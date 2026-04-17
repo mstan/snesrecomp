@@ -1063,9 +1063,15 @@ def auto_promote_branch_targets(rom: bytes, cfg) -> int:
                 continue  # intra-func branch; already has a label
             if tgt in func_entry_addrs:
                 continue  # landing on another func's entry — tail call works
-            # Is the target inside some other known func's range?
+            # Is the target inside SOME known func's range (including this
+            # function's own range)? A forward branch whose target isn't in
+            # decoded_addrs usually means decode_func gave up following
+            # that path — which happens when the target is past the end
+            # of decode or the intervening bytes look like data. Promote
+            # it to a sub-entry so the decoder can reach it standalone
+            # and the emitter can tail-call to it.
             for other_saddr, other_end in ends.items():
-                if other_saddr != saddr and other_saddr < tgt < other_end:
+                if other_saddr < tgt < other_end:
                     new_targets.add(tgt)
                     break
 
@@ -4976,23 +4982,14 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         print(f'  Auto-promote (cross-bank names): {_cross_registered} outgoing JSL targets named',
               file=sys.stderr)
 
-    # ── Auto-promote intra-bank branch targets ────────────────────────────
-    # Any BRA/BRL/BCC/JMP etc. whose target lands inside a different known
-    # function's range gets a synthetic `auto_BB_AAAA` name + sig so the
-    # sub-entry promotion pass below splits that parent and makes the
-    # target a callable tail-call destination. Without this, the emitter
-    # silently replaces the branch with `return;`, losing any setup the
-    # real target would run.
-    _auto_branch_promoted = auto_promote_branch_targets(rom, cfg)
-    if _auto_branch_promoted:
-        print(f'  Auto-promote (intra-bank branch targets): {_auto_branch_promoted} new names',
-              file=sys.stderr)
-
     # ── Sub-entry promotion ──────────────────────────────────────────────
     # A `name` directive with a `sig:` that falls strictly inside an existing
     # `func`'s address range is a *sub-entry point*: an address that external
     # code (or intra-bank code) can call into the middle of a parent function.
     # See promote_sub_entries for details.
+    # Runs BEFORE auto_promote_branch_targets so branch-target inference sees
+    # sub-entries as first-class funcs (their internal BRAs to other labels
+    # inside the parent range can then be auto-promoted).
     _promoted = promote_sub_entries(rom, cfg)
     if _promoted:
         print(f'  Sub-entry promotion: {len(_promoted)} entries promoted to func:',
@@ -5000,6 +4997,23 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         for pname, paddr, parent_name, parent_addr in _promoted:
             skipped = ' (skipped)' if pname in cfg.skip else ''
             print(f'    {pname} @ ${cfg.bank:02X}:{paddr:04X}  (parent: {parent_name} @ {parent_addr:04X}){skipped}',
+                  file=sys.stderr)
+
+    # ── Auto-promote intra-bank branch targets ────────────────────────────
+    # Any BRA/BRL/BCC/JMP etc. whose target lands inside a different known
+    # function's range gets a synthetic `auto_BB_AAAA` name + sig so a
+    # follow-up sub-entry promotion pass splits that parent and makes the
+    # target a callable tail-call destination. Without this, the emitter
+    # silently replaces the branch with `return;`, losing any setup the
+    # real target would run.
+    _auto_branch_promoted = auto_promote_branch_targets(rom, cfg)
+    if _auto_branch_promoted:
+        print(f'  Auto-promote (intra-bank branch targets): {_auto_branch_promoted} new names',
+              file=sys.stderr)
+        # Re-run sub-entry promotion so the new names become full funcs.
+        _promoted2 = promote_sub_entries(rom, cfg)
+        if _promoted2:
+            print(f'  Sub-entry promotion (round 2): {len(_promoted2)} additional',
                   file=sys.stderr)
 
     # --- Entry M/X inference from caller context --------------------------
