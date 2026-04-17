@@ -419,6 +419,406 @@ def _reconcile_sig(cfg_sig: Optional[str], funcs_h_sig: Optional[str]) -> Option
     return cfg_sig
 
 
+# ==============================================================================
+# LIVE-IN REGISTER INFERENCE
+# ==============================================================================
+#
+# For any function whose entry basic block reads A, X, or Y before writing it,
+# that register is an input parameter by definition — the caller must supply
+# it. The cfg cannot declare this for every function (and shouldn't need to):
+# it's fully derivable from the ROM. This pass walks the decoded instruction
+# graph from the function entry and reports which registers are live-in, along
+# with the m/x width at the first read site.
+#
+# Rule 0 applies: the recompiler derives sigs from the ROM; cfg only overrides
+# for information that cannot be derived (struct returns, DP-passed params,
+# non-register calling conventions).
+
+# Mnemonics that read a register implicitly (before any write). Read+write
+# mnems (e.g. ADC, INC A) are listed here too — the read happens first.
+#
+# Note: PHA/PHX/PHY are intentionally OMITTED. In 65816 calling conventions
+# the dominant pattern is "PH{A,X,Y} at entry, PL{A,X,Y} at exit" to save
+# and restore a register the callee wants to scribble on. That push reads
+# the register, but semantically the caller doesn't need to supply a
+# meaningful value — the function is just preserving whatever was there.
+# Counting PH* as a liveness read would promote every save-restore helper
+# into spuriously taking a register parameter, which breaks verbatim
+# callers that rightly call such helpers with no arguments.
+_A_IMPLICIT_READERS = frozenset({
+    'STA',
+    'TAX', 'TAY', 'TCD', 'TCS',
+    'AND', 'ORA', 'EOR', 'ADC', 'SBC', 'CMP', 'BIT',
+    'MVN', 'MVP',
+    'XBA',  # swaps A<->B: reads both
+})
+_A_IMPLICIT_WRITERS = frozenset({
+    'LDA', 'PLA',
+    'TXA', 'TYA', 'TDC', 'TSC',
+    'AND', 'ORA', 'EOR', 'ADC', 'SBC',
+    'MVN', 'MVP',
+    'XBA',
+})
+
+_X_IMPLICIT_READERS = frozenset({
+    'STX',
+    'TXA', 'TXS', 'TXY',
+    'CPX',
+    'DEX', 'INX',
+    'MVN', 'MVP',
+})
+_X_IMPLICIT_WRITERS = frozenset({
+    'LDX', 'PLX',
+    'TAX', 'TSX', 'TYX',
+    'DEX', 'INX',
+    'MVN', 'MVP',
+})
+
+_Y_IMPLICIT_READERS = frozenset({
+    'STY',
+    'TYA', 'TYX',
+    'CPY',
+    'DEY', 'INY',
+    'MVN', 'MVP',
+})
+_Y_IMPLICIT_WRITERS = frozenset({
+    'LDY', 'PLY',
+    'TAY', 'TXY',
+    'DEY', 'INY',
+    'MVN', 'MVP',
+})
+
+# Addressing modes that use an index register.
+_X_INDEX_MODES = frozenset({ABS_X, DP_X, LONG_X, INDIR_X, INDIR_DPX})
+_Y_INDEX_MODES = frozenset({ABS_Y, DP_Y, INDIR_Y, INDIR_LY, STK_IY})
+
+# A-accumulator shift/rotate/inc/dec read+write A when mode is ACC.
+_ACC_MODE_RW_MNEMS = frozenset({'ASL', 'LSR', 'ROL', 'ROR', 'INC', 'DEC'})
+
+
+def _insn_reg_use(insn: Insn, reg: str) -> Tuple[bool, bool]:
+    """Return (reads, writes) flags for `reg` ('A' | 'X' | 'Y') on this insn.
+
+    Read+write mnemonics (e.g. ADC, INC A) report both True — the read
+    happens before the write, so for live-in detection the read wins.
+    """
+    mn = insn.mnem
+    mode = insn.mode
+    reads = False
+    writes = False
+    if reg == 'A':
+        if mn in _A_IMPLICIT_READERS:
+            reads = True
+        if mn in _A_IMPLICIT_WRITERS:
+            writes = True
+        if mode == ACC and mn in _ACC_MODE_RW_MNEMS:
+            reads = True
+            writes = True
+    elif reg == 'X':
+        if mn in _X_IMPLICIT_READERS:
+            reads = True
+        if mn in _X_IMPLICIT_WRITERS:
+            writes = True
+        if mode in _X_INDEX_MODES:
+            reads = True
+    elif reg == 'Y':
+        if mn in _Y_IMPLICIT_READERS:
+            reads = True
+        if mn in _Y_IMPLICIT_WRITERS:
+            writes = True
+        if mode in _Y_INDEX_MODES:
+            reads = True
+    return reads, writes
+
+
+def infer_live_in_regs(insns: List[Insn], start_addr: int) -> Dict[str, int]:
+    """Compute which of A, X, Y are live-in at function entry.
+
+    Walks the in-function instruction graph from `start_addr`, asking for
+    each register: is there a reachable read before any write? If so, the
+    register is a parameter, and the width is taken from the m/x flag on
+    the insn that first reads it (m=0 -> 16-bit A; x=0 -> 16-bit X/Y).
+
+    Returns a dict like {'A': 8, 'X': None, 'Y': 16}. The value is the bit
+    width when live-in, or None when not live-in.
+
+    Conservative assumptions:
+      - JSR/JSL define A, X, Y (return values may populate any of them).
+        A function that reads A only after a JSR is NOT treated as
+        taking A as input.
+      - RTS/RTL/RTI/BRK/STP terminate paths.
+      - Unconditional JMP/BRA/BRL within the function follows the target;
+        cross-function JMP (target not in decoded set) terminates the path.
+      - Conditional branches fork. Both branches are explored.
+    """
+    if not insns:
+        return {'A': None, 'X': None, 'Y': None}
+
+    insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
+    sorted_addrs = sorted(insn_by_addr)
+    if not sorted_addrs:
+        return {'A': None, 'X': None, 'Y': None}
+    addr_to_idx = {a: i for i, a in enumerate(sorted_addrs)}
+    start16 = start_addr & 0xFFFF
+    # If decode didn't start exactly at start_addr (rare: sub-entry), fall back
+    # to the lowest decoded address.
+    if start16 not in insn_by_addr:
+        start16 = sorted_addrs[0]
+
+    def _succs(addr: int) -> List[int]:
+        insn = insn_by_addr.get(addr)
+        if insn is None:
+            return []
+        mn = insn.mnem
+        if mn in ('RTS', 'RTL', 'RTI', 'BRK', 'STP'):
+            return []
+        if mn in ('JMP', 'BRA', 'BRL'):
+            if insn.mode == ABS and insn.operand in insn_by_addr:
+                return [insn.operand]
+            # Cross-function JMP, indirect JMP, JML — terminate path for
+            # liveness purposes. (Tail calls don't bring A/X/Y back.)
+            return []
+        succs = []
+        if mn in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC'):
+            if insn.operand in insn_by_addr:
+                succs.append(insn.operand)
+        # Fall-through
+        idx = addr_to_idx.get(addr)
+        if idx is not None and idx + 1 < len(sorted_addrs):
+            succs.append(sorted_addrs[idx + 1])
+        return succs
+
+    def _reg_live_in(reg: str) -> Optional[int]:
+        # BFS with binary 'defined' state. Each (addr, defined) pair visited
+        # at most once -> linear time.
+        from collections import deque
+        queue = deque([(start16, False)])
+        visited = set()
+        while queue:
+            addr, defined = queue.popleft()
+            key = (addr, defined)
+            if key in visited:
+                continue
+            visited.add(key)
+            insn = insn_by_addr.get(addr)
+            if insn is None:
+                continue
+            reads, writes = _insn_reg_use(insn, reg)
+            if reads and not defined:
+                # Width: A follows m flag, X/Y follow x flag.
+                if reg == 'A':
+                    return 16 if insn.m_flag == 0 else 8
+                else:
+                    return 16 if insn.x_flag == 0 else 8
+            new_defined = defined or writes
+            # JSR/JSL may return values in A/X/Y — treat as a def so that
+            # post-call reads don't spuriously mark the reg as live-in.
+            if insn.mnem in ('JSR', 'JSL'):
+                new_defined = True
+            for succ in _succs(addr):
+                queue.append((succ, new_defined))
+        return None
+
+    return {
+        'A': _reg_live_in('A'),
+        'X': _reg_live_in('X'),
+        'Y': _reg_live_in('Y'),
+    }
+
+
+def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int]]) -> Optional[str]:
+    """Add any live-in register parameters missing from `sig`.
+
+    Cfg/funcs.h sigs keep priority for types, struct returns, DP params, and
+    any explicit `_a`/`_k`/`_j` params already declared. If inference finds
+    A/X/Y live-in and the sig doesn't already pass it via a register param,
+    one is appended.
+
+    Convention (matches existing cfg usage):
+      - A live-in -> append `uint8_a` / `uint16_a`.
+      - X live-in -> append `uint8_k` / `uint16_k`.
+      - Y live-in -> append `uint8_j` / `uint16_j`.
+
+    Ordering within the argument list matches the order registers first
+    become live, so callers using positional args stay consistent.
+    """
+    # When sig is None, treat it as a fresh `void()` — do NOT inherit
+    # parse_sig's legacy default of `[('uint8','k')]`, which would inject a
+    # phantom `k` parameter even when liveness analysis says X is not
+    # live-in at entry.
+    if sig is None:
+        ret, params = 'void', []
+    else:
+        ret, params = parse_sig(sig)
+    have_a = any(pname == 'a' for _pt, pname in params)
+    have_x = any(pname in ('k',) for _pt, pname in params)
+    have_y = any(pname == 'j' for _pt, pname in params)
+
+    new_params = list(params)
+    if live_in.get('X') is not None and not have_x:
+        t = 'uint16' if live_in['X'] == 16 else 'uint8'
+        new_params.append((t, 'k'))
+    if live_in.get('Y') is not None and not have_y:
+        t = 'uint16' if live_in['Y'] == 16 else 'uint8'
+        new_params.append((t, 'j'))
+    if live_in.get('A') is not None and not have_a:
+        t = 'uint16' if live_in['A'] == 16 else 'uint8'
+        new_params.append((t, 'a'))
+
+    if new_params == params:
+        return sig
+
+    params_str = ','.join(f'{t}_{n}' for t, n in new_params) if new_params else ''
+    return f'{ret}({params_str})'
+
+
+def _scan_parent_mx_at(rom: bytes, bank: int, parent_addr: int, parent_end,
+                        parent_mo: dict, target_addr: int,
+                        exclude_ranges=None,
+                        cache: Dict[int, Dict[int, Tuple[int, int]]] = None
+                        ) -> Tuple[int, int]:
+    """Compute M/X flag state at a sub-entry by decoding the enclosing parent
+    function and looking at the call-site M/X of any JSR/JSL that targets
+    the sub-entry, or falling back to the nearest prior instruction's M/X.
+
+    Shared between run_config's sub-entry promotion pass and
+    promote_sub_entries for sync_funcs_h.
+    """
+    if cache is None:
+        cache = {}
+    if parent_addr in cache and target_addr in cache[parent_addr]:
+        return cache[parent_addr][target_addr]
+    p_end = parent_end if parent_end else target_addr + 0x100
+    if p_end > 0xFFFF:
+        p_end = 0xFFFF
+    try:
+        parent_insns = decode_func(rom, bank, parent_addr, end=p_end,
+                                   mode_overrides=parent_mo or None,
+                                   exclude_ranges=exclude_ranges or None,
+                                   validate_branches=False)
+    except Exception:
+        parent_insns = []
+    call_mx = None
+    for insn in parent_insns:
+        if insn.mnem in ('JSR', 'JSL') and insn.operand == target_addr:
+            call_mx = (insn.m_flag, insn.x_flag)
+            break
+    if call_mx is not None:
+        result = call_mx
+    else:
+        result = (1, 1)
+        for insn in sorted(parent_insns, key=lambda i: i.addr):
+            local_pc = insn.addr & 0xFFFF
+            if local_pc > target_addr:
+                break
+            result = (insn.m_flag, insn.x_flag)
+    cache.setdefault(parent_addr, {})[target_addr] = result
+    return result
+
+
+def promote_sub_entries(rom: bytes, cfg) -> List[Tuple[str, int, str, int]]:
+    """Promote `name ADDR NAME sig:...` entries that fall inside an existing
+    `func`'s range into first-class func entries. Each sub-entry becomes its
+    own function starting at ADDR with the declared sig; the enclosing parent
+    is shortened so the split is clean.
+
+    Returns a list of (sub_name, sub_addr, parent_name, parent_addr) tuples
+    describing the promotions. Mutates cfg.funcs in place.
+    """
+    import re as _re
+    _existing_func_addrs = {a for _, a, *_ in cfg.funcs}
+    _existing_func_names = {n for n, *_ in cfg.funcs}
+    _verbatim_defn_re = _re.compile(r'^\s*(?:static\s+)?\w[\w\s\*]*?\s+(\w+)\s*\([^)]*\)\s*\{')
+    _verbatim_func_names = set()
+    for vline in cfg.verbatim:
+        vm = _verbatim_defn_re.match(vline)
+        if vm:
+            _verbatim_func_names.add(vm.group(1))
+    _promoted: List[Tuple[str, int, str, int]] = []
+    cache: Dict[int, Dict[int, Tuple[int, int]]] = {}
+
+    for name_full_addr, name_str in list(cfg.names.items()):
+        if (name_full_addr >> 16) != cfg.bank:
+            continue
+        if name_full_addr not in cfg.sigs:
+            continue
+        local_addr = name_full_addr & 0xFFFF
+        if local_addr in _existing_func_addrs:
+            continue
+        if name_str in _existing_func_names:
+            continue
+        if name_str in _verbatim_func_names:
+            continue
+        parent = None
+        for fname, faddr, fsig, fend, fmo, fhints in cfg.funcs:
+            if faddr < local_addr:
+                if parent is None or faddr > parent[1]:
+                    parent = (fname, faddr, fsig, fend, fmo, fhints)
+        if parent is None:
+            continue
+        sub_m, sub_x = _scan_parent_mx_at(
+            rom, cfg.bank, parent[1], parent[3], parent[4], local_addr,
+            exclude_ranges=cfg.exclude_ranges, cache=cache)
+        sub_mode_ovr = {}
+        if sub_m == 0 or sub_x == 0:
+            flags = 0
+            if sub_m == 0: flags |= 0x20
+            if sub_x == 0: flags |= 0x10
+            sub_mode_ovr[local_addr] = flags
+        sub_sig = cfg.sigs[name_full_addr]
+        cfg.funcs.append((name_str, local_addr, sub_sig, None, sub_mode_ovr, {}))
+        _existing_func_addrs.add(local_addr)
+        _promoted.append((name_str, local_addr, parent[0], parent[1]))
+    cfg.funcs.sort(key=lambda t: t[1])
+    return _promoted
+
+
+def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
+    """Run live-in register inference on every non-skipped function in `cfg`
+    and merge the resulting parameters back into `cfg.sigs`.
+
+    Returns the number of sigs augmented. Used both by recomp.py's main
+    codegen loop and by sync_funcs_h.py so that on-disk funcs.h agrees
+    with what the recompiler emits for each bank.
+    """
+    non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
+                if f not in cfg.skip]
+    non_skip.sort(key=lambda t: t[1])
+    known_func_addrs: Set[int] = set(cfg.names.keys())
+    for _fname, addr, *_ in cfg.funcs:
+        known_func_addrs.add((cfg.bank << 16) | addr)
+
+    augmented = 0
+    for i, (fname, start_addr, sig_tup, eovr, mo, _hints) in enumerate(non_skip):
+        if eovr is not None:
+            end_addr = eovr
+        elif i + 1 < len(non_skip):
+            end_addr = non_skip[i + 1][1]
+        else:
+            end_addr = 0x10000
+        full_addr = (cfg.bank << 16) | start_addr
+        current_sig = cfg.sigs.get(full_addr, sig_tup)
+        try:
+            insns = decode_func(
+                rom, cfg.bank, start_addr, end=end_addr,
+                jsl_dispatch=cfg.jsl_dispatch or None,
+                jsl_dispatch_long=cfg.jsl_dispatch_long or None,
+                mode_overrides=mo or None,
+                exclude_ranges=cfg.exclude_ranges or None,
+                known_func_starts=known_func_addrs,
+                validate_branches=False)
+        except Exception:
+            continue
+        if not insns:
+            continue
+        live_in = infer_live_in_regs(insns, start_addr)
+        new_sig = _augment_sig_with_livein(current_sig, live_in)
+        if new_sig != current_sig:
+            cfg.sigs[full_addr] = new_sig
+            augmented += 1
+    return augmented
+
+
 def parse_sig(sig: Optional[str]):
     """Parse sig string like 'void(uint8_k)' -> (ret_type, [(type, name), ...])."""
     if sig is None:
@@ -611,6 +1011,13 @@ class EmitCtx:
         self.y_after_map: Dict[int, int] = y_after_map or {}  # callee -> Y increment
         self.x_after_map: Dict[int, int] = x_after_map or {}  # callee -> X increment
         self.end_addr: int = 0  # function end address (for cross-function branch detection)
+
+        # Whether the previous instruction was an unconditional transfer
+        # (BRA/BRL/JMP/RTS/RTL/RTI/tail-call). If True, the current register
+        # state is dead — no path from the previous PC falls through to the
+        # next instruction, so label-target merges must not use self.A/X/Y
+        # as "the fall-through value".
+        self._prev_terminal: bool = False
 
         # Abstract register values (C expression strings, or None=unknown)
         self.A: Optional[str] = init_a
@@ -1215,7 +1622,30 @@ class EmitCtx:
             # The branch variable then holds:
             # - The branch-source value when reached via goto (assignment skipped)
             # - The fall-through value when reached via fall-through (assigned here)
-            if pc in self._branch_states:
+            #
+            # No-fall-through case: if the immediately preceding instruction
+            # was an unconditional transfer (BRA/JMP/RTS/RTL/RTI/tail-call),
+            # there is no fall-through path into this label — control can
+            # only arrive via the goto/branch that built the branch_state.
+            # Using the current (post-BRA) register expressions as the
+            # "fall-through value" emits bogus assignments that sit dead
+            # between the goto and the label (and can, on a subsequent
+            # pass, appear to double-update registers). Adopt the
+            # branch_state's variables directly and skip the assignments.
+            if self._prev_terminal and pc in self._branch_states:
+                bs = self._branch_states.pop(pc)
+                if bs.get('A_var'):
+                    self.A = bs['A_var']
+                if bs.get('X_var'):
+                    self.X = bs['X_var']
+                if bs.get('Y_var'):
+                    self.Y = bs['Y_var']
+                if bs.get('carry_var'):
+                    self.carry = bs['carry_var']
+                bstack = bs.get('stack')
+                if bstack is not None:
+                    self.stack = list(bstack)
+            elif pc in self._branch_states:
                 bs = self._branch_states.pop(pc)
                 branch_a_var = bs.get('A_var')
                 if branch_a_var and self.A != branch_a_var:
@@ -1292,12 +1722,17 @@ class EmitCtx:
             # so we must not use stale cached values after a merge point.
             self.dp_state.clear()
             if pc in self._backward_branch_targets:
-                # Record X/Y at this label for backward branch merge
+                # Record A/X/Y at this label so a backward branch knows the
+                # variable name each register must hold on loop re-entry.
+                # (Forward branches handle merges via _branch_states, which
+                # is set up at the branch site before the target is emitted.)
                 if not hasattr(self, '_label_x'):
                     self._label_x = {}
                     self._label_y = {}
+                    self._label_a = {}
                 self._label_x[pc] = self.X
                 self._label_y[pc] = self.Y
+                self._label_a[pc] = self.A
                 self._emit('WatchdogCheck();')
 
         # -- STZ ----------------------------------------------------------
@@ -2017,6 +2452,19 @@ class EmitCtx:
             self._warn(f'Unhandled: {insn}',
                        f'Add handler for {mn} mode={MODE_STR.get(mode, mode)}')
 
+        # -- Track whether this instruction terminates fall-through ------
+        # Used by the next instruction's label-merge step so that register
+        # state from a now-dead path doesn't leak into a label reachable
+        # only via goto/branch.
+        if mn in ('RTS', 'RTL', 'RTI', 'BRK', 'STP', 'BRA', 'BRL'):
+            self._prev_terminal = True
+        elif mn == 'JMP' and mode in (ABS, LONG, INDIR, INDIR_X, INDIR_L):
+            # All JMP/JML variants are unconditional transfers; any next
+            # linear instruction is unreachable without an incoming branch.
+            self._prev_terminal = True
+        else:
+            self._prev_terminal = False
+
     # -- Sub-emitters ---------------------------------------------------------
 
     def _resolve_mem_rw(self, mode: int, v: int) -> Optional[str]:
@@ -2368,6 +2816,24 @@ class EmitCtx:
                     'carry': self.carry, 'carry_var': None,
                     'stack': list(self.stack),
                 }
+            # Backward BRA: if the target label was emitted earlier with a
+            # known A/X/Y variable, assign the current register values into
+            # those variables before the goto so the next loop iteration
+            # sees the updated register state. X/Y already handled below;
+            # we also need A for patterns like HexToDec's SBC-A; BRA loop.
+            if hasattr(self, '_label_a') and v in self._label_a:
+                la = self._label_a[v]
+                if la and self.A and la != self.A and self._simple(la):
+                    self._emit(f'{la} = {self.A};')
+            if hasattr(self, '_label_x') and v in self._label_x:
+                lx = self._label_x[v]
+                ly = self._label_y.get(v)
+                if lx and self.X and lx != self.X and self._simple(lx) and self._simple(self.X):
+                    if lx != ly:
+                        self._emit(f'{lx} = {self.X};')
+                if ly and self.Y and ly != self.Y and self._simple(ly) and self._simple(self.Y):
+                    if ly != lx:
+                        self._emit(f'{ly} = {self.Y};')
             self._emit(f'goto label_{v:04x};')
         else:
             # Branch merge: materialize registers before the branch so the
@@ -2420,10 +2886,14 @@ class EmitCtx:
                 'carry_var': carry_var,
                 'stack': list(self.stack),
             }
-            # For backward branches: sync X/Y with the label's variables.
+            # For backward branches: sync A/X/Y with the label's variables.
             # The label was already emitted, so we can't merge there.
-            # Instead, assign current X/Y to the label's X/Y before the goto.
+            # Instead, assign current A/X/Y to the label's A/X/Y before the goto.
             # Skip X sync if label's X was shared with Y (would corrupt loop index).
+            if hasattr(self, '_label_a') and v in self._label_a:
+                la = self._label_a[v]
+                if la and self.A and la != self.A and self._simple(la):
+                    self._emit(f'{la} = {self.A};')
             if hasattr(self, '_label_x') and v in self._label_x:
                 lx = self._label_x[v]
                 ly = self._label_y.get(v)
@@ -3860,115 +4330,8 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # A `name` directive with a `sig:` that falls strictly inside an existing
     # `func`'s address range is a *sub-entry point*: an address that external
     # code (or intra-bank code) can call into the middle of a parent function.
-    #
-    # The recompiler cannot jump into the middle of a C function, so we split
-    # the parent at every sub-entry.  The parent keeps its start but ends just
-    # before the sub-entry; the sub-entry becomes a new func from its address
-    # to the parent's original end.  Fall-through between them is handled by
-    # the existing next_func / tail-call mechanism.
-    #
-    # Cross-bank names (bank prefix != cfg.bank) are skipped — they are
-    # extern declarations, not local sub-entries.
-    _bank_prefix = cfg.bank << 16
-    # Set of local-bank addresses that already have func entries
-    _existing_func_addrs = {a for _, a, *_ in cfg.funcs}
-    _existing_func_names = {n for n, *_ in cfg.funcs}
-    # Names that already have bodies supplied by a verbatim block — promoting
-    # them would emit a second (decoder-generated) body and collide with the
-    # verbatim definition at link time.
-    _verbatim_defn_re = re.compile(r'^\s*(?:static\s+)?\w[\w\s\*]*?\s+(\w+)\s*\([^)]*\)\s*\{')
-    _verbatim_func_names = set()
-    for vline in cfg.verbatim:
-        vm = _verbatim_defn_re.match(vline)
-        if vm:
-            _verbatim_func_names.add(vm.group(1))
-    _promoted = []
-    # Cache: parent_addr -> {sub_addr: (m, x)} from linear M/X scan
-    _parent_mx_cache: Dict[int, Dict[int, Tuple[int, int]]] = {}
-
-    def _scan_mx_at(parent_addr: int, parent_end, parent_mo: dict,
-                    target_addr: int) -> Tuple[int, int]:
-        """Decode parent function and find M/X at sub-entry address.
-
-        Strategy: decode the full parent, then look for JSR/JSL calls to
-        target_addr — the call-site M/X is the correct entry M/X for the
-        sub-entry.  Falls back to the M/X of the nearest decoded instruction
-        before target_addr.
-        """
-        cache_key = parent_addr
-        if cache_key in _parent_mx_cache and target_addr in _parent_mx_cache[cache_key]:
-            return _parent_mx_cache[cache_key][target_addr]
-        # Decode parent with its full original range (before splitting).
-        p_end = parent_end if parent_end else target_addr + 0x100
-        if p_end > 0xFFFF:
-            p_end = 0xFFFF
-        try:
-            parent_insns = decode_func(rom, cfg.bank, parent_addr, end=p_end,
-                                       mode_overrides=parent_mo or None,
-                                       exclude_ranges=cfg.exclude_ranges or None,
-                                       validate_branches=False)
-        except (AssertionError, Exception):
-            parent_insns = []
-        # Look for JSR/JSL calls to the sub-entry address
-        target_full = (cfg.bank << 16) | target_addr
-        call_mx = None
-        for insn in parent_insns:
-            if insn.mnem in ('JSR', 'JSL') and insn.operand == target_addr:
-                call_mx = (insn.m_flag, insn.x_flag)
-                break
-        if call_mx is not None:
-            result = call_mx
-        else:
-            # Fallback: nearest decoded instruction at or before target_addr
-            result = (1, 1)
-            for insn in sorted(parent_insns, key=lambda i: i.addr):
-                local_pc = insn.addr & 0xFFFF
-                if local_pc > target_addr:
-                    break
-                result = (insn.m_flag, insn.x_flag)
-        if cache_key not in _parent_mx_cache:
-            _parent_mx_cache[cache_key] = {}
-        _parent_mx_cache[cache_key][target_addr] = result
-        return result
-
-    for name_full_addr, name_str in list(cfg.names.items()):
-        # Only consider same-bank names with a sig
-        if (name_full_addr >> 16) != cfg.bank:
-            continue
-        if name_full_addr not in cfg.sigs:
-            continue
-        local_addr = name_full_addr & 0xFFFF
-        if local_addr in _existing_func_addrs:
-            continue  # already a func entry
-        if name_str in _existing_func_names:
-            continue  # name already used by another func (e.g. cross-bank trampoline alias)
-        if name_str in _verbatim_func_names:
-            continue  # body already provided by verbatim block
-        # Find which parent func this falls within.
-        # Sort funcs by address, find the one whose start < local_addr.
-        parent = None
-        for fname, faddr, fsig, fend, fmo, fhints in cfg.funcs:
-            if faddr < local_addr:
-                if parent is None or faddr > parent[1]:
-                    parent = (fname, faddr, fsig, fend, fmo, fhints)
-        if parent is None:
-            continue
-        # Inherit M/X state from parent at the sub-entry address.
-        sub_m, sub_x = _scan_mx_at(parent[1], parent[3], parent[4], local_addr)
-        sub_mode_ovr = {}
-        if sub_m == 0 or sub_x == 0:
-            flags = 0
-            if sub_m == 0: flags |= 0x20
-            if sub_x == 0: flags |= 0x10
-            sub_mode_ovr[local_addr] = flags
-        # The sub-entry is inside this parent's range.  Promote it.
-        sub_sig = cfg.sigs[name_full_addr]
-        new_func = (name_str, local_addr, sub_sig, None, sub_mode_ovr, {})
-        cfg.funcs.append(new_func)
-        _existing_func_addrs.add(local_addr)
-        _promoted.append((name_str, local_addr, parent[0], parent[1]))
-    # Re-sort cfg.funcs by address so end-address computation is correct
-    cfg.funcs.sort(key=lambda t: t[1])
+    # See promote_sub_entries for details.
+    _promoted = promote_sub_entries(rom, cfg)
     if _promoted:
         print(f'  Sub-entry promotion: {len(_promoted)} entries promoted to func:',
               file=sys.stderr)
@@ -4052,6 +4415,15 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # Auto-detect ExecutePtr-style dispatch helpers by ROM pattern. Unions
     # with any cfg-provided hints so existing cfgs keep working.
     _auto_detect_dispatch_helpers(rom, cfg)
+
+    # --- Live-in register inference (Rule 0: recompiler is authoritative) --
+    # Derive calling-convention parameters directly from the ROM. For each
+    # function, decode its body and walk from entry: any of A/X/Y that gets
+    # read before being written is live-in, i.e. a parameter. The inferred
+    # params are merged into cfg.sigs so both forward declarations and
+    # emitted bodies use the augmented sig, and sync_funcs_h.py sees the
+    # same result via augment_cfg_sigs_from_livein.
+    augment_cfg_sigs_from_livein(rom, cfg)
 
     # Build function list (excluding skipped)
     funcs_with_end = []
@@ -4214,13 +4586,15 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             print(f'  WARN: no instructions decoded for {fname} @ ${cfg.bank:02X}:{start_addr:04X}',
                   file=sys.stderr)
             continue
-        # Determine next function for fall-through detection
+        # Determine next function for fall-through detection.
+        # Prefer cfg.sigs over the stale tuple sig: live-in inference updates
+        # cfg.sigs but not the tuple, so the tuple may be missing parameters
+        # the callee actually needs.
         next_func = None
         if fi + 1 < len(funcs_with_end):
             nf_name = funcs_with_end[fi + 1][0]
-            nf_sig = funcs_with_end[fi + 1][3]
-            if nf_sig is None:
-                nf_sig = cfg.sigs.get((cfg.bank << 16) | funcs_with_end[fi + 1][1])
+            nf_full = (cfg.bank << 16) | funcs_with_end[fi + 1][1]
+            nf_sig = cfg.sigs.get(nf_full, funcs_with_end[fi + 1][3])
             next_func = (nf_name, nf_sig)
         # Also check cfg.names for oracle-only functions at end_addr or end_addr+1
         # (fall-through to skipped/oracle functions)
