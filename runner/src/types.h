@@ -102,6 +102,10 @@ typedef struct RetAY {
   uint8 a, y;
 } RetAY;
 
+typedef struct RetY {
+  uint8 y;
+} RetY;
+
 typedef struct PointU16 {
   uint16 x, y;
 } PointU16;

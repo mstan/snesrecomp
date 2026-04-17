@@ -656,6 +656,46 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
     }
 
 
+def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
+    """True if the function writes `reg` anywhere in its body AND does not
+    bracket those writes with a PH{R}/PL{R} save-restore at the function
+    boundary. Used to detect callees that clobber A/X/Y from the caller's
+    perspective, which in turn drives RetY/RetAY inference.
+
+    Heuristic: find the first PH{R} (at function entry), find the last
+    PL{R} before any RTS/RTL/RTI exit. If every write to `reg` is
+    strictly between the PH{R} and the PL{R}, the register is preserved.
+    Otherwise it's clobbered.
+
+    Simplification: if there is no PH{R}/PL{R} pair at all and there is
+    at least one write to `reg`, the register is clobbered. This catches
+    the common SMW pattern where a small helper computes a Y return
+    value with LDY #$xx / INY / ... / RTS and no save-restore.
+    """
+    ph = {'A': 'PHA', 'X': 'PHX', 'Y': 'PHY'}[reg]
+    pl = {'A': 'PLA', 'X': 'PLX', 'Y': 'PLY'}[reg]
+    has_write = False
+    has_push = False
+    has_pop = False
+    for insn in insns:
+        _r, w = _insn_reg_use(insn, reg)
+        if w:
+            has_write = True
+        if insn.mnem == ph:
+            has_push = True
+        if insn.mnem == pl:
+            has_pop = True
+    if not has_write:
+        return False
+    # If both PH{R} and PL{R} are present, assume the function preserves
+    # the register (save-restore pattern). This is an approximation —
+    # strict analysis would verify the PH/PL pair brackets all writes and
+    # lies on every path — but matches the common decomp convention.
+    if has_push and has_pop:
+        return False
+    return True
+
+
 def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int]]) -> Optional[str]:
     """Add any live-in register parameters missing from `sig`.
 
@@ -936,7 +976,19 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
         live_in = infer_live_in_regs(insns, start_addr, bank=cfg.bank,
                                      callee_sigs=cfg.sigs)
         new_sig = _augment_sig_with_livein(current_sig, live_in)
-        if new_sig != current_sig:
+        # Record whether this function clobbers A/X/Y without PHA/PLA-style
+        # save-restore, so the call-site emitter can drop the caller's
+        # register tracking instead of pretending the register was
+        # preserved. This is independent of the sig: the sig still
+        # describes the C-level return convention, whereas `clobbers`
+        # describes which 65816 registers leak across the call boundary.
+        if not hasattr(cfg, 'clobbers'):
+            cfg.clobbers = {}
+        cfg.clobbers[full_addr] = {
+            reg for reg in ('A', 'X', 'Y')
+            if _writes_register_without_save_restore(insns, reg)
+        }
+        if new_sig is not None and new_sig != current_sig:
             cfg.sigs[full_addr] = new_sig
             augmented += 1
     return augmented
@@ -1119,7 +1171,8 @@ class EmitCtx:
                  carry_ret: bool = False,
                  x_restores_map: Dict[int, str] = None,
                  y_after_map: Dict[int, int] = None,
-                 x_after_map: Dict[int, int] = None):
+                 x_after_map: Dict[int, int] = None,
+                 callee_clobbers: Dict[int, Set[str]] = None):
         self.bank = bank
         self.func_names = func_names
         self.func_sigs = func_sigs or {}
@@ -1133,6 +1186,11 @@ class EmitCtx:
         self.x_restores_map: Dict[int, str] = x_restores_map or {}  # callee -> X expr
         self.y_after_map: Dict[int, int] = y_after_map or {}  # callee -> Y increment
         self.x_after_map: Dict[int, int] = x_after_map or {}  # callee -> X increment
+        # Per-callee set of registers the callee clobbers (writes without a
+        # matching PH/PL save-restore pair). Used at JSR/JSL sites to drop
+        # the caller's tracking of any clobbered register, so we don't
+        # pretend the register was preserved and emit stale values.
+        self.callee_clobbers: Dict[int, Set[str]] = callee_clobbers or {}
         self.end_addr: int = 0  # function end address (for cross-function branch detection)
 
         # Whether the previous instruction was an unconditional transfer
@@ -1234,6 +1292,9 @@ class EmitCtx:
             a_val = self.A if self.A is not None else '0'
             y_val = self.Y if self.Y is not None else '0'
             return f'(RetAY){{ .a = {a_val}, .y = {y_val} }}'
+        if rt == 'RetY':
+            y_val = self.Y if self.Y is not None else '0'
+            return f'(RetY){{ .y = {y_val} }}'
         if self._ret_y:
             return self.Y if self.Y is not None else '0'
         if self.A is None:
@@ -3137,6 +3198,20 @@ class EmitCtx:
                 self._emit(f'{y_tmp} = {tmp}.y;')
                 self.Y = y_tmp
                 self.flag_src = self.A
+            elif _ret == 'RetY':
+                # RetY returns via Y register only.
+                tmp = self._alloc(_ret)
+                self._emit(f'{tmp} = {fname}({call_args});')
+                y_tmp = self._alloc('uint8')
+                self._emit(f'{y_tmp} = {tmp}.y;')
+                self.Y = y_tmp
+                self.flag_src = self.Y
+                # The callee may have scribbled on A as scratch; drop
+                # the caller's A tracking so code that reads A after
+                # the call doesn't use stale pre-call values. Callers
+                # that consume A usually overwrite it explicitly (TYA,
+                # LDA ...).
+                self.A = None
             elif _ret == 'uint16' and self.X and self._simple(self.X):
                 # HANDOFF requirement C: return value updates existing X.
                 # A is NOT modified by the callee (65816 convention: uint16
@@ -3153,9 +3228,20 @@ class EmitCtx:
                     self.X = tmp
             # Preserve Y across calls — JSR/JSL do not clobber Y in real
             # 65816.  Callers that need Y = A use explicit TAY.  Callees
-            # that modify Y are handled by y_after / RetAY / restores_x.
-            if _ret != 'RetAY':
-                self.Y = pre_call_y
+            # that modify Y are handled by y_after / RetAY / RetY /
+            # restores_x / explicit-clobber-set.
+            if _ret not in ('RetAY', 'RetY'):
+                # If we've inferred that the callee writes Y without a
+                # PHY/PLY save-restore, the ROM's Y after the call is
+                # whatever the callee left behind, not our pre-call
+                # value. Drop tracking so downstream TYA / LDA $xx,Y
+                # emits a warning (honest) instead of silently using a
+                # stale pre-call expression (wrong).
+                clobbers = self.callee_clobbers.get(target, set())
+                if 'Y' in clobbers:
+                    self.Y = None
+                else:
+                    self.Y = pre_call_y
             # ReturnsTwice pattern: the callee manipulates the stack to skip
             # the caller's remaining code when the sprite is offscreen/invalid.
             # The emitter must inject the early return that the callee would
@@ -3165,12 +3251,39 @@ class EmitCtx:
                 if _ret == 'bool':
                     self._emit(f'if ({rv}) return;')
                 elif _ret == 'uint8':
-                    if self.ret_type != 'void':
-                        self._emit(f'if ({rv} == 0xff) return {rv};')
-                    else:
+                    if self.ret_type == 'void':
                         self._emit(f'if ({rv} == 0xff) return;')
+                    elif self.ret_type == 'uint8':
+                        self._emit(f'if ({rv} == 0xff) return {rv};')
+                    elif self.ret_type == 'RetY':
+                        self._emit(f'if ({rv} == 0xff) return (RetY){{ .y = {rv} }};')
+                    elif self.ret_type == 'RetAY':
+                        self._emit(
+                            f'if ({rv} == 0xff) return (RetAY){{ .a = {rv},'
+                            f' .y = {rv} }};'
+                        )
+                    else:
+                        # Other struct/complex outer types: emit the bare
+                        # return expr (may still fail to compile if rv type
+                        # doesn't match, but that's a separate sig issue).
+                        self._emit(f'if ({rv} == 0xff) return {rv};')
         else:
             self._emit(f'{fname}({call_args});')
+            # Void-return callee: no return value to track, but the callee
+            # may still clobber A/X in the 65816 sense (writes without a
+            # PHA/PHX save-restore). Drop any register we know the callee
+            # clobbers so subsequent reads don't pretend the pre-call
+            # expression is still valid.
+            clobbers = self.callee_clobbers.get(target, set())
+            if 'A' in clobbers:
+                self.A = None
+            if 'X' in clobbers and self.X not in ('k', 'j'):
+                # X is often passed-through as the k param; only drop
+                # tracking if the callee clobbered X AND we weren't
+                # carrying the sprite-slot parameter through unchanged.
+                self.X = None
+            if 'Y' in clobbers:
+                self.Y = None
 
         # Track DP output values from callee's pointer output params.
         # If the callee has a pointer param like PointU16_*pt_out, it writes
@@ -3328,6 +3441,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   x_restores_map: Dict[int, str] = None,
                   y_after_map: Dict[int, int] = None,
                   x_after_map: Dict[int, int] = None,
+                  callee_clobbers: Dict[int, Set[str]] = None,
                   end_addr: int = 0,
                   decl_ret_override: Optional[str] = None) -> List[str]:
     """Emit a complete C function from decoded instructions.
@@ -3503,7 +3617,8 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   carry_ret=hints.get('carry_ret', '0') != '0',
                   x_restores_map=x_restores_map,
                   y_after_map=y_after_map,
-                  x_after_map=x_after_map)
+                  x_after_map=x_after_map,
+                  callee_clobbers=callee_clobbers)
     ctx._ret_y = hints.get('ret_y', '0') != '0'
     ctx.end_addr = end_addr
 
@@ -4755,6 +4870,7 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                                    x_restores_map=cfg.x_restores,
                                    y_after_map=cfg.y_after,
                                    x_after_map=cfg.x_after,
+                                   callee_clobbers=getattr(cfg, 'clobbers', None),
                                    end_addr=end_addr,
                                    decl_ret_override=decl_ret_overrides.get(full_addr_for_override))
         # Validation pass: detect obviously garbled output
