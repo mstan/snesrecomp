@@ -953,10 +953,16 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     on-disk funcs.h agrees with what the recompiler emits.
     """
     total_augmented = 0
+    # Always run at least two passes: the first populates cfg.clobbers;
+    # the second re-runs live-in with that clobber info in hand, which
+    # lets the analysis see through preserve-register helpers. Stopping
+    # after pass 1 with `changes == 0` would leave that second-order
+    # propagation unrun, and a JSR through a preserve-X helper would
+    # look like a destructive call to the caller's live-in pass.
     for _iter in range(8):
         changes = _augment_cfg_sigs_one_pass(rom, cfg)
         total_augmented += changes
-        if changes == 0:
+        if changes == 0 and _iter >= 1:
             break
     total_augmented += _promote_rety_from_caller_usage(rom, cfg)
     return total_augmented
