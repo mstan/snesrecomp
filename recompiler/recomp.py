@@ -2900,7 +2900,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                 if pc16 in valid_branch_targets:
                     ctx._emit(f'label_{pc16:04x}:;')
             continue
-        if start and pc16 < start:
+        if start16 and pc16 < start16:
             # Defer past-start insn to be emitted after the fall-through tail.
             _past_start_buf.append(insn)
             continue
