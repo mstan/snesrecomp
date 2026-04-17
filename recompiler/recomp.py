@@ -745,6 +745,33 @@ def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
     return f'g_ram[0x{addr:x}]'
 
 
+def _has_memory_save_restore(insns: List[Insn], reg: str) -> bool:
+    """True if the function uses the STORE-at-entry / LOAD-before-exit
+    idiom to preserve `reg`. Common alternative to PH{R}/PL{R}:
+
+        STY  $03          ; save Y on entry
+        ...arbitrary code that scribbles on Y...
+        LDY  $03          ; restore Y before returning
+        RTS (or JMP)
+
+    Returns True when some early instruction is a store from `reg` to
+    a DP/ABS address AND some later instruction loads `reg` back from
+    the same address. Callers that are preserve-X/Y-aware can treat
+    such a function as non-clobbering even though intermediate code
+    modifies the register.
+    """
+    st_mnem = {'A': 'STA', 'X': 'STX', 'Y': 'STY'}[reg]
+    ld_mnem = {'A': 'LDA', 'X': 'LDX', 'Y': 'LDY'}[reg]
+    saved_addrs: Set[int] = set()
+    for insn in insns:
+        if insn.mnem == st_mnem and insn.mode in (DP, ABS):
+            saved_addrs.add(insn.operand)
+        if insn.mnem == ld_mnem and insn.mode in (DP, ABS):
+            if insn.operand in saved_addrs:
+                return True
+    return False
+
+
 def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
     """True if the function writes `reg` anywhere in its body AND does not
     bracket those writes with a PH{R}/PL{R} save-restore at the function
@@ -781,6 +808,13 @@ def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
     # strict analysis would verify the PH/PL pair brackets all writes and
     # lies on every path — but matches the common decomp convention.
     if has_push and has_pop:
+        return False
+    # Memory-based save-restore (STR $addr at entry, LDR $addr before
+    # exit) is equivalent: the register's caller-visible value is
+    # preserved via a WRAM slot even though the body scribbles on it.
+    # Example: $00:86DF opens with `STY $03` and ends with `LDY $03`
+    # right before `JMP (abs)`.
+    if _has_memory_save_restore(insns, reg):
         return False
     return True
 
