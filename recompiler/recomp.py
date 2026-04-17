@@ -2671,24 +2671,36 @@ class EmitCtx:
                 self._emit(f'if ({arr_name}[{idx}]) {arr_name}[{idx}]({call_arg}); }}')
             else:
                 self._emit(f'{arr_name}[{idx}]({call_arg}); }}')
+            # Dispatch is terminal: emit the outer function's return to
+            # satisfy the declared ret type. Handlers in the table are
+            # typically void, so for a uint8/RetAY outer we fall back to
+            # _return_value_expr's default (A if tracked, else 0).
+            self._emit_return_for_current_sig()
             return
 
-        # Mixed / unknown entries: per-case switch.
+        # Mixed / unknown entries: per-case switch. Each case is terminal,
+        # so its return must match the outer function's declared ret type.
         call_arg = 'k' if self.has_k else ''
+        rv = self._return_value_expr()
+        ret_stmt = 'return;' if rv is None else f'return {rv};'
         self._emit(f'switch ({idx}) {{')
         for i, entry in enumerate(insn.dispatch_entries):
             if entry == 0:
                 # Null dispatch slot: unused object ID in a sparse table.
-                self._emit(f'  case {i}: return;  /* null dispatch */')
+                self._emit(f'  case {i}: {ret_stmt}  /* null dispatch */')
             elif _entry_is_known_func(entry):
                 fn = self._callee((self.bank << 16) | entry)
-                self._emit(f'  case {i}: {fn}({call_arg}); return;')
+                self._emit(f'  case {i}: {fn}({call_arg}); {ret_stmt}')
             else:
                 # Unknown — assume an intra-function branch target. If the
                 # label does not exist at link time the C compiler will error,
                 # surfacing the missing cfg name.
                 self._emit(f'  case {i}: goto label_{entry:04x};')
         self._emit(f'}}')
+        # Fallthrough past the switch would have no return statement for
+        # non-void sigs. Emit one matching the ret type.
+        if rv is not None:
+            self._emit(ret_stmt)
 
 
 # ==============================================================================
