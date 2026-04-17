@@ -928,6 +928,13 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     a change to a callee's sig can propagate a change to its caller on
     the next round. Bounded by a generous iteration cap.
 
+    After live-in fixpoint, a second pass promotes void-returning callees
+    that (a) clobber Y and (b) have at least one caller that reads Y
+    before writing it after the JSR site to `RetY(...)`. This is the
+    bidirectional half of the analysis: consumer-driven rather than
+    heuristic. Avoids spuriously demoting functions that merely use Y
+    as a scratch register.
+
     Returns the total number of sig augmentations across all passes. Used
     both by recomp.py's main codegen loop and by sync_funcs_h.py so that
     on-disk funcs.h agrees with what the recompiler emits.
@@ -938,7 +945,107 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
         total_augmented += changes
         if changes == 0:
             break
+    total_augmented += _promote_rety_from_caller_usage(rom, cfg)
     return total_augmented
+
+
+def _insns_read_reg_post_jsr(caller_insns: List[Insn], jsr_pc: int,
+                             target: int, reg: str) -> bool:
+    """Walk forward from a JSR/JSL at `jsr_pc` inside `caller_insns` and
+    ask whether `reg` is read before it is written (i.e. whether the
+    caller consumes the callee's register output). Scans along the
+    fall-through path only, stopping at the next transfer instruction.
+    """
+    insn_by_addr = {i.addr & 0xFFFF: i for i in caller_insns}
+    sorted_addrs = sorted(insn_by_addr)
+    addr_to_idx = {a: i for i, a in enumerate(sorted_addrs)}
+    idx = addr_to_idx.get(jsr_pc & 0xFFFF)
+    if idx is None:
+        return False
+    defined = False
+    for j in range(idx + 1, len(sorted_addrs)):
+        insn = insn_by_addr[sorted_addrs[j]]
+        r, w = _insn_reg_use(insn, reg)
+        if r and not defined:
+            return True
+        if w:
+            defined = True
+        # Stop following on any transfer; analysing fall-through is
+        # enough to catch the common "JSR foo ; TYA ; STA $xxxx" idiom.
+        if insn.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL'):
+            break
+    return False
+
+
+def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
+    """Promote a function's sig from `void(...)` to `RetY(...)` when
+      1. The callee clobbers Y (see _writes_register_without_save_restore),
+      2. At least one intra-bank caller reads Y after the JSR before
+         writing it (e.g. `JSR foo ; TYA ; STA $xxxx`).
+
+    Returns the number of promotions.
+    """
+    clobbers = getattr(cfg, 'clobbers', None)
+    if not clobbers:
+        return 0
+    non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
+                if f not in cfg.skip]
+    non_skip.sort(key=lambda t: t[1])
+    # Candidate callees: in this bank, sig is void(...), and clobber Y.
+    candidates: Set[int] = set()
+    for fname, addr, *_ in non_skip:
+        full = (cfg.bank << 16) | addr
+        sig = cfg.sigs.get(full)
+        if sig is None:
+            sig = 'void()'
+        ret, _ps = parse_sig(sig)
+        if ret != 'void':
+            continue
+        if 'Y' not in clobbers.get(full, set()):
+            continue
+        candidates.add(addr)
+    if not candidates:
+        return 0
+    # Decode every caller and look for consumer JSR to a candidate.
+    y_consumers: Set[int] = set()
+    known_func_addrs: Set[int] = set(cfg.names.keys())
+    for _fname, addr, *_ in cfg.funcs:
+        known_func_addrs.add((cfg.bank << 16) | addr)
+    for i, (fname, start_addr, _sig, eovr, mo, _h) in enumerate(non_skip):
+        if eovr is not None:
+            end_addr = eovr
+        elif i + 1 < len(non_skip):
+            end_addr = non_skip[i + 1][1]
+        else:
+            end_addr = 0x10000
+        try:
+            insns = decode_func(rom, cfg.bank, start_addr, end=end_addr,
+                                mode_overrides=mo or None,
+                                exclude_ranges=cfg.exclude_ranges or None,
+                                known_func_starts=known_func_addrs,
+                                validate_branches=False)
+        except Exception:
+            continue
+        for insn in insns:
+            if insn.mnem != 'JSR':
+                continue
+            tgt = insn.operand & 0xFFFF
+            if tgt not in candidates:
+                continue
+            if _insns_read_reg_post_jsr(insns, insn.addr & 0xFFFF, tgt, 'Y'):
+                y_consumers.add(tgt)
+    # Promote each consumer.
+    promoted = 0
+    for tgt in y_consumers:
+        full = (cfg.bank << 16) | tgt
+        sig = cfg.sigs.get(full, 'void()')
+        ret, _ps = parse_sig(sig)
+        if ret != 'void':
+            continue
+        params_part = sig[len('void'):] if sig.startswith('void') else '()'
+        cfg.sigs[full] = 'RetY' + params_part
+        promoted += 1
+    return promoted
 
 
 def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
@@ -3795,7 +3902,23 @@ def emit_function(name: str, insns: List[Insn], bank: int,
             ctx._emit(f'return {ctx._struct_ret_expr(ret_type)};')
         elif nf_ret != 'void' and ret_type != 'void':
             ctx._emit(f'RecompStackPop();')
-            ctx._emit(f'return {nf_name}({nf_args});  /* fall-through */')
+            if ret_type == 'RetY' and nf_ret != 'RetY':
+                # Outer declares RetY but the fall-through target returns
+                # a scalar — wrap in the struct literal.
+                ctx._emit(
+                    f'return (RetY){{ .y = {nf_name}({nf_args}) }};'
+                    '  /* fall-through */'
+                )
+            elif ret_type == 'RetAY' and nf_ret != 'RetAY':
+                # Outer declares RetAY but the fall-through returns a
+                # scalar. Map to .a (A is the most common SMW scalar
+                # return register when the outer isn't destructured).
+                ctx._emit(
+                    f'return (RetAY){{ .a = {nf_name}({nf_args}),'
+                    f' .y = 0 }};  /* fall-through */'
+                )
+            else:
+                ctx._emit(f'return {nf_name}({nf_args});  /* fall-through */')
         else:
             ctx._emit(f'RecompStackPop();')
             ctx._emit(f'{nf_name}({nf_args});  /* fall-through */')
