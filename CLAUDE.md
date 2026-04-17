@@ -1,35 +1,78 @@
 # SNES Recompilation – Claude Rules & Protocol
 
-This project is a **static SNES recompilation system**.
+---
+
+# 🔴 NORTH STAR — WHAT THIS PROJECT ACTUALLY IS
+
+We are building a **game-agnostic static SNES recompiler** (the `snesrecomp`
+framework at `snesrecomp/`). Super Mario World is **game #1** — chosen
+because SMWDisX gives us an exceptionally literal oracle, not because
+SMW itself is the goal. The long-term objective is a recompiler where
+adding game #2 / game #3 costs hours of per-title `game.cfg` work, not
+months of framework patching.
+
+This framing drives every design decision:
+
+1. **Every recompiler fix must pass the "would this help game #2?" test.**
+   If the answer is "no, this is SMW-specific," the fix belongs in
+   SMW's per-game cfg — not in `snesrecomp/recompiler/`. If the answer
+   is "yes, this generalizes," the fix belongs in the framework and
+   SMW's cfg should shed a line or two.
+
+2. **`recomp/bank*.cfg` is strictly last-resort.** It exists only for
+   information that is genuinely not derivable from the ROM bytes —
+   data-region boundaries, externally-imposed calling conventions,
+   rare hints that cannot be inferred statically. Every cfg line is
+   debt. If `discover.py` or the decoder can infer it, the cfg line
+   must be deleted and the recompiler must be taught.
+
+3. **Zero tolerance for stubs, placeholders, compatibility shims,
+   or TODO-impls anywhere in the codebase.** Not in generated C. Not
+   in runtime C. Not in Python. Not in cfg. "Make the test pass by
+   faking it" is never acceptable — the test exists to verify the
+   real thing. If you cannot do the real thing, STOP and extend
+   tooling/understanding before writing code.
+
+4. **SMW's progress is the leading indicator, not the goal.** When
+   SMW runs end-to-end, it proves the recompiler works on one real
+   commercial SNES game. The framework's shape at that point is
+   what determines whether game #2 takes a week or a quarter.
 
 We are NOT building an emulator.
-We are NOT trying to "make it look close enough."
+We are NOT writing interpretations of how the ROM "probably" works.
+We are NOT trying to make it "look close enough."
 
-We are achieving **measured behavioral equivalence** using:
-- the recompiled/native build
-- an oracle implementation
-- Ghidra for literal machine-code grounding
+We are achieving **measured behavioral equivalence** between:
+- the recompiled/native build (what `snesrecomp` produces)
+- an oracle implementation (smw-rev for behavior; SMWDisX for literal bytes)
 
-For Super Mario World work, the oracle implementation is typically **smw-rev**.
-However, **smw-rev is not a perfect literal oracle**. It contains inferred / reconstructed code in some places.
-Therefore:
-- use **smw-rev for behavior comparison**
-- use **Ghidra for literal code / control-flow / data interpretation**
-- do NOT assume smw-rev is 1:1 machine-code truth
+For Super Mario World work specifically:
+- **SMWDisX** is the primary literal-code oracle. It is 1:1 machine-code
+  truth. Use it for M/X state, function boundaries, data/code splits,
+  dispatch table interpretation, bank addressing.
+- **smw-rev** is the primary behavior oracle. It is a reconstructed
+  decompilation — NOT 1:1 machine-code truth. It may rename,
+  reorganize, or inline logic. Use it for high-level behavior
+  comparison only.
+- **Ghidra** is unreliable for 65816 semantics — prefer SMWDisX.
+- If a conclusion depends on non-literal smw-rev helper logic, say so
+  explicitly.
 
 ---
 
 # 🔴 PRIMARY OBJECTIVE
 
-We are building a SNES recompilation workflow that can correctly execute real commercial code.
+We are building a SNES recompilation workflow that can correctly execute
+real commercial code. SMW is the first such test case.
 
 For current work:
-- Super Mario World is the working reference target
+- Super Mario World is the working reference target (game #1)
+- SMWDisX is the primary literal-code oracle
 - smw-rev is the primary behavior oracle when applicable
-- Ghidra is the primary literal-code oracle
 - the recompiler, runtime, and tooling are all considered incomplete
 
-If behavior is correct but the explanation depends on non-literal smw-rev helper logic, that MUST be acknowledged explicitly.
+If behavior is correct but the explanation depends on non-literal smw-rev
+helper logic, that MUST be acknowledged explicitly.
 
 ---
 
@@ -54,6 +97,14 @@ cannot reconstruct from the ROM alone. Concretely: data-region boundaries
 convention depends on external context (e.g. WRAM struct returns), and
 rare hints that cannot be inferred statically.
 
+**The game-agnostic test (see NORTH STAR above):** Before adding any cfg
+line, ask: "if I were starting game #2 (Mega Man X, Contra III, F-Zero,
+whatever) tomorrow, would I need to write this same line for that game
+too?" If YES → the fix belongs in the recompiler, not cfg. If NO → it's
+genuinely per-game data and cfg is correct. Cfg lines that encode
+patterns are bugs; cfg lines that encode facts about one specific ROM
+are fine.
+
 This means:
 - A `dispatch`, `skip`, `jsl_dispatch*`, or similar cfg hint is SUSPECT.
   If the recompiler can handle the pattern itself, the hint is obsolete
@@ -67,10 +118,40 @@ This means:
   to tolerate bad cfg data.
 - When a cfg entry predates a recompiler feature that now makes it
   unnecessary, DELETE the entry. Redundant cfg is rot.
+- `discover.py` + `recomp.py`'s auto-promote passes will find any intra-
+  bank JSR/JSL target and any cross-bank JSL target reachable through
+  code-validated paths. If a REVIEW is firing on a `func_XXXXXX` that
+  discover.py *should* have found, the answer is to fix discovery —
+  not to add a cfg entry.
 
 Whenever a fix is tempting in Python, ask: "is this really a recompiler
 correctness fix, or am I working around wrong cfg?" If the latter,
 delete the cfg line instead.
+
+## -1. ZERO TOLERANCE FOR STUBS
+
+No stubs. Anywhere. For any reason.
+
+- No `// TODO: real implementation` in generated C, runtime C, or Python
+- No empty function bodies that "will be filled in later"
+- No `return 0; /* placeholder */` to make a link error go away
+- No `if (feature_flag) real_path(); else fake_path();` toggles
+- No mocked subsystems that pretend to work
+- No "just enough to boot past this point" hacks
+- No `#ifdef SKIP_BROKEN` guards
+
+If you cannot write the real thing right now, the correct response is
+to STOP and extend tooling, understanding, or observability until you
+can. Making the test suite green with a fake is worse than leaving the
+test red — the fake creates the illusion of progress while hiding the
+real state of the system.
+
+Exception: the `oracle/` directory contains hand-written
+implementations used as *behavior* stand-ins while the recompiler is
+still incomplete. These are not stubs — they are a deliberately marked
+transition scaffold, and every oracle function is a line item for the
+recompiler to eventually replace. When a function graduates from
+oracle to recompiled, the oracle entry is DELETED, not left behind.
 
 ---
 
