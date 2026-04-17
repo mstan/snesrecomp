@@ -685,6 +685,43 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
     }
 
 
+def _detect_register_restore_expr(insns: List[Insn], reg: str) -> Optional[str]:
+    """Generalised version of _detect_x_restore_expr that works for any of
+    A/X/Y. Returns the g_ram[0xXXXX] expression matching the most-recent
+    LOAD from DP/ABS of `reg` before each RTS/RTL exit, when all exits
+    agree. Returns None otherwise.
+    """
+    ld = {'A': 'LDA', 'X': 'LDX', 'Y': 'LDY'}[reg]
+    if not insns:
+        return None
+    insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
+    sorted_addrs = sorted(insn_by_addr)
+    idx = {a: i for i, a in enumerate(sorted_addrs)}
+    restore_addrs: Set[int] = set()
+    for insn in insns:
+        if insn.mnem not in ('RTS', 'RTL'):
+            continue
+        i = idx[insn.addr & 0xFFFF]
+        j = i - 1
+        while j >= 0:
+            cand = insn_by_addr[sorted_addrs[j]]
+            _r, w = _insn_reg_use(cand, reg)
+            if not w:
+                j -= 1
+                continue
+            if cand.mnem == ld and cand.mode in (DP, ABS):
+                restore_addrs.add(cand.operand)
+            else:
+                return None
+            break
+        else:
+            continue
+    if not restore_addrs or len(restore_addrs) > 1:
+        return None
+    addr = next(iter(restore_addrs))
+    return f'g_ram[0x{addr:x}]'
+
+
 def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
     """Detect an explicit X-restore pattern just before every RTS/RTL.
 
@@ -815,6 +852,13 @@ def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
     # Example: $00:86DF opens with `STY $03` and ends with `LDY $03`
     # right before `JMP (abs)`.
     if _has_memory_save_restore(insns, reg):
+        return False
+    # Explicit LD{R} $addr right before the last RTS is another
+    # preserve signal — the body's final write to `reg` is a reload
+    # from a deterministic WRAM slot, so callers can treat that slot
+    # as the post-call register value (also captured by
+    # _detect_register_restore_expr for X-restore wiring).
+    if _detect_register_restore_expr(insns, reg) is not None:
         return False
     return True
 
