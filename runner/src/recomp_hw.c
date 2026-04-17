@@ -1,0 +1,262 @@
+#include "recomp_state.h"
+#include "common_rtl.h"
+#include "snes/ppu.h"
+#include "snes/dma.h"
+#include "snes/snes.h"
+
+// Direct hardware register handlers for the recomp path.
+// These bypass the emulator bus (snes_write/snes_read) and dispatch
+// directly to the appropriate subsystem.
+
+extern uint8 g_ram[];
+extern const uint8 *g_rom;
+extern Snes *g_snes;
+extern Ppu *g_ppu;
+extern Dma *g_dma;
+
+// --- Internal register state (owned by recomp, not g_snes) ---
+static uint8_t  recomp_multiplyA;
+static uint16_t recomp_multiplyResult;
+static uint16_t recomp_divideA;
+static uint16_t recomp_divideResult;
+static bool     recomp_autoJoyRead;
+static bool     recomp_nmiEnabled;
+static bool     recomp_hIrqEnabled;
+static bool     recomp_ppuLatch;
+
+void recomp_hw_init(void) {
+  recomp_multiplyA = 0xff;
+  recomp_multiplyResult = 0xfe01;
+  recomp_divideA = 0xffff;
+  recomp_divideResult = 0x101;
+  recomp_autoJoyRead = false;
+  recomp_nmiEnabled = false;
+  recomp_hIrqEnabled = false;
+  recomp_ppuLatch = false;
+  g_recomp.wramAddr = 0;
+}
+
+// --- Lightweight DMA execution ---
+// Replaces the cycle-accurate dma_startDma/dma_cycle path.
+// Transfers all bytes at once without cycle stepping.
+
+static const uint8_t kDmaOffsets[8][4] = {
+  {0,0,0,0}, {0,1,0,1}, {0,0,0,0}, {0,0,1,1},
+  {0,1,2,3}, {0,1,0,1}, {0,0,0,0}, {0,0,1,1},
+};
+
+static uint8_t recomp_dma_read_byte(uint32_t addr) {
+  uint8_t bank = addr >> 16;
+  uint16_t adr = addr & 0xFFFF;
+  if (bank == 0x7E || bank == 0x7F)
+    return g_ram[((bank & 1) << 16) | adr];
+  if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
+    if (adr < 0x2000)
+      return g_ram[adr];
+    if (adr >= 0x8000)
+      return g_rom[(((uint32_t)bank << 15) | (adr & 0x7FFF)) & 0x3FFFFF];
+  }
+  // High bank ROM access
+  if (bank >= 0x40)
+    return g_rom[(((uint32_t)bank << 15) | (adr & 0x7FFF)) & 0x3FFFFF];
+  return 0;
+}
+
+static void recomp_dma_write_byte(uint32_t addr, uint8_t val) {
+  uint8_t bank = addr >> 16;
+  uint16_t adr = addr & 0xFFFF;
+  if (bank == 0x7E || bank == 0x7F) {
+    g_ram[((bank & 1) << 16) | adr] = val;
+    return;
+  }
+  if (adr < 0x2000) {
+    g_ram[adr] = val;
+  }
+}
+
+static void recomp_execute_dma_channel(DmaChannel *ch) {
+  uint8_t dest = ch->bAdr;
+  uint32_t src_addr = ch->aAdr | ((uint32_t)ch->aBank << 16);
+  uint16_t size = ch->size;
+  bool from_b = ch->fromB;
+  bool fixed = ch->fixed;
+  bool decrement = ch->decrement;
+  uint8_t mode = ch->mode & 7;
+  int unit_idx = 0;
+
+  // size=0 means 64K transfer
+  int bytes = (size == 0) ? 0x10000 : size;
+
+  for (int i = 0; i < bytes; i++) {
+    uint8_t ppu_reg = dest + kDmaOffsets[mode][unit_idx & 3];
+    if (from_b) {
+      // B->A: read from PPU, write to memory
+      uint8_t val = ppu_read(g_ppu, ppu_reg);
+      recomp_dma_write_byte(src_addr, val);
+    } else {
+      // A->B: read from memory, write to PPU
+      uint8_t byte = recomp_dma_read_byte(src_addr);
+      ppu_write(g_ppu, ppu_reg, byte);
+    }
+    if (!fixed) {
+      if (decrement) src_addr--; else src_addr++;
+    }
+    unit_idx++;
+  }
+
+  // Update channel state after transfer
+  ch->aAdr = src_addr & 0xFFFF;
+  ch->aBank = src_addr >> 16;
+  ch->size = 0;
+  ch->dmaActive = false;
+  ch->offIndex = 0;
+}
+
+void recomp_execute_dma(uint8_t channels_mask) {
+  for (int i = 0; i < 8; i++) {
+    if (channels_mask & (1 << i)) {
+      recomp_execute_dma_channel(&g_dma->channel[i]);
+    }
+  }
+}
+
+// --- WRAM access port (0x2180-0x2183) ---
+
+void recomp_write_wram_port(uint16 reg, uint8 val) {
+  switch (reg) {
+    case 0x2180:
+      g_ram[g_recomp.wramAddr++] = val;
+      g_recomp.wramAddr &= 0x1ffff;
+      break;
+    case 0x2181:
+      g_recomp.wramAddr = (g_recomp.wramAddr & 0x1ff00) | val;
+      break;
+    case 0x2182:
+      g_recomp.wramAddr = (g_recomp.wramAddr & 0x100ff) | (val << 8);
+      break;
+    case 0x2183:
+      g_recomp.wramAddr = (g_recomp.wramAddr & 0x0ffff) | ((val & 1) << 16);
+      break;
+  }
+}
+
+uint8 recomp_read_wram_port(void) {
+  uint8 ret = g_ram[g_recomp.wramAddr++];
+  g_recomp.wramAddr &= 0x1ffff;
+  return ret;
+}
+
+// --- Internal register writes (0x4200-0x421F) ---
+
+void recomp_write_internal_reg(uint16 reg, uint8 val) {
+  switch (reg) {
+    case 0x4200:  // NMITIMEN
+      recomp_autoJoyRead = val & 0x1;
+      recomp_hIrqEnabled = val & 0x10;
+      g_recomp.vIrqEnabled = (val & 0x20) != 0;
+      recomp_nmiEnabled = val & 0x80;
+      // Also update g_snes for subsystems that still read from it
+      g_snes->autoJoyRead = recomp_autoJoyRead;
+      g_snes->hIrqEnabled = recomp_hIrqEnabled;
+      g_snes->vIrqEnabled = g_recomp.vIrqEnabled;
+      g_snes->nmiEnabled = recomp_nmiEnabled;
+      break;
+    case 0x4201:  // WRIO
+      if (!(val & 0x80) && recomp_ppuLatch)
+        ppu_read(g_ppu, 0x37);
+      recomp_ppuLatch = val & 0x80;
+      break;
+    case 0x4202:  // WRMPYA
+      recomp_multiplyA = val;
+      break;
+    case 0x4203:  // WRMPYB - triggers multiply
+      recomp_multiplyResult = recomp_multiplyA * val;
+      break;
+    case 0x4204:  // WRDIVL
+      recomp_divideA = (recomp_divideA & 0xff00) | val;
+      break;
+    case 0x4205:  // WRDIVH
+      recomp_divideA = (recomp_divideA & 0x00ff) | (val << 8);
+      break;
+    case 0x4206:  // WRDIVB - triggers divide
+      if (val == 0) {
+        recomp_divideResult = 0xffff;
+        recomp_multiplyResult = recomp_divideA;
+      } else {
+        recomp_divideResult = recomp_divideA / val;
+        recomp_multiplyResult = recomp_divideA % val;
+      }
+      break;
+    case 0x4207:  // HTIMEL
+      g_snes->hTimer = (g_snes->hTimer & 0x100) | val;
+      break;
+    case 0x4208:  // HTIMEH
+      g_snes->hTimer = (g_snes->hTimer & 0x0ff) | ((val & 1) << 8);
+      break;
+    case 0x4209:  // VTIMEL
+      g_recomp.vTimer = (g_recomp.vTimer & 0x100) | val;
+      g_snes->vTimer = g_recomp.vTimer;
+      break;
+    case 0x420a:  // VTIMEH
+      g_recomp.vTimer = (g_recomp.vTimer & 0x0ff) | ((val & 1) << 8);
+      g_snes->vTimer = g_recomp.vTimer;
+      break;
+    case 0x420b:  // MDMAEN - DMA trigger
+      recomp_execute_dma(val);
+      break;
+    case 0x420c:  // HDMAEN
+      dma_startDma(g_dma, val, true);
+      break;
+    case 0x420d:  // MEMSEL (fast/slow ROM - no-op for recomp)
+      break;
+  }
+}
+
+// --- Internal register reads (0x4200-0x421F) ---
+
+static uint16_t SwapInputBits_Recomp(uint16_t x) {
+  uint16_t r = 0;
+  for (int i = 0; i < 16; i++, x >>= 1)
+    r = r * 2 + (x & 1);
+  return r;
+}
+
+uint8 recomp_read_internal_reg(uint16 reg) {
+  switch (reg) {
+    case 0x4210:  // RDNMI
+      return 0x02 | (g_snes->inNmi << 7);
+    case 0x4211:  // TIMEUP
+    {
+      uint8 val = g_snes->inIrq << 7;
+      g_snes->inIrq = false;
+      return val;
+    }
+    case 0x4212:  // HVBJOY
+      return (g_snes->inVblank << 7);
+    case 0x4213:  // RDIO
+      return recomp_ppuLatch << 7;
+    case 0x4214:  // RDDIVL
+      return recomp_divideResult & 0xff;
+    case 0x4215:  // RDDIVH
+      return recomp_divideResult >> 8;
+    case 0x4216:  // RDMPYL
+      return recomp_multiplyResult & 0xff;
+    case 0x4217:  // RDMPYH
+      return recomp_multiplyResult >> 8;
+    case 0x4218:  // JOY1L
+      return SwapInputBits_Recomp(g_recomp.input1) & 0xff;
+    case 0x4219:  // JOY1H
+      return SwapInputBits_Recomp(g_recomp.input1) >> 8;
+    case 0x421a:  // JOY2L
+      return SwapInputBits_Recomp(g_recomp.input2) & 0xff;
+    case 0x421b:  // JOY2H
+      return SwapInputBits_Recomp(g_recomp.input2) >> 8;
+    case 0x421c:
+    case 0x421d:
+    case 0x421e:
+    case 0x421f:
+      return 0;
+    default:
+      return 0;
+  }
+}

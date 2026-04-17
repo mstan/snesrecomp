@@ -1,0 +1,38 @@
+# Compiled output
+build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# ROM files (do not commit copyrighted ROMs)
+*.sfc
+*.smc
+*.fig
+
+# Extracted ROM data (generated from ROM at build time)
+smw_assets.dat
+
+# Save states
+saves/
+
+# NuGet / VS packages
+packages/
+*.suo
+*.user
+.vs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS junk
+Thumbs.db
+.DS_Store
+framedump_oracle/
+framedump_recomp/
+validate*.log
+regen.log
