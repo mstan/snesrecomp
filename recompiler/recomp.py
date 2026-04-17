@@ -983,6 +983,10 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
       2. At least one intra-bank caller reads Y after the JSR before
          writing it (e.g. `JSR foo ; TYA ; STA $xxxx`).
 
+    uint8 → RetAY promotion was tried but turned out to need strict
+    cross-bank fixpoint convergence that this one-shot pass can't
+    guarantee without more plumbing. Deferred.
+
     Returns the number of promotions.
     """
     clobbers = getattr(cfg, 'clobbers', None)
@@ -991,7 +995,7 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
     non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
                 if f not in cfg.skip]
     non_skip.sort(key=lambda t: t[1])
-    # Candidate callees: in this bank, sig is void(...), and clobber Y.
+    # Candidate callees: in this bank, ret is void, and Y is clobbered.
     candidates: Set[int] = set()
     for fname, addr, *_ in non_skip:
         full = (cfg.bank << 16) | addr
