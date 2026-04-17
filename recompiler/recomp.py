@@ -614,19 +614,31 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
             if insn is None:
                 continue
             reads, writes = _insn_reg_use(insn, reg)
-            # JSR/JSL/JMP (tail call): ask the callee's declared sig whether
-            # it consumes this register. If so, the call is a READ of the
-            # register — any caller-side code reaching this call without
-            # having written the register is using an input value. This is
-            # how trampolines (JSR $foo ; RTS, or JSR $a ; JMP $b) inherit
-            # their callees' sigs.
+            # JSR/JSL/JMP/BRA/BRL (call or tail transfer): ask the target's
+            # declared sig whether it consumes this register. If so, the
+            # transfer is a READ of the register — any caller-side code
+            # reaching this instruction without having written the register
+            # is using an input value. Handles:
+            #   * classic trampolines: JSR foo ; RTS
+            #   * chained trampolines: JSR a ; JMP b
+            #   * bare branch tail calls: STA $xx ; BRA next_func (common
+            #     pattern for auto-promoted sub-entries that simply set a
+            #     DP byte before flowing into the real handler).
             is_call = insn.mnem in ('JSR', 'JSL')
-            is_tail_jmp = insn.mnem in ('JMP',) and insn.mode in (ABS, LONG)
-            if is_call or is_tail_jmp:
+            is_tail_transfer = (
+                (insn.mnem == 'JMP' and insn.mode in (ABS, LONG)) or
+                (insn.mnem in ('BRA', 'BRL'))
+            )
+            # A BRA/BRL/JMP to an intra-function target is a local branch,
+            # not a tail call — skip those to avoid false-positive param
+            # reads from label gotos.
+            if is_tail_transfer and insn.operand in insn_by_addr:
+                is_tail_transfer = False
+            if is_call or is_tail_transfer:
                 target = insn.operand
                 if is_call and insn.mnem == 'JSR':
                     target = (bank << 16) | (target & 0xFFFF)
-                elif is_tail_jmp and insn.mode == ABS:
+                elif is_tail_transfer and insn.mode in (ABS, REL, REL16):
                     target = (bank << 16) | (target & 0xFFFF)
                 callee_sig = callee_sigs.get(target)
                 if callee_sig:
