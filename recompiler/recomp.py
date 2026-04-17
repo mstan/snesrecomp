@@ -533,7 +533,8 @@ def _insn_reg_use(insn: Insn, reg: str) -> Tuple[bool, bool]:
 
 def infer_live_in_regs(insns: List[Insn], start_addr: int,
                        bank: int = 0,
-                       callee_sigs: Optional[Dict[int, str]] = None) -> Dict[str, int]:
+                       callee_sigs: Optional[Dict[int, str]] = None,
+                       callee_clobbers: Optional[Dict[int, Set[str]]] = None) -> Dict[str, int]:
     """Compute which of A, X, Y are live-in at function entry.
 
     Walks the in-function instruction graph from `start_addr`, asking for
@@ -559,6 +560,7 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
       - Conditional branches fork. Both branches are explored.
     """
     callee_sigs = callee_sigs or {}
+    callee_clobbers = callee_clobbers or {}
     if not insns:
         return {'A': None, 'X': None, 'Y': None}
 
@@ -643,8 +645,21 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
             new_defined = defined or writes
             # JSR/JSL may return values in A/X/Y — treat as a def so that
             # post-call reads don't spuriously mark the reg as live-in.
+            # EXCEPT: if we have clobber info saying the callee preserves
+            # this register (not in callee_clobbers[target]), the call
+            # doesn't re-define it. This lets caller-side liveness see
+            # through preserve-X/preserve-Y helpers, so a post-JSR read
+            # of Y correctly implies Y was live-in at function entry.
             if insn.mnem in ('JSR', 'JSL'):
-                new_defined = True
+                target = insn.operand
+                if insn.mnem == 'JSR':
+                    target = (bank << 16) | (target & 0xFFFF)
+                clob = callee_clobbers.get(target)
+                if clob is not None and reg not in clob:
+                    # Callee is known to preserve this register.
+                    pass
+                else:
+                    new_defined = True
             for succ in _succs(addr):
                 queue.append((succ, new_defined))
         return None
@@ -1085,7 +1100,8 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
         if not insns:
             continue
         live_in = infer_live_in_regs(insns, start_addr, bank=cfg.bank,
-                                     callee_sigs=cfg.sigs)
+                                     callee_sigs=cfg.sigs,
+                                     callee_clobbers=getattr(cfg, 'clobbers', None))
         new_sig = _augment_sig_with_livein(current_sig, live_in)
         # Record whether this function clobbers A/X/Y without PHA/PLA-style
         # save-restore, so the call-site emitter can drop the caller's
