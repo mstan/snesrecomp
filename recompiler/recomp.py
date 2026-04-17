@@ -1102,6 +1102,37 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
         live_in = infer_live_in_regs(insns, start_addr, bank=cfg.bank,
                                      callee_sigs=cfg.sigs,
                                      callee_clobbers=getattr(cfg, 'clobbers', None))
+        # Fall-through to next function is a tail call. If the last decoded
+        # instruction doesn't transfer control, the function falls through
+        # into the next function in ROM order — whose sig's register
+        # params become live-in at the fall-through site, and therefore
+        # (if no earlier def exists) at entry too. Without this, a tiny
+        # stub like `STZ $05 ; REP #$10 ; <falls-through>` loses the X
+        # param its fall-through target needs.
+        last = insns[-1] if insns else None
+        is_terminal = last is not None and (
+            last.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL', 'BRK', 'STP'))
+        if not is_terminal and i + 1 < len(non_skip):
+            nf_full = (cfg.bank << 16) | non_skip[i + 1][1]
+            nf_sig = cfg.sigs.get(nf_full)
+            if nf_sig:
+                _nr, nf_params = parse_sig(nf_sig)
+                pnames = {pn for _pt, pn in nf_params}
+                # Only propagate if no local def of that reg exists
+                # anywhere in the body (conservative: if the body writes
+                # the reg, the fall-through's consumption uses the local
+                # def, so it's not live-in).
+                for reg, pname in (('A', 'a'), ('X', 'k'), ('Y', 'j')):
+                    if live_in.get(reg) is not None:
+                        continue
+                    if pname not in pnames:
+                        continue
+                    body_writes = any(
+                        _insn_reg_use(ins, reg)[1] for ins in insns
+                    )
+                    if body_writes:
+                        continue
+                    live_in[reg] = 8
         new_sig = _augment_sig_with_livein(current_sig, live_in)
         # Record whether this function clobbers A/X/Y without PHA/PLA-style
         # save-restore, so the call-site emitter can drop the caller's
