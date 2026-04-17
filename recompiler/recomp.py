@@ -782,6 +782,59 @@ def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
     return f'g_ram[0x{addr:x}]'
 
 
+def _looks_like_carry_return(insns: List[Insn]) -> bool:
+    """Heuristic: the function only manipulates the carry flag (CLC/SEC)
+    and returns without ever writing A. The SMW idiom for "bool return
+    via carry" is:
+
+        CLC          ; or SEC
+        RTS
+
+    Or a slightly longer variant where the function is a join point for
+    multiple early-return branches that all ultimately just set or clear
+    carry before returning. Such functions are best expressed as
+    `carry_ret` so the emitter returns the carry expression instead of
+    falling through to `return 0;` with an "A unknown at return" warning
+    when the cfg happens to declare `uint8()` return.
+
+    Returns True when every exit's preceding instruction is CLC or SEC
+    and no A writer appears anywhere in the body.
+    """
+    if not insns:
+        return False
+    insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
+    sorted_addrs = sorted(insn_by_addr)
+    idx = {a: i for i, a in enumerate(sorted_addrs)}
+    # Any A writer disqualifies.
+    for insn in insns:
+        _r, w = _insn_reg_use(insn, 'A')
+        if w:
+            return False
+    # Every RTS/RTL must be preceded by CLC or SEC on some path.
+    for insn in insns:
+        if insn.mnem not in ('RTS', 'RTL'):
+            continue
+        i = idx[insn.addr & 0xFFFF]
+        # Walk backward looking for a carry-affecting instruction as the
+        # most-recent operation. Skip pass-through ops (PLB/PHB/etc.)
+        # that don't touch carry or A.
+        found_carry = False
+        j = i - 1
+        while j >= 0:
+            cand = insn_by_addr[sorted_addrs[j]]
+            if cand.mnem in ('CLC', 'SEC'):
+                found_carry = True
+                break
+            if cand.mnem in ('PLB', 'PHB', 'PLP', 'PHP', 'NOP', 'XCE'):
+                j -= 1
+                continue
+            # Any other instruction invalidates the pure-carry pattern.
+            break
+        if not found_carry:
+            return False
+    return True
+
+
 def _has_memory_save_restore(insns: List[Insn], reg: str) -> bool:
     """True if the function uses the STORE-at-entry / LOAD-before-exit
     idiom to preserve `reg`. Common alternative to PH{R}/PL{R}:
@@ -1310,6 +1363,16 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
             reg for reg in ('A', 'X', 'Y')
             if _writes_register_without_save_restore(insns, reg)
         }
+        # Carry-return inference: CLC/SEC + RTS (or join of such exits)
+        # without any A writer. SMW uses this idiom for bool-via-carry
+        # helpers whose cfg was declared `uint8()` by AUTO but which
+        # never actually set A. With carry_ret, the emitter returns the
+        # carry expression at RTS instead of the default "A unknown
+        # -> 0" fallback.
+        if not hasattr(cfg, 'carry_ret'):
+            cfg.carry_ret = set()
+        if _looks_like_carry_return(insns):
+            cfg.carry_ret.add(full_addr)
         # Auto-detect the "LDX $xxxx ; RTS" explicit-restore pattern so
         # callers see X as preserved through the call. Without this, the
         # clobber bit above (X is written internally) makes the call
@@ -5288,6 +5351,12 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             _ret, _params = parse_sig(sig)
             if any(pn in ('k', 'j') for _pt, pn in _params):
                 effective_hints['init_y'] = cfg.default_init_y
+        # Apply inferred carry_ret (populated by augment pass for
+        # CLC/SEC-only carry-return helpers).
+        if (getattr(cfg, 'carry_ret', None)
+                and (cfg.bank << 16 | start_addr) in cfg.carry_ret
+                and 'carry_ret' not in effective_hints):
+            effective_hints['carry_ret'] = '1'
         full_addr_for_override = (cfg.bank << 16) | start_addr
         func_lines = emit_function(fname, insns, cfg.bank, cfg.names,
                                    func_sigs=cfg.sigs, sig=sig, trace=trace,
