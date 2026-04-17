@@ -327,6 +327,44 @@ def decode_func(rom: bytes, bank: int, start: int, end: int = 0,
 # SIGNATURE PARSING
 # ==============================================================================
 
+# Primitive types cfg's AUTO analysis can derive. Anything else (structs,
+# pointers, bool, RetAY) is semantic info only funcs.h carries.
+_SIMPLE_TYPES = frozenset(('void', 'uint8', 'uint16', 'int8', 'int16'))
+
+
+def _sig_has_complex_type(sig: Optional[str]) -> bool:
+    """True if sig declares any non-primitive type (return or param)."""
+    if not sig:
+        return False
+    ret, params = parse_sig(sig)
+    if ret not in _SIMPLE_TYPES:
+        return True
+    for ptype, _pname in params:
+        if ptype not in _SIMPLE_TYPES:
+            return True
+    return False
+
+
+def _reconcile_sig(cfg_sig: Optional[str], funcs_h_sig: Optional[str]) -> Optional[str]:
+    """Pick a single sig used for BOTH C declaration and body codegen.
+
+    When funcs.h declares a complex type (RetAY, struct, pointer, bool — in
+    the return or any param), funcs.h wins entirely: those types encode
+    multi-register or struct-return semantics AUTO analysis cannot derive.
+
+    Otherwise cfg wins. cfg reflects per-function analysis, while funcs.h has
+    historically blanket-promoted everything to uint8, which produces UB when
+    the body has no corresponding return value at every RTS.
+    """
+    if not funcs_h_sig:
+        return cfg_sig
+    if not cfg_sig:
+        return funcs_h_sig
+    if _sig_has_complex_type(funcs_h_sig):
+        return funcs_h_sig
+    return cfg_sig
+
+
 def parse_sig(sig: Optional[str]):
     """Parse sig string like 'void(uint8_k)' -> (ret_type, [(type, name), ...])."""
     if sig is None:
@@ -2613,14 +2651,12 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   x_restores_map: Dict[int, str] = None,
                   y_after_map: Dict[int, int] = None,
                   x_after_map: Dict[int, int] = None,
-                  end_addr: int = 0,
-                  decl_ret_override: str = None) -> List[str]:
+                  end_addr: int = 0) -> List[str]:
     """Emit a complete C function from decoded instructions.
     next_func: (name, sig) of the function immediately following in ROM, for fall-through.
     hints: dict of cfg hints like {'init_y': 'x'} to initialize Y from X on entry.
     dp_sync: ORACLE BRIDGE --{dp_addr: sync_func} to call after writing to dp_addr.
-    decl_ret_override: override the return type in the C declaration (e.g. from funcs.h)
-                       without changing the recompiler's internal return-type tracking."""
+    """
     hints = hints or {}
     ret_type, params = parse_sig(sig)
     param_str = format_param_str(params)
@@ -2648,7 +2684,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
     if 'init_carry' in hints:
         init_carry = hints['init_carry']
 
-    c_ret_type = decl_ret_override or ret_type
+    c_ret_type = ret_type
 
     if not insns:
         return [f'{c_ret_type} {name}({param_str}) {{}}']
@@ -3528,20 +3564,16 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     _cfg_path_for_siblings = cfg_path
     lines = []
 
-    # Populate sigs from funcs.h
+    # Reconcile cfg sigs with funcs.h using a single rule (see _reconcile_sig).
+    # The same effective sig is used for BOTH the C forward declaration and the
+    # function body, so they cannot disagree. No cross-bank-only special case.
     if funcs_h_sigs:
         for addr, name in cfg.names.items():
-            if addr not in cfg.sigs and name in funcs_h_sigs:
-                cfg.sigs[addr] = funcs_h_sigs[name]
-            elif addr in cfg.sigs and name in funcs_h_sigs:
-                if (addr >> 16) != cfg.bank:
-                    old_sig = cfg.sigs[addr]
-                    new_sig = funcs_h_sigs[name]
-                    if old_sig != new_sig:
-                        print(f'  [sig-mismatch] {name} @ ${addr:06X}: '
-                              f'cfg "{old_sig}" -> funcs.h "{new_sig}"',
-                              file=sys.stderr)
-                    cfg.sigs[addr] = new_sig
+            fh_sig = funcs_h_sigs.get(name)
+            cfg_sig = cfg.sigs.get(addr)
+            reconciled = _reconcile_sig(cfg_sig, fh_sig)
+            if reconciled is not None:
+                cfg.sigs[addr] = reconciled
 
     # Header
     guard = f'RECOMP_BANK{cfg.bank:02X}'
@@ -3991,15 +4023,12 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         print(f'Wrote bank_range.h: {bank_range_path} ({len(all_range_names)} functions)',
               file=sys.stderr)
 
-    # Forward declarations — prefer funcs.h sig (to avoid type mismatch with header)
+    # Forward declarations — use the reconciled sig (same one the body will use).
+    # cfg.sigs was updated above by _reconcile_sig, so decl and body agree.
     fwd_lines = []
     for fname, start_addr, end_addr, sig, _mo, _hints in funcs_with_end:
         full_addr = (cfg.bank << 16) | start_addr
-        # Use funcs.h sig for the forward declaration if available, else cfg sig
-        if funcs_h_sigs and fname in funcs_h_sigs:
-            _sig = funcs_h_sigs[fname]
-        else:
-            _sig = cfg.sigs.get(full_addr, sig)
+        _sig = cfg.sigs.get(full_addr, sig)
         ret_type, params = parse_sig(_sig)
         param_str = format_param_str(params)
         fwd_lines.append(f'{ret_type} {fname}({param_str});')
@@ -4062,9 +4091,12 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
 
     # Generate each function
     for fi, (fname, start_addr, end_addr, sig, mode_ovr, func_hints) in enumerate(funcs_with_end):
-        if sig is None:
-            full_addr = (cfg.bank << 16) | start_addr
-            sig = cfg.sigs.get(full_addr)
+        # cfg.sigs has been reconciled with funcs.h, so it's the single source
+        # of truth. Prefer it over the stale tuple sig.
+        full_addr = (cfg.bank << 16) | start_addr
+        reconciled = cfg.sigs.get(full_addr)
+        if reconciled is not None:
+            sig = reconciled
         insns = decode_func(rom, cfg.bank, start_addr, end=end_addr,
                             jsl_dispatch=cfg.jsl_dispatch or None,
                             jsl_dispatch_long=cfg.jsl_dispatch_long or None,
@@ -4100,14 +4132,6 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             _ret, _params = parse_sig(sig)
             if any(pn in ('k', 'j') for _pt, pn in _params):
                 effective_hints['init_y'] = cfg.default_init_y
-        # If funcs.h declares a different return type, use it for the C declaration
-        # (to avoid redefinition conflicts) while keeping cfg sig for codegen.
-        _decl_ret = None
-        if funcs_h_sigs and fname in funcs_h_sigs:
-            fh_ret, _ = parse_sig(funcs_h_sigs[fname])
-            cfg_ret, _ = parse_sig(sig)
-            if fh_ret != cfg_ret:
-                _decl_ret = fh_ret
         func_lines = emit_function(fname, insns, cfg.bank, cfg.names,
                                    func_sigs=cfg.sigs, sig=sig, trace=trace,
                                    next_func=next_func, hints=effective_hints,
@@ -4115,8 +4139,7 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                                    x_restores_map=cfg.x_restores,
                                    y_after_map=cfg.y_after,
                                    x_after_map=cfg.x_after,
-                                   end_addr=end_addr,
-                                   decl_ret_override=_decl_ret)
+                                   end_addr=end_addr)
         # Validation pass: detect obviously garbled output
         review_reasons = _validate_function_output(fname, func_lines, cfg.bank)
         if review_reasons:
