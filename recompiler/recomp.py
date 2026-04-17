@@ -702,14 +702,29 @@ def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
         if insn.mnem not in ('RTS', 'RTL'):
             continue
         i = idx[insn.addr & 0xFFFF]
-        if i == 0:
+        # Walk backwards from the RTS looking for the most-recent insn
+        # that WRITES X (not just reads it via indexed addressing). Code
+        # between the write and the RTS may use X via STA $xxxx,X etc.
+        # without disturbing it. If the most-recent writer is an
+        # LDX DP/ABS, that's our deterministic restore.
+        j = i - 1
+        while j >= 0:
+            cand = insn_by_addr[sorted_addrs[j]]
+            _r, w = _insn_reg_use(cand, 'X')
+            if not w:
+                j -= 1
+                continue
+            if cand.mnem == 'LDX' and cand.mode in (DP, ABS):
+                restore_addrs.add(cand.operand)
+            else:
+                return None  # any other X-writer (TAX/TSX/TYX/PLX/INX/DEX)
+                             # means X at RTS is not a deterministic WRAM
+                             # load; bail so we don't pretend it is.
+            break
+        else:
+            # No X write on this path — X is preserved "by not touching
+            # it" which is already covered by the clobber check.
             continue
-        prev = insn_by_addr[sorted_addrs[i - 1]]
-        if prev.mnem != 'LDX':
-            return None  # non-matching exit — bail
-        if prev.mode not in (DP, ABS):
-            return None
-        restore_addrs.add(prev.operand)
     if not restore_addrs or len(restore_addrs) > 1:
         return None
     addr = next(iter(restore_addrs))
