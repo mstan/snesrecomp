@@ -627,11 +627,13 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
             is_call = insn.mnem in ('JSR', 'JSL')
             is_tail_transfer = (
                 (insn.mnem == 'JMP' and insn.mode in (ABS, LONG)) or
-                (insn.mnem in ('BRA', 'BRL'))
+                (insn.mnem in ('BRA', 'BRL',
+                               'BPL','BMI','BEQ','BNE',
+                               'BCC','BCS','BVS','BVC'))
             )
-            # A BRA/BRL/JMP to an intra-function target is a local branch,
-            # not a tail call — skip those to avoid false-positive param
-            # reads from label gotos.
+            # A branch to an intra-function target is a local goto, not a
+            # tail call — skip those to avoid false-positive param reads
+            # from label gotos.
             if is_tail_transfer and insn.operand in insn_by_addr:
                 is_tail_transfer = False
             if is_call or is_tail_transfer:
