@@ -2659,13 +2659,21 @@ class EmitCtx:
             func_type = 'FuncU8' if self.has_k else 'FuncV'
             call_arg = 'k' if self.has_k else ''
             has_null = any(e == 0 for e in insn.dispatch_entries)
+            # Cast each handler to the dispatch table type. Some handlers
+            # declare param types like `const uint8 *p0` or struct pointers
+            # whose register-passing convention the SNES dispatch doesn't
+            # honor — the ROM sets DP/registers before the JSR and doesn't
+            # pass C-level args through the table. Casting silences C4113
+            # (param-list mismatch) without changing runtime behavior since
+            # the handlers read their inputs from WRAM/DP, not from the
+            # function's nominal C parameters.
             self._emit(f'{{ static {func_type} *const {arr_name}[] = {{')
             for entry in insn.dispatch_entries:
                 if entry == 0:
                     self._emit(f'  (void*)0,  /* null dispatch */')
                 else:
                     fn = self._callee((self.bank << 16) | entry)
-                    self._emit(f'  &{fn},')
+                    self._emit(f'  ({func_type}*)&{fn},')
             self._emit('};')
             if has_null:
                 self._emit(f'if ({arr_name}[{idx}]) {arr_name}[{idx}]({call_arg}); }}')
