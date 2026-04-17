@@ -671,6 +671,51 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
     }
 
 
+def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
+    """Detect an explicit X-restore pattern just before every RTS/RTL.
+
+    The common SMW pattern:
+        ...
+        LDX  $xxxx      ; reload caller-visible X from WRAM
+        RTS             ; return with X matching what the caller had
+
+    When the instruction immediately before a terminal RTS/RTL is
+    `LDX $xxxx` (direct-page or absolute), the callee is explicitly
+    restoring X from a known WRAM location. Callers can treat the
+    register as preserved *through* the call: their post-call X is
+    whatever is at that WRAM address.
+
+    Returns the C expression (`g_ram[0xXXXX]`) for the restore source,
+    or None when no such pattern is visible. Falls back to None if
+    multiple RTS exits restore from different addresses (inconsistent).
+
+    (Symmetric `LDY $xxxx ; RTS` could drive a Y restore the same way,
+    but the existing cfg schema only exposes restores_x today.)
+    """
+    if not insns:
+        return None
+    insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
+    sorted_addrs = sorted(insn_by_addr)
+    idx = {a: i for i, a in enumerate(sorted_addrs)}
+    restore_addrs: Set[int] = set()
+    for insn in insns:
+        if insn.mnem not in ('RTS', 'RTL'):
+            continue
+        i = idx[insn.addr & 0xFFFF]
+        if i == 0:
+            continue
+        prev = insn_by_addr[sorted_addrs[i - 1]]
+        if prev.mnem != 'LDX':
+            return None  # non-matching exit — bail
+        if prev.mode not in (DP, ABS):
+            return None
+        restore_addrs.add(prev.operand)
+    if not restore_addrs or len(restore_addrs) > 1:
+        return None
+    addr = next(iter(restore_addrs))
+    return f'g_ram[0x{addr:x}]'
+
+
 def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
     """True if the function writes `reg` anywhere in its body AND does not
     bracket those writes with a PH{R}/PL{R} save-restore at the function
@@ -1152,6 +1197,21 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
             reg for reg in ('A', 'X', 'Y')
             if _writes_register_without_save_restore(insns, reg)
         }
+        # Auto-detect the "LDX $xxxx ; RTS" explicit-restore pattern so
+        # callers see X as preserved through the call. Without this, the
+        # clobber bit above (X is written internally) makes the call
+        # look destructive, but the ROM actually restores X from WRAM
+        # before returning. Only populates when the cfg hasn't already
+        # declared a restore (explicit cfg still wins).
+        if full_addr not in cfg.x_restores:
+            x_restore = _detect_x_restore_expr(insns)
+            if x_restore:
+                cfg.x_restores[full_addr] = x_restore
+                # The callee restores X from WRAM before RTS, so from
+                # the caller's perspective X is preserved. Remove it
+                # from the clobber set so live-in analysis can see
+                # through this call on subsequent passes.
+                cfg.clobbers[full_addr].discard('X')
         if new_sig is not None and new_sig != current_sig:
             cfg.sigs[full_addr] = new_sig
             augmented += 1
