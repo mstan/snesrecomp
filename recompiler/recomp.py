@@ -536,8 +536,8 @@ _STRUCT_RETURN_DP: Dict[str, list] = {
     ],
     # PairU16 returns via A/X registers, handled specially in _emit_call.
     'HdmaPtrs': [
-        (0x04, 'r4', 'uint16'),  # r4 pointer at DP $04 (stored as uint16 offset)
-        (0x06, 'r6', 'uint16'),  # r6 pointer at DP $06
+        (0x04, 'r4', 'u8ptr'),  # const uint8 * r4 at DP $04 (WRAM offset)
+        (0x06, 'r6', 'u8ptr'),  # const uint8 * r6 at DP $06
     ],
     'PairU8': [
         (0x02, 'first', 'uint8'),   # first (r2) at DP $02
@@ -728,7 +728,15 @@ class EmitCtx:
         parts = []
         for dp_addr, field, ctype in _STRUCT_RETURN_DP[ret_type]:
             val = self.dp_state.get(dp_addr)
-            if val and ctype != 'uint16':
+            if ctype == 'u8ptr':
+                # const uint8 *: the ROM stores a 16-bit WRAM offset in
+                # DP[dp_addr..dp_addr+1]; reconstruct the C pointer as
+                # `g_ram + offset`. (Always read from g_ram — dp_state
+                # fields are per-byte and don't give us a clean offset.)
+                parts.append(
+                    f'.{field} = g_ram + PAIR16(g_ram[0x{dp_addr+1:02x}], '
+                    f'g_ram[0x{dp_addr:02x}])')
+            elif val and ctype != 'uint16':
                 parts.append(f'.{field} = {val}')
             elif ctype == 'uint16':
                 parts.append(f'.{field} = PAIR16(g_ram[0x{dp_addr+1:02x}], g_ram[0x{dp_addr:02x}])')
