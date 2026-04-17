@@ -3523,7 +3523,9 @@ def _auto_detect_dispatch_helpers(rom: bytes, cfg: Config) -> None:
 
 def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                funcs_h_sigs: Dict[str, str] = None, trace: bool = False,
-               prefix: str = '', func_range: Tuple[int, int] = None):
+               prefix: str = '', func_range: Tuple[int, int] = None,
+               cfg_path: Optional[str] = None):
+    _cfg_path_for_siblings = cfg_path
     lines = []
 
     # Populate sigs from funcs.h
@@ -3587,17 +3589,78 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     #     discovered address from being promoted
     _existing_addrs_pre = {a for _, a, *_ in cfg.funcs}
     _existing_local_names = {a & 0xFFFF for a in cfg.names if (a >> 16) == cfg.bank}
-    try:
-        _discovered_local, _ = discover_bank(
-            rom, cfg.bank,
-            external_seeds=_existing_addrs_pre,
-            jsl_dispatch=set(cfg.jsl_dispatch or []),
-            jsl_dispatch_long=set(cfg.jsl_dispatch_long or []),
-        )
-    except Exception as _disc_err:
-        print(f'  [auto-promote] discover_bank failed: {_disc_err}',
-              file=sys.stderr)
-        _discovered_local = set()
+    # Collect incoming cross-bank JSL targets by running discover_bank on
+    # each sibling bank (seeded from its own cfg funcs) and taking the
+    # cross-bank JSL targets it reports pointing back into this bank.
+    # Every target in that output came from a JSL that discover_bank
+    # reached through validated code paths — no false positives from
+    # random 0x22 bytes in data regions. Cost: O(N) extra discover_bank
+    # runs per bank regen, but results are worklist-bounded.
+    _incoming_from_siblings: Set[int] = set()
+    if _cfg_path_for_siblings:
+        _cfg_dir = os.path.dirname(os.path.abspath(_cfg_path_for_siblings))
+        _own_base = os.path.basename(_cfg_path_for_siblings)
+        import glob as _glob
+        for _sib_path in sorted(_glob.glob(os.path.join(_cfg_dir, 'bank*.cfg'))):
+            if os.path.basename(_sib_path) == _own_base:
+                continue
+            try:
+                _sib_cfg = parse_config(_sib_path)
+            except Exception:
+                continue
+            _sib_seeds = {a for _, a, *_ in _sib_cfg.funcs}
+            try:
+                _sib_local, _sib_cross = discover_bank(
+                    rom, _sib_cfg.bank,
+                    external_seeds=_sib_seeds,
+                    jsl_dispatch=set(_sib_cfg.jsl_dispatch or []),
+                    jsl_dispatch_long=set(_sib_cfg.jsl_dispatch_long or []),
+                )
+            except Exception:
+                continue
+            for _ta in _sib_cross.get(cfg.bank, set()):
+                if 0x8000 <= _ta <= 0xFFFF:
+                    _incoming_from_siblings.add(_ta)
+    # NOTE on incoming cross-bank JSL seeding (historical):
+    # We deliberately do NOT seed discover_bank with `scan_for_jsl_targets`
+    # output. That scan is a brute-force byte-pattern search for `22 LO HI
+    # BANK` across the ROM — it matches real JSLs *and* any data byte
+    # sequence that happens to look like one. Feeding those addresses as
+    # seeds causes over-promotion of data regions (observed: bank 00 went
+    # from 7 to 37 promotions with many RomPtr-invalid-bank REVIEWs).
+    # Cross-bank incoming discovery requires a code-path-validated JSL
+    # target set — which is what each bank's own outgoing discovery
+    # produces (see _discovered_cross below). Proper global cross-bank
+    # seeding is a future step: run discover_bank across all banks once,
+    # collect code-path-validated jsl_targets, then re-seed each bank with
+    # its incoming subset.
+    _discovered_local: Set[int] = set()
+    _discovered_cross: Dict[int, Set[int]] = {}
+    _seed_set = set(_existing_addrs_pre) | _incoming_from_siblings
+    # Iterate discovery to fixpoint: each round feeds the newly-found set
+    # back in as seeds, so transitively-reachable JSR targets inside
+    # discovered functions get traced. discover_bank itself is worklist-
+    # based but its linear walker exits at the first RTS/JMP per path and
+    # may not follow every branch, so iteration catches the tail.
+    for _round in range(8):
+        try:
+            _round_local, _round_cross = discover_bank(
+                rom, cfg.bank,
+                external_seeds=_seed_set,
+                jsl_dispatch=set(cfg.jsl_dispatch or []),
+                jsl_dispatch_long=set(cfg.jsl_dispatch_long or []),
+            )
+        except Exception as _disc_err:
+            print(f'  [auto-promote] discover_bank failed: {_disc_err}',
+                  file=sys.stderr)
+            break
+        _prev_size = len(_discovered_local)
+        _discovered_local |= _round_local
+        for _tb, _tas in _round_cross.items():
+            _discovered_cross.setdefault(_tb, set()).update(_tas)
+        if len(_discovered_local) == _prev_size:
+            break  # fixpoint
+        _seed_set |= _discovered_local
     _auto_promoted = []
     for _local_addr in sorted(_discovered_local):
         if _local_addr < 0x8000 or _local_addr > 0xFFFF:
@@ -3629,6 +3692,38 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         for _ap in _auto_promoted:
             print(f'    auto_{cfg.bank:02X}_{_ap:04X} @ ${cfg.bank:02X}:{_ap:04X}',
                   file=sys.stderr)
+
+    # ── Cross-bank auto-name (outgoing JSL targets) ──────────────────────
+    # When this bank's code does JSL $XX:YYYY to another bank, the emitter
+    # needs `cfg.names[(XX<<16)|YYYY]` to resolve the callee to a real C
+    # symbol. Sibling-cfg name import (farther down in main) only covers
+    # targets that the *other* bank has declared in its own cfg. If the
+    # target bank's cfg doesn't declare it (e.g. because it was itself
+    # only ever reached via a cross-bank JSL that nobody's cfg names), we
+    # get `func_XXXXXX(...)` in the caller and a REVIEW scrub.
+    #
+    # Register an `auto_<tgt_bank>_<tgt_addr>` name for every discovered
+    # outgoing cross-bank JSL target that isn't already named. The target
+    # bank's own auto-promote pass (driven by incoming JSL seed) will then
+    # emit a matching C definition, so the link resolves.
+    _cross_registered = 0
+    for _tgt_bank, _tgt_addrs in (_discovered_cross or {}).items():
+        if _tgt_bank == cfg.bank:
+            continue
+        for _tgt_addr in _tgt_addrs:
+            if _tgt_addr < 0x8000 or _tgt_addr > 0xFFFF:
+                continue
+            _tgt_full = (_tgt_bank << 16) | _tgt_addr
+            if _tgt_full in cfg.names:
+                continue
+            _auto_name = f'auto_{_tgt_bank:02X}_{_tgt_addr:04X}'
+            cfg.names[_tgt_full] = _auto_name
+            if _tgt_full not in cfg.sigs:
+                cfg.sigs[_tgt_full] = 'void()'
+            _cross_registered += 1
+    if _cross_registered:
+        print(f'  Auto-promote (cross-bank names): {_cross_registered} outgoing JSL targets named',
+              file=sys.stderr)
 
     # ── Sub-entry promotion ──────────────────────────────────────────────
     # A `name` directive with a `sig:` that falls strictly inside an existing
@@ -4191,7 +4286,7 @@ def main():
         func_range = (int(m.group(1)), int(m.group(2)))
 
     run_config(rom, cfg, args.output, funcs_h_sigs=funcs_h_sigs, trace=args.trace,
-               prefix=args.prefix, func_range=func_range)
+               prefix=args.prefix, func_range=func_range, cfg_path=args.config)
 
 
 if __name__ == '__main__':
