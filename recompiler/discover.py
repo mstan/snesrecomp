@@ -115,188 +115,136 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
         if func_start in decoded_pcs:
             continue
 
-        # Decode this function
-        pc = func_start
-        m, x = 1, 1  # default M=1, X=1
-        func_max_pc = pc
-        branch_targets: Set[int] = set()  # intra-function branch targets
-        pending_branches: List[Tuple[int, int, int]] = []  # (addr, m, x) to follow
+        # Path-based BFS: seed with (func_start, m=1, x=1); each popped path
+        # walks linearly until a terminator, pushing conditional-branch targets
+        # back onto the queue. Ensures every reachable byte in the function is
+        # decoded, not just the first linear path plus one level of fanout.
+        func_max_pc = func_start
+        pending_paths: List[Tuple[int, int, int]] = [(func_start, 1, 1)]
+        path_safety = 0
 
-        safety = 0
-        while pc < 0x10000 and safety < 5000:
-            safety += 1
+        while pending_paths and path_safety < 10000:
+            path_safety += 1
+            pc, m, x = pending_paths.pop()
             if pc in decoded_pcs and pc != func_start:
-                break  # already decoded by another function
+                continue
 
-            off = pc - 0x8000
-            if off < 0 or off + 4 >= len(bank_data):
-                break  # too close to end of bank
+            linear_safety = 0
+            while pc < 0x10000 and linear_safety < 5000:
+                linear_safety += 1
+                if pc in decoded_pcs and pc != func_start:
+                    break
 
-            insn = decode_insn(bank_data, off, pc, bank, m, x)
-            if insn is None:
-                break  # invalid opcode — likely data
+                off = pc - 0x8000
+                if off < 0 or off + 4 >= len(bank_data):
+                    break
 
-            decoded_pcs.add(pc)
-            func_max_pc = max(func_max_pc, pc + insn.length - 1)
-            pc += insn.length
+                insn = decode_insn(bank_data, off, pc, bank, m, x)
+                if insn is None:
+                    break
 
-            # Track M/X flag changes
-            if insn.mnem == 'REP':
-                if insn.operand & 0x20: m = 0
-                if insn.operand & 0x10: x = 0
-            elif insn.mnem == 'SEP':
-                if insn.operand & 0x20: m = 1
-                if insn.operand & 0x10: x = 1
+                decoded_pcs.add(pc)
+                func_max_pc = max(func_max_pc, pc + insn.length - 1)
+                pc += insn.length
 
-            # Collect call targets
-            if insn.mnem == 'JSR' and insn.mode == ABS:
-                target = insn.operand
-                if 0x8000 <= target <= 0xFFFF:
-                    jsr_targets.add(target)
-                    add_seed(target)
+                if insn.mnem == 'REP':
+                    if insn.operand & 0x20: m = 0
+                    if insn.operand & 0x10: x = 0
+                elif insn.mnem == 'SEP':
+                    if insn.operand & 0x20: m = 1
+                    if insn.operand & 0x10: x = 1
 
-            elif insn.mnem == 'JSL' and insn.mode == LONG:
-                tgt_bank = (insn.operand >> 16) & 0xFF
-                tgt_addr = insn.operand & 0xFFFF
-                if tgt_bank <= max_banks and 0x8000 <= tgt_addr <= 0xFFFF:
-                    if tgt_bank not in jsl_targets:
-                        jsl_targets[tgt_bank] = set()
-                    jsl_targets[tgt_bank].add(tgt_addr)
-                    if tgt_bank == bank:
-                        add_seed(tgt_addr)
-
-                # Inline dispatch table: bytes after JSL are table entries, not code
-                _is_short = insn.operand in jsl_dispatch
-                _is_long = insn.operand in jsl_dispatch_long
-                if _is_short or _is_long:
-                    entry_size = 3 if _is_long else 2
-                    tbl_pc = pc  # pc already advanced past JSL
-                    for _ in range(256):
-                        tbl_off = tbl_pc - 0x8000
-                        if tbl_off + entry_size > len(bank_data):
-                            break
-                        lo = bank_data[tbl_off]
-                        hi = bank_data[tbl_off + 1]
-                        entry = lo | (hi << 8)
-                        if _is_long:
-                            eb = bank_data[tbl_off + 2]
-                            if entry < 0x8000 or eb != bank:
-                                break
-                        else:
-                            if entry < 0x8000:
-                                break
-                        add_seed(entry)
-                        tbl_pc += entry_size
-                    # Skip past the inline table (don't decode entries as code)
-                    pc = tbl_pc
-                    decoded_pcs.update(range(insn.addr & 0xFFFF, tbl_pc))
-                    continue  # don't fall through to normal instruction handling
-
-            # Handle jumps
-            elif insn.mnem == 'JMP' and insn.mode == ABS:
-                target = insn.operand
-                if 0x8000 <= target <= 0xFFFF:
-                    if target < func_start or target in discovered:
-                        # Tail call to another function
+                if insn.mnem == 'JSR' and insn.mode == ABS:
+                    target = insn.operand
+                    if 0x8000 <= target <= 0xFFFF:
+                        jsr_targets.add(target)
                         add_seed(target)
-                    else:
-                        # Intra-function jump — follow it
-                        branch_targets.add(target)
-                        pending_branches.append((target, m, x))
-                break  # JMP ends this linear path
 
-            elif insn.mnem == 'JMP' and insn.mode == LONG:
-                tgt_bank = (insn.operand >> 16) & 0xFF
-                tgt_addr = insn.operand & 0xFFFF
-                if tgt_bank <= max_banks and 0x8000 <= tgt_addr <= 0xFFFF:
-                    if tgt_bank not in jsl_targets:
-                        jsl_targets[tgt_bank] = set()
-                    jsl_targets[tgt_bank].add(tgt_addr)
-                    if tgt_bank == bank:
-                        add_seed(tgt_addr)
-                break  # JML ends this path
+                elif insn.mnem == 'JSL' and insn.mode == LONG:
+                    tgt_bank = (insn.operand >> 16) & 0xFF
+                    tgt_addr = insn.operand & 0xFFFF
+                    if tgt_bank <= max_banks and 0x8000 <= tgt_addr <= 0xFFFF:
+                        if tgt_bank not in jsl_targets:
+                            jsl_targets[tgt_bank] = set()
+                        jsl_targets[tgt_bank].add(tgt_addr)
+                        if tgt_bank == bank:
+                            add_seed(tgt_addr)
 
-            elif insn.mnem == 'JMP' and insn.mode == INDIR_X:
-                # JMP (abs,X) — indirect jump table
-                table_addr = insn.operand
-                if 0x8000 <= table_addr <= 0xFFFF:
-                    entries = read_jump_table(bank_data, table_addr - 0x8000, func_start)
-                    for entry in entries:
-                        add_seed(entry)
-                break
+                    _is_short = insn.operand in jsl_dispatch
+                    _is_long = insn.operand in jsl_dispatch_long
+                    if _is_short or _is_long:
+                        entry_size = 3 if _is_long else 2
+                        tbl_pc = pc
+                        for _ in range(256):
+                            tbl_off = tbl_pc - 0x8000
+                            if tbl_off + entry_size > len(bank_data):
+                                break
+                            lo = bank_data[tbl_off]
+                            hi = bank_data[tbl_off + 1]
+                            entry = lo | (hi << 8)
+                            if _is_long:
+                                eb = bank_data[tbl_off + 2]
+                                if entry < 0x8000 or eb != bank:
+                                    break
+                            else:
+                                if entry < 0x8000:
+                                    break
+                            add_seed(entry)
+                            tbl_pc += entry_size
+                        pc = tbl_pc
+                        decoded_pcs.update(range(insn.addr & 0xFFFF, tbl_pc))
+                        continue
 
-            # Handle branches
-            elif insn.mnem in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVC','BVS'):
-                target = insn.operand
-                if 0x8000 <= target <= 0xFFFF:
-                    branch_targets.add(target)
-                    if target >= func_start:
-                        pending_branches.append((target, m, x))
+                elif insn.mnem == 'JMP' and insn.mode == ABS:
+                    target = insn.operand
+                    if 0x8000 <= target <= 0xFFFF:
+                        if target in discovered:
+                            add_seed(target)
+                        elif target not in decoded_pcs:
+                            pending_paths.append((target, m, x))
+                    break
 
-            elif insn.mnem == 'BRA':
-                target = insn.operand
-                if 0x8000 <= target <= 0xFFFF:
-                    branch_targets.add(target)
-                    pending_branches.append((target, m, x))
-                break  # unconditional
+                elif insn.mnem == 'JMP' and insn.mode == LONG:
+                    tgt_bank = (insn.operand >> 16) & 0xFF
+                    tgt_addr = insn.operand & 0xFFFF
+                    if tgt_bank <= max_banks and 0x8000 <= tgt_addr <= 0xFFFF:
+                        if tgt_bank not in jsl_targets:
+                            jsl_targets[tgt_bank] = set()
+                        jsl_targets[tgt_bank].add(tgt_addr)
+                        if tgt_bank == bank:
+                            add_seed(tgt_addr)
+                    break
 
-            elif insn.mnem == 'BRL':
-                target = insn.operand
-                if 0x8000 <= target <= 0xFFFF:
-                    branch_targets.add(target)
-                    pending_branches.append((target, m, x))
-                break
+                elif insn.mnem == 'JMP' and insn.mode == INDIR_X:
+                    table_addr = insn.operand
+                    if 0x8000 <= table_addr <= 0xFFFF:
+                        entries = read_jump_table(bank_data, table_addr - 0x8000, func_start)
+                        for entry in entries:
+                            add_seed(entry)
+                    break
 
-            # Function terminators
-            elif insn.mnem in ('RTS', 'RTL', 'RTI'):
-                # Check if there are pending branch targets past this RTS
-                # that are within the function (forward branches over early returns)
-                break
+                elif insn.mnem in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVC','BVS'):
+                    target = insn.operand
+                    if 0x8000 <= target <= 0xFFFF and target >= func_start:
+                        if target not in decoded_pcs:
+                            pending_paths.append((target, m, x))
 
-        # Follow pending branches within this function
-        for target, bm, bx in pending_branches:
-            if target not in decoded_pcs and target >= func_start:
-                save_pc, save_m, save_x = pc, m, x
-                pc, m, x = target, bm, bx
-                inner_safety = 0
-                while pc < 0x10000 and inner_safety < 2000:
-                    inner_safety += 1
-                    if pc in decoded_pcs:
-                        break
-                    off = pc - 0x8000
-                    if off < 0 or off + 4 >= len(bank_data):
-                        break
-                    insn = decode_insn(bank_data, off, pc, bank, m, x)
-                    if insn is None:
-                        break
-                    decoded_pcs.add(pc)
-                    func_max_pc = max(func_max_pc, pc + insn.length - 1)
-                    pc += insn.length
+                elif insn.mnem == 'BRA':
+                    target = insn.operand
+                    if 0x8000 <= target <= 0xFFFF:
+                        if target not in decoded_pcs:
+                            pending_paths.append((target, m, x))
+                    break
 
-                    if insn.mnem == 'REP':
-                        if insn.operand & 0x20: m = 0
-                        if insn.operand & 0x10: x = 0
-                    elif insn.mnem == 'SEP':
-                        if insn.operand & 0x20: m = 1
-                        if insn.operand & 0x10: x = 1
+                elif insn.mnem == 'BRL':
+                    target = insn.operand
+                    if 0x8000 <= target <= 0xFFFF:
+                        if target not in decoded_pcs:
+                            pending_paths.append((target, m, x))
+                    break
 
-                    if insn.mnem == 'JSR' and insn.mode == ABS:
-                        t = insn.operand
-                        if 0x8000 <= t <= 0xFFFF:
-                            jsr_targets.add(t)
-                            add_seed(t)
-                    elif insn.mnem == 'JSL' and insn.mode == LONG:
-                        tb = (insn.operand >> 16) & 0xFF
-                        ta = insn.operand & 0xFFFF
-                        if tb <= max_banks and 0x8000 <= ta <= 0xFFFF:
-                            if tb not in jsl_targets:
-                                jsl_targets[tb] = set()
-                            jsl_targets[tb].add(ta)
-                            if tb == bank:
-                                add_seed(ta)
-
-                    if insn.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL'):
-                        break
+                elif insn.mnem in ('RTS', 'RTL', 'RTI'):
+                    break
 
         decoded_ranges.append((func_start, func_max_pc))
 
