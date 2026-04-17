@@ -68,7 +68,11 @@ def decode_func(rom: bytes, bank: int, start: int, end: int = 0,
     max_extra = 32  # max out-of-range targets to follow
     _continuing_past_end = False  # True when following fall-through from past-end code
     while len(insns) < max_insns:
-        if end and pc > end and not _continuing_past_end:
+        # end_addr is exclusive (the first address NOT in the function). Stop
+        # decoding once pc reaches it; otherwise decode_func pulls in the next
+        # function's opening instruction, which downstream logic then
+        # misidentifies as our terminator and suppresses fall-through emit.
+        if end and pc >= end and not _continuing_past_end:
             if extra_past_end >= max_extra:
                 break
             # Collect all out-of-range targets (backward and forward)
@@ -345,22 +349,72 @@ def _sig_has_complex_type(sig: Optional[str]) -> bool:
     return False
 
 
+def _ret_is_pointer(sig: Optional[str]) -> bool:
+    """True if the sig's return type is a pointer (e.g. 'uint8*').
+
+    Pointer returns are a SNES-code oddity: the ROM typically communicates
+    the pointer via DP writes, not via the A register. The recompiler's A
+    tracking can't carry a pointer value through arithmetic without
+    breaking subsequent byte-level usage (e.g. ROL patterns). We therefore
+    keep the body sig as void when cfg says void, even if funcs.h declares
+    a pointer return — the callers that DO consume the pointer go through
+    hand-written / oracle code paths, not generated arithmetic.
+    """
+    if not sig:
+        return False
+    ret, _ = parse_sig(sig)
+    return '*' in ret
+
+
+def _sig_specificity(sig: Optional[str]) -> Tuple[int, int, int]:
+    """Specificity score for picking the better of two sigs.
+    (complex_types, param_count, non_void_return). Higher wins.
+
+    - complex_types: count of non-primitive types (struct, ptr-to-struct, bool,
+      RetAY) across return + params. These encode semantics the recompiler's
+      AUTO analysis cannot derive, so they should dominate.
+    - param_count: a sig declaring `void(uint8_k)` is strictly more
+      informative than `void()` — the caller's register-passing convention
+      depends on it.
+    - non_void_return: break ties in favor of sigs that actually return
+      a value (cfg AUTO sometimes misses the A-in-RTS return pattern).
+
+    Sigs that tie on all three are considered equally specific; callers
+    should keep whichever they already had (typically the defining bank's
+    entry, which is processed first).
+    """
+    if not sig:
+        return (0, 0, 0)
+    ret, params = parse_sig(sig)
+    complex_types = 1 if ret not in _SIMPLE_TYPES else 0
+    for ptype, _pname in params:
+        if ptype not in _SIMPLE_TYPES:
+            complex_types += 1
+    non_void = 1 if ret != 'void' else 0
+    return (complex_types, len(params), non_void)
+
+
 def _reconcile_sig(cfg_sig: Optional[str], funcs_h_sig: Optional[str]) -> Optional[str]:
     """Pick a single sig used for BOTH C declaration and body codegen.
 
-    When funcs.h declares a complex type (RetAY, struct, pointer, bool — in
-    the return or any param), funcs.h wins entirely: those types encode
-    multi-register or struct-return semantics AUTO analysis cannot derive.
+    Picks the sig with higher specificity (see _sig_specificity). This
+    favors complex return types from funcs.h (RetAY, struct, ptr) and
+    favors whichever source declares more parameter information, so callers
+    and callees agree on the register-passing convention.
 
-    Otherwise cfg wins. cfg reflects per-function analysis, while funcs.h has
-    historically blanket-promoted everything to uint8, which produces UB when
-    the body has no corresponding return value at every RTS.
+    Exception: when funcs.h declares a POINTER return and cfg says void,
+    the cfg's void wins for codegen purposes — see _ret_is_pointer. The
+    declared return type is preserved via a separate decl_ret_override map
+    in run_config (keeps oracle callers happy; the body's lack of a real
+    return becomes a C4715 warning rather than a C2297 compile error).
     """
     if not funcs_h_sig:
         return cfg_sig
     if not cfg_sig:
         return funcs_h_sig
-    if _sig_has_complex_type(funcs_h_sig):
+    if _ret_is_pointer(funcs_h_sig) and parse_sig(cfg_sig)[0] == 'void':
+        return cfg_sig
+    if _sig_specificity(funcs_h_sig) > _sig_specificity(cfg_sig):
         return funcs_h_sig
     return cfg_sig
 
@@ -616,6 +670,53 @@ class EmitCtx:
         self._tmp_n += 1
         self._hoisted[name] = type_
         return name
+
+    def _return_value_expr(self) -> Optional[str]:
+        """Return the C expression for `return <expr>` matching the current
+        function's ret_type, or None if the function is void.
+
+        Handles every non-void return convention the recompiler understands:
+        struct returns via DP writes, carry-flag returns (bool-via-carry),
+        uint16 (A/X combined), PairU16 / RetAY multi-register structs, and
+        RetY / ret-A scalar returns. Used by both the RTS handler and the
+        early-exit emitters (branch-as-return, JMP-as-return) so all exit
+        paths of a function agree on the return convention.
+        """
+        rt = self.ret_type
+        if rt == 'void':
+            return None
+        if rt in _STRUCT_RETURN_DP:
+            return self._struct_ret_expr(rt)
+        if self._carry_ret and self.carry is not None:
+            return f'({self.carry}) ? 1 : 0'
+        if rt == 'uint16':
+            if self.X is not None:
+                return self.X
+            if self.A is not None:
+                return self.A
+            self._warn('X and A unknown at uint16 return --returning 0')
+            return '0'
+        if rt == 'PairU16':
+            a_val = self.A if self.A is not None else '0'
+            x_val = self.X if self.X is not None else '0'
+            return f'(PairU16){{ .first = {a_val}, .second = {x_val} }}'
+        if rt == 'RetAY':
+            a_val = self.A if self.A is not None else '0'
+            y_val = self.Y if self.Y is not None else '0'
+            return f'(RetAY){{ .a = {a_val}, .y = {y_val} }}'
+        if self._ret_y:
+            return self.Y if self.Y is not None else '0'
+        if self.A is None:
+            self._warn('A unknown at return --returning 0')
+        return self.A if self.A is not None else '0'
+
+    def _emit_return_for_current_sig(self):
+        """Emit the C `return [expr];` line for the current ret_type."""
+        expr = self._return_value_expr()
+        if expr is None:
+            self._emit('return;')
+        else:
+            self._emit(f'return {expr};')
 
     def _struct_ret_expr(self, ret_type: str) -> str:
         """Build struct construction expression for a struct return at RTS/RTL.
@@ -1011,6 +1112,15 @@ class EmitCtx:
             # Conditional tail call: if (cond) { call; return; }
             if _ret != 'void' and self.ret_type != 'void':
                 self._emit(f'if ({cond}) {{ RecompStackPop(); return {fname}({call_args}); }}')
+            elif _ret != 'void':
+                # Callee has a retval we discard; outer is void.
+                self._emit(f'if ({cond}) {{ {fname}({call_args}); RecompStackPop(); return; }}')
+            elif self.ret_type != 'void':
+                # Callee is void; outer returns A (or RetAY etc.). After the
+                # call A is unknown, so fall back to _return_value_expr's
+                # defaulting ('0' when register is untracked).
+                rv = self._return_value_expr()
+                self._emit(f'if ({cond}) {{ {fname}({call_args}); RecompStackPop(); return {rv}; }}')
             else:
                 self._emit(f'if ({cond}) {{ {fname}({call_args}); RecompStackPop(); return; }}')
         else:
@@ -1020,16 +1130,14 @@ class EmitCtx:
                 tmp = self._alloc(_ret)
                 self._emit(f'{tmp} = {fname}({call_args});')
                 self._emit('RecompStackPop();')
-                self._emit('return;')
+                if self.ret_type != 'void':
+                    self._emit(f'return {tmp};')
+                else:
+                    self._emit('return;')
             else:
                 self._emit(f'{fname}({call_args});')
-                if self.ret_type != 'void':
-                    ret_val = self.A if self.A is not None else '0'
-                    self._emit('RecompStackPop();')
-                    self._emit(f'return {ret_val};')
-                else:
-                    self._emit('RecompStackPop();')
-                    self._emit('return;')
+                self._emit('RecompStackPop();')
+                self._emit_return_for_current_sig()
         return True
 
     # -- Branch condition builder ---------------------------------------------
@@ -1800,42 +1908,7 @@ class EmitCtx:
             # g_recomp_stack reflects the real dynamic call chain — required
             # for the watchdog dump to name the caller of a hung routine.
             self._emit('RecompStackPop();')
-            if self.ret_type in _STRUCT_RETURN_DP:
-                self._emit(f'return {self._struct_ret_expr(self.ret_type)};')
-            elif self._carry_ret and self.carry is not None:
-                # Function returns bool/uint8 via carry flag (not A register).
-                # Common 65816 idiom: CMP; BCS skip; <side-effect>; skip: RTS
-                self._emit(f'return ({self.carry}) ? 1 : 0;')
-            elif self.ret_type == 'uint16':
-                # uint16 return --value is in X register (65816 convention)
-                if self.X is not None:
-                    ret_val = self.X
-                elif self.A is not None:
-                    ret_val = self.A
-                else:
-                    self._warn('X and A unknown at uint16 return --returning 0')
-                    ret_val = '0'
-                self._emit(f'return {ret_val};')
-            elif self.ret_type == 'PairU16':
-                # PairU16 returns first in A, second in X.
-                a_val = self.A if self.A is not None else '0'
-                x_val = self.X if self.X is not None else '0'
-                self._emit(f'return (PairU16){{ .first = {a_val}, .second = {x_val} }};')
-            elif self.ret_type == 'RetAY':
-                # RetAY returns A in .a, Y in .y.
-                a_val = self.A if self.A is not None else '0'
-                y_val = self.Y if self.Y is not None else '0'
-                self._emit(f'return (RetAY){{ .a = {a_val}, .y = {y_val} }};')
-            elif self._ret_y and self.ret_type != 'void':
-                ret_val = self.Y if self.Y is not None else '0'
-                self._emit(f'return {ret_val};')
-            elif self.ret_type != 'void':
-                if self.A is None:
-                    self._warn('A unknown at return --returning 0')
-                ret_val = self.A if self.A is not None else '0'
-                self._emit(f'return {ret_val};')
-            else:
-                self._emit('return;')
+            self._emit_return_for_current_sig()
 
         elif mn == 'RTI':
             self._emit('RecompStackPop();')
@@ -2256,14 +2329,11 @@ class EmitCtx:
                 self._warn(f'{mn} ${v:04X} treated as return --{reason}',
                            f"Add 'end:{v:04X}' or 'name {(self.bank<<16)|v:06X} <Name>' to cfg")
             # Branch-as-return: pair with the entry's RecompStackPush.
-            if self.ret_type != 'void':
-                if self._ret_y:
-                    ret_val = self.Y if self.Y is not None else '0'
-                else:
-                    ret_val = self.A if self.A is not None else '0'
-                ret_expr = f'RecompStackPop(); return {ret_val};'
-            else:
+            rv = self._return_value_expr()
+            if rv is None:
                 ret_expr = 'RecompStackPop(); return;'
+            else:
+                ret_expr = f'RecompStackPop(); return {rv};'
             if mn in ('BRA', 'BRL'):
                 self._emit(ret_expr)
             else:
@@ -2366,11 +2436,11 @@ class EmitCtx:
                 else:
                     self._warn(f'{mn} ${v:04X} treated as return --outside decoded range',
                                f"Add 'end:{v:04X}' or 'name {(self.bank<<16)|v:06X} <Name>' to cfg")
-                    if self.ret_type != 'void':
-                        ret_val = (self.Y if self.Y else '0') if self._ret_y else (self.A if self.A else '0')
-                        self._emit(f'if ({cond}) return {ret_val};')
-                    else:
+                    rv = self._return_value_expr()
+                    if rv is None:
                         self._emit(f'if ({cond}) return;')
+                    else:
+                        self._emit(f'if ({cond}) return {rv};')
             else:
                 self._emit(f'if ({cond}) goto label_{v:04x};')
 
@@ -2387,14 +2457,7 @@ class EmitCtx:
                     return
                 self._warn(f'JMP ${v:04X} treated as return --outside decoded range',
                            f"Add 'end:{v:04X}' or 'name {(self.bank<<16)|v:06X} <Name>' to cfg")
-                if self.ret_type != 'void':
-                    if self._ret_y:
-                        ret_val = self.Y if self.Y is not None else '0'
-                    else:
-                        ret_val = self.A if self.A is not None else '0'
-                    self._emit(f'return {ret_val};')
-                else:
-                    self._emit('return;')
+                self._emit_return_for_current_sig()
             else:
                 self._emit(f'goto label_{v:04x};')
         elif mode == LONG:
@@ -2406,18 +2469,11 @@ class EmitCtx:
                 self._emit(f'return {fname}({call_args});')
             else:
                 self._emit(f'{fname}({call_args});')
-                if self.ret_type != 'void':
-                    ret_val = self.A if self.A is not None else '0'
-                    self._emit(f'return {ret_val};')
-                else:
-                    self._emit('return;')
+                self._emit_return_for_current_sig()
         elif mode in (INDIR, INDIR_X):
             self._warn(f'JMP ({MODE_STR[mode]} ${v:04x}) dispatch --needs verbatim body',
                        "Add 'skip <FuncName>' and provide verbatim body in cfg")
-            if self.ret_type != 'void':
-                self._emit(f'return {self.A if self.A else "0"};')
-            else:
-                self._emit('return;')
+            self._emit_return_for_current_sig()
         else:
             self._emit(f'/* JMP {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -2651,11 +2707,17 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   x_restores_map: Dict[int, str] = None,
                   y_after_map: Dict[int, int] = None,
                   x_after_map: Dict[int, int] = None,
-                  end_addr: int = 0) -> List[str]:
+                  end_addr: int = 0,
+                  decl_ret_override: Optional[str] = None) -> List[str]:
     """Emit a complete C function from decoded instructions.
     next_func: (name, sig) of the function immediately following in ROM, for fall-through.
     hints: dict of cfg hints like {'init_y': 'x'} to initialize Y from X on entry.
     dp_sync: ORACLE BRIDGE --{dp_addr: sync_func} to call after writing to dp_addr.
+    decl_ret_override: override the C return type in the DEFINITION header line
+        without changing the body's internal return tracking. Used only for
+        pointer-return functions where cfg says void but funcs.h declares
+        a pointer — the body stays void (avoids A-tracking confusion) while
+        the declared type keeps oracle/hand-written callers consistent.
     """
     hints = hints or {}
     ret_type, params = parse_sig(sig)
@@ -2684,7 +2746,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
     if 'init_carry' in hints:
         init_carry = hints['init_carry']
 
-    c_ret_type = ret_type
+    c_ret_type = decl_ret_override or ret_type
 
     if not insns:
         return [f'{c_ret_type} {name}({param_str}) {{}}']
@@ -3001,10 +3063,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
         else:
             ctx._emit(f'RecompStackPop();')
             ctx._emit(f'{nf_name}({nf_args});  /* fall-through */')
-            if ret_type != 'void':
-                ctx._emit(f'return {ctx.A if ctx.A else "0"};')
-            else:
-                ctx._emit('return;')
+            ctx._emit_return_for_current_sig()
 
     # Emit deferred past-start insns AFTER the fall-through emit. These are
     # reachable only via backward `goto label_XXXX` (e.g. BPL into the previous
@@ -3566,7 +3625,10 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
 
     # Reconcile cfg sigs with funcs.h using a single rule (see _reconcile_sig).
     # The same effective sig is used for BOTH the C forward declaration and the
-    # function body, so they cannot disagree. No cross-bank-only special case.
+    # function body — except for the pointer-return exception, which keeps cfg
+    # void for the body but records the funcs.h pointer return type in
+    # decl_ret_overrides so the declared function still matches funcs.h.
+    decl_ret_overrides: Dict[int, str] = {}
     if funcs_h_sigs:
         for addr, name in cfg.names.items():
             fh_sig = funcs_h_sigs.get(name)
@@ -3574,6 +3636,15 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             reconciled = _reconcile_sig(cfg_sig, fh_sig)
             if reconciled is not None:
                 cfg.sigs[addr] = reconciled
+            # Pointer-return exception: cfg void wins for body codegen, but
+            # the declared return type keeps funcs.h's pointer so that
+            # oracle / hand-written callers still see `uint8* Foo()` in the
+            # header. See _reconcile_sig docstring.
+            if (fh_sig and cfg_sig
+                    and _ret_is_pointer(fh_sig)
+                    and parse_sig(cfg_sig)[0] == 'void'):
+                fh_ret, _ = parse_sig(fh_sig)
+                decl_ret_overrides[addr] = fh_ret
 
     # Header
     guard = f'RECOMP_BANK{cfg.bank:02X}'
@@ -3970,7 +4041,10 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             # emitted, leaking a RecompStackPush without a Pop.
             end_addr = non_skip[i + 1][1]
         else:
-            end_addr = 0xFFFF
+            # Last function in the bank: end is the bank boundary ($10000).
+            # Using 0xFFFF would make the instruction at $FFFF unreachable
+            # because decode_func uses pc >= end as its exclusive-end check.
+            end_addr = 0x10000
         funcs_with_end.append((fname, start_addr, end_addr, sig, mode_ovr, func_hints))
 
     # Apply prefix to intra-bank function names (for test harness mode).
@@ -4024,12 +4098,16 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
               file=sys.stderr)
 
     # Forward declarations — use the reconciled sig (same one the body will use).
-    # cfg.sigs was updated above by _reconcile_sig, so decl and body agree.
+    # cfg.sigs was updated above by _reconcile_sig, so decl and body agree —
+    # except for the pointer-return exception where decl_ret_overrides kicks
+    # in to match funcs.h's declared pointer return.
     fwd_lines = []
     for fname, start_addr, end_addr, sig, _mo, _hints in funcs_with_end:
         full_addr = (cfg.bank << 16) | start_addr
         _sig = cfg.sigs.get(full_addr, sig)
         ret_type, params = parse_sig(_sig)
+        if full_addr in decl_ret_overrides:
+            ret_type = decl_ret_overrides[full_addr]
         param_str = format_param_str(params)
         fwd_lines.append(f'{ret_type} {fname}({param_str});')
     if fwd_lines:
@@ -4132,6 +4210,7 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             _ret, _params = parse_sig(sig)
             if any(pn in ('k', 'j') for _pt, pn in _params):
                 effective_hints['init_y'] = cfg.default_init_y
+        full_addr_for_override = (cfg.bank << 16) | start_addr
         func_lines = emit_function(fname, insns, cfg.bank, cfg.names,
                                    func_sigs=cfg.sigs, sig=sig, trace=trace,
                                    next_func=next_func, hints=effective_hints,
@@ -4139,7 +4218,8 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                                    x_restores_map=cfg.x_restores,
                                    y_after_map=cfg.y_after,
                                    x_after_map=cfg.x_after,
-                                   end_addr=end_addr)
+                                   end_addr=end_addr,
+                                   decl_ret_override=decl_ret_overrides.get(full_addr_for_override))
         # Validation pass: detect obviously garbled output
         review_reasons = _validate_function_output(fname, func_lines, cfg.bank)
         if review_reasons:
