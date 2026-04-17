@@ -825,8 +825,6 @@ def promote_sub_entries(rom: bytes, cfg) -> List[Tuple[str, int, str, int]]:
     for name_full_addr, name_str in list(cfg.names.items()):
         if (name_full_addr >> 16) != cfg.bank:
             continue
-        if name_full_addr not in cfg.sigs:
-            continue
         local_addr = name_full_addr & 0xFFFF
         if local_addr in _existing_func_addrs:
             continue
@@ -850,7 +848,7 @@ def promote_sub_entries(rom: bytes, cfg) -> List[Tuple[str, int, str, int]]:
             if sub_m == 0: flags |= 0x20
             if sub_x == 0: flags |= 0x10
             sub_mode_ovr[local_addr] = flags
-        sub_sig = cfg.sigs[name_full_addr]
+        sub_sig = cfg.sigs.get(name_full_addr)
         cfg.funcs.append((name_str, local_addr, sub_sig, None, sub_mode_ovr, {}))
         _existing_func_addrs.add(local_addr)
         _promoted.append((name_str, local_addr, parent[0], parent[1]))
@@ -993,14 +991,13 @@ def _insns_read_reg_post_jsr(caller_insns: List[Insn], jsr_pc: int,
 
 
 def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
-    """Promote a function's sig from `void(...)` to `RetY(...)` when
-      1. The callee clobbers Y (see _writes_register_without_save_restore),
-      2. At least one intra-bank caller reads Y after the JSR before
-         writing it (e.g. `JSR foo ; TYA ; STA $xxxx`).
+    """Promote a function's sig to carry Y in its return when intra-bank
+    callers consume Y after the JSR site.
 
-    uint8 → RetAY promotion was tried but turned out to need strict
-    cross-bank fixpoint convergence that this one-shot pass can't
-    guarantee without more plumbing. Deferred.
+      * `void(...)` + Y-clobber + Y-consumer → `RetY(...)`.
+      * `uint8(...)` + Y-clobber + Y-consumer → `RetAY(...)` (the function
+        already returns A via its declared uint8; promoting to RetAY
+        preserves that and adds the Y return on top).
 
     Returns the number of promotions.
     """
@@ -1010,7 +1007,7 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
     non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
                 if f not in cfg.skip]
     non_skip.sort(key=lambda t: t[1])
-    # Candidate callees: in this bank, ret is void, and Y is clobbered.
+    # Candidate callees: in this bank, ret is void or uint8, and Y is clobbered.
     candidates: Set[int] = set()
     for fname, addr, *_ in non_skip:
         full = (cfg.bank << 16) | addr
@@ -1018,7 +1015,7 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         if sig is None:
             sig = 'void()'
         ret, _ps = parse_sig(sig)
-        if ret != 'void':
+        if ret not in ('void', 'uint8'):
             continue
         if 'Y' not in clobbers.get(full, set()):
             continue
@@ -1059,11 +1056,14 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         full = (cfg.bank << 16) | tgt
         sig = cfg.sigs.get(full, 'void()')
         ret, _ps = parse_sig(sig)
-        if ret != 'void':
-            continue
-        params_part = sig[len('void'):] if sig.startswith('void') else '()'
-        cfg.sigs[full] = 'RetY' + params_part
-        promoted += 1
+        if ret == 'void':
+            params_part = sig[len('void'):] if sig.startswith('void') else '()'
+            cfg.sigs[full] = 'RetY' + params_part
+            promoted += 1
+        elif ret == 'uint8':
+            params_part = sig[len('uint8'):] if sig.startswith('uint8') else '()'
+            cfg.sigs[full] = 'RetAY' + params_part
+            promoted += 1
     return promoted
 
 
@@ -1825,7 +1825,13 @@ class EmitCtx:
     # -- Tail call emission ---------------------------------------------------
 
     def _emit_tail_call(self, v: int, cond: str = None) -> bool:
-        """Emit a tail call to a known function. If cond is given, wrap in if()."""
+        """Emit a tail call to a known function. If cond is given, wrap in if().
+
+        When the outer's return type differs from the callee's, bridge
+        them with the appropriate wrap/destructure so the C type checks.
+        The tail call is semantically `return callee()` but must match
+        the outer's declared return struct/scalar.
+        """
         full_addr = (self.bank << 16) | v
         if full_addr not in self.func_names:
             return False
@@ -1833,35 +1839,79 @@ class EmitCtx:
         callee_sig = self.func_sigs.get(full_addr)
         _ret, callee_params = parse_sig(callee_sig)
         call_args = self._build_call_args(callee_params)
+        call_expr = f'{fname}({call_args})'
+        outer = self.ret_type
+
+        def _bridge_return(callee_ret: str, outer_ret: str, expr: str) -> str:
+            """Return a C expression for `return <...>` that satisfies the
+            outer's declared return type given an expression of callee_ret
+            type. Used to bridge uint8 <-> RetAY / RetY mismatches across
+            tail calls."""
+            if callee_ret == outer_ret:
+                return f'return {expr};'
+            if callee_ret == 'void':
+                # Discard; rebuild outer's return from tracked state.
+                rv = self._return_value_expr()
+                rv_suffix = '' if rv is None else f' {rv}'
+                return f'{expr}; return{rv_suffix};'
+            # Callee has a concrete retval, wrap/unwrap to fit outer.
+            if outer_ret == 'void':
+                return f'{expr}; return;'
+            if callee_ret == outer_ret:
+                return f'return {expr};'
+            # uint8/uint16 outer, struct callee → pick the .a field.
+            if outer_ret in ('uint8', 'uint16') and callee_ret in ('RetAY', 'RetY'):
+                field = 'a' if callee_ret == 'RetAY' else 'y'
+                tmp = self._alloc(callee_ret)
+                self._emit(f'{tmp} = {expr};')
+                return f'return {tmp}.{field};'
+            # Struct outer, scalar callee → wrap into a struct literal.
+            if outer_ret == 'RetY' and callee_ret in ('uint8', 'uint16'):
+                return f'return (RetY){{ .y = {expr} }};'
+            if outer_ret == 'RetAY' and callee_ret in ('uint8', 'uint16'):
+                return f'return (RetAY){{ .a = {expr}, .y = 0 }};'
+            # Mixed struct types (RetAY ↔ RetY etc.) — destructure and
+            # rebuild by common field name.
+            if outer_ret == 'RetAY' and callee_ret == 'RetY':
+                tmp = self._alloc(callee_ret)
+                self._emit(f'{tmp} = {expr};')
+                return f'return (RetAY){{ .a = 0, .y = {tmp}.y }};'
+            if outer_ret == 'RetY' and callee_ret == 'RetAY':
+                tmp = self._alloc(callee_ret)
+                self._emit(f'{tmp} = {expr};')
+                return f'return (RetY){{ .y = {tmp}.y }};'
+            # Last resort: emit unchanged and let the C compiler flag it.
+            return f'return {expr};'
+
         # Tail calls must pop this frame before returning (see RTL/RTS handler).
         if cond:
             # Conditional tail call: if (cond) { call; return; }
-            if _ret != 'void' and self.ret_type != 'void':
-                self._emit(f'if ({cond}) {{ RecompStackPop(); return {fname}({call_args}); }}')
+            if _ret != 'void' and outer != 'void':
+                ret_stmt = _bridge_return(_ret, outer, call_expr)
+                self._emit(f'if ({cond}) {{ RecompStackPop(); {ret_stmt} }}')
             elif _ret != 'void':
                 # Callee has a retval we discard; outer is void.
-                self._emit(f'if ({cond}) {{ {fname}({call_args}); RecompStackPop(); return; }}')
-            elif self.ret_type != 'void':
-                # Callee is void; outer returns A (or RetAY etc.). After the
-                # call A is unknown, so fall back to _return_value_expr's
-                # defaulting ('0' when register is untracked).
+                self._emit(f'if ({cond}) {{ {call_expr}; RecompStackPop(); return; }}')
+            elif outer != 'void':
+                # Callee is void; outer returns A (or RetAY etc.). After
+                # the call A is unknown, so fall back to
+                # _return_value_expr's defaulting ('0' when register is
+                # untracked).
                 rv = self._return_value_expr()
-                self._emit(f'if ({cond}) {{ {fname}({call_args}); RecompStackPop(); return {rv}; }}')
+                self._emit(f'if ({cond}) {{ {call_expr}; RecompStackPop(); return {rv}; }}')
             else:
-                self._emit(f'if ({cond}) {{ {fname}({call_args}); RecompStackPop(); return; }}')
+                self._emit(f'if ({cond}) {{ {call_expr}; RecompStackPop(); return; }}')
         else:
-            if _ret != 'void' and self.ret_type != 'void':
-                self._emit(f'RecompStackPop(); return {fname}({call_args});')
+            if _ret != 'void' and outer != 'void':
+                self._emit('RecompStackPop();')
+                self._emit(_bridge_return(_ret, outer, call_expr))
             elif _ret != 'void':
                 tmp = self._alloc(_ret)
-                self._emit(f'{tmp} = {fname}({call_args});')
+                self._emit(f'{tmp} = {call_expr};')
                 self._emit('RecompStackPop();')
-                if self.ret_type != 'void':
-                    self._emit(f'return {tmp};')
-                else:
-                    self._emit('return;')
+                self._emit('return;')
             else:
-                self._emit(f'{fname}({call_args});')
+                self._emit(f'{call_expr};')
                 self._emit('RecompStackPop();')
                 self._emit_return_for_current_sig()
         return True
@@ -3922,23 +3972,38 @@ def emit_function(name: str, insns: List[Insn], bank: int,
             ctx._emit(f'return {ctx._struct_ret_expr(ret_type)};')
         elif nf_ret != 'void' and ret_type != 'void':
             ctx._emit(f'RecompStackPop();')
-            if ret_type == 'RetY' and nf_ret != 'RetY':
-                # Outer declares RetY but the fall-through target returns
-                # a scalar — wrap in the struct literal.
+            call_expr = f'{nf_name}({nf_args})'
+            if ret_type == nf_ret:
+                ctx._emit(f'return {call_expr};  /* fall-through */')
+            elif ret_type == 'RetY' and nf_ret in ('uint8', 'uint16'):
                 ctx._emit(
-                    f'return (RetY){{ .y = {nf_name}({nf_args}) }};'
+                    f'return (RetY){{ .y = {call_expr} }};  /* fall-through */'
+                )
+            elif ret_type == 'RetAY' and nf_ret in ('uint8', 'uint16'):
+                ctx._emit(
+                    f'return (RetAY){{ .a = {call_expr}, .y = 0 }};'
                     '  /* fall-through */'
                 )
-            elif ret_type == 'RetAY' and nf_ret != 'RetAY':
-                # Outer declares RetAY but the fall-through returns a
-                # scalar. Map to .a (A is the most common SMW scalar
-                # return register when the outer isn't destructured).
-                ctx._emit(
-                    f'return (RetAY){{ .a = {nf_name}({nf_args}),'
-                    f' .y = 0 }};  /* fall-through */'
-                )
+            elif ret_type in ('uint8', 'uint16') and nf_ret == 'RetAY':
+                # Scalar outer consuming a RetAY tail call — extract .a.
+                tmp = ctx._alloc('RetAY')
+                ctx._emit(f'{tmp} = {call_expr};  /* fall-through */')
+                ctx._emit(f'return {tmp}.a;')
+            elif ret_type in ('uint8', 'uint16') and nf_ret == 'RetY':
+                # Scalar outer consuming a RetY tail call — extract .y.
+                tmp = ctx._alloc('RetY')
+                ctx._emit(f'{tmp} = {call_expr};  /* fall-through */')
+                ctx._emit(f'return {tmp}.y;')
+            elif ret_type == 'RetAY' and nf_ret == 'RetY':
+                tmp = ctx._alloc('RetY')
+                ctx._emit(f'{tmp} = {call_expr};  /* fall-through */')
+                ctx._emit(f'return (RetAY){{ .a = 0, .y = {tmp}.y }};')
+            elif ret_type == 'RetY' and nf_ret == 'RetAY':
+                tmp = ctx._alloc('RetAY')
+                ctx._emit(f'{tmp} = {call_expr};  /* fall-through */')
+                ctx._emit(f'return (RetY){{ .y = {tmp}.y }};')
             else:
-                ctx._emit(f'return {nf_name}({nf_args});  /* fall-through */')
+                ctx._emit(f'return {call_expr};  /* fall-through */')
         else:
             ctx._emit(f'RecompStackPop();')
             ctx._emit(f'{nf_name}({nf_args});  /* fall-through */')
