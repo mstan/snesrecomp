@@ -33,6 +33,7 @@ from snes65816 import (
     LONG, LONG_X, REL, REL16, STK, INDIR, INDIR_X, INDIR_Y, INDIR_LY,
     INDIR_L, INDIR_DPX, DP_INDIR, STK_IY, MODE_STR,
 )
+from discover import discover_bank
 
 # Backward compat alias (internal uses of _validate_decoded_insns)
 _validate_decoded_insns = validate_decoded_insns
@@ -3024,6 +3025,7 @@ class Config:
         self.dispatch: Set[str] = set()  # functions provided by dispatch file (skip + no oracle fallback)
         self.data: List[dict] = []
         self.exclude_ranges: List[Tuple[int, int]] = []  # [(start, end)] --data ranges, don't decode
+        self.no_autodiscover: Set[int] = set()  # local addrs blocked from intra-bank auto-promote
         self.includes: List[str] = []
         self.comment: str = ''
         self.verbatim: List[str] = []
@@ -3260,6 +3262,9 @@ def parse_config(path: str) -> Config:
                 er_start = int(parts[1], 16)
                 er_end = int(parts[2], 16)
                 cfg.exclude_ranges.append((er_start, er_end))
+            elif key == 'no_autodiscover':
+                # no_autodiscover <addr_hex> --block intra-bank auto-promote for this addr
+                cfg.no_autodiscover.add(int(parts[1], 16))
             elif key == 'oracle':
                 # oracle <relative_path_to_oracle_source>
                 cfg.oracle_path = os.path.normpath(os.path.join(os.path.dirname(path), parts[1]))
@@ -3562,6 +3567,68 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         lines.append('')
 
     # Verbatim and oracle fallback --deferred to after forward declarations
+
+    # ── Intra-bank auto-promote (discover.py) ────────────────────────────
+    # Walk the ROM's call graph from every existing cfg func as a seed, and
+    # promote every newly-discovered intra-bank JSR/JSL target into a func
+    # entry. Without this, targets like $05:86E3 (a local JSR trampoline
+    # inside LoadLevelDataObject) emit as unresolved `func_0586e3(...)`
+    # calls and get scrubbed, triggering a REVIEW.
+    #
+    # Scope (intentionally minimal):
+    #   * intra-bank targets only (cross-bank JSLs are left to cfg until a
+    #     follow-up pass wires them through the global scan)
+    #   * skip addresses already in cfg.funcs (explicit)
+    #   * skip addresses in cfg.names (will be handled by sub-entry
+    #     promotion if they carry a sig; otherwise they're cross-bank alias
+    #     declarations that we must not duplicate)
+    #   * skip addresses that fall inside any exclude_range (data bytes)
+    #   * opt-out: `no_autodiscover ADDR` cfg directive blocks a specific
+    #     discovered address from being promoted
+    _existing_addrs_pre = {a for _, a, *_ in cfg.funcs}
+    _existing_local_names = {a & 0xFFFF for a in cfg.names if (a >> 16) == cfg.bank}
+    try:
+        _discovered_local, _ = discover_bank(
+            rom, cfg.bank,
+            external_seeds=_existing_addrs_pre,
+            jsl_dispatch=set(cfg.jsl_dispatch or []),
+            jsl_dispatch_long=set(cfg.jsl_dispatch_long or []),
+        )
+    except Exception as _disc_err:
+        print(f'  [auto-promote] discover_bank failed: {_disc_err}',
+              file=sys.stderr)
+        _discovered_local = set()
+    _auto_promoted = []
+    for _local_addr in sorted(_discovered_local):
+        if _local_addr < 0x8000 or _local_addr > 0xFFFF:
+            continue
+        if _local_addr in _existing_addrs_pre:
+            continue
+        if _local_addr in _existing_local_names:
+            continue  # will be handled by sub-entry promotion or is a cross-bank alias
+        if _local_addr in cfg.no_autodiscover:
+            continue
+        in_exclude = False
+        for _er_start, _er_end in cfg.exclude_ranges:
+            if _er_start <= _local_addr <= _er_end:
+                in_exclude = True
+                break
+        if in_exclude:
+            continue
+        _auto_name = f'auto_{cfg.bank:02X}_{_local_addr:04X}'
+        cfg.funcs.append((_auto_name, _local_addr, 'void()', None, {}, {}))
+        _full = (cfg.bank << 16) | _local_addr
+        cfg.names[_full] = _auto_name
+        cfg.sigs[_full] = 'void()'
+        _existing_addrs_pre.add(_local_addr)
+        _auto_promoted.append(_local_addr)
+    if _auto_promoted:
+        cfg.funcs.sort(key=lambda t: t[1])
+        print(f'  Auto-promote (intra-bank): {len(_auto_promoted)} JSR/JSL targets promoted',
+              file=sys.stderr)
+        for _ap in _auto_promoted:
+            print(f'    auto_{cfg.bank:02X}_{_ap:04X} @ ${cfg.bank:02X}:{_ap:04X}',
+                  file=sys.stderr)
 
     # ── Sub-entry promotion ──────────────────────────────────────────────
     # A `name` directive with a `sig:` that falls strictly inside an existing
