@@ -1136,6 +1136,12 @@ def auto_promote_branch_targets(rom: bytes, cfg) -> int:
         full_addr = (cfg.bank << 16) | tgt
         if full_addr in cfg.names:
             continue
+        # Skip targets within the last few bytes of the bank: any
+        # resulting decode would run off the end and produce garbled
+        # code. These usually come from BRA/BRL whose operand-byte
+        # interpretation landed on a data byte.
+        if tgt >= 0xFFFE:
+            continue
         auto_name = f'auto_{cfg.bank:02X}_{tgt:04X}'
         cfg.names[full_addr] = auto_name
         cfg.sigs[full_addr] = 'void()'
@@ -3415,9 +3421,18 @@ class EmitCtx:
                 except (AssertionError, IndexError):
                     pass
             if not is_shared_rts:
-                reason = 'before func start' if v < (self.func_start & 0xFFFF) else 'outside decoded range'
-                self._warn(f'{mn} ${v:04X} treated as return --{reason}',
-                           f"Add 'end:{v:04X}' or 'name {(self.bank<<16)|v:06X} <Name>' to cfg")
+                # BRA/BRL/BCC/etc. with operand below $8000 points into
+                # WRAM or RAM mirror — LoROM has no code there. That's
+                # always a decoder artifact (a data byte consumed as
+                # the opcode's offset). Swallow silently with a
+                # comment instead of a noisy "add cfg hint" warning,
+                # since there's nothing the cfg could usefully name.
+                if v < 0x8000:
+                    self._emit(f'/* {mn} ${v:04X} unreachable: target < $8000 is RAM, not code */')
+                else:
+                    reason = 'before func start' if v < (self.func_start & 0xFFFF) else 'outside decoded range'
+                    self._warn(f'{mn} ${v:04X} treated as return --{reason}',
+                               f"Add 'end:{v:04X}' or 'name {(self.bank<<16)|v:06X} <Name>' to cfg")
             # Branch-as-return: pair with the entry's RecompStackPush.
             rv = self._return_value_expr()
             if rv is None:
