@@ -531,7 +531,9 @@ def _insn_reg_use(insn: Insn, reg: str) -> Tuple[bool, bool]:
     return reads, writes
 
 
-def infer_live_in_regs(insns: List[Insn], start_addr: int) -> Dict[str, int]:
+def infer_live_in_regs(insns: List[Insn], start_addr: int,
+                       bank: int = 0,
+                       callee_sigs: Optional[Dict[int, str]] = None) -> Dict[str, int]:
     """Compute which of A, X, Y are live-in at function entry.
 
     Walks the in-function instruction graph from `start_addr`, asking for
@@ -543,14 +545,20 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int) -> Dict[str, int]:
     width when live-in, or None when not live-in.
 
     Conservative assumptions:
-      - JSR/JSL define A, X, Y (return values may populate any of them).
-        A function that reads A only after a JSR is NOT treated as
-        taking A as input.
+      - JSR/JSL to a callee with a known sig: any register the callee
+        takes as a parameter is treated as READ by this call (the caller
+        must supply it), THEN the call's return-value-carrying registers
+        become defined. Without this, trampoline functions like
+        `JSR $F465 ; RTS` wrap a callee that takes X but lose X-as-input
+        because the JSR was treated as a pure def.
+      - JSR/JSL with no known callee sig: conservatively define A, X, Y
+        (callees may return a value in any of them).
       - RTS/RTL/RTI/BRK/STP terminate paths.
       - Unconditional JMP/BRA/BRL within the function follows the target;
         cross-function JMP (target not in decoded set) terminates the path.
       - Conditional branches fork. Both branches are explored.
     """
+    callee_sigs = callee_sigs or {}
     if not insns:
         return {'A': None, 'X': None, 'Y': None}
 
@@ -604,6 +612,28 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int) -> Dict[str, int]:
             if insn is None:
                 continue
             reads, writes = _insn_reg_use(insn, reg)
+            # JSR/JSL/JMP (tail call): ask the callee's declared sig whether
+            # it consumes this register. If so, the call is a READ of the
+            # register — any caller-side code reaching this call without
+            # having written the register is using an input value. This is
+            # how trampolines (JSR $foo ; RTS, or JSR $a ; JMP $b) inherit
+            # their callees' sigs.
+            is_call = insn.mnem in ('JSR', 'JSL')
+            is_tail_jmp = insn.mnem in ('JMP',) and insn.mode in (ABS, LONG)
+            if is_call or is_tail_jmp:
+                target = insn.operand
+                if is_call and insn.mnem == 'JSR':
+                    target = (bank << 16) | (target & 0xFFFF)
+                elif is_tail_jmp and insn.mode == ABS:
+                    target = (bank << 16) | (target & 0xFFFF)
+                callee_sig = callee_sigs.get(target)
+                if callee_sig:
+                    _cret, cparams = parse_sig(callee_sig)
+                    pnames = {pn for _pt, pn in cparams}
+                    if ((reg == 'A' and 'a' in pnames)
+                            or (reg == 'X' and 'k' in pnames)
+                            or (reg == 'Y' and 'j' in pnames)):
+                        reads = True
             if reads and not defined:
                 # Width: A follows m flag, X/Y follow x flag.
                 if reg == 'A':
@@ -773,14 +803,106 @@ def promote_sub_entries(rom: bytes, cfg) -> List[Tuple[str, int, str, int]]:
     return _promoted
 
 
+def auto_promote_branch_targets(rom: bytes, cfg) -> int:
+    """Auto-promote unresolved intra-bank branch targets to sub-entries.
+
+    When a function in bank B branches (BRA/BRL/BEQ/BNE/BCC/BCS/BVS/BVC/JMP)
+    to an address A that is inside some OTHER known function's range but is
+    NOT that function's entry point, the recompiler currently emits a bare
+    `return;` because no callable symbol exists for A. The real ROM branches
+    into the middle of code that runs specific setup/cleanup — emitting
+    `return` silently skips it.
+
+    This pass scans every function's body for such targets and registers an
+    `auto_BB_AAAA` name + sig at each one, so `promote_sub_entries` can
+    split the enclosing parent and emit a proper tail call.
+
+    Runs BEFORE promote_sub_entries so the added names get picked up in
+    the promotion pass. Returns the number of targets promoted.
+    """
+    import re as _re
+    # Build end-addr map so we know each func's range.
+    srt = sorted(cfg.funcs, key=lambda t: t[1])
+    ends: Dict[int, int] = {}
+    for i, tup in enumerate(srt):
+        _, saddr, _, eovr, _, _ = tup
+        if eovr is not None:
+            ends[saddr] = eovr
+        elif i + 1 < len(srt):
+            ends[saddr] = srt[i + 1][1]
+        else:
+            ends[saddr] = 0x10000
+    func_entry_addrs = {a for _, a, *_ in cfg.funcs}
+
+    new_targets: Set[int] = set()
+    for fname, saddr, _sig, eovr, mo, _h in cfg.funcs:
+        if fname in cfg.skip:
+            continue
+        try:
+            insns = decode_func(rom, cfg.bank, saddr, end=ends.get(saddr, 0),
+                                mode_overrides=mo or None,
+                                exclude_ranges=cfg.exclude_ranges or None,
+                                validate_branches=False)
+        except Exception:
+            continue
+        decoded_addrs = {i.addr & 0xFFFF for i in insns}
+        for insn in insns:
+            mn = insn.mnem
+            if mn in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC','BRA','BRL'):
+                tgt = insn.operand
+            elif mn == 'JMP' and insn.mode == ABS:
+                tgt = insn.operand
+            else:
+                continue
+            if tgt in decoded_addrs:
+                continue  # intra-func branch; already has a label
+            if tgt in func_entry_addrs:
+                continue  # landing on another func's entry — tail call works
+            # Is the target inside some other known func's range?
+            for other_saddr, other_end in ends.items():
+                if other_saddr != saddr and other_saddr < tgt < other_end:
+                    new_targets.add(tgt)
+                    break
+
+    # Register each as `auto_BB_AAAA` name + sig:void(). Sub-entry promotion
+    # will pick them up; live-in inference (after promotion) augments the
+    # sig to match the register conventions at that entry point.
+    added = 0
+    for tgt in sorted(new_targets):
+        full_addr = (cfg.bank << 16) | tgt
+        if full_addr in cfg.names:
+            continue
+        auto_name = f'auto_{cfg.bank:02X}_{tgt:04X}'
+        cfg.names[full_addr] = auto_name
+        cfg.sigs[full_addr] = 'void()'
+        added += 1
+    return added
+
+
 def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     """Run live-in register inference on every non-skipped function in `cfg`
     and merge the resulting parameters back into `cfg.sigs`.
 
-    Returns the number of sigs augmented. Used both by recomp.py's main
-    codegen loop and by sync_funcs_h.py so that on-disk funcs.h agrees
-    with what the recompiler emits for each bank.
+    Iterates to a fixpoint: a caller's live-in set depends on its callees'
+    sigs (JSR to a uint8_k callee counts as reading X in the caller). So
+    a change to a callee's sig can propagate a change to its caller on
+    the next round. Bounded by a generous iteration cap.
+
+    Returns the total number of sig augmentations across all passes. Used
+    both by recomp.py's main codegen loop and by sync_funcs_h.py so that
+    on-disk funcs.h agrees with what the recompiler emits.
     """
+    total_augmented = 0
+    for _iter in range(8):
+        changes = _augment_cfg_sigs_one_pass(rom, cfg)
+        total_augmented += changes
+        if changes == 0:
+            break
+    return total_augmented
+
+
+def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
+    """Single pass of live-in augmentation over every cfg.funcs entry."""
     non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
                 if f not in cfg.skip]
     non_skip.sort(key=lambda t: t[1])
@@ -811,7 +933,8 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
             continue
         if not insns:
             continue
-        live_in = infer_live_in_regs(insns, start_addr)
+        live_in = infer_live_in_regs(insns, start_addr, bank=cfg.bank,
+                                     callee_sigs=cfg.sigs)
         new_sig = _augment_sig_with_livein(current_sig, live_in)
         if new_sig != current_sig:
             cfg.sigs[full_addr] = new_sig
@@ -4324,6 +4447,18 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
             _cross_registered += 1
     if _cross_registered:
         print(f'  Auto-promote (cross-bank names): {_cross_registered} outgoing JSL targets named',
+              file=sys.stderr)
+
+    # ── Auto-promote intra-bank branch targets ────────────────────────────
+    # Any BRA/BRL/BCC/JMP etc. whose target lands inside a different known
+    # function's range gets a synthetic `auto_BB_AAAA` name + sig so the
+    # sub-entry promotion pass below splits that parent and makes the
+    # target a callable tail-call destination. Without this, the emitter
+    # silently replaces the branch with `return;`, losing any setup the
+    # real target would run.
+    _auto_branch_promoted = auto_promote_branch_targets(rom, cfg)
+    if _auto_branch_promoted:
+        print(f'  Auto-promote (intra-bank branch targets): {_auto_branch_promoted} new names',
               file=sys.stderr)
 
     # ── Sub-entry promotion ──────────────────────────────────────────────
