@@ -5505,6 +5505,75 @@ def main():
         print(f'  [global-ns] imported {cross_bank_count} cross-bank names from sibling cfgs',
               file=sys.stderr)
 
+    # Cross-bank clobber propagation
+    # -------------------------------
+    # augment_cfg_sigs_from_livein populates cfg.clobbers only for the
+    # current bank's functions, so every cross-bank JSL falls back to
+    # the conservative "callee clobbers A/X/Y" default inside
+    # infer_live_in_regs. That kills live-in tracking at the first
+    # cross-bank call: a caller whose entry X flows through a JSL to
+    # a known-void helper is seen as having X re-defined by the call,
+    # so X-as-param-at-entry is lost.
+    #
+    # Decode each sibling's non-skip functions once, compute the same
+    # clobber set the augment pass would, and record them under the
+    # full 24-bit address the decoder will emit for intra-sibling
+    # calls. From the current bank's perspective these are
+    # cross-bank JSL targets, and the lookup in infer_live_in_regs
+    # now returns the real preserve-set.
+    if not hasattr(cfg, 'clobbers'):
+        cfg.clobbers = {}
+    if not hasattr(cfg, 'x_restores'):
+        cfg.x_restores = {}
+    xbank_clobber_count = 0
+    for sibling in sorted(_glob.glob(os.path.join(cfg_dir_abs, 'bank*.cfg'))):
+        sib_base = os.path.basename(sibling)
+        if sib_base == cfg_basename:
+            continue
+        if 'bisect' in sib_base.lower():
+            continue
+        try:
+            sib_cfg = parse_config(sibling)
+        except Exception:
+            continue
+        if sib_cfg.bank is None:
+            continue
+        sib_funcs = sorted(sib_cfg.funcs, key=lambda t: t[1])
+        for i, (sfname, start_addr, _ssig, eovr, mo, _sh) in enumerate(sib_funcs):
+            if sfname in sib_cfg.skip:
+                continue
+            if eovr is not None:
+                end_addr = eovr
+            elif i + 1 < len(sib_funcs):
+                end_addr = sib_funcs[i + 1][1]
+            else:
+                end_addr = 0x10000
+            full_addr = (sib_cfg.bank << 16) | start_addr
+            if full_addr in cfg.clobbers:
+                continue  # already recorded (current bank owns this)
+            try:
+                insns = decode_func(rom, sib_cfg.bank, start_addr, end=end_addr,
+                                    jsl_dispatch=sib_cfg.jsl_dispatch or None,
+                                    jsl_dispatch_long=sib_cfg.jsl_dispatch_long or None,
+                                    mode_overrides=mo or None,
+                                    exclude_ranges=sib_cfg.exclude_ranges or None,
+                                    validate_branches=False)
+            except Exception:
+                continue
+            if not insns:
+                continue
+            clob = {reg for reg in ('A', 'X', 'Y')
+                    if _writes_register_without_save_restore(insns, reg)}
+            x_restore = _detect_x_restore_expr(insns)
+            if x_restore:
+                cfg.x_restores[full_addr] = x_restore
+                clob.discard('X')
+            cfg.clobbers[full_addr] = clob
+            xbank_clobber_count += 1
+    if xbank_clobber_count:
+        print(f'  [xbank-clobbers] imported {xbank_clobber_count} cross-bank clobber sets',
+              file=sys.stderr)
+
     # Locate funcs.h — prefer output-relative (game project's copy) over
     # cfg-relative (recompiler's potentially stale copy).
     cfg_dir = os.path.dirname(os.path.abspath(args.config))
