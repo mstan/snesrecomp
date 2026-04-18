@@ -1477,10 +1477,17 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
         # describes which 65816 registers leak across the call boundary.
         if not hasattr(cfg, 'clobbers'):
             cfg.clobbers = {}
-        cfg.clobbers[full_addr] = {
-            reg for reg in ('A', 'X', 'Y')
-            if _writes_register_without_save_restore(insns, reg)
-        }
+        # cfg `preserves` hint wins over auto-detection — used for
+        # functions where the heuristic is imprecise (e.g., path-sensitive
+        # tail-jumps that write a register on the non-returning path only).
+        preserved = cfg.preserves.get(full_addr) if hasattr(cfg, 'preserves') else None
+        if preserved is not None:
+            cfg.clobbers[full_addr] = {'A', 'X', 'Y'} - preserved
+        else:
+            cfg.clobbers[full_addr] = {
+                reg for reg in ('A', 'X', 'Y')
+                if _writes_register_without_save_restore(insns, reg)
+            }
         # Carry-return inference: CLC/SEC + RTS (or join of such exits)
         # without any A writer. SMW uses this idiom for bool-via-carry
         # helpers whose cfg was declared `uint8()` by AUTO but which
