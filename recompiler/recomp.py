@@ -1149,6 +1149,33 @@ def auto_promote_branch_targets(rom: bytes, cfg) -> int:
     return added
 
 
+def _sig_matches_dispatch_shape(sig: Optional[str]) -> bool:
+    """True if `sig` has a parameter list compatible with a dispatch cast
+    (`()` or `(uint8 k)`).
+
+    The return type is irrelevant for dispatch safety: casting a
+    RetY/RetAY/uint8-returning function to `FuncU8*` and calling it
+    through the pointer just discards the return value at the ABI level
+    (the struct is returned in the normal register, the caller ignores
+    it). What WOULD crash is a mismatched param count — `void(uint8_k,
+    uint8_a)` declared but called with only `k` leaves `a` as
+    uninitialised register state in the callee. So we gate only on
+    params.
+
+    Consumers that legitimately need the return (direct JSR callers,
+    not dispatch callers) still see the full RetAY sig and consume the
+    struct normally.
+    """
+    if sig is None:
+        return True
+    _ret, params = parse_sig(sig)
+    if len(params) == 0:
+        return True
+    if len(params) == 1 and params[0][1] == 'k':
+        return True
+    return False
+
+
 def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     """Run live-in register inference on every non-skipped function in `cfg`
     and merge the resulting parameters back into `cfg.sigs`.
@@ -1169,6 +1196,13 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     both by recomp.py's main codegen loop and by sync_funcs_h.py so that
     on-disk funcs.h agrees with what the recompiler emits.
     """
+    # Collect dispatch-table targets FIRST so the augment pass knows
+    # which functions must keep a FuncU8-compatible sig. Every entry in
+    # a jump table gets cast to `FuncU8*` / `FuncV*` at emit time; that
+    # cast assumes a fixed 0- or 1-argument shape, so widening a
+    # dispatch-target sig leaves later params as garbage at call time.
+    cfg.dispatch_target_addrs = _collect_dispatch_targets(rom, cfg)
+
     total_augmented = 0
     # Always run at least two passes: the first populates cfg.clobbers;
     # the second re-runs live-in with that clobber info in hand, which
@@ -1273,7 +1307,13 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
                 continue
             if _insns_read_reg_post_jsr(insns, insn.addr & 0xFFFF, tgt, 'Y'):
                 y_consumers.add(tgt)
-    # Promote each consumer.
+    # Promote each consumer. Dispatch-table entries are eligible too:
+    # direct-JSR callers still consume the Y return, and dispatch-call
+    # sites (through FuncU8 cast) harmlessly discard it at the ABI
+    # level. Skipping dispatch targets here regresses direct callers
+    # (real case: Spr04C_ExplodingBlock_Init's direct JSR caller writes
+    # g_ram[0xc2+k] from the Y return, and skipping promotion degraded
+    # it to `= 0 /* UNKNOWN */`).
     promoted = 0
     for tgt in y_consumers:
         full = (cfg.bank << 16) | tgt
@@ -1288,6 +1328,63 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
             cfg.sigs[full] = 'RetAY' + params_part
             promoted += 1
     return promoted
+
+
+def _collect_dispatch_targets(rom: bytes, cfg) -> Set[int]:
+    """Decode every function once and collect every dispatch-table entry.
+    Returns the set of full_addr values that appear as handlers in a
+    dispatch table.
+
+    Dispatch tables emit as `FuncU8*` / `FuncV*` casts in the generated
+    C. That cast assumes a fixed shape (`void(uint8 k)` or `void()`)
+    for every handler, so the augment pass MUST NOT widen any
+    dispatch-target function's sig beyond that shape — doing so would
+    make the C call pass fewer args than the function declares, leaving
+    later parameters as uninitialised stack/register reads. Real crash
+    mode: SprStatus01_Init's dispatch of SprXXX_Generic_Init_
+    StandardSpritesInit segfaulted when the augment pass added a second
+    `uint8 a` param the dispatch cast couldn't pass through.
+    """
+    non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
+                if f not in cfg.skip]
+    non_skip.sort(key=lambda t: t[1])
+    ends: Dict[int, int] = {}
+    for i, tup in enumerate(non_skip):
+        _, saddr, _, eovr, _, _ = tup
+        if eovr is not None:
+            ends[saddr] = eovr
+        elif i + 1 < len(non_skip):
+            ends[saddr] = non_skip[i + 1][1]
+        else:
+            ends[saddr] = 0x10000
+    known_func_addrs: Set[int] = set(cfg.names.keys())
+    for _fname, addr, *_ in cfg.funcs:
+        known_func_addrs.add((cfg.bank << 16) | addr)
+    targets: Set[int] = set()
+    for fname, saddr, _sig, _eovr, mo, _h in non_skip:
+        try:
+            insns = decode_func(rom, cfg.bank, saddr, end=ends.get(saddr, 0),
+                                jsl_dispatch=cfg.jsl_dispatch or None,
+                                jsl_dispatch_long=cfg.jsl_dispatch_long or None,
+                                mode_overrides=mo or None,
+                                dispatch_known_addrs=known_func_addrs,
+                                exclude_ranges=cfg.exclude_ranges or None,
+                                known_func_starts=known_func_addrs,
+                                validate_branches=False)
+        except Exception:
+            continue
+        for insn in insns:
+            if insn.dispatch_entries:
+                for entry in insn.dispatch_entries:
+                    if entry == 0:
+                        continue
+                    # Dispatch entries are bank-local addresses in almost
+                    # all SMW cases; cross-bank dispatch uses long table
+                    # entries (`jsl_dispatch_long`) whose emit path is
+                    # separate. Store as full_addr so augment can look
+                    # up by cfg.sigs key directly.
+                    targets.add((cfg.bank << 16) | (entry & 0xFFFF))
+    return targets
 
 
 def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
@@ -1394,6 +1491,24 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                 # from the clobber set so live-in analysis can see
                 # through this call on subsequent passes.
                 cfg.clobbers[full_addr].discard('X')
+        # Dispatch-target guard: if this function is in any dispatch
+        # table, the cast site calls it as `FuncU8*` — the param list
+        # must stay `()` or `(uint8 k)`. Any wider param list would
+        # leave later params as garbage at dispatch-call time. The
+        # return type is unrestricted — a RetAY function called via
+        # FuncU8 just discards the return at the ABI level, which is
+        # the SNES-level behavior anyway.
+        #
+        # Narrow (not just block widening): if `current_sig` / `new_sig`
+        # has excess params from earlier pollution (funcs.h seeded from
+        # a prior regen that widened the target), strip them back to
+        # a dispatch-compatible param list while preserving the return.
+        dispatch_targets = getattr(cfg, 'dispatch_target_addrs', None)
+        if (dispatch_targets is not None and full_addr in dispatch_targets
+                and new_sig is not None
+                and not _sig_matches_dispatch_shape(new_sig)):
+            ret_keep, _ps = parse_sig(new_sig)
+            new_sig = f'{ret_keep}(uint8_k)'
         if new_sig is not None and new_sig != current_sig:
             cfg.sigs[full_addr] = new_sig
             augmented += 1
@@ -3867,7 +3982,11 @@ class EmitCtx:
 
         # Mixed / unknown entries: per-case switch. Each case is terminal,
         # so its return must match the outer function's declared ret type.
-        call_arg = 'k' if self.has_k else ''
+        # Per-callee arg list: switch cases emit direct function calls
+        # (not through a FuncU8 cast), so each call must match the
+        # callee's declared sig. A handler declared `(uint8 k)` needs
+        # an actual arg — use _build_call_args to pull the current X
+        # track (or a RECOMP_WARN fallback if X is unknown).
         rv = self._return_value_expr()
         ret_stmt = 'return;' if rv is None else f'return {rv};'
         self._emit(f'switch ({idx}) {{')
@@ -3877,7 +3996,10 @@ class EmitCtx:
                 self._emit(f'  case {i}: {ret_stmt}  /* null dispatch */')
             elif _entry_is_known_func(entry):
                 fn = self._callee((self.bank << 16) | entry)
-                self._emit(f'  case {i}: {fn}({call_arg}); {ret_stmt}')
+                callee_sig = (self.func_sigs or {}).get((self.bank << 16) | entry)
+                _cr, callee_params = parse_sig(callee_sig) if callee_sig else ('void', [])
+                call_args = self._build_call_args(callee_params)
+                self._emit(f'  case {i}: {fn}({call_args}); {ret_stmt}')
             else:
                 # Unknown — assume an intra-function branch target. If the
                 # label does not exist at link time the C compiler will error,
@@ -5084,15 +5206,38 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # target a callable tail-call destination. Without this, the emitter
     # silently replaces the branch with `return;`, losing any setup the
     # real target would run.
-    _auto_branch_promoted = auto_promote_branch_targets(rom, cfg)
-    if _auto_branch_promoted:
-        print(f'  Auto-promote (intra-bank branch targets): {_auto_branch_promoted} new names',
-              file=sys.stderr)
-        # Re-run sub-entry promotion so the new names become full funcs.
-        _promoted2 = promote_sub_entries(rom, cfg)
-        if _promoted2:
-            print(f'  Sub-entry promotion (round 2): {len(_promoted2)} additional',
+    #
+    # Single pass. A prior version iterated to a fixpoint on the theory
+    # that each sub-entry promotion could expose more branch targets,
+    # but in practice subsequent rounds break the parent function's
+    # structure: once a sub-entry is promoted, the parent's remaining
+    # body sometimes contains branches to addresses that are now inside
+    # the *promoted* sub-function's range rather than the shrunk
+    # parent's range. The emitter then demotes those back to "BEQ $XXXX
+    # treated as return", which silently drops setup code that was
+    # reachable in the original single-function emit. Real crash: the
+    # SprXXX_Eeries_Init ... ProcessNormalSprites_HandleSprite ...
+    # SprStatus01_Init path segfaulted because the 2nd-round promotion
+    # of $01:A9F2 truncated the enclosing SpriteMain function so the
+    # BEQ $AA01 in its body became "treat as return", skipping a
+    # subsequent fall-through that the dispatched sprite code relied
+    # on. Fixing multi-round promotion without that regression is a
+    # separate project: the emitter needs to re-decode the parent's
+    # remaining body against the post-promotion boundary and emit
+    # missing-label branches as tail calls rather than returns.
+    for _branch_iter in range(1):
+        _auto_branch_promoted = auto_promote_branch_targets(rom, cfg)
+        if _auto_branch_promoted:
+            print(f'  Auto-promote (intra-bank branch targets, round {_branch_iter + 1}): '
+                  f'{_auto_branch_promoted} new names',
                   file=sys.stderr)
+            _promoted_round = promote_sub_entries(rom, cfg)
+            if _promoted_round:
+                print(f'  Sub-entry promotion (round {_branch_iter + 2}): '
+                      f'{len(_promoted_round)} additional',
+                      file=sys.stderr)
+        if _auto_branch_promoted == 0:
+            break
 
     # --- Entry M/X inference from caller context --------------------------
     # Default decode starts every function at M=1,X=1. That's wrong for
