@@ -614,6 +614,21 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
             if insn is None:
                 continue
             reads, writes = _insn_reg_use(insn, reg)
+            # BIT-for-V-flag idiom: `BIT abs ; BVS/BVC ...` reads A only
+            # to compute the Z flag (A & mem == 0), but if the next
+            # instruction is BVS/BVC, only the V flag (bit 6 of memory,
+            # independent of A) is tested. The Z flag result is dead, so
+            # the A-read is dead too. Drop it here so liveness doesn't
+            # spuriously promote the function's sig to take `uint8 a`.
+            # Narrow by design: we only match the literal `BIT ; BVS/BVC`
+            # pair. BIT followed by BEQ/BNE keeps A-read live since Z
+            # does depend on A.
+            if reg == 'A' and insn.mnem == 'BIT' and reads:
+                idx = addr_to_idx.get(addr)
+                if idx is not None and idx + 1 < len(sorted_addrs):
+                    next_insn = insn_by_addr.get(sorted_addrs[idx + 1])
+                    if next_insn is not None and next_insn.mnem in ('BVS', 'BVC'):
+                        reads = False
             # JSR/JSL/JMP/BRA/BRL (call or tail transfer): ask the target's
             # declared sig whether it consumes this register. If so, the
             # transfer is a READ of the register — any caller-side code
