@@ -81,8 +81,28 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
     jsr_targets: Set[int] = set()      # JSR targets found during traversal
     jsl_targets: Dict[int, Set[int]] = {}  # bank -> set of JSL targets
 
+    # Byte-level ranges that we've observed as inline dispatch-table data.
+    # Any seed whose address falls inside one of these ranges is NOT a real
+    # function entry — it's a byte inside a pointer table, added to the
+    # worklist by a mis-sized instruction decode (most commonly: caller's
+    # m/x state was wrong, so a 3-byte immediate got read as a 2-byte
+    # immediate + a phantom JSR opcode).
+    dispatch_table_ranges: List[Tuple[int, int]] = []
+
+    def _in_dispatch_table(addr: int) -> bool:
+        for lo, hi in dispatch_table_ranges:
+            if lo <= addr < hi:
+                return True
+        return False
+
     def add_seed(addr: int):
         if 0x8000 <= addr <= 0xFFFF and addr not in discovered:
+            if _in_dispatch_table(addr):
+                # Rejected: address lands inside a dispatch-table byte range.
+                # Can't be a real function entry (those ranges are raw
+                # pointer data). Seeing this means some earlier walker
+                # mis-decoded and proposed the address as a call target.
+                return
             discovered.add(addr)
             worklist.append(addr)
 
@@ -175,6 +195,7 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                     if _is_short or _is_long:
                         entry_size = 3 if _is_long else 2
                         tbl_pc = pc
+                        _tbl_start = tbl_pc
                         for _ in range(256):
                             tbl_off = tbl_pc - 0x8000
                             if tbl_off + entry_size > len(bank_data):
@@ -193,6 +214,15 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                             tbl_pc += entry_size
                         pc = tbl_pc
                         decoded_pcs.update(range(insn.addr & 0xFFFF, tbl_pc))
+                        # Record the byte range of this dispatch table so
+                        # mis-decoded seeds inside it are rejected by
+                        # add_seed. The entry starts (at _tbl_start +
+                        # k*entry_size) are valid ROM pointers to the
+                        # handlers, but any byte strictly between entry
+                        # starts is data — a proposed "function entry"
+                        # landing there is a mis-decode artifact.
+                        if tbl_pc > _tbl_start:
+                            dispatch_table_ranges.append((_tbl_start, tbl_pc))
                         continue
 
                 elif insn.mnem == 'JMP' and insn.mode == ABS:
@@ -247,6 +277,16 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                     break
 
         decoded_ranges.append((func_start, func_max_pc))
+
+    # Post-filter: remove any seeds that ended up in a dispatch-table
+    # range. A seed can be added BEFORE the table that contains it is
+    # walked (if the seed came from a caller's mis-sized instruction
+    # decode earlier in the worklist), so add_seed's up-front check
+    # alone doesn't catch all cases. The final sweep handles those.
+    if dispatch_table_ranges:
+        discovered = {
+            a for a in discovered if not _in_dispatch_table(a)
+        }
 
     return discovered, jsl_targets
 

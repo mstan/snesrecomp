@@ -227,6 +227,22 @@ def decode_func(rom: bytes, bank: int, start: int, end: int = 0,
                 if dispatch_known_addrs and full_entry not in dispatch_known_addrs:
                     if exclude_ranges and any(er_s <= entry <= er_e for er_s, er_e in exclude_ranges):
                         break
+                    # Known-handler cluster break: once we've accepted at
+                    # least one known-function entry from this table, any
+                    # SUBSEQUENT unknown entry is a strong end-of-table
+                    # signal. Real dispatch tables are contiguous runs of
+                    # pointers to known code; a non-known entry after
+                    # known entries almost always means the decoder has
+                    # run off the real table into data that happens to
+                    # parse as a valid 16-bit address. Applies to both
+                    # declared and auto-detected dispatches — the
+                    # heuristic is just about table structure, not about
+                    # whether the dispatch helper was user-declared.
+                    if any(
+                        e != 0 and ((bank << 16) | e) in dispatch_known_addrs
+                        for e in entries
+                    ):
+                        break
                     # For configured jsl_dispatch targets, trust all $8000+
                     # entries bank-wide (the user declared this IS a dispatch).
                     # For auto-detected dispatches, use a tighter proximity check.
