@@ -121,3 +121,173 @@ def test_sync_funcs_h_rebuilds_auto_block_on_rerun():
     assert second.count('void RerunFunc(void);') == 1, (
         f'declaration duplicated on rerun\nout=\n{second}'
     )
+
+
+def test_sync_funcs_h_drops_stale_struct_return_when_no_hand_body():
+    # When cfg explicitly declares a function void and gen emits a
+    # body (but no hand body exists anywhere in src/*.c or cfg verbatim
+    # blocks), funcs.h must track the cfg's void — not keep a stale
+    # struct return from a prior hand-wrapper that's been deleted.
+    #
+    # This pins the fix for the tier-2 struct-return blocker: without
+    # it, un-skipping a function whose hand wrapper returned a
+    # synthetic struct leaves funcs.h perpetually declaring the struct
+    # and callers fail to compile with "cannot convert from void to
+    # StructT". With it, sync_funcs_h notices no hand body exists and
+    # uses cfg's pre-gen-overlay sig directly, rewriting funcs.h to
+    # match cfg; the next regen emits a void body and the cycle
+    # converges.
+    sfh = _load_sync_funcs_h()
+    if sfh is None:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        funcs_h = pathlib.Path(tmpdir) / 'funcs.h'
+        # Stale struct return from a deleted hand wrapper.
+        funcs_h.write_text(
+            '#ifndef TEST_FUNCS_H_\n'
+            '#define TEST_FUNCS_H_\n'
+            '#include "smw_rtl.h"\n'
+            'PointU8 StaleStructFunc(uint8 k);\n'
+            '#endif\n'
+        )
+        sfh.FUNCS_H = funcs_h
+        # cfg has explicit void (e.g. cfg author verified against SMWDisX).
+        # gen emitted PointU8 because _reconcile_sig picked funcs.h's
+        # specificity; but with no hand body, sync_funcs_h should still
+        # correct funcs.h to cfg's void and let the next regen converge.
+        sfh.collect_cfg_sigs = lambda: {
+            0x02D813: ('StaleStructFunc', 'void(uint8_k)'),
+        }
+        sfh.collect_gen_sigs = lambda: {
+            0x02D813: ('StaleStructFunc', 'PointU8(uint8_k)'),
+        }
+        # No hand body anywhere: return an empty set.
+        sfh.collect_hand_body_fnames = lambda: set()
+
+        sfh.main()
+        out = funcs_h.read_text()
+
+    assert 'void StaleStructFunc(uint8 k)' in out, (
+        f'sync_funcs_h did not correct stale struct return when no hand '
+        f'body exists\nout=\n{out}'
+    )
+    assert 'PointU8 StaleStructFunc' not in out, (
+        f'stale PointU8 declaration still present\nout=\n{out}'
+    )
+
+
+def test_sync_funcs_h_propagates_gen_params_when_no_hand_body():
+    # When gen emits a widened param list via live-in inference (e.g.
+    # `void f(uint8 j)` where cfg only had `void()`), and no hand body
+    # exists to override the ABI, funcs.h must follow gen's params.
+    # Otherwise hand-written callers that rely on funcs.h's declaration
+    # pass too many arguments and fail to compile.
+    sfh = _load_sync_funcs_h()
+    if sfh is None:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        funcs_h = pathlib.Path(tmpdir) / 'funcs.h'
+        funcs_h.write_text(
+            '#ifndef TEST_FUNCS_H_\n'
+            '#define TEST_FUNCS_H_\n'
+            '#include "smw_rtl.h"\n'
+            'void LiveInWidened(void);\n'
+            '#endif\n'
+        )
+        sfh.FUNCS_H = funcs_h
+        # cfg had void() (AUTO). Gen added `uint8 j` after live-in.
+        sfh.collect_cfg_sigs = lambda: {
+            0x009322: ('LiveInWidened', 'void()'),
+        }
+        sfh.collect_gen_sigs = lambda: {
+            0x009322: ('LiveInWidened', 'void(uint8_j)'),
+        }
+        sfh.collect_hand_body_fnames = lambda: set()
+
+        sfh.main()
+        out = funcs_h.read_text()
+
+    assert 'void LiveInWidened(uint8 j)' in out, (
+        f'sync_funcs_h did not propagate gen live-in param (uint8 j) '
+        f'to funcs.h\nout=\n{out}'
+    )
+
+
+def test_sync_funcs_h_preserves_pointer_return_when_no_hand_body():
+    # SNES functions that "return a pointer" actually communicate via
+    # DP writes; the recompiler emits them as void bodies. funcs.h
+    # declares them as pointer returns so hand callers (src/lm.c's
+    # LmHook_GraphicsDecompress, for instance) can consume the DP-
+    # stashed value as `uint8 *p = GraphicsDecompress(a);`.
+    #
+    # When un-skipping a different function forces funcs.h to pick cfg's
+    # void, the pointer-return carve-out must still protect these: no
+    # hand body exists for GraphicsDecompress, cfg says void, funcs.h
+    # says uint8*. The pointer stays.
+    sfh = _load_sync_funcs_h()
+    if sfh is None:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        funcs_h = pathlib.Path(tmpdir) / 'funcs.h'
+        funcs_h.write_text(
+            '#ifndef TEST_FUNCS_H_\n'
+            '#define TEST_FUNCS_H_\n'
+            '#include "smw_rtl.h"\n'
+            'uint8 *PointerReturnFunc(uint8 a);\n'
+            '#endif\n'
+        )
+        sfh.FUNCS_H = funcs_h
+        sfh.collect_cfg_sigs = lambda: {
+            0x00BA28: ('PointerReturnFunc', 'void(uint8_a)'),
+        }
+        sfh.collect_gen_sigs = lambda: {
+            0x00BA28: ('PointerReturnFunc', 'void(uint8_a)'),
+        }
+        sfh.collect_hand_body_fnames = lambda: set()
+
+        sfh.main()
+        out = funcs_h.read_text()
+
+    assert 'uint8 *PointerReturnFunc(uint8 a)' in out or \
+           'uint8* PointerReturnFunc(uint8 a)' in out, (
+        f'pointer-return carve-out lost: sync_funcs_h dropped funcs.h '
+        f'pointer even though the recompiler emits void body (pointer '
+        f'value is DP-stashed and consumed by hand callers)\nout=\n{out}'
+    )
+
+
+def test_sync_funcs_h_preserves_struct_return_when_hand_body_exists():
+    # Inverse of the above: when a hand body DOES exist (e.g. the
+    # function is in cfg's verbatim block or in src/lm.c), the hand
+    # body is the ABI oracle. funcs.h union path preserves the struct
+    # return even if cfg somehow says void — the hand body, not the
+    # recompiler, is authoritative here.
+    sfh = _load_sync_funcs_h()
+    if sfh is None:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        funcs_h = pathlib.Path(tmpdir) / 'funcs.h'
+        funcs_h.write_text(
+            '#ifndef TEST_FUNCS_H_\n'
+            '#define TEST_FUNCS_H_\n'
+            '#include "smw_rtl.h"\n'
+            'PointU8 WrappedStructFunc(uint8 k);\n'
+            '#endif\n'
+        )
+        sfh.FUNCS_H = funcs_h
+        sfh.collect_cfg_sigs = lambda: {
+            0x02D900: ('WrappedStructFunc', 'void(uint8_k)'),
+        }
+        sfh.collect_gen_sigs = lambda: {
+            0x02D900: ('WrappedStructFunc', 'PointU8(uint8_k)'),
+        }
+        # Hand body exists (e.g. in cfg verbatim or src/smw_02.c).
+        sfh.collect_hand_body_fnames = lambda: {'WrappedStructFunc'}
+
+        sfh.main()
+        out = funcs_h.read_text()
+
+    assert 'PointU8 WrappedStructFunc(uint8 k)' in out, (
+        f'sync_funcs_h dropped funcs.h struct return when hand body '
+        f'still exists — hand body is the ABI oracle\nout=\n{out}'
+    )
