@@ -26,6 +26,7 @@ TEST_MODULES = [
     'test_function_boundaries',
     'test_livein_inference',
     'test_sig_augment',
+    'test_sync_funcs_h',
 ]
 
 
