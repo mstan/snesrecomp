@@ -598,12 +598,36 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
             succs.append(sorted_addrs[idx + 1])
         return succs
 
+    # Pre-scan for PH{R} at function entry. When a function begins with
+    # a run of PH{R} pushes (saving the entry values of A/X/Y) and later
+    # pops them back, the PL{R}'s restore the entry values rather than
+    # defining new ones. The BFS below treats PL{R} as a write by default,
+    # which incorrectly severs the live-in chain from any fall-through
+    # or tail-call consumer. Example pattern that hit this:
+    #   PHY ; JSR sub ; PLY ; <fall-through to foo(j)>
+    # PLY restores the entry Y, fall-through reads it → Y IS live-in.
+    # Skipping PL{R}'s write for registers that were push-saved at entry
+    # produces the correct result.
+    _pl_for = {'A': 'PLA', 'X': 'PLX', 'Y': 'PLY'}
+    _entry_pushed: Set[str] = set()
+    for _insn in insns:
+        if _insn.mnem == 'PHA':
+            _entry_pushed.add('A')
+        elif _insn.mnem == 'PHX':
+            _entry_pushed.add('X')
+        elif _insn.mnem == 'PHY':
+            _entry_pushed.add('Y')
+        else:
+            break  # stop at first non-PH{R} instruction
+
     def _reg_live_in(reg: str) -> Optional[int]:
         # BFS with binary 'defined' state. Each (addr, defined) pair visited
         # at most once -> linear time.
         from collections import deque
         queue = deque([(start16, False)])
         visited = set()
+        _skip_pl_write = reg in _entry_pushed
+        _pl_mnem = _pl_for[reg]
         while queue:
             addr, defined = queue.popleft()
             key = (addr, defined)
@@ -629,6 +653,14 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
                     next_insn = insn_by_addr.get(sorted_addrs[idx + 1])
                     if next_insn is not None and next_insn.mnem in ('BVS', 'BVC'):
                         reads = False
+            # PL{R} matching an entry PH{R}: restores the entry value.
+            # Downstream reads are reads of the entry value, so the BFS
+            # must treat the post-PL state as "not defined yet" (same as
+            # at function entry). This is stronger than just dropping
+            # writes -- it also cancels any `defined` that got set by an
+            # intermediate JSR's conservative clobber, because the
+            # intervening clobber is itself insulated by the PH/PL pair.
+            _is_restoring_pl = _skip_pl_write and insn.mnem == _pl_mnem
             # JSR/JSL/JMP/BRA/BRL (call or tail transfer): ask the target's
             # declared sig whether it consumes this register. If so, the
             # transfer is a READ of the register — any caller-side code
@@ -689,6 +721,13 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
                     pass
                 else:
                     new_defined = True
+            # PL{R} matching an entry PH{R} restores the entry value, so
+            # state goes back to "not defined" regardless of what any
+            # intervening op did. Applied AFTER the JSR clobber
+            # propagation so it cancels the conservative JSR-clobbers-
+            # everything default.
+            if _is_restoring_pl:
+                new_defined = False
             for succ in _succs(addr):
                 queue.append((succ, new_defined))
         return None
@@ -1453,6 +1492,18 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
             if nf_sig:
                 _nr, nf_params = parse_sig(nf_sig)
                 pnames = {pn for _pt, pn in nf_params}
+                # Identify registers push-saved at entry. A PL{R} that
+                # matches an entry PH{R} restores the entry value, so
+                # treating it as a "body write" blocks legitimate fall-
+                # through-to-consumer propagation (e.g. HandleMenuCursor_
+                # 9ACB: PHY ; JSR ; PLY ; <falls through to consumer(j)>).
+                _entry_pushed: Set[str] = set()
+                for _insn in insns:
+                    if _insn.mnem == 'PHA': _entry_pushed.add('A')
+                    elif _insn.mnem == 'PHX': _entry_pushed.add('X')
+                    elif _insn.mnem == 'PHY': _entry_pushed.add('Y')
+                    else: break
+                _pl_for = {'A': 'PLA', 'X': 'PLX', 'Y': 'PLY'}
                 # Only propagate if no local def of that reg exists
                 # anywhere in the body (conservative: if the body writes
                 # the reg, the fall-through's consumption uses the local
@@ -1462,8 +1513,12 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                         continue
                     if pname not in pnames:
                         continue
+                    _skip_pl = reg in _entry_pushed
+                    _pl_mnem = _pl_for[reg]
                     body_writes = any(
-                        _insn_reg_use(ins, reg)[1] for ins in insns
+                        _insn_reg_use(ins, reg)[1] and
+                        not (_skip_pl and ins.mnem == _pl_mnem)
+                        for ins in insns
                     )
                     if body_writes:
                         continue

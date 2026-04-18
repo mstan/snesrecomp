@@ -102,6 +102,81 @@ def test_BIT_abs_followed_by_BNE_still_reads_A():
 
 
 # ---------------------------------------------------------------------------
+# PHY/PLY save-restore pattern preserves Y-live-in across the pop
+# ---------------------------------------------------------------------------
+
+def test_PHY_PLY_save_restore_preserves_Y_liveness():
+    # PHY ; JSR $0100 ; PLY ; RTS
+    # with callee $0100 taking void() (doesn't read Y).
+    # PHY saves Y, PLY restores it. The whole body from the caller's
+    # perspective doesn't touch Y. Y should NOT be live-in here.
+    rom = bytes([0x5A, 0x20, 0x00, 0x01, 0x7A, 0x60])
+    insns = _build_insns(rom, 0x8000)
+    li = recomp.infer_live_in_regs(insns, 0x8000, bank=0,
+                                    callee_sigs={0x000100: 'void()'})
+    assert li['Y'] is None, (
+        f'PHY/PLY bracketing a void() call should not mark Y live-in, '
+        f'got Y={li["Y"]}'
+    )
+
+
+def test_PHY_then_PLY_then_tail_call_reads_Y():
+    # PHY ; JSR $0100 ; PLY ; JMP $0200 (tail call to consumer)
+    # Consumer $0200 takes uint8_j. PLY restores the entry Y, the tail
+    # JMP reads it. So Y IS live-in at entry. Previously the PLY was
+    # treated as a write that blocked propagation.
+    # Pattern matches HandleMenuCursor_9ACB at $00:9ACB.
+    rom = bytes([
+        0x5A,              # PHY
+        0x20, 0x00, 0x01,  # JSR $0100
+        0x7A,              # PLY
+        0x4C, 0x00, 0x02,  # JMP $0200
+    ])
+    insns = _build_insns(rom, 0x8000)
+    li = recomp.infer_live_in_regs(
+        insns, 0x8000, bank=0,
+        callee_sigs={
+            0x000100: 'void()',       # inner: doesn't consume Y
+            0x000200: 'void(uint8_j)',  # tail target: consumes Y
+        },
+        # Inner preserves Y (empty clobber set) -- the JSR to it doesn't
+        # kill Y tracking. The whole point of this pattern is that the
+        # entry PHY insulates against exactly this kind of intermediate
+        # clobber, but we need the non-clobbering path covered too.
+        callee_clobbers={0x000100: set()},
+    )
+    assert li['Y'] == 8, (
+        f'PHY ; JSR sub ; PLY ; JMP consumer(j) should propagate Y '
+        f'live-in from the tail call, got Y={li["Y"]}'
+    )
+
+
+def test_PLY_without_entry_PHY_still_defines_Y():
+    # JSR $0100 ; PLY ; RTS  -- no entry PHY.
+    # PLY without a matching entry PHY is a real Y-defining stack pop
+    # (e.g. pulling a value the callee left on the stack). It should
+    # still count as a write and prevent Y from being live-in through
+    # subsequent consumers.
+    rom = bytes([
+        0x20, 0x00, 0x01,  # JSR $0100
+        0x7A,              # PLY
+        0x4C, 0x00, 0x02,  # JMP $0200
+    ])
+    insns = _build_insns(rom, 0x8000)
+    li = recomp.infer_live_in_regs(
+        insns, 0x8000, bank=0,
+        callee_sigs={
+            0x000100: 'void()',
+            0x000200: 'void(uint8_j)',
+        },
+    )
+    assert li['Y'] is None, (
+        f'PLY without preceding PHY at entry is a real write; Y should '
+        f'not be live-in via the subsequent tail call, got Y={li["Y"]}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # `preserves` cfg directive
 # ---------------------------------------------------------------------------
 
