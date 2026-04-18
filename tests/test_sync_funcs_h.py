@@ -213,6 +213,50 @@ def test_sync_funcs_h_propagates_gen_params_when_no_hand_body():
     )
 
 
+def test_sync_funcs_h_drops_stale_pointer_param_when_no_hand_body():
+    # When a previous hand body used a synthetic pointer parameter
+    # (e.g. `ExtCollOut *out`) and funcs.h still declares it, un-skipping
+    # the function should drop that param — pointers aren't derivable
+    # from live-in analysis (live-in only adds register-style uint8
+    # params named k/j/a/x/y). A pointer in gen's params must have been
+    # inherited from funcs.h via _reconcile_sig's specificity choice;
+    # without this filter the pointer param persists forever and
+    # un-skipping is impossible.
+    sfh = _load_sync_funcs_h()
+    if sfh is None:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        funcs_h = pathlib.Path(tmpdir) / 'funcs.h'
+        funcs_h.write_text(
+            '#ifndef TEST_FUNCS_H_\n'
+            '#define TEST_FUNCS_H_\n'
+            '#include "smw_rtl.h"\n'
+            'uint8 HandleExtFake(uint8 k, ExtCollOut *out);\n'
+            '#endif\n'
+        )
+        sfh.FUNCS_H = funcs_h
+        sfh.collect_cfg_sigs = lambda: {
+            0x02A56E: ('HandleExtFake', 'uint8(uint8_k)'),
+        }
+        # Gen inherited the pointer param via _reconcile_sig's
+        # specificity bias from funcs.h.
+        sfh.collect_gen_sigs = lambda: {
+            0x02A56E: ('HandleExtFake', 'uint8(uint8_k,ExtCollOut*_out)'),
+        }
+        sfh.collect_hand_body_fnames = lambda: set()
+
+        sfh.main()
+        out = funcs_h.read_text()
+
+    assert 'uint8 HandleExtFake(uint8 k)' in out, (
+        f'sync_funcs_h kept stale pointer param when no hand body '
+        f'exists\nout=\n{out}'
+    )
+    assert 'ExtCollOut' not in out, (
+        f'stale ExtCollOut pointer param still declared\nout=\n{out}'
+    )
+
+
 def test_sync_funcs_h_preserves_pointer_return_when_no_hand_body():
     # SNES functions that "return a pointer" actually communicate via
     # DP writes; the recompiler emits them as void bodies. funcs.h
