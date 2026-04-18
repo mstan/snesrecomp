@@ -4484,6 +4484,12 @@ class Config:
         # dp_sync: {dp_addr: sync_func_name} --call sync_func after writing to dp_addr
         self.dp_sync: Dict[int, str] = {}
         self._skip_all: bool = False  # skip all funcs (emit no bodies in gen)
+        # preserves: {full_addr: set of registers ('A','X','Y') the callee
+        # preserves}. Used for HLE/WRAM-resident callees whose body isn't
+        # in ROM, so per-bank augmentation can't analyze them. The
+        # liveness pass consumes this through cfg.clobbers (populated as
+        # {A,X,Y} - preserves_set at import time).
+        self.preserves: Dict[int, Set[str]] = {}
 
 
 def parse_config(path: str) -> Config:
@@ -4610,6 +4616,18 @@ def parse_config(path: str) -> Config:
             elif key == 'no_autodiscover':
                 # no_autodiscover <addr_hex> --block intra-bank auto-promote for this addr
                 cfg.no_autodiscover.add(int(parts[1], 16))
+            elif key == 'preserves':
+                # preserves <full_addr_hex> [A] [X] [Y] --HLE/WRAM callee
+                # preserves the listed registers. Empty list means preserves
+                # none (callee clobbers everything -- same as default). Use
+                # for callees not declared as `func` in any bank cfg, where
+                # the recompiler can't infer clobbers from ROM code.
+                full_addr = int(parts[1], 16)
+                regs = set()
+                for tok in parts[2:]:
+                    if tok.upper() in ('A', 'X', 'Y'):
+                        regs.add(tok.upper())
+                cfg.preserves[full_addr] = regs
             elif key == 'skip_all':
                 cfg._skip_all = True
             elif key == 'skip_all_except':
@@ -5570,6 +5588,15 @@ def main():
                 clob.discard('X')
             cfg.clobbers[full_addr] = clob
             xbank_clobber_count += 1
+        # Import sibling's `preserves` hints — these describe HLE/WRAM
+        # callees the sibling bank declared. The current bank may JSL to
+        # those addresses too, so we need the preserves data here.
+        for p_addr, p_regs in sib_cfg.preserves.items():
+            cfg.clobbers[p_addr] = {'A', 'X', 'Y'} - p_regs
+    # Apply current cfg's own preserves hints (override any sibling-derived
+    # entry, since the owner cfg is authoritative).
+    for p_addr, p_regs in cfg.preserves.items():
+        cfg.clobbers[p_addr] = {'A', 'X', 'Y'} - p_regs
     if xbank_clobber_count:
         print(f'  [xbank-clobbers] imported {xbank_clobber_count} cross-bank clobber sets',
               file=sys.stderr)
