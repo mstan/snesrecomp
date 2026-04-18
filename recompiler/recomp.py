@@ -4482,112 +4482,8 @@ class Config:
         self.jsl_dispatch_long: Set[int] = set()  # 3-byte long-pointer tables (A-indexed)
         self.default_init_y: Optional[str] = None  # bank-wide Y init hint
         # dp_sync: {dp_addr: sync_func_name} --call sync_func after writing to dp_addr
-        # ORACLE BRIDGE: remove when all banks are recompiled and oracle is gone
         self.dp_sync: Dict[int, str] = {}
-        self.oracle_path: Optional[str] = None  # path to oracle source file
-        self.oracle_blocks: Dict[str, str] = {}  # func_name -> oracle block content
-        self._skip_all: bool = False  # skip all funcs (oracle fallback test mode)
-
-def parse_oracle_blocks(oracle_path: str, bank: int) -> Dict[str, str]:
-    """Parse oracle source file, extract #ifndef RECOMP_BANKXX blocks keyed by function name.
-    Also extracts non-function content (static const data, forward decls) into a special
-    '__preamble__' key so oracle fallback functions can reference their data arrays."""
-    guard = f'RECOMP_BANK{bank:02X}'
-    blocks: Dict[str, str] = {}
-    preamble_lines: List[str] = []
-    with open(oracle_path) as f:
-        text = f.read()
-    # Split on #ifndef guard blocks (supports both old-style #ifndef and new-style #if !defined)
-    pattern = re.compile(
-        r'(?:#ifndef\s+' + re.escape(guard) + r'|#if\s+!defined\(' + re.escape(guard) + r'\)\s*&&\s*!defined\(RECOMP_0D_\w+\))'
-        r'\s*\n(.*?)#endif\s*(?://[^\n]*)?\s*\n',
-        re.DOTALL
-    )
-    for m in pattern.finditer(text):
-        body = m.group(1)
-        # Extract function name from the body (first line is the signature)
-        sig_match = re.match(r'\s*\w+\s+(\w+)\s*\(', body)
-        if sig_match:
-            blocks[sig_match.group(1)] = body.rstrip('\n')
-    # Extract static/const data arrays needed by oracle fallback functions.
-    # Capture the region between the last #include and the first #ifndef guard --
-    # this contains all file-scope static const declarations.
-    lines_list = text.split('\n')
-    last_include_idx = 0
-    first_guard_idx = len(lines_list)
-    for i, line in enumerate(lines_list):
-        if line.strip().startswith('#include'):
-            last_include_idx = i
-        if re.match(r'(?:#ifndef\s+' + re.escape(guard) + r'|#if\s+!defined\(' + re.escape(guard) + r'\))', line.strip()):
-            first_guard_idx = i
-            break
-    # Collect ALL static/const data declarations from the oracle file.
-    # These may be:
-    # 1. Between #include and first guard (file-scope constants)
-    # 2. Between guard blocks (inter-block file-scope constants)
-    # Collect ALL static/const data declarations from the oracle file.
-    # These may be at file scope (between guard blocks) or inside guard blocks
-    # (before function bodies). Uses brace-depth tracking for multi-line arrays.
-    preamble_parts = []
-    past_includes = False
-    in_guard = False
-    in_func_depth = 0  # brace depth inside function bodies
-    collecting = []
-    collect_depth = 0
-    for line in lines_list:
-        stripped = line.strip()
-        if stripped.startswith('#include'):
-            past_includes = True
-            continue
-        if not past_includes:
-            continue
-        # Track #ifndef guards
-        if re.match(r'#ifndef\s+' + re.escape(guard), stripped):
-            in_guard = True; continue
-        if stripped.startswith('#endif') and in_guard:
-            in_guard = False; in_func_depth = 0; continue
-        # Track function bodies via brace depth (skip data inside functions)
-        if in_guard or not in_guard:
-            # Count braces to detect function bodies vs data arrays
-            opens = stripped.count('{')
-            closes = stripped.count('}')
-            if collecting:
-                # Continue collecting multi-line data declaration
-                collecting.append(line)
-                collect_depth += opens - closes
-                if collect_depth <= 0:
-                    preamble_parts.append('\n'.join(collecting))
-                    collecting = []
-                    collect_depth = 0
-                continue
-            # Detect function definition (has return type, name, params, and opening brace)
-            # Function signatures look like: "type name(...) {" or "type name(...) {"
-            if in_func_depth > 0:
-                in_func_depth += opens - closes
-                continue
-            if (re.match(r'(void|uint\d+|int\d*|bool|OwHvPos|static void)\s+\w+\s*\(', stripped)
-                    and '{' in stripped):
-                in_func_depth = 1 + opens - closes
-                continue
-            # Start collecting a data declaration (static const / const with '=')
-            is_data = ((stripped.startswith('static const ') or
-                        (stripped.startswith('const ') and '[' in stripped))
-                       and '=' in stripped)
-            # Skip function pointer tables (void (*kName...)  --they need fwd decls)
-            if stripped.startswith('void (*') or stripped.startswith('static FuncV'):
-                is_data = False
-            if is_data:
-                depth = opens - closes
-                if depth <= 0:
-                    # Single-line declaration
-                    preamble_parts.append(line)
-                else:
-                    # Multi-line declaration --start collecting
-                    collecting = [line]
-                    collect_depth = depth
-    if preamble_parts:
-        blocks['__preamble__'] = '\n'.join(preamble_parts)
-    return blocks
+        self._skip_all: bool = False  # skip all funcs (emit no bodies in gen)
 
 
 def parse_config(path: str) -> Config:
@@ -4714,26 +4610,19 @@ def parse_config(path: str) -> Config:
             elif key == 'no_autodiscover':
                 # no_autodiscover <addr_hex> --block intra-bank auto-promote for this addr
                 cfg.no_autodiscover.add(int(parts[1], 16))
-            elif key == 'oracle':
-                # oracle <relative_path_to_oracle_source>
-                cfg.oracle_path = os.path.normpath(os.path.join(os.path.dirname(path), parts[1]))
             elif key == 'skip_all':
                 cfg._skip_all = True
             elif key == 'skip_all_except':
                 cfg._skip_all = True
                 cfg._skip_all_except = set(parts[1:])
 
-    # skip_all: mark every func as skipped (oracle fallback handles them)
+    # skip_all: mark every func as skipped (no body emitted in gen)
     # skip_all_except: skip all except the listed functions
     if getattr(cfg, '_skip_all', False):
         except_set = getattr(cfg, '_skip_all_except', set())
         for fname, _a, _s, _e, _m, _h in cfg.funcs:
             if fname not in except_set:
                 cfg.skip.add(fname)
-
-    # Parse oracle blocks if oracle path is set
-    if cfg.oracle_path:
-        cfg.oracle_blocks = parse_oracle_blocks(cfg.oracle_path, cfg.bank)
 
     return cfg
 
@@ -5372,16 +5261,17 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                             if range_start <= i <= range_end]
         funcs_with_end = [f for i, f in enumerate(funcs_with_end)
                           if range_start <= i <= range_end]
-        # Also collect function names from verbatim blocks and oracle fallbacks (always emitted)
+        # Also collect function names from verbatim blocks (always emitted)
         verbatim_func_names = []
         for vline in cfg.verbatim:
             vm = re.match(r'(?:void|uint8|uint16|int)\s+(\w+)\s*\(', vline)
             if vm:
                 verbatim_func_names.append(vm.group(1))
-        # Oracle fallback (skip, non-dispatch) functions are also always emitted into the gen file
-        oracle_fallback_names = [s for s in cfg.skip if s not in cfg.dispatch] if cfg.skip else []
-        all_range_names = range_func_names + verbatim_func_names + oracle_fallback_names
-        # Generate range header — tells the oracle which functions the gen file provides
+        # Skip (non-dispatch) funcs are provided by hand-written src/smw_XX.c;
+        # declare them in the range header so banks.h marks them externally provided.
+        external_skip_names = [s for s in cfg.skip if s not in cfg.dispatch] if cfg.skip else []
+        all_range_names = range_func_names + verbatim_func_names + external_skip_names
+        # Generate range header --tells consumers which functions this gen file (or its
         # Write to bank_range.h (included via banks.h which is force-included everywhere)
         bank_range_path = os.path.join(os.path.dirname(os.path.abspath(out_path or 'src/gen/dummy')),
                                        'bank_range.h')
@@ -5414,51 +5304,10 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         lines.extend(fwd_lines)
         lines.append('')
 
-    # Verbatim block and oracle fallback (skip in prefix/test mode)
+    # Verbatim block (skip in prefix/test mode)
     if not prefix and cfg.verbatim:
         lines.extend(cfg.verbatim)
         lines.append('')
-
-    if not prefix and cfg.oracle_blocks:
-        skip_names_using_oracle = [s for s in cfg.skip if s in cfg.oracle_blocks]
-        if skip_names_using_oracle and '__preamble__' in cfg.oracle_blocks:
-            _defined_arrays: set = set()
-            _arr_re = re.compile(r'\s*(?:static\s+)?const\s+\w+\s+(\w+)\s*\[')
-            for vline in cfg.verbatim:
-                _am = _arr_re.match(vline)
-                if _am:
-                    _defined_arrays.add(_am.group(1))
-            for dspec in cfg.data:
-                _defined_arrays.add(dspec['decl'].split('[')[0].strip())
-            preamble_text = cfg.oracle_blocks['__preamble__']
-            filtered = []
-            skip_depth = 0
-            for pline in preamble_text.split('\n'):
-                if skip_depth > 0:
-                    skip_depth += pline.count('{') - pline.count('}')
-                    continue
-                if pline.strip().startswith('#include'):
-                    continue
-                _pm = _arr_re.match(pline)
-                if _pm and _pm.group(1) in _defined_arrays:
-                    depth = pline.count('{') - pline.count('}')
-                    if depth > 0:
-                        skip_depth = depth
-                    continue
-                filtered.append(pline)
-            preamble_text = '\n'.join(filtered)
-            if preamble_text.strip():
-                lines.append('// Oracle data arrays (needed by oracle fallback functions)')
-                lines.append(preamble_text)
-                lines.append('')
-        verbatim_text = '\n'.join(cfg.verbatim)
-        for skip_name in sorted(cfg.skip):
-            if skip_name in cfg.dispatch:
-                continue  # provided by dispatch file, don't emit
-            if skip_name in cfg.oracle_blocks and skip_name not in verbatim_text:
-                lines.append(f'// Oracle fallback for {skip_name}')
-                lines.append(cfg.oracle_blocks[skip_name])
-                lines.append('')
 
     # Known addresses for dispatch table boundary detection
     known_addrs: Set[int] = set(cfg.names.keys())
