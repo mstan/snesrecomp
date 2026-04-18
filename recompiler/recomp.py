@@ -5543,6 +5543,14 @@ def main():
         cfg.clobbers = {}
     if not hasattr(cfg, 'x_restores'):
         cfg.x_restores = {}
+    # Global funcname -> full_addr map. Used below to alias cfg.clobbers
+    # by C-symbol name resolution (cross-bank name entries may point at
+    # trampoline/alias addresses whose clobbers are actually those of a
+    # differently-addressed func with the same name, e.g. $01:802A's
+    # `HandleNormalSpriteGravity` resolves in C to $01:9032's body).
+    funcname_to_addr: Dict[str, int] = {}
+    for fname, addr, *_ in cfg.funcs:
+        funcname_to_addr[fname] = (cfg.bank << 16) | addr
     xbank_clobber_count = 0
     for sibling in sorted(_glob.glob(os.path.join(cfg_dir_abs, 'bank*.cfg'))):
         sib_base = os.path.basename(sibling)
@@ -5556,6 +5564,8 @@ def main():
             continue
         if sib_cfg.bank is None:
             continue
+        for fname, addr, *_ in sib_cfg.funcs:
+            funcname_to_addr.setdefault(fname, (sib_cfg.bank << 16) | addr)
         sib_funcs = sorted(sib_cfg.funcs, key=lambda t: t[1])
         for i, (sfname, start_addr, _ssig, eovr, mo, _sh) in enumerate(sib_funcs):
             if sfname in sib_cfg.skip:
@@ -5597,8 +5607,32 @@ def main():
     # entry, since the owner cfg is authoritative).
     for p_addr, p_regs in cfg.preserves.items():
         cfg.clobbers[p_addr] = {'A', 'X', 'Y'} - p_regs
-    if xbank_clobber_count:
-        print(f'  [xbank-clobbers] imported {xbank_clobber_count} cross-bank clobber sets',
+
+    # Name-resolution alias pass
+    # --------------------------
+    # ROM JSL targets are addresses, and cfg.clobbers is address-keyed.
+    # But cross-bank `name <addr> <N>` entries sometimes point at an
+    # address that has no owning `func` entry (e.g., a JSL trampoline
+    # in the owner bank). The C linker resolves those calls by symbol
+    # name to the canonical `func N` body at a different address, so
+    # the RUNTIME clobbers at the call site are those of the canonical
+    # function. Mirror that in cfg.clobbers: for every name entry whose
+    # address lacks clobber data, resolve the name to its canonical
+    # address and copy the clobber set across.
+    alias_count = 0
+    for full_addr, name in list(cfg.names.items()):
+        if full_addr in cfg.clobbers:
+            continue
+        canonical = funcname_to_addr.get(name)
+        if canonical is None or canonical not in cfg.clobbers:
+            continue
+        cfg.clobbers[full_addr] = cfg.clobbers[canonical]
+        if canonical in cfg.x_restores:
+            cfg.x_restores.setdefault(full_addr, cfg.x_restores[canonical])
+        alias_count += 1
+    if xbank_clobber_count or alias_count:
+        print(f'  [xbank-clobbers] imported {xbank_clobber_count} cross-bank clobber sets, '
+              f'aliased {alias_count} name-resolved entries',
               file=sys.stderr)
 
     # Locate funcs.h — prefer output-relative (game project's copy) over
