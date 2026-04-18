@@ -978,6 +978,13 @@ def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int
     A/X/Y live-in and the sig doesn't already pass it via a register param,
     one is appended.
 
+    This pass only WIDENS: it never drops a param that's already in the
+    sig, even when live-in says the register isn't consumed. Rationale:
+    live-in analysis is conservative and has known gaps (mid-body
+    scribble-restore PHX...PLX patterns, values read through DP
+    indirection, etc.), and hand-written src/smw_*.c callers codify
+    the true ABI. Dropping a sig param would break those callers.
+
     Convention (matches existing cfg usage):
       - A live-in -> append `uint8_a` / `uint16_a`.
       - X live-in -> append `uint8_k` / `uint16_k`.
@@ -1465,6 +1472,7 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                 rom, cfg.bank, start_addr, end=end_addr,
                 jsl_dispatch=cfg.jsl_dispatch or None,
                 jsl_dispatch_long=cfg.jsl_dispatch_long or None,
+                dispatch_known_addrs=known_func_addrs,
                 mode_overrides=mo or None,
                 exclude_ranges=cfg.exclude_ranges or None,
                 known_func_starts=known_func_addrs,

@@ -297,3 +297,68 @@ def test_augment_without_preserves_uses_heuristic():
         f'no preserves hint + body writes Y => heuristic should flag Y, '
         f'got clobbers={cfg.clobbers[0x008000]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue A: dispatch decode no longer pollutes caller live-in
+# ---------------------------------------------------------------------------
+
+def test_decode_func_terminates_dispatch_when_all_handlers_known():
+    # Pin the decoder contract: when a JSL is to a declared jsl_dispatch
+    # helper, and dispatch_known_addrs includes every table entry, the
+    # decoder must mark the JSL as dispatch_terminal and NOT queue the
+    # handler addresses into pending_fwd. Without this, handler bodies
+    # get stapled into the caller's insn list (sorted_addrs[idx+1] in
+    # infer_live_in_regs._succs can then walk fall-through from the
+    # caller's JSL into a handler body, polluting the caller's live-in
+    # with reads that reach the caller only via dispatch).
+    #
+    # The pollution path in real SMW: SprStatus08 JSLs to $0086DF
+    # (sprite-status dispatcher), followed by a 16-byte table of sprite
+    # handler addresses. Without dispatch_known_addrs, the augment pass
+    # decodes every handler body into SprStatus08's insns.
+    rom_bytes = bytearray(0x20000)
+    # Caller body at $8000: JSL $0000 80 00 (4 bytes), then 2-byte
+    # entries $9000 $9010 (4 bytes). Caller's end=0x10000 (whole bank)
+    # to mirror real-world decode (where the caller's end is set
+    # generously and pending_fwd entries survive the end-filter).
+    rom_bytes[0x0000] = 0x22  # JSL
+    rom_bytes[0x0001] = 0x80
+    rom_bytes[0x0002] = 0x00
+    rom_bytes[0x0003] = 0x00
+    rom_bytes[0x0004] = 0x00; rom_bytes[0x0005] = 0x90  # entry0 = $9000
+    rom_bytes[0x0006] = 0x10; rom_bytes[0x0007] = 0x90  # entry1 = $9010
+    rom_bytes[0x0008] = 0x00; rom_bytes[0x0009] = 0x00  # table terminator
+    # Handler A: LDY $12 ; RTS (a Y-read the pollution path would drag
+    # into the caller's insns).
+    rom_bytes[0x1000] = 0xA4; rom_bytes[0x1001] = 0x12
+    rom_bytes[0x1002] = 0x60
+    rom_bytes[0x1010] = 0x60  # handler B: RTS
+    rom = bytes(rom_bytes)
+
+    # Decode the caller with dispatch_known_addrs populated. The
+    # decoder should see all entries as known and mark dispatch
+    # terminal — the returned insns list contains only the caller's
+    # own JSL, not the handler bodies.
+    known = {0x008000, 0x009000, 0x009010}
+    insns = recomp.decode_func(
+        rom, bank=0, start=0x8000, end=0x800A,
+        jsl_dispatch={0x000080},
+        dispatch_known_addrs=known,
+        known_func_starts=known,
+        validate_branches=False,
+    )
+    insn_addrs = sorted(i.addr & 0xFFFF for i in insns)
+    # Caller body has exactly 1 instruction (the JSL); no handler
+    # bodies should be in the decoded list.
+    handler_addrs = [a for a in insn_addrs if a >= 0x9000]
+    assert not handler_addrs, (
+        f'handler bodies leaked into caller insns: {handler_addrs!r}'
+    )
+    # And the JSL must be flagged terminal.
+    jsl_insn = next(i for i in insns if i.mnem == 'JSL')
+    assert jsl_insn.dispatch_terminal, (
+        'JSL to known-dispatch-helper with all entries known must be '
+        'marked dispatch_terminal so the caller treats it as a path '
+        'terminator (no fall-through merge of the table bytes).'
+    )
