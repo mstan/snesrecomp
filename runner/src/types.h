@@ -121,8 +121,18 @@ typedef struct OamEnt {
   uint8 flags;
 } OamEnt;
 
-typedef void FuncU8(uint8 kk);
-typedef void FuncV(void);
+// Dispatch table function-pointer typedefs.
+// Each is the shape of a handler cast from a JSL/JSR dispatch site.
+// The recompiler picks one based on the UNION of live-in registers across
+// all handlers in a given dispatch table: if any handler reads Y at
+// entry, all handlers in that table must be declared to accept `j`, and
+// so on. Mixing shapes within one table would produce cast-mismatch UB,
+// so the emitter upgrades the whole table to the widest shape needed.
+typedef void FuncV(void);              // no live-in registers
+typedef void FuncU8(uint8 kk);         // k only (X live-in)
+typedef void FuncU8J(uint8 kk, uint8 jj);        // k + j (X + Y live-in)
+typedef void FuncU8A(uint8 kk, uint8 aa);        // k + a (X + A live-in)
+typedef void FuncU8JA(uint8 kk, uint8 jj, uint8 aa);  // k + j + a
 
 // Some convenience macros to make partial accesses nicer
 #define LAST_IND(x,part_type)    (sizeof(x)/sizeof(part_type) - 1)

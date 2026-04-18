@@ -1210,31 +1210,90 @@ def auto_promote_branch_targets(rom: bytes, cfg) -> int:
     return added
 
 
-def _sig_matches_dispatch_shape(sig: Optional[str]) -> bool:
-    """True if `sig` has a parameter list compatible with a dispatch cast
-    (`()` or `(uint8 k)`).
+_DISPATCH_SHAPE_NAMES = ('k', 'j', 'a')
 
-    The return type is irrelevant for dispatch safety: casting a
-    RetY/RetAY/uint8-returning function to `FuncU8*` and calling it
-    through the pointer just discards the return value at the ABI level
-    (the struct is returned in the normal register, the caller ignores
-    it). What WOULD crash is a mismatched param count — `void(uint8_k,
-    uint8_a)` declared but called with only `k` leaves `a` as
-    uninitialised register state in the callee. So we gate only on
-    params.
 
-    Consumers that legitimately need the return (direct JSR callers,
-    not dispatch callers) still see the full RetAY sig and consume the
-    struct normally.
+def _sig_matches_dispatch_shape(sig: Optional[str],
+                                 allow_shape: Optional[frozenset] = None) -> bool:
+    """True if `sig`'s parameter list is compatible with a dispatch cast.
+
+    `allow_shape` is the UNION of register-param names the dispatch
+    table's FuncU8*/FuncU8J*/FuncU8A/FuncU8JA cast will pass through.
+    - If `allow_shape` is None, fall back to the legacy narrow contract
+      (`()` or `(uint8 k)`).
+    - Otherwise, any ordered subset of `{'k', 'j', 'a'}` contained in
+      `allow_shape` is OK. The canonical order is k, j, a so the emitted
+      cast type is deterministic.
+
+    Return type is irrelevant for dispatch safety — casting a
+    RetY/RetAY/uint8-returning function through a FuncU8* just discards
+    the return at the ABI level. The crash mode is a param count
+    mismatch, so we gate only on params.
     """
     if sig is None:
         return True
     _ret, params = parse_sig(sig)
-    if len(params) == 0:
-        return True
-    if len(params) == 1 and params[0][1] == 'k':
-        return True
-    return False
+    # Legacy narrow contract when no table shape is supplied.
+    if allow_shape is None:
+        if len(params) == 0:
+            return True
+        if len(params) == 1 and params[0][1] == 'k':
+            return True
+        return False
+    # Widened contract: every param name must be in the allow_shape,
+    # and params must appear in canonical k/j/a order.
+    last_idx = -1
+    for _t, n in params:
+        if n not in _DISPATCH_SHAPE_NAMES:
+            return False
+        if n not in allow_shape:
+            return False
+        idx = _DISPATCH_SHAPE_NAMES.index(n)
+        if idx <= last_idx:
+            return False  # out-of-order or duplicate
+        last_idx = idx
+    return True
+
+
+def _dispatch_shape_sig(ret: str, shape: frozenset) -> str:
+    """Build a sig string for a handler whose table demands `shape`.
+    Params are emitted in canonical k/j/a order."""
+    params = [f'uint8_{n}' for n in _DISPATCH_SHAPE_NAMES if n in shape]
+    if not params:
+        return f'{ret}()'
+    return f'{ret}(' + ','.join(params) + ')'
+
+
+def _dispatch_typedef_for_shape(shape: frozenset) -> Tuple[str, List[str]]:
+    """Return (typedef_name, call_arg_names) for the given dispatch
+    table shape.
+
+    Typedef family (see snesrecomp/runner/src/types.h):
+      ()            -> FuncV
+      (k)           -> FuncU8
+      (k, j)        -> FuncU8J
+      (k, a)        -> FuncU8A
+      (k, j, a)     -> FuncU8JA
+    A table with just (j) or (a) alone is unusual; we still emit an
+    ordered-subset typedef (always canonical k, j, a order). For
+    {'j'} only we conservatively upgrade to {'k','j'} so we hit the
+    shared FuncU8J typedef; the handler ignores k.
+    """
+    has_k = 'k' in shape
+    has_j = 'j' in shape
+    has_a = 'a' in shape
+    # Canonicalize: j/a without k still use the k-including typedef.
+    if has_j or has_a:
+        has_k = True
+    if has_k and has_j and has_a:
+        return ('FuncU8JA', ['k', 'j', 'a'])
+    if has_k and has_a:
+        return ('FuncU8A', ['k', 'a'])
+    if has_k and has_j:
+        return ('FuncU8J', ['k', 'j'])
+    if has_k:
+        return ('FuncU8', ['k'])
+    return ('FuncV', [])
 
 
 def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
@@ -1257,12 +1316,19 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     both by recomp.py's main codegen loop and by sync_funcs_h.py so that
     on-disk funcs.h agrees with what the recompiler emits.
     """
-    # Collect dispatch-table targets FIRST so the augment pass knows
-    # which functions must keep a FuncU8-compatible sig. Every entry in
-    # a jump table gets cast to `FuncU8*` / `FuncV*` at emit time; that
-    # cast assumes a fixed 0- or 1-argument shape, so widening a
-    # dispatch-target sig leaves later params as garbage at call time.
-    cfg.dispatch_target_addrs = _collect_dispatch_targets(rom, cfg)
+    # Collect dispatch-table handler groups FIRST so the augment pass
+    # knows (a) which functions must keep a dispatch-compatible sig
+    # (the flat set, see `dispatch_target_addrs`), and (b) which
+    # handlers share a table with which other handlers (so they can
+    # all upgrade to the same union shape).
+    cfg.dispatch_tables = _collect_dispatch_tables(rom, cfg)
+    cfg.dispatch_target_addrs: Set[int] = set()
+    # For each dispatch target, map to the widest shape any of its
+    # tables demands. Computed lazily below after the first augment
+    # pass populates initial live-ins.
+    cfg.dispatch_shape = {}
+    for tbl in cfg.dispatch_tables:
+        cfg.dispatch_target_addrs |= tbl
 
     total_augmented = 0
     # Always run at least two passes: the first populates cfg.clobbers;
@@ -1274,10 +1340,65 @@ def augment_cfg_sigs_from_livein(rom: bytes, cfg) -> int:
     for _iter in range(8):
         changes = _augment_cfg_sigs_one_pass(rom, cfg)
         total_augmented += changes
+        # Recompute per-table union shapes from the latest sigs. A
+        # handler whose live-in grew this pass might upgrade its
+        # entire table's shape; that in turn forces sibling handlers
+        # to share the wider sig so the FuncU8J*/etc. cast stays
+        # consistent. Stored on cfg so the next augment pass reads
+        # the new bound via _sig_matches_dispatch_shape.
+        cfg.dispatch_shape = _compute_dispatch_table_shapes(cfg)
         if changes == 0 and _iter >= 1:
             break
     total_augmented += _promote_rety_from_caller_usage(rom, cfg)
     return total_augmented
+
+
+def _compute_dispatch_table_shapes(cfg) -> Dict[int, frozenset]:
+    """For each handler in any dispatch table, return the UNION of
+    register-parameter names needed across all handlers of the same
+    table. Entries are `{'k'}`, `{'k', 'j'}`, `{'k', 'a'}`, etc.
+    A handler that appears in multiple tables gets the union across
+    all its tables.
+
+    Union is computed from the pre-narrowing live-in data recorded by
+    `_augment_cfg_sigs_one_pass` (via `cfg._dispatch_handler_livein`).
+    Reading cfg.sigs directly wouldn't work: the narrowing cap caps
+    every dispatch target at (uint8 k) before the union is computed,
+    losing the information that a sibling handler originally wanted j
+    or a.
+
+    Output drives two things:
+      1. The augment pass uses `_sig_matches_dispatch_shape` with the
+         per-handler shape to allow widening up to the table's union
+         (instead of hard-capping at `(uint8 k)`).
+      2. The emitter picks the matching FuncU8/FuncU8J/FuncU8A/FuncU8JA
+         typedef at the cast site.
+    """
+    _REG_TO_PARAM = {'X': 'k', 'Y': 'j', 'A': 'a'}
+    handler_livein: Dict[int, Set[str]] = getattr(
+        cfg, '_dispatch_handler_livein', {})
+    tables = getattr(cfg, 'dispatch_tables', [])
+    out: Dict[int, frozenset] = {}
+    for tbl in tables:
+        tbl_union: Set[str] = set()
+        for addr in tbl:
+            for reg in handler_livein.get(addr, ()):
+                tbl_union.add(_REG_TO_PARAM[reg])
+            # Also union in whatever cfg.sigs already says the handler
+            # takes — explicit cfg sig: hints are ROM-authoritative
+            # the same way live-in is.
+            sig = cfg.sigs.get(addr)
+            if sig is not None:
+                _ret, params = parse_sig(sig)
+                for _t, n in params:
+                    if n in ('k', 'j', 'a'):
+                        tbl_union.add(n)
+        shape = frozenset(tbl_union)
+        for addr in tbl:
+            prev = out.get(addr)
+            if prev is None or len(shape) > len(prev):
+                out[addr] = shape
+    return out
 
 
 def _insns_read_reg_post_jsr(caller_insns: List[Insn], jsr_pc: int,
@@ -1391,20 +1512,18 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
     return promoted
 
 
-def _collect_dispatch_targets(rom: bytes, cfg) -> Set[int]:
-    """Decode every function once and collect every dispatch-table entry.
-    Returns the set of full_addr values that appear as handlers in a
-    dispatch table.
+def _collect_dispatch_tables(rom: bytes, cfg) -> List[Set[int]]:
+    """Decode every function once and collect every dispatch table's
+    handler set. Returns a list where each element is the set of
+    full_addr handlers for one dispatch table.
 
-    Dispatch tables emit as `FuncU8*` / `FuncV*` casts in the generated
-    C. That cast assumes a fixed shape (`void(uint8 k)` or `void()`)
-    for every handler, so the augment pass MUST NOT widen any
-    dispatch-target function's sig beyond that shape — doing so would
-    make the C call pass fewer args than the function declares, leaving
-    later parameters as uninitialised stack/register reads. Real crash
-    mode: SprStatus01_Init's dispatch of SprXXX_Generic_Init_
-    StandardSpritesInit segfaulted when the augment pass added a second
-    `uint8 a` param the dispatch cast couldn't pass through.
+    Per-table grouping (vs a flat merged set) lets the augment pass
+    compute a UNION of live-in registers across handlers of the same
+    table. All handlers in a given table must share the same C param
+    list — otherwise the FuncU8*/FuncU8J*/... cast at the call site
+    would be a lie. If any handler reads Y at entry, every handler in
+    the table must accept `j`, with callers that genuinely don't
+    consume Y simply ignoring the extra parameter.
     """
     non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
                 if f not in cfg.skip]
@@ -1421,7 +1540,8 @@ def _collect_dispatch_targets(rom: bytes, cfg) -> Set[int]:
     known_func_addrs: Set[int] = set(cfg.names.keys())
     for _fname, addr, *_ in cfg.funcs:
         known_func_addrs.add((cfg.bank << 16) | addr)
-    targets: Set[int] = set()
+    tables: List[Set[int]] = []
+    seen_table_sigs: Set[frozenset] = set()
     for fname, saddr, _sig, _eovr, mo, _h in non_skip:
         try:
             insns = decode_func(rom, cfg.bank, saddr, end=ends.get(saddr, 0),
@@ -1435,16 +1555,35 @@ def _collect_dispatch_targets(rom: bytes, cfg) -> Set[int]:
         except Exception:
             continue
         for insn in insns:
-            if insn.dispatch_entries:
-                for entry in insn.dispatch_entries:
-                    if entry == 0:
-                        continue
-                    # Dispatch entries are bank-local addresses in almost
-                    # all SMW cases; cross-bank dispatch uses long table
-                    # entries (`jsl_dispatch_long`) whose emit path is
-                    # separate. Store as full_addr so augment can look
-                    # up by cfg.sigs key directly.
-                    targets.add((cfg.bank << 16) | (entry & 0xFFFF))
+            if not insn.dispatch_entries:
+                continue
+            handlers: Set[int] = set()
+            for entry in insn.dispatch_entries:
+                if entry == 0:
+                    continue
+                handlers.add((cfg.bank << 16) | (entry & 0xFFFF))
+            if not handlers:
+                continue
+            # De-duplicate: multiple JSLs to the same helper produce
+            # the same handler set — skip repeats so we don't double-
+            # count union live-ins.
+            key = frozenset(handlers)
+            if key in seen_table_sigs:
+                continue
+            seen_table_sigs.add(key)
+            tables.append(handlers)
+    return tables
+
+
+def _collect_dispatch_targets(rom: bytes, cfg) -> Set[int]:
+    """Flat superset of every dispatch-table handler across the bank.
+    Wrapper around _collect_dispatch_tables for consumers that only
+    care about "is this address ever a dispatch target" (e.g. the
+    narrowing guard in the augment pass).
+    """
+    targets: Set[int] = set()
+    for tbl in _collect_dispatch_tables(rom, cfg):
+        targets |= tbl
     return targets
 
 
@@ -1532,6 +1671,17 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                         continue
                     live_in[reg] = 8
         new_sig = _augment_sig_with_livein(current_sig, live_in)
+        # Record the pre-narrowing live-in for dispatch-union computation.
+        # After narrowing caps a handler's sig to (uint8_k), looking at
+        # cfg.sigs can no longer reveal that the handler originally
+        # needed j or a. Stash the raw live-in per handler so the table
+        # shape union can be computed from ground truth.
+        if not hasattr(cfg, '_dispatch_handler_livein'):
+            cfg._dispatch_handler_livein = {}
+        cfg._dispatch_handler_livein[full_addr] = {
+            reg for reg in ('A', 'X', 'Y')
+            if live_in.get(reg) is not None
+        }
         # Record whether this function clobbers A/X/Y without PHA/PLA-style
         # save-restore, so the call-site emitter can drop the caller's
         # register tracking instead of pretending the register was
@@ -1577,23 +1727,30 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                 # through this call on subsequent passes.
                 cfg.clobbers[full_addr].discard('X')
         # Dispatch-target guard: if this function is in any dispatch
-        # table, the cast site calls it as `FuncU8*` — the param list
-        # must stay `()` or `(uint8 k)`. Any wider param list would
-        # leave later params as garbage at dispatch-call time. The
-        # return type is unrestricted — a RetAY function called via
-        # FuncU8 just discards the return at the ABI level, which is
-        # the SNES-level behavior anyway.
+        # table, its param list must match the shape the cast at the
+        # dispatch site will pass through. The emitter picks among
+        # FuncV / FuncU8 / FuncU8J / FuncU8A / FuncU8JA based on the
+        # UNION of register live-ins across handlers of the same table
+        # (see _compute_dispatch_table_shapes). Any param outside the
+        # table's union shape would leave that argument uninitialized
+        # at call time.
         #
-        # Narrow (not just block widening): if `current_sig` / `new_sig`
-        # has excess params from earlier pollution (funcs.h seeded from
-        # a prior regen that widened the target), strip them back to
-        # a dispatch-compatible param list while preserving the return.
+        # Narrow (not just block widening): if `new_sig` has excess
+        # params outside the table's shape, strip them back while
+        # preserving the return type.
         dispatch_targets = getattr(cfg, 'dispatch_target_addrs', None)
         if (dispatch_targets is not None and full_addr in dispatch_targets
-                and new_sig is not None
-                and not _sig_matches_dispatch_shape(new_sig)):
-            ret_keep, _ps = parse_sig(new_sig)
-            new_sig = f'{ret_keep}(uint8_k)'
+                and new_sig is not None):
+            shape = getattr(cfg, 'dispatch_shape', {}).get(full_addr)
+            if not _sig_matches_dispatch_shape(new_sig, shape):
+                ret_keep, _ps = parse_sig(new_sig)
+                if shape is None:
+                    # Pre-first-table-compute: cap at the conservative
+                    # single-k shape and let the next augment iter
+                    # widen once the table union has been computed.
+                    new_sig = f'{ret_keep}(uint8_k)'
+                else:
+                    new_sig = _dispatch_shape_sig(ret_keep, shape)
         if new_sig is not None and new_sig != current_sig:
             cfg.sigs[full_addr] = new_sig
             augmented += 1
@@ -4035,8 +4192,30 @@ class EmitCtx:
             # Compact form: function pointer table. Null entries become
             # NULL and are skipped at dispatch time.
             arr_name = f'kDispatch_{tbl_addr:04x}'
-            func_type = 'FuncU8' if self.has_k else 'FuncV'
-            call_arg = 'k' if self.has_k else ''
+            # Determine the typedef to use based on the union of register
+            # parameters across all handlers in this table. A handler
+            # that accepts `uint8 k, uint8 j` can't be cast to FuncU8*
+            # without truncating — the call would pass only k and leave
+            # j as whatever garbage sits in the ABI's second-arg register.
+            # Widen the cast type to match the handler that needs the
+            # most parameters; sibling handlers simply ignore the extras.
+            tbl_shape: Set[str] = set()
+            for entry in insn.dispatch_entries:
+                if entry == 0:
+                    continue
+                h_sig = (self.func_sigs or {}).get((self.bank << 16) | entry)
+                if not h_sig:
+                    continue
+                _ret, h_params = parse_sig(h_sig)
+                for _t, n in h_params:
+                    if n in _DISPATCH_SHAPE_NAMES:
+                        tbl_shape.add(n)
+            func_type, cast_params = _dispatch_typedef_for_shape(frozenset(tbl_shape))
+            # Call args: use _build_call_args so the caller's X/Y/A
+            # tracking supplies k/j/a; warnings appear when the caller
+            # genuinely doesn't know the value.
+            synth_params = [('uint8', n) for n in cast_params]
+            call_arg = self._build_call_args(synth_params)
             has_null = any(e == 0 for e in insn.dispatch_entries)
             # Cast each handler to the dispatch table type. Some handlers
             # declare param types like `const uint8 *p0` or struct pointers

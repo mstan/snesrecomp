@@ -29,6 +29,116 @@ sys.path.insert(0, str(REPO / 'recompiler'))
 import recomp  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Issue B: FuncU8J / FuncU8A / FuncU8JA union-sig dispatch
+# ---------------------------------------------------------------------------
+
+def test_dispatch_typedef_for_shape_covers_all_combinations():
+    # Every reachable shape maps to its typedef.
+    assert recomp._dispatch_typedef_for_shape(frozenset()) == ('FuncV', [])
+    assert recomp._dispatch_typedef_for_shape(frozenset({'k'})) == ('FuncU8', ['k'])
+    assert recomp._dispatch_typedef_for_shape(frozenset({'k', 'j'})) == ('FuncU8J', ['k', 'j'])
+    assert recomp._dispatch_typedef_for_shape(frozenset({'k', 'a'})) == ('FuncU8A', ['k', 'a'])
+    assert recomp._dispatch_typedef_for_shape(frozenset({'k', 'j', 'a'})) == ('FuncU8JA', ['k', 'j', 'a'])
+
+
+def test_dispatch_typedef_upgrades_orphan_j_or_a_to_k_form():
+    # {'j'} / {'a'} alone (no k) route through the k-including typedef
+    # — keeps all handlers sharing a typedef family; the handler simply
+    # ignores the extra k argument.
+    assert recomp._dispatch_typedef_for_shape(frozenset({'j'})) == ('FuncU8J', ['k', 'j'])
+    assert recomp._dispatch_typedef_for_shape(frozenset({'a'})) == ('FuncU8A', ['k', 'a'])
+    assert recomp._dispatch_typedef_for_shape(frozenset({'j', 'a'})) == ('FuncU8JA', ['k', 'j', 'a'])
+
+
+def test_sig_matches_dispatch_shape_with_union_accepts_kj():
+    # With allow_shape={k,j}, a (uint8_k, uint8_j) handler is valid.
+    assert recomp._sig_matches_dispatch_shape(
+        'void(uint8_k,uint8_j)', allow_shape=frozenset({'k', 'j'})) is True
+    # Narrower sigs still fit the wider allow.
+    assert recomp._sig_matches_dispatch_shape(
+        'void(uint8_k)', allow_shape=frozenset({'k', 'j'})) is True
+    assert recomp._sig_matches_dispatch_shape(
+        'void()', allow_shape=frozenset({'k', 'j'})) is True
+
+
+def test_sig_matches_dispatch_shape_rejects_out_of_order():
+    # Param order must be canonical k, j, a.
+    assert recomp._sig_matches_dispatch_shape(
+        'void(uint8_j,uint8_k)', allow_shape=frozenset({'k', 'j'})) is False
+
+
+def test_sig_matches_dispatch_shape_rejects_param_outside_shape():
+    # allow_shape={k} → (uint8_k, uint8_j) doesn't fit.
+    assert recomp._sig_matches_dispatch_shape(
+        'void(uint8_k,uint8_j)', allow_shape=frozenset({'k'})) is False
+
+
+def test_dispatch_shape_sig_builds_canonical_order():
+    assert recomp._dispatch_shape_sig('void', frozenset({'a', 'j', 'k'})) == \
+        'void(uint8_k,uint8_j,uint8_a)'
+    assert recomp._dispatch_shape_sig('uint8', frozenset({'k', 'a'})) == \
+        'uint8(uint8_k,uint8_a)'
+    assert recomp._dispatch_shape_sig('void', frozenset()) == 'void()'
+
+
+def test_compute_dispatch_table_shapes_unions_handler_liveins():
+    # One table with three handlers, union live-in X+Y+A.
+    # Table shape = {k, j, a}; all handlers share it.
+    cfg = recomp.Config()
+    cfg.bank = 0
+    cfg.dispatch_tables = [{0x8000, 0x9000, 0xA000}]
+    cfg._dispatch_handler_livein = {
+        0x8000: {'X'},
+        0x9000: {'X', 'Y'},
+        0xA000: {'X', 'A'},
+    }
+    cfg.sigs = {}
+    shapes = recomp._compute_dispatch_table_shapes(cfg)
+    expected = frozenset({'k', 'j', 'a'})
+    assert shapes[0x8000] == expected
+    assert shapes[0x9000] == expected
+    assert shapes[0xA000] == expected
+
+
+def test_compute_dispatch_table_shapes_unions_across_tables():
+    # A handler shared across two tables gets the wider union.
+    cfg = recomp.Config()
+    cfg.bank = 0
+    shared = 0x9000
+    cfg.dispatch_tables = [
+        {0x8000, shared},         # needs k only
+        {shared, 0xA000},         # needs k, j (table 2's Y-reading handler)
+    ]
+    cfg._dispatch_handler_livein = {
+        0x8000: {'X'},
+        shared: {'X'},
+        0xA000: {'X', 'Y'},
+    }
+    cfg.sigs = {}
+    shapes = recomp._compute_dispatch_table_shapes(cfg)
+    assert shapes[shared] == frozenset({'k', 'j'}), (
+        f'shared handler must pick up the wider table\'s shape, '
+        f'got {shapes[shared]!r}'
+    )
+
+
+def test_compute_dispatch_table_shapes_from_sigs_without_livein():
+    # When _dispatch_handler_livein is empty (e.g. handlers never ran
+    # through augment), the union pulls from cfg.sigs instead.
+    cfg = recomp.Config()
+    cfg.bank = 0
+    cfg.dispatch_tables = [{0x8000, 0x9000}]
+    cfg._dispatch_handler_livein = {}
+    cfg.sigs = {
+        0x8000: 'void(uint8_k)',
+        0x9000: 'void(uint8_k,uint8_j)',
+    }
+    shapes = recomp._compute_dispatch_table_shapes(cfg)
+    assert shapes[0x8000] == frozenset({'k', 'j'})
+    assert shapes[0x9000] == frozenset({'k', 'j'})
+
+
 def test_dispatch_shape_accepts_void_nullary():
     assert recomp._sig_matches_dispatch_shape('void()')
 
