@@ -3091,7 +3091,7 @@ class EmitCtx:
         # -- ADC (all modes) --HANDOFF requirement B ----------------------
         elif mn == 'ADC':
             self._emit_adc(mode, v, wide_a, a_type)
-            self.overflow = None  # ADC modifies V flag
+            # V flag set by _emit_adc itself
 
         # -- SBC ----------------------------------------------------------
         elif mn == 'SBC':
@@ -3684,6 +3684,9 @@ class EmitCtx:
             self.carry_chain = None
             # Carry out from the propagated ADC #0 is the overflow of the sum
             self.carry = f'({chain["var"]} >= 256)' if not wide else f'({chain["var"]} >= 65536)'
+            # V flag for the propagated ADC #0 is hard to express precisely
+            # without re-materializing both operands; conservatively unknown.
+            self.overflow = None
         else:
             # Start a new carry chain --works for ALL modes (IMM, DP, ABS, LONG, etc.)
             widen = 'uint32' if wide else 'uint16'
@@ -3700,6 +3703,13 @@ class EmitCtx:
             # Carry out: set when the wider result overflows the original type
             threshold = 65536 if wide else 256
             self.carry = f'({tname} >= {threshold})'
+            # V (signed overflow) flag: set when both operands have the same
+            # sign and the result has a different sign. Standard formula:
+            #   V = ((a ^ result) & (operand ^ result) & sign_bit) != 0
+            sign_bit = 0x8000 if wide else 0x80
+            result_byte = f'(({a_type})({tname}))'
+            self.overflow = (f'(((({a_type})({an}) ^ {result_byte}) & '
+                             f'(({a_type})({mem}) ^ {result_byte}) & 0x{sign_bit:x}) != 0)')
         self.flag_src = self.A
 
     def _emit_sbc(self, mode: int, v: int, wide: bool, a_type: str):
