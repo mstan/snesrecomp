@@ -451,10 +451,6 @@ typedef struct {
 
 typedef struct {
     int frame_number;
-    uint16_t ptr_map16_c;     // ptr_lo_map16_data offset from g_ram
-    uint16_t ptr_map16_dp;    // g_ram[0x6b] | g_ram[0x6c]<<8
-    uint16_t ptr_map16_bak_c;
-    uint16_t ptr_map16_bak_dp;
     char last_func[64];
     uint8_t snap[SNAP_BYTES]; // key game state snapshot for cross-server comparison
     // --- Extended state (added for exhaustive comparison) ---
@@ -481,8 +477,6 @@ static int s_history_count = 0;
 // Called from the verify system after each frame comparison (main thread).
 // Protected by mutex since the network thread reads frame history.
 void debug_server_record_frame(int frame) {
-    extern uint8_t *ptr_lo_map16_data;
-    extern uint8_t *ptr_lo_map16_data_bak;
     extern uint8_t g_ram[];
 
     // Step counter: auto-re-pause after N frames
@@ -496,12 +490,6 @@ void debug_server_record_frame(int frame) {
 
     FrameRecord *r = &s_frame_history[s_history_write_idx];
     r->frame_number = frame;
-
-    // Record pointer sync state
-    r->ptr_map16_c = (uint16_t)(ptr_lo_map16_data - g_ram);
-    r->ptr_map16_dp = g_ram[0x6b] | (g_ram[0x6c] << 8);
-    r->ptr_map16_bak_c = (uint16_t)(ptr_lo_map16_data_bak - g_ram);
-    r->ptr_map16_bak_dp = g_ram[0x04] | (g_ram[0x05] << 8);
 
     // Record last function
     if (g_last_recomp_func)
@@ -775,7 +763,6 @@ static void cmd_get_dispatch_trace(const char *args) {
 // Protected by mutex since the network thread reads dispatch trace.
 void debug_dispatch_trace_before(int obj_number) {
     extern uint8_t g_ram[];
-    extern uint8_t *ptr_lo_map16_data;
     extern const uint8_t *ptr_layer1_data;
     extern const uint8_t *g_rom;  // ROM base pointer
     if (snes_frame_counter != s_dispatch_trace_frame) return;
@@ -785,7 +772,7 @@ void debug_dispatch_trace_before(int obj_number) {
 
     DispatchTraceEntry *e = &s_dispatch_trace[s_dispatch_trace_count];
     e->obj_number = obj_number;
-    e->ptr_before = (uint16_t)(ptr_lo_map16_data - g_ram);
+    e->ptr_before = (uint16_t)(g_ram[0x6b] | (g_ram[0x6c] << 8));
     e->layer1_before = (uint32_t)((uintptr_t)ptr_layer1_data & 0xFFFFFFFF);
 
     // Snapshot key bytes
@@ -802,7 +789,6 @@ void debug_dispatch_trace_before(int obj_number) {
 
 void debug_dispatch_trace_after(void) {
     extern uint8_t g_ram[];
-    extern uint8_t *ptr_lo_map16_data;
     extern const uint8_t *ptr_layer1_data;
     extern const uint8_t *g_rom;
     if (snes_frame_counter != s_dispatch_trace_frame) return;
@@ -811,7 +797,7 @@ void debug_dispatch_trace_after(void) {
     lock_mutex();
 
     DispatchTraceEntry *e = &s_dispatch_trace[s_dispatch_trace_count];
-    e->ptr_after = (uint16_t)(ptr_lo_map16_data - g_ram);
+    e->ptr_after = (uint16_t)(g_ram[0x6b] | (g_ram[0x6c] << 8));
     e->layer1_after = (uint32_t)((uintptr_t)ptr_layer1_data & 0xFFFFFFFF);
 
     // Snapshot key bytes after
@@ -832,26 +818,6 @@ void debug_dispatch_trace_after(void) {
     s_dispatch_trace_count++;
 
     unlock_mutex();
-}
-
-static void cmd_read_ptr(const char *args) {
-    // Read a named C pointer and compare with raw DP bytes
-    extern uint8_t *ptr_lo_map16_data;
-    extern uint8_t *ptr_lo_map16_data_bak;
-    extern uint8_t g_ram[];
-
-    if (strstr(args, "map16")) {
-        uint16_t c_offset = (uint16_t)(ptr_lo_map16_data - g_ram);
-        uint16_t dp_offset = g_ram[0x6b] | (g_ram[0x6c] << 8);
-        uint16_t bak_c = (uint16_t)(ptr_lo_map16_data_bak - g_ram);
-        uint16_t bak_dp = g_ram[0x04] | (g_ram[0x05] << 8);
-        send_fmt("{\"ptr_lo_map16_data\":{\"c_ptr\":\"0x%04x\",\"dp_bytes\":\"0x%04x\",\"match\":%s},"
-                 "\"ptr_lo_map16_data_bak\":{\"c_ptr\":\"0x%04x\",\"dp_bytes\":\"0x%04x\",\"match\":%s}}",
-                 c_offset, dp_offset, c_offset == dp_offset ? "true" : "false",
-                 bak_c, bak_dp, bak_c == bak_dp ? "true" : "false");
-    } else {
-        send_fmt("{\"error\":\"unknown pointer name\",\"available\":[\"map16\"]}");
-    }
 }
 
 static void cmd_call_stack(const char *args) {
@@ -1095,14 +1061,8 @@ static void cmd_get_frame(const char *args) {
     }
     char buf[8192];
     int pos = snprintf(buf, sizeof(buf),
-        "{\"frame\":%d,"
-        "\"ptr_map16\":{\"c\":\"0x%04x\",\"dp\":\"0x%04x\",\"match\":%s},"
-        "\"ptr_map16_bak\":{\"c\":\"0x%04x\",\"dp\":\"0x%04x\",\"match\":%s},"
-        "\"func\":\"%s\"",
-        r->frame_number,
-        r->ptr_map16_c, r->ptr_map16_dp, r->ptr_map16_c == r->ptr_map16_dp ? "true" : "false",
-        r->ptr_map16_bak_c, r->ptr_map16_bak_dp, r->ptr_map16_bak_c == r->ptr_map16_bak_dp ? "true" : "false",
-        r->last_func);
+        "{\"frame\":%d,\"func\":\"%s\"",
+        r->frame_number, r->last_func);
     // Add game state snapshot
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         ",\"game_mode\":\"0x%02x\",\"gfx_files\":\"%02x %02x %02x %02x %02x %02x %02x %02x\",\"snap\":\"",
@@ -1115,20 +1075,6 @@ static void cmd_get_frame(const char *args) {
     send_line(buf);
 }
 
-static void cmd_first_desync(const char *args) {
-    // Find the first frame where ptr_map16 C pointer != DP bytes
-    for (int i = 0; i < s_history_count; i++) {
-        int idx = (s_history_write_idx - s_history_count + i + FRAME_HISTORY_SIZE) % FRAME_HISTORY_SIZE;
-        FrameRecord *r = &s_frame_history[idx];
-        if (r->ptr_map16_c != r->ptr_map16_dp) {
-            send_fmt("{\"first_desync\":%d,\"c\":\"0x%04x\",\"dp\":\"0x%04x\",\"func\":\"%s\"}",
-                     r->frame_number, r->ptr_map16_c, r->ptr_map16_dp, r->last_func);
-            return;
-        }
-    }
-    send_fmt("{\"first_desync\":null,\"all_synced\":true,\"frames_checked\":%d}", s_history_count);
-}
-
 static void cmd_frame_range(const char *args) {
     int start = 0, end = 0;
     sscanf(args, "%d %d", &start, &end);
@@ -1139,11 +1085,10 @@ static void cmd_frame_range(const char *args) {
         FrameRecord *r = find_frame(f);
         if (!r) continue;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"ptr_sync\":%s,"
+            "%s{\"f\":%d,"
             "\"mode\":\"0x%02x\",\"gfx\":\"%02x%02x%02x%02x%02x%02x%02x%02x\"}",
             pos > 12 ? "," : "",
             r->frame_number,
-            r->ptr_map16_c == r->ptr_map16_dp ? "true" : "false",
             r->snap[21],
             r->snap[22], r->snap[23], r->snap[24], r->snap[25],
             r->snap[26], r->snap[27], r->snap[28], r->snap[29]);
@@ -1628,7 +1573,6 @@ static const CmdEntry s_commands[] = {
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
-    {"read_ptr",      cmd_read_ptr},
     {"trace_dispatch", cmd_trace_dispatch},
     {"get_dispatch_trace", cmd_get_dispatch_trace},
     {"call_stack",    cmd_call_stack},
@@ -1644,7 +1588,6 @@ static const CmdEntry s_commands[] = {
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
     {"get_frame",     cmd_get_frame},
-    {"first_desync",  cmd_first_desync},
     {"frame_range",   cmd_frame_range},
     {"history",       cmd_history_status},
     {"profile",       cmd_profile_query},
