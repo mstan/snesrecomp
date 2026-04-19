@@ -2364,22 +2364,27 @@ class EmitCtx:
         elif mode == INDIR_L:
             return self._indir_read(v, '0', wide=wide)
         elif mode == INDIR_Y:
-            # LDA ($dp),Y — 16-bit indirect (NOT long). Read 2-byte pointer from DP, add Y, access WRAM.
-            addr_expr = f'(g_ram[0x{v:02x}] | (g_ram[0x{v:02x} + 1] << 8))'
+            # LDA ($dp),Y — 16-bit indirect (NOT long): 2-byte pointer
+            # from DP + DB for the bank. IndirPtrDB routes to WRAM or
+            # ROM per the effective address; the old `g_ram[addr]` emit
+            # silently assumed DB=$7E and returned garbage under DB=$00
+            # (common case for in-bank code reading ROM data tables).
             y_expr = self._idx('Y')
             if wide:
-                return f'GET_WORD(g_ram + {addr_expr} + {y_expr})'
-            return f'g_ram[{addr_expr} + {y_expr}]'
+                return f'GET_WORD(IndirPtrDB(0x{v:02x}, {y_expr}))'
+            return f'IndirPtrDB(0x{v:02x}, {y_expr})[0]'
         elif mode == INDIR_DPX:
-            addr_expr = f'(g_ram[0x{v:02x} + {self._idx("X")}] | (g_ram[0x{v:02x} + {self._idx("X")} + 1] << 8))'
+            # LDA ($dp,X) — DP-pre-indexed indirect. DP+X is the pointer
+            # location; the resulting pointer's bank is DB.
+            x_expr = self._idx('X')
             if wide:
-                return f'GET_WORD(g_ram + {addr_expr})'
-            return f'g_ram[{addr_expr}]'
+                return f'GET_WORD(IndirPtrDB(0x{v:02x} + {x_expr}, 0))'
+            return f'IndirPtrDB(0x{v:02x} + {x_expr}, 0)[0]'
         elif mode == DP_INDIR:
-            addr_expr = self._dp_indir_addr(v)
+            # LDA ($dp) — plain 16-bit indirect, no index. Bank is DB.
             if wide:
-                return f'GET_WORD(g_ram + {addr_expr})'
-            return f'g_ram[{addr_expr}]'
+                return f'GET_WORD(IndirPtrDB(0x{v:02x}, 0))'
+            return f'IndirPtrDB(0x{v:02x}, 0)[0]'
         elif mode == STK:
             # Stack-relative: treat as named local variable
             vname = f'stk_{v:02x}'
@@ -3618,15 +3623,14 @@ class EmitCtx:
         elif mode == INDIR_LY: self._indir_write(v, self._idx('Y'), a)
         elif mode == INDIR_L:  self._indir_write(v, '0', a)
         elif mode == INDIR_Y:
-            # STA ($dp),Y — 16-bit indirect (NOT long). Write to WRAM via 2-byte pointer.
-            addr_expr = f'(g_ram[0x{v:02x}] | (g_ram[0x{v:02x} + 1] << 8))'
+            # STA ($dp),Y — 16-bit indirect write via DB.
             y_expr = self._idx('Y')
-            self._emit(f'g_ram[{addr_expr} + {y_expr}] = {a};')
+            self._emit(f'IndirPtrDB(0x{v:02x}, {y_expr})[0] = {a};')
         elif mode == INDIR_DPX:
-            addr_expr = f'(g_ram[0x{v:02x} + {self._idx("X")}] | (g_ram[0x{v:02x} + {self._idx("X")} + 1] << 8))'
-            self._emit(f'g_ram[{addr_expr}] = {a};')
+            x_expr = self._idx('X')
+            self._emit(f'IndirPtrDB(0x{v:02x} + {x_expr}, 0)[0] = {a};')
         elif mode == DP_INDIR:
-            self._emit(f'g_ram[{self._dp_indir_addr(v)}] = {a};')
+            self._emit(f'IndirPtrDB(0x{v:02x}, 0)[0] = {a};')
         elif mode == LONG:
             bk = (v >> 16) & 0xFF
             if bk in (0x7E, 0x7F):

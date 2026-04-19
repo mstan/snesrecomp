@@ -30,6 +30,7 @@ TEST_MODULES = [
     'test_smwdisx_compare',
     'test_mflag_width',
     'test_emit_order_fallthrough',
+    'test_dp_indirect_uses_db',
 ]
 
 

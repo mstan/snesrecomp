@@ -188,6 +188,15 @@ void WriteRegWord(uint16 reg, uint16 value);
 uint16 ReadRegWord(uint16 reg);
 uint8 ReadReg(uint16 reg);
 uint8_t *IndirPtr_Slow(LongPtr ptr, uint16 offs);
+
+// 16-bit-indirect-via-DP resolution. The addressing modes `(dp)`,
+// `(dp),Y`, `(dp,X)` and `(dp,S),Y` all fetch a 2-byte pointer from
+// DP and combine it with the data bank register (DB) to form the
+// full 24-bit effective address. Use this instead of raw
+// `g_ram[ptr_lo | ptr_hi<<8]` — that silently assumes DB=\$7E and
+// returns garbage when DB is a ROM bank (typical for in-ROM
+// data-table loads).
+uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs);
 static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
   uint32 a = (*(uint32 *)&ptr & 0xffffff) + offs;
   uint8 bank = (uint8)(a >> 16);

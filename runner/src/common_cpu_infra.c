@@ -43,6 +43,15 @@ uint8_t *SnesRomPtr(uint32 v) {
   return (uint8 *)RomPtr(v);
 }
 
+// Resolve a 16-bit-indirect-through-DP pointer using the current
+// data bank register. See comment in common_rtl.h for why this
+// matters for `(dp)`, `(dp),Y`, `(dp,X)` addressing modes.
+uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs) {
+  LongPtr p = MAKE_LONG((uint16)g_ram[dp_addr] | ((uint16)g_ram[dp_addr + 1] << 8),
+                        g_cpu->db);
+  return IndirPtr(p, offs);
+}
+
 bool ProcessHook(uint32 v) {
   uint8_t *rombyte = SnesRomPtr(v);
   switch (hookmode) {
