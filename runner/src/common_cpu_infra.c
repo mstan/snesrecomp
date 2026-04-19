@@ -16,6 +16,12 @@ Cpu *g_cpu;
 bool g_calling_asm_from_c;
 int g_calling_asm_from_c_ret;
 bool g_fail;
+// HLE SPC for now. The real cycle-accurate APU emulator
+// (snes/apu.c + snes/spc.c + snes/dsp.c) is wired up but a full
+// HLE→real switch needs more than just flipping this flag —
+// initial integration attempt showed the SPC IPL handshake
+// doesn't complete (port 0 never receives $AA), needs deeper
+// debugging of catchup-cycle accounting and SPC state init.
 bool g_use_my_apu_code = true;
 extern bool g_other_image;
 const RtlGameInfo *g_rtl_game_info;
