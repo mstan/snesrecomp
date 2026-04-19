@@ -45,10 +45,34 @@ extern int snes_frame_counter;
 #include "snes/apu.h"
 #include "snes/spc.h"
 #include "snes/snes.h"
+#include "snes/saveload.h"
+#include "../../../src/gen/recomp_func_registry.h"
 extern Ppu *g_ppu;
 extern Cpu *g_cpu;
 extern Dma *g_dma;
 extern Snes *g_snes;
+extern Ppu *g_my_ppu;
+extern uint8 g_ram[0x20000];
+void ppu_copy(Ppu *dst, Ppu *src);
+void snes_saveload(Snes *snes, SaveLoadInfo *sli);
+
+// Bridge for the L3 harness.
+// Recomp maintains TWO WRAM buffers and TWO PPU instances:
+//   g_ram / g_my_ppu — used by the recompiled code's direct-dispatch path
+//   g_snes->ram / g_snes->ppu — used by the emulator's MMIO path
+// snes_saveload only handles the g_snes-side buffers. Every time state
+// crosses the L3 harness boundary we have to manually bridge the two
+// representations so both sides see the same memory.
+static void _l3_sync_to_snes(void) {
+    memcpy(g_snes->ram, g_ram, 0x20000);
+    if (g_my_ppu && g_snes->ppu && g_my_ppu != g_snes->ppu)
+        ppu_copy(g_snes->ppu, g_my_ppu);
+}
+static void _l3_sync_from_snes(void) {
+    memcpy(g_ram, g_snes->ram, 0x20000);
+    if (g_my_ppu && g_snes->ppu && g_my_ppu != g_snes->ppu)
+        ppu_copy(g_my_ppu, g_snes->ppu);
+}
 
 #define RECOMP_STACK_DEPTH 16
 extern const char *g_recomp_stack[];
@@ -1270,6 +1294,145 @@ static void cmd_loadstate(const char *args) {
     send_fmt("{\"ok\":true,\"loading_slot\":%d}", slot);
 }
 
+// ---- L3 harness: synchronous save_state / load_state ----
+// Minimal snapshot — serializes full SNES state (CPU/PPU/DMA/APU/cart/WRAM)
+// via snes_saveload to a raw binary file. No replay log, no state-recorder
+// overhead. Intended for per-function L3 tests: capture a fixture, replay
+// into both recomp and oracle, invoke one function, diff.
+
+typedef struct FileSli {
+    SaveLoadInfo sli;
+    FILE *f;
+    int is_save;
+    int error;
+    size_t total;
+} FileSli;
+
+static void _file_sli_func(SaveLoadInfo *info, void *data, size_t size) {
+    FileSli *fs = (FileSli *)info;
+    if (fs->error) return;
+    size_t got;
+    if (fs->is_save)
+        got = fwrite(data, 1, size, fs->f);
+    else
+        got = fread(data, 1, size, fs->f);
+    if (got != size) fs->error = 1;
+    fs->total += size;
+}
+
+// 4-byte magic + 4-byte version lets us evolve the format.
+#define L3_SNAP_MAGIC 0x4c33534e  /* "L3SN" */
+#define L3_SNAP_VERSION 1
+
+static void cmd_save_state(const char *args) {
+    char filename[512];
+    if (sscanf(args, "%500s", filename) != 1) {
+        send_fmt("{\"error\":\"usage: save_state <filename>\"}");
+        return;
+    }
+    // If recompiled code has been executing, g_ram/g_my_ppu hold newer
+    // state than g_snes->ram/g_snes->ppu. Push those updates into the
+    // emulator-side buffers before snes_saveload serializes them.
+    _l3_sync_to_snes();
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        send_fmt("{\"error\":\"fopen failed: %s\"}", filename);
+        return;
+    }
+    uint32_t magic = L3_SNAP_MAGIC, version = L3_SNAP_VERSION;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    FileSli fs = {{_file_sli_func}, f, 1, 0, 0};
+    snes_saveload(g_snes, &fs.sli);
+    fclose(f);
+    if (fs.error) {
+        send_fmt("{\"error\":\"write failed after %zu bytes\"}", fs.total);
+        return;
+    }
+    send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
+}
+
+// ---- L3 harness: invoke one recompiled function by name ----
+// invoke_recomp <name>
+//
+// Looks the name up in the generated registry (gen_func_registry.py output)
+// and dispatches via the matching sig. For MVP we handle argc=0 (void())
+// and argc=1 (void(uint8), arg read from g_cpu->a low byte). Other sigs
+// error out with the detected sig so the test can mark itself skipped.
+static void cmd_invoke_recomp(const char *args) {
+    char name[128];
+    if (sscanf(args, "%127s", name) != 1) {
+        send_fmt("{\"error\":\"usage: invoke_recomp <name>\"}");
+        return;
+    }
+    const RecompFuncEntry *e = recomp_func_registry_lookup(name);
+    if (!e) {
+        send_fmt("{\"error\":\"unknown function: %s\"}", name);
+        return;
+    }
+    // Route PPU writes through g_my_ppu (recomp's dedicated instance). Tests
+    // then read g_snes->ppu after sync — keeps the two paths honest.
+    g_ppu = g_my_ppu ? g_my_ppu : g_snes->ppu;
+    if (e->argc == 0) {
+        ((void (*)(void))e->fn)();
+    } else if (e->argc == 1) {
+        uint8_t a = (uint8_t)(g_cpu->a & 0xFF);
+        ((void (*)(uint8_t))e->fn)(a);
+    } else {
+        send_fmt("{\"error\":\"unsupported sig for L3 invoke\","
+                 "\"name\":\"%s\",\"argc\":%d}",
+                 e->name, e->argc);
+        return;
+    }
+    // Post-invoke: recompiled code mutated g_ram/g_my_ppu. Push those into
+    // g_snes-side buffers so read_ram/dump_vram report what the function
+    // actually did.
+    _l3_sync_to_snes();
+    send_fmt("{\"ok\":true,\"name\":\"%s\",\"argc\":%d,"
+             "\"rom_addr\":\"0x%06x\"}",
+             e->name, e->argc, e->rom_addr);
+}
+
+static void cmd_load_state(const char *args) {
+    char filename[512];
+    if (sscanf(args, "%500s", filename) != 1) {
+        send_fmt("{\"error\":\"usage: load_state <filename>\"}");
+        return;
+    }
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        send_fmt("{\"error\":\"fopen failed: %s\"}", filename);
+        return;
+    }
+    uint32_t magic = 0, version = 0;
+    if (fread(&magic, 4, 1, f) != 1 || magic != L3_SNAP_MAGIC) {
+        fclose(f);
+        send_fmt("{\"error\":\"bad magic: expected L3 snapshot\"}");
+        return;
+    }
+    if (fread(&version, 4, 1, f) != 1 || version != L3_SNAP_VERSION) {
+        fclose(f);
+        send_fmt("{\"error\":\"bad version: got %u want %u\"}", version, L3_SNAP_VERSION);
+        return;
+    }
+    FileSli fs = {{_file_sli_func}, f, 0, 0, 0};
+    snes_saveload(g_snes, &fs.sli);
+    fclose(f);
+    if (fs.error) {
+        send_fmt("{\"error\":\"read failed after %zu bytes\"}", fs.total);
+        return;
+    }
+    // snes_saveload restored g_snes->ram/ppu. Push those into g_ram/g_my_ppu
+    // so the recompiled direct-dispatch path sees the restored state when
+    // invoke_recomp fires.
+    _l3_sync_from_snes();
+    // g_ppu is only set during RtlRunFrameCompare in normal operation. For
+    // the L3 harness we need it valid immediately after load so dump_vram
+    // and register reads work without running a frame first.
+    if (!g_ppu) g_ppu = g_my_ppu ? g_my_ppu : g_snes->ppu;
+    send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
+}
+
 static void cmd_get_frame(const char *args) {
     int frame_num = 0;
     sscanf(args, "%d", &frame_num);
@@ -1809,6 +1972,9 @@ static const CmdEntry s_commands[] = {
     {"step",          cmd_step},
     {"run_to_frame",  cmd_run_to_frame},
     {"loadstate",     cmd_loadstate},
+    {"save_state",    cmd_save_state},
+    {"load_state",    cmd_load_state},
+    {"invoke_recomp", cmd_invoke_recomp},
     {"trace_addr",    cmd_trace_addr},
     {"get_trace",     cmd_get_trace},
     {"trace_reg",     cmd_trace_reg},
