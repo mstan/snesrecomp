@@ -29,6 +29,7 @@ TEST_MODULES = [
     'test_sync_funcs_h',
     'test_smwdisx_compare',
     'test_mflag_width',
+    'test_emit_order_fallthrough',
 ]
 
 

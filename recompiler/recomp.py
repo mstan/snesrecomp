@@ -4610,7 +4610,18 @@ def emit_function(name: str, insns: List[Insn], bank: int,
     _last_pc = -1
     _past_start_lines = None
     _past_start_buf: List = []  # (insn,) records to emit after fall-through
-    for insn in insns:
+    # Helper: does this insn have ROM fall-through (= non-terminator)?
+    _UNCOND_XFER = ('RTS', 'RTL', 'RTI', 'BRA', 'BRL')
+    def _insn_has_fallthrough(ins):
+        mn = ins.mnem
+        if mn in _UNCOND_XFER:
+            return False
+        if mn == 'JMP' and ins.mode in (ABS, LONG, INDIR, INDIR_X, INDIR_L):
+            return False
+        if getattr(ins, 'dispatch_terminal', False):
+            return False
+        return True
+    for idx, insn in enumerate(insns):
         pc16 = insn.addr & 0xFFFF
         if end_addr and pc16 >= end_addr:
             if pc16 in _past_end_emit:
@@ -4638,6 +4649,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
         # This pattern: BNE inner_loop; <fall-through to outer_loop_header>
         # The C fall-through just continues to the next statement, but the
         # 65816 fall-through to the outer loop header means "iterate again."
+        _outer_loop_goto_emitted = False
         if insn.mnem in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC'):
             branch_tgt = insn.operand
             # Only if the branch target is backward (inner loop back-edge)
@@ -4648,6 +4660,33 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                     if (next_addr in outer_loop_headers
                             and not ctx._is_always_taken(insn.mnem)):
                         ctx._emit(f'goto label_{next_addr:04x};  /* outer loop */')
+                        _outer_loop_goto_emitted = True
+
+        # ROM-fall-through repair: when decode order ≠ ROM order, the
+        # natural C fall-through from this insn lands on the WRONG code
+        # (whatever was decoded next, not ROM's pc+length). Inject an
+        # explicit goto to the physical next PC so C flow matches ROM
+        # flow. Skip if the current insn already transfers control (no
+        # fall-through) or the outer-loop-goto clause above already
+        # emitted a goto to the same target.
+        if not _outer_loop_goto_emitted and _insn_has_fallthrough(insn):
+            phys_next = (pc16 + insn.length) & 0xFFFF
+            # Find the next emitted insn's address in decode order,
+            # skipping past-end/past-start insns that get special handling.
+            next_list_addr = None
+            for _k in range(idx + 1, len(insns)):
+                _n_pc = insns[_k].addr & 0xFFFF
+                if end_addr and _n_pc >= end_addr and _n_pc not in _past_end_emit:
+                    continue
+                if start16 and _n_pc < start16:
+                    continue
+                next_list_addr = _n_pc
+                break
+            if (next_list_addr != phys_next
+                    and phys_next in valid_branch_targets
+                    and (not end_addr or phys_next < end_addr)
+                    and (not start16 or phys_next >= start16)):
+                ctx._emit(f'goto label_{phys_next:04x};  /* ROM fall-through */')
 
     # Fall-through detection: use the last instruction BEFORE end_addr.
     # Also check if the skipped boundary instruction was terminal (the function's
