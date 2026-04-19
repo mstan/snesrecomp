@@ -16,13 +16,13 @@ Cpu *g_cpu;
 bool g_calling_asm_from_c;
 int g_calling_asm_from_c_ret;
 bool g_fail;
-// HLE SPC for now. The real cycle-accurate APU emulator
-// (snes/apu.c + snes/spc.c + snes/dsp.c) is wired up but a full
-// HLE→real switch needs more than just flipping this flag —
-// integration attempts so far show the per-byte upload protocol
-// hangs partway through (handshake completes, but the data-upload
-// loop stalls) even with the V-flag fix in recomp.py and a 1000-cycle
-// per-port-read catchup. Needs deeper SPC opcode-trace work.
+// HLE SPC. Full HLE→real switch is a multi-day framework effort — the
+// recompiler emits the SPC upload routine with multiple M-flag width
+// bugs (polling 16-bit A against an 8-bit port echo; missing writes
+// inside the per-byte loop), unrelated to the V-flag issue already
+// fixed. Real-APU mode works for the $AABB handshake + the single
+// $CC echo, then hangs inside the per-byte data loop. Leaving HLE
+// as the default until the recompiler's M-flag tracking is broader.
 bool g_use_my_apu_code = true;
 extern bool g_other_image;
 const RtlGameInfo *g_rtl_game_info;
