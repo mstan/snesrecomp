@@ -2129,6 +2129,25 @@ class EmitCtx:
             if val is not None and not self._simple(val) and var in val:
                 self._materialize(reg, type_)
 
+    def _invalidate_dp_aliases_to(self, var: str):
+        """Drop dp_state entries that mirror a C variable which is about to
+        be mutated in place. dp_state caches 'DP slot N currently holds the
+        value of register var V' so later reads of DP N can fold to V
+        directly. But any RMW on V (ASL/LSR/ROL/ROR A, INC/DEC A, INX/DEX,
+        INY/DEY) leaves the DP memory at its stored value while V moves on,
+        so the cached alias becomes a lie.
+
+        Example of the bug this prevents (SMW HandleLevelTileAnimations,
+        $05:BB3B):
+            LDA EffFrame ; AND #$07 ; STA _0 ; ASL A ; ADC _0
+        Without this invalidation, ADC _0 folded _0 back to `v1` (A's var
+        name), but ASL had already shifted v1. Result was v1+v1+carry (4n)
+        instead of the intended v1_preshift + v1_shifted (3n), mis-indexing
+        a 6-byte-stride table and firing garbage DMAs at BG1 chr."""
+        stale = [k for k, val in self.dp_state.items() if val == var]
+        for k in stale:
+            del self.dp_state[k]
+
     def _materialize(self, reg: str, type_: str = 'uint8') -> str:
         """Ensure register holds a named variable; allocate+assign if not."""
         val = getattr(self, reg)
@@ -3191,6 +3210,7 @@ class EmitCtx:
             if xn:
                 self._materialize_refs_to(xn)
                 self._emit(f'{xn}++;')
+                self._invalidate_dp_aliases_to(xn)
                 self.flag_src = xn
                 self.flag_width = 16 if wide_x else 8
             else:
@@ -3200,6 +3220,7 @@ class EmitCtx:
             if xn:
                 self._materialize_refs_to(xn)
                 self._emit(f'{xn}--;')
+                self._invalidate_dp_aliases_to(xn)
                 self.flag_src = xn
                 self.flag_width = 16 if wide_x else 8
             else:
@@ -3209,6 +3230,7 @@ class EmitCtx:
             if yn and self._simple(yn):
                 self._materialize_refs_to(yn)
                 self._emit(f'{yn}++;')
+                self._invalidate_dp_aliases_to(yn)
                 self.flag_src = yn
                 self.flag_width = 16 if wide_x else 8
             else:
@@ -3218,6 +3240,7 @@ class EmitCtx:
             if yn and self._simple(yn):
                 self._materialize_refs_to(yn)
                 self._emit(f'{yn}--;')
+                self._invalidate_dp_aliases_to(yn)
                 self.flag_src = yn
                 self.flag_width = 16 if wide_x else 8
             else:
@@ -3226,10 +3249,12 @@ class EmitCtx:
         elif mn == 'INC' and mode == ACC:
             an = self._materialize('A', a_type)
             self._emit(f'{an}++;')
+            self._invalidate_dp_aliases_to(an)
             self.flag_src = an
         elif mn == 'DEC' and mode == ACC:
             an = self._materialize('A', a_type)
             self._emit(f'{an}--;')
+            self._invalidate_dp_aliases_to(an)
             self.flag_src = an
 
         # -- INC / DEC memory ---------------------------------------------
@@ -3284,6 +3309,7 @@ class EmitCtx:
                 self._emit(f'{cv} = ({an} >> 7) & 1;')
                 self.carry = cv
                 self._emit(f'{an} <<= 1;')
+                self._invalidate_dp_aliases_to(an)
                 self.flag_src = an
             else:
                 mem = self._resolve_mem_rw(mode, v)
@@ -3292,6 +3318,8 @@ class EmitCtx:
                     self._emit(f'{cv} = ({mem} >> 7) & 1;')
                     self.carry = cv
                     self._emit(f'{mem} <<= 1;')
+                    if mode == DP:
+                        self.dp_state.pop(v, None)
                     self.flag_src = None
                 else:
                     self._emit(f'/* ASL {MODE_STR.get(mode,"?")} ${v:x} */')
@@ -3304,6 +3332,7 @@ class EmitCtx:
                 self._emit(f'{cv} = {an} & 1;')
                 self.carry = cv
                 self._emit(f'{an} >>= 1;')
+                self._invalidate_dp_aliases_to(an)
                 self.flag_src = an
             else:
                 mem = self._resolve_mem_rw(mode, v)
@@ -3312,6 +3341,8 @@ class EmitCtx:
                     self._emit(f'{cv} = {mem} & 1;')
                     self.carry = cv
                     self._emit(f'{mem} >>= 1;')
+                    if mode == DP:
+                        self.dp_state.pop(v, None)
                     self.flag_src = None
                 else:
                     self._emit(f'/* LSR {MODE_STR.get(mode,"?")} ${v:x} */')
@@ -3324,6 +3355,7 @@ class EmitCtx:
                 cv = self._alloc_tmp('uint8')
                 self._emit(f'{cv} = ({an} >> 7) & 1;')
                 self._emit(f'{an} = ({a_type})(({an} << 1) | {carry_in});')
+                self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
                 mem = self._resolve_mem_rw(mode, v)
@@ -3331,6 +3363,8 @@ class EmitCtx:
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = ({mem} >> 7) & 1;')
                     self._emit(f'{mem} = (uint8)(({mem} << 1) | {carry_in});')
+                    if mode == DP:
+                        self.dp_state.pop(v, None)
                     self.carry = cv; self.flag_src = None
                 else:
                     self._emit(f'/* ROL {MODE_STR.get(mode,"?")} ${v:x} */')
@@ -3343,6 +3377,7 @@ class EmitCtx:
                 cv = self._alloc_tmp('uint8')
                 self._emit(f'{cv} = {an} & 1;')
                 self._emit(f'{an} = ({a_type})(({an} >> 1) | ({carry_in} << 7));')
+                self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
                 mem = self._resolve_mem_rw(mode, v)
@@ -3350,6 +3385,8 @@ class EmitCtx:
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = {mem} & 1;')
                     self._emit(f'{mem} = (uint8)(({mem} >> 1) | ({carry_in} << 7));')
+                    if mode == DP:
+                        self.dp_state.pop(v, None)
                     self.carry = cv; self.flag_src = None
                 else:
                     self._emit(f'/* ROR {MODE_STR.get(mode,"?")} ${v:x} */')
@@ -3372,6 +3409,8 @@ class EmitCtx:
             mem = self._resolve_mem_rw(mode, v)
             if mem:
                 self._emit(f'{mem} |= {a};')
+                if mode == DP:
+                    self.dp_state.pop(v, None)
                 self.flag_src = None
             else:
                 self._emit(f'/* TSB {MODE_STR.get(mode,"?")} ${v:x} */')
@@ -3380,6 +3419,8 @@ class EmitCtx:
             mem = self._resolve_mem_rw(mode, v)
             if mem:
                 self._emit(f'{mem} &= ~{a};')
+                if mode == DP:
+                    self.dp_state.pop(v, None)
                 self.flag_src = None
             else:
                 self._emit(f'/* TRB {MODE_STR.get(mode,"?")} ${v:x} */')

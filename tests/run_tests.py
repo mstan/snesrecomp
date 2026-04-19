@@ -31,6 +31,7 @@ TEST_MODULES = [
     'test_mflag_width',
     'test_emit_order_fallthrough',
     'test_dp_indirect_uses_db',
+    'test_dp_alias_after_register_mutation',
 ]
 
 
