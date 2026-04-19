@@ -35,7 +35,6 @@ uint8 g_ram[0x20000];
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
-bool g_is_uploading_apu;
 bool g_did_finish_level_hook;
 uint8 game_id;
 bool g_playback_mode;
@@ -775,33 +774,26 @@ enum {
 static struct ApuWriteEnt g_apu_write_ents[kApuMaxQueueSize], g_apu_write;
 static uint8 g_apu_write_ent_pos, g_apu_queue_size, g_apu_time_since_empty;
 
-void RtlSetUploadingApu(bool uploading) {
-  RtlApuLock();
-  if (g_is_uploading_apu != uploading && !g_use_my_apu_code) {
-
-    if (!uploading) {
-      g_snes->apuCatchupCycles = 10000;
-      snes_catchupApu(g_snes);
-    } else {
-      g_apu_queue_size = 0;
-    }
-    g_is_uploading_apu = uploading;
-  }
-  RtlApuUnlock();
-}
-
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
 
-  if (g_is_uploading_apu) {
-    //    g_snes->apuCatchupCycles = 32;
-    snes_catchupApu(g_snes); // catch up the apu before writing
+  if (!g_use_my_apu_code) {
+    // Real SPC: catch the APU up to the current cycle and write the
+    // new port value directly. Serialise with the audio thread via
+    // RtlApuLock — it holds the same lock while cycling the APU in
+    // RtlRenderAudio.
+    RtlApuLock();
+    g_snes->apuCatchupCycles = 32;
+    snes_catchupApu(g_snes);
     g_snes->apu->inPorts[adr & 0x3] = val;
+    RtlApuUnlock();
     return;
   }
 
-  if (g_snes->runningWhichVersion == (g_use_my_apu_code ? 2 : 1)) {
-    g_apu_write.ports[adr & 0x3] = val;  // mine
+  // HLE SPC: queue the write for the audio thread to replay into
+  // g_spc_player->input_ports at audio-render time.
+  if (g_snes->runningWhichVersion == 2) {
+    g_apu_write.ports[adr & 0x3] = val;
   }
 }
 
@@ -810,33 +802,36 @@ static bool IsFrameEmpty(ApuWriteEnt *w) {
 }
 
 void RtlPushApuState(void) {
+  // Queue machinery is HLE-only: under real SPC, RtlApuWrite writes
+  // inPorts directly so there is nothing to queue. Early-out so the
+  // audio thread sees an empty queue (RtlPopApuState_Locked becomes
+  // a no-op).
+  if (!g_use_my_apu_code)
+    return;
+
   RtlApuLock();
-  if (!g_is_uploading_apu) {
-    // Strive for the queue to be empty.
-    if (g_apu_queue_size == 0) {
-      g_apu_time_since_empty = 0;
-    } else {
-      if (g_apu_time_since_empty >= 32 && IsFrameEmpty(&g_apu_write)) {
-        g_apu_time_since_empty -= 4;
-        RtlApuUnlock();
-        return;
-      }
-      g_apu_time_since_empty++;
-    }
-    // Merge the two oldest to make space
-    ApuWriteEnt *w0 = &g_apu_write_ents[g_apu_write_ent_pos++ & (kApuMaxQueueSize - 1)];
-    if (g_apu_queue_size == kApuMaxQueueSize) {
-      ApuWriteEnt *w1 = &g_apu_write_ents[g_apu_write_ent_pos & (kApuMaxQueueSize - 1)];
-      for (int i = 0; i < 4; i++)
-        if (w1->ports[i] == 0)
-          w1->ports[i] = w0->ports[i];
-    } else {
-      g_apu_queue_size++;
-    }
-    *w0 = g_apu_write;
+  // Strive for the queue to be empty.
+  if (g_apu_queue_size == 0) {
+    g_apu_time_since_empty = 0;
   } else {
-    g_apu_queue_size = 0;
+    if (g_apu_time_since_empty >= 32 && IsFrameEmpty(&g_apu_write)) {
+      g_apu_time_since_empty -= 4;
+      RtlApuUnlock();
+      return;
+    }
+    g_apu_time_since_empty++;
   }
+  // Merge the two oldest to make space
+  ApuWriteEnt *w0 = &g_apu_write_ents[g_apu_write_ent_pos++ & (kApuMaxQueueSize - 1)];
+  if (g_apu_queue_size == kApuMaxQueueSize) {
+    ApuWriteEnt *w1 = &g_apu_write_ents[g_apu_write_ent_pos & (kApuMaxQueueSize - 1)];
+    for (int i = 0; i < 4; i++)
+      if (w1->ports[i] == 0)
+        w1->ports[i] = w0->ports[i];
+  } else {
+    g_apu_queue_size++;
+  }
+  *w0 = g_apu_write;
   RtlApuUnlock();
 }
 
@@ -910,11 +905,13 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   RtlPopApuState_Locked();
 
   if (!g_use_my_apu_code) {
-    if (!g_is_uploading_apu) {
-      while (g_snes->apu->dsp->sampleOffset < 534)
-        apu_cycle(g_snes->apu);
-      dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
-    }
+    // Real SPC: cycle the APU to fill the DSP sample buffer, then
+    // drain samples. RtlApuLock is held throughout — matches the
+    // lock acquired by RtlApuWrite / snes_readBBus on the CPU
+    // thread so both threads agree on APU state.
+    while (g_snes->apu->dsp->sampleOffset < 534)
+      apu_cycle(g_snes->apu);
+    dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
   } else {
     g_spc_player->gen_samples(g_spc_player);
     dsp_getSamples(g_spc_player->dsp, audio_buffer, samples);

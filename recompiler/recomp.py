@@ -2233,6 +2233,35 @@ class EmitCtx:
     def _wrap(self, expr: str) -> str:
         return expr if self._simple(expr) else f'({expr})'
 
+    def _emit_backedge_phi(self, target_pc: int):
+        """Emit `{label_var} = {current_reg};` assignments before a
+        goto that jumps BACK to an earlier-emitted loop header. The
+        loop header's code reads the register values from named vars
+        captured at label-emit time; for the next iteration to see
+        the new register state, each changed register must be copied
+        into the header's named var here.
+
+        Handles A, B, X, Y. B matters because REP #$20 at a loop
+        header merges (B, A_low) into a 16-bit accumulator — if the
+        loop body updates B (e.g. via XBA after a fresh LDA), the
+        new byte must propagate to the header's B-var before the
+        back-edge goto.
+        """
+        la = getattr(self, '_label_a', {}).get(target_pc)
+        if la and self.A and la != self.A and self._simple(la):
+            self._emit(f'{la} = {self.A};')
+        lb = getattr(self, '_label_b', {}).get(target_pc)
+        if lb and self.B and lb != self.B and self._simple(lb):
+            self._emit(f'{lb} = {self.B};')
+        lx = getattr(self, '_label_x', {}).get(target_pc)
+        ly = getattr(self, '_label_y', {}).get(target_pc)
+        if lx and self.X and lx != self.X and self._simple(lx) and self._simple(self.X):
+            if lx != ly:
+                self._emit(f'{lx} = {self.X};')
+        if ly and self.Y and ly != self.Y and self._simple(ly) and self._simple(self.Y):
+            if ly != lx:
+                self._emit(f'{ly} = {self.Y};')
+
     # -- Indirect addressing helpers ------------------------------------------
 
     def _indir_read(self, dp: int, y_expr: str, wide: bool = False) -> str:
@@ -2734,18 +2763,27 @@ class EmitCtx:
             # Multiple paths can reach a label with different DP values cached,
             # so we must not use stale cached values after a merge point.
             self.dp_state.clear()
+            # Record A/B/X/Y at EVERY label so any back-edge (explicit
+            # backward BRA, or implicit ROM-fall-through from an insn
+            # decoded later than the label) can reassign the header's
+            # tracked variables before the goto. Cheap memory; required
+            # for correctness of fall-through loops like the NextByte
+            # → StartTransfer wrap in HandleSPCUploads_Inner.
+            # B is tracked because REP #$20 at a loop header merges A+B
+            # into the 16-bit accumulator — if B carries a value the
+            # loop-body refreshes (e.g. LDA[_0],Y → XBA → new byte sits
+            # in B), the back-edge must assign to whatever var the
+            # header captured as B.
+            if not hasattr(self, '_label_x'):
+                self._label_x = {}
+                self._label_y = {}
+                self._label_a = {}
+                self._label_b = {}
+            self._label_x[pc] = self.X
+            self._label_y[pc] = self.Y
+            self._label_a[pc] = self.A
+            self._label_b[pc] = self.B
             if pc in self._backward_branch_targets:
-                # Record A/X/Y at this label so a backward branch knows the
-                # variable name each register must hold on loop re-entry.
-                # (Forward branches handle merges via _branch_states, which
-                # is set up at the branch site before the target is emitted.)
-                if not hasattr(self, '_label_x'):
-                    self._label_x = {}
-                    self._label_y = {}
-                    self._label_a = {}
-                self._label_x[pc] = self.X
-                self._label_y[pc] = self.Y
-                self._label_a[pc] = self.A
                 self._emit('WatchdogCheck();')
 
         # -- STZ ----------------------------------------------------------
@@ -3860,23 +3898,10 @@ class EmitCtx:
                     'stack': list(self.stack),
                 }
             # Backward BRA: if the target label was emitted earlier with a
-            # known A/X/Y variable, assign the current register values into
+            # known A/B/X/Y variable, assign the current register values into
             # those variables before the goto so the next loop iteration
-            # sees the updated register state. X/Y already handled below;
-            # we also need A for patterns like HexToDec's SBC-A; BRA loop.
-            if hasattr(self, '_label_a') and v in self._label_a:
-                la = self._label_a[v]
-                if la and self.A and la != self.A and self._simple(la):
-                    self._emit(f'{la} = {self.A};')
-            if hasattr(self, '_label_x') and v in self._label_x:
-                lx = self._label_x[v]
-                ly = self._label_y.get(v)
-                if lx and self.X and lx != self.X and self._simple(lx) and self._simple(self.X):
-                    if lx != ly:
-                        self._emit(f'{lx} = {self.X};')
-                if ly and self.Y and ly != self.Y and self._simple(ly) and self._simple(self.Y):
-                    if ly != lx:
-                        self._emit(f'{ly} = {self.Y};')
+            # sees the updated register state.
+            self._emit_backedge_phi(v)
             self._emit(f'goto label_{v:04x};')
         else:
             # Branch merge: materialize registers before the branch so the
@@ -4406,6 +4431,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
             if tgt < (insn.addr & 0xFFFF) and tgt in valid_branch_targets:
                 backward_branch_targets.add(tgt)
 
+
     # Phase 2: detect implicit backward loops via fall-through + branch cycles.
     # Build a mini-CFG: for each instruction, what addresses can follow it?
     # Then find addresses reachable from a backward branch target that can
@@ -4686,6 +4712,13 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                     and phys_next in valid_branch_targets
                     and (not end_addr or phys_next < end_addr)
                     and (not start16 or phys_next >= start16)):
+                # If the target label was emitted earlier (forms a loop
+                # via fall-through), copy current register state into
+                # the header's named vars so the next iteration reads
+                # updated values. Same machinery as a backward BRA.
+                # _emit_backedge_phi is a no-op if the target has no
+                # recorded label vars (forward-only jump).
+                ctx._emit_backedge_phi(phys_next)
                 ctx._emit(f'goto label_{phys_next:04x};  /* ROM fall-through */')
 
     # Fall-through detection: use the last instruction BEFORE end_addr.
