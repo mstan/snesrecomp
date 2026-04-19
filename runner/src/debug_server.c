@@ -381,7 +381,18 @@ void debug_server_profile_latch(int frame_num) {
 // Stores per-frame data for retroactive queries (10 min @ 60fps = 36000 frames).
 // Each frame records: pass/fail, ptr sync status, diff summary, last func,
 // and a snapshot of key game state bytes for cross-server comparison.
-#define FRAME_HISTORY_SIZE 36000
+// Ring buffer sizing tradeoff: capturing full WRAM (128KB) + full VRAM
+// (64KB) per frame is ~196KB. At FRAME_HISTORY_SIZE=6000 that's ~1.2GB
+// resident — enough for ~100 seconds of full-state history. A larger
+// ring (e.g. the previous 36000-frame / 10-minute target) multiplied
+// by 196KB becomes 7GB+ which exceeds reasonable dev-machine budgets
+// and Windows MSVC static-array linker limits. If you need a longer
+// window, either (a) bump this and accept the memory cost, or (b)
+// split into separate rings (a 36000-frame small-state ring + a
+// smaller big-state ring). The small-state ring still holds ~100s
+// of every-frame CPU/PPU/DMA/CGRAM/OAM/zeropage/wram_1000 without
+// the 196KB/frame adds.
+#define FRAME_HISTORY_SIZE 6000
 #define MAX_DIFF_ENTRIES 64   // max diverging addresses to record per frame
 
 // Key RAM addresses snapshotted each frame (must match oracle debug_server.c)
@@ -463,8 +474,14 @@ typedef struct {
     uint16_t cgram[0x100];    // 512 bytes (full palette)
     uint16_t oam[0x100];      // 512 bytes (main OAM table)
     uint8_t highOam[0x20];    // 32 bytes (high OAM table)
-    uint8_t zeropage[256];    // 256 bytes (WRAM $00-$FF)
-    uint8_t wram_1000[4096];  // 4096 bytes (WRAM $1000-$1FFF — player state, physics, timers)
+    uint8_t zeropage[256];    // 256 bytes (WRAM $00-$FF) — retained for backward-compat with tools that read it directly
+    uint8_t wram_1000[4096];  // 4096 bytes (WRAM $1000-$1FFF) — retained for backward-compat
+    // Full state captures (added 2026-04-18 per ring-buffer-is-principal-
+    // observability principle). Any address range that was previously only
+    // queryable on-demand (dump_ram, dump_vram) is now also in the ring
+    // for historical queries. zeropage/wram_1000 are now subsets of wram.
+    uint8_t wram[0x20000];    // 128 KB — full SNES WRAM ($7E0000-$7FFFFF)
+    uint8_t vram[0x10000];    // 64 KB  — full SNES VRAM ($0000-$FFFF word-addressable × 2)
 } FrameRecord;
 
 static FrameRecord s_frame_history[FRAME_HISTORY_SIZE];
@@ -589,17 +606,33 @@ void debug_server_record_frame(int frame, int pass,
         memset(r->dma, 0, sizeof(r->dma));
     }
 
-    // Zero page snapshot (WRAM $00-$FF)
+    // Zero page snapshot (WRAM $00-$FF) — backward-compat alias.
     if (s_ram && s_ram_size >= 256)
         memcpy(r->zeropage, s_ram, 256);
     else
         memset(r->zeropage, 0, 256);
 
-    // Game state WRAM snapshot ($1000-$1FFF)
+    // Game state WRAM snapshot ($1000-$1FFF) — backward-compat alias.
     if (s_ram && s_ram_size >= 0x2000)
         memcpy(r->wram_1000, s_ram + 0x1000, 4096);
     else
         memset(r->wram_1000, 0, 4096);
+
+    // Full WRAM snapshot ($0-$1FFFF, 128KB). Source of truth; the two
+    // back-compat subsets above are redundant with this.
+    if (s_ram && s_ram_size >= 0x20000)
+        memcpy(r->wram, s_ram, 0x20000);
+    else {
+        memset(r->wram, 0, 0x20000);
+        if (s_ram && s_ram_size > 0)
+            memcpy(r->wram, s_ram, s_ram_size < 0x20000 ? s_ram_size : 0x20000);
+    }
+
+    // Full VRAM snapshot (64KB word-addressable → stored as raw bytes).
+    if (g_ppu)
+        memcpy(r->vram, g_ppu->vram, 0x10000);
+    else
+        memset(r->vram, 0, 0x10000);
 
     s_history_write_idx = (s_history_write_idx + 1) % FRAME_HISTORY_SIZE;
     if (s_history_count < FRAME_HISTORY_SIZE) s_history_count++;
@@ -1282,6 +1315,74 @@ static void cmd_dump_vram(const char *args) {
     send(s_client_sock, "\"}\n", 3, 0);
 }
 
+// Historical VRAM dump: reads the ring-buffer snapshot for a specific
+// frame. Args: `<frame> [addr_hex] [len]`. If frame isn't in the ring
+// (not yet recorded, or evicted), returns an error.
+static void cmd_dump_frame_vram(const char *args) {
+    int frame_num = -1;
+    unsigned int addr = 0, len = 0x10000;
+    if (sscanf(args, "%d %x %u", &frame_num, &addr, &len) < 1) {
+        send_fmt("{\"error\":\"usage: dump_frame_vram <frame> [addr_hex] [len]\"}");
+        return;
+    }
+    if (len > 0x10000) len = 0x10000;
+    if (addr + len > 0x10000) {
+        send_fmt("{\"error\":\"out of range\"}");
+        return;
+    }
+    lock_mutex();
+    FrameRecord *r = find_frame(frame_num);
+    if (!r) {
+        unlock_mutex();
+        send_fmt("{\"error\":\"frame %d not in ring buffer\"}", frame_num);
+        return;
+    }
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr),
+             "{\"frame\":%d,\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"",
+             frame_num, addr, len);
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    // Copy out of the locked record so we don't hold the mutex during send.
+    static uint8_t tmp[0x10000];
+    memcpy(tmp, r->vram + addr, len);
+    unlock_mutex();
+    send_hex_blob(tmp, len);
+    send(s_client_sock, "\"}\n", 3, 0);
+}
+
+// Historical WRAM dump: reads the ring-buffer snapshot for a specific
+// frame. Args: `<frame> [addr_hex] [len]`.
+static void cmd_dump_frame_wram(const char *args) {
+    int frame_num = -1;
+    unsigned int addr = 0, len = 0x20000;
+    if (sscanf(args, "%d %x %u", &frame_num, &addr, &len) < 1) {
+        send_fmt("{\"error\":\"usage: dump_frame_wram <frame> [addr_hex] [len]\"}");
+        return;
+    }
+    if (len > 0x20000) len = 0x20000;
+    if (addr + len > 0x20000) {
+        send_fmt("{\"error\":\"out of range\"}");
+        return;
+    }
+    lock_mutex();
+    FrameRecord *r = find_frame(frame_num);
+    if (!r) {
+        unlock_mutex();
+        send_fmt("{\"error\":\"frame %d not in ring buffer\"}", frame_num);
+        return;
+    }
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr),
+             "{\"frame\":%d,\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"",
+             frame_num, addr, len);
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    static uint8_t tmp[0x20000];
+    memcpy(tmp, r->wram + addr, len);
+    unlock_mutex();
+    send_hex_blob(tmp, len);
+    send(s_client_sock, "\"}\n", 3, 0);
+}
+
 static void cmd_dump_cgram(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
     const uint8_t *cgram_bytes = (const uint8_t *)g_ppu->cgram;
@@ -1605,6 +1706,8 @@ static const CmdEntry s_commands[] = {
     {"get_functions", cmd_get_functions},
     // Exhaustive state dumps
     {"dump_vram",     cmd_dump_vram},
+    {"dump_frame_vram", cmd_dump_frame_vram},
+    {"dump_frame_wram", cmd_dump_frame_wram},
     {"dump_cgram",    cmd_dump_cgram},
     {"dump_oam",      cmd_dump_oam},
     {"get_ppu_state", cmd_get_ppu_state},
