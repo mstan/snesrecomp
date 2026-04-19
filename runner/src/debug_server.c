@@ -1352,6 +1352,87 @@ static void cmd_save_state(const char *args) {
     send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
 }
 
+// ---- L3 harness: minimal-input fixture helpers ----
+// write_ram / zero_ram / set_cpu — building blocks for the input-injection
+// style of per-function test. Each test zeros both runtimes, writes its
+// small set of input bytes, sets CPU regs, invokes, then reads the
+// declared output regions. No savestate needed.
+
+static int _hex_nibble(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static void cmd_write_ram(const char *args) {
+    unsigned int addr = 0;
+    if (sscanf(args, "%x", &addr) != 1) {
+        send_fmt("{\"error\":\"usage: write_ram <addr_hex> <hex_bytes>\"}");
+        return;
+    }
+    // Skip past addr to hex blob.
+    const char *p = args;
+    while (*p && !((*p == ' ') || (*p == '\t'))) p++;
+    while (*p == ' ' || *p == '\t') p++;
+    int count = 0;
+    while (p[0] && p[1] && addr + count < 0x20000) {
+        int hi = _hex_nibble(p[0]);
+        int lo = _hex_nibble(p[1]);
+        if (hi < 0 || lo < 0) break;
+        g_snes->ram[addr + count] = (uint8_t)((hi << 4) | lo);
+        count++;
+        p += 2;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+    // Mirror into g_ram so the recompiled direct-dispatch path sees the
+    // write. (L3 invoke_recomp will also sync pre-call but doing it here
+    // lets unit-level reads of g_ram work too.)
+    memcpy(g_ram + addr, g_snes->ram + addr, count);
+    send_fmt("{\"ok\":true,\"addr\":\"0x%x\",\"count\":%d}", addr, count);
+}
+
+static void cmd_zero_ram(const char *args) {
+    (void)args;
+    memset(g_snes->ram, 0, 0x20000);
+    memset(g_ram, 0, 0x20000);
+    send_fmt("{\"ok\":true,\"size\":%u}", 0x20000);
+}
+
+// set_cpu key=val key=val ...   where key in {a,x,y,sp,dp,db,pb,pc,p,e}
+// Values are parsed as hex (prefix optional).
+static void cmd_set_cpu(const char *args) {
+    const char *p = args;
+    int count = 0;
+    char keybuf[16];
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        int klen = 0;
+        while (p[klen] && p[klen] != '=' && klen < 15) { keybuf[klen] = p[klen]; klen++; }
+        keybuf[klen] = 0;
+        if (p[klen] != '=') break;
+        p += klen + 1;
+        unsigned int val = 0;
+        int nread = 0;
+        if (sscanf(p, "%x%n", &val, &nread) != 1) break;
+        p += nread;
+        if      (strcmp(keybuf, "a")  == 0) g_cpu->a  = (uint16_t)val;
+        else if (strcmp(keybuf, "x")  == 0) g_cpu->x  = (uint16_t)val;
+        else if (strcmp(keybuf, "y")  == 0) g_cpu->y  = (uint16_t)val;
+        else if (strcmp(keybuf, "sp") == 0) g_cpu->sp = (uint16_t)val;
+        else if (strcmp(keybuf, "dp") == 0) g_cpu->dp = (uint16_t)val;
+        else if (strcmp(keybuf, "db") == 0) g_cpu->db = (uint8_t)val;
+        else if (strcmp(keybuf, "pb") == 0) g_cpu->k  = (uint8_t)val;
+        else if (strcmp(keybuf, "pc") == 0) g_cpu->pc = (uint16_t)val;
+        else if (strcmp(keybuf, "p")  == 0) cpu_setFlags(g_cpu, (uint8_t)val);
+        else if (strcmp(keybuf, "e")  == 0) g_cpu->e  = (val != 0);
+        else { send_fmt("{\"error\":\"unknown cpu field: %s\"}", keybuf); return; }
+        count++;
+    }
+    send_fmt("{\"ok\":true,\"fields_set\":%d}", count);
+}
+
 // ---- L3 harness: invoke one recompiled function by name ----
 // invoke_recomp <name>
 //
@@ -1975,6 +2056,9 @@ static const CmdEntry s_commands[] = {
     {"save_state",    cmd_save_state},
     {"load_state",    cmd_load_state},
     {"invoke_recomp", cmd_invoke_recomp},
+    {"write_ram",     cmd_write_ram},
+    {"zero_ram",      cmd_zero_ram},
+    {"set_cpu",       cmd_set_cpu},
     {"trace_addr",    cmd_trace_addr},
     {"get_trace",     cmd_get_trace},
     {"trace_reg",     cmd_trace_reg},

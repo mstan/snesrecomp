@@ -179,6 +179,129 @@ def diff_snapshots(a: Dict[str, bytes], b: Dict[str, bytes]) -> Dict[str, List[T
 
 # ---- the main entry point -------------------------------------------------
 
+def _read_wram_bytes(client: DebugClient, addr: int, length: int) -> bytes:
+    """Read an arbitrary WRAM range via read_ram (which caps at 1024
+    bytes per call). Stitches multiple calls if length exceeds that."""
+    out = bytearray()
+    while length > 0:
+        chunk = min(1024, length)
+        r = client.cmd(f'read_ram 0x{addr:x} {chunk}')
+        hexs = r.get('hex', '')
+        got = bytes(int(x, 16) for x in hexs.split()) if hexs else b''
+        if len(got) != chunk:
+            raise RuntimeError(
+                f'read_ram {addr:#x}+{chunk} returned {len(got)} bytes: {r}'
+            )
+        out.extend(got)
+        addr += chunk
+        length -= chunk
+    return bytes(out)
+
+
+def _format_cpu(cpu: Dict[str, int]) -> str:
+    return ' '.join(f'{k}=0x{v:x}' for k, v in cpu.items())
+
+
+def _normalize_input(val) -> bytes:
+    if isinstance(val, int):
+        return bytes([val & 0xFF])
+    if isinstance(val, (bytes, bytearray)):
+        return bytes(val)
+    if isinstance(val, (list, tuple)):
+        return bytes(val)
+    raise TypeError(f'unsupported input value type: {type(val).__name__}')
+
+
+StubbedDiff = List[Tuple[int, int, int]]  # (addr, recomp_byte, oracle_byte)
+
+
+def run_stubbed(
+    name: str,
+    *,
+    inputs: Optional[Dict[int, object]] = None,
+    cpu: Optional[Dict[str, int]] = None,
+    expected_writes: Optional[List[Tuple[int, int]]] = None,
+    emu_pc: Optional[int] = None,
+    emu_ret: str = 'rts',
+) -> StubbedDiff:
+    """Input-injection equivalence test for a single recompiled function.
+
+    - inputs: {wram_addr: int or bytes-like}  injected into WRAM on both
+      sides after zeroing, before invoke.
+    - cpu: {'a': int, 'x': int, ...}  CPU register fields to set on both
+      sides before invoke. See cmd_set_cpu in debug_server for supported
+      field names.
+    - expected_writes: [(wram_addr, length), ...]  regions diffed after
+      invoke. Anything outside these ranges is ignored — the test
+      documents the function's declared output contract.
+    - emu_pc: ROM entry point for the interpreter. If None, resolved from
+      the recomp_func_registry's recorded rom_addr.
+    - emu_ret: 'rts' or 'rtl'.
+
+    Returns the list of per-byte disagreements (empty list = pass).
+    """
+    launch_pair()
+    try:
+        r_client = DebugClient(RECOMP_PORT)
+        o_client = DebugClient(ORACLE_PORT)
+        try:
+            for c in (r_client, o_client):
+                reply = c.cmd('zero_ram')
+                if not reply.get('ok'):
+                    raise RuntimeError(f'zero_ram on port {c.port}: {reply}')
+
+            for addr, val in (inputs or {}).items():
+                data = _normalize_input(val)
+                hex_str = data.hex()
+                for c in (r_client, o_client):
+                    reply = c.cmd(f'write_ram 0x{addr:x} {hex_str}')
+                    if not reply.get('ok'):
+                        raise RuntimeError(
+                            f'write_ram {addr:#x} on port {c.port}: {reply}'
+                        )
+
+            if cpu:
+                kv = _format_cpu(cpu)
+                for c in (r_client, o_client):
+                    reply = c.cmd(f'set_cpu {kv}')
+                    if not reply.get('ok'):
+                        raise RuntimeError(f'set_cpu on port {c.port}: {reply}')
+
+            r_invoke = r_client.cmd(f'invoke_recomp {name}')
+            if not r_invoke.get('ok'):
+                raise RuntimeError(f'invoke_recomp failed: {r_invoke}')
+            if emu_pc is None:
+                emu_pc = int(r_invoke.get('rom_addr', '0x0'), 16)
+            o_invoke = o_client.cmd(f'invoke_emu {emu_pc:x} {emu_ret}')
+            if not o_invoke.get('ok'):
+                raise RuntimeError(f'invoke_emu failed: {o_invoke}')
+
+            diffs: StubbedDiff = []
+            for addr, length in (expected_writes or []):
+                rb = _read_wram_bytes(r_client, addr, length)
+                ob = _read_wram_bytes(o_client, addr, length)
+                for i in range(length):
+                    if rb[i] != ob[i]:
+                        diffs.append((addr + i, rb[i], ob[i]))
+            return diffs
+        finally:
+            r_client.close()
+            o_client.close()
+    finally:
+        shutdown_pair()
+
+
+def format_stubbed_diff(diffs: StubbedDiff) -> str:
+    if not diffs:
+        return '(no divergence)'
+    lines = [f'{len(diffs)} byte(s) differ:']
+    for addr, rv, ov in diffs[:16]:
+        lines.append(f'  ${addr:05x}: recomp=0x{rv:02x} oracle=0x{ov:02x}')
+    if len(diffs) > 16:
+        lines.append(f'  ... ({len(diffs) - 16} more)')
+    return '\n'.join(lines)
+
+
 def run_load_only(fixture: str) -> Dict[str, List[Tuple[int, int, int]]]:
     """Sanity test: load the same fixture on both sides and diff state
     without invoking anything. Should always be empty diff if load_state

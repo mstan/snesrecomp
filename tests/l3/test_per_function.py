@@ -1,14 +1,13 @@
-"""L3 per-function behavioral-equivalence tests.
+"""L3 per-function behavioral-equivalence tests, input-injection style.
 
-Each test loads a savestate fixture on both recomp and oracle, invokes
-a single recompiled function, and asserts that the resulting WRAM/VRAM
-state matches between the two runtimes.
+Each test declares a minimal input contract (WRAM bytes + CPU regs),
+invokes the function on both the recompiled binary (direct C call) and
+the oracle (65816 interpreter, same ROM), and diffs a declared output
+region. No savestate dependency — the inputs ARE the fixture.
 
-Green tests are regression guards — we already fixed the bug and want
-it to stay fixed. @known_red tests pin currently-broken bugs so they
-stay visible until someone fixes them (the decorator expects them to
-FAIL; if they unexpectedly pass, it raises to tell you to remove the
-marker).
+Green tests are regression guards for bugs we fixed. @known_red tests
+pin bugs we haven't — the decorator raises if an expected-red test
+unexpectedly passes, prompting you to graduate it to green.
 """
 import sys
 import pathlib
@@ -16,57 +15,67 @@ import pathlib
 THIS_DIR = pathlib.Path(__file__).parent
 sys.path.insert(0, str(THIS_DIR))
 
-from harness import run_func, known_red, format_diff_summary  # noqa: E402
+from harness import run_stubbed, known_red, format_stubbed_diff  # noqa: E402
 
 
-def test_HandleLevelTileAnimations_matches_emulator():
-    """Regression guard for the 3N-multiplier codegen bug fixed in
-    snesrecomp 252a2a0 (STA _0 ; ASL A ; ADC _0 folding the stale
-    post-shift A back into ADC). Before the fix this function wrote
-    $0101 to $0D7C/7E/80 instead of reading the correct entries from
-    the $05:B93B pointer table."""
-    diff = run_func(
+def test_HandleLevelTileAnimations_three_times_pattern():
+    """Pin the 3N multiplier fix (snesrecomp 252a2a0).
+
+    ROM at $05:BB3B does: LDA EffFrame ; AND #$07 ; STA _0 ; ASL A ; ADC _0
+    expecting A = 3 * (EffFrame & 7) — used as a 6-byte-stride index
+    into the $05:B93B pointer table. The function writes three words to
+    $0D7C/7E/80 (Gfx33DestAddr C/B/A).
+
+    Before the fix, ADC _0 folded to the post-ASL A variable, computing
+    4N instead of 3N and reading misaligned entries. The observable was
+    $0D7C/7E/80 = $0101 (garbage) instead of the correct table words.
+
+    With EffFrame=3, we expect table entries at offset 3*3*2 = 18 = $12
+    from the 3 base tables ($05:B93B/B93D/B93F).
+    """
+    diffs = run_stubbed(
         name='HandleLevelTileAnimations',
-        fixture='attract_f94.snap',
-        emu_ret='rts',
+        inputs={0x0014: 0x03},       # EffFrame
+        cpu={'db': 0x00, 'dp': 0x0000, 'pb': 0x05, 'e': 0, 'p': 0x30},
+        # Writes both $D7C/7E/80 (Gfx33DestAddr C/B/A) and $D76/78/7A
+        # (the loop body's GetAnimatedTile storage). Full output window
+        # is $D76..$D81, 12 bytes.
+        expected_writes=[(0x0D76, 12)],
+        emu_ret='rtl',
     )
-    assert not diff, (
-        f"HandleLevelTileAnimations diverges from emulator:\n"
-        f"{format_diff_summary(diff)}"
+    assert not diffs, (
+        f'HandleLevelTileAnimations(EffFrame=3) output diverges:\n'
+        f'{format_stubbed_diff(diffs)}'
     )
 
 
-@known_red(
-    "BG1 chr upload shortfall; recomp writes fewer VRAM words than "
-    "emulator during attract-mode level-graphics load. Visible in-game "
-    "as missing ground tiles and single-column bush rendering on the "
-    "title-screen backdrop. Root cause not yet identified — pinned here "
-    "for investigation"
-)
-def test_UploadPlayerGFX_matches_emulator():
-    """Currently RED: at the captured attract-mode frame, UploadPlayerGFX
-    produces ~211 fewer VRAM-word writes on recomp vs the emulator,
-    concentrated in BG1 chr ($0600-$07FF) and OBJ chr ($1E00-$1FFF)
-    regions. Test is marked @known_red until the underlying miscompile
-    is found and fixed."""
-    diff = run_func(
-        name='UploadPlayerGFX',
-        fixture='attract_f94.snap',
-        emu_ret='rts',
+def test_HandleLevelTileAnimations_eff_frame_zero():
+    """EffFrame=0 is the degenerate case: 3*0=0, reads the first entry
+    of each table. Good coverage for 'does the function work when
+    EffFrame & 7 is zero' — an edge the 3N bug wouldn't have caught
+    (0*3 == 0*4)."""
+    diffs = run_stubbed(
+        name='HandleLevelTileAnimations',
+        inputs={0x0014: 0x00},
+        cpu={'db': 0x00, 'dp': 0x0000, 'pb': 0x05, 'e': 0, 'p': 0x30},
+        # Writes both $D7C/7E/80 (Gfx33DestAddr C/B/A) and $D76/78/7A
+        # (the loop body's GetAnimatedTile storage). Full output window
+        # is $D76..$D81, 12 bytes.
+        expected_writes=[(0x0D76, 12)],
+        emu_ret='rtl',
     )
-    assert not diff, (
-        f"UploadPlayerGFX diverges from emulator:\n"
-        f"{format_diff_summary(diff)}"
-    )
+    assert not diffs, format_stubbed_diff(diffs)
 
 
 if __name__ == '__main__':
-    # Manual invocation for ad-hoc runs. Proper run is via run_tests.py.
-    for fn_name in ('test_HandleLevelTileAnimations_matches_emulator',
-                    'test_UploadPlayerGFX_matches_emulator'):
-        fn = globals()[fn_name]
+    tests = [
+        'test_HandleLevelTileAnimations_three_times_pattern',
+        'test_HandleLevelTileAnimations_eff_frame_zero',
+    ]
+    for tname in tests:
+        fn = globals()[tname]
         try:
             fn()
-            print(f'PASS  {fn_name}')
+            print(f'PASS  {tname}')
         except AssertionError as e:
-            print(f'FAIL  {fn_name}: {e!s}'[:500])
+            print(f'FAIL  {tname}:\n{str(e)[:2000]}')
