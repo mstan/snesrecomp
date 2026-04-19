@@ -205,6 +205,55 @@ static void check_range_trace(void) {
     }
 }
 
+// ---- MMIO register-write trace ----
+// Captures every write to an MMIO register address in any configured
+// [lo, hi] range, tagged with frame + last recomp func + call-stack.
+// Enabled via "trace_reg <lo> <hi>" (appends a range, up to
+// MAX_TRACE_RANGES); read via "get_reg_trace"; cleared via
+// "trace_reg_reset".
+#define REG_TRACE_LOG_SIZE 8192
+#define MAX_TRACE_RANGES 8
+static struct {
+    int active;
+    int nranges;
+    struct { uint16_t lo, hi; } ranges[MAX_TRACE_RANGES];
+    int write_idx;
+    int count;
+    struct {
+        int frame;
+        uint16_t adr;
+        uint8_t val;
+        char func[64];
+        const char *stack[TRACE_STACK_DEPTH];
+        int stack_depth;
+    } log[REG_TRACE_LOG_SIZE];
+} s_reg_trace = {0};
+
+void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
+    if (!s_reg_trace.active) return;
+    int hit = 0;
+    for (int i = 0; i < s_reg_trace.nranges; i++)
+        if (adr >= s_reg_trace.ranges[i].lo && adr <= s_reg_trace.ranges[i].hi) { hit = 1; break; }
+    if (!hit) return;
+    extern const char *g_recomp_stack[];
+    extern int g_recomp_stack_top;
+    int idx = s_reg_trace.write_idx % REG_TRACE_LOG_SIZE;
+    s_reg_trace.log[idx].frame = snes_frame_counter;
+    s_reg_trace.log[idx].adr = adr;
+    s_reg_trace.log[idx].val = val;
+    if (g_last_recomp_func)
+        strncpy(s_reg_trace.log[idx].func, g_last_recomp_func, 63);
+    else
+        strcpy(s_reg_trace.log[idx].func, "(none)");
+    s_reg_trace.log[idx].func[63] = 0;
+    int depth = g_recomp_stack_top < TRACE_STACK_DEPTH ? g_recomp_stack_top : TRACE_STACK_DEPTH;
+    s_reg_trace.log[idx].stack_depth = depth;
+    for (int s = 0; s < depth; s++)
+        s_reg_trace.log[idx].stack[s] = g_recomp_stack[g_recomp_stack_top - depth + s];
+    s_reg_trace.write_idx++;
+    if (s_reg_trace.count < REG_TRACE_LOG_SIZE) s_reg_trace.count++;
+}
+
 // ---- Map16 write log ----
 // Captures every write to the Map16 low-byte range ($C800-$CFFF) with full context.
 // Enabled via TCP command "map16_trace_on", retrieved via "get_map16_trace".
@@ -930,6 +979,67 @@ static void cmd_get_trace(const char *args) {
     send_line(buf);
 }
 
+static void cmd_trace_reg(const char *args) {
+    unsigned int lo = 0, hi = 0;
+    sscanf(args, "%x %x", &lo, &hi);
+    if (hi < lo || hi > 0xffff) {
+        send_fmt("{\"error\":\"bad range\"}"); return;
+    }
+    if (s_reg_trace.nranges >= MAX_TRACE_RANGES) {
+        send_fmt("{\"error\":\"too many ranges (max %d) — call trace_reg_reset first\"}",
+                 MAX_TRACE_RANGES); return;
+    }
+    s_reg_trace.ranges[s_reg_trace.nranges].lo = (uint16_t)lo;
+    s_reg_trace.ranges[s_reg_trace.nranges].hi = (uint16_t)hi;
+    s_reg_trace.nranges++;
+    s_reg_trace.active = 1;
+    send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
+             lo, hi, s_reg_trace.nranges);
+}
+
+static void cmd_trace_reg_reset(const char *args) {
+    (void)args;
+    s_reg_trace.nranges = 0;
+    s_reg_trace.write_idx = 0;
+    s_reg_trace.count = 0;
+    s_reg_trace.active = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_reg_trace(const char *args) {
+    if (!s_reg_trace.active) {
+        send_fmt("{\"error\":\"no reg trace active\"}"); return;
+    }
+    char buf[65536];
+    int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
+    for (int i = 0; i < s_reg_trace.nranges; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
+            s_reg_trace.ranges[i].lo, s_reg_trace.ranges[i].hi);
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "],\"entries\":%d,\"log\":[", s_reg_trace.count);
+    int start = s_reg_trace.count < REG_TRACE_LOG_SIZE ? 0 :
+                s_reg_trace.write_idx - REG_TRACE_LOG_SIZE;
+    for (int i = 0; i < s_reg_trace.count && pos < 60000; i++) {
+        int idx = (start + i) % REG_TRACE_LOG_SIZE;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"func\":\"%s\",\"stack\":[",
+            i ? "," : "",
+            s_reg_trace.log[idx].frame,
+            s_reg_trace.log[idx].adr,
+            s_reg_trace.log[idx].val,
+            s_reg_trace.log[idx].func);
+        for (int s = 0; s < s_reg_trace.log[idx].stack_depth; s++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", s ? "," : "",
+                s_reg_trace.log[idx].stack[s] ? s_reg_trace.log[idx].stack[s] : "?");
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
 static void cmd_trace_range(const char *args) {
     unsigned int base = 0;
     unsigned int len = 0;
@@ -1363,6 +1473,8 @@ static void cmd_get_ppu_state(const char *args) {
     Ppu *p = g_ppu;
     send_fmt("{\"inidisp\":\"0x%02x\",\"bgmode\":%d,\"mosaic\":\"0x%02x\",\"obsel\":\"0x%02x\","
              "\"setini\":\"0x%02x\","
+             "\"bgXsc\":[\"0x%02x\",\"0x%02x\",\"0x%02x\",\"0x%02x\"],"
+             "\"bgTileAdr\":\"0x%04x\","
              "\"hScroll\":[%d,%d,%d,%d],\"vScroll\":[%d,%d,%d,%d],"
              "\"screenEnabled\":[\"0x%02x\",\"0x%02x\"],\"screenWindowed\":[\"0x%02x\",\"0x%02x\"],"
              "\"cgadsub\":\"0x%02x\",\"cgwsel\":\"0x%02x\","
@@ -1373,6 +1485,8 @@ static void cmd_get_ppu_state(const char *args) {
              "\"evenFrame\":%s}",
              p->inidisp, p->bgmode & 7, p->mosaic, p->obsel,
              p->setini,
+             p->bgXsc[0], p->bgXsc[1], p->bgXsc[2], p->bgXsc[3],
+             p->bgTileAdr,
              p->hScroll[0], p->hScroll[1], p->hScroll[2], p->hScroll[3],
              p->vScroll[0], p->vScroll[1], p->vScroll[2], p->vScroll[3],
              p->screenEnabled[0], p->screenEnabled[1], p->screenWindowed[0], p->screenWindowed[1],
@@ -1585,6 +1699,9 @@ static const CmdEntry s_commands[] = {
     {"loadstate",     cmd_loadstate},
     {"trace_addr",    cmd_trace_addr},
     {"get_trace",     cmd_get_trace},
+    {"trace_reg",     cmd_trace_reg},
+    {"trace_reg_reset", cmd_trace_reg_reset},
+    {"get_reg_trace", cmd_get_reg_trace},
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
     {"get_frame",     cmd_get_frame},

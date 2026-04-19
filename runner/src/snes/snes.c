@@ -15,6 +15,7 @@
 #include "../tracing.h"
 #include "variables.h"
 #include "../common_rtl.h"
+#include "../debug_server.h"
 
 extern bool g_use_my_apu_code;
 
@@ -473,6 +474,9 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     }
     if(adr >= 0x4300 && adr < 0x4380) {
       dma_write(snes->dma, adr, val); // dma registers
+    }
+    if(adr >= 0x2100 && adr < 0x4400) {
+      debug_server_on_reg_write(adr, val);
     }
   }
   // write to cart

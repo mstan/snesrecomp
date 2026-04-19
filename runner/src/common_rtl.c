@@ -6,6 +6,7 @@
 #include "util.h"
 #include "config.h"
 #include "snes/snes.h"
+#include "debug_server.h"
 
 // PRINCIPLES.md rule 20: prints the violating ROM address and aborts.
 // Called by Rule20Violation(addr, "kind") in generated code whenever the
@@ -684,6 +685,7 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x4300 && reg < 0x4380) {
     dma_write(g_dma, reg, value);
   }
+  debug_server_on_reg_write(reg, value);
 }
 
 uint16 Mult8x8(uint8 a, uint8 b) {

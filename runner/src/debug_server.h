@@ -46,4 +46,9 @@ void debug_server_log_map16_write(uint16_t ram_addr, uint8_t value,
                                    uint16_t ptr_lo, uint8_t ptr_bank,
                                    uint16_t offset);
 
+// MMIO register-write trace. Call from snes_write paths after the write
+// completes. Captures entries for addresses in [s_reg_trace_lo, s_reg_trace_hi).
+// Disabled by default; enable via the "trace_reg <lo> <hi>" TCP command.
+void debug_server_on_reg_write(uint16_t adr, uint8_t val);
+
 #endif
