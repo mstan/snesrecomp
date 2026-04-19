@@ -51,4 +51,10 @@ void debug_server_log_map16_write(uint16_t ram_addr, uint8_t value,
 // Disabled by default; enable via the "trace_reg <lo> <hi>" TCP command.
 void debug_server_on_reg_write(uint16_t adr, uint8_t val);
 
+// VRAM-word write trace. Call from every path that mutates ppu->vram —
+// ppu_write $2118/$2119 cases, WriteVramWord, and any hand-written code
+// that writes g_ppu->vram directly (e.g. LoadStripeImage_UploadToVRAM).
+// Disabled by default; enable via "trace_vram <lo> <hi>" (word addresses).
+void debug_server_on_vram_write(uint16_t adr_word, uint16_t value);
+
 #endif

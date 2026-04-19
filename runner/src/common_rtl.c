@@ -735,6 +735,7 @@ uint16 ReadRegWord(uint16 reg) {
 static void WriteVramWord(Ppu *ppu, uint16 value) {
   uint16_t adr = ppu->vramPointer;
   ppu->vram[adr & 0x7fff] = value;
+  debug_server_on_vram_write(adr & 0x7fff, value);
   ppu->vramPointer += ppu->vramIncrement;
 }
 
@@ -996,6 +997,7 @@ uint16 *RtlGetVramAddr() {
 void RtlPpuWrite(uint16 addr, uint8 value) {
   assert((addr & 0xff00) == 0x2100);
   ppu_write(g_ppu, addr, value);
+  debug_server_on_reg_write(addr, value);
 }
 
 void RtlPpuWriteTwice(uint16 addr, uint16 value) {

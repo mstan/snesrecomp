@@ -8,6 +8,7 @@
 #include <stddef.h>
 
 #include "snes.h"
+#include "../debug_server.h"
 #include "snes_regs.h"
 
 
@@ -1052,12 +1053,14 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       // TODO: vram access during rendering (also cgram and oam)
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
+      debug_server_on_vram_write(vramAdr & 0x7fff, ppu->vram[vramAdr & 0x7fff]);
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }
     case 0x19: {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
+      debug_server_on_vram_write(vramAdr & 0x7fff, ppu->vram[vramAdr & 0x7fff]);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }

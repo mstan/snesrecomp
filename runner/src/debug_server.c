@@ -229,6 +229,57 @@ static struct {
     } log[REG_TRACE_LOG_SIZE];
 } s_reg_trace = {0};
 
+// ---- VRAM-word write trace ----
+// Captures every word-address write to PPU VRAM with attribution. Unlike
+// reg trace this sees *all* writes, including LoadStripeImage_UploadToVRAM
+// and other hand-code that bypasses $2118/$2119 and writes g_ppu->vram
+// directly. Enabled via "trace_vram <lo> <hi>" (word addresses, up to
+// MAX_VRAM_TRACE_RANGES disjoint ranges); read via "get_vram_trace";
+// cleared via "trace_vram_reset".
+#define VRAM_TRACE_LOG_SIZE 16384
+#define MAX_VRAM_TRACE_RANGES 8
+static struct {
+    int active;
+    int nranges;
+    struct { uint16_t lo, hi; } ranges[MAX_VRAM_TRACE_RANGES];
+    int write_idx;
+    int count;
+    struct {
+        int frame;
+        uint16_t adr;
+        uint16_t val;
+        char func[64];
+        const char *stack[TRACE_STACK_DEPTH];
+        int stack_depth;
+    } log[VRAM_TRACE_LOG_SIZE];
+} s_vram_trace = {0};
+
+void debug_server_on_vram_write(uint16_t adr_word, uint16_t value) {
+    if (!s_vram_trace.active) return;
+    int hit = 0;
+    for (int i = 0; i < s_vram_trace.nranges; i++)
+        if (adr_word >= s_vram_trace.ranges[i].lo &&
+            adr_word <= s_vram_trace.ranges[i].hi) { hit = 1; break; }
+    if (!hit) return;
+    extern const char *g_recomp_stack[];
+    extern int g_recomp_stack_top;
+    int idx = s_vram_trace.write_idx % VRAM_TRACE_LOG_SIZE;
+    s_vram_trace.log[idx].frame = snes_frame_counter;
+    s_vram_trace.log[idx].adr = adr_word;
+    s_vram_trace.log[idx].val = value;
+    if (g_last_recomp_func)
+        strncpy(s_vram_trace.log[idx].func, g_last_recomp_func, 63);
+    else
+        strcpy(s_vram_trace.log[idx].func, "(none)");
+    s_vram_trace.log[idx].func[63] = 0;
+    int depth = g_recomp_stack_top < TRACE_STACK_DEPTH ? g_recomp_stack_top : TRACE_STACK_DEPTH;
+    s_vram_trace.log[idx].stack_depth = depth;
+    for (int s = 0; s < depth; s++)
+        s_vram_trace.log[idx].stack[s] = g_recomp_stack[g_recomp_stack_top - depth + s];
+    s_vram_trace.write_idx++;
+    if (s_vram_trace.count < VRAM_TRACE_LOG_SIZE) s_vram_trace.count++;
+}
+
 void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
     if (!s_reg_trace.active) return;
     int hit = 0;
@@ -1006,6 +1057,67 @@ static void cmd_trace_reg_reset(const char *args) {
     send_fmt("{\"ok\":true}");
 }
 
+static void cmd_trace_vram(const char *args) {
+    unsigned int lo = 0, hi = 0;
+    sscanf(args, "%x %x", &lo, &hi);
+    if (hi < lo || hi > 0xffff) {
+        send_fmt("{\"error\":\"bad range\"}"); return;
+    }
+    if (s_vram_trace.nranges >= MAX_VRAM_TRACE_RANGES) {
+        send_fmt("{\"error\":\"too many ranges (max %d) — call trace_vram_reset first\"}",
+                 MAX_VRAM_TRACE_RANGES); return;
+    }
+    s_vram_trace.ranges[s_vram_trace.nranges].lo = (uint16_t)lo;
+    s_vram_trace.ranges[s_vram_trace.nranges].hi = (uint16_t)hi;
+    s_vram_trace.nranges++;
+    s_vram_trace.active = 1;
+    send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
+             lo, hi, s_vram_trace.nranges);
+}
+
+static void cmd_trace_vram_reset(const char *args) {
+    (void)args;
+    s_vram_trace.nranges = 0;
+    s_vram_trace.write_idx = 0;
+    s_vram_trace.count = 0;
+    s_vram_trace.active = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_vram_trace(const char *args) {
+    if (!s_vram_trace.active) {
+        send_fmt("{\"error\":\"no vram trace active\"}"); return;
+    }
+    char buf[65536];
+    int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
+    for (int i = 0; i < s_vram_trace.nranges; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
+            s_vram_trace.ranges[i].lo, s_vram_trace.ranges[i].hi);
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "],\"entries\":%d,\"log\":[", s_vram_trace.count);
+    int start = s_vram_trace.count < VRAM_TRACE_LOG_SIZE ? 0 :
+                s_vram_trace.write_idx - VRAM_TRACE_LOG_SIZE;
+    for (int i = 0; i < s_vram_trace.count && pos < 60000; i++) {
+        int idx = (start + i) % VRAM_TRACE_LOG_SIZE;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"func\":\"%s\",\"stack\":[",
+            i ? "," : "",
+            s_vram_trace.log[idx].frame,
+            s_vram_trace.log[idx].adr,
+            s_vram_trace.log[idx].val,
+            s_vram_trace.log[idx].func);
+        for (int s = 0; s < s_vram_trace.log[idx].stack_depth; s++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", s ? "," : "",
+                s_vram_trace.log[idx].stack[s] ? s_vram_trace.log[idx].stack[s] : "?");
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
 static void cmd_get_reg_trace(const char *args) {
     if (!s_reg_trace.active) {
         send_fmt("{\"error\":\"no reg trace active\"}"); return;
@@ -1702,6 +1814,9 @@ static const CmdEntry s_commands[] = {
     {"trace_reg",     cmd_trace_reg},
     {"trace_reg_reset", cmd_trace_reg_reset},
     {"get_reg_trace", cmd_get_reg_trace},
+    {"trace_vram",    cmd_trace_vram},
+    {"trace_vram_reset", cmd_trace_vram_reset},
+    {"get_vram_trace", cmd_get_vram_trace},
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
     {"get_frame",     cmd_get_frame},
