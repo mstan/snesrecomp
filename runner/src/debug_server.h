@@ -25,11 +25,11 @@ void debug_server_wait_if_paused(void);
 // Consumes the request (only returns it once).
 int debug_server_consume_loadstate(void);
 
-// Record a frame's verify result into the history ring buffer.
-// Called after each frame comparison. mine_ram/theirs_ram can be NULL if no verify.
-void debug_server_record_frame(int frame, int pass,
-                               const uint8_t *mine_ram, const uint8_t *theirs_ram,
-                               uint32_t ram_size);
+// Snapshot the current frame's state (CPU/PPU/DMA/WRAM/VRAM/CGRAM/OAM)
+// into the history ring buffer. Called once per frame from common_cpu_infra.
+// Cross-runtime divergence comparison is done by an external tool that
+// reads from both runtimes' TCP servers — not in here.
+void debug_server_record_frame(int frame);
 
 // Set pointers the server needs to inspect game state.
 void debug_server_set_ram(uint8_t *ram, uint32_t ram_size);

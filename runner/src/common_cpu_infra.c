@@ -299,7 +299,7 @@ void RtlRunFrameCompare() {
   if (g_framedump_callback)
     g_framedump_callback(snes_frame_counter, g_ram, NULL);
   {
-    extern void debug_server_record_frame(int, int, const uint8_t*, const uint8_t*, uint32_t);
-    debug_server_record_frame(snes_frame_counter, 1, NULL, NULL, 0);
+    extern void debug_server_record_frame(int);
+    debug_server_record_frame(snes_frame_counter);
   }
 }

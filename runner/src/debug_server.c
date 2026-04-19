@@ -393,7 +393,6 @@ void debug_server_profile_latch(int frame_num) {
 // of every-frame CPU/PPU/DMA/CGRAM/OAM/zeropage/wram_1000 without
 // the 196KB/frame adds.
 #define FRAME_HISTORY_SIZE 6000
-#define MAX_DIFF_ENTRIES 64   // max diverging addresses to record per frame
 
 // Key RAM addresses snapshotted each frame (must match oracle debug_server.c)
 #define SNAP_BYTES 64
@@ -428,12 +427,6 @@ static const uint16_t s_snap_addrs[SNAP_BYTES] = {
     0, 0
 };
 
-typedef struct {
-    uint32_t addr;
-    uint8_t mine;
-    uint8_t theirs;
-} DiffEntry;
-
 // Per-frame CPU register snapshot (16 bytes)
 typedef struct {
     uint16_t a, x, y, sp, pc, dp;
@@ -458,9 +451,6 @@ typedef struct {
 
 typedef struct {
     int frame_number;
-    int verify_pass;          // 1 = pass, 0 = fail
-    int diff_count;           // number of diverging WRAM bytes
-    DiffEntry diffs[MAX_DIFF_ENTRIES];
     uint16_t ptr_map16_c;     // ptr_lo_map16_data offset from g_ram
     uint16_t ptr_map16_dp;    // g_ram[0x6b] | g_ram[0x6c]<<8
     uint16_t ptr_map16_bak_c;
@@ -490,9 +480,7 @@ static int s_history_count = 0;
 
 // Called from the verify system after each frame comparison (main thread).
 // Protected by mutex since the network thread reads frame history.
-void debug_server_record_frame(int frame, int pass,
-                               const uint8_t *mine_ram, const uint8_t *theirs_ram,
-                               uint32_t ram_size) {
+void debug_server_record_frame(int frame) {
     extern uint8_t *ptr_lo_map16_data;
     extern uint8_t *ptr_lo_map16_data_bak;
     extern uint8_t g_ram[];
@@ -508,8 +496,6 @@ void debug_server_record_frame(int frame, int pass,
 
     FrameRecord *r = &s_frame_history[s_history_write_idx];
     r->frame_number = frame;
-    r->verify_pass = pass;
-    r->diff_count = 0;
 
     // Record pointer sync state
     r->ptr_map16_c = (uint16_t)(ptr_lo_map16_data - g_ram);
@@ -523,18 +509,6 @@ void debug_server_record_frame(int frame, int pass,
     else
         strcpy(r->last_func, "?");
     r->last_func[sizeof(r->last_func) - 1] = 0;
-
-    // Record WRAM diff (if both snapshots provided)
-    if (mine_ram && theirs_ram) {
-        for (uint32_t i = 0; i < ram_size && r->diff_count < MAX_DIFF_ENTRIES; i++) {
-            if (mine_ram[i] != theirs_ram[i]) {
-                DiffEntry *d = &r->diffs[r->diff_count++];
-                d->addr = i;
-                d->mine = mine_ram[i];
-                d->theirs = theirs_ram[i];
-            }
-        }
-    }
 
     // Snapshot key game state bytes for cross-server comparison
     for (int i = 0; i < SNAP_BYTES; i++) {
@@ -1121,21 +1095,14 @@ static void cmd_get_frame(const char *args) {
     }
     char buf[8192];
     int pos = snprintf(buf, sizeof(buf),
-        "{\"frame\":%d,\"pass\":%s,\"diff_count\":%d,"
+        "{\"frame\":%d,"
         "\"ptr_map16\":{\"c\":\"0x%04x\",\"dp\":\"0x%04x\",\"match\":%s},"
         "\"ptr_map16_bak\":{\"c\":\"0x%04x\",\"dp\":\"0x%04x\",\"match\":%s},"
         "\"func\":\"%s\"",
-        r->frame_number, r->verify_pass ? "true" : "false", r->diff_count,
+        r->frame_number,
         r->ptr_map16_c, r->ptr_map16_dp, r->ptr_map16_c == r->ptr_map16_dp ? "true" : "false",
         r->ptr_map16_bak_c, r->ptr_map16_bak_dp, r->ptr_map16_bak_c == r->ptr_map16_bak_dp ? "true" : "false",
         r->last_func);
-    if (r->diff_count > 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"diffs\":[");
-        for (int i = 0; i < r->diff_count && pos < 6000; i++)
-            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{\"addr\":\"0x%x\",\"mine\":\"0x%02x\",\"theirs\":\"0x%02x\"}",
-                            i ? "," : "", r->diffs[i].addr, r->diffs[i].mine, r->diffs[i].theirs);
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
-    }
     // Add game state snapshot
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         ",\"game_mode\":\"0x%02x\",\"gfx_files\":\"%02x %02x %02x %02x %02x %02x %02x %02x\",\"snap\":\"",
@@ -1146,23 +1113,6 @@ static void cmd_get_frame(const char *args) {
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\"");
     snprintf(buf + pos, sizeof(buf) - pos, "}");
     send_line(buf);
-}
-
-static void cmd_first_failure(const char *args) {
-    // Find the first frame that failed verify
-    for (int i = 0; i < s_history_count; i++) {
-        int idx = (s_history_write_idx - s_history_count + i + FRAME_HISTORY_SIZE) % FRAME_HISTORY_SIZE;
-        FrameRecord *r = &s_frame_history[idx];
-        if (!r->verify_pass) {
-            send_fmt("{\"first_failure\":%d,\"diff_count\":%d,\"func\":\"%s\","
-                     "\"ptr_map16\":{\"c\":\"0x%04x\",\"dp\":\"0x%04x\",\"match\":%s}}",
-                     r->frame_number, r->diff_count, r->last_func,
-                     r->ptr_map16_c, r->ptr_map16_dp,
-                     r->ptr_map16_c == r->ptr_map16_dp ? "true" : "false");
-            return;
-        }
-    }
-    send_fmt("{\"first_failure\":null,\"frames_checked\":%d}", s_history_count);
 }
 
 static void cmd_first_desync(const char *args) {
@@ -1189,11 +1139,10 @@ static void cmd_frame_range(const char *args) {
         FrameRecord *r = find_frame(f);
         if (!r) continue;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"pass\":%s,\"diffs\":%d,\"ptr_sync\":%s,"
+            "%s{\"f\":%d,\"ptr_sync\":%s,"
             "\"mode\":\"0x%02x\",\"gfx\":\"%02x%02x%02x%02x%02x%02x%02x%02x\"}",
             pos > 12 ? "," : "",
-            r->frame_number, r->verify_pass ? "true" : "false",
-            r->diff_count,
+            r->frame_number,
             r->ptr_map16_c == r->ptr_map16_dp ? "true" : "false",
             r->snap[21],
             r->snap[22], r->snap[23], r->snap[24], r->snap[25],
@@ -1695,7 +1644,6 @@ static const CmdEntry s_commands[] = {
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
     {"get_frame",     cmd_get_frame},
-    {"first_failure", cmd_first_failure},
     {"first_desync",  cmd_first_desync},
     {"frame_range",   cmd_frame_range},
     {"history",       cmd_history_status},
