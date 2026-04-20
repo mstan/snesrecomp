@@ -809,130 +809,6 @@ static void cmd_dump_ram(const char *args) {
     send(s_client_sock, "\"}\n", 3, 0);
 }
 
-// ---- Per-dispatch object trace ----
-// Captures g_ram key bytes before/after each bank 0D dispatch call.
-// Enabled for a specific frame via: trace_dispatch <frame>
-// Query results via: get_dispatch_trace
-
-#define MAX_DISPATCH_TRACE 128
-#define DISPATCH_KEY_BYTES 32  // number of key g_ram addresses to snapshot
-
-// Key DP/WRAM addresses to capture per dispatch
-static const uint16_t s_dispatch_key_addrs[DISPATCH_KEY_BYTES] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05,  // DP scratch / backup
-    0x57, 0x59, 0x5A,                      // blocks_sub_scr_pos, size_or_type, object_number
-    0x6B, 0x6C, 0x6E, 0x6F, 0x70,         // Map16 pointer bytes
-    0x80, 0x98, 0x99, 0x9A, 0x9B,         // blocks misc
-    0x1BA1 & 0xFF, 0x1928 & 0xFF,         // screen counters (low byte — need full addr)
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0          // padding
-};
-
-typedef struct {
-    int obj_number;              // blocks_object_number
-    uint8_t before[DISPATCH_KEY_BYTES];
-    uint8_t after[DISPATCH_KEY_BYTES];
-    char func_name[48];          // last recomp func after dispatch
-    uint16_t ptr_before;         // Map16 ptr C offset before
-    uint16_t ptr_after;          // Map16 ptr C offset after
-    uint32_t layer1_before;      // ptr_layer1_data offset from ROM start
-    uint32_t layer1_after;
-} DispatchTraceEntry;
-
-static DispatchTraceEntry s_dispatch_trace[MAX_DISPATCH_TRACE];
-static int s_dispatch_trace_count = 0;
-static int s_dispatch_trace_frame = -1;  // set via trace_dispatch cmd, or hardcode for debugging
-
-static void cmd_trace_dispatch(const char *args) {
-    int frame = 0;
-    sscanf(args, "%d", &frame);
-    s_dispatch_trace_frame = frame;
-    s_dispatch_trace_count = 0;
-    send_fmt("{\"ok\":true,\"tracing_frame\":%d}", frame);
-}
-
-static void cmd_get_dispatch_trace(const char *args) {
-    extern uint8_t g_ram[];
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "{\"frame\":%d,\"count\":%d,\"entries\":[",
-                       s_dispatch_trace_frame, s_dispatch_trace_count);
-    for (int i = 0; i < s_dispatch_trace_count && pos < 7000; i++) {
-        DispatchTraceEntry *e = &s_dispatch_trace[i];
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                       "%s{\"obj\":%d,\"func\":\"%s\","
-                       "\"ptr\":\"0x%04x->0x%04x\","
-                       "\"sub\":\"0x%02x->0x%02x\","
-                       "\"layer1\":\"0x%x->0x%x\"}",
-                       i ? "," : "",
-                       e->obj_number, e->func_name,
-                       e->ptr_before, e->ptr_after,
-                       e->before[6], e->after[6],
-                       e->layer1_before, e->layer1_after);
-    }
-    snprintf(buf + pos, sizeof(buf) - pos, "]}");
-    send_line(buf);
-}
-
-// Called from dispatch functions to record trace (main thread).
-// Protected by mutex since the network thread reads dispatch trace.
-void debug_dispatch_trace_before(int obj_number) {
-    extern uint8_t g_ram[];
-    extern const uint8_t *ptr_layer1_data;
-    extern const uint8_t *g_rom;  // ROM base pointer
-    if (snes_frame_counter != s_dispatch_trace_frame) return;
-    if (s_dispatch_trace_count >= MAX_DISPATCH_TRACE) return;
-
-    lock_mutex();
-
-    DispatchTraceEntry *e = &s_dispatch_trace[s_dispatch_trace_count];
-    e->obj_number = obj_number;
-    e->ptr_before = (uint16_t)(g_ram[0x6b] | (g_ram[0x6c] << 8));
-    e->layer1_before = (uint32_t)((uintptr_t)ptr_layer1_data & 0xFFFFFFFF);
-
-    // Snapshot key bytes
-    for (int i = 0; i < DISPATCH_KEY_BYTES; i++) {
-        uint16_t a = s_dispatch_key_addrs[i];
-        e->before[i] = (a < 0x20000) ? g_ram[a] : 0;
-    }
-    // Also capture full-address variables
-    e->before[20] = g_ram[0x1BA1 & 0x1FFFF];  // blocks_screen_to_place_next_object
-    e->before[21] = g_ram[0x1928 & 0x1FFFF];  // blocks_screen_to_place_current_object
-
-    unlock_mutex();
-}
-
-void debug_dispatch_trace_after(void) {
-    extern uint8_t g_ram[];
-    extern const uint8_t *ptr_layer1_data;
-    extern const uint8_t *g_rom;
-    if (snes_frame_counter != s_dispatch_trace_frame) return;
-    if (s_dispatch_trace_count >= MAX_DISPATCH_TRACE) return;
-
-    lock_mutex();
-
-    DispatchTraceEntry *e = &s_dispatch_trace[s_dispatch_trace_count];
-    e->ptr_after = (uint16_t)(g_ram[0x6b] | (g_ram[0x6c] << 8));
-    e->layer1_after = (uint32_t)((uintptr_t)ptr_layer1_data & 0xFFFFFFFF);
-
-    // Snapshot key bytes after
-    for (int i = 0; i < DISPATCH_KEY_BYTES; i++) {
-        uint16_t a = s_dispatch_key_addrs[i];
-        e->after[i] = (a < 0x20000) ? g_ram[a] : 0;
-    }
-    e->after[20] = g_ram[0x1BA1 & 0x1FFFF];
-    e->after[21] = g_ram[0x1928 & 0x1FFFF];
-
-    // Record function name
-    if (g_last_recomp_func)
-        strncpy(e->func_name, g_last_recomp_func, sizeof(e->func_name) - 1);
-    else
-        strcpy(e->func_name, "?");
-    e->func_name[sizeof(e->func_name) - 1] = 0;
-
-    s_dispatch_trace_count++;
-
-    unlock_mutex();
-}
-
 static void cmd_call_stack(const char *args) {
     char buf[2048];
     int pos = snprintf(buf, sizeof(buf), "{\"depth\":%d,\"stack\":[", g_recomp_stack_top);
@@ -2032,8 +1908,6 @@ static const CmdEntry s_commands[] = {
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
-    {"trace_dispatch", cmd_trace_dispatch},
-    {"get_dispatch_trace", cmd_get_dispatch_trace},
     {"call_stack",    cmd_call_stack},
     {"watch",         cmd_watch},
     {"unwatch",       cmd_unwatch},
