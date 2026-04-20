@@ -76,8 +76,6 @@ uint8_t snes_read(Snes* snes, uint32_t adr);
 void snes_write(Snes* snes, uint32_t adr, uint8_t val);
 uint8_t snes_cpuRead(Snes* snes, uint32_t adr);
 void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val);
-// debugging
-void snes_debugCycle(Snes* snes, bool* cpuNext, bool* spcNext);
 
 
 // snes_other.c functions:
@@ -85,8 +83,6 @@ void snes_debugCycle(Snes* snes, bool* cpuNext, bool* spcNext);
 bool snes_loadRom(Snes* snes, const uint8_t* data, int length);
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
-
-void snes_runCycle(Snes *snes);
 
 extern int snes_frame_counter;
 #endif
