@@ -61,9 +61,6 @@ void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
 void apu_cycle(Apu* apu) {
   if(apu->cpuCyclesLeft == 0) {
     apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
-    if (apu->spc->x == 0) {
-      apu->spc->x = 0;
-    }
   }
   apu->cpuCyclesLeft--;
 
