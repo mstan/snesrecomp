@@ -37,7 +37,6 @@ typedef struct DmaChannel {
 struct Dma {
   Snes* snes;
   DmaChannel channel[8];
-  uint16_t hdmaTimer;
   uint32_t dmaTimer;
   bool dmaBusy;
   uint8_t pad[7];

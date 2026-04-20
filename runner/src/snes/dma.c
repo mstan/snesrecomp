@@ -59,7 +59,6 @@ void dma_reset(Dma* dma) {
     dma->channel[i].terminated = false;
     dma->channel[i].offIndex = 0;
   }
-  dma->hdmaTimer = 0;
   dma->dmaTimer = 0;
   dma->dmaBusy = false;
 }
@@ -240,10 +239,7 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
 }
 
 bool dma_cycle(Dma* dma) {
-  if(dma->hdmaTimer > 0) {
-    dma->hdmaTimer -= 2;
-    return true;
-  } else if(dma->dmaBusy) {
+  if(dma->dmaBusy) {
     dma_doDma(dma);
     return true;
   }
