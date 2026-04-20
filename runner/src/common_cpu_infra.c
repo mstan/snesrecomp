@@ -184,7 +184,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     g_cpu->d = false;
     g_cpu->i = true;  // SEI at $8000
     cpu_setFlags(g_cpu, cpu_getFlags(g_cpu));
-    recomp_hw_init();
   } else {
     g_snes->cart->ramSize = 2048;
     g_snes->cart->ram = calloc(1, 2048);
@@ -199,13 +198,3 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   return g_snes;
 }
 
-void RtlRunFrameCompare() {
-  WatchdogFrameStart();
-  g_rtl_game_info->run_frame();
-  if (g_framedump_callback)
-    g_framedump_callback(snes_frame_counter, g_ram);
-  {
-    extern void debug_server_record_frame(int);
-    debug_server_record_frame(snes_frame_counter);
-  }
-}

@@ -160,7 +160,7 @@ void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val) {
   }
 }
 
-static uint16_t SwapInputBits(uint16_t x) {
+uint16_t SwapInputBits(uint16_t x) {
   uint16_t r = 0;
   for (int i = 0; i < 16; i++, x >>= 1)
     r = r * 2 + (x & 1);

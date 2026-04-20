@@ -21,7 +21,6 @@ typedef uint32 PatchBugsFunc(void);
 typedef void CpuInfraInitializeFunc(void);
 typedef void RunOneFrameOfGameFunc(void);
 
-void RtlRunFrameCompare(void);
 void WatchdogCheck(void);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);

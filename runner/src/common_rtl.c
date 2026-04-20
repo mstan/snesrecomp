@@ -1,6 +1,7 @@
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #include "recomp_hw.h"
+#include "framedump.h"
 #include "smw_spc_player.h"
 #include "util.h"
 #include "config.h"
@@ -428,13 +429,16 @@ bool RtlRunFrame(uint32 inputs) {
   g_snes->input1_currentState = inputs & 0xfff;
   g_snes->input2_currentState = (inputs >> 12) & 0xfff;
 
-  RtlRunFrameCompare();
+  WatchdogFrameStart();
+  g_rtl_game_info->run_frame();
+  if (g_framedump_callback)
+    g_framedump_callback(snes_frame_counter, g_ram);
+  {
+    extern void debug_server_record_frame(int);
+    debug_server_record_frame(snes_frame_counter);
+  }
 
   snes_frame_counter++;
-
-
-  // Heartbeat removed -- use TCP debug server instead
-
   return is_replay;
 }
 

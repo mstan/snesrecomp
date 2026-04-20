@@ -14,12 +14,6 @@ extern Snes *g_snes;
 extern Ppu *g_ppu;
 extern Dma *g_dma;
 
-void recomp_hw_init(void) {
-  // snes_reset() in SnesInit already establishes multiply/divide/latch/
-  // ramAdr defaults — nothing else to do here.
-}
-
-
 // --- WRAM access port (0x2180-0x2183), backed by snes->ramAdr ---
 
 void recomp_write_wram_port(uint16 reg, uint8 val) {
@@ -107,13 +101,6 @@ void recomp_write_internal_reg(uint16 reg, uint8 val) {
 }
 
 // --- Internal register reads (0x4200-0x421F) ---
-
-static uint16_t SwapInputBits(uint16_t x) {
-  uint16_t r = 0;
-  for (int i = 0; i < 16; i++, x >>= 1)
-    r = r * 2 + (x & 1);
-  return r;
-}
 
 uint8 recomp_read_internal_reg(uint16 reg) {
   switch (reg) {
