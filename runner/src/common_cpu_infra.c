@@ -219,8 +219,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
 
   g_sram = g_snes->cart->ram;
   g_sram_size = g_snes->cart->ramSize;
-  game_id = g_rtl_game_info->game_id;
-
   return g_snes;
 }
 

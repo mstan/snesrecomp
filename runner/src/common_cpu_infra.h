@@ -34,7 +34,6 @@ extern int g_watchdog_tripped;
 
 typedef struct RtlGameInfo {
   const char *title;
-  uint8 game_id;
   const uint32 *patch_carrys;
   size_t patch_carrys_count;
   PatchBugsFunc *patch_bugs;

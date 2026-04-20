@@ -15,7 +15,6 @@ uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
 bool g_did_finish_level_hook;
-uint8 game_id;
 Ppu *g_ppu;
 Dma *g_dma;
 

@@ -6,12 +6,6 @@
 #include <stdlib.h>
 
 enum {
-  kGameID_SMW = 1,
-  kGameID_SMB1 = 2,
-  kGameID_SMBLL = 3,
-};
-
-enum {
   // Version was bumped to 1 after I fixed bug #1
   kCurrentBugFixCounter = 1,
 };
@@ -43,7 +37,6 @@ extern Dma *g_dma;
 #define GET_BYTE(p) (*(uint8*)(p))
 
 extern int snes_frame_counter;
-extern uint8 game_id;
 
 typedef struct SpcPlayer SpcPlayer;
 extern SpcPlayer *g_spc_player;
