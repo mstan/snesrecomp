@@ -13,8 +13,6 @@ extern Snes *g_snes;
 extern Cpu *g_cpu;
 extern bool g_fail;
 
-typedef struct Snes Snes;
-
 Snes *SnesInit(const uint8 *data, int data_size);
 bool FixBugHook(uint32 addr);
 uint8_t *SnesRomPtr(uint32 v);
