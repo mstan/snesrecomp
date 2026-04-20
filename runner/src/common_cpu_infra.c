@@ -2,7 +2,6 @@
 #include "framedump.h"
 #include "types.h"
 #include "common_rtl.h"
-#include "recomp_state.h"
 #include "recomp_hw.h"
 #include "snes/cpu.h"
 #include "snes/snes.h"
@@ -186,7 +185,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     g_cpu->i = true;  // SEI at $8000
     cpu_setFlags(g_cpu, cpu_getFlags(g_cpu));
     recomp_hw_init();
-    recomp_sync_from_emu();
   } else {
     g_snes->cart->ramSize = 2048;
     g_snes->cart->ram = calloc(1, 2048);
@@ -203,7 +201,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
 
 void RtlRunFrameCompare() {
   WatchdogFrameStart();
-  recomp_sync_from_emu();
   g_rtl_game_info->run_frame();
   if (g_framedump_callback)
     g_framedump_callback(snes_frame_counter, g_ram);

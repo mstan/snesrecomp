@@ -1,4 +1,3 @@
-#include "recomp_state.h"
 #include "common_rtl.h"
 #include "snes/ppu.h"
 #include "snes/dma.h"
@@ -6,7 +5,8 @@
 
 // Direct hardware register handlers for the recomp path.
 // These bypass the emulator bus (snes_write/snes_read) and dispatch
-// directly to the appropriate subsystem.
+// directly to the appropriate subsystem, but operate on the SAME
+// underlying snes/ppu/dma state — no parallel shadows.
 
 extern uint8 g_ram[];
 extern const uint8 *g_rom;
@@ -14,46 +14,35 @@ extern Snes *g_snes;
 extern Ppu *g_ppu;
 extern Dma *g_dma;
 
-// --- Internal register state (owned by recomp, not g_snes) ---
-static uint8_t  recomp_multiplyA;
-static uint16_t recomp_multiplyResult;
-static uint16_t recomp_divideA;
-static uint16_t recomp_divideResult;
-static bool     recomp_ppuLatch;
-
 void recomp_hw_init(void) {
-  recomp_multiplyA = 0xff;
-  recomp_multiplyResult = 0xfe01;
-  recomp_divideA = 0xffff;
-  recomp_divideResult = 0x101;
-  recomp_ppuLatch = false;
-  g_recomp.wramAddr = 0;
+  // snes_reset() in SnesInit already establishes multiply/divide/latch/
+  // ramAdr defaults — nothing else to do here.
 }
 
 
-// --- WRAM access port (0x2180-0x2183) ---
+// --- WRAM access port (0x2180-0x2183), backed by snes->ramAdr ---
 
 void recomp_write_wram_port(uint16 reg, uint8 val) {
   switch (reg) {
     case 0x2180:
-      g_ram[g_recomp.wramAddr++] = val;
-      g_recomp.wramAddr &= 0x1ffff;
+      g_ram[g_snes->ramAdr++] = val;
+      g_snes->ramAdr &= 0x1ffff;
       break;
     case 0x2181:
-      g_recomp.wramAddr = (g_recomp.wramAddr & 0x1ff00) | val;
+      g_snes->ramAdr = (g_snes->ramAdr & 0x1ff00) | val;
       break;
     case 0x2182:
-      g_recomp.wramAddr = (g_recomp.wramAddr & 0x100ff) | (val << 8);
+      g_snes->ramAdr = (g_snes->ramAdr & 0x100ff) | (val << 8);
       break;
     case 0x2183:
-      g_recomp.wramAddr = (g_recomp.wramAddr & 0x0ffff) | ((val & 1) << 16);
+      g_snes->ramAdr = (g_snes->ramAdr & 0x0ffff) | ((val & 1) << 16);
       break;
   }
 }
 
 uint8 recomp_read_wram_port(void) {
-  uint8 ret = g_ram[g_recomp.wramAddr++];
-  g_recomp.wramAddr &= 0x1ffff;
+  uint8 ret = g_ram[g_snes->ramAdr++];
+  g_snes->ramAdr &= 0x1ffff;
   return ret;
 }
 
@@ -64,34 +53,33 @@ void recomp_write_internal_reg(uint16 reg, uint8 val) {
     case 0x4200:  // NMITIMEN
       g_snes->autoJoyRead = val & 0x1;
       g_snes->hIrqEnabled = val & 0x10;
-      g_recomp.vIrqEnabled = (val & 0x20) != 0;
-      g_snes->vIrqEnabled = g_recomp.vIrqEnabled;
+      g_snes->vIrqEnabled = (val & 0x20) != 0;
       g_snes->nmiEnabled = val & 0x80;
       break;
     case 0x4201:  // WRIO
-      if (!(val & 0x80) && recomp_ppuLatch)
+      if (!(val & 0x80) && g_snes->ppuLatch)
         ppu_read(g_ppu, 0x37);
-      recomp_ppuLatch = val & 0x80;
+      g_snes->ppuLatch = val & 0x80;
       break;
     case 0x4202:  // WRMPYA
-      recomp_multiplyA = val;
+      g_snes->multiplyA = val;
       break;
     case 0x4203:  // WRMPYB - triggers multiply
-      recomp_multiplyResult = recomp_multiplyA * val;
+      g_snes->multiplyResult = g_snes->multiplyA * val;
       break;
     case 0x4204:  // WRDIVL
-      recomp_divideA = (recomp_divideA & 0xff00) | val;
+      g_snes->divideA = (g_snes->divideA & 0xff00) | val;
       break;
     case 0x4205:  // WRDIVH
-      recomp_divideA = (recomp_divideA & 0x00ff) | (val << 8);
+      g_snes->divideA = (g_snes->divideA & 0x00ff) | (val << 8);
       break;
     case 0x4206:  // WRDIVB - triggers divide
       if (val == 0) {
-        recomp_divideResult = 0xffff;
-        recomp_multiplyResult = recomp_divideA;
+        g_snes->divideResult = 0xffff;
+        g_snes->multiplyResult = g_snes->divideA;
       } else {
-        recomp_divideResult = recomp_divideA / val;
-        recomp_multiplyResult = recomp_divideA % val;
+        g_snes->divideResult = g_snes->divideA / val;
+        g_snes->multiplyResult = g_snes->divideA % val;
       }
       break;
     case 0x4207:  // HTIMEL
@@ -101,12 +89,10 @@ void recomp_write_internal_reg(uint16 reg, uint8 val) {
       g_snes->hTimer = (g_snes->hTimer & 0x0ff) | ((val & 1) << 8);
       break;
     case 0x4209:  // VTIMEL
-      g_recomp.vTimer = (g_recomp.vTimer & 0x100) | val;
-      g_snes->vTimer = g_recomp.vTimer;
+      g_snes->vTimer = (g_snes->vTimer & 0x100) | val;
       break;
     case 0x420a:  // VTIMEH
-      g_recomp.vTimer = (g_recomp.vTimer & 0x0ff) | ((val & 1) << 8);
-      g_snes->vTimer = g_recomp.vTimer;
+      g_snes->vTimer = (g_snes->vTimer & 0x0ff) | ((val & 1) << 8);
       break;
     case 0x420b:  // MDMAEN - DMA trigger
       dma_startDma(g_dma, val, false);
@@ -122,7 +108,7 @@ void recomp_write_internal_reg(uint16 reg, uint8 val) {
 
 // --- Internal register reads (0x4200-0x421F) ---
 
-static uint16_t SwapInputBits_Recomp(uint16_t x) {
+static uint16_t SwapInputBits(uint16_t x) {
   uint16_t r = 0;
   for (int i = 0; i < 16; i++, x >>= 1)
     r = r * 2 + (x & 1);
@@ -165,23 +151,23 @@ uint8 recomp_read_internal_reg(uint16 reg) {
       return (g_snes->inVblank << 7) | hblank_toggle;
     }
     case 0x4213:  // RDIO
-      return recomp_ppuLatch << 7;
+      return g_snes->ppuLatch << 7;
     case 0x4214:  // RDDIVL
-      return recomp_divideResult & 0xff;
+      return g_snes->divideResult & 0xff;
     case 0x4215:  // RDDIVH
-      return recomp_divideResult >> 8;
+      return g_snes->divideResult >> 8;
     case 0x4216:  // RDMPYL
-      return recomp_multiplyResult & 0xff;
+      return g_snes->multiplyResult & 0xff;
     case 0x4217:  // RDMPYH
-      return recomp_multiplyResult >> 8;
+      return g_snes->multiplyResult >> 8;
     case 0x4218:  // JOY1L
-      return SwapInputBits_Recomp(g_recomp.input1) & 0xff;
+      return SwapInputBits(g_snes->input1_currentState) & 0xff;
     case 0x4219:  // JOY1H
-      return SwapInputBits_Recomp(g_recomp.input1) >> 8;
+      return SwapInputBits(g_snes->input1_currentState) >> 8;
     case 0x421a:  // JOY2L
-      return SwapInputBits_Recomp(g_recomp.input2) & 0xff;
+      return SwapInputBits(g_snes->input2_currentState) & 0xff;
     case 0x421b:  // JOY2H
-      return SwapInputBits_Recomp(g_recomp.input2) >> 8;
+      return SwapInputBits(g_snes->input2_currentState) >> 8;
     case 0x421c:
     case 0x421d:
     case 0x421e:

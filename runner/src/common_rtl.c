@@ -1,7 +1,6 @@
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #include "recomp_hw.h"
-#include "recomp_state.h"
 #include "smw_spc_player.h"
 #include "util.h"
 #include "config.h"
@@ -426,11 +425,8 @@ bool RtlRunFrame(uint32 inputs) {
     if (g_rtl_game_info->on_frame_inputs)
       g_rtl_game_info->on_frame_inputs(inputs);
   }
-  g_recomp.input1 = inputs & 0xfff;
-  g_recomp.input2 = (inputs >> 12) & 0xfff;
-  // Keep g_snes in sync for subsystems that still read it
-  g_snes->input1_currentState = g_recomp.input1;
-  g_snes->input2_currentState = g_recomp.input2;
+  g_snes->input1_currentState = inputs & 0xfff;
+  g_snes->input2_currentState = (inputs >> 12) & 0xfff;
 
   RtlRunFrameCompare();
 
