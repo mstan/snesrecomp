@@ -86,6 +86,7 @@ bool FixBugHook(uint32 addr) {
 
 uint32 PatchBugs(uint32 mode, uint32 addr) {
   hookmode = mode, hookadr = addr, hookcnt = 0;
+  if (!g_rtl_game_info->patch_bugs) return 0;
   return g_rtl_game_info->patch_bugs();
 }
 
