@@ -501,15 +501,6 @@ void MemCpy(void *dst, const void *src, int size) {
   memcpy(dst, src, size);
 }
 
-void mov24(struct LongPtr *a, uint32 d) {
-  a->addr = d & 0xffff;
-  a->bank = d >> 16;
-}
-
-uint32 Load24(LongPtr src) {
-  return *(uint32 *)&src & 0xffffff;
-}
-
 bool Unreachable(void) {
   printf("Unreachable!\n");
   assert(0);
