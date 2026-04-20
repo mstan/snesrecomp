@@ -26,8 +26,6 @@ struct Snes {
   uint16 input1_currentState;
   uint16 input2_currentState;
   // input
-  bool debug_cycles;
-  bool debug_apu_cycles;
   bool disableRender;
 
   // ram

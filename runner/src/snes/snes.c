@@ -26,8 +26,6 @@ static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = malloc(sizeof(Snes));
   snes->ram = ram;
-  snes->debug_cycles = false;
-  snes->debug_apu_cycles = false;
 
   snes->cpu = cpu_init(snes, 0);
   snes->apu = apu_init();
@@ -176,12 +174,6 @@ void snes_handle_pos_stuff(Snes *snes) {
 void snes_runCpu(Snes *snes) {
   uint32_t pc = snes->cpu->k << 16 | snes->cpu->pc;
 
-  if (snes->debug_cycles) {
-    char line[80];
-    getProcessorStateCpu(snes, line);
-    puts(line);
-    line[0] = 0;
-  }
   snes->cpuMemOps = 0;
   cpu_runOpcode(snes->cpu);
 }

@@ -59,15 +59,8 @@ void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
   spc_saveload(apu->spc, sli);
 }
 
-bool g_debug_apu_cycles=0;
-
 void apu_cycle(Apu* apu) {
   if(apu->cpuCyclesLeft == 0) {
-    if (g_debug_apu_cycles) {
-      char line[80];
-      getProcessorStateSpc(apu, line);
-      puts(line);
-    }
     apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
     if (apu->spc->x == 0) {
       apu->spc->x = 0;
