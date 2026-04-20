@@ -51,27 +51,18 @@ extern Ppu *g_ppu;
 extern Cpu *g_cpu;
 extern Dma *g_dma;
 extern Snes *g_snes;
-extern Ppu *g_my_ppu;
 extern uint8 g_ram[0x20000];
-void ppu_copy(Ppu *dst, Ppu *src);
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 
-// Bridge for the L3 harness.
-// Recomp maintains TWO WRAM buffers and TWO PPU instances:
-//   g_ram / g_my_ppu — used by the recompiled code's direct-dispatch path
-//   g_snes->ram / g_snes->ppu — used by the emulator's MMIO path
-// snes_saveload only handles the g_snes-side buffers. Every time state
-// crosses the L3 harness boundary we have to manually bridge the two
-// representations so both sides see the same memory.
+// Bridge for the L3 harness: snes_saveload reads/writes g_snes->ram; the
+// recompiled direct-dispatch path uses g_ram. Keep them in sync across
+// the harness boundary. (PPU is single-instance — g_ppu == g_snes->ppu
+// since the dual-PPU compare scaffolding was retired.)
 static void _l3_sync_to_snes(void) {
     memcpy(g_snes->ram, g_ram, 0x20000);
-    if (g_my_ppu && g_snes->ppu && g_my_ppu != g_snes->ppu)
-        ppu_copy(g_snes->ppu, g_my_ppu);
 }
 static void _l3_sync_from_snes(void) {
     memcpy(g_ram, g_snes->ram, 0x20000);
-    if (g_my_ppu && g_snes->ppu && g_my_ppu != g_snes->ppu)
-        ppu_copy(g_my_ppu, g_snes->ppu);
 }
 
 #define RECOMP_STACK_DEPTH 16
@@ -1195,9 +1186,9 @@ static void cmd_save_state(const char *args) {
         send_fmt("{\"error\":\"usage: save_state <filename>\"}");
         return;
     }
-    // If recompiled code has been executing, g_ram/g_my_ppu hold newer
-    // state than g_snes->ram/g_snes->ppu. Push those updates into the
-    // emulator-side buffers before snes_saveload serializes them.
+    // If recompiled code has been executing, g_ram holds newer state
+    // than g_snes->ram. Push that update into the emulator-side buffer
+    // before snes_saveload serializes it.
     _l3_sync_to_snes();
     FILE *f = fopen(filename, "wb");
     if (!f) {
@@ -1316,9 +1307,6 @@ static void cmd_invoke_recomp(const char *args) {
         send_fmt("{\"error\":\"unknown function: %s\"}", name);
         return;
     }
-    // Route PPU writes through g_my_ppu (recomp's dedicated instance). Tests
-    // then read g_snes->ppu after sync — keeps the two paths honest.
-    g_ppu = g_my_ppu ? g_my_ppu : g_snes->ppu;
     if (e->argc == 0) {
         ((void (*)(void))e->fn)();
     } else if (e->argc == 1) {
@@ -1330,9 +1318,8 @@ static void cmd_invoke_recomp(const char *args) {
                  e->name, e->argc);
         return;
     }
-    // Post-invoke: recompiled code mutated g_ram/g_my_ppu. Push those into
-    // g_snes-side buffers so read_ram/dump_vram report what the function
-    // actually did.
+    // Post-invoke: recompiled code mutated g_ram. Push that into g_snes->ram
+    // so read_ram reports what the function actually did.
     _l3_sync_to_snes();
     send_fmt("{\"ok\":true,\"name\":\"%s\",\"argc\":%d,"
              "\"rom_addr\":\"0x%06x\"}",
@@ -1368,14 +1355,10 @@ static void cmd_load_state(const char *args) {
         send_fmt("{\"error\":\"read failed after %zu bytes\"}", fs.total);
         return;
     }
-    // snes_saveload restored g_snes->ram/ppu. Push those into g_ram/g_my_ppu
-    // so the recompiled direct-dispatch path sees the restored state when
+    // snes_saveload restored g_snes->ram. Push that into g_ram so the
+    // recompiled direct-dispatch path sees the restored state when
     // invoke_recomp fires.
     _l3_sync_from_snes();
-    // g_ppu is only set during RtlRunFrameCompare in normal operation. For
-    // the L3 harness we need it valid immediately after load so dump_vram
-    // and register reads work without running a frame first.
-    if (!g_ppu) g_ppu = g_my_ppu ? g_my_ppu : g_snes->ppu;
     send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
 }
 

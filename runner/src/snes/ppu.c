@@ -29,14 +29,6 @@ void ppu_free(Ppu* ppu) {
   free(ppu);
 }
 
-void ppu_copy(Ppu *ppu, Ppu *ppu_src) {
-  size_t pitch = ppu->renderPitch;
-  uint8_t *renderBuffer = ppu->renderBuffer;
-  memcpy(ppu, ppu_src, sizeof(*ppu));
-  ppu->renderBuffer = renderBuffer;
-  ppu->renderPitch = (uint32_t)pitch;
-}
-
 void ppu_reset(Ppu* ppu) {
   {
     size_t pitch = ppu->renderPitch;

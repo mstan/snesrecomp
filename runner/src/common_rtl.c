@@ -31,7 +31,7 @@ int g_sram_size;
 const uint8 *g_rom;
 bool g_did_finish_level_hook;
 uint8 game_id;
-Ppu *g_ppu, *g_my_ppu;
+Ppu *g_ppu;
 Dma *g_dma;
 bool g_custom_music;
 
@@ -166,7 +166,7 @@ void RtlReset(int mode) {
   g_cpu->d = false;
   g_cpu->i = true;
   cpu_setFlags(g_cpu, cpu_getFlags(g_cpu));
-  ppu_reset(g_my_ppu);
+  ppu_reset(g_ppu);
   if (!(mode & 1))
     memset(g_sram, 0, g_sram_size);
 
@@ -481,7 +481,6 @@ static void RtlLoadFromFile(FILE *f, bool replay) {
   RtlApuLock();
 
   StateRecorder_Load(&state_recorder, f, replay);
-  ppu_copy(g_my_ppu, g_snes->ppu);
 
   RtlApuUnlock();
 }

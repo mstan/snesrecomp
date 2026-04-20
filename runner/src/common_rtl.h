@@ -52,7 +52,7 @@ extern uint8 g_ram[0x20000];
 extern uint8 *g_sram;
 extern int g_sram_size;
 extern const uint8 *g_rom;
-extern Ppu *g_ppu, *g_my_ppu;
+extern Ppu *g_ppu;
 extern Dma *g_dma;
 
 #define GET_BYTE(p) (*(uint8*)(p))

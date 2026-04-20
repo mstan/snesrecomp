@@ -216,12 +216,10 @@ static void FixupCarry(uint32 addr) {
 }
   
 Snes *SnesInit(const uint8 *data, int data_size) {
-  g_my_ppu = ppu_init();
-  ppu_reset(g_my_ppu);
-
   g_snes = snes_init(g_ram);
   g_cpu = g_snes->cpu;
   g_dma = g_snes->dma;
+  g_ppu = g_snes->ppu;
 
   if (data_size != 0) {
     bool loaded = snes_loadRom(g_snes, data, data_size);
@@ -273,17 +271,11 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   g_sram_size = g_snes->cart->ramSize;
   game_id = g_rtl_game_info->game_id;
 
-  // Copy the emulator's PPU state to g_my_ppu so the recomp path
-  // has a properly initialized PPU.
-  if (g_my_ppu && g_snes->ppu)
-    memcpy(g_my_ppu, g_snes->ppu, sizeof(*g_my_ppu));
-
   return g_snes;
 }
 
 void RtlRunFrameCompare() {
   WatchdogFrameStart();
-  g_ppu = g_my_ppu;
   g_snes->runningWhichVersion = 2;
   recomp_sync_from_emu();
   g_rtl_game_info->run_frame();

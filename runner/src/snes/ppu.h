@@ -217,7 +217,6 @@ enum {
 
 Ppu* ppu_init(void);
 void ppu_free(Ppu* ppu);
-void ppu_copy(Ppu *ppu, Ppu *ppu_src);
 void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
