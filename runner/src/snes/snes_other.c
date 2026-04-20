@@ -103,11 +103,6 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   return true;
 }
 
-void snes_setSamples(Snes* snes, int16_t* sampleData, int samplesPerFrame) {
-  // size is 2 (int16) * 2 (stereo) * samplesPerFrame
-  // sets samples in the sampleData
-  dsp_getSamples(snes->apu->dsp, sampleData, samplesPerFrame);
-}
 
 static void readHeader(const uint8_t* data, int length, int location, CartHeader* header) {
   // read name, TODO: non-ASCII names?
