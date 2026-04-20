@@ -729,8 +729,6 @@ extern int CpuOpcodeHook(uint32 addr);
 
 uint32_t pc_hist[16], pc_hist_ctr;
 
-uint32_t pc_bp = 0;
-int bp_cnt = 0;
 void DumpCpuHistory() {
   for (int i = 0; i < 16; i++) {
     printf("PC history: 0x%x\n", pc_hist[(pc_hist_ctr + i) & 15]);
@@ -745,16 +743,6 @@ static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
   uint32 cur_pc = ((cpu->k << 16) | cpu->pc - 1) & 0x7fffff;
   pc_hist[pc_hist_ctr] = cur_pc;
   pc_hist_ctr = (pc_hist_ctr + 1) & 15;
-  
-  if (cur_pc == pc_bp) {
-    printf("Reached BP 0x%x. A=0x%.2x, X=0x%.2x, Y=0x%.2x. C=0x%.2x,0x%.2x\n", 
-      cur_pc, cpu->a, cpu->x, cpu->y, 
-      g_ram[0xbcee],
-      g_ram[0xad10]);
-//    printf("T: 16 j=%d, %d\n", g_cpu->y, g_cpu->a);
-    bp_cnt += 1;
-    //g_snes->debug_cycles = 1;
-  }
 
 restart:
   switch(opcode) {
