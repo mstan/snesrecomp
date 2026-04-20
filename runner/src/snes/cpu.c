@@ -98,7 +98,6 @@ void cpu_reset(Cpu* cpu) {
 
 void cpu_saveload(Cpu *cpu, SaveLoadInfo *sli) {
   sli->func(sli, &cpu->a, offsetof(Cpu, cyclesUsed) - offsetof(Cpu, a));
-  cpu->spBreakpoint = 0x0;
 }
 
 int cpu_runOpcode(Cpu* cpu) {
@@ -1376,13 +1375,6 @@ restart:
       break;
     }
     case 0x60: { // rts imp
-      if (cpu->sp >= cpu->spBreakpoint && cpu->spBreakpoint) {
-        int delta = cpu->sp - cpu->spBreakpoint;
-        assert(delta == 0 || delta == 2);
-        cpu->spBreakpoint = 0;
-        if (HookedFunctionRts(delta == 2))
-          return;
-      }
       cpu->pc = cpu_pullWord(cpu) + 1;
       break;
     }
@@ -1455,13 +1447,6 @@ restart:
       break;
     }
     case 0x6b: { // rtl imp
-      if (cpu->sp >= cpu->spBreakpoint && cpu->spBreakpoint) {
-        assert(cpu->sp == cpu->spBreakpoint);
-        cpu->spBreakpoint = 0;
-        if (HookedFunctionRts(0))
-          return;
-      }
-
       cpu->pc = cpu_pullWord(cpu) + 1;
       cpu->k = cpu_pullByte(cpu) & 0x7f;
       break;

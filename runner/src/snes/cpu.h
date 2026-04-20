@@ -42,12 +42,10 @@ struct Cpu {
   bool stopped;
   // internal use
   uint8_t cyclesUsed; // indicates how many cycles an opcode used
-  uint16_t spBreakpoint;
   bool in_emu;
 };
 
 extern struct Cpu *g_cpu;
-bool HookedFunctionRts(int is_long);
 
 Cpu* cpu_init(void* mem, int memType);
 void cpu_free(Cpu* cpu);

@@ -12,8 +12,6 @@
 Snes *g_snes;
 Cpu *g_cpu;
 
-bool g_calling_asm_from_c;
-int g_calling_asm_from_c_ret;
 bool g_fail;
 extern bool g_other_image;
 const RtlGameInfo *g_rtl_game_info;
@@ -92,16 +90,6 @@ int CpuOpcodeHook(uint32 addr) {
   printf("Bad hook at 0x%x!\n", addr);
   assert(0);
   return 0;
-}
-
-bool HookedFunctionRts(int is_long) {
-  if (g_calling_asm_from_c) {
-    g_calling_asm_from_c_ret = is_long;
-    g_calling_asm_from_c = false;
-    return false;
-  }
-  assert(0);
-  return false;
 }
 
 // Debug: recomp function call stack for watchdog diagnostics.
