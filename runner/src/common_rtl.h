@@ -157,8 +157,6 @@ static inline const uint8 *RomPtr_E0(uint16_t addr) { (void)addr; return g_rom; 
 static inline const uint8 *RomPtr_E5(uint16_t addr) { (void)addr; return g_rom; }
 static inline const uint8 *RomPtr_F0(uint16_t addr) { (void)addr; return g_rom; }
 
-void AddHiLo(uint8 *hi, uint8 *lo, uint16 v);
-void SetHiLo(uint8 *hi, uint8 *lo, uint16 v);
 void WriteReg(uint16 reg, uint8 value);
 void WriteRegWord(uint16 reg, uint16 value);
 uint16 ReadRegWord(uint16 reg);

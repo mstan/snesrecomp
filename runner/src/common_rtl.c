@@ -599,15 +599,6 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 
 /* IndirWriteByte is now inline in common_rtl.h */
 
-void SetHiLo(uint8 *hi, uint8 *lo, uint16 v) {
-  *hi = v >> 8;
-  *lo = v;
-}
-
-void AddHiLo(uint8 *hi, uint8 *lo, uint16 v) {
-  SetHiLo(hi, lo, PAIR16(*hi, *lo) + v);
-}
-
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
   // Catch the APU up to the current cycle and write the port value
