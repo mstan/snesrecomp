@@ -18,7 +18,6 @@ bool g_did_finish_level_hook;
 uint8 game_id;
 Ppu *g_ppu;
 Dma *g_dma;
-bool g_custom_music;
 
 void ByteArray_AppendVl(ByteArray *arr, uint32 v) {
   for (; v >= 255; v -= 255)
