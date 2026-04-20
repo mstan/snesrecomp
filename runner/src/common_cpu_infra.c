@@ -137,14 +137,12 @@ static int g_watchdog_enabled;
 static int g_watchdog_counter;
 jmp_buf g_watchdog_jmp;
 int g_watchdog_tripped;
-int g_indirptr_count;
 
 void WatchdogFrameStart(void) {
   g_frame_start_clock = clock();
   g_watchdog_enabled = 1;
   g_watchdog_tripped = 0;
   g_watchdog_counter = 0;
-  g_indirptr_count = 0;
   g_recomp_stack_top = 0;
 }
 
@@ -158,9 +156,9 @@ void WatchdogCheck(void) {
   if (elapsed > 5.0) {
     fprintf(stderr,
       "\n=== WATCHDOG: Frame %d exceeded %.1fs ===\n"
-      "Game mode: %d | IndirPtr calls: %d | WatchdogCheck calls: %d\n"
+      "Game mode: %d | WatchdogCheck calls: %d\n"
       "Call stack (most recent first):\n",
-      snes_frame_counter, elapsed, g_ram[0x100], g_indirptr_count, g_watchdog_counter * 10000);
+      snes_frame_counter, elapsed, g_ram[0x100], g_watchdog_counter * 10000);
     for (int i = g_recomp_stack_top - 1; i >= 0; i--)
       fprintf(stderr, "  [%d] %s\n", g_recomp_stack_top - 1 - i, g_recomp_stack[i]);
     if (g_recomp_stack_top == 0)
