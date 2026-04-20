@@ -30,89 +30,6 @@ void recomp_hw_init(void) {
   g_recomp.wramAddr = 0;
 }
 
-// --- Lightweight DMA execution ---
-// Replaces the cycle-accurate dma_startDma/dma_cycle path.
-// Transfers all bytes at once without cycle stepping.
-
-static const uint8_t kDmaOffsets[8][4] = {
-  {0,0,0,0}, {0,1,0,1}, {0,0,0,0}, {0,0,1,1},
-  {0,1,2,3}, {0,1,0,1}, {0,0,0,0}, {0,0,1,1},
-};
-
-static uint8_t recomp_dma_read_byte(uint32_t addr) {
-  uint8_t bank = addr >> 16;
-  uint16_t adr = addr & 0xFFFF;
-  if (bank == 0x7E || bank == 0x7F)
-    return g_ram[((bank & 1) << 16) | adr];
-  if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
-    if (adr < 0x2000)
-      return g_ram[adr];
-    if (adr >= 0x8000)
-      return g_rom[(((uint32_t)bank << 15) | (adr & 0x7FFF)) & 0x3FFFFF];
-  }
-  // High bank ROM access
-  if (bank >= 0x40)
-    return g_rom[(((uint32_t)bank << 15) | (adr & 0x7FFF)) & 0x3FFFFF];
-  return 0;
-}
-
-static void recomp_dma_write_byte(uint32_t addr, uint8_t val) {
-  uint8_t bank = addr >> 16;
-  uint16_t adr = addr & 0xFFFF;
-  if (bank == 0x7E || bank == 0x7F) {
-    g_ram[((bank & 1) << 16) | adr] = val;
-    return;
-  }
-  if (adr < 0x2000) {
-    g_ram[adr] = val;
-  }
-}
-
-static void recomp_execute_dma_channel(DmaChannel *ch) {
-  uint8_t dest = ch->bAdr;
-  uint32_t src_addr = ch->aAdr | ((uint32_t)ch->aBank << 16);
-  uint16_t size = ch->size;
-  bool from_b = ch->fromB;
-  bool fixed = ch->fixed;
-  bool decrement = ch->decrement;
-  uint8_t mode = ch->mode & 7;
-  int unit_idx = 0;
-
-  // size=0 means 64K transfer
-  int bytes = (size == 0) ? 0x10000 : size;
-
-  for (int i = 0; i < bytes; i++) {
-    uint8_t ppu_reg = dest + kDmaOffsets[mode][unit_idx & 3];
-    if (from_b) {
-      // B->A: read from PPU, write to memory
-      uint8_t val = ppu_read(g_ppu, ppu_reg);
-      recomp_dma_write_byte(src_addr, val);
-    } else {
-      // A->B: read from memory, write to PPU
-      uint8_t byte = recomp_dma_read_byte(src_addr);
-      ppu_write(g_ppu, ppu_reg, byte);
-    }
-    if (!fixed) {
-      if (decrement) src_addr--; else src_addr++;
-    }
-    unit_idx++;
-  }
-
-  // Update channel state after transfer
-  ch->aAdr = src_addr & 0xFFFF;
-  ch->aBank = src_addr >> 16;
-  ch->size = 0;
-  ch->dmaActive = false;
-  ch->offIndex = 0;
-}
-
-void recomp_execute_dma(uint8_t channels_mask) {
-  for (int i = 0; i < 8; i++) {
-    if (channels_mask & (1 << i)) {
-      recomp_execute_dma_channel(&g_dma->channel[i]);
-    }
-  }
-}
 
 // --- WRAM access port (0x2180-0x2183) ---
 
@@ -192,7 +109,8 @@ void recomp_write_internal_reg(uint16 reg, uint8 val) {
       g_snes->vTimer = g_recomp.vTimer;
       break;
     case 0x420b:  // MDMAEN - DMA trigger
-      recomp_execute_dma(val);
+      dma_startDma(g_dma, val, false);
+      while (dma_cycle(g_dma)) {}
       break;
     case 0x420c:  // HDMAEN
       dma_startDma(g_dma, val, true);
