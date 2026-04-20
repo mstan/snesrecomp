@@ -455,17 +455,6 @@ void debug_server_profile_push(const char *name) {
     }
 }
 
-void debug_server_profile_frame_start(void) {
-    if (!s_profile_enabled || s_profile_latched) return;
-    s_profile_count = 0;
-    s_profile_frame_start = clock();
-}
-
-void debug_server_profile_frame_end(void) {
-    if (!s_profile_enabled || s_profile_latched) return;
-    s_profile_frame_ms = (double)(clock() - s_profile_frame_start) * 1000.0 / CLOCKS_PER_SEC;
-}
-
 // Called from watchdog handler — save profile snapshot to latch ring
 void debug_server_profile_latch(int frame_num) {
     if (!s_profile_enabled) return;

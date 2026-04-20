@@ -45,26 +45,6 @@ uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs) {
   return IndirPtr(p, offs);
 }
 
-bool ProcessHook(uint32 v) {
-  uint8_t *rombyte = SnesRomPtr(v);
-  switch (hookmode) {
-  case 0: // remove hooks
-    *rombyte = hook_orgbyte[hookcnt++];
-    return false;
-  case 1: // install hooks
-    hook_orgbyte[hookcnt++] = *rombyte;
-    *rombyte = 0;
-    return false;
-  case 2:  // run hook
-    if (v == hookadr) {
-      hookmode = 3;
-      return true;
-    }
-    return false;
-  }
-  return false;
-}
-
 bool FixBugHook(uint32 addr) {
   switch (hookmode) {
   case 1: { // install hooks

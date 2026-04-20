@@ -178,13 +178,6 @@ void RtlReset(int mode) {
     StateRecorder_Init(&state_recorder);
 }
 
-int GetFileSize(FILE *f) {
-  fseek(f, 0, SEEK_END);
-  int r = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  return r;
-}
-
 void StateRecorder_Load(StateRecorder *sr, FILE *f, bool replay_mode) {
   uint32 hdr[16] = { 0 };
 
