@@ -224,7 +224,13 @@ static uint16_t SwapInputBits_Recomp(uint16_t x) {
 uint8 recomp_read_internal_reg(uint16 reg) {
   switch (reg) {
     case 0x4210:  // RDNMI
-      return 0x02 | (g_snes->inNmi << 7);
+    {
+      // Bit 7 = NMI-pending, cleared on read (hardware-accurate).
+      // Low 4 bits are 5A22 chip revision (commonly $02 for SNES).
+      uint8 val = 0x02 | (g_snes->inNmi << 7);
+      g_snes->inNmi = false;
+      return val;
+    }
     case 0x4211:  // TIMEUP
     {
       uint8 val = g_snes->inIrq << 7;
@@ -232,7 +238,24 @@ uint8 recomp_read_internal_reg(uint16 reg) {
       return val;
     }
     case 0x4212:  // HVBJOY
-      return (g_snes->inVblank << 7);
+    {
+      // Bit 7 = VBlank. Bit 6 = HBlank. Our renderer runs a whole
+      // scanline per ppu_runLine() call (no sub-scanline timing), so
+      // HBlank isn't a real phase. ROM code that polls HVBJOY for the
+      // HBlank bit (e.g. SMW's WaitForHBlank at $843B, which brackets
+      // `BIT HVBJOY ; BVS -` then `BIT HVBJOY ; BVC -` to wait across
+      // one HBlank-end + one HBlank-start transition) would deadlock
+      // against a constant-value bit 6. Toggle bit 6 on every read so
+      // the two-edge waits always make progress. The actual HBlank
+      // duration (~25% of a scanline on real hardware) is elided; the
+      // game sees "an HBlank occurred between reads." For counted waits
+      // (LDY #N ; loop { WaitForHBlank ; DEY ; BNE }), Y decrements
+      // correctly — the timing shortens but the semantic count is
+      // preserved.
+      static uint8 hblank_toggle;
+      hblank_toggle ^= 0x40;
+      return (g_snes->inVblank << 7) | hblank_toggle;
+    }
     case 0x4213:  // RDIO
       return recomp_ppuLatch << 7;
     case 0x4214:  // RDDIVL
