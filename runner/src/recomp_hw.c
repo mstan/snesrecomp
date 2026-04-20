@@ -19,9 +19,6 @@ static uint8_t  recomp_multiplyA;
 static uint16_t recomp_multiplyResult;
 static uint16_t recomp_divideA;
 static uint16_t recomp_divideResult;
-static bool     recomp_autoJoyRead;
-static bool     recomp_nmiEnabled;
-static bool     recomp_hIrqEnabled;
 static bool     recomp_ppuLatch;
 
 void recomp_hw_init(void) {
@@ -29,9 +26,6 @@ void recomp_hw_init(void) {
   recomp_multiplyResult = 0xfe01;
   recomp_divideA = 0xffff;
   recomp_divideResult = 0x101;
-  recomp_autoJoyRead = false;
-  recomp_nmiEnabled = false;
-  recomp_hIrqEnabled = false;
   recomp_ppuLatch = false;
   g_recomp.wramAddr = 0;
 }
@@ -151,15 +145,11 @@ uint8 recomp_read_wram_port(void) {
 void recomp_write_internal_reg(uint16 reg, uint8 val) {
   switch (reg) {
     case 0x4200:  // NMITIMEN
-      recomp_autoJoyRead = val & 0x1;
-      recomp_hIrqEnabled = val & 0x10;
+      g_snes->autoJoyRead = val & 0x1;
+      g_snes->hIrqEnabled = val & 0x10;
       g_recomp.vIrqEnabled = (val & 0x20) != 0;
-      recomp_nmiEnabled = val & 0x80;
-      // Also update g_snes for subsystems that still read from it
-      g_snes->autoJoyRead = recomp_autoJoyRead;
-      g_snes->hIrqEnabled = recomp_hIrqEnabled;
       g_snes->vIrqEnabled = g_recomp.vIrqEnabled;
-      g_snes->nmiEnabled = recomp_nmiEnabled;
+      g_snes->nmiEnabled = val & 0x80;
       break;
     case 0x4201:  // WRIO
       if (!(val & 0x80) && recomp_ppuLatch)
