@@ -8,21 +8,6 @@
 #include "snes/snes.h"
 #include "debug_server.h"
 
-// PRINCIPLES.md rule 20: prints the violating ROM address and aborts.
-// Called by Rule20Violation(addr, "kind") in generated code whenever the
-// recompiler emitted a placeholder for an unknown register/parameter value.
-void _rule20_die(uint32 addr, const char *kind) {
-  fprintf(stderr,
-    "\n=== RULE 20 VIOLATION ===\n"
-    "  ROM address : $%06x\n"
-    "  kind        : %s\n"
-    "  meaning     : recompiler couldn't determine register/parameter value at codegen time\n"
-    "  fix         : add cfg hint (ret_y/RetAY/restores_x/x_after/preserves_y/etc.) and regenerate\n",
-    addr, kind);
-  fflush(stderr);
-  abort();
-}
-
 struct StateRecorder;
 
 uint8 g_ram[0x20000];

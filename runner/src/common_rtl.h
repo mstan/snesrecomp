@@ -5,20 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// PRINCIPLES.md rule 20: NO STUBS EVER.
-// When the recompiler can't determine a register/parameter value at codegen
-// time, it MUST emit one of these calls instead of silently substituting 0.
-// At runtime any execution path through one will print the violating ROM
-// address and abort, making the divergence observable instead of corrupting
-// state silently. To eliminate a violation: add the appropriate cfg hint
-// (ret_y, RetAY, restores_x, x_after, preserves_y, etc.) and regenerate.
-void _rule20_die(uint32 addr, const char *kind);
-// Single macro: kind is a string literal embedded at the call site.
-// _rule20_die never returns (it calls abort()), so the trailing 0 is dead code,
-// but the comma operator makes the macro usable as an expression that has
-// the right type at the use site.
-#define Rule20Violation(addr, kind) (_rule20_die((addr), (kind)), 0)
-
 enum {
   kGameID_SMW = 1,
   kGameID_SMB1 = 2,
