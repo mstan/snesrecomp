@@ -54,16 +54,9 @@ extern Snes *g_snes;
 extern uint8 g_ram[0x20000];
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 
-// Bridge for the L3 harness: snes_saveload reads/writes g_snes->ram; the
-// recompiled direct-dispatch path uses g_ram. Keep them in sync across
-// the harness boundary. (PPU is single-instance — g_ppu == g_snes->ppu
-// since the dual-PPU compare scaffolding was retired.)
-static void _l3_sync_to_snes(void) {
-    memcpy(g_snes->ram, g_ram, 0x20000);
-}
-static void _l3_sync_from_snes(void) {
-    memcpy(g_ram, g_snes->ram, 0x20000);
-}
+// Note: g_snes->ram == g_ram (same pointer, see snes_init). The dual-WRAM
+// pattern this file once bridged was phantom — both "sides" always pointed
+// to the same 128KB buffer. Single-PPU likewise (see Tier 3d).
 
 #define RECOMP_STACK_DEPTH 16
 extern const char *g_recomp_stack[];
@@ -1186,10 +1179,6 @@ static void cmd_save_state(const char *args) {
         send_fmt("{\"error\":\"usage: save_state <filename>\"}");
         return;
     }
-    // If recompiled code has been executing, g_ram holds newer state
-    // than g_snes->ram. Push that update into the emulator-side buffer
-    // before snes_saveload serializes it.
-    _l3_sync_to_snes();
     FILE *f = fopen(filename, "wb");
     if (!f) {
         send_fmt("{\"error\":\"fopen failed: %s\"}", filename);
@@ -1236,21 +1225,16 @@ static void cmd_write_ram(const char *args) {
         int hi = _hex_nibble(p[0]);
         int lo = _hex_nibble(p[1]);
         if (hi < 0 || lo < 0) break;
-        g_snes->ram[addr + count] = (uint8_t)((hi << 4) | lo);
+        g_ram[addr + count] = (uint8_t)((hi << 4) | lo);
         count++;
         p += 2;
         while (*p == ' ' || *p == '\t') p++;
     }
-    // Mirror into g_ram so the recompiled direct-dispatch path sees the
-    // write. (L3 invoke_recomp will also sync pre-call but doing it here
-    // lets unit-level reads of g_ram work too.)
-    memcpy(g_ram + addr, g_snes->ram + addr, count);
     send_fmt("{\"ok\":true,\"addr\":\"0x%x\",\"count\":%d}", addr, count);
 }
 
 static void cmd_zero_ram(const char *args) {
     (void)args;
-    memset(g_snes->ram, 0, 0x20000);
     memset(g_ram, 0, 0x20000);
     send_fmt("{\"ok\":true,\"size\":%u}", 0x20000);
 }
@@ -1318,9 +1302,6 @@ static void cmd_invoke_recomp(const char *args) {
                  e->name, e->argc);
         return;
     }
-    // Post-invoke: recompiled code mutated g_ram. Push that into g_snes->ram
-    // so read_ram reports what the function actually did.
-    _l3_sync_to_snes();
     send_fmt("{\"ok\":true,\"name\":\"%s\",\"argc\":%d,"
              "\"rom_addr\":\"0x%06x\"}",
              e->name, e->argc, e->rom_addr);
@@ -1355,10 +1336,6 @@ static void cmd_load_state(const char *args) {
         send_fmt("{\"error\":\"read failed after %zu bytes\"}", fs.total);
         return;
     }
-    // snes_saveload restored g_snes->ram. Push that into g_ram so the
-    // recompiled direct-dispatch path sees the restored state when
-    // invoke_recomp fires.
-    _l3_sync_from_snes();
     send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
 }
 
