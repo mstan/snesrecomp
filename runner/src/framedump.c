@@ -81,28 +81,18 @@ static void write_bin(const char *path, const uint8_t *wram) {
   fclose(f);
 }
 
-static void dump_one(const char *subdir, uint32_t frame, const uint8_t *wram) {
+static void framedump_callback(uint32_t frame, const uint8_t *wram) {
+  if (!wram) return;
   char path[768];
-  snprintf(path, sizeof(path), "%s/%s/frame_%06u.json", g_framedump_dir, subdir, frame);
+  snprintf(path, sizeof(path), "%s/frame_%06u.json", g_framedump_dir, frame);
   write_json(path, frame, wram);
-  snprintf(path, sizeof(path), "%s/%s/frame_%06u_wram.bin", g_framedump_dir, subdir, frame);
+  snprintf(path, sizeof(path), "%s/frame_%06u_wram.bin", g_framedump_dir, frame);
   write_bin(path, wram);
-}
-
-static void framedump_callback(uint32_t frame,
-    const uint8_t *wram_mine, const uint8_t *wram_theirs) {
-  if (wram_mine)   dump_one("recomp", frame, wram_mine);
-  if (wram_theirs) dump_one("oracle", frame, wram_theirs);
 }
 
 void FrameDump_Init(const char *dir) {
   strncpy(g_framedump_dir, dir, sizeof(g_framedump_dir) - 1);
-
   MKDIR(dir);
-  char sub[768];
-  snprintf(sub, sizeof(sub), "%s/recomp", dir); MKDIR(sub);
-  snprintf(sub, sizeof(sub), "%s/oracle", dir); MKDIR(sub);
-
   g_framedump_callback = framedump_callback;
   fprintf(stderr, "framedump: writing to '%s'\n", dir);
 }

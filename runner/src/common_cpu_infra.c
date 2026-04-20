@@ -246,7 +246,7 @@ void RtlRunFrameCompare() {
   recomp_sync_from_emu();
   g_rtl_game_info->run_frame();
   if (g_framedump_callback)
-    g_framedump_callback(snes_frame_counter, g_ram, NULL);
+    g_framedump_callback(snes_frame_counter, g_ram);
   {
     extern void debug_server_record_frame(int);
     debug_server_record_frame(snes_frame_counter);
