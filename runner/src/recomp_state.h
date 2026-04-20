@@ -34,7 +34,3 @@ extern RecompHwState g_recomp;
 // Sync g_recomp from emulator state (g_cpu, g_snes).
 // Call at frame boundaries or before code that reads g_recomp.
 void recomp_sync_from_emu(void);
-
-// Write g_recomp back to emulator state (g_cpu, g_snes).
-// Call after code that modifies g_recomp (e.g., PatchBugs hooks).
-void recomp_sync_to_emu(void);

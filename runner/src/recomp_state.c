@@ -29,24 +29,3 @@ void recomp_sync_from_emu(void) {
   g_recomp.wramAddr = g_snes->ramAdr;
   g_recomp.frame_counter = snes_frame_counter;
 }
-
-void recomp_sync_to_emu(void) {
-  g_cpu->a = g_recomp.a;
-  g_cpu->x = g_recomp.x;
-  g_cpu->y = g_recomp.y;
-  g_cpu->sp = g_recomp.sp;
-  g_cpu->dp = g_recomp.dp;
-  g_cpu->pc = g_recomp.pc;
-  g_cpu->k = g_recomp.k;
-  g_cpu->db = g_recomp.db;
-  cpu_setFlags(g_cpu, g_recomp.flags);
-  g_cpu->e = g_recomp.e;
-  g_cpu->mf = g_recomp.mf;
-  g_cpu->xf = g_recomp.xf;
-
-  g_snes->vIrqEnabled = g_recomp.vIrqEnabled;
-  g_snes->vTimer = g_recomp.vTimer;
-  g_snes->input1_currentState = g_recomp.input1;
-  g_snes->input2_currentState = g_recomp.input2;
-  g_snes->ramAdr = g_recomp.wramAddr;
-}
