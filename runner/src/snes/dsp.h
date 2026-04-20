@@ -81,11 +81,6 @@ struct Dsp {
   uint16_t sampleOffset; // current offset in samplebuffer
 };
 
-typedef struct DspRegWriteHistory {
-  uint32_t count;
-  uint8_t addr[256];
-  uint8_t val[256];
-} DspRegWriteHistory;
 
 Dsp *dsp_init(uint8_t *ram);
 void dsp_free(Dsp* dsp);

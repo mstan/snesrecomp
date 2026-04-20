@@ -49,7 +49,6 @@ void apu_reset(Apu* apu) {
     apu->timer[i].enabled = false;
   }
   apu->cpuCyclesLeft = 7;
-  apu->hist.count = 0;
 }
 
 void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
@@ -154,12 +153,6 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
       break;
     }
     case 0xf3: {
-      int i = apu->hist.count;
-      if (i != 256) {
-        apu->hist.count = i + 1;
-        apu->hist.addr[i] = (uint8_t)apu->dspAdr;
-        apu->hist.val[i] = val;
-      }
       if(apu->dspAdr < 0x80) dsp_write(apu->dsp, apu->dspAdr, val);
       break;
     }
