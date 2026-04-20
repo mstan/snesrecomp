@@ -628,13 +628,6 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   RtlApuUnlock();
 }
 
-void RtlCheat(char c) {
-  if (c == 'w') {
-  } else if (c == 'q') {
-  } else if (c == 'q') {
-  }
-}
-
 void RtlReadSram(void) {
   char filename[64];
   snprintf(filename, sizeof(filename), "saves/%s.srm", g_rtl_game_info->title);

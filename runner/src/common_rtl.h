@@ -206,7 +206,6 @@ enum {
 };
 
 void RtlSaveLoad(int cmd, int slot);
-void RtlCheat(char c);
 void RtlApuLock();
 void RtlApuUnlock();
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
