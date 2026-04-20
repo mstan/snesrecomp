@@ -29,8 +29,6 @@ static uint8 hook_orgbyte[1024];
 static uint8 hook_fixbug_orgbyte[1024];
 static uint8 kPatchedCarrysOrg[1024];
 
-void MakeSnapshot(Snapshot *s);
-void RestoreSnapshot(Snapshot *s);
 
 uint8_t *SnesRomPtr(uint32 v) {
   return (uint8 *)RomPtr(v);
@@ -179,34 +177,6 @@ void WatchdogCheck(void) {
       debug_server_profile_latch(snes_frame_counter); }
     longjmp(g_watchdog_jmp, 1);
   }
-}
-
-void MakeSnapshot(Snapshot *s) {
-  Cpu *c = g_cpu;
-  s->a = c->a, s->x = c->x, s->y = c->y;
-  s->sp = c->sp, s->dp = c->dp, s->db = c->db;
-  s->pc = c->pc, s->k = c->k;
-  s->flags = cpu_getFlags(c);
-  s->vTimer = g_snes->vTimer;
-  memcpy(s->ram, g_snes->ram, 0x20000);
-  memcpy(s->sram, g_snes->cart->ram, g_snes->cart->ramSize);
-  memcpy(s->vram, g_ppu->vram, sizeof(uint16) * 0x8000);
-  memcpy(s->oam, g_ppu->oam, sizeof(uint16) * 0x120);
-  memcpy(s->cgram, g_ppu->cgram, sizeof(uint16) * 0x100);
-}
-
-void RestoreSnapshot(Snapshot *s) {
-  Cpu *c = g_cpu;
-  c->a = s->a, c->x = s->x, c->y = s->y;
-  c->sp = s->sp, c->dp = s->dp, c->db = s->db;
-  c->pc = s->pc, c->k = s->k;
-  g_snes->vTimer = s->vTimer;
-  cpu_setFlags(c, s->flags);
-  memcpy(g_snes->ram, s->ram, 0x20000);
-  memcpy(g_snes->cart->ram, s->sram, g_snes->cart->ramSize);
-  memcpy(g_ppu->vram, s->vram, sizeof(uint16) * 0x8000);
-  memcpy(g_ppu->oam, s->oam, sizeof(uint16) * 0x120);
-  memcpy(g_ppu->cgram, s->cgram, sizeof(uint16) * 0x100);
 }
 
 static void FixupCarry(uint32 addr) {

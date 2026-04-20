@@ -8,7 +8,6 @@
 
 typedef struct Snes Snes;
 typedef struct Cpu Cpu;
-typedef struct Snapshot Snapshot;
 
 extern Snes *g_snes;
 extern Cpu *g_cpu;
@@ -32,8 +31,6 @@ void RecompStackPop(void);
 #include <setjmp.h>
 extern jmp_buf g_watchdog_jmp;
 extern int g_watchdog_tripped;
-void MakeSnapshot(Snapshot *s);
-void RestoreSnapshot(Snapshot *s);
 
 typedef struct RtlGameInfo {
   const char *title;
@@ -56,20 +53,6 @@ typedef struct RtlGameInfo {
   // Returns true if the game consumed the call; false to fall through.
   bool (*special_save_load)(int cmd, int slot);
 } RtlGameInfo;
-
-typedef struct Snapshot {
-  uint16 a, x, y, sp, dp, pc;
-  uint8 k, db, flags;
-
-  uint16_t vTimer;
-
-  uint8 ram[0x20000];
-  uint16 vram[0x8000];
-  uint8 sram[0x2000];
-
-  uint16 oam[0x120];
-  uint16 cgram[0x100];
-} Snapshot;
 
 extern const RtlGameInfo *g_rtl_game_info;
 
