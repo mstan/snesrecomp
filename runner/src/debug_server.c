@@ -1887,14 +1887,6 @@ void debug_server_set_ram(uint8_t *ram, uint32_t ram_size) {
     s_ram_size = ram_size;
 }
 
-void debug_server_set_frame_counter(int *counter) {
-    (void)counter; // Deprecated — snes_frame_counter used directly
-}
-
-void debug_server_set_snapshots(void *mine, void *theirs, void *before) {
-    // Store for verify_diff — will implement later
-}
-
 static void check_watchpoints(void) {
     if (!s_ram) return;
     for (int i = 0; i < MAX_WATCHPOINTS; i++) {

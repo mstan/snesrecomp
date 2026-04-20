@@ -33,8 +33,6 @@ void debug_server_record_frame(int frame);
 
 // Set pointers the server needs to inspect game state.
 void debug_server_set_ram(uint8_t *ram, uint32_t ram_size);
-void debug_server_set_frame_counter(int *counter);
-void debug_server_set_snapshots(void *mine, void *theirs, void *before);
 
 // MMIO register-write trace. Call from snes_write paths after the write
 // completes. Captures entries for addresses in [s_reg_trace_lo, s_reg_trace_hi).
