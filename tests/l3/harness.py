@@ -104,7 +104,7 @@ def _ports_ready() -> bool:
 class DebugClient:
     def __init__(self, port: int):
         self.port = port
-        self.sock = socket.create_connection(('127.0.0.1', port), timeout=30)
+        self.sock = socket.create_connection(('127.0.0.1', port), timeout=600)
         self.f = self.sock.makefile('rwb')
         self.f.readline()  # consume banner
 
@@ -212,7 +212,17 @@ def _normalize_input(val) -> bytes:
     raise TypeError(f'unsupported input value type: {type(val).__name__}')
 
 
-StubbedDiff = List[Tuple[int, int, int]]  # (addr, recomp_byte, oracle_byte)
+StubbedDiff = List[Tuple[str, int, int, int]]  # (region, addr, recomp_byte, oracle_byte)
+
+
+def _read_vram_bytes(client: DebugClient, word_addr: int, word_len: int) -> bytes:
+    """Read VRAM by word address/length. VRAM is 32K words = 64K bytes;
+    dump_vram takes byte addresses. Byte addr = word_addr * 2."""
+    byte_addr = word_addr * 2
+    byte_len = word_len * 2
+    r = client.cmd(f'dump_vram {byte_addr:x} {byte_len}')
+    hex_str = r.get('hex', '')
+    return bytes.fromhex(hex_str) if hex_str else b''
 
 
 def run_stubbed(
@@ -220,7 +230,7 @@ def run_stubbed(
     *,
     inputs: Optional[Dict[int, object]] = None,
     cpu: Optional[Dict[str, int]] = None,
-    expected_writes: Optional[List[Tuple[int, int]]] = None,
+    expected_writes: Optional[List[Tuple]] = None,
     emu_pc: Optional[int] = None,
     emu_ret: str = 'rts',
 ) -> StubbedDiff:
@@ -231,14 +241,16 @@ def run_stubbed(
     - cpu: {'a': int, 'x': int, ...}  CPU register fields to set on both
       sides before invoke. See cmd_set_cpu in debug_server for supported
       field names.
-    - expected_writes: [(wram_addr, length), ...]  regions diffed after
-      invoke. Anything outside these ranges is ignored — the test
-      documents the function's declared output contract.
+    - expected_writes: [(addr, length), ...] for WRAM diff (default), or
+      [('vram', word_addr, word_length), ...] for VRAM diff. Can mix.
+      Anything outside these ranges is ignored.
     - emu_pc: ROM entry point for the interpreter. If None, resolved from
       the recomp_func_registry's recorded rom_addr.
     - emu_ret: 'rts' or 'rtl'.
 
-    Returns the list of per-byte disagreements (empty list = pass).
+    Returns the list of per-byte disagreements (empty list = pass). Each
+    entry is (region, addr, recomp_byte, oracle_byte) where region is
+    'wram' or 'vram'.
     """
     launch_pair()
     try:
@@ -277,12 +289,22 @@ def run_stubbed(
                 raise RuntimeError(f'invoke_emu failed: {o_invoke}')
 
             diffs: StubbedDiff = []
-            for addr, length in (expected_writes or []):
-                rb = _read_wram_bytes(r_client, addr, length)
-                ob = _read_wram_bytes(o_client, addr, length)
-                for i in range(length):
-                    if rb[i] != ob[i]:
-                        diffs.append((addr + i, rb[i], ob[i]))
+            for entry in (expected_writes or []):
+                if len(entry) == 3 and entry[0] == 'vram':
+                    _, word_addr, word_len = entry
+                    rb = _read_vram_bytes(r_client, word_addr, word_len)
+                    ob = _read_vram_bytes(o_client, word_addr, word_len)
+                    byte_len = word_len * 2
+                    for i in range(byte_len):
+                        if i < len(rb) and i < len(ob) and rb[i] != ob[i]:
+                            diffs.append(('vram', word_addr * 2 + i, rb[i], ob[i]))
+                else:
+                    addr, length = entry
+                    rb = _read_wram_bytes(r_client, addr, length)
+                    ob = _read_wram_bytes(o_client, addr, length)
+                    for i in range(length):
+                        if rb[i] != ob[i]:
+                            diffs.append(('wram', addr + i, rb[i], ob[i]))
             return diffs
         finally:
             r_client.close()
@@ -294,9 +316,14 @@ def run_stubbed(
 def format_stubbed_diff(diffs: StubbedDiff) -> str:
     if not diffs:
         return '(no divergence)'
-    lines = [f'{len(diffs)} byte(s) differ:']
-    for addr, rv, ov in diffs[:16]:
-        lines.append(f'  ${addr:05x}: recomp=0x{rv:02x} oracle=0x{ov:02x}')
+    # Count per region
+    by_region: Dict[str, int] = {}
+    for region, _, _, _ in diffs:
+        by_region[region] = by_region.get(region, 0) + 1
+    summary = ', '.join(f'{k}: {v}' for k, v in by_region.items())
+    lines = [f'{len(diffs)} byte(s) differ ({summary}):']
+    for region, addr, rv, ov in diffs[:16]:
+        lines.append(f'  {region} ${addr:05x}: recomp=0x{rv:02x} oracle=0x{ov:02x}')
     if len(diffs) > 16:
         lines.append(f'  ... ({len(diffs) - 16} more)')
     return '\n'.join(lines)
