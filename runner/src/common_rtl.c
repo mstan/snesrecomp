@@ -586,26 +586,6 @@ void WriteReg(uint16 reg, uint8 value) {
   debug_server_on_reg_write(reg, value);
 }
 
-uint16 Mult8x8(uint8 a, uint8 b) {
-  return a * b;
-}
-
-uint16 SnesDivide(uint16 a, uint8 b) {
-  return (b == 0) ? 0xffff : a / b;
-}
-
-uint16 SnesModulus(uint16 a, uint8 b) {
-  return (b == 0) ? a : a % b;
-}
-
-OamEnt *get_OamEnt(OamEnt *base, uint16 off) {
-  return (OamEnt *)((uint8 *)base + off);
-}
-
-PointU16 *get_PointU16(PointU16 *base, uint8 off) {
-  return (PointU16 *)((uint8 *)base + off);
-}
-
 
 uint8 ReadReg(uint16 reg) {
   // Direct dispatch — bypass emulator bus

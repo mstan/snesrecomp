@@ -174,9 +174,6 @@ static inline const uint8 *RomPtr_E0(uint16_t addr) { (void)addr; return g_rom; 
 static inline const uint8 *RomPtr_E5(uint16_t addr) { (void)addr; return g_rom; }
 static inline const uint8 *RomPtr_F0(uint16_t addr) { (void)addr; return g_rom; }
 
-uint16 Mult8x8(uint8 a, uint8 b);
-uint16 SnesDivide(uint16 a, uint8 b);
-uint16 SnesModulus(uint16 a, uint8 b);
 void AddHiLo(uint8 *hi, uint8 *lo, uint16 v);
 void SetHiLo(uint8 *hi, uint8 *lo, uint16 v);
 void WriteReg(uint16 reg, uint8 value);
