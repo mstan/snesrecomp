@@ -6,7 +6,6 @@
 #include "recomp_hw.h"
 #include "snes/cpu.h"
 #include "snes/snes.h"
-#include "tracing.h"
 #include "util.h"
 #include <time.h>
 
