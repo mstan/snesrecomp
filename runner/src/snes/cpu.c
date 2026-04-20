@@ -8,8 +8,7 @@
 #include "cpu.h"
 #include "snes.h"
 #include "../types.h"
-//#include "variables.h"
-#include "smw_rtl.h"
+#include "../common_rtl.h"
 #include "variables.h"
 
 static const int cyclesPerOpcode[256] = {
@@ -732,8 +731,6 @@ uint32_t pc_hist[16], pc_hist_ctr;
 
 uint32_t pc_bp = 0;
 int bp_cnt = 0;
-extern bool g_debug_apu_cycles;
-
 void DumpCpuHistory() {
   for (int i = 0; i < 16; i++) {
     printf("PC history: 0x%x\n", pc_hist[(pc_hist_ctr + i) & 15]);
@@ -749,11 +746,6 @@ static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
   pc_hist[pc_hist_ctr] = cur_pc;
   pc_hist_ctr = (pc_hist_ctr + 1) & 15;
   
-  if (cur_pc == 0x3FDE0) {
-    DumpCpuHistory();
-    g_snes->debug_cycles = 0;
-  }
-
   if (cur_pc == pc_bp) {
     printf("Reached BP 0x%x. A=0x%.2x, X=0x%.2x, Y=0x%.2x. C=0x%.2x,0x%.2x\n", 
       cur_pc, cpu->a, cpu->x, cpu->y, 
@@ -1373,11 +1365,6 @@ restart:
     case 0x5c: { // jml abl
       uint16_t value = cpu_readOpcodeWord(cpu);
       uint8_t new_k = cpu_readOpcode(cpu);
-      if (game_id == kGameID_SMW && new_k == 0x80 && value == 0x8573) {
-        printf("Current PC = 0x%x\n", cpu->k << 16 | cpu->pc);
-        DumpCpuHistory();
-        Die("The game has crashed!\n");
-      }
       cpu->k = new_k & 0x7f;
       cpu->pc = value;
       break;
