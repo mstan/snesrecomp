@@ -28,9 +28,6 @@ enum {
 enum {
   // Version was bumped to 1 after I fixed bug #1
   kCurrentBugFixCounter = 1,
-
-  kSmwRam_APUI02 = 0x18c5,
-  kSmwRam_my_flags = 0x19C7C,
 };
 
 typedef struct SimpleHdma {
@@ -61,7 +58,6 @@ extern Dma *g_dma;
 #define GET_BYTE(p) (*(uint8*)(p))
 
 extern int snes_frame_counter;
-extern bool g_use_my_apu_code;
 extern bool g_debug_flag;
 extern uint8 game_id;
 
@@ -226,6 +222,7 @@ static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
 void RtlReset(int mode);
 void RtlClearKeyLog();
 void RtlStopReplay();
+bool RtlIsReplayMode(void);
 
 enum {
   kSaveLoad_Save = 1,
@@ -240,11 +237,13 @@ void RtlApuUnlock();
 void RtlApuReset();
 void RtlApuUpload(const uint8 *p);
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
-void RtlPushApuState();
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
 void RtlWriteSram();
 void RtlSaveSnapshot(const char *filename, bool saving_with_bug);
+bool RtlLoadSnapshot(const char *filename, bool replay);
+uint8 RtlApuReadReg(int reg);
+void RtlRecordPatchByte(const uint8 *value, int num);
 
 void RtlUpdatePalette(const uint16 *src, int dst, int n);
 uint16 *RtlGetVramAddr();

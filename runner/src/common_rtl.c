@@ -25,20 +25,12 @@ void _rule20_die(uint32 addr, const char *kind) {
 
 struct StateRecorder;
 
-static void RtlSaveMusicStateToRam_Locked();
-static void RtlRestoreMusicAfterLoad_Locked(bool is_reset);
-static uint8 RtlApuReadReg(int reg);
-
-void SmwSavePlaythroughSnapshot();
-void SmwLoadNextPlaybackSnapshot();
-
 uint8 g_ram[0x20000];
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
 bool g_did_finish_level_hook;
 uint8 game_id;
-bool g_playback_mode;
 Ppu *g_ppu, *g_my_ppu;
 Dma *g_dma;
 bool g_custom_music;
@@ -179,7 +171,7 @@ void RtlReset(int mode) {
     memset(g_sram, 0, g_sram_size);
 
   RtlApuLock();
-  RtlRestoreMusicAfterLoad_Locked(true);
+  g_spc_player->initialize(g_spc_player);
   RtlApuUnlock();
 
   if ((mode & 2) == 0)
@@ -264,9 +256,6 @@ void StateRecorder_Load(StateRecorder *sr, FILE *f, bool replay_mode) {
     if (is_old)
       RtlClearKeyLog();
   }
-
-  if (!is_reset)
-    RtlRestoreMusicAfterLoad_Locked(false);
 }
 
 void StateRecorder_Save(StateRecorder *sr, FILE *f, bool saving_with_bug) {
@@ -418,6 +407,14 @@ void RtlClearKeyLog(void) {
   StateRecorder_ClearKeyLog(&state_recorder);
 }
 
+bool RtlIsReplayMode(void) {
+  return state_recorder.replay_mode;
+}
+
+void RtlRecordPatchByte(const uint8 *value, int num) {
+  StateRecorder_RecordPatchByte(&state_recorder, value, num);
+}
+
 void RtlStopReplay(void) {
   StateRecorder_StopReplay(&state_recorder);
 }
@@ -425,13 +422,9 @@ void RtlStopReplay(void) {
 bool RtlRunFrame(uint32 inputs) {
 
   if (g_did_finish_level_hook) {
-    if (game_id == kGameID_SMW && !state_recorder.replay_mode && g_config.save_playthrough) {
-      SmwSavePlaythroughSnapshot();
-      RtlClearKeyLog();
-    }
     g_did_finish_level_hook = false;
-    if (g_playback_mode)
-      SmwLoadNextPlaybackSnapshot();
+    if (g_rtl_game_info->on_finish_level)
+      g_rtl_game_info->on_finish_level();
   }
 
   // Avoid up/down and left/right from being pressed at the same time
@@ -454,21 +447,8 @@ bool RtlRunFrame(uint32 inputs) {
     }
     StateRecorder_Record(&state_recorder, inputs);
 
-    if (game_id == kGameID_SMW) {
-      // This is whether APUI02 is true or false, this is used by the ancilla code.
-      uint8 apui02 = RtlApuReadReg(2);
-      if (apui02 != g_ram[kSmwRam_APUI02]) {
-        g_ram[kSmwRam_APUI02] = apui02;
-        StateRecorder_RecordPatchByte(&state_recorder, &g_ram[kSmwRam_APUI02], 1);
-      }
-      // Whether controllers are plugged in.
-      uint32 new_my_flags = inputs >> 30;
-      if (new_my_flags != g_ram[kSmwRam_my_flags]) {
-        assert(new_my_flags <= 255);
-        g_ram[kSmwRam_my_flags] = new_my_flags;
-        StateRecorder_RecordPatchByte(&state_recorder, &g_ram[kSmwRam_my_flags], 1);
-      }
-    }
+    if (g_rtl_game_info->on_frame_inputs)
+      g_rtl_game_info->on_frame_inputs(inputs);
   }
   g_recomp.input1 = inputs & 0xfff;
   g_recomp.input2 = (inputs >> 12) & 0xfff;
@@ -493,14 +473,12 @@ bool RtlRunFrame(uint32 inputs) {
 
   // Heartbeat removed -- use TCP debug server instead
 
-  RtlPushApuState();
   return is_replay;
 }
 
 void RtlSaveSnapshot(const char *filename, bool saving_with_bug) {
   FILE *f = fopen(filename, "wb");
   RtlApuLock();
-  RtlSaveMusicStateToRam_Locked();
   StateRecorder_Save(&state_recorder, f, saving_with_bug);
   RtlApuUnlock();
   fclose(f);
@@ -515,45 +493,27 @@ static void RtlLoadFromFile(FILE *f, bool replay) {
   RtlApuUnlock();
 }
 
-static const char *const kBugSaves[] = {
-  "playthrough/1_1",
-};
-
-
-static int g_playback_ctr = ( 1) * 2 - 1; // 36
-void SmwLoadNextPlaybackSnapshot() {
-  char name[128];
-  for (int i = 0; i < 100; i++) {
-    g_playback_ctr++;
-    sprintf(name, "saves/playthrough/%d_%d.sav", g_playback_ctr >> 1, (g_playback_ctr & 1) + 1);
-    FILE *f = fopen(name, "rb");
-    if (f) {
-      printf("Playthrough %s\n", name);
-      RtlLoadFromFile(f, true);
-      fclose(f);
-      return;
-    }
-  }
+bool RtlLoadSnapshot(const char *filename, bool replay) {
+  FILE *f = fopen(filename, "rb");
+  if (!f)
+    return false;
+  RtlLoadFromFile(f, replay);
+  fclose(f);
+  return true;
 }
 
 void RtlSaveLoad(int cmd, int slot) {
   char name[128];
-  if (cmd == kSaveLoad_Replay && slot == 256) {
-    g_playback_mode = 1;
-    SmwLoadNextPlaybackSnapshot();
+  if (slot >= 256) {
+    if (g_rtl_game_info->special_save_load && g_rtl_game_info->special_save_load(cmd, slot))
+      return;
     return;
   }
-  if (slot >= 256) {
-    int i = slot - 256;
-    if (cmd == kSaveLoad_Save || i >= sizeof(kBugSaves) / sizeof(kBugSaves[0]))
-      return;
-    sprintf(name, "saves/%s.sav", kBugSaves[i]);
-  } else {
-    if (game_id == kGameID_SMW)
-      sprintf(name, "saves/save%d.sav", slot);
-    else
-      sprintf(name, "saves/%s_save%d.sav", g_rtl_game_info->title, slot);
-  }
+  const char *prefix = g_rtl_game_info->save_name_prefix;
+  if (prefix)
+    sprintf(name, "saves/%s%d.sav", prefix, slot);
+  else
+    sprintf(name, "saves/%s_save%d.sav", g_rtl_game_info->title, slot);
   printf("*** %s slot %d: %s\n",
     cmd == kSaveLoad_Save ? "Saving" : cmd == kSaveLoad_Load ? "Loading" : "Replaying", slot, name);
   if (cmd != kSaveLoad_Save) {
@@ -764,102 +724,22 @@ void AddHiLo(uint8 *hi, uint8 *lo, uint16 v) {
   SetHiLo(hi, lo, PAIR16(*hi, *lo) + v);
 }
 
-// Maintain a queue cause the snes and audio callback are not in sync.
-// If an entry is 255, it means unset.
-typedef struct ApuWriteEnt {
-  uint8 ports[4];
-} ApuWriteEnt;
-
-enum {
-  kApuMaxQueueSize = 16,
-};
-
-static struct ApuWriteEnt g_apu_write_ents[kApuMaxQueueSize], g_apu_write;
-static uint8 g_apu_write_ent_pos, g_apu_queue_size, g_apu_time_since_empty;
-
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
-
-  if (!g_use_my_apu_code) {
-    // Real SPC: catch the APU up to the current cycle and write the
-    // new port value directly. Serialise with the audio thread via
-    // RtlApuLock — it holds the same lock while cycling the APU in
-    // RtlRenderAudio.
-    RtlApuLock();
-    g_snes->apuCatchupCycles = 32;
-    snes_catchupApu(g_snes);
-    g_snes->apu->inPorts[adr & 0x3] = val;
-    RtlApuUnlock();
-    return;
-  }
-
-  // HLE SPC: queue the write for the audio thread to replay into
-  // g_spc_player->input_ports at audio-render time.
-  if (g_snes->runningWhichVersion == 2) {
-    g_apu_write.ports[adr & 0x3] = val;
-  }
-}
-
-static bool IsFrameEmpty(ApuWriteEnt *w) {
-  return (w->ports[0] == 0) && (w->ports[1] == 0) && (w->ports[2] == 0) && (w->ports[3] == 0);
-}
-
-void RtlPushApuState(void) {
-  // Queue machinery is HLE-only: under real SPC, RtlApuWrite writes
-  // inPorts directly so there is nothing to queue. Early-out so the
-  // audio thread sees an empty queue (RtlPopApuState_Locked becomes
-  // a no-op).
-  if (!g_use_my_apu_code)
-    return;
-
+  // Catch the APU up to the current cycle and write the port value
+  // directly. Serialise with the audio thread via RtlApuLock — it
+  // holds the same lock while cycling the APU in RtlRenderAudio.
   RtlApuLock();
-  // Strive for the queue to be empty.
-  if (g_apu_queue_size == 0) {
-    g_apu_time_since_empty = 0;
-  } else {
-    if (g_apu_time_since_empty >= 32 && IsFrameEmpty(&g_apu_write)) {
-      g_apu_time_since_empty -= 4;
-      RtlApuUnlock();
-      return;
-    }
-    g_apu_time_since_empty++;
-  }
-  // Merge the two oldest to make space
-  ApuWriteEnt *w0 = &g_apu_write_ents[g_apu_write_ent_pos++ & (kApuMaxQueueSize - 1)];
-  if (g_apu_queue_size == kApuMaxQueueSize) {
-    ApuWriteEnt *w1 = &g_apu_write_ents[g_apu_write_ent_pos & (kApuMaxQueueSize - 1)];
-    for (int i = 0; i < 4; i++)
-      if (w1->ports[i] == 0)
-        w1->ports[i] = w0->ports[i];
-  } else {
-    g_apu_queue_size++;
-  }
-  *w0 = g_apu_write;
+  g_snes->apuCatchupCycles = 32;
+  snes_catchupApu(g_snes);
+  g_snes->apu->inPorts[adr & 0x3] = val;
   RtlApuUnlock();
-}
-
-static void RtlPopApuState_Locked(void) {
-  uint8 *input_ports = g_use_my_apu_code ? g_spc_player->input_ports : g_snes->apu->inPorts;
-  if (g_apu_queue_size != 0) {
-    ApuWriteEnt *w = &g_apu_write_ents[(g_apu_write_ent_pos - g_apu_queue_size--) & (kApuMaxQueueSize - 1)];
-    for (int i = 0; i != 4; i++) {
-      input_ports[i] = w->ports[i];
-    }
-  }
-}
-
-static void RtlResetApuQueue_Locked(void) {
-  g_apu_write_ent_pos = g_apu_time_since_empty = g_apu_queue_size = 0;
-  uint8 *input_ports = g_use_my_apu_code ? g_spc_player->input_ports : g_snes->apu->inPorts;
-  memcpy(g_apu_write.ports, input_ports, sizeof(g_apu_write.ports));
 }
 
 void RtlApuUpload(const uint8 *p) {
   RtlApuLock();
-  if (!g_custom_music) {
+  if (!g_custom_music)
     g_spc_player->upload(g_spc_player, p);
-    RtlResetApuQueue_Locked();
-  }
   RtlApuUnlock();
 }
 
@@ -867,59 +747,23 @@ void RtlApuReset() {
   RtlApuLock();
   g_spc_player->initialize(g_spc_player);
   apu_reset(g_snes->apu);
-  RtlResetApuQueue_Locked();
   RtlApuUnlock();
 }
 
-static uint8 RtlApuReadReg(int reg) {
-  if (g_use_my_apu_code)
-    return g_spc_player->port_to_snes[reg];
+uint8 RtlApuReadReg(int reg) {
   return g_snes->apu->outPorts[reg];
-}
-
-void RtlRestoreMusicAfterLoad_Locked(bool is_reset) {
-  if (g_use_my_apu_code) {
-    memcpy(g_spc_player->ram, g_snes->apu->ram, 65536);
-    memcpy(g_spc_player->input_ports, g_snes->apu->inPorts, 4);
-    memcpy(g_spc_player->dsp->ram, g_snes->apu->dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
-    g_spc_player->copy_vars(g_spc_player, false);
-  }
-  if (is_reset) {
-    g_spc_player->initialize(g_spc_player);
-  }
-  RtlResetApuQueue_Locked();
-}
-
-void RtlSaveMusicStateToRam_Locked(void) {
-  if (g_use_my_apu_code) {
-    SpcPlayer *spc_player = g_spc_player;
-
-    g_spc_player->copy_vars(g_spc_player, true);
-    memcpy(g_snes->apu->dsp->ram, g_spc_player->dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
-    memcpy(g_snes->apu->ram, g_spc_player->ram, 65536);
-    memcpy(g_snes->apu->inPorts, g_spc_player->input_ports, 4);
-  }
 }
 
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   assert(channels == 2);
   RtlApuLock();
-
-  RtlPopApuState_Locked();
-
-  if (!g_use_my_apu_code) {
-    // Real SPC: cycle the APU to fill the DSP sample buffer, then
-    // drain samples. RtlApuLock is held throughout — matches the
-    // lock acquired by RtlApuWrite / snes_readBBus on the CPU
-    // thread so both threads agree on APU state.
-    while (g_snes->apu->dsp->sampleOffset < 534)
-      apu_cycle(g_snes->apu);
-    dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
-  } else {
-    g_spc_player->gen_samples(g_spc_player);
-    dsp_getSamples(g_spc_player->dsp, audio_buffer, samples);
-  }
-
+  // Cycle the APU to fill the DSP sample buffer, then drain samples.
+  // RtlApuLock is held throughout — matches the lock acquired by
+  // RtlApuWrite / snes_readBBus on the CPU thread so both threads
+  // agree on APU state.
+  while (g_snes->apu->dsp->sampleOffset < 534)
+    apu_cycle(g_snes->apu);
+  dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
   RtlApuUnlock();
 }
 
@@ -959,35 +803,9 @@ void RtlWriteSram(void) {
 
 
 
-void SmwCopyToVram(uint16 vram_addr, const uint8 *src, int n) {
-  for (size_t i = 0; i < (n >> 1); i++)
-    g_ppu->vram[vram_addr + i] = WORD(src[i * 2]);
-}
-
-void SmwCopyToVramPitch32(uint16 vram_addr, const uint8 *src, int n) {
-  for (size_t i = 0; i < (n >> 1); i++)
-    g_ppu->vram[vram_addr + i * 32] = WORD(src[i * 2]);
-}
-
-void SmwCopyToVramLow(uint16 vram_addr, const uint8 *src, int n) {
-  for (size_t i = 0; i < n; i++)
-    g_ppu->vram[vram_addr + i] = (g_ppu->vram[vram_addr + i] & 0xff00) | src[i];
-}
-
-void SmwCopyFromVram(uint16 vram_addr, uint8 *dst, int n) {
-  for (size_t i = 0; i < (n >> 1); i++)
-    WORD(dst[i * 2]) = g_ppu->vram[vram_addr + i];
-}
-
-
 void RtlUpdatePalette(const uint16 *src, int dst, int n) {
   for(int i = 0; i < n; i++)
     g_ppu->cgram[dst + i] = src[i];
-}
-
-void SmwClearVram(uint16 vram_addr, uint16 value, int n) {
-  for (int i = 0; i < n; i++)
-    g_ppu->vram[vram_addr + i] = value;
 }
 
 uint16 *RtlGetVramAddr() {
@@ -1024,17 +842,14 @@ void RtlEnableVirq(int line) {
   g_snes->vTimer = g_recomp.vTimer;
 }
 
-static const uint8 kSetupHDMAWindowingEffects_DATA_00927C[] = { 0xF0,0xA0,   4,0xF0,0x80,   5,   0 };
 static const uint8 *SimpleHdma_GetPtr(uint32 p) {
-  if (game_id == kGameID_SMW) {
-    switch (p) {
-    case 0x927c: return kSetupHDMAWindowingEffects_DATA_00927C;
-    }
-    if (p < 0x2000)
-      return g_ram + p;
-  }
-  printf("SimpleHdma_GetPtr: bad addr 0x%x\n", p);
-  return NULL;
+  uint8 bank = (uint8)(p >> 16);
+  uint16 addr = (uint16)(p & 0xffff);
+  if (bank == 0x7E) return g_ram + addr;
+  if (bank == 0x7F) return g_ram + 0x10000 + addr;
+  if ((bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) && addr < 0x2000)
+    return g_ram + addr;
+  return RomPtr(p);
 }
 
 void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc) {

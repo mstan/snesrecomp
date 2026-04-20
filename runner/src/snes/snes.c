@@ -17,8 +17,6 @@
 #include "../common_rtl.h"
 #include "../debug_server.h"
 
-extern bool g_use_my_apu_code;
-
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
 
@@ -207,15 +205,10 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     return ppu_read(g_ppu, adr);
   }
   if(adr < 0x80) {
-    // APU port read ($2140-$217F).
-    // Under HLE SPC (g_use_my_apu_code=true), the real APU isn't being
-    // driven — all audio state lives in g_spc_player — so port reads
-    // have nothing meaningful to return. Under real SPC, catch the
-    // APU up to the current cycle and return the live outPort value.
-    // RtlApuLock serialises us against the audio thread's render loop,
-    // which also advances the APU under the same lock.
-    if (g_use_my_apu_code)
-      return 0;
+    // APU port read ($2140-$217F). Catch the APU up to the current
+    // cycle and return the live outPort value. RtlApuLock serialises
+    // us against the audio thread's render loop, which advances the
+    // APU under the same lock.
     RtlApuLock();
     snes->apuCatchupCycles = 32;
     snes_catchupApu(snes);

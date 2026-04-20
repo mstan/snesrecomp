@@ -16,19 +16,12 @@ Cpu *g_cpu;
 bool g_calling_asm_from_c;
 int g_calling_asm_from_c_ret;
 bool g_fail;
-// Real SPC via recompiled code. The HLE g_spc_player is retired:
-// recompiled HandleSPCUploads_Inner at $8079 now runs the actual
-// $BBAA/$CC IPL handshake against the emulated SPC, then streams
-// the bytes via the per-byte loop. Required framework fixes landed
-// in snesrecomp@7dc2cdc (SEP narrows A to low byte) and
-// snesrecomp@48a11cd (emit-order fall-through repair).
-// Runtime-side, the g_is_uploading_apu flag is gone — snes_readBBus
-// and RtlApuWrite route straight to the real APU under
-// !g_use_my_apu_code, serialised with the audio thread via
-// RtlApuLock.
-bool g_use_my_apu_code = false;
 extern bool g_other_image;
 const RtlGameInfo *g_rtl_game_info;
+
+void RtlRegisterGame(const RtlGameInfo *info) {
+  g_rtl_game_info = info;
+}
 
 static uint32 hookmode, hookcnt, hookadr;
 static uint32 hooked_func_pc;
@@ -248,7 +241,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   g_snes = snes_init(g_ram);
   g_cpu = g_snes->cpu;
   g_dma = g_snes->dma;
-  g_use_my_apu_code = false;  // real SPC via recompiled HandleSPCUploads_Inner
 
   if (data_size != 0) {
     bool loaded = snes_loadRom(g_snes, data, data_size);
@@ -257,7 +249,7 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     }
     g_rom = g_snes->cart->rom;
 
-    g_rtl_game_info = &kSmwGameInfo;
+    assert(g_rtl_game_info && "RtlRegisterGame must be called before SnesInit");
 
     for (size_t i = 0; i != g_rtl_game_info->patch_carrys_count; i++) {
       uint8 t = *SnesRomPtr(g_rtl_game_info->patch_carrys[i]);
@@ -290,7 +282,7 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   } else {
     g_snes->cart->ramSize = 2048;
     g_snes->cart->ram = calloc(1, 2048);
-    g_rtl_game_info = &kSmwGameInfo;
+    assert(g_rtl_game_info && "RtlRegisterGame must be called before SnesInit");
     g_rtl_game_info->initialize();
     ppu_reset(g_snes->ppu);
     dma_reset(g_snes->dma);
