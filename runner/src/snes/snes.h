@@ -36,7 +36,6 @@ struct Snes {
   // frame timing
   uint16_t hPos;
   uint16_t vPos;
-  uint32_t frames;
   // cpu handling
   uint8_t cpuCyclesLeft;
   uint8_t cpuMemOps;
@@ -52,7 +51,6 @@ struct Snes {
   bool inIrq;
   bool inVblank;
   // joypad handling
-  uint16_t portAutoReadX[4]; // as read by auto-joypad read
   bool autoJoyRead;
   uint16_t autoJoyTimer; // times how long until reading is done
   bool ppuLatch;

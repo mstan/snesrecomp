@@ -70,7 +70,6 @@ void snes_reset(Snes* snes, bool hard) {
   snes->ramAdr = 0;
   snes->hPos = 0;
   snes->vPos = 0;
-  snes->frames = 0;
   snes->cpuCyclesLeft = 52; // 5 reads (8) + 2 IntOp (6)
   snes->cpuMemOps = 0;
   snes->apuCatchupCycles = 0.0;
@@ -82,7 +81,6 @@ void snes_reset(Snes* snes, bool hard) {
   snes->inNmi = false;
   snes->inIrq = false;
   snes->inVblank = false;
-  memset(snes->portAutoReadX, 0, sizeof(snes->portAutoReadX));
   snes->autoJoyRead = false;
   snes->autoJoyTimer = 0;
   snes->ppuLatch = false;
