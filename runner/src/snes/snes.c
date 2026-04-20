@@ -284,14 +284,6 @@ static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420b: {
-      if (val == 2) {
-        uint32_t t = snes->dma->channel[1].aBank << 16 | snes->dma->channel[1].aAdr;
-        int data = snes_read(snes, t) | snes_read(snes, t + 1) << 8;
-
-        if (0)printf("DMA: 0x%x -> 0x%x (ppu 0x%x), 0x%x bytes, data 0x%x\n",
-               t, snes->dma->channel[1].bAdr,
-               snes->ppu->vramPointer, snes->dma->channel[1].size, data);
-      }
       dma_startDma(snes->dma, val, false);
       while (dma_cycle(snes->dma)) {}
       break;
