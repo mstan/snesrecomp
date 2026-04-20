@@ -575,60 +575,6 @@ uint8 *MvnPtr(uint8_t bank, uint16_t addr) {
 }
 
 // Replay a DMA transfer into g_ppu after the emulator executed it into g_snes->ppu.
-// Reads DMA channel config from g_snes to determine source, dest, and size,
-// then performs the equivalent write into g_ppu.
-// Replay a DMA channel's transfer into g_ppu using a snapshot of the channel
-// state taken BEFORE the emulator's DMA engine ran (which zeroes size/advances aAdr).
-static void SyncDmaChannelToPpuFromSnapshot(int ch, const DmaChannel *dch) {
-  uint8_t dest = dch->bAdr;            // B-bus destination (PPU register low byte)
-  uint32_t src_addr = dch->aAdr | ((uint32_t)dch->aBank << 16);
-  uint16_t size = dch->size;            // byte count (0 = 64K)
-  bool from_b = dch->fromB;            // direction: 0=A->B (to PPU), 1=B->A (from PPU)
-  bool fixed = dch->fixed;              // fixed source address
-  bool decrement = dch->decrement;      // decrement source address
-  uint8_t mode = dch->mode;             // transfer mode (0-4)
-
-  if (from_b) return;  // B->A transfers don't write to PPU
-  if (size == 0) return;  // 0 = 64K, skip to avoid huge loop
-
-  // Transfer mode determines which B-bus registers are written per unit:
-  // Mode 0: 1 byte to dest
-  // Mode 1: 2 bytes to dest, dest+1
-  // Mode 2/6: 2 bytes to dest, dest (same register twice)
-  // Mode 3/7: 4 bytes to dest, dest, dest+1, dest+1
-  // Mode 4: 4 bytes to dest, dest+1, dest+2, dest+3
-  // Mode 5: 4 bytes to dest, dest+1, dest, dest+1
-  static const uint8_t kDmaOffsets[8][4] = {
-    {0,0,0,0}, {0,1,0,1}, {0,0,0,0}, {0,0,1,1},
-    {0,1,2,3}, {0,1,0,1}, {0,0,0,0}, {0,0,1,1},
-  };
-  static const int kDmaUnitSize[8] = {1,2,2,4,4,4,2,4};
-  int unit_size = kDmaUnitSize[mode & 7];
-
-  // Replay the DMA transfer byte by byte into g_ppu
-  uint32_t cur_addr = src_addr;
-  int bytes_left = size;
-  int unit_idx = 0;
-  while (bytes_left > 0) {
-    uint8_t byte;
-    // Read source byte from SNES address space
-    if ((cur_addr & 0xFFFF) < 0x2000 || (cur_addr >> 16) >= 0x7E) {
-      byte = g_ram[cur_addr & 0x1FFFF];
-    } else if (cur_addr & 0x8000) {
-      byte = g_rom[(((cur_addr >> 16) << 15) | (cur_addr & 0x7fff)) & 0x3fffff];
-    } else {
-      byte = 0;
-    }
-    // Write to g_ppu at the appropriate B-bus register
-    ppu_write(g_ppu, dest + kDmaOffsets[mode & 7][unit_idx % unit_size], byte);
-    // Advance source address
-    if (!fixed) {
-      if (decrement) cur_addr--; else cur_addr++;
-    }
-    unit_idx++;
-    bytes_left--;
-  }
-}
 
 static int _writereg_ppu_count = 0;
 static int _writereg_dma_count = 0;
