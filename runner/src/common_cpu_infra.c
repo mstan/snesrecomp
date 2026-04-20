@@ -276,10 +276,8 @@ Snes *SnesInit(const uint8 *data, int data_size) {
 
 void RtlRunFrameCompare() {
   WatchdogFrameStart();
-  g_snes->runningWhichVersion = 2;
   recomp_sync_from_emu();
   g_rtl_game_info->run_frame();
-  g_snes->runningWhichVersion = 0;
   if (g_framedump_callback)
     g_framedump_callback(snes_frame_counter, g_ram, NULL);
   {

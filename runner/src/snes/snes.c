@@ -28,7 +28,6 @@ Snes* snes_init(uint8_t *ram) {
   snes->ram = ram;
   snes->debug_cycles = false;
   snes->debug_apu_cycles = false;
-  snes->runningWhichVersion = 0;
 
   snes->cpu = cpu_init(snes, 0);
   snes->apu = apu_init();
@@ -60,7 +59,6 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   sli->func(sli, snes->ram, 0x20000);
   sli->func(sli, &snes->ramAdr, 4);
 
-  snes->runningWhichVersion = 0;
   snes->cpu->e = 0;
 }
 

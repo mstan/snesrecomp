@@ -29,7 +29,6 @@ struct Snes {
   bool debug_cycles;
   bool debug_apu_cycles;
   bool disableRender;
-  uint8_t runningWhichVersion;
 
   // ram
   uint32_t ramAdr;
