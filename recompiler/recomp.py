@@ -2149,7 +2149,15 @@ class EmitCtx:
             del self.dp_state[k]
 
     def _materialize(self, reg: str, type_: str = 'uint8') -> str:
-        """Ensure register holds a named variable; allocate+assign if not."""
+        """Ensure register holds a named variable; allocate+assign if not.
+
+        Also refreshes self.flag_src if it aliased the old register value:
+        LDA HW_TIMEUP sets both self.A and self.flag_src to 'ReadReg(0x4211)'.
+        Materializing A into v1 must also update flag_src to 'v1', otherwise
+        a subsequent branch re-emits the side-effecting call — reading and
+        re-acking a hardware register twice produces wrong code (e.g. $4211
+        TIMEUP clears g_snes->inIrq on read, so the second read returns 0).
+        """
         val = getattr(self, reg)
         if val is None:
             name = self._alloc(type_)
@@ -2157,12 +2165,16 @@ class EmitCtx:
                        f'Trace upstream LDA/LDX/LDY')
             self._emit(f'{name} = 0;')
             setattr(self, reg, name)
+            if self.flag_src == val:  # both None
+                self.flag_src = name
             return name
         if self._simple(val):
             return val
         name = self._alloc(type_)
         self._emit(f'{name} = {val};')
         setattr(self, reg, name)
+        if self.flag_src == val:
+            self.flag_src = name
         return name
 
     def _ensure_mutable_x(self, x_type: str = 'uint8') -> Optional[str]:
@@ -2834,7 +2846,21 @@ class EmitCtx:
         elif mn == 'LDA':
             expr = self._resolve_mem(mode, v, wide=wide_a)
             if expr is not None:
-                self.A = expr
+                # Side-effecting MMIO reads must materialize eagerly: a lazy
+                # `self.A = 'ReadReg(0x4211)'` binding would be re-emitted by
+                # any downstream reference (branch condition, STA, ADC...), and
+                # $4211 TIMEUP / $4210 RDNMI / $2139 VMDATALREAD / $213A / $213B
+                # all have read-acknowledge or data-port-advance side effects,
+                # so re-reading returns a different value. Cache into a local
+                # so self.A and self.flag_src reference the immutable snapshot.
+                # (LDX/LDY already materialize in all cases; LDA used to be
+                # lazy for the common WRAM-read case where re-read is free.)
+                if 'ReadReg(' in expr or 'ReadRegWord(' in expr:
+                    name = self._alloc(a_type)
+                    self._emit(f'{name} = {expr};')
+                    self.A = name
+                else:
+                    self.A = expr
             else:
                 self.A = None
                 self._warn(f'LDA {MODE_STR.get(mode,"?")} ${v:x} not handled')
