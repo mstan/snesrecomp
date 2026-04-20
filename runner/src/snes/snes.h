@@ -79,7 +79,6 @@ void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val);
 // debugging
 void snes_debugCycle(Snes* snes, bool* cpuNext, bool* spcNext);
 
-void snes_handle_pos_stuff(Snes *snes);
 
 // snes_other.c functions:
 
