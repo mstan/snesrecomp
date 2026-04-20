@@ -13,7 +13,6 @@ Snes *g_snes;
 Cpu *g_cpu;
 
 bool g_fail;
-extern bool g_other_image;
 const RtlGameInfo *g_rtl_game_info;
 
 void RtlRegisterGame(const RtlGameInfo *info) {
