@@ -87,7 +87,6 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
 
 void snes_runCycle(Snes *snes);
-void snes_runCpu(Snes *snes);
 
 extern int snes_frame_counter;
 #endif

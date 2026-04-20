@@ -94,13 +94,6 @@ void snes_reset(Snes* snes, bool hard) {
   snes->openBus = 0;
 }
 
-void snes_runCpu(Snes *snes) {
-  uint32_t pc = snes->cpu->k << 16 | snes->cpu->pc;
-
-  snes->cpuMemOps = 0;
-  cpu_runOpcode(snes->cpu);
-}
-
 void snes_catchupApu(Snes* snes) {
   if (snes->apuCatchupCycles > 10000)
     snes->apuCatchupCycles = 10000;
