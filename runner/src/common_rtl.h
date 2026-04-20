@@ -46,7 +46,6 @@ typedef struct Ppu Ppu;
 
 void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc);
 void SimpleHdma_DoLine(SimpleHdma *c);
-void RtlHdmaSetup(uint8 which, uint8 transfer_unit, uint8 reg, uint32 addr, uint8 indirect_bank);
 
 extern uint8 g_ram[0x20000];
 extern uint8 *g_sram;
@@ -240,12 +239,8 @@ bool RtlLoadSnapshot(const char *filename, bool replay);
 uint8 RtlApuReadReg(int reg);
 void RtlRecordPatchByte(const uint8 *value, int num);
 
-void RtlUpdatePalette(const uint16 *src, int dst, int n);
-uint16 *RtlGetVramAddr();
 void RtlPpuWrite(uint16 addr, uint8 value);
-void RtlPpuWriteTwice(uint16 addr, uint16 value);
 void RtlApuWrite(uint16 adr, uint8 val);
-void RtlEnableVirq(int line);
 
 
 enum {

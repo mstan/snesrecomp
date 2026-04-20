@@ -711,43 +711,10 @@ void RtlWriteSram(void) {
 
 
 
-void RtlUpdatePalette(const uint16 *src, int dst, int n) {
-  for(int i = 0; i < n; i++)
-    g_ppu->cgram[dst + i] = src[i];
-}
-
-uint16 *RtlGetVramAddr() {
-  return g_ppu->vram;
-}
-
 void RtlPpuWrite(uint16 addr, uint8 value) {
   assert((addr & 0xff00) == 0x2100);
   ppu_write(g_ppu, addr, value);
   debug_server_on_reg_write(addr, value);
-}
-
-void RtlPpuWriteTwice(uint16 addr, uint16 value) {
-  RtlPpuWrite(addr, value);
-  RtlPpuWrite(addr, value >> 8);
-}
-
-void RtlHdmaSetup(uint8 which, uint8 transfer_unit, uint8 reg, uint32 addr, uint8 indirect_bank) {
-  Dma *dma = g_dma;
-  dma_write(dma, DMAP0 + which * 16, transfer_unit);
-  dma_write(dma, BBAD0 + which * 16, reg);
-  dma_write(dma, A1T0L + which * 16, addr);
-  dma_write(dma, A1T0H + which * 16, addr >> 8);
-  dma_write(dma, A1B0 + which * 16, addr >> 16);
-  dma_write(dma, DAS00 + which * 16, indirect_bank);
-}
-
-void RtlEnableVirq(int line) {
-  g_recomp.vIrqEnabled = line >= 0;
-  if (line >= 0)
-    g_recomp.vTimer = line;
-  // Keep g_snes in sync for subsystems that still read it
-  g_snes->vIrqEnabled = g_recomp.vIrqEnabled;
-  g_snes->vTimer = g_recomp.vTimer;
 }
 
 static const uint8 *SimpleHdma_GetPtr(uint32 p) {
