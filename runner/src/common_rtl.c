@@ -629,20 +629,6 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   RtlApuUnlock();
 }
 
-void RtlApuUpload(const uint8 *p) {
-  RtlApuLock();
-  if (!g_custom_music)
-    g_spc_player->upload(g_spc_player, p);
-  RtlApuUnlock();
-}
-
-void RtlApuReset() {
-  RtlApuLock();
-  g_spc_player->initialize(g_spc_player);
-  apu_reset(g_snes->apu);
-  RtlApuUnlock();
-}
-
 uint8 RtlApuReadReg(int reg) {
   return g_snes->apu->outPorts[reg];
 }
