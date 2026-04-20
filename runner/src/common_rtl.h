@@ -43,7 +43,6 @@ extern Dma *g_dma;
 #define GET_BYTE(p) (*(uint8*)(p))
 
 extern int snes_frame_counter;
-extern bool g_debug_flag;
 extern uint8 game_id;
 
 typedef struct SpcPlayer SpcPlayer;
