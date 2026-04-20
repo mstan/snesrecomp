@@ -313,64 +313,6 @@ void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
     if (s_reg_trace.count < REG_TRACE_LOG_SIZE) s_reg_trace.count++;
 }
 
-// ---- Map16 write log ----
-// Captures every write to the Map16 low-byte range ($C800-$CFFF) with full context.
-// Enabled via TCP command "map16_trace_on", retrieved via "get_map16_trace".
-#define MAP16_LOG_SIZE 1024
-static struct {
-    int active;
-    int write_idx;
-    int count;
-    struct {
-        int frame;
-        uint16_t ram_addr;    // effective RAM address written
-        uint8_t value;        // value written
-        uint16_t ptr_lo;      // 3-byte pointer at $6B (low 16 bits)
-        uint8_t ptr_bank;     // bank byte at $6D
-        uint16_t offset;      // Y offset passed to IndirWriteByte
-        uint8_t dp57;         // object Y position register
-        uint8_t dp0a;         // level data byte 0A
-        uint8_t dp0b;         // level data byte 0B
-        uint16_t dp65;        // level data stream pointer ($65/$66)
-        uint8_t dp67;         // level data bank byte ($67)
-        char func[64];
-        const char *stack[TRACE_STACK_DEPTH];
-        int stack_depth;
-    } log[MAP16_LOG_SIZE];
-} s_map16_trace = {0};
-
-void debug_server_log_map16_write(uint16_t ram_addr, uint8_t value,
-                                   uint16_t ptr_lo, uint8_t ptr_bank,
-                                   uint16_t offset) {
-    if (!s_map16_trace.active) return;
-    // Only log writes to Map16 low-byte range $C800-$CFFF
-    if (ram_addr < 0xC800 || ram_addr > 0xCFFF) return;
-
-    int idx = s_map16_trace.write_idx % MAP16_LOG_SIZE;
-    s_map16_trace.log[idx].frame = snes_frame_counter;
-    s_map16_trace.log[idx].ram_addr = ram_addr;
-    s_map16_trace.log[idx].value = value;
-    s_map16_trace.log[idx].ptr_lo = ptr_lo;
-    s_map16_trace.log[idx].ptr_bank = ptr_bank;
-    s_map16_trace.log[idx].offset = offset;
-    s_map16_trace.log[idx].dp57 = s_ram ? s_ram[0x57] : 0;
-    s_map16_trace.log[idx].dp0a = s_ram ? s_ram[0x0a] : 0;
-    s_map16_trace.log[idx].dp0b = s_ram ? s_ram[0x0b] : 0;
-    s_map16_trace.log[idx].dp65 = s_ram ? (s_ram[0x65] | (s_ram[0x66] << 8)) : 0;
-    s_map16_trace.log[idx].dp67 = s_ram ? s_ram[0x67] : 0;
-    if (g_last_recomp_func)
-        strncpy(s_map16_trace.log[idx].func, g_last_recomp_func, 63);
-    else
-        strcpy(s_map16_trace.log[idx].func, "(none)");
-    s_map16_trace.log[idx].func[63] = 0;
-    int depth = g_recomp_stack_top < TRACE_STACK_DEPTH ? g_recomp_stack_top : TRACE_STACK_DEPTH;
-    s_map16_trace.log[idx].stack_depth = depth;
-    for (int s = 0; s < depth; s++)
-        s_map16_trace.log[idx].stack[s] = g_recomp_stack[g_recomp_stack_top - depth + s];
-    s_map16_trace.write_idx++;
-    if (s_map16_trace.count < MAP16_LOG_SIZE) s_map16_trace.count++;
-}
-
 #include <time.h>
 // ---- Per-frame function call profiler ----
 // Records which functions were called and how many times during the current frame.
@@ -1072,59 +1014,6 @@ static void cmd_get_trace_range(const char *args) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
                 "%s\"%s\"", s ? "," : "",
                 s_range_trace.log[idx].stack[s] ? s_range_trace.log[idx].stack[s] : "?");
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
-    }
-    snprintf(buf + pos, sizeof(buf) - pos, "]}");
-    send_line(buf);
-}
-
-static void cmd_map16_trace_on(const char *args) {
-    s_map16_trace.active = 1;
-    s_map16_trace.write_idx = 0;
-    s_map16_trace.count = 0;
-    send_fmt("{\"ok\":true,\"map16_trace\":\"on\"}");
-}
-
-static void cmd_map16_trace_off(const char *args) {
-    s_map16_trace.active = 0;
-    send_fmt("{\"ok\":true,\"map16_trace\":\"off\"}");
-}
-
-static void cmd_get_map16_trace(const char *args) {
-    if (!s_map16_trace.count) {
-        send_fmt("{\"entries\":0,\"log\":[]}");
-        return;
-    }
-    // Use large buffer — up to 1024 entries
-    static char buf[262144];
-    int pos = snprintf(buf, sizeof(buf), "{\"entries\":%d,\"log\":[", s_map16_trace.count);
-    int start = s_map16_trace.count < MAP16_LOG_SIZE ? 0 :
-                s_map16_trace.write_idx - MAP16_LOG_SIZE;
-    for (int i = 0; i < s_map16_trace.count && pos < 250000; i++) {
-        int idx = (start + i) % MAP16_LOG_SIZE;
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"addr\":\"0x%04x\",\"val\":\"0x%02x\","
-            "\"ptr\":\"0x%02x%04x\",\"off\":%d,"
-            "\"dp57\":\"0x%02x\",\"dp0a\":\"0x%02x\",\"dp0b\":\"0x%02x\",\"dp65\":\"0x%04x\",\"dp67\":\"0x%02x\","
-            "\"func\":\"%s\",\"stack\":[",
-            i ? "," : "",
-            s_map16_trace.log[idx].frame,
-            s_map16_trace.log[idx].ram_addr,
-            s_map16_trace.log[idx].value,
-            s_map16_trace.log[idx].ptr_bank,
-            s_map16_trace.log[idx].ptr_lo,
-            s_map16_trace.log[idx].offset,
-            s_map16_trace.log[idx].dp57,
-            s_map16_trace.log[idx].dp0a,
-            s_map16_trace.log[idx].dp0b,
-            s_map16_trace.log[idx].dp65,
-            s_map16_trace.log[idx].dp67,
-            s_map16_trace.log[idx].func);
-        for (int s = 0; s < s_map16_trace.log[idx].stack_depth; s++) {
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s\"%s\"", s ? "," : "",
-                s_map16_trace.log[idx].stack[s] ? s_map16_trace.log[idx].stack[s] : "?");
         }
         pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
@@ -1914,9 +1803,6 @@ static const CmdEntry s_commands[] = {
     {"screenshot",     cmd_screenshot},
     {"get_frame_extended", cmd_get_frame_extended},
     {"get_frame_range_extended", cmd_get_frame_range_extended},
-    {"map16_trace_on",  cmd_map16_trace_on},
-    {"map16_trace_off", cmd_map16_trace_off},
-    {"get_map16_trace", cmd_get_map16_trace},
     {NULL, NULL}
 };
 

@@ -199,45 +199,17 @@ static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
     return &g_ram[a & 0x1ffff];
   return RomPtr(a);
 }
-void debug_server_log_map16_write(uint16_t ram_addr, uint8_t value,
-                                   uint16_t ptr_lo, uint8_t ptr_bank,
-                                   uint16_t offset);
 static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
-  // Map16 write instrumentation: check if writing to WRAM $C800-$CFFF
-  uint32 a = (*(uint32 *)&ptr & 0xffffff) + offs;
-  uint16_t ram_addr = (uint16_t)(a & 0x1ffff);
-  if (ram_addr >= 0xC800 && ram_addr <= 0xCFFF) {
-    debug_server_log_map16_write(ram_addr, value,
-      (uint16_t)(*(uint32 *)&ptr & 0xffff),
-      (uint8_t)((*(uint32 *)&ptr >> 16) & 0xff),
-      offs);
-  }
   dst[0] = value;
 }
 
 // 16-bit word store through a 24-bit DP pointer. Native counterpart of
 // `STA [dp]` / `STA [dp],Y` emitted when M=0 (A-16). Writes the low byte
 // at the effective address and the high byte one byte later; the pair is
-// always contiguous in the target region (WRAM or ROM-mirror). Mirrors
-// IndirWriteByte's Map16 instrumentation for both bytes of the word.
+// always contiguous in the target region (WRAM or ROM-mirror).
 static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
-  uint32 a = (*(uint32 *)&ptr & 0xffffff) + offs;
-  uint16_t ram_addr_lo = (uint16_t)(a & 0x1ffff);
-  uint16_t ram_addr_hi = (uint16_t)((a + 1) & 0x1ffff);
-  if (ram_addr_lo >= 0xC800 && ram_addr_lo <= 0xCFFF) {
-    debug_server_log_map16_write(ram_addr_lo, (uint8_t)value,
-      (uint16_t)(*(uint32 *)&ptr & 0xffff),
-      (uint8_t)((*(uint32 *)&ptr >> 16) & 0xff),
-      offs);
-  }
-  if (ram_addr_hi >= 0xC800 && ram_addr_hi <= 0xCFFF) {
-    debug_server_log_map16_write(ram_addr_hi, (uint8_t)(value >> 8),
-      (uint16_t)(*(uint32 *)&ptr & 0xffff),
-      (uint8_t)((*(uint32 *)&ptr >> 16) & 0xff),
-      (uint16_t)(offs + 1));
-  }
   dst[0] = (uint8_t)value;
   dst[1] = (uint8_t)(value >> 8);
 }
