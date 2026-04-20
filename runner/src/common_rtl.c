@@ -453,16 +453,6 @@ bool RtlRunFrame(uint32 inputs) {
 
   snes_frame_counter++;
 
-  // Close boot trace after 3 frames
-  { extern FILE *g_boot_trace_file;
-    extern int g_boot_trace_frames;
-    g_boot_trace_frames = snes_frame_counter;
-    if (snes_frame_counter == 1800 && g_boot_trace_file) {
-      fclose(g_boot_trace_file);
-      g_boot_trace_file = NULL;
-      fprintf(stderr, "Boot trace written to boot_trace.txt\n");
-    }
-  }
 
   // Heartbeat removed -- use TCP debug server instead
 
