@@ -23,8 +23,6 @@ void RtlRegisterGame(const RtlGameInfo *info) {
 }
 
 static uint32 hookmode, hookcnt, hookadr;
-static uint32 hooked_func_pc;
-static uint8 hook_orgbyte[1024];
 static uint8 hook_fixbug_orgbyte[1024];
 static uint8 kPatchedCarrysOrg[1024];
 
