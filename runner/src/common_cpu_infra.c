@@ -21,7 +21,6 @@ void RtlRegisterGame(const RtlGameInfo *info) {
 
 static uint32 hookmode, hookcnt, hookadr;
 static uint8 hook_fixbug_orgbyte[1024];
-static uint8 kPatchedCarrysOrg[1024];
 
 
 uint8_t *SnesRomPtr(uint32 v) {
@@ -77,15 +76,8 @@ int RunPatchBugHook(uint32 addr) {
 }
 
 int CpuOpcodeHook(uint32 addr) {
-  for (size_t i = 0; i != g_rtl_game_info->patch_carrys_count; i++) {
-    if (addr == g_rtl_game_info->patch_carrys[i]) {
-      return kPatchedCarrysOrg[i];
-    }
-  }
-  {
-    int i = RunPatchBugHook(addr);
-    if (i >= 0) return i;
-  }
+  int i = RunPatchBugHook(addr);
+  if (i >= 0) return i;
   printf("Bad hook at 0x%x!\n", addr);
   assert(0);
   return 0;
@@ -161,10 +153,6 @@ void WatchdogCheck(void) {
   }
 }
 
-static void FixupCarry(uint32 addr) {
-  *SnesRomPtr(addr) = 0;
-}
-  
 Snes *SnesInit(const uint8 *data, int data_size) {
   g_snes = snes_init(g_ram);
   g_cpu = g_snes->cpu;
@@ -180,15 +168,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
 
     assert(g_rtl_game_info && "RtlRegisterGame must be called before SnesInit");
 
-    for (size_t i = 0; i != g_rtl_game_info->patch_carrys_count; i++) {
-      uint8 t = *SnesRomPtr(g_rtl_game_info->patch_carrys[i]);
-      if (t) {
-        kPatchedCarrysOrg[i] = t;
-        FixupCarry(g_rtl_game_info->patch_carrys[i]);
-      } else {
-        printf("0x%x double patched!\n", g_rtl_game_info->patch_carrys[i]);
-      }
-    }
     g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
     PatchBugs(1, 0);

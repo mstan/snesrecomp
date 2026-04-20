@@ -757,18 +757,7 @@ restart:
         cpu->pc = cpu_pullWord(cpu) + 1;
         cpu->k = cpu_pullByte(cpu) & 0x7f;
         break;
-      case 0xe5:
-      case 0xe9:
-      case 0xed: cpu->c = 1; goto restart;
-      case 0x65:
-      case 0x75:
-      case 0x6d: 
-      case 0x69:
-      case 0x79:
-      case 0x7d:
-      case 0x7f: cpu->c = 0; goto restart;
       default:
-//        printf("Unk op 0x%x!\n", opcode);
         goto restart;
       }
       break;
