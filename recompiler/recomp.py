@@ -2307,15 +2307,21 @@ class EmitCtx:
             return f'GET_WORD(IndirPtr(*(LongPtr*)(g_ram+0x{dp:x}), {y_expr}))'
         return f'IndirPtr(*(LongPtr*)(g_ram+0x{dp:x}), {y_expr})[0]'
 
-    def _indir_write(self, dp: int, y_expr: str, val: str):
+    def _indir_write(self, dp: int, y_expr: str, val: str, wide: bool = False):
         if dp in _DP_PTR_MAP:
             ptr = _DP_PTR_MAP[dp]
-            if y_expr == '0':
-                self._emit(f'{ptr}[0] = {val};')
+            idx = '0' if y_expr == '0' else y_expr
+            if wide:
+                # 16-bit word write via direct pointer: aliased to uint16*
+                if idx == '0':
+                    self._emit(f'*(uint16*)({ptr}) = {val};')
+                else:
+                    self._emit(f'*(uint16*)({ptr} + {idx}) = {val};')
             else:
-                self._emit(f'{ptr}[{y_expr}] = {val};')
+                self._emit(f'{ptr}[{idx}] = {val};')
         else:
-            self._emit(f'IndirWriteByte(*(LongPtr*)(g_ram+0x{dp:x}), {y_expr}, {val});')
+            fn = 'IndirWriteWord' if wide else 'IndirWriteByte'
+            self._emit(f'{fn}(*(LongPtr*)(g_ram+0x{dp:x}), {y_expr}, {val});')
 
     def _dp_indir_addr(self, dp: int) -> str:
         """Read 16-bit address from DP: (g_ram[$dp] | g_ram[$dp+1]<<8)"""
@@ -3746,8 +3752,17 @@ class EmitCtx:
                 self._emit(f'WriteRegWord(0x{v:x} + {self._idx("Y")}, {a});')
             else:
                 self._wram16_write(v, self._idx('Y'), a)
-        elif mode == INDIR_LY: self._indir_write(v, self._idx('Y'), a)
-        elif mode == INDIR_L:  self._indir_write(v, '0', a)
+        elif mode == INDIR_LY: self._indir_write(v, self._idx('Y'), a, wide=True)
+        elif mode == INDIR_L:  self._indir_write(v, '0', a, wide=True)
+        elif mode == INDIR_Y:
+            # STA ($dp),Y in A-16: 16-bit indirect write via DB.
+            y_expr = self._idx('Y')
+            self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x}, {y_expr})) = {a};')
+        elif mode == INDIR_DPX:
+            x_expr = self._idx('X')
+            self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x} + {x_expr}, 0)) = {a};')
+        elif mode == DP_INDIR:
+            self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x}, 0)) = {a};')
         elif mode == LONG:
             bk = (v >> 16) & 0xFF
             if bk in (0x7E, 0x7F):
@@ -4802,6 +4817,16 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                    or getattr(last, 'dispatch_terminal', False))
     if boundary_insn and boundary_insn.mnem in ('RTL', 'RTS', 'RTI', 'JMP', 'BRA', 'BRL'):
         is_terminal = True  # the boundary instruction was the real terminator
+    if not is_terminal and not next_func:
+        # Non-terminal body with no valid fall-through target: the cfg
+        # deliberately ended this function here (typically because the
+        # range past end_addr is excluded or a runtime bridge takes over
+        # from here — e.g. ROM I_RESET's init body ends on INC $10 and
+        # the GameLoop at $806B is excluded because SmwRunOneFrameOfGame
+        # supersedes it). Without this branch the body closes with no
+        # matching RecompStackPop, leaking a frame on the recomp stack.
+        ctx._emit(f'RecompStackPop();')
+        ctx._emit_return_for_current_sig()
     if not is_terminal and next_func:
         nf_name, nf_sig = next_func
         nf_ret, nf_params = parse_sig(nf_sig)
@@ -5802,10 +5827,20 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         # the callee actually needs.
         next_func = None
         if fi + 1 < len(funcs_with_end):
-            nf_name = funcs_with_end[fi + 1][0]
-            nf_full = (cfg.bank << 16) | funcs_with_end[fi + 1][1]
-            nf_sig = cfg.sigs.get(nf_full, funcs_with_end[fi + 1][3])
-            next_func = (nf_name, nf_sig)
+            nf_start = funcs_with_end[fi + 1][1]
+            # Fall-through only applies when the next function is
+            # contiguous with end_addr. If the cfg puts an exclude_range
+            # (or any other gap — data, skipped region) between end_addr
+            # and the next function's start, execution cannot naturally
+            # reach the next function by falling through, so emitting a
+            # fall-through call would be a framework bug. Leave
+            # next_func None in that case — the emitter closes the body
+            # with `return;` instead.
+            if nf_start == end_addr:
+                nf_name = funcs_with_end[fi + 1][0]
+                nf_full = (cfg.bank << 16) | nf_start
+                nf_sig = cfg.sigs.get(nf_full, funcs_with_end[fi + 1][3])
+                next_func = (nf_name, nf_sig)
         # Also check cfg.names for oracle-only functions at end_addr or end_addr+1
         # (fall-through to skipped/oracle functions)
         if next_func is None:
