@@ -219,7 +219,7 @@ static void check_range_trace(void) {
 // Enabled via "trace_reg <lo> <hi>" (appends a range, up to
 // MAX_TRACE_RANGES); read via "get_reg_trace"; cleared via
 // "trace_reg_reset".
-#define REG_TRACE_LOG_SIZE 8192
+#define REG_TRACE_LOG_SIZE 32768
 #define MAX_TRACE_RANGES 8
 static struct {
     int active;
@@ -244,7 +244,7 @@ static struct {
 // directly. Enabled via "trace_vram <lo> <hi>" (word addresses, up to
 // MAX_VRAM_TRACE_RANGES disjoint ranges); read via "get_vram_trace";
 // cleared via "trace_vram_reset".
-#define VRAM_TRACE_LOG_SIZE 16384
+#define VRAM_TRACE_LOG_SIZE 65536
 #define MAX_VRAM_TRACE_RANGES 8
 static struct {
     int active;
@@ -903,7 +903,8 @@ static void cmd_get_vram_trace(const char *args) {
     if (!s_vram_trace.active) {
         send_fmt("{\"error\":\"no vram trace active\"}"); return;
     }
-    char buf[65536];
+    int nostack = args && strstr(args, "nostack") != NULL;
+    static char buf[524288];
     int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
     for (int i = 0; i < s_vram_trace.nranges; i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -913,21 +914,32 @@ static void cmd_get_vram_trace(const char *args) {
         "],\"entries\":%d,\"log\":[", s_vram_trace.count);
     int start = s_vram_trace.count < VRAM_TRACE_LOG_SIZE ? 0 :
                 s_vram_trace.write_idx - VRAM_TRACE_LOG_SIZE;
-    for (int i = 0; i < s_vram_trace.count && pos < 60000; i++) {
+    int budget = (int)sizeof(buf) - 4096;
+    for (int i = 0; i < s_vram_trace.count && pos < budget; i++) {
         int idx = (start + i) % VRAM_TRACE_LOG_SIZE;
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"func\":\"%s\",\"stack\":[",
-            i ? "," : "",
-            s_vram_trace.log[idx].frame,
-            s_vram_trace.log[idx].adr,
-            s_vram_trace.log[idx].val,
-            s_vram_trace.log[idx].func);
-        for (int s = 0; s < s_vram_trace.log[idx].stack_depth; s++) {
+        if (nostack) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s\"%s\"", s ? "," : "",
-                s_vram_trace.log[idx].stack[s] ? s_vram_trace.log[idx].stack[s] : "?");
+                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"func\":\"%s\"}",
+                i ? "," : "",
+                s_vram_trace.log[idx].frame,
+                s_vram_trace.log[idx].adr,
+                s_vram_trace.log[idx].val,
+                s_vram_trace.log[idx].func);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"func\":\"%s\",\"stack\":[",
+                i ? "," : "",
+                s_vram_trace.log[idx].frame,
+                s_vram_trace.log[idx].adr,
+                s_vram_trace.log[idx].val,
+                s_vram_trace.log[idx].func);
+            for (int s = 0; s < s_vram_trace.log[idx].stack_depth; s++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%s\"%s\"", s ? "," : "",
+                    s_vram_trace.log[idx].stack[s] ? s_vram_trace.log[idx].stack[s] : "?");
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
         }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
@@ -937,7 +949,8 @@ static void cmd_get_reg_trace(const char *args) {
     if (!s_reg_trace.active) {
         send_fmt("{\"error\":\"no reg trace active\"}"); return;
     }
-    char buf[65536];
+    int nostack = args && strstr(args, "nostack") != NULL;
+    static char buf[524288];
     int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
     for (int i = 0; i < s_reg_trace.nranges; i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -947,21 +960,32 @@ static void cmd_get_reg_trace(const char *args) {
         "],\"entries\":%d,\"log\":[", s_reg_trace.count);
     int start = s_reg_trace.count < REG_TRACE_LOG_SIZE ? 0 :
                 s_reg_trace.write_idx - REG_TRACE_LOG_SIZE;
-    for (int i = 0; i < s_reg_trace.count && pos < 60000; i++) {
+    int budget = (int)sizeof(buf) - 4096;
+    for (int i = 0; i < s_reg_trace.count && pos < budget; i++) {
         int idx = (start + i) % REG_TRACE_LOG_SIZE;
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"func\":\"%s\",\"stack\":[",
-            i ? "," : "",
-            s_reg_trace.log[idx].frame,
-            s_reg_trace.log[idx].adr,
-            s_reg_trace.log[idx].val,
-            s_reg_trace.log[idx].func);
-        for (int s = 0; s < s_reg_trace.log[idx].stack_depth; s++) {
+        if (nostack) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s\"%s\"", s ? "," : "",
-                s_reg_trace.log[idx].stack[s] ? s_reg_trace.log[idx].stack[s] : "?");
+                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"func\":\"%s\"}",
+                i ? "," : "",
+                s_reg_trace.log[idx].frame,
+                s_reg_trace.log[idx].adr,
+                s_reg_trace.log[idx].val,
+                s_reg_trace.log[idx].func);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"func\":\"%s\",\"stack\":[",
+                i ? "," : "",
+                s_reg_trace.log[idx].frame,
+                s_reg_trace.log[idx].adr,
+                s_reg_trace.log[idx].val,
+                s_reg_trace.log[idx].func);
+            for (int s = 0; s < s_reg_trace.log[idx].stack_depth; s++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%s\"%s\"", s ? "," : "",
+                    s_reg_trace.log[idx].stack[s] ? s_reg_trace.log[idx].stack[s] : "?");
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
         }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
