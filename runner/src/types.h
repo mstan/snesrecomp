@@ -54,7 +54,6 @@ static FORCEINLINE int IntMax(int a, int b) { return a > b ? a : b; }
 static inline uint16 swap16(uint16 v) { return (v << 8) | (v >> 8); }
 
 void NORETURN Die(const char *error);
-void Warning(const char *error);
 
 #pragma pack(push, 1)
 typedef struct LongPtr {
