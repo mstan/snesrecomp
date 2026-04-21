@@ -19,8 +19,8 @@
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
 
-static uint8_t snes_readReg(Snes* snes, uint16_t adr);
-static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
+uint8_t snes_readReg(Snes* snes, uint16_t adr);
+void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
 
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = malloc(sizeof(Snes));
@@ -167,7 +167,7 @@ uint16_t SwapInputBits(uint16_t x) {
   return r;
 }
 
-static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
+uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   switch(adr) {
     case 0x4210: {
       uint8_t val = 0x2; // CPU version (4 bit)
@@ -217,7 +217,7 @@ static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   }
 }
 
-static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
+void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
   switch(adr) {
     case 0x4200: {
       snes->autoJoyRead = val & 0x1;
