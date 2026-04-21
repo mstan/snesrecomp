@@ -1951,10 +1951,12 @@ class EmitCtx:
                  x_restores_map: Dict[int, str] = None,
                  y_after_map: Dict[int, int] = None,
                  x_after_map: Dict[int, int] = None,
-                 callee_clobbers: Dict[int, Set[str]] = None):
+                 callee_clobbers: Dict[int, Set[str]] = None,
+                 reverse_debug: bool = False):
         self.bank = bank
         self.func_names = func_names
         self.func_sigs = func_sigs or {}
+        self._reverse_debug = reverse_debug
         self.ret_type = ret_type
         self.func_start = func_start & 0xFFFF
         self.valid_branch_targets = valid_branch_targets or set()
@@ -2234,13 +2236,35 @@ class EmitCtx:
         if idx in ('0', '0x0'): return f'GET_WORD(g_ram + 0x{addr:x}){sym}'
         return f'GET_WORD(g_ram + 0x{addr:x} + {idx})'
 
-    def _wram16_write(self, addr: int, idx: str, val: str):
-        """16-bit WRAM write."""
+    def _emit_wram_store8(self, addr: int, idx: str, val: str):
+        """Emit a byte WRAM store. When reverse-debug generation is on,
+        routes through RDB_STORE8 so the runtime hook records it; otherwise
+        emits a plain assignment identical to the legacy codegen."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
         if idx in ('0', '0x0'):
-            self._emit(f'*(uint16*)(g_ram + 0x{addr:x}) = {val};{sym}')
+            addr_expr = f'0x{addr:x}'
         else:
-            self._emit(f'*(uint16*)(g_ram + 0x{addr:x} + {idx}) = {val};')
+            addr_expr = f'0x{addr:x} + {idx}'
+        if self._reverse_debug:
+            self._emit(f'RDB_STORE8({addr_expr}, {val});{sym}')
+        else:
+            self._emit(f'g_ram[{addr_expr}] = {val};{sym}')
+
+    def _emit_wram_store16(self, addr: int, idx: str, val: str):
+        """Emit a 16-bit WRAM store. Reverse-debug-aware; see _emit_wram_store8."""
+        sym = self._sym(addr) if idx in ('0', '0x0') else ''
+        if idx in ('0', '0x0'):
+            addr_expr = f'0x{addr:x}'
+        else:
+            addr_expr = f'0x{addr:x} + {idx}'
+        if self._reverse_debug:
+            self._emit(f'RDB_STORE16({addr_expr}, {val});{sym}')
+        else:
+            self._emit(f'*(uint16*)(g_ram + {addr_expr}) = {val};{sym}')
+
+    def _wram16_write(self, addr: int, idx: str, val: str):
+        """16-bit WRAM write (legacy name; routes through _emit_wram_store16)."""
+        self._emit_wram_store16(addr, idx, val)
 
     def _rom(self, full_addr: int, idx: str) -> str:
         bk = (full_addr >> 16) & 0xFF
@@ -3674,25 +3698,25 @@ class EmitCtx:
 
     def _emit_sta8(self, mode: int, v: int, a: str):
         if   mode == DP:
-            self._emit(f'{self._wram(v, "0")} = {a};')
+            self._emit_wram_store8(v, '0', a)
             self._check_dp_sync(v)
-        elif mode == DP_X:     self._emit(f'{self._wram(v, self._idx("X"))} = {a};')
-        elif mode == DP_Y:     self._emit(f'{self._wram(v, self._idx("Y"))} = {a};')
+        elif mode == DP_X:     self._emit_wram_store8(v, self._idx("X"), a)
+        elif mode == DP_Y:     self._emit_wram_store8(v, self._idx("Y"), a)
         elif mode == ABS:
             if self._is_hw_reg(v):
                 self._emit(f'WriteReg(0x{v:x}, {a});')
             else:
-                self._emit(f'g_ram[0x{v:x}] = {a};')
+                self._emit_wram_store8(v, '0', a)
         elif mode == ABS_X:
             if self._is_hw_reg(v):
                 self._emit(f'WriteReg(0x{v:x} + {self._idx("X")}, {a});')
             else:
-                self._emit(f'{self._wram(v, self._idx("X"))} = {a};')
+                self._emit_wram_store8(v, self._idx("X"), a)
         elif mode == ABS_Y:
             if self._is_hw_reg(v):
                 self._emit(f'WriteReg(0x{v:x} + {self._idx("Y")}, {a});')
             else:
-                self._emit(f'{self._wram(v, self._idx("Y"))} = {a};')
+                self._emit_wram_store8(v, self._idx("Y"), a)
         elif mode == INDIR_LY: self._indir_write(v, self._idx('Y'), a)
         elif mode == INDIR_L:  self._indir_write(v, '0', a)
         elif mode == INDIR_Y:
@@ -3709,7 +3733,7 @@ class EmitCtx:
             if bk in (0x7E, 0x7F):
                 addr = v & 0xFFFF
                 base = addr if bk == 0x7E else (0x10000 + addr)
-                self._emit(f'g_ram[0x{base:x}] = {a};')
+                self._emit_wram_store8(base, '0', a)
             elif bk == 0x70:
                 addr = v & 0xFFFF
                 self._emit(f'g_sram[0x{addr:x}] = {a};')
@@ -3720,7 +3744,7 @@ class EmitCtx:
             if bk in (0x7E, 0x7F):
                 addr = v & 0xFFFF
                 base = addr if bk == 0x7E else (0x10000 + addr)
-                self._emit(f'{self._wram(base, self._idx("X"))} = {a};')
+                self._emit_wram_store8(base, self._idx("X"), a)
             elif bk == 0x70:
                 addr = v & 0xFFFF
                 self._emit(f'g_sram[0x{addr:x} + {self._idx("X")}] = {a};')
@@ -4442,7 +4466,8 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   x_after_map: Dict[int, int] = None,
                   callee_clobbers: Dict[int, Set[str]] = None,
                   end_addr: int = 0,
-                  decl_ret_override: Optional[str] = None) -> List[str]:
+                  decl_ret_override: Optional[str] = None,
+                  reverse_debug: bool = False) -> List[str]:
     """Emit a complete C function from decoded instructions.
     next_func: (name, sig) of the function immediately following in ROM, for fall-through.
     hints: dict of cfg hints like {'init_y': 'x'} to initialize Y from X on entry.
@@ -4618,7 +4643,8 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   x_restores_map=x_restores_map,
                   y_after_map=y_after_map,
                   x_after_map=x_after_map,
-                  callee_clobbers=callee_clobbers)
+                  callee_clobbers=callee_clobbers,
+                  reverse_debug=reverse_debug)
     ctx._ret_y = hints.get('ret_y', '0') != '0'
     ctx.end_addr = end_addr
 
@@ -5349,7 +5375,8 @@ def _auto_detect_dispatch_helpers(rom: bytes, cfg: Config) -> None:
 def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                funcs_h_sigs: Dict[str, str] = None, trace: bool = False,
                prefix: str = '', func_range: Tuple[int, int] = None,
-               cfg_path: Optional[str] = None):
+               cfg_path: Optional[str] = None,
+               reverse_debug: bool = False):
     _cfg_path_for_siblings = cfg_path
     lines = []
 
@@ -5873,7 +5900,8 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                                    x_after_map=cfg.x_after,
                                    callee_clobbers=getattr(cfg, 'clobbers', None),
                                    end_addr=end_addr,
-                                   decl_ret_override=decl_ret_overrides.get(full_addr_for_override))
+                                   decl_ret_override=decl_ret_overrides.get(full_addr_for_override),
+                                   reverse_debug=reverse_debug)
         # Validation pass: detect obviously garbled output
         review_reasons = _validate_function_output(fname, func_lines, cfg.bank)
         if review_reasons:
@@ -5949,6 +5977,12 @@ def main():
     ap.add_argument('--symbols', default=None,
                     help='JSON symbol file for inline RAM/register name comments '
                          '(generated by parse_smwdisx_symbols.py)')
+    ap.add_argument('--reverse-debug', action='store_true', dest='reverse_debug',
+                    help='Emit WRAM-store hooks for the Tier-1 reverse debugger '
+                         '(see snesrecomp/REVERSE_DEBUGGER.md). Every g_ram[x]=val '
+                         'becomes RDB_STORE8(x,val); every *(uint16*)(g_ram+x)=val '
+                         'becomes RDB_STORE16(x,val). The runtime must also be '
+                         'built with SNESRECOMP_REVERSE_DEBUG=1.')
     args = ap.parse_args()
 
     rom = load_rom(args.rom)
@@ -6155,7 +6189,8 @@ def main():
         func_range = (int(m.group(1)), int(m.group(2)))
 
     run_config(rom, cfg, args.output, funcs_h_sigs=funcs_h_sigs, trace=args.trace,
-               prefix=args.prefix, func_range=func_range, cfg_path=args.config)
+               prefix=args.prefix, func_range=func_range, cfg_path=args.config,
+               reverse_debug=args.reverse_debug)
 
 
 if __name__ == '__main__':

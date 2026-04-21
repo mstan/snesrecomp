@@ -3,6 +3,20 @@
 
 #include <stdint.h>
 
+// Reverse debugger build flag. See snesrecomp/REVERSE_DEBUGGER.md.
+// When 0: the generator emits raw `g_ram[x] = val` stores exactly as it
+// always has; no hooks are compiled; zero runtime cost. When 1: the
+// generator must be rerun with `recomp.py --reverse-debug` so every WRAM
+// store becomes a call to rdb_store8 / rdb_store16, which records into
+// an in-memory ring for TCP readout. Flip by defining to 1 on the
+// compiler command line (or editing this file) AND regenerating all
+// src/gen/smw_*_gen.c. Mixing a debug build with non-debug generated C
+// is a no-op silently; mixing a non-debug build with debug generated C
+// fails to link.
+#ifndef SNESRECOMP_REVERSE_DEBUG
+#define SNESRECOMP_REVERSE_DEBUG 1
+#endif
+
 // Initialize the debug TCP server on the given port. Non-blocking.
 // Returns 0 on success, -1 on failure.
 int debug_server_init(int port);
@@ -44,5 +58,25 @@ void debug_server_on_reg_write(uint16_t adr, uint8_t val);
 // that writes g_ppu->vram directly (e.g. LoadStripeImage_UploadToVRAM).
 // Disabled by default; enable via "trace_vram <lo> <hi>" (word addresses).
 void debug_server_on_vram_write(uint16_t adr_word, uint16_t value);
+
+#if SNESRECOMP_REVERSE_DEBUG
+// Tier-1 reverse-debugger WRAM write hooks. Called from every WRAM store
+// in the recomp-generated C when the generator was invoked with
+// --reverse-debug. Never called from a non-debug generation; these
+// functions do not exist when SNESRECOMP_REVERSE_DEBUG == 0.
+extern uint8_t g_ram[];
+void debug_on_wram_write_byte(uint16_t addr, uint8_t val);
+void debug_on_wram_write_word(uint16_t addr, uint16_t val);
+static inline void rdb_store8(uint16_t addr, uint8_t val) {
+    g_ram[addr] = val;
+    debug_on_wram_write_byte(addr, val);
+}
+static inline void rdb_store16(uint16_t addr, uint16_t val) {
+    *(uint16_t *)(g_ram + addr) = val;
+    debug_on_wram_write_word(addr, val);
+}
+#define RDB_STORE8(addr, val)  rdb_store8((uint16_t)(addr), (uint8_t)(val))
+#define RDB_STORE16(addr, val) rdb_store16((uint16_t)(addr), (uint16_t)(val))
+#endif
 
 #endif

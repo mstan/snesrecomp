@@ -313,6 +313,67 @@ void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
     if (s_reg_trace.count < REG_TRACE_LOG_SIZE) s_reg_trace.count++;
 }
 
+#if SNESRECOMP_REVERSE_DEBUG
+// ---- Tier-1 reverse debugger WRAM write trace ----
+// Called synchronously from every WRAM store in the generated C when the
+// generator was invoked with --reverse-debug. Filters by up to
+// MAX_WRAM_TRACE_RANGES configurable address ranges so we don't log the
+// whole world every store. Ring holds ~1M entries, dumped on demand
+// via `get_wram_trace`.
+#define WRAM_TRACE_LOG_SIZE  (1 << 20)
+#define MAX_WRAM_TRACE_RANGES 8
+static struct {
+    int active;
+    int nranges;
+    struct { uint16_t lo, hi; } ranges[MAX_WRAM_TRACE_RANGES];
+    int write_idx;
+    int count;
+    struct {
+        int frame;
+        uint16_t adr;
+        uint16_t val;   // 16-bit to hold word writes; byte writes use low 8
+        uint8_t width;  // 1 = byte, 2 = word
+        char func[48];
+    } log[WRAM_TRACE_LOG_SIZE];
+} s_wram_trace = {0};
+
+// Filter hits if ANY byte in [adr, adr+width-1] lies inside any watched range.
+static inline int rdb_range_hit(uint16_t adr, uint8_t width) {
+    uint16_t lo = adr;
+    uint16_t hi = (uint16_t)(adr + width - 1);
+    for (int i = 0; i < s_wram_trace.nranges; i++) {
+        uint16_t r_lo = s_wram_trace.ranges[i].lo;
+        uint16_t r_hi = s_wram_trace.ranges[i].hi;
+        if (lo <= r_hi && hi >= r_lo) return 1;
+    }
+    return 0;
+}
+
+static inline void rdb_record(uint16_t adr, uint16_t val, uint8_t width) {
+    if (!s_wram_trace.active) return;
+    if (!rdb_range_hit(adr, width)) return;
+    int idx = s_wram_trace.write_idx % WRAM_TRACE_LOG_SIZE;
+    s_wram_trace.log[idx].frame = snes_frame_counter;
+    s_wram_trace.log[idx].adr = adr;
+    s_wram_trace.log[idx].val = val;
+    s_wram_trace.log[idx].width = width;
+    if (g_last_recomp_func)
+        strncpy(s_wram_trace.log[idx].func, g_last_recomp_func, 47);
+    else
+        s_wram_trace.log[idx].func[0] = 0;
+    s_wram_trace.log[idx].func[47] = 0;
+    s_wram_trace.write_idx++;
+    if (s_wram_trace.count < WRAM_TRACE_LOG_SIZE) s_wram_trace.count++;
+}
+
+void debug_on_wram_write_byte(uint16_t addr, uint8_t val) {
+    rdb_record(addr, val, 1);
+}
+void debug_on_wram_write_word(uint16_t addr, uint16_t val) {
+    rdb_record(addr, val, 2);
+}
+#endif
+
 #include <time.h>
 // ---- Per-frame function call profiler ----
 // Records which functions were called and how many times during the current frame.
@@ -944,6 +1005,66 @@ static void cmd_get_vram_trace(const char *args) {
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
 }
+
+#if SNESRECOMP_REVERSE_DEBUG
+static void cmd_trace_wram(const char *args) {
+    unsigned int lo = 0, hi = 0;
+    sscanf(args, "%x %x", &lo, &hi);
+    if (hi < lo || hi > 0xffff) {
+        send_fmt("{\"error\":\"bad range\"}"); return;
+    }
+    if (s_wram_trace.nranges >= MAX_WRAM_TRACE_RANGES) {
+        send_fmt("{\"error\":\"too many ranges (max %d) — call trace_wram_reset first\"}",
+                 MAX_WRAM_TRACE_RANGES); return;
+    }
+    s_wram_trace.ranges[s_wram_trace.nranges].lo = (uint16_t)lo;
+    s_wram_trace.ranges[s_wram_trace.nranges].hi = (uint16_t)hi;
+    s_wram_trace.nranges++;
+    s_wram_trace.active = 1;
+    send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
+             lo, hi, s_wram_trace.nranges);
+}
+
+static void cmd_trace_wram_reset(const char *args) {
+    (void)args;
+    s_wram_trace.nranges = 0;
+    s_wram_trace.write_idx = 0;
+    s_wram_trace.count = 0;
+    s_wram_trace.active = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_wram_trace(const char *args) {
+    (void)args;
+    if (!s_wram_trace.active) {
+        send_fmt("{\"error\":\"no wram trace active (or SNESRECOMP_REVERSE_DEBUG=0)\"}"); return;
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
+    for (int i = 0; i < s_wram_trace.nranges; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
+            s_wram_trace.ranges[i].lo, s_wram_trace.ranges[i].hi);
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "],\"entries\":%d,\"log\":[", s_wram_trace.count);
+    int start = s_wram_trace.count < WRAM_TRACE_LOG_SIZE ? 0 :
+                s_wram_trace.write_idx - WRAM_TRACE_LOG_SIZE;
+    int budget = (int)sizeof(buf) - 4096;
+    for (int i = 0; i < s_wram_trace.count && pos < budget; i++) {
+        int idx = (start + i) % WRAM_TRACE_LOG_SIZE;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"w\":%u,\"func\":\"%s\"}",
+            i ? "," : "",
+            s_wram_trace.log[idx].frame,
+            s_wram_trace.log[idx].adr,
+            s_wram_trace.log[idx].val,
+            (unsigned)s_wram_trace.log[idx].width,
+            s_wram_trace.log[idx].func);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+#endif
 
 static void cmd_get_reg_trace(const char *args) {
     if (!s_reg_trace.active) {
@@ -1803,6 +1924,11 @@ static const CmdEntry s_commands[] = {
     {"trace_vram",    cmd_trace_vram},
     {"trace_vram_reset", cmd_trace_vram_reset},
     {"get_vram_trace", cmd_get_vram_trace},
+#if SNESRECOMP_REVERSE_DEBUG
+    {"trace_wram",       cmd_trace_wram},
+    {"trace_wram_reset", cmd_trace_wram_reset},
+    {"get_wram_trace",   cmd_get_wram_trace},
+#endif
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
     {"get_frame",     cmd_get_frame},

@@ -1,6 +1,7 @@
 #pragma once
 #include "types.h"
 #include "snes/snes_regs.h"
+#include "debug_server.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
