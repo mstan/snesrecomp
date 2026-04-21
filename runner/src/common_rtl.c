@@ -541,7 +541,7 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x2140 && reg < 0x2180) {
     RtlApuWrite(reg, value);
   } else if (reg >= 0x2180 && reg < 0x2184) {
-    recomp_write_wram_port(reg, value);
+    snes_writeBBus(g_snes, reg & 0xff, value);
   } else if (reg >= 0x4200 && reg < 0x4220) {
     recomp_write_internal_reg(reg, value);
   } else if (reg >= 0x4300 && reg < 0x4380) {
@@ -559,7 +559,7 @@ uint8 ReadReg(uint16 reg) {
     // APU read — need emulator for this since APU is emulated
     return snes_read(g_snes, reg);
   } else if (reg == 0x2180) {
-    return recomp_read_wram_port();
+    return snes_readBBus(g_snes, reg & 0xff);
   } else if (reg >= 0x4200 && reg < 0x4220) {
     return recomp_read_internal_reg(reg);
   } else if (reg >= 0x4300 && reg < 0x4380) {

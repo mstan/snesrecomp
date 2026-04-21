@@ -14,32 +14,6 @@ extern Snes *g_snes;
 extern Ppu *g_ppu;
 extern Dma *g_dma;
 
-// --- WRAM access port (0x2180-0x2183), backed by snes->ramAdr ---
-
-void recomp_write_wram_port(uint16 reg, uint8 val) {
-  switch (reg) {
-    case 0x2180:
-      g_ram[g_snes->ramAdr++] = val;
-      g_snes->ramAdr &= 0x1ffff;
-      break;
-    case 0x2181:
-      g_snes->ramAdr = (g_snes->ramAdr & 0x1ff00) | val;
-      break;
-    case 0x2182:
-      g_snes->ramAdr = (g_snes->ramAdr & 0x100ff) | (val << 8);
-      break;
-    case 0x2183:
-      g_snes->ramAdr = (g_snes->ramAdr & 0x0ffff) | ((val & 1) << 16);
-      break;
-  }
-}
-
-uint8 recomp_read_wram_port(void) {
-  uint8 ret = g_ram[g_snes->ramAdr++];
-  g_snes->ramAdr &= 0x1ffff;
-  return ret;
-}
-
 // --- Internal register writes (0x4200-0x421F) ---
 
 void recomp_write_internal_reg(uint16 reg, uint8 val) {
