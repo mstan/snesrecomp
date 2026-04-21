@@ -5,11 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-enum {
-  // Version was bumped to 1 after I fixed bug #1
-  kCurrentBugFixCounter = 1,
-};
-
 typedef struct SimpleHdma {
   const uint8 *table;
   const uint8 *indir_ptr;
