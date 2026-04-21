@@ -12,7 +12,6 @@ uint8 g_ram[0x20000];
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
-bool g_did_finish_level_hook;
 Ppu *g_ppu;
 Dma *g_dma;
 
@@ -59,10 +58,6 @@ void RtlReset(int mode) {
 }
 
 bool RtlRunFrame(uint32 inputs) {
-  // g_did_finish_level_hook is still set by recompiled level-end paths
-  // for telemetry / debug bookkeeping; we just clear it here.
-  g_did_finish_level_hook = false;
-
   // Avoid up/down and left/right from being pressed at the same time
   if ((inputs & 0x30) == 0x30) inputs ^= 0x30;
   if ((inputs & 0xc0) == 0xc0) inputs ^= 0xc0;
