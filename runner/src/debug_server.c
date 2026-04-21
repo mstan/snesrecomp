@@ -322,15 +322,18 @@ void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
 // via `get_wram_trace`.
 #define WRAM_TRACE_LOG_SIZE  (1 << 20)
 #define MAX_WRAM_TRACE_RANGES 8
+// Addresses are 17-bit (128KB WRAM = $00000..$1FFFF). uint32_t on the
+// hot path, uint32_t in the ring, so bank-$7F writes aren't silently
+// truncated into bank $7E.
 static struct {
     int active;
     int nranges;
-    struct { uint16_t lo, hi; } ranges[MAX_WRAM_TRACE_RANGES];
+    struct { uint32_t lo, hi; } ranges[MAX_WRAM_TRACE_RANGES];
     int write_idx;
     int count;
     struct {
         int frame;
-        uint16_t adr;
+        uint32_t adr;
         uint16_t val;   // 16-bit to hold word writes; byte writes use low 8
         uint8_t width;  // 1 = byte, 2 = word
         char func[48];
@@ -338,18 +341,18 @@ static struct {
 } s_wram_trace = {0};
 
 // Filter hits if ANY byte in [adr, adr+width-1] lies inside any watched range.
-static inline int rdb_range_hit(uint16_t adr, uint8_t width) {
-    uint16_t lo = adr;
-    uint16_t hi = (uint16_t)(adr + width - 1);
+static inline int rdb_range_hit(uint32_t adr, uint8_t width) {
+    uint32_t lo = adr;
+    uint32_t hi = adr + width - 1;
     for (int i = 0; i < s_wram_trace.nranges; i++) {
-        uint16_t r_lo = s_wram_trace.ranges[i].lo;
-        uint16_t r_hi = s_wram_trace.ranges[i].hi;
+        uint32_t r_lo = s_wram_trace.ranges[i].lo;
+        uint32_t r_hi = s_wram_trace.ranges[i].hi;
         if (lo <= r_hi && hi >= r_lo) return 1;
     }
     return 0;
 }
 
-static inline void rdb_record(uint16_t adr, uint16_t val, uint8_t width) {
+static inline void rdb_record(uint32_t adr, uint16_t val, uint8_t width) {
     if (!s_wram_trace.active) return;
     if (!rdb_range_hit(adr, width)) return;
     int idx = s_wram_trace.write_idx % WRAM_TRACE_LOG_SIZE;
@@ -366,10 +369,10 @@ static inline void rdb_record(uint16_t adr, uint16_t val, uint8_t width) {
     if (s_wram_trace.count < WRAM_TRACE_LOG_SIZE) s_wram_trace.count++;
 }
 
-void debug_on_wram_write_byte(uint16_t addr, uint8_t val) {
+void debug_on_wram_write_byte(uint32_t addr, uint8_t val) {
     rdb_record(addr, val, 1);
 }
-void debug_on_wram_write_word(uint16_t addr, uint16_t val) {
+void debug_on_wram_write_word(uint32_t addr, uint16_t val) {
     rdb_record(addr, val, 2);
 }
 #endif
@@ -1010,18 +1013,18 @@ static void cmd_get_vram_trace(const char *args) {
 static void cmd_trace_wram(const char *args) {
     unsigned int lo = 0, hi = 0;
     sscanf(args, "%x %x", &lo, &hi);
-    if (hi < lo || hi > 0xffff) {
-        send_fmt("{\"error\":\"bad range\"}"); return;
+    if (hi < lo || hi > 0x1ffff) {
+        send_fmt("{\"error\":\"bad range (max \\$1ffff for 128KB WRAM)\"}"); return;
     }
     if (s_wram_trace.nranges >= MAX_WRAM_TRACE_RANGES) {
         send_fmt("{\"error\":\"too many ranges (max %d) — call trace_wram_reset first\"}",
                  MAX_WRAM_TRACE_RANGES); return;
     }
-    s_wram_trace.ranges[s_wram_trace.nranges].lo = (uint16_t)lo;
-    s_wram_trace.ranges[s_wram_trace.nranges].hi = (uint16_t)hi;
+    s_wram_trace.ranges[s_wram_trace.nranges].lo = lo;
+    s_wram_trace.ranges[s_wram_trace.nranges].hi = hi;
     s_wram_trace.nranges++;
     s_wram_trace.active = 1;
-    send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
+    send_fmt("{\"ok\":true,\"lo\":\"0x%05x\",\"hi\":\"0x%05x\",\"nranges\":%d}",
              lo, hi, s_wram_trace.nranges);
 }
 
@@ -1043,7 +1046,7 @@ static void cmd_get_wram_trace(const char *args) {
     int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
     for (int i = 0; i < s_wram_trace.nranges; i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
+            "%s[\"0x%05x\",\"0x%05x\"]", i ? "," : "",
             s_wram_trace.ranges[i].lo, s_wram_trace.ranges[i].hi);
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         "],\"entries\":%d,\"log\":[", s_wram_trace.count);
@@ -1053,7 +1056,7 @@ static void cmd_get_wram_trace(const char *args) {
     for (int i = 0; i < s_wram_trace.count && pos < budget; i++) {
         int idx = (start + i) % WRAM_TRACE_LOG_SIZE;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"w\":%u,\"func\":\"%s\"}",
+            "%s{\"f\":%d,\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,\"func\":\"%s\"}",
             i ? "," : "",
             s_wram_trace.log[idx].frame,
             s_wram_trace.log[idx].adr,

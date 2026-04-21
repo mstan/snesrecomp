@@ -64,19 +64,25 @@ void debug_server_on_vram_write(uint16_t adr_word, uint16_t value);
 // in the recomp-generated C when the generator was invoked with
 // --reverse-debug. Never called from a non-debug generation; these
 // functions do not exist when SNESRECOMP_REVERSE_DEBUG == 0.
+//
+// Address is uint32_t (not uint16_t!) because the generated C writes to
+// bank $7F via `g_ram[0x10000 + off]` and `*(uint16*)(g_ram + 0x18000)`,
+// which exceed uint16_t range. A tighter cast here silently wraps
+// bank-$7F writes into bank $7E and causes cross-bank state corruption
+// — classic latent 128KB-WRAM-over-16-bit-SNES-semantics bug.
 extern uint8_t g_ram[];
-void debug_on_wram_write_byte(uint16_t addr, uint8_t val);
-void debug_on_wram_write_word(uint16_t addr, uint16_t val);
-static inline void rdb_store8(uint16_t addr, uint8_t val) {
+void debug_on_wram_write_byte(uint32_t addr, uint8_t val);
+void debug_on_wram_write_word(uint32_t addr, uint16_t val);
+static inline void rdb_store8(uint32_t addr, uint8_t val) {
     g_ram[addr] = val;
     debug_on_wram_write_byte(addr, val);
 }
-static inline void rdb_store16(uint16_t addr, uint16_t val) {
+static inline void rdb_store16(uint32_t addr, uint16_t val) {
     *(uint16_t *)(g_ram + addr) = val;
     debug_on_wram_write_word(addr, val);
 }
-#define RDB_STORE8(addr, val)  rdb_store8((uint16_t)(addr), (uint8_t)(val))
-#define RDB_STORE16(addr, val) rdb_store16((uint16_t)(addr), (uint16_t)(val))
+#define RDB_STORE8(addr, val)  rdb_store8((uint32_t)(addr), (uint8_t)(val))
+#define RDB_STORE16(addr, val) rdb_store16((uint32_t)(addr), (uint16_t)(val))
 #endif
 
 #endif
