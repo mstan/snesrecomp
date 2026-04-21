@@ -18,12 +18,18 @@ void RtlRegisterGame(const RtlGameInfo *info) {
   g_rtl_game_info = info;
 }
 
-static uint32 hookmode, hookcnt, hookadr;
-static uint8 hook_fixbug_orgbyte[1024];
-
-
 uint8_t *SnesRomPtr(uint32 v) {
   return (uint8 *)RomPtr(v);
+}
+
+// Linker stub: cpu.c's BRK opcode case in the (dead) cpu_doOpcode
+// path references this. cpu_runOpcode has zero callers in our build,
+// so reaching here would mean the SNES interpreter was somehow
+// invoked — which shouldn't be possible.
+int CpuOpcodeHook(uint32 addr) {
+  (void)addr;
+  assert(0 && "CpuOpcodeHook reached — interpreter path should be dead");
+  return -1;
 }
 
 // Resolve a 16-bit-indirect-through-DP pointer using the current
@@ -33,53 +39,6 @@ uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs) {
   LongPtr p = MAKE_LONG((uint16)g_ram[dp_addr] | ((uint16)g_ram[dp_addr + 1] << 8),
                         g_cpu->db);
   return IndirPtr(p, offs);
-}
-
-bool FixBugHook(uint32 addr) {
-  switch (hookmode) {
-  case 1: { // install hooks
-    uint8_t *rombyte = SnesRomPtr(addr);
-    hook_fixbug_orgbyte[hookcnt++] = *rombyte;
-    *rombyte = 0;
-    return false;
-  }
-  case 2:  // run hook
-    if (addr == hookadr) {
-      hookmode = 3;
-      return true;
-    }
-    hookcnt++;
-    return false;
-  }
-  return false;
-}
-
-uint32 PatchBugs(uint32 mode, uint32 addr) {
-  hookmode = mode, hookadr = addr, hookcnt = 0;
-  if (!g_rtl_game_info->patch_bugs) return 0;
-  return g_rtl_game_info->patch_bugs();
-}
-
-int RunPatchBugHook(uint32 addr) {
-  uint32 new_pc = PatchBugs(2, addr);
-  if (hookmode == 3) {
-    if (new_pc == 0) {
-      return hook_fixbug_orgbyte[hookcnt];
-    } else {
-      g_cpu->k = new_pc >> 16;
-      g_cpu->pc = (new_pc & 0xffff) + 1;
-      return *SnesRomPtr(new_pc);
-    }
-  }
-  return -1;
-}
-
-int CpuOpcodeHook(uint32 addr) {
-  int i = RunPatchBugHook(addr);
-  if (i >= 0) return i;
-  printf("Bad hook at 0x%x!\n", addr);
-  assert(0);
-  return 0;
 }
 
 // Debug: recomp function call stack for watchdog diagnostics.
@@ -170,7 +129,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     if (g_rtl_game_info->initialize)
       g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
-    PatchBugs(1, 0);
     // The real ROM's reset vector ($00:8000) sets up CPU state:
     //   $801B: CLC; XCE    → native mode (e=0)
     //   $801D: REP #$38    → 16-bit A/X/Y, clear decimal

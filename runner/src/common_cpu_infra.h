@@ -14,10 +14,8 @@ extern Cpu *g_cpu;
 extern bool g_fail;
 
 Snes *SnesInit(const uint8 *data, int data_size);
-bool FixBugHook(uint32 addr);
 uint8_t *SnesRomPtr(uint32 v);
 
-typedef uint32 PatchBugsFunc(void);
 typedef void CpuInfraInitializeFunc(void);
 typedef void RunOneFrameOfGameFunc(void);
 
@@ -31,7 +29,6 @@ extern int g_watchdog_tripped;
 
 typedef struct RtlGameInfo {
   const char *title;
-  PatchBugsFunc *patch_bugs;
   CpuInfraInitializeFunc *initialize;
   RunOneFrameOfGameFunc *run_frame;
   RunOneFrameOfGameFunc *draw_ppu_frame;
