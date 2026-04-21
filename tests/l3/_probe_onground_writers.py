@@ -54,6 +54,7 @@ def main():
         r.cmd('trace_wram_reset')
         r.cmd('trace_wram 72 72')
         r.cmd('trace_wram 77 77')
+        r.cmd('trace_wram 7d 7d')      # PlayerYSpeed+1 (set first by $EF60)
         r.cmd('trace_wram 13ef 13ef')
         step_to(r, 200)
         trace = r.cmd('get_wram_trace')
@@ -61,7 +62,7 @@ def main():
         print(f'=== Recomp writes to $13EF f0-f200 ({len(log)} writes) ===')
         for e in log[:80]:
             a = int(e['adr'], 16)
-            label = {0x72: 'PlayerInAir', 0x77: 'PlayerBlockedDir', 0x13ef: 'OnGround'}.get(a, '?')
+            label = {0x72: 'PlayerInAir', 0x77: 'PlayerBlockedDir', 0x7d: 'YSpeed+1', 0x13ef: 'OnGround'}.get(a, '?')
             print(f'  f{e["f"]} ${a:04x}({label}) val=0x{int(e["val"], 16):x} w={e["w"]} fn={e["func"]} parent={e.get("parent", "?")}')
         # Note: oracle has no Tier 1, but we know it sets to 1 by f195.
         print(f'\n[oracle] sets $13EF=1 by f195 (confirmed via probe).')

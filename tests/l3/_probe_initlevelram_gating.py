@@ -61,13 +61,13 @@ def main():
     try:
         r.cmd('pause'); o.cmd('pause')
         addrs = [
-            (0x141D, 'ShowMarioStart'),
-            (0x141A, 'SublevelCount'),
-            (0x141F, 'DisableNoYoshiIntro'),
-            (0x13CF, 'SkipMidwayCastleIntro'),
+            (0x185C, 'PlayerDisableObjInt'),
+            (0x0D9B, 'IRQNMICommand'),
             (0x0072, 'PlayerInAir'),
+            (0x0077, 'PlayerBlockedDir'),
+            (0x13EF, 'PlayerIsOnGround'),
         ]
-        for f in [90, 93, 95, 100]:
+        for f in [95, 96, 100]:
             step_to(r, f); step_to(o, f)
             print(f'\n=== f{f} ===')
             for a, name in addrs:
