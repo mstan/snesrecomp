@@ -22,16 +22,6 @@ uint8_t *SnesRomPtr(uint32 v) {
   return (uint8 *)RomPtr(v);
 }
 
-// Linker stub: cpu.c's BRK opcode case in the (dead) cpu_doOpcode
-// path references this. cpu_runOpcode has zero callers in our build,
-// so reaching here would mean the SNES interpreter was somehow
-// invoked — which shouldn't be possible.
-int CpuOpcodeHook(uint32 addr) {
-  (void)addr;
-  assert(0 && "CpuOpcodeHook reached — interpreter path should be dead");
-  return -1;
-}
-
 // Resolve a 16-bit-indirect-through-DP pointer using the current
 // data bank register. See comment in common_rtl.h for why this
 // matters for `(dp)`, `(dp),Y`, `(dp,X)` addressing modes.

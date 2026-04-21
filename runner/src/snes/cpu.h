@@ -50,7 +50,6 @@ extern struct Cpu *g_cpu;
 Cpu* cpu_init(void* mem, int memType);
 void cpu_free(Cpu* cpu);
 void cpu_reset(Cpu* cpu);
-int cpu_runOpcode(Cpu* cpu);
 uint8_t cpu_getFlags(Cpu *cpu);
 void cpu_setFlags(Cpu *cpu, uint8_t val);
 void cpu_saveload(Cpu *cpu, SaveLoadInfo *sli);
