@@ -117,31 +117,17 @@ static inline const uint8 *RomPtrWithBank(uint8 bank, uint16_t addr) { return Ro
 // WRAM banks — $7E:xxxx → g_ram[addr], $7F:xxxx → g_ram[0x10000 + addr]
 static inline uint8 *RomPtr_7E(uint16_t addr) { return g_ram + addr; }
 static inline uint8 *RomPtr_7F(uint16_t addr) { return g_ram + 0x10000 + addr; }
-// $FF, $AA, $93, $13, $2A, $A5, $62, $9F, $A9, $E2 etc. are dead-code / invalid banks — should never execute; stubs to avoid compile error
-static inline uint8 *RomPtr_FF(uint16_t addr) { (void)addr; return g_ram; }
-static inline const uint8 *RomPtr_AA(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_93(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_13(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_2A(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_A5(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_62(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_9B(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_9F(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_A9(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_E2(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_84(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_85(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_88(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_B9(uint16_t addr) { (void)addr; return g_rom; }
 static inline const uint8 *RomPtr_10(uint16_t addr) { return RomPtr(0x100000 | addr); }
 static inline const uint8 *RomPtr_17(uint16_t addr) { return RomPtr(0x170000 | addr); }
 static inline const uint8 *RomPtr_1B(uint16_t addr) { return RomPtr(0x1b0000 | addr); }
 static inline const uint8 *RomPtr_1C(uint16_t addr) { return RomPtr(0x1c0000 | addr); }
-static inline const uint8 *RomPtr_71(uint16_t addr) { (void)addr; return g_rom; }
 static inline const uint8 *RomPtr_80(uint16_t addr) { return RomPtr(0x000000 | addr); }
-static inline const uint8 *RomPtr_E0(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_E5(uint16_t addr) { (void)addr; return g_rom; }
-static inline const uint8 *RomPtr_F0(uint16_t addr) { (void)addr; return g_rom; }
+// FIXME(latent-correctness): RomPtr_88 is emitted by smw_01_gen.c at ROM
+// $01:BD9C but the stub returns g_rom[0] — NOT bank $88. If that code
+// path is ever live at runtime, v13 is reading garbage. Promote to
+// `RomPtr(0x880000 | addr)` once per-game eyeball confirms either
+// (a) the path is dead at runtime, or (b) bank $88 is the right source.
+static inline const uint8 *RomPtr_88(uint16_t addr) { (void)addr; return g_rom; }
 
 void WriteReg(uint16 reg, uint8 value);
 void WriteRegWord(uint16 reg, uint16 value);
