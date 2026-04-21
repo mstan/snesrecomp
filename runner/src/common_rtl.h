@@ -203,9 +203,7 @@ void RtlReadSram();
 void RtlWriteSram();
 void RtlSaveSnapshot(const char *filename);
 bool RtlLoadSnapshot(const char *filename);
-uint8 RtlApuReadReg(int reg);
 
-void RtlPpuWrite(uint16 addr, uint8 value);
 void RtlApuWrite(uint16 adr, uint8 val);
 
 

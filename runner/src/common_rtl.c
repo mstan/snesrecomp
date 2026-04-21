@@ -255,10 +255,6 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   RtlApuUnlock();
 }
 
-uint8 RtlApuReadReg(int reg) {
-  return g_snes->apu->outPorts[reg];
-}
-
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   assert(channels == 2);
   RtlApuLock();
@@ -295,17 +291,7 @@ void RtlWriteSram(void) {
   } else {
     fprintf(stderr, "Unable to write %s\n", filename);
   }
-}
-
-
-
-void RtlPpuWrite(uint16 addr, uint8 value) {
-  assert((addr & 0xff00) == 0x2100);
-  ppu_write(g_ppu, addr, value);
-  debug_server_on_reg_write(addr, value);
-}
-
-static const uint8 *SimpleHdma_GetPtr(uint32 p) {
+}static const uint8 *SimpleHdma_GetPtr(uint32 p) {
   uint8 bank = (uint8)(p >> 16);
   uint16 addr = (uint16)(p & 0xffff);
   if (bank == 0x7E) return g_ram + addr;
@@ -360,7 +346,9 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
   if(do_transfer || c->rep_count & 0x80) {
     for(int j = 0, j_end = transferLength[c->mode & 7]; j < j_end; j++) {
       uint8 v = c->mode & 0x40 ? *c->indir_ptr++ : *c->table++;
-      RtlPpuWrite(0x2100 + c->ppu_addr + bAdrOffsets[c->mode & 7][j], v);
+      uint16 addr = 0x2100 + c->ppu_addr + bAdrOffsets[c->mode & 7][j];
+      ppu_write(g_ppu, addr, v);
+      debug_server_on_reg_write(addr, v);
     }
   }
   c->rep_count--;
