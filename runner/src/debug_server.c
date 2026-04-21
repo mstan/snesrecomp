@@ -430,20 +430,54 @@ static struct {
     } log[BLOCK_TRACE_LOG_SIZE];
 } s_block_trace = {0};
 
+// ---- Tier 2.5: pause-on-block (breakpoints + single-stepping) ----
+// Mirrors the Sonic-recomp design (rdb_on_block_slow / step / continue),
+// adapted to our threaded TCP server. The hot path reads two volatile
+// ints; almost always falls through. The slow path checks the
+// break/step state and uses the EXISTING s_paused mechanism +
+// debug_server_wait_if_paused() to park the main thread.
+//
+// NOTE: pause happens AFTER block-trace recording, so traces still
+// capture the parked block.
+#define RDB_MAX_BREAKS 16
+static volatile int s_rdb_break_armed = 0;        // any of break_pcs are set
+static uint32_t s_rdb_break_pcs[RDB_MAX_BREAKS] = {0};
+static int s_rdb_break_count = 0;
+static volatile int s_rdb_step_pending = 0;       // pause at the next block
+static volatile uint32_t s_rdb_parked_pc = 0;     // pc parked at, 0 when not parked
+
 void debug_on_block_enter(uint32_t pc) {
-    if (!s_block_trace.active) return;
-    int idx = s_block_trace.write_idx % BLOCK_TRACE_LOG_SIZE;
-    s_block_trace.log[idx].frame = snes_frame_counter;
-    s_block_trace.log[idx].depth = g_recomp_stack_top;
-    s_block_trace.log[idx].pc = pc;
-    if (g_last_recomp_func) {
-        strncpy(s_block_trace.log[idx].func, g_last_recomp_func, 47);
-        s_block_trace.log[idx].func[47] = 0;
-    } else {
-        s_block_trace.log[idx].func[0] = 0;
+    if (s_block_trace.active) {
+        int idx = s_block_trace.write_idx % BLOCK_TRACE_LOG_SIZE;
+        s_block_trace.log[idx].frame = snes_frame_counter;
+        s_block_trace.log[idx].depth = g_recomp_stack_top;
+        s_block_trace.log[idx].pc = pc;
+        if (g_last_recomp_func) {
+            strncpy(s_block_trace.log[idx].func, g_last_recomp_func, 47);
+            s_block_trace.log[idx].func[47] = 0;
+        } else {
+            s_block_trace.log[idx].func[0] = 0;
+        }
+        s_block_trace.write_idx++;
+        if (s_block_trace.count < BLOCK_TRACE_LOG_SIZE) s_block_trace.count++;
     }
-    s_block_trace.write_idx++;
-    if (s_block_trace.count < BLOCK_TRACE_LOG_SIZE) s_block_trace.count++;
+    // Hot-path pause check. Almost always not taken.
+    if (!s_rdb_break_armed && !s_rdb_step_pending) return;
+    int hit = s_rdb_step_pending;
+    if (!hit) {
+        for (int i = 0; i < s_rdb_break_count; i++) {
+            if (s_rdb_break_pcs[i] == pc) { hit = 1; break; }
+        }
+    }
+    if (hit) {
+        s_rdb_step_pending = 0;     // single-step is one-shot
+        s_rdb_parked_pc = pc;
+        s_paused = 1;
+        // Reuse the existing pause-spin loop. TCP thread will clear
+        // s_paused via continue / step / step_block / break_continue.
+        debug_server_wait_if_paused();
+        s_rdb_parked_pc = 0;
+    }
 }
 
 void debug_on_recomp_stack_push(const char *name) {
@@ -1163,6 +1197,64 @@ static void cmd_get_wram_trace(const char *args) {
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
+}
+
+// ---- Tier 2.5 TCP commands ----
+static void cmd_break_add(const char *args) {
+    uint32_t pc = 0;
+    if (!args || sscanf(args, "%x", &pc) != 1) {
+        send_fmt("{\"error\":\"usage: break_add <hex_pc>\"}"); return;
+    }
+    if (s_rdb_break_count >= RDB_MAX_BREAKS) {
+        send_fmt("{\"error\":\"break table full (max %d)\"}", RDB_MAX_BREAKS); return;
+    }
+    s_rdb_break_pcs[s_rdb_break_count++] = pc;
+    s_rdb_break_armed = 1;
+    send_fmt("{\"ok\":true,\"pc\":\"0x%06x\",\"count\":%d}", pc, s_rdb_break_count);
+}
+
+static void cmd_break_clear(const char *args) {
+    (void)args;
+    s_rdb_break_count = 0;
+    s_rdb_break_armed = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_break_list(const char *args) {
+    (void)args;
+    char buf[1024];
+    int pos = snprintf(buf, sizeof(buf), "{\"count\":%d,\"pcs\":[", s_rdb_break_count);
+    for (int i = 0; i < s_rdb_break_count; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%06x\"",
+                        i ? "," : "", s_rdb_break_pcs[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+static void cmd_step_block(const char *args) {
+    (void)args;
+    // Arm one-shot: pause at the very next block hook (regardless of bp).
+    s_rdb_step_pending = 1;
+    // If currently parked, unblock so the game runs to the next hook.
+    s_paused = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_break_continue(const char *args) {
+    (void)args;
+    // Resume execution past the current parked block. Breakpoints stay
+    // armed; execution will pause again if it hits another break_add'd pc.
+    s_paused = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_parked(const char *args) {
+    (void)args;
+    send_fmt("{\"parked\":%s,\"pc\":\"0x%06x\",\"break_armed\":%d,\"step_pending\":%d}",
+             s_rdb_parked_pc ? "true" : "false",
+             s_rdb_parked_pc,
+             s_rdb_break_armed,
+             s_rdb_step_pending);
 }
 
 static void cmd_trace_blocks(const char *args) {
@@ -2174,6 +2266,12 @@ static const CmdEntry s_commands[] = {
     {"trace_blocks",       cmd_trace_blocks},
     {"trace_blocks_reset", cmd_trace_blocks_reset},
     {"get_block_trace",    cmd_get_block_trace},
+    {"break_add",          cmd_break_add},
+    {"break_clear",        cmd_break_clear},
+    {"break_list",         cmd_break_list},
+    {"break_continue",     cmd_break_continue},
+    {"step_block",         cmd_step_block},
+    {"parked",             cmd_parked},
 #endif
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
