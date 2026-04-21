@@ -19,7 +19,7 @@ Dma *g_dma;
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
 #define RTL_SAV_MAGIC   0x52544c53u  /* "RTLS" */
-#define RTL_SAV_VERSION 1u
+#define RTL_SAV_VERSION 2u  /* v2: Cpu struct shrunk after interpreter rip */
 
 typedef struct FileSli {
   SaveLoadInfo base;

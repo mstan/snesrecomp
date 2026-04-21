@@ -11,10 +11,12 @@
 
 typedef struct Cpu Cpu;
 
+// Interpreter ripped 2026-04-20 — Cpu now holds only the register +
+// flag state that recompiled C bodies and the framework consult
+// (mostly D, DB, PB, m/x flags, e bit, sp). Interpreter-only fields
+// (mem/memType, irqWanted/nmiWanted, waiting/stopped, cyclesUsed,
+// in_emu) were write-only-never-read after the interpreter rip.
 struct Cpu {
-  // reference to memory handler, for reading//writing
-  void* mem;
-  uint8_t memType; // used to define which type mem is
   // registers
   uint16_t a;
   uint16_t x;
@@ -34,20 +36,11 @@ struct Cpu {
   bool xf;
   bool mf;
   bool e;
-  // interrupts
-  bool irqWanted;
-  bool nmiWanted;
-  // power state (WAI/STP)
-  bool waiting;
-  bool stopped;
-  // internal use
-  uint8_t cyclesUsed; // indicates how many cycles an opcode used
-  bool in_emu;
 };
 
 extern struct Cpu *g_cpu;
 
-Cpu* cpu_init(void* mem, int memType);
+Cpu* cpu_init(void);
 void cpu_free(Cpu* cpu);
 void cpu_reset(Cpu* cpu);
 uint8_t cpu_getFlags(Cpu *cpu);

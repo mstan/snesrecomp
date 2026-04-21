@@ -18,11 +18,9 @@
 #include "../common_rtl.h"
 #include "variables.h"
 
-Cpu* cpu_init(void* mem, int memType) {
+Cpu* cpu_init(void) {
   Cpu* cpu = malloc(sizeof(Cpu));
   memset(cpu, 0, sizeof(Cpu));
-  cpu->mem = mem;
-  cpu->memType = memType;
   return cpu;
 }
 
@@ -48,15 +46,12 @@ void cpu_reset(Cpu* cpu) {
   cpu->xf = true;
   cpu->mf = true;
   cpu->e = true;
-  cpu->irqWanted = false;
-  cpu->nmiWanted = false;
-  cpu->waiting = false;
-  cpu->stopped = false;
-  cpu->cyclesUsed = 0;
 }
 
+// Saves the entire Cpu struct as a single blob — registers + flags only
+// after the interpreter rip; struct end == end of saved region.
 void cpu_saveload(Cpu *cpu, SaveLoadInfo *sli) {
-  sli->func(sli, &cpu->a, offsetof(Cpu, cyclesUsed) - offsetof(Cpu, a));
+  sli->func(sli, &cpu->a, sizeof(*cpu) - offsetof(Cpu, a));
 }
 
 uint8_t cpu_getFlags(Cpu* cpu) {

@@ -26,7 +26,7 @@ Snes* snes_init(uint8_t *ram) {
   Snes* snes = malloc(sizeof(Snes));
   snes->ram = ram;
 
-  snes->cpu = cpu_init(snes, 0);
+  snes->cpu = cpu_init();
   snes->apu = apu_init();
   snes->dma = dma_init(snes);
   snes->ppu = ppu_init();
@@ -178,7 +178,6 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
     case 0x4211: {
       uint8_t val = snes->inIrq << 7;
       snes->inIrq = false;
-      snes->cpu->irqWanted = false;
       return val | (snes->openBus & 0x7f);
     }
     case 0x4212: {
@@ -227,7 +226,6 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       snes->nmiEnabled = val & 0x80;
       if(!snes->hIrqEnabled && !snes->vIrqEnabled) {
         snes->inIrq = false;
-        snes->cpu->irqWanted = false;
       }
       // TODO: enabling nmi during vblank with inNmi still set generates nmi
       //   enabling virq (and not h) on the vPos that vTimer is at generates irq (?)
