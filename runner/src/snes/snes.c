@@ -52,7 +52,7 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   ppu_saveload(snes->ppu, sli);
   cart_saveload(snes->cart, sli);
 
-  sli->func(sli, &snes->hPos, offsetof(Snes, openBus) + 1 - offsetof(Snes, hPos));
+  sli->func(sli, &snes->hPos, sizeof(*snes) - offsetof(Snes, hPos));
   sli->func(sli, snes->ram, 0x20000);
   sli->func(sli, &snes->ramAdr, 4);
 
@@ -70,8 +70,6 @@ void snes_reset(Snes* snes, bool hard) {
   snes->ramAdr = 0;
   snes->hPos = 0;
   snes->vPos = 0;
-  snes->cpuCyclesLeft = 52; // 5 reads (8) + 2 IntOp (6)
-  snes->cpuMemOps = 0;
   snes->apuCatchupCycles = 0.0;
   snes->hIrqEnabled = false;
   snes->vIrqEnabled = false;
@@ -88,8 +86,6 @@ void snes_reset(Snes* snes, bool hard) {
   snes->multiplyResult = 0xfe01;
   snes->divideA = 0xffff;
   snes->divideResult = 0x101;
-  snes->fastMem = false;
-  snes->openBus = 0;
 }
 
 void snes_catchupApu(Snes* snes) {
@@ -127,7 +123,7 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
   }
 
   assert(0);
-  return snes->openBus;
+  return 0;
 }
 
 void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val) {
@@ -172,19 +168,18 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
     case 0x4210: {
       uint8_t val = 0x2; // CPU version (4 bit)
       val |= snes->inNmi << 7;
-
-      return val | (snes->openBus & 0x70);
+      return val;
     }
     case 0x4211: {
       uint8_t val = snes->inIrq << 7;
       snes->inIrq = false;
-      return val | (snes->openBus & 0x7f);
+      return val;
     }
     case 0x4212: {
       uint8_t val = (snes->autoJoyTimer > 0);
       val |= (snes->hPos >= 1024) << 6;
       val |= snes->inVblank << 7;
-      return val | (snes->openBus & 0x3e);
+      return val;
     }
     case 0x4213:
       return snes->ppuLatch << 7; // IO-port
@@ -211,7 +206,7 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return 0;
 
     default: {
-      return snes->openBus;
+      return 0;
     }
   }
 }
@@ -290,10 +285,6 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       dma_startDma(snes->dma, val, true);
       break;
     }
-    case 0x420d: {
-      snes->fastMem = val & 0x1;
-      break;
-    }
     default: {
       break;
     }
@@ -356,16 +347,4 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
   cart_write(snes->cart, bank, adr, val);
 }
 
-
-uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
-  snes->cpuMemOps++;
-  snes->cpuCyclesLeft += 8;
-  return snes_read(snes, adr);
-}
-
-void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val) {
-  snes->cpuMemOps++;
-  snes->cpuCyclesLeft += 8;
-  snes_write(snes, adr, val);
-}
 

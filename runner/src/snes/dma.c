@@ -115,7 +115,7 @@ uint8_t dma_read(Dma* dma, uint16_t adr) {
     }
     default: {
       assert(0);
-      return dma->snes->openBus;
+      return 0;
     }
   }
 }

@@ -55,12 +55,12 @@ uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
   switch(cart->type) {
     case 0: 
       assert(0);
-      return cart->snes->openBus;
+      return 0;
     case 1: return cart_readLorom(cart, bank, adr);
     case 2: return cart_readHirom(cart, bank, adr);
   }
   assert(0);
-  return cart->snes->openBus;
+  return 0;
 }
 
 void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
@@ -104,7 +104,7 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
     return cart->rom[(((bank & 0x3f) << 16) | adr) & (cart->romSize - 1)];
   }
   assert(0);
-  return cart->snes->openBus;
+  return 0;
 }
 
 static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {

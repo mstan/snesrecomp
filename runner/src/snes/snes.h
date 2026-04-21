@@ -25,21 +25,15 @@ struct Snes {
   Cart* cart;
   uint16 input1_currentState;
   uint16 input2_currentState;
-  // input
   bool disableRender;
 
-  // ram
+  // ram data port ($2180-$2183)
   uint32_t ramAdr;
   uint8_t *ram;
-  uint8_t padx[4];
 
-  // frame timing
+  // --- saveload blob starts here (hPos .. divideResult) ---
   uint16_t hPos;
   uint16_t vPos;
-  // cpu handling
-  uint8_t cpuCyclesLeft;
-  uint8_t cpuMemOps;
-  uint8_t padpad[2];
   double apuCatchupCycles;
   // nmi / irq
   bool hIrqEnabled;
@@ -50,18 +44,15 @@ struct Snes {
   bool inNmi;
   bool inIrq;
   bool inVblank;
-  // joypad handling
+  // joypad
   bool autoJoyRead;
-  uint16_t autoJoyTimer; // times how long until reading is done
+  uint16_t autoJoyTimer;
   bool ppuLatch;
   // multiplication/division
   uint8_t multiplyA;
   uint16_t multiplyResult;
   uint16_t divideA;
   uint16_t divideResult;
-  // misc
-  bool fastMem;
-  uint8_t openBus;
 };
 
 Snes* snes_init(uint8_t *ram);
@@ -75,8 +66,6 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val);
 uint8_t snes_readReg(Snes* snes, uint16_t adr);
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
 uint16_t SwapInputBits(uint16_t x);
-uint8_t snes_cpuRead(Snes* snes, uint32_t adr);
-void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val);
 
 
 // snes_other.c functions:
