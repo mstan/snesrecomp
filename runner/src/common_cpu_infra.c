@@ -167,7 +167,8 @@ Snes *SnesInit(const uint8 *data, int data_size) {
 
     assert(g_rtl_game_info && "RtlRegisterGame must be called before SnesInit");
 
-    g_rtl_game_info->initialize();
+    if (g_rtl_game_info->initialize)
+      g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
     PatchBugs(1, 0);
     // The real ROM's reset vector ($00:8000) sets up CPU state:
@@ -188,7 +189,8 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     g_snes->cart->ramSize = 2048;
     g_snes->cart->ram = calloc(1, 2048);
     assert(g_rtl_game_info && "RtlRegisterGame must be called before SnesInit");
-    g_rtl_game_info->initialize();
+    if (g_rtl_game_info->initialize)
+      g_rtl_game_info->initialize();
     ppu_reset(g_snes->ppu);
     dma_reset(g_snes->dma);
   }
