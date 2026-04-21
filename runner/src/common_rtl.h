@@ -159,6 +159,13 @@ static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
 static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
   dst[0] = value;
+#if SNESRECOMP_REVERSE_DEBUG
+  // Only fire the WRAM hook if the write actually landed in WRAM.
+  // dst may point into ROM for in-ROM data-table writes (a NOP in practice
+  // since ROM is read-only, but the ptr math still lands there).
+  if (dst >= g_ram && dst < g_ram + 0x20000)
+    debug_on_wram_write_byte((uint32_t)(dst - g_ram), value);
+#endif
 }
 
 // 16-bit word store through a 24-bit DP pointer. Native counterpart of
@@ -169,7 +176,29 @@ static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
   dst[0] = (uint8_t)value;
   dst[1] = (uint8_t)(value >> 8);
+#if SNESRECOMP_REVERSE_DEBUG
+  if (dst >= g_ram && dst < g_ram + 0x20000)
+    debug_on_wram_write_word((uint32_t)(dst - g_ram), value);
+#endif
 }
+
+// Tier-1 wrappers for the direct IndirPtrDB([0] = val) pattern the generator
+// emits for STA (dp),Y / STA (dp,X) / STA (dp). Equivalent to the raw
+// pattern when SNESRECOMP_REVERSE_DEBUG=0; adds the hook when =1.
+#if SNESRECOMP_REVERSE_DEBUG
+static inline void rdb_indir_dbx_store8(uint8 dp_addr, uint16 offs, uint8 value) {
+  uint8_t *dst = IndirPtrDB(dp_addr, offs);
+  dst[0] = value;
+  if (dst >= g_ram && dst < g_ram + 0x20000)
+    debug_on_wram_write_byte((uint32_t)(dst - g_ram), value);
+}
+static inline void rdb_indir_dbx_store16(uint8 dp_addr, uint16 offs, uint16 value) {
+  uint8_t *dst = IndirPtrDB(dp_addr, offs);
+  *(uint16_t *)dst = value;
+  if (dst >= g_ram && dst < g_ram + 0x20000)
+    debug_on_wram_write_word((uint32_t)(dst - g_ram), value);
+}
+#endif
 
 void RtlReset(int mode);
 

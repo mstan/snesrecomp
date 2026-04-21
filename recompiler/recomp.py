@@ -3722,12 +3722,21 @@ class EmitCtx:
         elif mode == INDIR_Y:
             # STA ($dp),Y — 16-bit indirect write via DB.
             y_expr = self._idx('Y')
-            self._emit(f'IndirPtrDB(0x{v:02x}, {y_expr})[0] = {a};')
+            if self._reverse_debug:
+                self._emit(f'rdb_indir_dbx_store8(0x{v:02x}, {y_expr}, {a});')
+            else:
+                self._emit(f'IndirPtrDB(0x{v:02x}, {y_expr})[0] = {a};')
         elif mode == INDIR_DPX:
             x_expr = self._idx('X')
-            self._emit(f'IndirPtrDB(0x{v:02x} + {x_expr}, 0)[0] = {a};')
+            if self._reverse_debug:
+                self._emit(f'rdb_indir_dbx_store8(0x{v:02x} + {x_expr}, 0, {a});')
+            else:
+                self._emit(f'IndirPtrDB(0x{v:02x} + {x_expr}, 0)[0] = {a};')
         elif mode == DP_INDIR:
-            self._emit(f'IndirPtrDB(0x{v:02x}, 0)[0] = {a};')
+            if self._reverse_debug:
+                self._emit(f'rdb_indir_dbx_store8(0x{v:02x}, 0, {a});')
+            else:
+                self._emit(f'IndirPtrDB(0x{v:02x}, 0)[0] = {a};')
         elif mode == LONG:
             bk = (v >> 16) & 0xFF
             if bk in (0x7E, 0x7F):
@@ -3781,12 +3790,21 @@ class EmitCtx:
         elif mode == INDIR_Y:
             # STA ($dp),Y in A-16: 16-bit indirect write via DB.
             y_expr = self._idx('Y')
-            self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x}, {y_expr})) = {a};')
+            if self._reverse_debug:
+                self._emit(f'rdb_indir_dbx_store16(0x{v:02x}, {y_expr}, {a});')
+            else:
+                self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x}, {y_expr})) = {a};')
         elif mode == INDIR_DPX:
             x_expr = self._idx('X')
-            self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x} + {x_expr}, 0)) = {a};')
+            if self._reverse_debug:
+                self._emit(f'rdb_indir_dbx_store16(0x{v:02x} + {x_expr}, 0, {a});')
+            else:
+                self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x} + {x_expr}, 0)) = {a};')
         elif mode == DP_INDIR:
-            self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x}, 0)) = {a};')
+            if self._reverse_debug:
+                self._emit(f'rdb_indir_dbx_store16(0x{v:02x}, 0, {a});')
+            else:
+                self._emit(f'*(uint16*)(IndirPtrDB(0x{v:02x}, 0)) = {a};')
         elif mode == LONG:
             bk = (v >> 16) & 0xFF
             if bk in (0x7E, 0x7F):
