@@ -35,6 +35,7 @@ TEST_MODULES = [
     'test_side_effecting_lda_branch',
     'test_sta_indir_wide',
     'test_fallthrough_gap',
+    'test_promote_rety_loop_thread',
 ]
 
 

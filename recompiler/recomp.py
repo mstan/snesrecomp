@@ -1418,30 +1418,83 @@ def _compute_dispatch_table_shapes(cfg) -> Dict[int, frozenset]:
 
 
 def _insns_read_reg_post_jsr(caller_insns: List[Insn], jsr_pc: int,
-                             target: int, reg: str) -> bool:
+                             target: int, reg: str,
+                             reg_livein_by_addr: Optional[Dict[int, Set[str]]] = None) -> bool:
     """Walk forward from a JSR/JSL at `jsr_pc` inside `caller_insns` and
     ask whether `reg` is read before it is written (i.e. whether the
-    caller consumes the callee's register output). Scans along the
-    fall-through path only, stopping at the next transfer instruction.
+    caller consumes the callee's register output).
+
+    Follows the function's CFG (fall-through + branch targets), not just
+    the immediate fall-through. This is required to detect loop-carried
+    register dependencies — the canonical case is StdObj05_Coins's
+    do-while loop where each iteration's JSR consumes the Y left by the
+    previous iteration's JSR, but a fall-through-only walk hits the
+    BPL back-edge and stops without seeing any reader.
+
+    `reg_livein_by_addr` (optional) maps in-bank function-start addrs to
+    the set of registers that function reads as live-in. When provided,
+    a JSR/JSL whose target reads `reg` as live-in counts as a reg
+    consumer at the call site — that catches "JSR foo ; ... ; JSR foo"
+    loops where Y is implicitly threaded through both JSRs.
     """
     insn_by_addr = {i.addr & 0xFFFF: i for i in caller_insns}
     sorted_addrs = sorted(insn_by_addr)
     addr_to_idx = {a: i for i, a in enumerate(sorted_addrs)}
-    idx = addr_to_idx.get(jsr_pc & 0xFFFF)
-    if idx is None:
+    start = addr_to_idx.get(jsr_pc & 0xFFFF)
+    if start is None:
         return False
-    defined = False
-    for j in range(idx + 1, len(sorted_addrs)):
+
+    # BFS over instruction indices. Each enqueued index is "live to visit".
+    # An index reached via a path that already wrote `reg` is killed.
+    visited: Set[int] = set()
+    queue: List[int] = []
+
+    def enqueue(idx: int) -> None:
+        if idx is None or idx < 0 or idx >= len(sorted_addrs):
+            return
+        if idx in visited:
+            return
+        visited.add(idx)
+        queue.append(idx)
+
+    # Seed: instruction immediately after the JSR.
+    enqueue(start + 1)
+    while queue:
+        j = queue.pop(0)
         insn = insn_by_addr[sorted_addrs[j]]
+        mn = insn.mnem
+        # Check the JSR-target-reads-reg-as-live-in case BEFORE the
+        # generic reg use check. A JSR doesn't read Y itself, but the
+        # callee does, so we must conclude "consumed" here.
+        if mn in ('JSR', 'JSL') and reg_livein_by_addr is not None:
+            tgt_addr = insn.operand & 0xFFFF
+            if reg in reg_livein_by_addr.get(tgt_addr, ()):
+                return True
         r, w = _insn_reg_use(insn, reg)
-        if r and not defined:
+        if r:
             return True
         if w:
-            defined = True
-        # Stop following on any transfer; analysing fall-through is
-        # enough to catch the common "JSR foo ; TYA ; STA $xxxx" idiom.
-        if insn.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL'):
-            break
+            # This path defines `reg` — anything reachable past here
+            # consumes the local def, not the JSR's output. Kill path.
+            continue
+        # Hand-off to successors based on control flow.
+        if mn in ('RTS', 'RTL', 'RTI', 'BRK', 'STP'):
+            continue
+        if mn in ('JMP', 'BRA', 'BRL'):
+            tgt_in_func = addr_to_idx.get(insn.operand & 0xFFFF)
+            enqueue(tgt_in_func)
+            continue
+        if mn in ('BEQ', 'BNE', 'BPL', 'BMI', 'BCS', 'BCC', 'BVS', 'BVC'):
+            # Both branch-taken and fall-through.
+            tgt_in_func = addr_to_idx.get(insn.operand & 0xFFFF)
+            enqueue(tgt_in_func)
+            enqueue(j + 1)
+            continue
+        # JSR/JSL: callee may write `reg`, but we conservatively pass
+        # through to fall-through (the analyzer's job here is detecting
+        # *whether the caller reads reg*, not tracking callee clobbers —
+        # that's handled separately when the sig is queried).
+        enqueue(j + 1)
     return False
 
 
@@ -1462,7 +1515,68 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
     non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
                 if f not in cfg.skip]
     non_skip.sort(key=lambda t: t[1])
-    # Candidate callees: in this bank, ret is void or uint8, and Y is clobbered.
+    # Compute fall-through edges: a function whose last instruction
+    # isn't a transfer (RTS/RTL/RTI/JMP/BRA/BRL/BRK/STP) implicitly
+    # tail-calls the next function in ROM order. Y-clobber and
+    # Y-returning return type both must be inherited across that edge,
+    # since callers of the upper function transparently see the lower
+    # function's effects (the canonical case is HHSCCO whose body is
+    # the single `STA [Map16],Y` and which falls through to _Entry2,
+    # which writes Y and returns RetAY — without this propagation,
+    # HHSCCO looks like a non-Y-clobber to the candidate filter).
+    known_func_addrs: Set[int] = set(cfg.names.keys())
+    for _fname, addr, *_ in cfg.funcs:
+        known_func_addrs.add((cfg.bank << 16) | addr)
+    fallthrough_to: Dict[int, int] = {}
+    for i, (_fname, start_addr, _sig, eovr, mo, _h) in enumerate(non_skip):
+        if i + 1 >= len(non_skip):
+            continue
+        next_addr = non_skip[i + 1][1]
+        end_addr = eovr if eovr is not None else next_addr
+        try:
+            insns = decode_func(rom, cfg.bank, start_addr, end=end_addr,
+                                mode_overrides=mo or None,
+                                exclude_ranges=cfg.exclude_ranges or None,
+                                known_func_starts=known_func_addrs,
+                                validate_branches=False)
+        except Exception:
+            continue
+        if not insns:
+            continue
+        last = insns[-1]
+        if last.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL', 'BRK', 'STP'):
+            continue
+        # Fall-through reaches the next function only when the decoded
+        # body lands exactly on the next-func boundary (no gap).
+        if (last.addr & 0xFFFF) + last.length == next_addr:
+            fallthrough_to[start_addr] = next_addr
+
+    def _y_effective_clobber(addr: int, _seen: Optional[Set[int]] = None) -> bool:
+        """True if this function or any fall-through chain clobbers Y."""
+        if _seen is None:
+            _seen = set()
+        if addr in _seen:
+            return False
+        _seen.add(addr)
+        full = (cfg.bank << 16) | addr
+        if 'Y' in clobbers.get(full, set()):
+            return True
+        nxt = fallthrough_to.get(addr)
+        if nxt is None:
+            return False
+        # Also inherit if the fall-through callee's *current* sig already
+        # returns Y (RetY/RetAY). That makes the upper function a
+        # Y-producer at the C-ABI level even when it doesn't write Y in
+        # its own insns.
+        nxt_sig = cfg.sigs.get((cfg.bank << 16) | nxt)
+        if nxt_sig is not None:
+            nxt_ret, _ = parse_sig(nxt_sig)
+            if nxt_ret in ('RetY', 'RetAY'):
+                return True
+        return _y_effective_clobber(nxt, _seen)
+
+    # Candidate callees: in this bank, ret is void or uint8, and Y is
+    # effectively clobbered (own body or via fall-through chain).
     candidates: Set[int] = set()
     for fname, addr, *_ in non_skip:
         full = (cfg.bank << 16) | addr
@@ -1472,16 +1586,24 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         ret, _ps = parse_sig(sig)
         if ret not in ('void', 'uint8'):
             continue
-        if 'Y' not in clobbers.get(full, set()):
+        if not _y_effective_clobber(addr):
             continue
         candidates.add(addr)
     if not candidates:
         return 0
     # Decode every caller and look for consumer JSR to a candidate.
     y_consumers: Set[int] = set()
-    known_func_addrs: Set[int] = set(cfg.names.keys())
-    for _fname, addr, *_ in cfg.funcs:
-        known_func_addrs.add((cfg.bank << 16) | addr)
+    # Build {in-bank-addr: live-in regs} from the live-in pass that
+    # already ran. This lets _insns_read_reg_post_jsr count
+    # "JSR foo ; ... ; JSR foo" loop-back as a Y consumer when foo
+    # reads Y as live-in. Without it, do-while loops that thread Y
+    # implicitly through repeated JSRs would never trigger Y promotion.
+    handler_livein: Dict[int, Set[str]] = getattr(
+        cfg, '_dispatch_handler_livein', {})
+    reg_livein_by_addr: Dict[int, Set[str]] = {}
+    for full_a, regs in handler_livein.items():
+        if (full_a >> 16) == cfg.bank:
+            reg_livein_by_addr[full_a & 0xFFFF] = regs
     for i, (fname, start_addr, _sig, eovr, mo, _h) in enumerate(non_skip):
         if eovr is not None:
             end_addr = eovr
@@ -1503,7 +1625,8 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
             tgt = insn.operand & 0xFFFF
             if tgt not in candidates:
                 continue
-            if _insns_read_reg_post_jsr(insns, insn.addr & 0xFFFF, tgt, 'Y'):
+            if _insns_read_reg_post_jsr(insns, insn.addr & 0xFFFF, tgt, 'Y',
+                                        reg_livein_by_addr=reg_livein_by_addr):
                 y_consumers.add(tgt)
     # Promote each consumer. Dispatch-table entries are eligible too:
     # direct-JSR callers still consume the Y return, and dispatch-call
