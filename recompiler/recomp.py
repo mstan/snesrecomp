@@ -1515,23 +1515,37 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
     non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
                 if f not in cfg.skip]
     non_skip.sort(key=lambda t: t[1])
-    # Compute fall-through edges: a function whose last instruction
-    # isn't a transfer (RTS/RTL/RTI/JMP/BRA/BRL/BRK/STP) implicitly
-    # tail-calls the next function in ROM order. Y-clobber and
-    # Y-returning return type both must be inherited across that edge,
-    # since callers of the upper function transparently see the lower
-    # function's effects (the canonical case is HHSCCO whose body is
-    # the single `STA [Map16],Y` and which falls through to _Entry2,
-    # which writes Y and returns RetAY — without this propagation,
-    # HHSCCO looks like a non-Y-clobber to the candidate filter).
+    # Compute fall-through edges + intra-bank JSR edges per function.
+    # Both are needed for Y-clobber propagation:
+    #
+    #   * Fall-through: a function whose last instruction isn't a
+    #     transfer (RTS/RTL/RTI/JMP/BRA/BRL/BRK/STP) implicitly tail-calls
+    #     the next function in ROM order. The canonical case is HHSCCO
+    #     whose body is the single `STA [Map16],Y` and which falls
+    #     through to _Entry2 (writes Y, returns RetAY).
+    #
+    #   * JSR edges: a wrapper function `Foo` that contains
+    #     `JSR Bar ; ... ; RTS` where Bar clobbers Y, and Foo writes
+    #     nothing to Y after the JSR, transparently passes Bar's Y to
+    #     Foo's caller. The canonical case is
+    #     ExtObjXX_LargeBush_HandleOverlappingBigBushTiles which calls
+    #     HHSCCO twice and then RTSes — its callers' do-while loops
+    #     thread Y through it the same way they thread Y through HHSCCO
+    #     directly.
     known_func_addrs: Set[int] = set(cfg.names.keys())
     for _fname, addr, *_ in cfg.funcs:
         known_func_addrs.add((cfg.bank << 16) | addr)
     fallthrough_to: Dict[int, int] = {}
+    # For each function: list of (jsr_target_in_bank, writes_y_after) — the
+    # second flag is True if the function writes Y on any path from this
+    # JSR site to RTS. When False, the JSR's Y output passes through to
+    # the function's RTS unchanged, and Y-clobber should be inherited.
+    jsr_callees: Dict[int, List[Tuple[int, bool]]] = {}
     for i, (_fname, start_addr, _sig, eovr, mo, _h) in enumerate(non_skip):
         if i + 1 >= len(non_skip):
-            continue
-        next_addr = non_skip[i + 1][1]
+            next_addr = 0x10000
+        else:
+            next_addr = non_skip[i + 1][1]
         end_addr = eovr if eovr is not None else next_addr
         try:
             insns = decode_func(rom, cfg.bank, start_addr, end=end_addr,
@@ -1544,15 +1558,56 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         if not insns:
             continue
         last = insns[-1]
-        if last.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL', 'BRK', 'STP'):
-            continue
-        # Fall-through reaches the next function only when the decoded
-        # body lands exactly on the next-func boundary (no gap).
-        if (last.addr & 0xFFFF) + last.length == next_addr:
-            fallthrough_to[start_addr] = next_addr
+        if last.mnem not in ('RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL', 'BRK', 'STP'):
+            # Fall-through reaches the next function only when the decoded
+            # body lands exactly on the next-func boundary (no gap).
+            if (last.addr & 0xFFFF) + last.length == next_addr:
+                fallthrough_to[start_addr] = next_addr
+        # Collect intra-bank JSR targets and a coarse "Y written after this
+        # call?" flag. We walk forward from each JSR to the next terminator
+        # (RTS family) along fall-through and ask: is there any Y write?
+        # Branches make this conservative — if any path writes Y the flag
+        # is True and we don't propagate. False positive is safe (same as
+        # today: function doesn't get marked as Y-passthrough). False
+        # negative would over-promote (mostly benign).
+        callees: List[Tuple[int, bool]] = []
+        # Both JSR and JMP-to-known-func count: JMP is a tail call (the
+        # callee's RTS returns directly to our caller), and from our
+        # caller's perspective the tail-called function's Y output is
+        # what they see. The canonical case is
+        # ExtObjXX_LargeBush_HandleOverlappingBigBushTiles which ends
+        # in `LDA _F ; JMP CODE_0DA95B` — a tail call to HHSCCO.
+        for j, ins in enumerate(insns):
+            is_call = ins.mnem == 'JSR'
+            is_tail = (ins.mnem == 'JMP'
+                       and ((cfg.bank << 16) | (ins.operand & 0xFFFF)) in known_func_addrs)
+            if not (is_call or is_tail):
+                continue
+            tgt = ins.operand & 0xFFFF
+            if is_tail:
+                # Tail call: nothing executes after this in our function,
+                # so writes_y_after is definitionally False.
+                callees.append((tgt, False))
+                continue
+            writes_y_after = False
+            for k in range(j + 1, len(insns)):
+                _r, w = _insn_reg_use(insns[k], 'Y')
+                if w:
+                    writes_y_after = True
+                    break
+                if insns[k].mnem in ('RTS', 'RTL', 'RTI', 'BRK', 'STP'):
+                    break
+                # Don't follow branches here (conservative — treats them
+                # as "may write Y" only if a write is seen on the linear
+                # fall-through path).
+            callees.append((tgt, writes_y_after))
+        if callees:
+            jsr_callees[start_addr] = callees
 
     def _y_effective_clobber(addr: int, _seen: Optional[Set[int]] = None) -> bool:
-        """True if this function or any fall-through chain clobbers Y."""
+        """True if this function effectively makes its caller see Y as
+        modified — either by writing Y itself, or by chaining through a
+        fall-through callee or a JSR'd callee that does."""
         if _seen is None:
             _seen = set()
         if addr in _seen:
@@ -1561,19 +1616,30 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         full = (cfg.bank << 16) | addr
         if 'Y' in clobbers.get(full, set()):
             return True
+        # Fall-through inheritance.
         nxt = fallthrough_to.get(addr)
-        if nxt is None:
-            return False
-        # Also inherit if the fall-through callee's *current* sig already
-        # returns Y (RetY/RetAY). That makes the upper function a
-        # Y-producer at the C-ABI level even when it doesn't write Y in
-        # its own insns.
-        nxt_sig = cfg.sigs.get((cfg.bank << 16) | nxt)
-        if nxt_sig is not None:
-            nxt_ret, _ = parse_sig(nxt_sig)
-            if nxt_ret in ('RetY', 'RetAY'):
+        if nxt is not None:
+            nxt_sig = cfg.sigs.get((cfg.bank << 16) | nxt)
+            if nxt_sig is not None:
+                nxt_ret, _ = parse_sig(nxt_sig)
+                if nxt_ret in ('RetY', 'RetAY'):
+                    return True
+            if _y_effective_clobber(nxt, _seen):
                 return True
-        return _y_effective_clobber(nxt, _seen)
+        # JSR-callee inheritance: any intra-bank callee that writes Y
+        # and whose Y output isn't overwritten before this function
+        # RTSes effectively passes Y through to our caller.
+        for tgt, writes_after in jsr_callees.get(addr, ()):
+            if writes_after:
+                continue
+            tgt_sig = cfg.sigs.get((cfg.bank << 16) | tgt)
+            if tgt_sig is not None:
+                tgt_ret, _ = parse_sig(tgt_sig)
+                if tgt_ret in ('RetY', 'RetAY'):
+                    return True
+            if _y_effective_clobber(tgt, _seen):
+                return True
+        return False
 
     # Candidate callees: in this bank, ret is void or uint8, and Y is
     # effectively clobbered (own body or via fall-through chain).

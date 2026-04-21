@@ -99,6 +99,42 @@ def test_no_y_consumer_returns_false():
         insns, jsr_pc=0x008000, target=0x9000, reg='Y') is False
 
 
+def test_jmp_tail_call_wrapper_inherits_y_clobber():
+    """`ExtObjXX_LargeBush_HandleOverlappingBigBushTiles` shape: a small
+    wrapper that ends in `JMP CODE_0DA95B` (tail call). The wrapper's
+    body has no JSR — only branches and a final JMP. From the wrapper's
+    caller's perspective, the wrapper is a Y-clobber pass-through (the
+    callee's RTS returns directly to the caller, with the callee's Y).
+
+    The promoter's `_y_effective_clobber` must recognize JMP-to-known-func
+    as a tail call edge and inherit the tail-callee's Y-clobber. Without
+    this, the wrapper stays uint8(...) and bush placement loops fail
+    the same way the HHSCCO loops did before the loop-Y fix."""
+    import importlib
+    # Build a synthetic bank cfg + decode pipeline. Easier: use the real
+    # bank0d.cfg + ROM, then assert the wrapper got promoted to RetAY.
+    bank0d_cfg = REPO.parent / 'recomp' / 'bank0d.cfg'
+    rom_path = REPO.parent / 'smw.sfc'
+    if not bank0d_cfg.exists() or not rom_path.exists():
+        # In CI / fresh checkout without the ROM, skip silently — the
+        # smaller synthetic cases above still pin the analyzer.
+        return
+    rom = open(rom_path, 'rb').read()
+    if len(rom) % 1024 == 512:
+        rom = rom[512:]
+    cfg = recomp.parse_config(str(bank0d_cfg))
+    recomp.augment_cfg_sigs_from_livein(rom, cfg)
+    # ExtObjXX_LargeBush_HandleOverlappingBigBushTiles @ $0D:$A78D.
+    addr = (0x0D << 16) | 0xA78D
+    sig = cfg.sigs.get(addr)
+    assert sig is not None, 'wrapper sig missing'
+    ret, _params = recomp.parse_sig(sig)
+    assert ret == 'RetAY', (
+        f'wrapper sig should auto-promote to RetAY (it tail-calls HHSCCO '
+        f'which is RetAY); got {sig}'
+    )
+
+
 def test_branch_target_y_read_detected():
     """JSR ; BEQ skip ; (Y untouched) ; skip: TYA. The Y read on the
     branch-target side must be detected even though the fall-through

@@ -337,6 +337,7 @@ static struct {
         uint16_t val;   // 16-bit to hold word writes; byte writes use low 8
         uint8_t width;  // 1 = byte, 2 = word
         char func[48];
+        char parent[48];  // caller of `func` (one level up the recomp stack)
     } log[WRAM_TRACE_LOG_SIZE];
 } s_wram_trace = {0};
 
@@ -365,6 +366,17 @@ static inline void rdb_record(uint32_t adr, uint16_t val, uint8_t width) {
     else
         s_wram_trace.log[idx].func[0] = 0;
     s_wram_trace.log[idx].func[47] = 0;
+    // Parent: one level up the recomp stack. g_recomp_stack_top points at
+    // the next-free slot, so [top-1] is the current function (same as
+    // g_last_recomp_func) and [top-2] is its caller.
+    s_wram_trace.log[idx].parent[0] = 0;
+    if (g_recomp_stack_top >= 2) {
+        const char *p = g_recomp_stack[g_recomp_stack_top - 2];
+        if (p) {
+            strncpy(s_wram_trace.log[idx].parent, p, 47);
+            s_wram_trace.log[idx].parent[47] = 0;
+        }
+    }
     s_wram_trace.write_idx++;
     if (s_wram_trace.count < WRAM_TRACE_LOG_SIZE) s_wram_trace.count++;
 }
@@ -1056,13 +1068,14 @@ static void cmd_get_wram_trace(const char *args) {
     for (int i = 0; i < s_wram_trace.count && pos < budget; i++) {
         int idx = (start + i) % WRAM_TRACE_LOG_SIZE;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,\"func\":\"%s\"}",
+            "%s{\"f\":%d,\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,\"func\":\"%s\",\"parent\":\"%s\"}",
             i ? "," : "",
             s_wram_trace.log[idx].frame,
             s_wram_trace.log[idx].adr,
             s_wram_trace.log[idx].val,
             (unsigned)s_wram_trace.log[idx].width,
-            s_wram_trace.log[idx].func);
+            s_wram_trace.log[idx].func,
+            s_wram_trace.log[idx].parent);
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
