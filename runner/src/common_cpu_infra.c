@@ -132,7 +132,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     g_cpu->xf = false;
     g_cpu->d = false;
     g_cpu->i = true;  // SEI at $8000
-    cpu_setFlags(g_cpu, cpu_getFlags(g_cpu));
   } else {
     g_snes->cart->ramSize = 2048;
     g_snes->cart->ram = calloc(1, 2048);

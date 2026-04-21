@@ -46,7 +46,6 @@ void RtlReset(int mode) {
   g_cpu->xf = false;
   g_cpu->d = false;
   g_cpu->i = true;
-  cpu_setFlags(g_cpu, cpu_getFlags(g_cpu));
   ppu_reset(g_ppu);
   if (!(mode & 1))
     memset(g_sram, 0, g_sram_size);

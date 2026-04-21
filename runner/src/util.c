@@ -134,16 +134,6 @@ void StrSet(char **rv, const char *s) {
   free(old);
 }
 
-char *StrFmt(const char *fmt, ...) {
-  char buf[4096];
-  va_list va;
-  va_start(va, fmt);
-  int n = vsnprintf(buf, sizeof(buf), fmt, va);
-  if (n < 0 || n >= sizeof(buf)) Die("vsnprintf failed");
-  va_end(va);
-  return strdup(buf);
-}
-
 void ByteArray_Resize(ByteArray *arr, size_t new_size) {
   arr->size = new_size;
   if (new_size > arr->capacity) {
@@ -164,11 +154,6 @@ void ByteArray_Destroy(ByteArray *arr) {
 void ByteArray_AppendData(ByteArray *arr, const uint8 *data, size_t data_size) {
   ByteArray_Resize(arr, arr->size + data_size);
   memcpy(arr->data + arr->size - data_size, data, data_size);
-}
-
-void ByteArray_AppendByte(ByteArray *arr, uint8 v) {
-  ByteArray_Resize(arr, arr->size + 1);
-  arr->data[arr->size - 1] = v;
 }
 
 MemBlk FindIndexInMemblk(MemBlk data, size_t i) {
