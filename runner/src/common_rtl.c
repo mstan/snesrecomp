@@ -2,7 +2,6 @@
 #include "common_cpu_infra.h"
 #include "recomp_hw.h"
 #include "framedump.h"
-#include "smw_spc_player.h"
 #include "util.h"
 #include "config.h"
 #include "snes/snes.h"

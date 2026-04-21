@@ -33,8 +33,7 @@ extern Dma *g_dma;
 
 extern int snes_frame_counter;
 
-typedef struct SpcPlayer SpcPlayer;
-extern SpcPlayer *g_spc_player;
+#include "spc_player.h"
 
 void MemCpy(void *dst, const void *src, int size);
 bool Unreachable();

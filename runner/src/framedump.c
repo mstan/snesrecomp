@@ -37,40 +37,19 @@ static uint32_t crc32(const uint8_t *buf, size_t len) {
   return c ^ 0xFFFFFFFFu;
 }
 
-// --- WRAM field accessors (key SMW state) ---
-// All little-endian reads from WRAM buffer (65816 native order)
-static uint8_t  w8 (const uint8_t *w, uint32_t a) { return w[a]; }
-static uint16_t w16(const uint8_t *w, uint32_t a) { return (uint16_t)(w[a] | (w[a+1] << 8)); }
-
+// Game-agnostic per-frame metadata. Per-game offline tools decode the
+// accompanying .bin dump for game-specific fields.
 static void write_json(const char *path, uint32_t frame, const uint8_t *wram) {
   uint32_t crc = crc32(wram, 0x20000);
-
-  uint8_t  game_mode    = w8 (wram, 0x100);
-  uint8_t  frame_ctr    = w8 (wram, 0x13);
-  uint8_t  ow_process   = w8 (wram, 0x13D9);
-  uint16_t ow_submap    = w16(wram, 0x13C3);
-  uint16_t ow_player_x  = w16(wram, 0x1F17);
-  uint16_t ow_player_y  = w16(wram, 0x1F19);
-  uint8_t  ow_map       = w8 (wram, 0x1F11);
-
   FILE *f = fopen(path, "w");
   if (!f) return;
   fprintf(f,
     "{\n"
     "  \"frame\": %u,\n"
-    "  \"game_mode\": %u,\n"
-    "  \"frame_ctr\": %u,\n"
-    "  \"ow_process\": %u,\n"
-    "  \"ow_submap\": %u,\n"
-    "  \"ow_player_x\": %u,\n"
-    "  \"ow_player_y\": %u,\n"
-    "  \"ow_map\": %u,\n"
+    "  \"wram_size\": %u,\n"
     "  \"crc32_wram\": \"0x%08X\"\n"
     "}\n",
-    frame, game_mode, frame_ctr,
-    ow_process, ow_submap,
-    ow_player_x, ow_player_y, ow_map,
-    crc);
+    frame, 0x20000u, crc);
   fclose(f);
 }
 
