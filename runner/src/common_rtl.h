@@ -188,14 +188,10 @@ static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
 }
 
 void RtlReset(int mode);
-void RtlClearKeyLog();
-void RtlStopReplay();
-bool RtlIsReplayMode(void);
 
 enum {
   kSaveLoad_Save = 1,
   kSaveLoad_Load = 2,
-  kSaveLoad_Replay = 3,
 };
 
 void RtlSaveLoad(int cmd, int slot);
@@ -205,10 +201,9 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
 void RtlWriteSram();
-void RtlSaveSnapshot(const char *filename, bool saving_with_bug);
-bool RtlLoadSnapshot(const char *filename, bool replay);
+void RtlSaveSnapshot(const char *filename);
+bool RtlLoadSnapshot(const char *filename);
 uint8 RtlApuReadReg(int reg);
-void RtlRecordPatchByte(const uint8 *value, int num);
 
 void RtlPpuWrite(uint16 addr, uint8 value);
 void RtlApuWrite(uint16 adr, uint8 val);

@@ -35,17 +35,9 @@ typedef struct RtlGameInfo {
   CpuInfraInitializeFunc *initialize;
   RunOneFrameOfGameFunc *run_frame;
   RunOneFrameOfGameFunc *draw_ppu_frame;
-  // Filename prefix used by RtlSaveLoad for slot < 256 saves, e.g. "save"
-  // produces "saves/save%d.sav". If NULL, framework uses "%s_save" with title.
+  // Filename prefix used by RtlSaveLoad, e.g. "save" produces
+  // "saves/save%d.sav". If NULL, framework uses "%s_save" with title.
   const char *save_name_prefix;
-  // Optional per-frame hook invoked after state recording; receives the
-  // resolved input word. Used for game-specific RAM reflection.
-  void (*on_frame_inputs)(uint32 inputs);
-  // Optional hook invoked when g_did_finish_level_hook trips.
-  void (*on_finish_level)(void);
-  // Optional override for RtlSaveLoad when slot >= 256 (bug/playback saves).
-  // Returns true if the game consumed the call; false to fall through.
-  bool (*special_save_load)(int cmd, int slot);
 } RtlGameInfo;
 
 extern const RtlGameInfo *g_rtl_game_info;
