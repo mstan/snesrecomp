@@ -314,6 +314,10 @@ void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
 }
 
 #if SNESRECOMP_REVERSE_DEBUG
+void debug_on_recomp_stack_push(const char *name);  // forward (defined below alongside the WRAM trace)
+#endif
+
+#if SNESRECOMP_REVERSE_DEBUG
 // ---- Tier-1 reverse debugger WRAM write trace ----
 // Called synchronously from every WRAM store in the generated C when the
 // generator was invoked with --reverse-debug. Filters by up to
@@ -387,6 +391,49 @@ void debug_on_wram_write_byte(uint32_t addr, uint8_t val) {
 void debug_on_wram_write_word(uint32_t addr, uint16_t val) {
     rdb_record(addr, val, 2);
 }
+
+// ---- Call-trace ring (per-RecompStackPush log) ----
+// Active when SNESRECOMP_REVERSE_DEBUG is enabled and trace_calls
+// has been turned on. Each entry records (frame, depth, func, parent)
+// at the moment of the push. Used to reconstruct the actual call
+// sequence within a frame for divergence analysis against SMWDisX.
+#define CALL_TRACE_LOG_SIZE 65536
+extern const char *g_recomp_stack[];
+extern int g_recomp_stack_top;
+static struct {
+    int active;
+    int write_idx;
+    int count;
+    struct {
+        int frame;
+        int depth;
+        char func[48];
+        char parent[48];
+    } log[CALL_TRACE_LOG_SIZE];
+} s_call_trace = {0};
+
+void debug_on_recomp_stack_push(const char *name) {
+    if (!s_call_trace.active) return;
+    int idx = s_call_trace.write_idx % CALL_TRACE_LOG_SIZE;
+    s_call_trace.log[idx].frame = snes_frame_counter;
+    s_call_trace.log[idx].depth = g_recomp_stack_top;
+    if (name) {
+        strncpy(s_call_trace.log[idx].func, name, 47);
+        s_call_trace.log[idx].func[47] = 0;
+    } else s_call_trace.log[idx].func[0] = 0;
+    // Parent: stack[top-2] (since top-1 is THIS push). RecompStackPush
+    // does ++top before calling us, so top-1 IS us — we want top-2.
+    s_call_trace.log[idx].parent[0] = 0;
+    if (g_recomp_stack_top >= 2) {
+        const char *p = g_recomp_stack[g_recomp_stack_top - 2];
+        if (p) {
+            strncpy(s_call_trace.log[idx].parent, p, 47);
+            s_call_trace.log[idx].parent[47] = 0;
+        }
+    }
+    s_call_trace.write_idx++;
+    if (s_call_trace.count < CALL_TRACE_LOG_SIZE) s_call_trace.count++;
+}
 #endif
 
 #include <time.h>
@@ -443,6 +490,9 @@ static void func_tracker_push(const char *name) {
 // Called from RecompStackPush when profiling is enabled
 void debug_server_profile_push(const char *name) {
     func_tracker_push(name);  // always track, regardless of profiling state
+#if SNESRECOMP_REVERSE_DEBUG
+    debug_on_recomp_stack_push(name);
+#endif
     if (!s_profile_enabled) return;
     for (int i = 0; i < s_profile_count; i++) {
         if (s_profile[i].name == name) {
@@ -1078,6 +1128,75 @@ static void cmd_get_wram_trace(const char *args) {
             s_wram_trace.log[idx].parent);
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+static void cmd_trace_calls(const char *args) {
+    (void)args;
+    s_call_trace.active = 1;
+    send_fmt("{\"ok\":true,\"max_entries\":%d}", CALL_TRACE_LOG_SIZE);
+}
+
+static void cmd_trace_calls_reset(const char *args) {
+    (void)args;
+    s_call_trace.active = 0;
+    s_call_trace.write_idx = 0;
+    s_call_trace.count = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_call_trace(const char *args) {
+    // Optional filters: `from=N to=M` (frame range), `max_depth=D`
+    // (skip pushes deeper than D — useful to drop Decompress / nested-
+    // recursion noise), `contains=SUBSTR` (only emit entries where
+    // func or parent contains SUBSTR — case-sensitive).
+    int from_frame = -1, to_frame = -1, max_depth = -1;
+    char contains[48] = {0};
+    if (args) {
+        const char *p = strstr(args, "from=");
+        if (p) sscanf(p + 5, "%d", &from_frame);
+        p = strstr(args, "to=");
+        if (p) sscanf(p + 3, "%d", &to_frame);
+        p = strstr(args, "max_depth=");
+        if (p) sscanf(p + 10, "%d", &max_depth);
+        p = strstr(args, "contains=");
+        if (p) {
+            int i = 0;
+            p += 9;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && i < 47) {
+                contains[i++] = *p++;
+            }
+            contains[i] = 0;
+        }
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf), "{\"entries\":%d,\"log\":[", s_call_trace.count);
+    int start = s_call_trace.count < CALL_TRACE_LOG_SIZE ? 0 :
+                s_call_trace.write_idx - CALL_TRACE_LOG_SIZE;
+    int budget = (int)sizeof(buf) - 4096;
+    int first = 1;
+    int emitted = 0;
+    for (int i = 0; i < s_call_trace.count && pos < budget; i++) {
+        int idx = (start + i) % CALL_TRACE_LOG_SIZE;
+        int f = s_call_trace.log[idx].frame;
+        if (from_frame >= 0 && f < from_frame) continue;
+        if (to_frame >= 0 && f > to_frame) continue;
+        if (max_depth >= 0 && s_call_trace.log[idx].depth > max_depth) continue;
+        if (contains[0]) {
+            if (!strstr(s_call_trace.log[idx].func, contains)
+                && !strstr(s_call_trace.log[idx].parent, contains)) continue;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"d\":%d,\"func\":\"%s\",\"parent\":\"%s\"}",
+            first ? "" : ",",
+            f,
+            s_call_trace.log[idx].depth,
+            s_call_trace.log[idx].func,
+            s_call_trace.log[idx].parent);
+        first = 0;
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
     send_line(buf);
 }
 #endif
@@ -1941,9 +2060,12 @@ static const CmdEntry s_commands[] = {
     {"trace_vram_reset", cmd_trace_vram_reset},
     {"get_vram_trace", cmd_get_vram_trace},
 #if SNESRECOMP_REVERSE_DEBUG
-    {"trace_wram",       cmd_trace_wram},
-    {"trace_wram_reset", cmd_trace_wram_reset},
-    {"get_wram_trace",   cmd_get_wram_trace},
+    {"trace_wram",        cmd_trace_wram},
+    {"trace_wram_reset",  cmd_trace_wram_reset},
+    {"get_wram_trace",    cmd_get_wram_trace},
+    {"trace_calls",       cmd_trace_calls},
+    {"trace_calls_reset", cmd_trace_calls_reset},
+    {"get_call_trace",    cmd_get_call_trace},
 #endif
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},

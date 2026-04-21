@@ -54,6 +54,7 @@ void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH)
     g_recomp_stack[g_recomp_stack_top++] = name;
   g_last_recomp_func = name;
+  debug_server_profile_push(name);
 }
 
 void RecompStackDump(void) {
