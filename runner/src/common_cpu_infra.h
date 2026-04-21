@@ -16,6 +16,12 @@ extern bool g_fail;
 Snes *SnesInit(const uint8 *data, int data_size);
 uint8_t *SnesRomPtr(uint32 v);
 
+// Apply the native-mode CPU state the real ROM's reset vector would
+// have established (CLC;XCE / REP #$38 / TCD / TCS / SEI). The recomp
+// path never executes those opcodes, so RtlReset and SnesInit invoke
+// this after snes_reset to pick up where the ROM would be at $8028.
+void SnesEnterNativeMode(void);
+
 typedef void CpuInfraInitializeFunc(void);
 typedef void RunOneFrameOfGameFunc(void);
 

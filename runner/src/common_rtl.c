@@ -18,7 +18,7 @@ Dma *g_dma;
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
 #define RTL_SAV_MAGIC   0x52544c53u  /* "RTLS" */
-#define RTL_SAV_VERSION 3u  /* v3: Snes struct shrunk (removed interpreter residue cpuCyclesLeft/cpuMemOps + dead fastMem/openBus + padx/padpad) */
+#define RTL_SAV_VERSION 4u  /* v4: dropped Dma.pad[7] blob tail */
 
 typedef struct FileSli {
   SaveLoadInfo base;
@@ -38,14 +38,7 @@ static void file_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 void RtlReset(int mode) {
   snes_frame_counter = 0;
   snes_reset(g_snes, true);
-  // The real ROM's reset vector sets up CPU state (see common_cpu_infra.c).
-  g_cpu->e = false;
-  g_cpu->sp = 0x01FF;
-  g_cpu->dp = 0;
-  g_cpu->mf = false;
-  g_cpu->xf = false;
-  g_cpu->d = false;
-  g_cpu->i = true;
+  SnesEnterNativeMode();
   ppu_reset(g_ppu);
   if (!(mode & 1))
     memset(g_sram, 0, g_sram_size);

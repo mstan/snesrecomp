@@ -134,6 +134,28 @@ void StrSet(char **rv, const char *s) {
   free(old);
 }
 
+bool ParseBool(const char *value, bool *result) {
+  bool rv = false;
+  switch (*value++ | 32) {
+  case '0': if (*value == 0) break; return false;
+  case 'f': if (StringEqualsNoCase(value, "alse")) break; return false;
+  case 'n': if (StringEqualsNoCase(value, "o")) break; return false;
+  case 'o':
+    rv = (*value | 32) == 'n';
+    if (StringEqualsNoCase(value, rv ? "n" : "ff")) break;
+    return false;
+  case '1': rv = true; if (*value == 0) break; return false;
+  case 'y': rv = true; if (StringEqualsNoCase(value, "es")) break; return false;
+  case 't': rv = true; if (StringEqualsNoCase(value, "rue")) break; return false;
+  default: return false;
+  }
+  if (result) {
+    *result = rv;
+    return true;
+  }
+  return rv;
+}
+
 void ByteArray_Resize(ByteArray *arr, size_t new_size) {
   arr->size = new_size;
   if (new_size > arr->capacity) {

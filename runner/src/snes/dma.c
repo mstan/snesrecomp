@@ -64,7 +64,7 @@ void dma_reset(Dma* dma) {
 }
 
 void dma_saveload(Dma *dma, SaveLoadInfo *sli) {
-  sli->func(sli, &dma->channel, offsetof(Dma, pad) + 7 - offsetof(Dma, channel));
+  sli->func(sli, &dma->channel, sizeof(*dma) - offsetof(Dma, channel));
 }
 
 uint8_t dma_read(Dma* dma, uint16_t adr) {

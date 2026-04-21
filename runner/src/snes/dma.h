@@ -39,7 +39,6 @@ struct Dma {
   DmaChannel channel[8];
   uint32_t dmaTimer;
   bool dmaBusy;
-  uint8_t pad[7];
 };
 
 Dma* dma_init(Snes* snes);

@@ -22,6 +22,18 @@ uint8_t *SnesRomPtr(uint32 v) {
   return (uint8 *)RomPtr(v);
 }
 
+// Apply the native-mode CPU state the real ROM's reset vector would
+// have established. See header comment.
+void SnesEnterNativeMode(void) {
+  g_cpu->e = false;
+  g_cpu->sp = 0x01FF;
+  g_cpu->dp = 0;
+  g_cpu->mf = false;
+  g_cpu->xf = false;
+  g_cpu->d = false;
+  g_cpu->i = true;
+}
+
 // Resolve a 16-bit-indirect-through-DP pointer using the current
 // data bank register. See comment in common_rtl.h for why this
 // matters for `(dp)`, `(dp),Y`, `(dp,X)` addressing modes.
@@ -119,19 +131,7 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     if (g_rtl_game_info->initialize)
       g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
-    // The real ROM's reset vector ($00:8000) sets up CPU state:
-    //   $801B: CLC; XCE    → native mode (e=0)
-    //   $801D: REP #$38    → 16-bit A/X/Y, clear decimal
-    //   $801F: LDA #$0000; TCD  → DP=0
-    //   $8023: LDA #$01FF; TCS  → SP=$01FF
-    // The recomp path never executes these opcodes, so apply them here.
-    g_cpu->e = false;
-    g_cpu->sp = 0x01FF;
-    g_cpu->dp = 0;
-    g_cpu->mf = false;
-    g_cpu->xf = false;
-    g_cpu->d = false;
-    g_cpu->i = true;  // SEI at $8000
+    SnesEnterNativeMode();
   } else {
     g_snes->cart->ramSize = 2048;
     g_snes->cart->ram = calloc(1, 2048);

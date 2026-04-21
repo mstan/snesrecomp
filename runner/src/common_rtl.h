@@ -122,11 +122,14 @@ static inline const uint8 *RomPtr_17(uint16_t addr) { return RomPtr(0x170000 | a
 static inline const uint8 *RomPtr_1B(uint16_t addr) { return RomPtr(0x1b0000 | addr); }
 static inline const uint8 *RomPtr_1C(uint16_t addr) { return RomPtr(0x1c0000 | addr); }
 static inline const uint8 *RomPtr_80(uint16_t addr) { return RomPtr(0x000000 | addr); }
-// FIXME(latent-correctness): RomPtr_88 is emitted by smw_01_gen.c at ROM
-// $01:BD9C but the stub returns g_rom[0] — NOT bank $88. If that code
-// path is ever live at runtime, v13 is reading garbage. Promote to
-// `RomPtr(0x880000 | addr)` once per-game eyeball confirms either
-// (a) the path is dead at runtime, or (b) bank $88 is the right source.
+// RomPtr_88 is emitted only inside auto_01_8636 — a REVIEW-flagged
+// function the recompiler auto-promoted from a garbled decode at
+// $01:8636 ("garbled JSL operands; RomPtr with invalid banks (F8,88,B9)
+// --data decoded as code"). Grep confirms auto_01_8636 has zero callers,
+// so this stub is never executed at runtime; kept only so smw_01_gen.c
+// still compiles. Real fix is a recomp.py pass that suppresses
+// zero-caller REVIEW functions at generation time, at which point this
+// stub (and the dead function body) both go.
 static inline const uint8 *RomPtr_88(uint16_t addr) { (void)addr; return g_rom; }
 
 void WriteReg(uint16 reg, uint8 value);
