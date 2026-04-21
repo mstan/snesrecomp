@@ -59,6 +59,8 @@ def main():
                 (0x55, 1, 'Level/misc'),
                 (0x1931, 1, 'ObjectTileset'),
                 (0x0FBE, 64, 'Map16Pointers (0..32)'),
+                (0x1224, 64, 'Map16Pointers @ +$266 (outer loop writes here)'),
+                (0x13B0, 16, 'Map16Pointers tail'),
                 (0x6B, 6, '_6B..6F (Map16LowPtr+HighPtr)'),
                 (0x8, 2, '_8 (BufferScrollingTiles loop counter)'),
                 (0x0, 4, '_0.._3 temp'),

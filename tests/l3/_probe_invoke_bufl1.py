@@ -58,19 +58,20 @@ def main():
     r = DebugClient(RECOMP_PORT); o = DebugClient(ORACLE_PORT)
     try:
         r.cmd('pause'); o.cmd('pause')
-        step_to(r, 95); step_to(o, 95)
+        target = int(sys.argv[1]) if len(sys.argv) > 1 else 95
+        step_to(r, target); step_to(o, target)
         # At f95 both sides are paused with identical input state. Invoke.
         print('[pre-invoke] comparing Layer1VramBuffer...')
         rb_pre = rb(r, 0x1BE6, 256)
         ob_pre = rb(o, 0x1BE6, 256)
         if rb_pre != ob_pre:
-            print('  PRE-INVOKE BUFFERS DIFFER — can\'t isolate')
+            print('  PRE-INVOKE BUFFERS DIFFER — proceeding anyway')
             for i, (a, b) in enumerate(zip(rb_pre, ob_pre)):
                 if a != b:
                     print(f'  first diff at offset {i:04x} ($1BE6+{i:04x}) R=0x{a:02x} O=0x{b:02x}')
                     break
-            return
-        print('  pre-invoke: MATCH')
+        else:
+            print('  pre-invoke: MATCH')
 
         # Invoke
         print('[invoke] BufferScrollingTiles_Layer1 on recomp and oracle...')
