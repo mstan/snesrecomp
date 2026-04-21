@@ -3014,6 +3014,9 @@ class EmitCtx:
                             merged.append((b_entry[0], phi))
                     self.stack = merged
             self.lines.append(f'  label_{pc:04x}:;')
+            if self._reverse_debug:
+                full_pc = (self.bank << 16) | pc
+                self.lines.append(f'  RDB_BLOCK_HOOK(0x{full_pc:06x});')
             # Branch target: clear dp_state so that dp reads re-read from g_ram.
             # Multiple paths can reach a label with different DP values cached,
             # so we must not use stale cached values after a merge point.
@@ -5149,6 +5152,9 @@ def emit_function(name: str, insns: List[Insn], bank: int,
     lines.append(f'  extern const char *g_last_recomp_func;')
     lines.append(f'  g_last_recomp_func = "{name}";')
     lines.append(f'  RecompStackPush("{name}");')
+    if reverse_debug:
+        full_pc = (bank << 16) | start
+        lines.append(f'  RDB_BLOCK_HOOK(0x{full_pc:06x});')
     if trace:
         lines.append(f'  extern void WatchdogCheck(void);')
         lines.append(f'  WatchdogCheck();')

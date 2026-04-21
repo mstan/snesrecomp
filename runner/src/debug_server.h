@@ -83,6 +83,16 @@ static inline void rdb_store16(uint32_t addr, uint16_t val) {
 }
 #define RDB_STORE8(addr, val)  rdb_store8((uint32_t)(addr), (uint8_t)(val))
 #define RDB_STORE16(addr, val) rdb_store16((uint32_t)(addr), (uint16_t)(val))
+
+// Tier-2 block-level execution hook. Emitted by --reverse-debug at every
+// basic-block boundary (function entry + every label). When trace_blocks
+// is active, records (frame, depth, pc, func) so a probe can replay the
+// exact intra-function execution path. When inactive, the call returns
+// immediately — but the call itself is unconditional, so non-debug
+// builds need recomp.py NOT to emit RDB_BLOCK_HOOK at all (gated by the
+// --reverse-debug flag at gen time, same as RDB_STORE*).
+void debug_on_block_enter(uint32_t pc);
+#define RDB_BLOCK_HOOK(pc) debug_on_block_enter((uint32_t)(pc))
 #endif
 
 #endif

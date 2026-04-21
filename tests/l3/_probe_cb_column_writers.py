@@ -61,7 +61,7 @@ def main():
         per_func = Counter()
         for e in log:
             a = int(e['adr'], 16)
-            per_addr[a].append((e['f'], int(e['val'], 16), e['func'], e['w']))
+            per_addr[a].append((e['f'], int(e['val'], 16), e['func'], e['w'], e.get('parent', '')))
             per_func[e['func']] += 1
 
         print('=== Top writers to $CB00-$CB80 (both banks) ===')
@@ -77,7 +77,7 @@ def main():
             print(f'\n  ${a:05x}{tag}  ({len(evs)} writes)')
             # Show first 6, last 2
             for ev in evs:
-                print(f'    f{ev[0]} val=0x{ev[1]:02x} w={ev[3]} fn={ev[2]}')
+                print(f'    f{ev[0]} val=0x{ev[1]:02x} w={ev[3]} fn={ev[2]} parent={ev[4] if len(ev) > 4 else "?"}')
     finally:
         c.close(); _kill()
 

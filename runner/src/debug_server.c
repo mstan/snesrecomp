@@ -412,6 +412,40 @@ static struct {
     } log[CALL_TRACE_LOG_SIZE];
 } s_call_trace = {0};
 
+// ---- Tier-2 block-level execution trace ----
+// Emitted at every basic-block boundary (function entry + every label) by
+// recomp.py --reverse-debug. Active only when trace_blocks command was
+// issued. Used to reconstruct the exact intra-function execution path
+// for divergence analysis at sub-function granularity.
+#define BLOCK_TRACE_LOG_SIZE 262144
+static struct {
+    int active;
+    int write_idx;
+    int count;
+    struct {
+        int frame;
+        int depth;
+        uint32_t pc;     // 24-bit bank:pc of the block start
+        char func[48];
+    } log[BLOCK_TRACE_LOG_SIZE];
+} s_block_trace = {0};
+
+void debug_on_block_enter(uint32_t pc) {
+    if (!s_block_trace.active) return;
+    int idx = s_block_trace.write_idx % BLOCK_TRACE_LOG_SIZE;
+    s_block_trace.log[idx].frame = snes_frame_counter;
+    s_block_trace.log[idx].depth = g_recomp_stack_top;
+    s_block_trace.log[idx].pc = pc;
+    if (g_last_recomp_func) {
+        strncpy(s_block_trace.log[idx].func, g_last_recomp_func, 47);
+        s_block_trace.log[idx].func[47] = 0;
+    } else {
+        s_block_trace.log[idx].func[0] = 0;
+    }
+    s_block_trace.write_idx++;
+    if (s_block_trace.count < BLOCK_TRACE_LOG_SIZE) s_block_trace.count++;
+}
+
 void debug_on_recomp_stack_push(const char *name) {
     if (!s_call_trace.active) return;
     int idx = s_call_trace.write_idx % CALL_TRACE_LOG_SIZE;
@@ -1128,6 +1162,63 @@ static void cmd_get_wram_trace(const char *args) {
             s_wram_trace.log[idx].parent);
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+static void cmd_trace_blocks(const char *args) {
+    (void)args;
+    s_block_trace.active = 1;
+    send_fmt("{\"ok\":true,\"max_entries\":%d}", BLOCK_TRACE_LOG_SIZE);
+}
+
+static void cmd_trace_blocks_reset(const char *args) {
+    (void)args;
+    s_block_trace.active = 0;
+    s_block_trace.write_idx = 0;
+    s_block_trace.count = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_block_trace(const char *args) {
+    int from_frame = -1, to_frame = -1;
+    char func_filter[48] = {0};
+    if (args) {
+        const char *p = strstr(args, "from=");
+        if (p) sscanf(p + 5, "%d", &from_frame);
+        p = strstr(args, "to=");
+        if (p) sscanf(p + 3, "%d", &to_frame);
+        p = strstr(args, "func=");
+        if (p) {
+            int i = 0; p += 5;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && i < 47)
+                func_filter[i++] = *p++;
+            func_filter[i] = 0;
+        }
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf), "{\"entries\":%d,\"log\":[", s_block_trace.count);
+    int start = s_block_trace.count < BLOCK_TRACE_LOG_SIZE ? 0 :
+                s_block_trace.write_idx - BLOCK_TRACE_LOG_SIZE;
+    int budget = (int)sizeof(buf) - 4096;
+    int first = 1;
+    int emitted = 0;
+    for (int i = 0; i < s_block_trace.count && pos < budget; i++) {
+        int idx = (start + i) % BLOCK_TRACE_LOG_SIZE;
+        int f = s_block_trace.log[idx].frame;
+        if (from_frame >= 0 && f < from_frame) continue;
+        if (to_frame >= 0 && f > to_frame) continue;
+        if (func_filter[0] && !strstr(s_block_trace.log[idx].func, func_filter)) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"d\":%d,\"pc\":\"0x%06x\",\"func\":\"%s\"}",
+            first ? "" : ",",
+            f,
+            s_block_trace.log[idx].depth,
+            s_block_trace.log[idx].pc,
+            s_block_trace.log[idx].func);
+        first = 0;
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
     send_line(buf);
 }
 
@@ -2066,6 +2157,9 @@ static const CmdEntry s_commands[] = {
     {"trace_calls",       cmd_trace_calls},
     {"trace_calls_reset", cmd_trace_calls_reset},
     {"get_call_trace",    cmd_get_call_trace},
+    {"trace_blocks",       cmd_trace_blocks},
+    {"trace_blocks_reset", cmd_trace_blocks_reset},
+    {"get_block_trace",    cmd_get_block_trace},
 #endif
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},

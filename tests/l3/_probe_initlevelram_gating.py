@@ -61,13 +61,13 @@ def main():
     try:
         r.cmd('pause'); o.cmd('pause')
         addrs = [
-            (0x185C, 'PlayerDisableObjInt'),
-            (0x0D9B, 'IRQNMICommand'),
+            (0x1471, 'StandOnSolidSprite'),
+            (0x007D, 'PlayerYSpeed+1'),
             (0x0072, 'PlayerInAir'),
             (0x0077, 'PlayerBlockedDir'),
             (0x13EF, 'PlayerIsOnGround'),
         ]
-        for f in [95, 96, 100]:
+        for f in [94, 95, 96, 100]:
             step_to(r, f); step_to(o, f)
             print(f'\n=== f{f} ===')
             for a, name in addrs:
