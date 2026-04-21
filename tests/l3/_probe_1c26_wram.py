@@ -51,8 +51,10 @@ def main():
             step_to(r, target); step_to(o, target)
             print(f'\n=== FRAME {target} ===')
             # Dump $1BE0-$1D00 (Layer1 + Layer2 DMA data buffers)
-            for base, name in [(0xBAB0, 'Map16LowPtr target $BAB0+'),
-                              (0xBE00, 'Map16HighPtr target $BE00+ (+0x50)')]:
+            for base, name in [(0xC9B0, 'Tile data at $C9B0'),
+                              (0xCDB0, 'Tile data at $CDB0'),
+                              (0xBAB0, 'Map16LowPtr target $BAB0+'),
+                              (0xBEB0, 'Map16HighPtr target $BEB0+')]:
                 rb = read_bytes(r, base, 0x40)
                 ob = read_bytes(o, base, 0x40)
                 if rb != ob:

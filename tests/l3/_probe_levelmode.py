@@ -51,6 +51,9 @@ def main():
         for target in [94, 95, 96]:
             step_to(r, target); step_to(o, target)
             ram_addrs = [
+                (0x0100, 1, 'GameMode ($7E:0100)'),
+                (0x13C6, 1, 'GameMode secondary'),
+                (0x13D9, 1, 'OWProcess'),
                 (0x1925, 1, 'LevelModeSetting'),
                 (0x13D7, 1, 'Layer1ScrollDir'),
                 (0x45, 32, 'Layer1TileUp table (start)'),
