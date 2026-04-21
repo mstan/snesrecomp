@@ -1181,6 +1181,8 @@ static void cmd_trace_blocks_reset(const char *args) {
 
 static void cmd_get_block_trace(const char *args) {
     int from_frame = -1, to_frame = -1;
+    uint32_t pc_lo = 0, pc_hi = 0xFFFFFF;
+    int pc_filter_set = 0;
     char func_filter[48] = {0};
     if (args) {
         const char *p = strstr(args, "from=");
@@ -1194,6 +1196,14 @@ static void cmd_get_block_trace(const char *args) {
                 func_filter[i++] = *p++;
             func_filter[i] = 0;
         }
+        // PC range: pc_lo=0xXXXXXX pc_hi=0xXXXXXX (24-bit bank:pc).
+        // Use this when the func attribution is unreliable (recomp stack
+        // depth-cap can corrupt g_last_recomp_func after deep call
+        // sequences).
+        p = strstr(args, "pc_lo=");
+        if (p) { sscanf(p + 6, "%x", &pc_lo); pc_filter_set = 1; }
+        p = strstr(args, "pc_hi=");
+        if (p) { sscanf(p + 6, "%x", &pc_hi); pc_filter_set = 1; }
     }
     static char buf[524288];
     int pos = snprintf(buf, sizeof(buf), "{\"entries\":%d,\"log\":[", s_block_trace.count);
@@ -1208,6 +1218,10 @@ static void cmd_get_block_trace(const char *args) {
         if (from_frame >= 0 && f < from_frame) continue;
         if (to_frame >= 0 && f > to_frame) continue;
         if (func_filter[0] && !strstr(s_block_trace.log[idx].func, func_filter)) continue;
+        if (pc_filter_set) {
+            uint32_t pc = s_block_trace.log[idx].pc;
+            if (pc < pc_lo || pc > pc_hi) continue;
+        }
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s{\"f\":%d,\"d\":%d,\"pc\":\"0x%06x\",\"func\":\"%s\"}",
             first ? "" : ",",

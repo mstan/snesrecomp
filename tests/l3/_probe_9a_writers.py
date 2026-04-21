@@ -1,9 +1,5 @@
-"""Capture recomp's block-level execution trace inside RunPlayerBlockCode_EB77
-during f95. Compare the sequence of label_xxxx visits against SMWDisX
-expected branch path. The divergence point identifies which conditional
-in EB77 takes the wrong branch in recomp.
-
-EB77 lives at $00:$EB77 → $00:$EE5C-ish. Filter by func name.
+"""Trace all writes to $98 / $9A (TouchBlockYPos / XPos) in recomp f95
+to understand the order of writes. Compare to expected WallRun output.
 """
 import sys, pathlib, time, subprocess, socket
 THIS_DIR = pathlib.Path(__file__).parent
@@ -43,19 +39,15 @@ def main():
     try:
         c.cmd('pause')
         step_to(c, 95)
-        c.cmd('trace_blocks_reset')
-        c.cmd('trace_blocks')
+        c.cmd('trace_wram_reset')
+        c.cmd('trace_wram 98 9b')
         step_to(c, 96)
-        # Filter to blocks whose func contains EB77 (the function we're
-        # debugging) — that gives us the exact path.
-        # Get blocks INSIDE EB77 + the WallRun helper it calls.
-        # Filter by PC range covering EB77's entire body ($00:$EB77 - $00:$EE5C).
-        # Func filter unreliable due to recomp-stack depth-cap corruption.
-        trace = c.cmd('get_block_trace from=95 to=95 pc_lo=0x00eb77 pc_hi=0x00ee5c')
+        trace = c.cmd('get_wram_trace')
         log = trace.get('log', [])
-        print(f'Captured {trace.get("emitted", 0)} blocks in EB77 at f95 (total ring: {trace.get("entries", 0)})\n')
+        print(f'Captured {trace.get("entries", 0)} writes to $98-$9B at f95-f96\n')
         for e in log:
-            print(f'  pc={e["pc"]} d={e["d"]} func={e["func"]}')
+            a = int(e['adr'], 16)
+            print(f'  f{e["f"]} ${a:04x} val=0x{int(e["val"], 16):04x} w={e["w"]} fn={e["func"]} parent={e.get("parent", "?")}')
     finally:
         c.close(); _kill()
 

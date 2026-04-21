@@ -61,13 +61,21 @@ def main():
     try:
         r.cmd('pause'); o.cmd('pause')
         addrs = [
-            (0x1471, 'StandOnSolidSprite'),
-            (0x007D, 'PlayerYSpeed+1'),
-            (0x0072, 'PlayerInAir'),
-            (0x0077, 'PlayerBlockedDir'),
-            (0x13EF, 'PlayerIsOnGround'),
+            (0x0019, 'Powerup'),
+            (0x0073, 'PlayerIsDucking'),
+            (0x187A, 'PlayerRidingYoshi'),
+            (0x0094, 'PlayerXPosNext_lo'),
+            (0x0095, 'PlayerXPosNext_hi'),
+            (0x0096, 'PlayerYPosNext_lo'),
+            (0x0097, 'PlayerYPosNext_hi'),
+            (0x0090, 'PlayerYPosInBlock_or_$90'),
+            (0x0091, '$91'),
+            (0x0092, '$92'),
+            (0x0093, '$93'),
+            (0x0098, '$98_collision_x'),
+            (0x009A, '$9A_collision_x_alt'),
         ]
-        for f in [94, 95, 96, 100]:
+        for f in [95, 96]:
             step_to(r, f); step_to(o, f)
             print(f'\n=== f{f} ===')
             for a, name in addrs:
