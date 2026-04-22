@@ -86,7 +86,17 @@ def main() -> int:
     data = json.loads(path.read_text())
     results = data['results']
 
-    redundant = [r for r in results if r.get('diff_line_count', -1) == 0]
+    # An override is safe to strip only if: (a) per-token strip produced
+    # diff == 0 AND (b) it wasn't flagged as a cascade offender by the
+    # validator's apply-all verification (see cfg_override_validator's
+    # _apply_all_redundant_and_verify + _bisect_cascade_offenders).
+    # Cascade offenders have diff_line_count rewritten to the apply-all
+    # diff count and cascade_offender == True; the guard below covers
+    # both invariants explicitly so older result files (pre-verification)
+    # still work.
+    redundant = [r for r in results
+                 if r.get('diff_line_count', -1) == 0
+                 and not r.get('cascade_offender', False)]
     if args.bank is not None:
         redundant = [r for r in redundant if r['bank'] == args.bank]
     by_bank: Dict[int, List[Dict]] = {}
