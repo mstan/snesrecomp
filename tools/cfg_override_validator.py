@@ -191,29 +191,77 @@ def build_cfg_without_override(bank: int, line_no: int, token: str) -> str:
     return nl.decode('utf-8').join(lines)
 
 
+def mirror_repo_layout(tmp_dir: pathlib.Path) -> pathlib.Path:
+    """Create a mirrored recomp/ + src/funcs.h layout under tmp_dir so regens
+    from inside tmp_dir resolve sibling cfgs and funcs.h the same way the
+    baseline regen does.
+
+    Returns the path to the mirrored recomp/ dir (containing all bank*.cfg
+    copies). Callers modify one cfg at a time in-place for each test.
+    """
+    mirror_recomp = tmp_dir / 'recomp'
+    mirror_src = tmp_dir / 'src'
+    mirror_recomp.mkdir(parents=True, exist_ok=True)
+    mirror_src.mkdir(parents=True, exist_ok=True)
+    # Copy every bank*.cfg from the real recomp dir.
+    for p in sorted(CFG_DIR.glob('bank*.cfg')):
+        shutil.copy2(p, mirror_recomp / p.name)
+    # Copy funcs.h so recomp.py's cfg_dir-relative search (`../src/funcs.h`)
+    # resolves inside the mirror. Prefer the project's canonical copy at
+    # PARENT/src/funcs.h; fall back to snesrecomp/../src/funcs.h if not
+    # present (sync_funcs_h.py keeps both consistent).
+    src_funcs_h = PARENT / 'src' / 'funcs.h'
+    if not src_funcs_h.exists():
+        src_funcs_h = REPO.parent / 'src' / 'funcs.h'
+    if src_funcs_h.exists():
+        shutil.copy2(src_funcs_h, mirror_src / 'funcs.h')
+    return mirror_recomp
+
+
+def mirror_cfg_path(mirror_recomp: pathlib.Path, bank: int) -> pathlib.Path:
+    return mirror_recomp / f'bank{bank:02x}.cfg'
+
+
 def validate_override(bank: int, override: Dict, baseline_gen: pathlib.Path,
-                       tmp_dir: pathlib.Path) -> Dict:
-    """Strip a single override, regen, diff, return result dict."""
-    tmp_cfg = tmp_dir / f'bank{bank:02x}_test.cfg'
+                       tmp_dir: pathlib.Path,
+                       mirror_recomp: pathlib.Path) -> Dict:
+    """Strip a single override in the mirrored cfg, regen, diff, restore.
+
+    The cfg modification happens IN-PLACE inside the mirrored recomp/ dir
+    so recomp.py's sibling-cfg and funcs.h resolution behaves identically
+    to the baseline regen. The original (baseline) cfg is restored after
+    the test so subsequent tests start from a clean mirror.
+    """
+    mirror_cfg = mirror_cfg_path(mirror_recomp, bank)
+    original_cfg_text = mirror_cfg.read_text(encoding='utf-8')
     tmp_gen = tmp_dir / f'smw_{bank:02x}_test.c'
     new_cfg_text = build_cfg_without_override(bank, override['line_no'], override['token'])
-    tmp_cfg.write_text(new_cfg_text, encoding='utf-8')
-    ok = regen_bank_to(bank, tmp_cfg, tmp_gen)
-    if not ok:
-        return dict(override, diff_line_count=-1, diff_byte_count=-1,
-                    regen_ok=False)
-    line_count, byte_count = diff_stats(tmp_gen, baseline_gen)
-    return dict(override, diff_line_count=line_count, diff_byte_count=byte_count,
-                regen_ok=True)
+    try:
+        mirror_cfg.write_text(new_cfg_text, encoding='utf-8')
+        ok = regen_bank_to(bank, mirror_cfg, tmp_gen)
+        if not ok:
+            return dict(override, diff_line_count=-1, diff_byte_count=-1,
+                        regen_ok=False)
+        line_count, byte_count = diff_stats(tmp_gen, baseline_gen)
+        return dict(override, diff_line_count=line_count, diff_byte_count=byte_count,
+                    regen_ok=True)
+    finally:
+        mirror_cfg.write_text(original_cfg_text, encoding='utf-8')
 
 
-def build_baselines(banks: List[int], baseline_dir: pathlib.Path) -> Dict[int, pathlib.Path]:
-    """Regen each bank from its CURRENT cfg, save to baseline_dir. Returns
-    bank -> path map."""
+def build_baselines(banks: List[int], baseline_dir: pathlib.Path,
+                     mirror_recomp: pathlib.Path) -> Dict[int, pathlib.Path]:
+    """Regen each bank FROM the mirrored cfg layout into baseline_dir.
+
+    Uses the mirror (not CFG_DIR) so baseline and per-override regens share
+    identical path-resolution context — same sibling cfgs, same funcs.h
+    search result. Otherwise every stripped regen shows a path-induced
+    diff unrelated to the override being tested.
+    """
     out = {}
     for bank in banks:
         baseline_path = baseline_dir / f'smw_{bank:02x}_baseline.c'
-        cfg_path = bank_cfg_path(bank)
+        cfg_path = mirror_cfg_path(mirror_recomp, bank)
         ok = regen_bank_to(bank, cfg_path, baseline_path)
         if not ok:
             print(f'  [!] baseline regen failed for bank {bank:02x}', file=sys.stderr)
@@ -230,15 +278,18 @@ def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> N
         baseline_dir = tmp_dir / 'baseline'
         baseline_dir.mkdir()
 
-        print('Building baseline gen-C per bank...', flush=True)
-        baselines = build_baselines(banks, baseline_dir)
+        mirror_recomp = mirror_repo_layout(tmp_dir)
+
+        print('Building baseline gen-C per bank (from mirrored cfg layout)...', flush=True)
+        baselines = build_baselines(banks, baseline_dir, mirror_recomp)
 
         all_results: List[Dict] = []
         for bank in banks:
             overrides = find_overrides(bank, override_type)
             print(f'  bank {bank:02x}: {len(overrides)} {override_type} overrides', flush=True)
             for idx, ov in enumerate(overrides):
-                result = validate_override(bank, ov, baselines[bank], tmp_dir)
+                result = validate_override(bank, ov, baselines[bank], tmp_dir,
+                                           mirror_recomp)
                 all_results.append(result)
                 if idx % 25 == 0 and idx > 0:
                     print(f'    ...bank {bank:02x} {idx}/{len(overrides)}', flush=True)

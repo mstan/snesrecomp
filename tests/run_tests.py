@@ -40,6 +40,7 @@ TEST_MODULES = [
     'test_block_hook_emits_regs',
     'test_insn_hook_emits',
     'test_wram_read_trace',
+    'test_mx_inference_from_callers',
 ]
 
 

@@ -6084,23 +6084,35 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                 new_funcs.append(tup); continue
             ms = {c[0] for c in callers}
             xs = {c[1] for c in callers}
-            if len(ms) != 1 or len(xs) != 1:
-                new_funcs.append(tup); continue  # mixed — can't decide
-            target_m, target_x = ms.pop(), xs.pop()
+            # Decide M and X bits INDEPENDENTLY. A caller set may be
+            # unanimous on M but mixed on X (e.g. $04:9885 is called
+            # from both X=0 and X=1 contexts but always M=0 — the M=0
+            # fact is still derivable). Requiring joint unanimity
+            # (the earlier rule) masked the common case where only
+            # one axis is decidable, and left cfg with a rep: hint
+            # that the framework already knew about.
             want_bits = 0
-            if target_m == 0: want_bits |= 0x20
-            if target_x == 0: want_bits |= 0x10
+            if ms == {0}: want_bits |= 0x20
+            if xs == {0}: want_bits |= 0x10
             if want_bits == 0:
-                new_funcs.append(tup); continue  # callers agree on M=1,X=1 = default
+                new_funcs.append(tup); continue  # neither axis decidable as non-default
             new_mo = dict(mo) if mo else {}
             old_entry = new_mo.get(saddr, 0)
-            # Only set if not already overridden (preserve explicit cfg / sub-entry state).
-            if old_entry == 0:
-                new_mo[saddr] = want_bits
-                changed = True
-                new_funcs.append((fname, saddr, sig, eovr, new_mo, hints))
-            else:
-                new_funcs.append(tup)
+            # SEP marker (0x40) is an explicit "caller wants default M=1,X=1"
+            # signal — treat as opaque and don't touch.
+            if old_entry & 0x40:
+                new_funcs.append(tup); continue
+            # Merge derived bits into any existing rep:/repx: override. The
+            # old logic skipped entirely when old_entry != 0, which blocked
+            # pair-derivation: e.g., cfg says `repx:X` (0x10) but callers
+            # agree on M=0,X=0 — the missing M=0 bit should be added, not
+            # skipped. The old-entry bits stay dominant where they exist.
+            merged = old_entry | want_bits
+            if merged == old_entry:
+                new_funcs.append(tup); continue  # nothing new to add
+            new_mo[saddr] = merged
+            changed = True
+            new_funcs.append((fname, saddr, sig, eovr, new_mo, hints))
         cfg.funcs = new_funcs
         if not changed:
             break
