@@ -36,3 +36,4 @@ framedump_oracle/
 framedump_recomp/
 validate*.log
 regen.log
+cfg_audit_results/
