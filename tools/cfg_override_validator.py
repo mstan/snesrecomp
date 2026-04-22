@@ -269,6 +269,138 @@ def build_baselines(banks: List[int], baseline_dir: pathlib.Path,
     return out
 
 
+def _apply_all_redundant_and_verify(banks: List[int], override_type: str,
+                                      redundants_by_bank: Dict[int, List[Dict]],
+                                      baselines: Dict[int, pathlib.Path],
+                                      tmp_dir: pathlib.Path,
+                                      mirror_recomp: pathlib.Path) -> Dict[int, int]:
+    """Apply EVERY per-token-redundant strip simultaneously, regen every bank
+    from the stripped cfgs, and diff against baseline.
+
+    Per-token 'redundant' means `strip this one override, regen ONE bank,
+    diff == baseline`. That test holds with every OTHER override still in
+    place — most cfg-driven invariants stay pinned. But applying ALL
+    redundant strips together can cascade: live-in/sig inference is a
+    fixpoint, and removing many hints at once lets the fixpoint converge
+    to a different (but still self-consistent) solution. Downstream
+    effects: a callee's inferred return type widens to a pointer, and the
+    caller's emitted C uses the pointer in a bitwise op context that no
+    longer compiles.
+
+    This pass regens every bank against the all-strip mirror and records
+    per-bank diff-line counts. A non-zero diff proves a cascade; the
+    caller's `run_audit` uses that to demote a subset of strips back to
+    load-bearing before writing the results file.
+
+    Returns {bank -> diff_line_count}. Zero everywhere means the apply-all
+    set is safe to strip en masse.
+    """
+    print('Apply-all verification: applying every redundant strip to mirror...',
+          flush=True)
+    originals = {}
+    for bank, ops in redundants_by_bank.items():
+        mirror_cfg = mirror_cfg_path(mirror_recomp, bank)
+        originals[bank] = mirror_cfg.read_text(encoding='utf-8')
+        # Sort ops by descending line_no so earlier strips don't shift later
+        # line indices (not strictly needed — build_cfg_without_override reads
+        # from REAL cfg each call — but keep stable).
+        text = originals[bank]
+        nl = '\r\n' if '\r\n' in text else '\n'
+        lines = text.split(nl)
+        for op in sorted(ops, key=lambda o: o['line_no'], reverse=True):
+            ln = op['line_no']
+            if ln >= len(lines):
+                continue
+            tok_esc = re.escape(op['token'])
+            lines[ln] = re.sub(r'\s*' + tok_esc + r'(?!\S)', '', lines[ln], count=1)
+        mirror_cfg.write_text(nl.join(lines), encoding='utf-8')
+
+    diffs: Dict[int, int] = {}
+    try:
+        for bank in banks:
+            tmp_gen = tmp_dir / f'smw_{bank:02x}_applyall.c'
+            ok = regen_bank_to(bank, mirror_cfg_path(mirror_recomp, bank), tmp_gen)
+            if not ok:
+                diffs[bank] = -1
+                print(f'  [!] apply-all regen failed for bank {bank:02x}',
+                      file=sys.stderr, flush=True)
+                continue
+            line_count, _ = diff_stats(tmp_gen, baselines[bank])
+            diffs[bank] = line_count
+            status = 'CLEAN' if line_count == 0 else f'CASCADE+{line_count}'
+            print(f'  bank {bank:02x}: apply-all diff = {line_count} lines ({status})',
+                  flush=True)
+    finally:
+        # Restore mirror so subsequent runs start clean.
+        for bank, original in originals.items():
+            mirror_cfg_path(mirror_recomp, bank).write_text(original, encoding='utf-8')
+    return diffs
+
+
+def _bisect_cascade_offenders(bank: int, candidates: List[Dict],
+                                baseline: pathlib.Path,
+                                tmp_dir: pathlib.Path,
+                                mirror_recomp: pathlib.Path) -> List[Dict]:
+    """Given a bank where apply-all regen diverged from baseline, find the
+    subset of `candidates` whose simultaneous removal causes the cascade.
+
+    Strategy: a binary partition. Apply the first half, regen, check diff.
+    If clean, the cascade culprit is in the second half; else it's in the
+    first (and possibly also in the second). Recurse on non-clean halves.
+    A single-element set is trivially the offender.
+
+    Worst case: O(n log n) regens for n candidates, vs O(n) for a naive
+    one-at-a-time strip. For n=348 sigs this is ~8 rounds of regen per
+    bank that cascaded — tolerable.
+
+    Returns the list of candidates that must be DEMOTED to load-bearing.
+    """
+    offenders: List[Dict] = []
+    mirror_cfg = mirror_cfg_path(mirror_recomp, bank)
+    original = mirror_cfg.read_text(encoding='utf-8')
+    nl = '\r\n' if '\r\n' in original else '\n'
+
+    def _apply_subset(subset):
+        text = original
+        lines = text.split(nl)
+        for op in sorted(subset, key=lambda o: o['line_no'], reverse=True):
+            ln = op['line_no']
+            if ln >= len(lines):
+                continue
+            tok_esc = re.escape(op['token'])
+            lines[ln] = re.sub(r'\s*' + tok_esc + r'(?!\S)', '', lines[ln], count=1)
+        mirror_cfg.write_text(nl.join(lines), encoding='utf-8')
+        tmp_gen = tmp_dir / f'smw_{bank:02x}_bisect.c'
+        ok = regen_bank_to(bank, mirror_cfg, tmp_gen)
+        if not ok:
+            return -1
+        lc, _ = diff_stats(tmp_gen, baseline)
+        return lc
+
+    try:
+        def _recurse(subset):
+            if not subset:
+                return
+            if len(subset) == 1:
+                diff = _apply_subset(subset)
+                if diff != 0:
+                    offenders.append(subset[0])
+                return
+            mid = len(subset) // 2
+            left, right = subset[:mid], subset[mid:]
+            # Check left: strip only left, keep right pinned.
+            diff_left = _apply_subset(left)
+            if diff_left != 0:
+                _recurse(left)
+            diff_right = _apply_subset(right)
+            if diff_right != 0:
+                _recurse(right)
+        _recurse(candidates)
+    finally:
+        mirror_cfg.write_text(original, encoding='utf-8')
+    return offenders
+
+
 def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> None:
     print(f'Auditing {override_type} overrides across banks: '
           f'{", ".join(f"{b:02x}" for b in banks)}', flush=True)
@@ -293,6 +425,42 @@ def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> N
                 all_results.append(result)
                 if idx % 25 == 0 and idx > 0:
                     print(f'    ...bank {bank:02x} {idx}/{len(overrides)}', flush=True)
+
+        # Apply-all verification: per-token "diff=0" only proves each strip
+        # is locally redundant (every OTHER override still pinning the
+        # fixpoint). Applying every redundant strip together can let
+        # live-in / sig inference converge to a different fixpoint whose
+        # outputs don't match baseline — a real compile regression, not
+        # noise. Bisect down to the specific cascade-offenders and demote
+        # them to load-bearing.
+        redundants_by_bank: Dict[int, List[Dict]] = {}
+        for r in all_results:
+            if r['diff_line_count'] == 0:
+                redundants_by_bank.setdefault(r['bank'], []).append(r)
+        if any(redundants_by_bank.values()):
+            applyall_diffs = _apply_all_redundant_and_verify(
+                banks, override_type, redundants_by_bank, baselines,
+                tmp_dir, mirror_recomp)
+            for bank, diff in applyall_diffs.items():
+                if diff == 0:
+                    continue
+                candidates = redundants_by_bank.get(bank, [])
+                if not candidates:
+                    continue
+                print(f'  bisecting bank {bank:02x} ({len(candidates)} candidates)...',
+                      flush=True)
+                offenders = _bisect_cascade_offenders(
+                    bank, candidates, baselines[bank], tmp_dir, mirror_recomp)
+                # Demote offenders: patch their all_results entry with the
+                # per-bank apply-all diff so they report load-bearing.
+                offender_keys = {(o['bank'], o['line_no'], o['token']) for o in offenders}
+                for r in all_results:
+                    key = (r['bank'], r['line_no'], r['token'])
+                    if key in offender_keys:
+                        r['diff_line_count'] = diff  # surface the cascade size
+                        r['cascade_offender'] = True
+                print(f'    demoted {len(offenders)} cascade-offenders in bank {bank:02x}',
+                      flush=True)
 
         # Summary counts.
         redundant = sum(1 for r in all_results if r['diff_line_count'] == 0)
