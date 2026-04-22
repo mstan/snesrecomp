@@ -304,12 +304,25 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
         }
 
     if return_ends:
-        # The shared-walk func_ends_raw is order-dependent: when sibling
-        # functions overlap (one walk decodes bytes that belong to
-        # another's body), whichever walked first wins. Recompute each
-        # discovered function's end with an INDEPENDENT path-BFS using a
-        # local decoded_pcs (not shared with siblings), following forward
-        # branches but stopping at known sibling function entries.
+        # Per-function end walker. Independent linear+branch walk per
+        # function, LOCAL decoded set (not shared with siblings). Rules:
+        #
+        #   - Linear walk does NOT stop at sibling function entries.
+        #     Rationale: shared-tail / overlapping-body functions are
+        #     legitimate SMW pattern. ParseLevelSpriteList_Entry2 ($a802)
+        #     has body extending to $ab78, but FindFreeNormalSpriteSlot_*
+        #     siblings ($a9de, $a9e4, $a9ef) live inside that byte range
+        #     as named entry-points. If linear walk stopped at sibling
+        #     entries, $a802's d_end would narrow to $a9de, losing the
+        #     full body. Linear walk will terminate naturally at RTS/
+        #     RTL/RTI/BRA/BRL/unconditional-JMP in F's own code.
+        #
+        #   - Unconditional transfers (BRA/BRL/JMP-abs) DO NOT follow
+        #     targets into sibling entries — those are tail calls.
+        #
+        #   - Conditional branches follow targets unconditionally. A
+        #     conditional branch to a sibling-start address is rare but
+        #     legitimate (conditional tail call / shared sub-entry).
         func_ends: Dict[int, int] = {}
         sibling_starts = set(discovered)
         for s in discovered:
@@ -324,7 +337,6 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                 while wpc < 0x10000 and lin_safety < 5000:
                     lin_safety += 1
                     if wpc in local_decoded and wpc != s: break
-                    if wpc != s and wpc in sibling_starts: break
                     woff = wpc - 0x8000
                     if woff < 0 or woff + 4 >= len(bank_data): break
                     wins = decode_insn(bank_data, woff, wpc, bank, wm, wx)
@@ -341,6 +353,7 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                     if wins.mnem in ('RTS', 'RTL', 'RTI'): break
                     if wins.mnem in ('BRA', 'BRL'):
                         tgt = wins.operand
+                        # Don't follow tail-call BRA into a sibling's entry.
                         if 0x8000 <= tgt <= 0xFFFF and tgt not in local_decoded \
                                 and tgt not in sibling_starts:
                             paths.append((tgt, wm, wx))
@@ -354,8 +367,9 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                     if wins.mnem == 'JMP' and wins.mode == LONG: break
                     if wins.mnem in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVC','BVS'):
                         tgt = wins.operand
-                        if 0x8000 <= tgt <= 0xFFFF and tgt not in local_decoded \
-                                and tgt not in sibling_starts:
+                        # Conditional branches: always follow (sibling_starts
+                        # OK — shared sub-entry / conditional tail call).
+                        if 0x8000 <= tgt <= 0xFFFF and tgt not in local_decoded:
                             paths.append((tgt, wm, wx))
             func_ends[s] = local_max + 1
         return discovered, jsl_targets, func_ends

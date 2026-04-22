@@ -184,28 +184,66 @@ def pass1_strip_redundant_end(rom: bytes, bank: int, apply: bool) -> Tuple[int, 
 
 def pass2_strip_pure_auto(rom: bytes, bank: int, apply: bool) -> Tuple[int, int]:
     """Strip whole `func` lines that the discoverer + auto-promote would
-    recreate identically (no `end:`, no sig override beyond void(), no
-    other hints). Comment lines are preserved.
+    recreate identically. A line is strippable only if ALL of:
+
+     - discoverer would find the addr (so auto-promote fires for it).
+     - line has no override hints (no end:, sig, init_y, etc.).
+     - NO standalone `name` entry exists at the same addr — those block
+       auto-promote from re-adding the func (recomp.py:5873).
+     - The name on the func line matches the `auto_BB_AAAA` shape that
+       auto-promote would generate. If the cfg author gave it a
+       semantic name (e.g. `HandleSPCUploads_UploadSPCEngine`), that
+       name carries human knowledge and re-adding as `auto_00_80E8`
+       would regress every caller's symbol reference.
 
     Returns (stripped, kept)."""
     cp = CFG_DIR / f'bank{bank:02x}.cfg'
     if not cp.exists(): return (0, 0)
     cfg = recomp.parse_config(str(cp))
-    seeds = {a for _, a, *_ in cfg.funcs}
-    discovered, _jsl = discover.discover_bank(rom, bank, external_seeds=seeds)
+    # Check whether auto-promote would RE-FIND each addr if the cfg
+    # entry were removed. Running discover.py with the FULL seed set
+    # includes the addr itself (trivially "discovered" just because we
+    # seeded it), so that test is tautological. Instead, seed discover
+    # with only the func entries NOT at this addr, then check.
+    all_seeds = {a for _, a, *_ in cfg.funcs}
+    discovered, _jsl = discover.discover_bank(
+        rom, bank, external_seeds=all_seeds)
+    # For strip-safety, run a second discovery with NO external seeds
+    # (vectors-only + brute-force JSL scan). Addresses in this set are
+    # what auto-promote would find on a fresh regen starting from an
+    # empty cfg + the discovered addresses. Only these are safely
+    # strippable.
+    organically_discovered, _jsl2 = discover.discover_bank(
+        rom, bank, external_seeds=set())
+    # Addresses that have a STANDALONE `name` line (NOT the auto-added
+    # name entry that `func` lines also populate — those are not
+    # separate cfg lines). Standalone `name` lines block auto-promote's
+    # re-addition via the cfg.names check (recomp.py:5873).
+    standalone_name_addrs: Set[int] = set()
+    _name_re = re.compile(r'^\s*name\s+([0-9a-fA-F]{4,6})\b')
+    raw_text = cp.read_text(encoding='utf-8', errors='replace')
+    for rline in raw_text.splitlines():
+        m = _name_re.match(rline)
+        if m:
+            standalone_name_addrs.add(int(m.group(1), 16) & 0xFFFF)
+    name_addrs = standalone_name_addrs
+    # Auto-promote regenerates entries as `auto_BB_AAAA`. Only lines
+    # whose fname matches that EXACT shape can be stripped without
+    # losing the cfg author's semantic name.
+    auto_name_re = re.compile(
+        rf'^auto_{bank:02X}_[0-9A-F]{{4}}$'
+    )
     lines, nl = _read_cfg_lines(cp)
-    stripped = 0
-    kept = 0
-    out = []
+    strippable: Set[int] = set()
+    kept_count = 0
     for line in lines:
         m = FUNC_RE.match(line)
-        if not m:
-            out.append(line); continue
+        if not m: continue
         try:
             addr = int(m.group('addr'), 16) & 0xFFFF
         except ValueError:
-            out.append(line); continue
-        # Tokenize the rest (sans inline comment) to inspect hints.
+            continue
+        fname = m.group('name')
         rest = m.group('rest')
         comment_idx = rest.find('#')
         body = rest[:comment_idx] if comment_idx >= 0 else rest
@@ -219,24 +257,28 @@ def pass2_strip_pure_auto(rom: bytes, bank: int, apply: bool) -> Tuple[int, int]
             if t in PRESERVED_HINT_TOKENS:
                 has_real_hint = True; break
         if has_real_hint:
-            kept += 1
-            out.append(line); continue
-        if addr not in discovered:
-            # Discoverer wouldn't recreate this — keep.
-            kept += 1
-            out.append(line); continue
-        # Strippable. Drop the entire line. Leave any preceding comment
-        # block in place — it documents whatever the human noted.
-        stripped += 1
-    if apply and stripped:
-        _write_cfg_lines(cp, [
-            l for l in lines
-            if not (FUNC_RE.match(l) and _line_is_strippable(l, discovered))
-        ], nl)
-    return (stripped, kept)
+            kept_count += 1; continue
+        if addr not in organically_discovered:
+            # This func would NOT be re-discovered by auto-promote on
+            # a fresh regen. Stripping it would lose the symbol.
+            kept_count += 1; continue
+        if addr in name_addrs:
+            kept_count += 1; continue
+        if not auto_name_re.match(fname):
+            # Human-named entry — carries semantic information. Strip
+            # would regress every caller's symbol.
+            kept_count += 1; continue
+        strippable.add(addr)
+    if apply and strippable:
+        out = [l for l in lines
+               if not (FUNC_RE.match(l) and _line_is_strippable(l, organically_discovered, name_addrs, auto_name_re))]
+        _write_cfg_lines(cp, out, nl)
+    return (len(strippable), kept_count)
 
 
-def _line_is_strippable(line: str, discovered: Set[int]) -> bool:
+def _line_is_strippable(line: str, discovered: Set[int],
+                         name_addrs: Set[int],
+                         auto_name_re) -> bool:
     m = FUNC_RE.match(line)
     if not m: return False
     try:
@@ -244,6 +286,8 @@ def _line_is_strippable(line: str, discovered: Set[int]) -> bool:
     except ValueError:
         return False
     if addr not in discovered: return False
+    if addr in name_addrs: return False
+    if not auto_name_re.match(m.group('name')): return False
     rest = m.group('rest')
     comment_idx = rest.find('#')
     body = rest[:comment_idx] if comment_idx >= 0 else rest
