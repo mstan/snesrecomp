@@ -60,70 +60,10 @@ def _rom_with(base: int, *seqs):
 
 
 def _run_mx_inference(rom: bytes, cfg):
-    """Drive the caller-M/X inference pass in isolation. The pass lives
-    inline in run_config; we re-create its body here so the test can
-    validate it without building every other upstream step."""
-    # Mirror the logic from run_config's pass.
-    def _compute_tentative_ends(funcs):
-        srt = sorted(funcs, key=lambda t: t[1])
-        ends = {}
-        for i, tup in enumerate(srt):
-            _, saddr, _, eovr, _, _ = tup
-            if eovr is not None:
-                ends[saddr] = eovr
-            elif i + 1 < len(srt):
-                ends[saddr] = srt[i + 1][1] - 1
-            else:
-                ends[saddr] = 0xFFFF
-        return ends
-
-    from typing import Dict, List, Tuple
-    func_entry_addrs = {a for _, a, *_ in cfg.funcs}
-    for _iter in range(5):
-        ends = _compute_tentative_ends(cfg.funcs)
-        callsite_mx: Dict[int, List[Tuple[int, int]]] = {}
-        for fname, saddr, _sig, _eovr, mo, _h in cfg.funcs:
-            if fname in cfg.skip:
-                continue
-            try:
-                insns = recomp.decode_func(
-                    rom, cfg.bank, saddr, end=ends[saddr],
-                    mode_overrides=mo or None,
-                    validate_branches=False)
-            except Exception:
-                continue
-            for insn in insns:
-                if insn.mnem == 'JSR' and insn.operand in func_entry_addrs:
-                    callsite_mx.setdefault(insn.operand, []).append(
-                        (insn.m_flag, insn.x_flag))
-
-        changed = False
-        new_funcs = []
-        for tup in cfg.funcs:
-            fname, saddr, sig, eovr, mo, hints = tup
-            callers = callsite_mx.get(saddr)
-            if not callers:
-                new_funcs.append(tup); continue
-            ms = {c[0] for c in callers}
-            xs = {c[1] for c in callers}
-            want_bits = 0
-            if ms == {0}: want_bits |= 0x20
-            if xs == {0}: want_bits |= 0x10
-            if want_bits == 0:
-                new_funcs.append(tup); continue
-            new_mo = dict(mo) if mo else {}
-            old_entry = new_mo.get(saddr, 0)
-            if old_entry & 0x40:
-                new_funcs.append(tup); continue
-            merged = old_entry | want_bits
-            if merged == old_entry:
-                new_funcs.append(tup); continue
-            new_mo[saddr] = merged
-            changed = True
-            new_funcs.append((fname, saddr, sig, eovr, new_mo, hints))
-        cfg.funcs = new_funcs
-        if not changed:
-            break
+    """Thin wrapper around the module-scope helper. Earlier versions of
+    this test re-implemented the loop; the refactor that extracted
+    _infer_entry_mx_from_callers removed that duplication."""
+    recomp._infer_entry_mx_from_callers(rom, cfg)
 
 
 def test_unanimous_m_and_x_from_callers_installs_both_bits():

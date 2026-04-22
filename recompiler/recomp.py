@@ -1083,6 +1083,94 @@ def _scan_parent_mx_at(rom: bytes, bank: int, parent_addr: int, parent_end,
     return result
 
 
+def _infer_entry_mx_from_callers(rom: bytes, cfg) -> int:
+    """Derive each function's entry M/X state from its intra-bank JSR callers.
+
+    The 65816 default decode assumes M=1,X=1 at function entry, but SMW
+    (and any 65816 game) calls many helpers in 16-bit mode via `REP #$30 ;
+    JSR helper`. Without propagation, the decoder mis-sizes the helper's
+    multi-byte immediate ops and the live-in pass + auto-promote cascade
+    off broken insn streams.
+
+    For each func F:
+      1. Walk all other funcs' bodies with their current mode_overrides.
+      2. At every `JSR target` insn, record (insn.m_flag, insn.x_flag).
+      3. Decide bits independently: if all callers say M=0, install the
+         M=0 bit; if all say X=0, install X=0. Each axis is decidable on
+         its own — common in the ROM ($04:9885 is always M=0 but split
+         on X).
+      4. Merge with any existing partial mode_override at F's entry
+         addr (cfg's `rep:/repx:` alone leaves the other axis empty;
+         derived bits fill it). SEP marker (0x40) is opaque and stays.
+
+    Iterates to a fixpoint (bounded at 5 rounds): a caller's M/X at a
+    JSR depends on its own entry state, which this pass refines. Returns
+    the total number of mode_override entries installed/merged across
+    all iterations.
+    """
+    def _compute_tentative_ends(funcs):
+        srt = sorted(funcs, key=lambda t: t[1])
+        ends: Dict[int, int] = {}
+        for i, tup in enumerate(srt):
+            _, saddr, _, eovr, _, _ = tup
+            if eovr is not None:
+                ends[saddr] = eovr
+            elif i + 1 < len(srt):
+                ends[saddr] = srt[i + 1][1] - 1
+            else:
+                ends[saddr] = 0xFFFF
+        return ends
+
+    total_augmented = 0
+    for _iter in range(5):
+        ends = _compute_tentative_ends(cfg.funcs)
+        func_entry_addrs = {a for _, a, *_ in cfg.funcs}
+        callsite_mx: Dict[int, List[Tuple[int, int]]] = {}
+        for fname, saddr, _sig, _eovr, mo, _h in cfg.funcs:
+            if fname in cfg.skip:
+                continue
+            try:
+                insns = decode_func(rom, cfg.bank, saddr, end=ends[saddr],
+                                    mode_overrides=mo or None,
+                                    validate_branches=False)
+            except (AssertionError, IndexError, Exception):
+                continue
+            for insn in insns:
+                if insn.mnem == 'JSR' and insn.operand in func_entry_addrs:
+                    callsite_mx.setdefault(insn.operand, []).append(
+                        (insn.m_flag, insn.x_flag))
+
+        changed = False
+        new_funcs = []
+        for tup in cfg.funcs:
+            fname, saddr, sig, eovr, mo, hints = tup
+            callers = callsite_mx.get(saddr)
+            if not callers:
+                new_funcs.append(tup); continue
+            ms = {c[0] for c in callers}
+            xs = {c[1] for c in callers}
+            want_bits = 0
+            if ms == {0}: want_bits |= 0x20
+            if xs == {0}: want_bits |= 0x10
+            if want_bits == 0:
+                new_funcs.append(tup); continue
+            new_mo = dict(mo) if mo else {}
+            old_entry = new_mo.get(saddr, 0)
+            if old_entry & 0x40:
+                new_funcs.append(tup); continue
+            merged = old_entry | want_bits
+            if merged == old_entry:
+                new_funcs.append(tup); continue
+            new_mo[saddr] = merged
+            changed = True
+            total_augmented += 1
+            new_funcs.append((fname, saddr, sig, eovr, new_mo, hints))
+        cfg.funcs = new_funcs
+        if not changed:
+            break
+    return total_augmented
+
+
 def promote_sub_entries(rom: bytes, cfg) -> List[Tuple[str, int, str, int]]:
     """Promote `name ADDR NAME sig:...` entries that fall inside an existing
     `func`'s range into first-class func entries. Each sub-entry becomes its
@@ -5976,6 +6064,19 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         print(f'  Auto-promote (cross-bank names): {_cross_registered} outgoing JSL targets named',
               file=sys.stderr)
 
+    # ── Entry M/X inference from caller context (early) ──────────────────
+    # Runs BEFORE sub_entry_promotion and auto_promote_branch_targets so
+    # those passes decode each function with the correct entry M/X state
+    # already installed. Without this ordering, a caller at M=0 passes
+    # state to a callee; the pre-MX-inference decode of the callee runs
+    # at default (M=1,X=1), mis-splits multi-byte immediates, and
+    # auto_promote_branch_targets picks up spurious branch targets from
+    # the garbled decode — those spurious auto_XX entries survive into
+    # emit and make stripped-cfg regens diverge from baseline even when
+    # the override would otherwise be redundant (the auto_ names have
+    # no other producer).
+    _infer_entry_mx_from_callers(rom, cfg)
+
     # ── Sub-entry promotion ──────────────────────────────────────────────
     # A `name` directive with a `sig:` that falls strictly inside an existing
     # `func`'s address range is a *sub-entry point*: an address that external
@@ -6033,89 +6134,12 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         if _auto_branch_promoted == 0:
             break
 
-    # --- Entry M/X inference from caller context --------------------------
-    # Default decode starts every function at M=1,X=1. That's wrong for
-    # functions whose callers always run them in 16-bit mode (e.g. helpers
-    # called after a REP #$30). Without this, ADC #$xxxx etc. get decoded
-    # as 2-byte when the ROM emits 3-byte, producing garbled code that
-    # hangs at runtime.
-    #
-    # Approach: decode each func once, collect M/X at every intra-bank JSR
-    # site. If all callers of F agree on (m, x), seed F's entry with an
-    # implicit REP. Iterate to fixpoint — a caller's M/X at JSR depends on
-    # its own entry state, which this pass refines.
-    def _compute_tentative_ends(funcs):
-        srt = sorted(funcs, key=lambda t: t[1])
-        ends: Dict[int, int] = {}
-        for i, tup in enumerate(srt):
-            _, saddr, _, eovr, _, _ = tup
-            if eovr is not None:
-                ends[saddr] = eovr
-            elif i + 1 < len(srt):
-                ends[saddr] = srt[i + 1][1] - 1
-            else:
-                ends[saddr] = 0xFFFF
-        return ends
-
-    func_entry_addrs = {a for _, a, *_ in cfg.funcs}
-    for _iter in range(5):  # fixpoint bound
-        ends = _compute_tentative_ends(cfg.funcs)
-        callsite_mx: Dict[int, List[Tuple[int, int]]] = {}
-        for fname, saddr, _sig, _eovr, mo, _h in cfg.funcs:
-            if fname in cfg.skip:
-                continue
-            try:
-                insns = decode_func(rom, cfg.bank, saddr, end=ends[saddr],
-                                    mode_overrides=mo or None,
-                                    validate_branches=False)
-            except (AssertionError, IndexError, Exception):
-                continue
-            for insn in insns:
-                if insn.mnem == 'JSR' and insn.operand in func_entry_addrs:
-                    callsite_mx.setdefault(insn.operand, []).append(
-                        (insn.m_flag, insn.x_flag))
-
-        changed = False
-        new_funcs = []
-        for tup in cfg.funcs:
-            fname, saddr, sig, eovr, mo, hints = tup
-            callers = callsite_mx.get(saddr)
-            if not callers:
-                new_funcs.append(tup); continue
-            ms = {c[0] for c in callers}
-            xs = {c[1] for c in callers}
-            # Decide M and X bits INDEPENDENTLY. A caller set may be
-            # unanimous on M but mixed on X (e.g. $04:9885 is called
-            # from both X=0 and X=1 contexts but always M=0 — the M=0
-            # fact is still derivable). Requiring joint unanimity
-            # (the earlier rule) masked the common case where only
-            # one axis is decidable, and left cfg with a rep: hint
-            # that the framework already knew about.
-            want_bits = 0
-            if ms == {0}: want_bits |= 0x20
-            if xs == {0}: want_bits |= 0x10
-            if want_bits == 0:
-                new_funcs.append(tup); continue  # neither axis decidable as non-default
-            new_mo = dict(mo) if mo else {}
-            old_entry = new_mo.get(saddr, 0)
-            # SEP marker (0x40) is an explicit "caller wants default M=1,X=1"
-            # signal — treat as opaque and don't touch.
-            if old_entry & 0x40:
-                new_funcs.append(tup); continue
-            # Merge derived bits into any existing rep:/repx: override. The
-            # old logic skipped entirely when old_entry != 0, which blocked
-            # pair-derivation: e.g., cfg says `repx:X` (0x10) but callers
-            # agree on M=0,X=0 — the missing M=0 bit should be added, not
-            # skipped. The old-entry bits stay dominant where they exist.
-            merged = old_entry | want_bits
-            if merged == old_entry:
-                new_funcs.append(tup); continue  # nothing new to add
-            new_mo[saddr] = merged
-            changed = True
-            new_funcs.append((fname, saddr, sig, eovr, new_mo, hints))
-        cfg.funcs = new_funcs
-        if not changed:
-            break
+    # --- Entry M/X inference from caller context (refinement) ------------
+    # Runs AGAIN after sub-entry + auto-promote. Sub-entries and auto-
+    # promoted branch targets gain their own callsite information once
+    # they're full cfg.funcs entries; the refinement pass picks up those
+    # new callers.
+    _infer_entry_mx_from_callers(rom, cfg)
 
     # Auto-detect ExecutePtr-style dispatch helpers by ROM pattern. Unions
     # with any cfg-provided hints so existing cfgs keep working.
