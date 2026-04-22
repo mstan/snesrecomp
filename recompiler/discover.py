@@ -55,7 +55,8 @@ def read_vectors(rom: bytes) -> Dict[str, int]:
 def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                   max_banks: int = 0x0E,
                   jsl_dispatch: Set[int] = None,
-                  jsl_dispatch_long: Set[int] = None) -> Set[int]:
+                  jsl_dispatch_long: Set[int] = None,
+                  return_ends: bool = False):
     """Discover function start addresses in a single bank.
 
     Args:
@@ -65,6 +66,11 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
         max_banks: Maximum valid bank number for JSL validation
         jsl_dispatch: Set of 24-bit addresses for inline 2-byte dispatch tables
         jsl_dispatch_long: Set of 24-bit addresses for inline 3-byte dispatch tables
+        return_ends: If True, return (discovered, jsl_targets, func_ends);
+                     otherwise (legacy) (discovered, jsl_targets).
+                     func_ends maps func_start → end_addr (exclusive),
+                     capped at the next discovered function start so
+                     siblings' bodies can never be subsumed.
 
     Returns:
         Set of discovered function start addresses (bank-local, $8000-$FFFF)
@@ -129,6 +135,7 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
 
     # Phase 3: Worklist-based traversal
     decoded_pcs: Set[int] = set()  # PCs we've already decoded (avoid re-decode)
+    func_ends_raw: Dict[int, int] = {}  # func_start -> max byte reached
 
     while worklist:
         func_start = worklist.pop()
@@ -277,6 +284,11 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
                     break
 
         decoded_ranges.append((func_start, func_max_pc))
+        # Aggregate: a func_start can be popped twice if it was added as a
+        # branch-fallthrough then later confirmed as a JSR target. Keep the
+        # widest end seen.
+        prev = func_ends_raw.get(func_start, func_start)
+        func_ends_raw[func_start] = max(prev, func_max_pc)
 
     # Post-filter: remove any seeds that ended up in a dispatch-table
     # range. A seed can be added BEFORE the table that contains it is
@@ -287,6 +299,66 @@ def discover_bank(rom: bytes, bank: int, external_seeds: Set[int] = None,
         discovered = {
             a for a in discovered if not _in_dispatch_table(a)
         }
+        func_ends_raw = {
+            a: e for a, e in func_ends_raw.items() if not _in_dispatch_table(a)
+        }
+
+    if return_ends:
+        # The shared-walk func_ends_raw is order-dependent: when sibling
+        # functions overlap (one walk decodes bytes that belong to
+        # another's body), whichever walked first wins. Recompute each
+        # discovered function's end with an INDEPENDENT path-BFS using a
+        # local decoded_pcs (not shared with siblings), following forward
+        # branches but stopping at known sibling function entries.
+        func_ends: Dict[int, int] = {}
+        sibling_starts = set(discovered)
+        for s in discovered:
+            local_decoded: Set[int] = set()
+            local_max = s
+            paths: List[Tuple[int, int, int]] = [(s, 1, 1)]
+            safety = 0
+            while paths and safety < 10000:
+                safety += 1
+                wpc, wm, wx = paths.pop()
+                lin_safety = 0
+                while wpc < 0x10000 and lin_safety < 5000:
+                    lin_safety += 1
+                    if wpc in local_decoded and wpc != s: break
+                    if wpc != s and wpc in sibling_starts: break
+                    woff = wpc - 0x8000
+                    if woff < 0 or woff + 4 >= len(bank_data): break
+                    wins = decode_insn(bank_data, woff, wpc, bank, wm, wx)
+                    if wins is None: break
+                    local_decoded.add(wpc)
+                    local_max = max(local_max, wpc + wins.length - 1)
+                    wpc += wins.length
+                    if wins.mnem == 'REP':
+                        if wins.operand & 0x20: wm = 0
+                        if wins.operand & 0x10: wx = 0
+                    elif wins.mnem == 'SEP':
+                        if wins.operand & 0x20: wm = 1
+                        if wins.operand & 0x10: wx = 1
+                    if wins.mnem in ('RTS', 'RTL', 'RTI'): break
+                    if wins.mnem in ('BRA', 'BRL'):
+                        tgt = wins.operand
+                        if 0x8000 <= tgt <= 0xFFFF and tgt not in local_decoded \
+                                and tgt not in sibling_starts:
+                            paths.append((tgt, wm, wx))
+                        break
+                    if wins.mnem == 'JMP' and wins.mode in (ABS,):
+                        tgt = wins.operand
+                        if 0x8000 <= tgt <= 0xFFFF and tgt not in local_decoded \
+                                and tgt not in sibling_starts:
+                            paths.append((tgt, wm, wx))
+                        break
+                    if wins.mnem == 'JMP' and wins.mode == LONG: break
+                    if wins.mnem in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVC','BVS'):
+                        tgt = wins.operand
+                        if 0x8000 <= tgt <= 0xFFFF and tgt not in local_decoded \
+                                and tgt not in sibling_starts:
+                            paths.append((tgt, wm, wx))
+            func_ends[s] = local_max + 1
+        return discovered, jsl_targets, func_ends
 
     return discovered, jsl_targets
 

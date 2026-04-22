@@ -5682,10 +5682,23 @@ def _auto_detect_dispatch_helpers(rom: bytes, cfg: Config) -> None:
     """
     cache: Dict[int, Optional[str]] = {}
     jsl_targets: Set[int] = set()
+    # Resolve next-func-start fallback like every other pass that decodes
+    # bodies. Using end=0 here previously let decode_func walk past natural
+    # function ends into sibling bodies, picking up JSL targets that
+    # technically belong to the sibling. Once Phase-2 auto-promote started
+    # setting tight eovr on auto entries, the walks stopped at the correct
+    # boundary and dispatch classification shifted under previously-
+    # over-decoded auto entries — cascading into different sub-entry
+    # promotion outcomes. Match the fallback the other passes use.
+    _srt = sorted(cfg.funcs, key=lambda t: t[1])
+    _next_addr_for: Dict[int, int] = {}
+    for _i, _t in enumerate(_srt):
+        _saddr = _t[1]
+        _next_addr_for[_saddr] = _srt[_i + 1][1] if _i + 1 < len(_srt) else 0x10000
     for fname, start_addr, _sig, eovr, mo, _h in cfg.funcs:
         if fname in cfg.skip:
             continue
-        end = eovr if eovr is not None else 0
+        end = eovr if eovr is not None else _next_addr_for.get(start_addr, 0x10000)
         try:
             insns = decode_func(rom, cfg.bank, start_addr, end=end,
                                 mode_overrides=mo or None,
@@ -5839,6 +5852,7 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # its incoming subset.
     _discovered_local: Set[int] = set()
     _discovered_cross: Dict[int, Set[int]] = {}
+    _discovered_ends: Dict[int, int] = {}  # func_start -> exclusive end (capped)
     _seed_set = set(_existing_addrs_pre) | _incoming_from_siblings
     # Iterate discovery to fixpoint: each round feeds the newly-found set
     # back in as seeds, so transitively-reachable JSR targets inside
@@ -5847,11 +5861,12 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # may not follow every branch, so iteration catches the tail.
     for _round in range(8):
         try:
-            _round_local, _round_cross = discover_bank(
+            _round_local, _round_cross, _round_ends = discover_bank(
                 rom, cfg.bank,
                 external_seeds=_seed_set,
                 jsl_dispatch=set(cfg.jsl_dispatch or []),
                 jsl_dispatch_long=set(cfg.jsl_dispatch_long or []),
+                return_ends=True,
             )
         except Exception as _disc_err:
             print(f'  [auto-promote] discover_bank failed: {_disc_err}',
@@ -5861,9 +5876,37 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         _discovered_local |= _round_local
         for _tb, _tas in _round_cross.items():
             _discovered_cross.setdefault(_tb, set()).update(_tas)
+        # Each round's ends include caps based on the round's own discovered
+        # set; the final iteration's _round_ends is the most accurate
+        # (largest discovered set → tightest caps). Overwrite each round.
+        _discovered_ends = _round_ends
         if len(_discovered_local) == _prev_size:
             break  # fixpoint
         _seed_set |= _discovered_local
+    # Filter the discovered set to the addresses we'll actually keep as
+    # auto-promoted funcs (post exclude_range / no_autodiscover) PLUS any
+    # already-cfg'd starts. This filtered set is what we cap end-addresses
+    # against — capping at the raw discovered set is wrong because some
+    # discovered "starts" land inside cfg-declared exclude_range (data
+    # bytes that happen to be valid JSR targets due to caller mis-decode,
+    # or labels inside a hand-managed body like the NMI handler at $816A).
+    def _is_real_func_start(addr: int) -> bool:
+        if addr < 0x8000 or addr > 0xFFFF: return False
+        if addr in cfg.no_autodiscover: return False
+        for _er_start, _er_end in cfg.exclude_ranges:
+            if _er_start <= addr <= _er_end:
+                return False
+        return True
+    _filtered_starts = {a for a in _discovered_local if _is_real_func_start(a)}
+    _filtered_starts |= {a for _, a, *_ in cfg.funcs if 0x8000 <= a <= 0xFFFF}
+    _filtered_sorted = sorted(_filtered_starts)
+    def _cap_end_for(addr: int, raw_end: int) -> int:
+        # Smallest filtered start strictly greater than addr.
+        for s in _filtered_sorted:
+            if s > addr:
+                return min(raw_end, s)
+        return min(raw_end, 0x10000)
+
     _auto_promoted = []
     for _local_addr in sorted(_discovered_local):
         if _local_addr < 0x8000 or _local_addr > 0xFFFF:
@@ -5882,7 +5925,12 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
         if in_exclude:
             continue
         _auto_name = f'auto_{cfg.bank:02X}_{_local_addr:04X}'
-        cfg.funcs.append((_auto_name, _local_addr, 'void()', None, {}, {}))
+        # Use the discoverer's raw end, capped at the next *real* function
+        # start (filtered above to drop addresses inside exclude_range).
+        # Eliminates the AUTO_NEEDS_END defect class.
+        _raw_end = _discovered_ends.get(_local_addr, _local_addr + 1)
+        _auto_end = _cap_end_for(_local_addr, _raw_end)
+        cfg.funcs.append((_auto_name, _local_addr, 'void()', _auto_end, {}, {}))
         _full = (cfg.bank << 16) | _local_addr
         cfg.names[_full] = _auto_name
         cfg.sigs[_full] = 'void()'
