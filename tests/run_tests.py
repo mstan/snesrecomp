@@ -36,6 +36,10 @@ TEST_MODULES = [
     'test_sta_indir_wide',
     'test_fallthrough_gap',
     'test_promote_rety_loop_thread',
+    'test_reverse_debug_hook_coverage',
+    'test_block_hook_emits_regs',
+    'test_insn_hook_emits',
+    'test_wram_read_trace',
 ]
 
 

@@ -2119,6 +2119,29 @@ def load_symbols(path: str):
     _reg_symbols = {int(k, 16): v for k, v in data.get('reg', {}).items()}
 
 
+# Tier-4 instruction-hook mnemonic table. Index 0 is reserved for "?"
+# (unknown mnemonic). MUST stay in sync with the runtime's
+# s_insn_mnemonics[] in debug_server.c — the test
+# test_insn_hook_emits.test_mnemonic_table_in_sync checks both files
+# byte-for-byte. When adding a new opcode, append to the END of this
+# list and the runtime list; do NOT reorder existing entries (every
+# previously-recorded log entry references its index).
+INSN_MNEMONICS = (
+    "?",
+    "ADC", "AND", "ASL", "BCC", "BCS", "BEQ", "BIT", "BMI", "BNE",
+    "BPL", "BRA", "BRK", "BRL", "BVC", "BVS", "CLC", "CLD", "CLI", "CLV",
+    "CMP", "COP", "CPX", "CPY", "DEC", "DEX", "DEY", "EOR", "INC", "INX",
+    "INY", "JMP", "JML", "JSL", "JSR", "LDA", "LDX", "LDY", "LSR", "MVN",
+    "MVP", "NOP", "ORA", "PEA", "PEI", "PER", "PHA", "PHB", "PHD", "PHK",
+    "PHP", "PHX", "PHY", "PLA", "PLB", "PLD", "PLP", "PLX", "PLY", "REP",
+    "ROL", "ROR", "RTI", "RTL", "RTS", "SBC", "SEC", "SED", "SEI", "SEP",
+    "STA", "STP", "STX", "STY", "STZ", "TAX", "TAY", "TCD", "TCS", "TDC",
+    "TRB", "TSB", "TSC", "TSX", "TXA", "TXS", "TXY", "TYA", "TYX", "WAI",
+    "WDM", "XBA", "XCE",
+)
+INSN_MNEM_TO_ID = {m: i for i, m in enumerate(INSN_MNEMONICS)}
+
+
 class EmitCtx:
     """Tracks abstract register state and emits C statements.
 
@@ -2175,6 +2198,11 @@ class EmitCtx:
         self.B: Optional[str] = init_b  # 65816 B accumulator (high byte, swapped via XBA)
         self.X: Optional[str] = init_x
         self._init_x: Optional[str] = init_x  # saved for PLX heuristic
+        # Saved init values for function-entry RDB_BLOCK_HOOK emission
+        # (the hook is emitted at end-of-codegen, AFTER self.A/X/Y have
+        # been mutated by per-instruction emit() calls).
+        self._init_a: Optional[str] = init_a
+        self._init_b: Optional[str] = init_b
         self._last_pha_val: Optional[str] = None  # saved for branch-forked PLA
         self._stk_vars: Set[str] = set()  # stack-relative variable names
         self.has_k = (init_x is not None)
@@ -2415,15 +2443,31 @@ class EmitCtx:
         return f' /* {name} */' if name else ''
 
     def _wram(self, addr: int, idx: str) -> str:
+        """Returns a C expression for an 8-bit WRAM read at addr+idx.
+        In --reverse-debug mode this routes through the RDB_LOAD8
+        macro so the runtime can record the read; in non-debug mode
+        it expands to a plain g_ram[X] access (byte-identical to
+        legacy codegen)."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
-        if idx in ('0', '0x0'): return f'g_ram[0x{addr:x}]{sym}'
-        return f'g_ram[0x{addr:x} + {idx}]'
+        if idx in ('0', '0x0'):
+            base = f'0x{addr:x}'
+        else:
+            base = f'0x{addr:x} + {idx}'
+        if self._reverse_debug:
+            return f'RDB_LOAD8({base}){sym}'
+        return f'g_ram[{base}]{sym}'
 
     def _wram16(self, addr: int, idx: str) -> str:
-        """16-bit WRAM read: GET_WORD(g_ram + addr + idx)"""
+        """Returns a C expression for a 16-bit WRAM read at addr+idx.
+        Routes through RDB_LOAD16 in --reverse-debug mode."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
-        if idx in ('0', '0x0'): return f'GET_WORD(g_ram + 0x{addr:x}){sym}'
-        return f'GET_WORD(g_ram + 0x{addr:x} + {idx})'
+        if idx in ('0', '0x0'):
+            base = f'0x{addr:x}'
+        else:
+            base = f'0x{addr:x} + {idx}'
+        if self._reverse_debug:
+            return f'RDB_LOAD16({base}){sym}'
+        return f'GET_WORD(g_ram + {base}){sym}'
 
     def _emit_wram_store8(self, addr: int, idx: str, val: str):
         """Emit a byte WRAM store. When reverse-debug generation is on,
@@ -2454,6 +2498,45 @@ class EmitCtx:
     def _wram16_write(self, addr: int, idx: str, val: str):
         """16-bit WRAM write (legacy name; routes through _emit_wram_store16)."""
         self._emit_wram_store16(addr, idx, val)
+
+    def _emit_rmw8(self, mode, addr, expr_template) -> Optional[str]:
+        """Emit a 8-bit read-modify-write to WRAM, routing through the
+        Tier-1 hook wrapper when --reverse-debug is on. INC/DEC/ASL/
+        LSR/ROL/ROR/TRB/TSB previously emitted in-place `mem++`-style
+        statements that bypassed RDB_STORE8, hiding their writes from
+        the WRAM trace. This helper makes them honest.
+
+        expr_template uses `{cur}` for the pre-modification value.
+        Returns the C expression that holds the post-modification
+        value (suitable for flag_src), or None if the mode is
+        unsupported (caller should fall back to a /* comment */).
+        """
+        idx_map = {DP: '0', DP_X: self._idx('X'), ABS: '0', ABS_X: self._idx('X')}
+        idx = idx_map.get(mode)
+        if idx is None:
+            return None
+        cur_expr = self._wram(addr, idx)
+        new_expr = expr_template.format(cur=cur_expr)
+        if self._reverse_debug:
+            tmp = self._alloc_tmp('uint8')
+            self._emit(f'{tmp} = (uint8)({new_expr});')
+            self._emit_wram_store8(addr, idx, tmp)
+            return tmp
+        # Legacy path: in-place modification, identical to the prior
+        # codegen so non-reverse-debug binaries are byte-for-byte
+        # unchanged.
+        self._emit(f'{cur_expr} = (uint8)({new_expr});')
+        return cur_expr
+
+    def _reg_for_hook(self, reg_value: Optional[str]) -> str:
+        """Return a C expression suitable for the RDB_BLOCK_HOOK macro's
+        a/x/y argument. Maps the recomp's abstract-register tracker
+        value to either a (uint32_t)-cast expression or the
+        RDB_REG_UNKNOWN sentinel (0xFFFFFFFF)."""
+        if reg_value is None:
+            return 'RDB_REG_UNKNOWN'
+        # Accept any C expression string; the runtime cast handles widening.
+        return f'(uint32_t)({reg_value})'
 
     def _rom(self, full_addr: int, idx: str) -> str:
         bk = (full_addr >> 16) & 0xFF
@@ -3016,7 +3099,11 @@ class EmitCtx:
             self.lines.append(f'  label_{pc:04x}:;')
             if self._reverse_debug:
                 full_pc = (self.bank << 16) | pc
-                self.lines.append(f'  RDB_BLOCK_HOOK(0x{full_pc:06x});')
+                a_expr = self._reg_for_hook(self.A)
+                x_expr = self._reg_for_hook(self.X)
+                y_expr = self._reg_for_hook(self.Y)
+                self.lines.append(
+                    f'  RDB_BLOCK_HOOK(0x{full_pc:06x}, {a_expr}, {x_expr}, {y_expr});')
             # Branch target: clear dp_state so that dp reads re-read from g_ram.
             # Multiple paths can reach a label with different DP values cached,
             # so we must not use stale cached values after a merge point.
@@ -3044,6 +3131,25 @@ class EmitCtx:
             if pc in self._backward_branch_targets:
                 self._emit('WatchdogCheck();')
 
+        # Tier-4 per-instruction hook. Fires BEFORE the per-mnemonic
+        # dispatch below. Captures the FULL recomp tracker state at
+        # the moment this 65816 instruction is about to execute:
+        # pc, mnem, A, X, Y, B (XBA-high accumulator), and the
+        # m/x flag widths from the cfg-derived insn metadata.
+        # Combine with the snes9x emu insn trace (full hardware
+        # registers per insn) for ground-truth comparison.
+        if self._reverse_debug:
+            full_pc = (self.bank << 16) | pc
+            mnem_id = INSN_MNEM_TO_ID.get(mn, 0)  # 0 = "?"
+            a_expr = self._reg_for_hook(self.A)
+            x_expr = self._reg_for_hook(self.X)
+            y_expr = self._reg_for_hook(self.Y)
+            b_expr = self._reg_for_hook(self.B)
+            mx = (1 if not wide_a else 0) | ((1 if not wide_x else 0) << 1)
+            self._emit(
+                f'RDB_INSN_HOOK(0x{full_pc:06x}, {mnem_id}, '
+                f'{a_expr}, {x_expr}, {y_expr}, {b_expr}, {mx});')
+
         # -- STZ ----------------------------------------------------------
         if mn == 'STZ':
             if mode == ABS and self._is_hw_reg(v):
@@ -3061,7 +3167,11 @@ class EmitCtx:
                 if wide_a:
                     self._wram16_write(v, idx, '0')
                 else:
-                    self._emit(f'{self._wram(v, idx)} = 0;')
+                    # Route through _emit_wram_store8 so --reverse-debug
+                    # emits RDB_STORE8. Consecutive-STZ chains were
+                    # previously bypassing the Tier-1 write hook, hiding
+                    # PlayerInAir/PlayerOnGround clears from the trace.
+                    self._emit_wram_store8(v, idx, '0')
             self.carry_chain = None
 
         # -- LDA ----------------------------------------------------------
@@ -3150,10 +3260,10 @@ class EmitCtx:
                 self._wram16_write(v, '0', x)
             elif mode in (DP, ABS):
                 self._materialize_refs_to(self._wram(v, '0'))
-                self._emit(f'{self._wram(v, "0")} = {x};')
+                self._emit_wram_store8(v, '0', x)
             elif mode == DP_Y:
                 self._materialize_refs_to(self._wram(v, self._idx("Y")))
-                self._emit(f'{self._wram(v, self._idx("Y"))} = {x};')
+                self._emit_wram_store8(v, self._idx("Y"), x)
             else:
                 self._emit(f'/* STX {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -3171,9 +3281,9 @@ class EmitCtx:
                 self._wram16_write(v, '0', y)
             elif mode in (DP, ABS):
                 self._materialize_refs_to(self._wram(v, '0'))
-                self._emit(f'{self._wram(v, "0")} = {y};')
+                self._emit_wram_store8(v, '0', y)
             elif mode == DP_X:
-                self._emit(f'{self._wram(v, self._idx("X"))} = {y};')
+                self._emit_wram_store8(v, self._idx("X"), y)
             else:
                 self._emit(f'/* STY {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -3521,8 +3631,8 @@ class EmitCtx:
             else:
                 mem = self._resolve_mem_rw(mode, v)
                 if mem:
-                    self._emit(f'{mem}++;')
-                    self.flag_src = mem
+                    new = self._emit_rmw8(mode, v, '{cur} + 1')
+                    self.flag_src = new if new else mem
                     if mode == DP:
                         self.dp_state.pop(v, None)  # invalidate stale dp_state after INC
                 else:
@@ -3542,8 +3652,8 @@ class EmitCtx:
             else:
                 mem = self._resolve_mem_rw(mode, v)
                 if mem:
-                    self._emit(f'{mem}--;')
-                    self.flag_src = mem
+                    new = self._emit_rmw8(mode, v, '{cur} - 1')
+                    self.flag_src = new if new else mem
                     if mode == DP:
                         self.dp_state.pop(v, None)  # invalidate stale dp_state after DEC
                 else:
@@ -3565,10 +3675,10 @@ class EmitCtx:
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = ({mem} >> 7) & 1;')
                     self.carry = cv
-                    self._emit(f'{mem} <<= 1;')
+                    new = self._emit_rmw8(mode, v, '{cur} << 1')
                     if mode == DP:
                         self.dp_state.pop(v, None)
-                    self.flag_src = None
+                    self.flag_src = new
                 else:
                     self._emit(f'/* ASL {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -3588,10 +3698,10 @@ class EmitCtx:
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = {mem} & 1;')
                     self.carry = cv
-                    self._emit(f'{mem} >>= 1;')
+                    new = self._emit_rmw8(mode, v, '{cur} >> 1')
                     if mode == DP:
                         self.dp_state.pop(v, None)
-                    self.flag_src = None
+                    self.flag_src = new
                 else:
                     self._emit(f'/* LSR {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -3610,10 +3720,10 @@ class EmitCtx:
                 if mem:
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = ({mem} >> 7) & 1;')
-                    self._emit(f'{mem} = (uint8)(({mem} << 1) | {carry_in});')
+                    new = self._emit_rmw8(mode, v, '({{cur}} << 1) | {ci}'.format(ci=carry_in))
                     if mode == DP:
                         self.dp_state.pop(v, None)
-                    self.carry = cv; self.flag_src = None
+                    self.carry = cv; self.flag_src = new
                 else:
                     self._emit(f'/* ROL {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -3632,10 +3742,10 @@ class EmitCtx:
                 if mem:
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = {mem} & 1;')
-                    self._emit(f'{mem} = (uint8)(({mem} >> 1) | ({carry_in} << 7));')
+                    new = self._emit_rmw8(mode, v, '({{cur}} >> 1) | ({ci} << 7)'.format(ci=carry_in))
                     if mode == DP:
                         self.dp_state.pop(v, None)
-                    self.carry = cv; self.flag_src = None
+                    self.carry = cv; self.flag_src = new
                 else:
                     self._emit(f'/* ROR {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -3656,20 +3766,20 @@ class EmitCtx:
             a = self._wrap(self.A) if self.A else '0'
             mem = self._resolve_mem_rw(mode, v)
             if mem:
-                self._emit(f'{mem} |= {a};')
+                new = self._emit_rmw8(mode, v, '{{cur}} | {a}'.format(a=a))
                 if mode == DP:
                     self.dp_state.pop(v, None)
-                self.flag_src = None
+                self.flag_src = new
             else:
                 self._emit(f'/* TSB {MODE_STR.get(mode,"?")} ${v:x} */')
         elif mn == 'TRB':
             a = self._wrap(self.A) if self.A else '0'
             mem = self._resolve_mem_rw(mode, v)
             if mem:
-                self._emit(f'{mem} &= ~{a};')
+                new = self._emit_rmw8(mode, v, '{{cur}} & ~({a})'.format(a=a))
                 if mode == DP:
                     self.dp_state.pop(v, None)
-                self.flag_src = None
+                self.flag_src = new
             else:
                 self._emit(f'/* TRB {MODE_STR.get(mode,"?")} ${v:x} */')
 
@@ -4882,6 +4992,15 @@ def emit_function(name: str, insns: List[Insn], bank: int,
         else:
             ctx.Y = iy
 
+    # Snapshot the post-setup register state for the function-entry
+    # RDB_BLOCK_HOOK call, which is emitted after ctx.lines (i.e. AFTER
+    # per-instruction emit() has mutated ctx.A/X/Y). Without this
+    # snapshot the function-entry hook would record end-of-codegen
+    # state instead of entry state.
+    ctx._init_y = ctx.Y
+    # _init_a / _init_b were captured by EmitCtx.__init__ from init_a/init_b.
+    # _init_x is also captured there. So all four are available downstream.
+
     # Emit instructions. The decoder may include instructions past end_addr
     # for branch target resolution. For past-end instructions:
     # - If it's a branch target from within the function: emit normally
@@ -5154,7 +5273,18 @@ def emit_function(name: str, insns: List[Insn], bank: int,
     lines.append(f'  RecompStackPush("{name}");')
     if reverse_debug:
         full_pc = (bank << 16) | start
-        lines.append(f'  RDB_BLOCK_HOOK(0x{full_pc:06x});')
+        # Function-entry registers come from ctx's snapshot of the
+        # post-setup register state (taken before per-instruction emit
+        # mutated ctx.A/X/Y). Includes:
+        #   _init_a: A param if function-sig binds A; else None
+        #   _init_x: X param (typically 'k')
+        #   _init_y: Y param (typically 'j') if has_j_param, else
+        #            inherited from init_y hint, else None
+        a_expr = ctx._reg_for_hook(ctx._init_a)
+        x_expr = ctx._reg_for_hook(ctx._init_x)
+        y_expr = ctx._reg_for_hook(getattr(ctx, '_init_y', None))
+        lines.append(
+            f'  RDB_BLOCK_HOOK(0x{full_pc:06x}, {a_expr}, {x_expr}, {y_expr});')
     if trace:
         lines.append(f'  extern void WatchdogCheck(void);')
         lines.append(f'  WatchdogCheck();')

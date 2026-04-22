@@ -32,6 +32,7 @@ typedef int socket_t;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include "debug_server.h"
 
 // External references
@@ -340,10 +341,187 @@ static struct {
         uint32_t adr;
         uint16_t val;   // 16-bit to hold word writes; byte writes use low 8
         uint8_t width;  // 1 = byte, 2 = word
+        uint64_t block_idx;  // Tier 3: monotonic block counter at time of write
         char func[48];
         char parent[48];  // caller of `func` (one level up the recomp stack)
     } log[WRAM_TRACE_LOG_SIZE];
 } s_wram_trace = {0};
+
+// ---- Tier-4 reads: WRAM read trace ----
+//
+// Symmetric counterpart of Tier 1's write trace. Every g_ram[X]
+// read in --reverse-debug generated code routes through
+// debug_wram_read_byte/word; this function records to a ring when
+// the trace is active and any armed range covers the address.
+//
+// Gated on SNESRECOMP_TIER4 (auto-set by ENABLE_ORACLE_BACKEND).
+// Production Release|x64 omits the ring + helpers entirely; the
+// RDB_LOAD8/16 macros expand to direct array access there.
+#if SNESRECOMP_TIER4
+#define READ_TRACE_LOG_SIZE 1048576   /* 1M entries; ~80 MB */
+#define READ_TRACE_MAX_RANGES 8
+
+static volatile int s_read_trace_active = 0;
+static int s_read_trace_nranges = 0;
+static struct { uint32_t lo, hi; } s_read_trace_ranges[READ_TRACE_MAX_RANGES];
+static int s_read_trace_write_idx = 0;
+static int s_read_trace_count = 0;
+static struct {
+    int      frame;
+    uint64_t block_idx;
+    uint32_t adr;
+    uint16_t val;
+    uint8_t  width;
+    char     func[48];
+    char     parent[48];
+} s_read_trace[READ_TRACE_LOG_SIZE];
+
+extern volatile uint64_t g_block_counter;
+
+static inline int read_trace_in_range(uint32_t adr, uint8_t width) {
+    uint32_t hi_byte = adr + width - 1;
+    for (int i = 0; i < s_read_trace_nranges; i++)
+        if (adr <= s_read_trace_ranges[i].hi && hi_byte >= s_read_trace_ranges[i].lo)
+            return 1;
+    return 0;
+}
+
+static void read_trace_record(uint32_t adr, uint16_t val, uint8_t width) {
+    if (!s_read_trace_active) return;
+    if (!read_trace_in_range(adr, width)) return;
+    int idx = s_read_trace_write_idx % READ_TRACE_LOG_SIZE;
+    s_read_trace[idx].frame = snes_frame_counter;
+    s_read_trace[idx].block_idx = g_block_counter;
+    s_read_trace[idx].adr = adr;
+    s_read_trace[idx].val = val;
+    s_read_trace[idx].width = width;
+    if (g_last_recomp_func) {
+        strncpy(s_read_trace[idx].func, g_last_recomp_func, 47);
+        s_read_trace[idx].func[47] = 0;
+    } else {
+        s_read_trace[idx].func[0] = 0;
+    }
+    s_read_trace[idx].parent[0] = 0;
+    if (g_recomp_stack_top >= 2) {
+        const char *p = g_recomp_stack[g_recomp_stack_top - 2];
+        if (p) {
+            strncpy(s_read_trace[idx].parent, p, 47);
+            s_read_trace[idx].parent[47] = 0;
+        }
+    }
+    s_read_trace_write_idx++;
+    if (s_read_trace_count < READ_TRACE_LOG_SIZE) s_read_trace_count++;
+}
+
+uint8_t debug_wram_read_byte(uint32_t addr) {
+    uint8_t v = g_ram[addr];
+    read_trace_record(addr, v, 1);
+    return v;
+}
+
+uint16_t debug_wram_read_word(uint32_t addr) {
+    uint16_t v = *(uint16_t *)(g_ram + addr);
+    read_trace_record(addr, v, 2);
+    return v;
+}
+#endif /* SNESRECOMP_TIER4 */
+
+// ---- Tier-4 per-instruction trace ----
+//
+// Captures every 65816 instruction the recomp executes. Disabled by
+// default. When trace_insn arms it, every instruction-emit-time call
+// to debug_on_insn_enter records (frame, block_idx, pc, mnem_id) into
+// a 2M-entry ring (~24 MB). Memory budget chosen so the ring covers
+// roughly tens of seconds of attract-demo at typical instruction
+// rates.
+//
+// The mnemonic table is shared with all entries; the entry stores a
+// small int index. Probes can fetch the table via get_insn_mnemonics.
+//
+// Entire subsystem gated on SNESRECOMP_TIER4 (debug_server.h sets
+// this when ENABLE_ORACLE_BACKEND is defined). Production Release|x64
+// leaves it undefined; the ring and TCP commands are entirely absent
+// from the binary.
+#if SNESRECOMP_TIER4
+#define INSN_TRACE_LOG_SIZE 2097152
+static volatile int s_insn_trace_active = 0;
+static int s_insn_trace_write_idx = 0;
+static int s_insn_trace_count = 0;
+static struct {
+    int      frame;
+    uint64_t block_idx;
+    uint32_t pc;
+    uint32_t mnem_id;
+    uint32_t a, x, y, b;     // RDB_REG_UNKNOWN (0xFFFFFFFF) when not pinned
+    uint8_t  m_flag;         // 1 if 8-bit accumulator
+    uint8_t  x_flag;         // 1 if 8-bit index
+} s_insn_trace[INSN_TRACE_LOG_SIZE];
+
+// Forward declaration: g_block_counter is defined below in the Tier 3
+// section but referenced here. Both live in this same TU so the
+// extern is just for forward-visibility within the file.
+extern volatile uint64_t g_block_counter;
+
+void debug_on_insn_enter(uint32_t pc, uint32_t mnem_id,
+                         uint32_t a, uint32_t x, uint32_t y, uint32_t b,
+                         uint32_t mx_flags) {
+    if (!s_insn_trace_active) return;
+    int idx = s_insn_trace_write_idx % INSN_TRACE_LOG_SIZE;
+    s_insn_trace[idx].frame = snes_frame_counter;
+    s_insn_trace[idx].block_idx = g_block_counter;
+    s_insn_trace[idx].pc = pc;
+    s_insn_trace[idx].mnem_id = mnem_id;
+    s_insn_trace[idx].a = a;
+    s_insn_trace[idx].x = x;
+    s_insn_trace[idx].y = y;
+    s_insn_trace[idx].b = b;
+    s_insn_trace[idx].m_flag = (uint8_t)((mx_flags >> 0) & 1);
+    s_insn_trace[idx].x_flag = (uint8_t)((mx_flags >> 1) & 1);
+    s_insn_trace_write_idx++;
+    if (s_insn_trace_count < INSN_TRACE_LOG_SIZE) s_insn_trace_count++;
+}
+#endif /* SNESRECOMP_TIER4 */
+
+// ---- Tier 3 monotonic block counter ----
+// Incremented inside debug_on_block_enter on every basic-block boundary.
+// Both the WRAM trace ring (Tier 1) and the block trace ring (Tier 2)
+// stamp every entry with the current value so probes can correlate
+// "this WRAM write happened during this block." Read-only from outside
+// for query purposes.
+volatile uint64_t g_block_counter = 0;
+
+// ---- Tier 3 WRAM anchors ----
+// Periodic full-WRAM snapshots that let wram_at_block reconstruct
+// historical state without replaying millions of writes from boot.
+// Disabled by default (zero overhead). When armed via
+// tier3_anchor_on, every Nth block_counter value triggers a 128KB
+// memcpy snapshot. Ring size cap: ANCHOR_RING_SIZE.
+//
+// Memory: 64 anchors x 128KB = 8 MB. Covers 64 * anchor_interval
+// blocks of replay range; older anchors are evicted FIFO.
+#define ANCHOR_RING_SIZE 64
+static volatile int     s_anchor_active = 0;
+static uint32_t         s_anchor_interval = 4096;  // blocks per anchor
+static int              s_anchor_write_idx = 0;
+static int              s_anchor_count = 0;
+static struct {
+    uint64_t block_idx;
+    int      frame;
+    uint8_t  wram[0x20000];
+} s_wram_anchors[ANCHOR_RING_SIZE];
+
+extern uint8_t g_ram[];
+
+// Capture a full WRAM snapshot tagged with the current block_counter.
+// Called from debug_on_block_enter when armed and at interval boundaries.
+static void anchor_capture(int frame) {
+    int idx = s_anchor_write_idx % ANCHOR_RING_SIZE;
+    s_wram_anchors[idx].block_idx = g_block_counter;
+    s_wram_anchors[idx].frame = frame;
+    memcpy(s_wram_anchors[idx].wram, g_ram, 0x20000);
+    s_anchor_write_idx++;
+    if (s_anchor_count < ANCHOR_RING_SIZE) s_anchor_count++;
+}
 
 // Filter hits if ANY byte in [adr, adr+width-1] lies inside any watched range.
 static inline int rdb_range_hit(uint32_t adr, uint8_t width) {
@@ -365,6 +543,7 @@ static inline void rdb_record(uint32_t adr, uint16_t val, uint8_t width) {
     s_wram_trace.log[idx].adr = adr;
     s_wram_trace.log[idx].val = val;
     s_wram_trace.log[idx].width = width;
+    s_wram_trace.log[idx].block_idx = g_block_counter;
     if (g_last_recomp_func)
         strncpy(s_wram_trace.log[idx].func, g_last_recomp_func, 47);
     else
@@ -385,11 +564,16 @@ static inline void rdb_record(uint32_t adr, uint16_t val, uint8_t width) {
     if (s_wram_trace.count < WRAM_TRACE_LOG_SIZE) s_wram_trace.count++;
 }
 
+// Forward decl — watchpoint state + body live below the Tier 2.5 block.
+static void rdb_check_watch(uint32_t addr, uint16_t val, uint8_t width);
+
 void debug_on_wram_write_byte(uint32_t addr, uint8_t val) {
     rdb_record(addr, val, 1);
+    rdb_check_watch(addr, val, 1);
 }
 void debug_on_wram_write_word(uint32_t addr, uint16_t val) {
     rdb_record(addr, val, 2);
+    rdb_check_watch(addr, val, 2);
 }
 
 // ---- Call-trace ring (per-RecompStackPush log) ----
@@ -417,6 +601,12 @@ static struct {
 // recomp.py --reverse-debug. Active only when trace_blocks command was
 // issued. Used to reconstruct the exact intra-function execution path
 // for divergence analysis at sub-function granularity.
+//
+// Each entry now also captures the recomp's tracked A/X/Y at the
+// block-entry moment (RDB_REG_UNKNOWN = 0xFFFFFFFF when the generator
+// could not statically pin the register). Closes the gap that the
+// emu side has full PC-attributed write tracing while recomp had only
+// post-frame snapshots.
 #define BLOCK_TRACE_LOG_SIZE 262144
 static struct {
     int active;
@@ -426,6 +616,10 @@ static struct {
         int frame;
         int depth;
         uint32_t pc;     // 24-bit bank:pc of the block start
+        uint32_t a;      // recomp's tracked A at this block (RDB_REG_UNKNOWN if not pinned)
+        uint32_t x;      // tracked X
+        uint32_t y;      // tracked Y
+        uint64_t block_idx;  // Tier 3: monotonic block counter (this entry's index)
         char func[48];
     } log[BLOCK_TRACE_LOG_SIZE];
 } s_block_trace = {0};
@@ -446,12 +640,90 @@ static int s_rdb_break_count = 0;
 static volatile int s_rdb_step_pending = 0;       // pause at the next block
 static volatile uint32_t s_rdb_parked_pc = 0;     // pc parked at, 0 when not parked
 
-void debug_on_block_enter(uint32_t pc) {
+// ---- Tier 2.5: WRAM watchpoints (pause on write) ----
+// Runs inside debug_on_wram_write_byte / debug_on_wram_write_word after
+// the trace record. Disarmed by default: one volatile-int read + branch
+// in the hot path. When a watched store fires, hijacks the same s_paused
+// machinery the block breakpoint uses.
+//
+// Exact-address match only: a byte write at addr matches watches at addr.
+// A word write at addr matches watches at addr (low byte) AND at addr+1
+// (high byte). The `parked` command reports which watch hit, the value
+// that was written, the actual byte stride of the write, and the writing
+// function (captured from g_last_recomp_func at the moment of the store).
+#define RDB_MAX_WATCHES 16
+static volatile int s_rdb_watch_armed = 0;
+static struct {
+    uint32_t addr;         // WRAM offset (20-bit; bank $7E/$7F safe)
+    int32_t  match_val;    // -1 = any value, else compare low bits
+} s_rdb_watches[RDB_MAX_WATCHES];
+static int s_rdb_watch_count = 0;
+// Parked state — observable via `parked` command.
+static volatile int      s_rdb_parked_watch_idx = -1; // -1 when not parked on watch
+static volatile uint32_t s_rdb_parked_watch_addr = 0;
+static volatile uint32_t s_rdb_parked_watch_val  = 0;
+static volatile uint8_t  s_rdb_parked_watch_width = 0;
+static char              s_rdb_parked_watch_func[48];
+
+// Called from debug_on_wram_write_byte/word. Fast path: one volatile read.
+// Slow path: linear scan over at most RDB_MAX_WATCHES entries, parks main
+// thread via s_paused and debug_server_wait_if_paused if any match.
+static void rdb_check_watch(uint32_t addr, uint16_t val, uint8_t width) {
+    if (!s_rdb_watch_armed) return;
+    int hit_idx = -1;
+    uint32_t hit_addr = 0;
+    uint32_t hit_val = 0;
+    for (int i = 0; i < s_rdb_watch_count; i++) {
+        uint32_t wa = s_rdb_watches[i].addr;
+        int32_t  mv = s_rdb_watches[i].match_val;
+        // Byte write at addr covers [addr,addr]. Word write at addr covers [addr,addr+1].
+        if (wa == addr) {
+            uint32_t v = (width == 2) ? (val & 0xFFFFu) : (val & 0xFFu);
+            if (mv < 0 || (uint32_t)mv == v) {
+                hit_idx = i; hit_addr = addr; hit_val = v; break;
+            }
+        } else if (width == 2 && wa == addr + 1) {
+            uint32_t v = (val >> 8) & 0xFFu;
+            if (mv < 0 || (uint32_t)mv == v) {
+                hit_idx = i; hit_addr = wa; hit_val = v; break;
+            }
+        }
+    }
+    if (hit_idx < 0) return;
+    s_rdb_parked_watch_idx = hit_idx;
+    s_rdb_parked_watch_addr = hit_addr;
+    s_rdb_parked_watch_val = hit_val;
+    s_rdb_parked_watch_width = width;
+    if (g_last_recomp_func) {
+        strncpy(s_rdb_parked_watch_func, g_last_recomp_func, 47);
+        s_rdb_parked_watch_func[47] = 0;
+    } else {
+        s_rdb_parked_watch_func[0] = 0;
+    }
+    s_paused = 1;
+    debug_server_wait_if_paused();
+    s_rdb_parked_watch_idx = -1;
+}
+
+void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
+    // Tier 3: bump the monotonic block counter on EVERY hook call,
+    // regardless of trace state, so WRAM writes can correlate to block
+    // index even when the block trace itself isn't being recorded.
+    g_block_counter++;
+
+    // Tier 3 WRAM anchors: snapshot full WRAM every N blocks when armed.
+    if (s_anchor_active && (g_block_counter % s_anchor_interval) == 0) {
+        anchor_capture(snes_frame_counter);
+    }
     if (s_block_trace.active) {
         int idx = s_block_trace.write_idx % BLOCK_TRACE_LOG_SIZE;
         s_block_trace.log[idx].frame = snes_frame_counter;
         s_block_trace.log[idx].depth = g_recomp_stack_top;
         s_block_trace.log[idx].pc = pc;
+        s_block_trace.log[idx].a = a;
+        s_block_trace.log[idx].x = x;
+        s_block_trace.log[idx].y = y;
+        s_block_trace.log[idx].block_idx = g_block_counter;
         if (g_last_recomp_func) {
             strncpy(s_block_trace.log[idx].func, g_last_recomp_func, 47);
             s_block_trace.log[idx].func[47] = 0;
@@ -1186,12 +1458,14 @@ static void cmd_get_wram_trace(const char *args) {
     for (int i = 0; i < s_wram_trace.count && pos < budget; i++) {
         int idx = (start + i) % WRAM_TRACE_LOG_SIZE;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,\"func\":\"%s\",\"parent\":\"%s\"}",
+            "%s{\"f\":%d,\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,"
+            "\"bi\":%llu,\"func\":\"%s\",\"parent\":\"%s\"}",
             i ? "," : "",
             s_wram_trace.log[idx].frame,
             s_wram_trace.log[idx].adr,
             s_wram_trace.log[idx].val,
             (unsigned)s_wram_trace.log[idx].width,
+            (unsigned long long)s_wram_trace.log[idx].block_idx,
             s_wram_trace.log[idx].func,
             s_wram_trace.log[idx].parent);
     }
@@ -1250,11 +1524,451 @@ static void cmd_break_continue(const char *args) {
 
 static void cmd_parked(const char *args) {
     (void)args;
-    send_fmt("{\"parked\":%s,\"pc\":\"0x%06x\",\"break_armed\":%d,\"step_pending\":%d}",
-             s_rdb_parked_pc ? "true" : "false",
+    int watch_hit = (s_rdb_parked_watch_idx >= 0);
+    int block_parked = (s_rdb_parked_pc != 0);
+    char watch_buf[160] = {0};
+    if (watch_hit) {
+        snprintf(watch_buf, sizeof(watch_buf),
+                 ",\"watch_idx\":%d,\"watch_addr\":\"0x%05x\","
+                 "\"watch_val\":\"0x%04x\",\"watch_width\":%u,\"writer\":\"%s\"",
+                 s_rdb_parked_watch_idx,
+                 s_rdb_parked_watch_addr,
+                 s_rdb_parked_watch_val,
+                 (unsigned)s_rdb_parked_watch_width,
+                 s_rdb_parked_watch_func);
+    }
+    send_fmt("{\"parked\":%s,\"reason\":\"%s\",\"pc\":\"0x%06x\","
+             "\"break_armed\":%d,\"step_pending\":%d,"
+             "\"watch_armed\":%d,\"watch_count\":%d%s}",
+             (block_parked || watch_hit) ? "true" : "false",
+             watch_hit ? "watch" : (block_parked ? "break" : "none"),
              s_rdb_parked_pc,
              s_rdb_break_armed,
-             s_rdb_step_pending);
+             s_rdb_step_pending,
+             s_rdb_watch_armed,
+             s_rdb_watch_count,
+             watch_buf);
+}
+
+// ---- Tier 2.5 WRAM-watchpoint TCP commands ----
+// watch_add <hex_addr> [hex_val]
+//   Pause when the given WRAM offset is written. If hex_val is provided,
+//   only match that exact value. Addresses are 20-bit WRAM offsets
+//   (bank $7E = 0x00000..0x0FFFF, bank $7F = 0x10000..0x1FFFF).
+static void cmd_watch_add(const char *args) {
+    uint32_t addr = 0;
+    uint32_t val = 0;
+    int n = args ? sscanf(args, "%x %x", &addr, &val) : 0;
+    if (n < 1) {
+        send_fmt("{\"error\":\"usage: watch_add <hex_addr> [hex_val]\"}"); return;
+    }
+    if (s_rdb_watch_count >= RDB_MAX_WATCHES) {
+        send_fmt("{\"error\":\"watch table full (max %d)\"}", RDB_MAX_WATCHES); return;
+    }
+    int idx = s_rdb_watch_count;
+    s_rdb_watches[idx].addr = addr;
+    s_rdb_watches[idx].match_val = (n >= 2) ? (int32_t)val : -1;
+    s_rdb_watch_count++;
+    s_rdb_watch_armed = 1;
+    if (n >= 2)
+        send_fmt("{\"ok\":true,\"idx\":%d,\"addr\":\"0x%05x\",\"match_val\":\"0x%04x\",\"count\":%d}",
+                 idx, addr, val, s_rdb_watch_count);
+    else
+        send_fmt("{\"ok\":true,\"idx\":%d,\"addr\":\"0x%05x\",\"match_val\":\"any\",\"count\":%d}",
+                 idx, addr, s_rdb_watch_count);
+}
+
+static void cmd_watch_clear(const char *args) {
+    (void)args;
+    s_rdb_watch_count = 0;
+    s_rdb_watch_armed = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_watch_list(const char *args) {
+    (void)args;
+    char buf[1024];
+    int pos = snprintf(buf, sizeof(buf), "{\"count\":%d,\"watches\":[", s_rdb_watch_count);
+    for (int i = 0; i < s_rdb_watch_count; i++) {
+        int32_t mv = s_rdb_watches[i].match_val;
+        if (mv < 0)
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                            "%s{\"idx\":%d,\"addr\":\"0x%05x\",\"match_val\":\"any\"}",
+                            i ? "," : "", i, s_rdb_watches[i].addr);
+        else
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                            "%s{\"idx\":%d,\"addr\":\"0x%05x\",\"match_val\":\"0x%04x\"}",
+                            i ? "," : "", i, s_rdb_watches[i].addr, (uint32_t)mv);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+// watch_continue: alias for break_continue when parked on a watchpoint.
+// Kept as a named command so probe scripts read clearly.
+static void cmd_watch_continue(const char *args) {
+    (void)args;
+    s_paused = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+// ---- Tier 3: time-travel WRAM inspection ----
+//
+// block_idx_now: current monotonic block counter.
+// tier3_anchor_on [interval=4096]: arm periodic full-WRAM snapshots.
+// tier3_anchor_off: stop snapshotting; keep existing snapshots.
+// tier3_anchor_status: how many anchors held, intervals.
+// wram_at_block <block_idx> [start_addr=0] [len=128]: reconstruct
+//   historical WRAM by starting from the nearest anchor (or zeros if
+//   no anchor) and replaying every Tier 1 wram_trace write up to the
+//   target block_idx. Returns the requested slice as hex.
+// wram_first_change <hex_addr> [from_block=0] [to_block=current]:
+//   scan wram_trace for the first entry that writes addr in the
+//   range, returning (block_idx, val, frame, func).
+//
+// Reconstruction quality requires Tier 1 trace_wram covering the
+// queried range. For best results: arm trace_wram on a wide range
+// at session start (e.g., 0 1ffff) and tier3_anchor_on so the ring
+// is populated.
+static void cmd_block_idx_now(const char *args) {
+    (void)args;
+    send_fmt("{\"ok\":true,\"block_idx\":%llu,\"frame\":%d}",
+             (unsigned long long)g_block_counter, snes_frame_counter);
+}
+
+static void cmd_tier3_anchor_on(const char *args) {
+    unsigned int interval = 4096;
+    if (args) sscanf(args, "%u", &interval);
+    if (interval < 1) interval = 1;
+    s_anchor_interval = interval;
+    s_anchor_active = 1;
+    send_fmt("{\"ok\":true,\"interval\":%u,\"ring_size\":%d}",
+             interval, ANCHOR_RING_SIZE);
+}
+
+static void cmd_tier3_anchor_off(const char *args) {
+    (void)args;
+    s_anchor_active = 0;
+    send_fmt("{\"ok\":true,\"count\":%d}", s_anchor_count);
+}
+
+static void cmd_tier3_anchor_status(const char *args) {
+    (void)args;
+    char ranges[1024];
+    int pos = snprintf(ranges, sizeof(ranges), "[");
+    int start = s_anchor_count < ANCHOR_RING_SIZE ? 0 :
+                s_anchor_write_idx - ANCHOR_RING_SIZE;
+    for (int i = 0; i < s_anchor_count; i++) {
+        int idx = (start + i) % ANCHOR_RING_SIZE;
+        pos += snprintf(ranges + pos, sizeof(ranges) - pos,
+                        "%s{\"bi\":%llu,\"f\":%d}",
+                        i ? "," : "",
+                        (unsigned long long)s_wram_anchors[idx].block_idx,
+                        s_wram_anchors[idx].frame);
+        if (pos > (int)sizeof(ranges) - 64) break;
+    }
+    snprintf(ranges + pos, sizeof(ranges) - pos, "]");
+    send_fmt("{\"ok\":true,\"active\":%d,\"interval\":%u,\"count\":%d,\"anchors\":%s}",
+             s_anchor_active, s_anchor_interval, s_anchor_count, ranges);
+}
+
+// Find largest anchor with block_idx <= target. Returns -1 if none.
+static int anchor_find_le(uint64_t target) {
+    int best = -1;
+    uint64_t best_bi = 0;
+    int start = s_anchor_count < ANCHOR_RING_SIZE ? 0 :
+                s_anchor_write_idx - ANCHOR_RING_SIZE;
+    for (int i = 0; i < s_anchor_count; i++) {
+        int idx = (start + i) % ANCHOR_RING_SIZE;
+        uint64_t bi = s_wram_anchors[idx].block_idx;
+        if (bi <= target && (best < 0 || bi > best_bi)) {
+            best = idx;
+            best_bi = bi;
+        }
+    }
+    return best;
+}
+
+static void cmd_wram_at_block(const char *args) {
+    if (!args || !*args) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: wram_at_block <block_idx> [start_addr] [len]\"}");
+        return;
+    }
+    unsigned long long target_ull = 0;
+    unsigned int start_addr = 0;
+    unsigned int len = 128;
+    int n = sscanf(args, "%llu %x %u", &target_ull, &start_addr, &len);
+    if (n < 1) {
+        send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
+        return;
+    }
+    if (len < 1) len = 1;
+    if (len > 4096) len = 4096;
+    if (start_addr >= 0x20000) start_addr = 0;
+    if (start_addr + len > 0x20000) len = 0x20000 - start_addr;
+    uint64_t target = (uint64_t)target_ull;
+
+    // Build full reconstructed WRAM into a static scratch buffer, then
+    // slice for response. (128KB scratch isn't huge.)
+    static uint8_t scratch[0x20000];
+    int anchor_idx = anchor_find_le(target);
+    uint64_t replay_start_bi = 0;
+    if (anchor_idx >= 0) {
+        memcpy(scratch, s_wram_anchors[anchor_idx].wram, 0x20000);
+        replay_start_bi = s_wram_anchors[anchor_idx].block_idx;
+    } else {
+        memset(scratch, 0, 0x20000);
+    }
+
+    // Replay all wram_trace writes with block_idx in (replay_start_bi, target].
+    // Iterate the ring in chronological (write) order.
+    int wstart = s_wram_trace.count < WRAM_TRACE_LOG_SIZE ? 0 :
+                 s_wram_trace.write_idx - WRAM_TRACE_LOG_SIZE;
+    int applied = 0;
+    int oldest_seen_bi = -1;
+    int newest_seen_bi = -1;
+    for (int i = 0; i < s_wram_trace.count; i++) {
+        int idx = (wstart + i) % WRAM_TRACE_LOG_SIZE;
+        uint64_t bi = s_wram_trace.log[idx].block_idx;
+        if ((int)bi < oldest_seen_bi || oldest_seen_bi < 0) oldest_seen_bi = (int)bi;
+        if ((int)bi > newest_seen_bi) newest_seen_bi = (int)bi;
+        if (bi <= replay_start_bi) continue;
+        if (bi > target) continue;
+        uint32_t a = s_wram_trace.log[idx].adr;
+        uint16_t v = s_wram_trace.log[idx].val;
+        uint8_t  w = s_wram_trace.log[idx].width;
+        if (a < 0x20000) {
+            scratch[a] = (uint8_t)(v & 0xff);
+            if (w == 2 && a + 1 < 0x20000) scratch[a + 1] = (uint8_t)((v >> 8) & 0xff);
+        }
+        applied++;
+    }
+
+    // Hex-encode the requested slice.
+    char hex[8192];
+    int pos = 0;
+    for (unsigned int i = 0; i < len && pos + 3 < (int)sizeof(hex); i++)
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", scratch[start_addr + i]);
+    hex[pos] = 0;
+
+    send_fmt("{\"ok\":true,\"target_bi\":%llu,\"anchor_bi\":%lld,"
+             "\"applied_writes\":%d,\"trace_bi_range\":[%d,%d],"
+             "\"start\":\"0x%05x\",\"len\":%u,\"hex\":\"%s\"}",
+             (unsigned long long)target,
+             (anchor_idx >= 0) ? (long long)s_wram_anchors[anchor_idx].block_idx : -1LL,
+             applied, oldest_seen_bi, newest_seen_bi,
+             start_addr, len, hex);
+}
+
+#if SNESRECOMP_TIER4
+// ---- Tier-4: WRAM-read trace TCP commands ----
+// trace_wram_reads <hex_lo> [hex_hi] : add a watched range, arm trace
+// trace_wram_reads_reset             : drop all ranges, clear ring
+// get_wram_read_trace [filters]      : dump ring as JSON
+
+static void cmd_trace_wram_reads(const char *args) {
+    unsigned int lo = 0, hi = 0;
+    int n = args ? sscanf(args, "%x %x", &lo, &hi) : 0;
+    if (n < 1) {
+        send_fmt("{\"error\":\"usage: trace_wram_reads <hex_lo> [hex_hi]\"}"); return;
+    }
+    if (n < 2) hi = lo;
+    if (hi < lo || hi > 0x1FFFF) {
+        send_fmt("{\"error\":\"bad range\"}"); return;
+    }
+    if (s_read_trace_nranges >= READ_TRACE_MAX_RANGES) {
+        send_fmt("{\"error\":\"too many ranges (max %d)\"}", READ_TRACE_MAX_RANGES); return;
+    }
+    s_read_trace_ranges[s_read_trace_nranges].lo = lo;
+    s_read_trace_ranges[s_read_trace_nranges].hi = hi;
+    s_read_trace_nranges++;
+    s_read_trace_active = 1;
+    send_fmt("{\"ok\":true,\"lo\":\"0x%05x\",\"hi\":\"0x%05x\",\"nranges\":%d}",
+             lo, hi, s_read_trace_nranges);
+}
+
+static void cmd_trace_wram_reads_reset(const char *args) {
+    (void)args;
+    s_read_trace_active = 0;
+    s_read_trace_nranges = 0;
+    s_read_trace_write_idx = 0;
+    s_read_trace_count = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_wram_read_trace(const char *args) {
+    (void)args;
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf), "{\"ok\":true,\"count\":%d,\"log\":[",
+                       s_read_trace_count);
+    int start = s_read_trace_count < READ_TRACE_LOG_SIZE ? 0 :
+                s_read_trace_write_idx - READ_TRACE_LOG_SIZE;
+    int budget = (int)sizeof(buf) - 256;
+    for (int i = 0; i < s_read_trace_count && pos < budget; i++) {
+        int idx = (start + i) % READ_TRACE_LOG_SIZE;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"bi\":%llu,\"adr\":\"0x%05x\",\"val\":\"0x%04x\","
+            "\"w\":%u,\"func\":\"%s\",\"parent\":\"%s\"}",
+            i ? "," : "",
+            s_read_trace[idx].frame,
+            (unsigned long long)s_read_trace[idx].block_idx,
+            s_read_trace[idx].adr,
+            s_read_trace[idx].val,
+            (unsigned)s_read_trace[idx].width,
+            s_read_trace[idx].func,
+            s_read_trace[idx].parent);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+// ---- Tier-4: per-instruction trace TCP commands ----
+//
+// trace_insn / trace_insn_reset / get_insn_trace mirror the
+// trace_blocks family. Insn entries are tiny (no func name) so
+// 2M-entry ring fits ~24 MB; cap on get_insn_trace JSON response
+// is 256 entries unless filter narrows further.
+//
+// Filters: from_block / to_block (block_idx range), pc_lo / pc_hi.
+static void cmd_trace_insn(const char *args) {
+    (void)args;
+    s_insn_trace_active = 1;
+    send_fmt("{\"ok\":true,\"max_entries\":%d}", INSN_TRACE_LOG_SIZE);
+}
+
+static void cmd_trace_insn_reset(const char *args) {
+    (void)args;
+    s_insn_trace_active = 0;
+    s_insn_trace_write_idx = 0;
+    s_insn_trace_count = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_get_insn_trace(const char *args) {
+    unsigned long long from_bi = 0, to_bi = 0xFFFFFFFFFFFFFFFFull;
+    uint32_t pc_lo = 0, pc_hi = 0xFFFFFFu;
+    int max_emit = 256;
+    if (args) {
+        const char *p;
+        if ((p = strstr(args, "from_block="))) sscanf(p + 11, "%llu", &from_bi);
+        if ((p = strstr(args, "to_block=")))   sscanf(p + 9,  "%llu", &to_bi);
+        if ((p = strstr(args, "pc_lo=")))      sscanf(p + 6,  "%x", &pc_lo);
+        if ((p = strstr(args, "pc_hi=")))      sscanf(p + 6,  "%x", &pc_hi);
+        if ((p = strstr(args, "limit=")))      sscanf(p + 6,  "%d", &max_emit);
+    }
+    if (max_emit < 1) max_emit = 1;
+    if (max_emit > 4096) max_emit = 4096;
+
+    static char buf[262144];
+    int pos = snprintf(buf, sizeof(buf), "{\"ok\":true,\"total\":%d,\"log\":[",
+                       s_insn_trace_count);
+    int start = s_insn_trace_count < INSN_TRACE_LOG_SIZE ? 0 :
+                s_insn_trace_write_idx - INSN_TRACE_LOG_SIZE;
+    int budget = (int)sizeof(buf) - 256;
+    int emitted = 0;
+    int first = 1;
+    for (int i = 0; i < s_insn_trace_count && pos < budget && emitted < max_emit; i++) {
+        int idx = (start + i) % INSN_TRACE_LOG_SIZE;
+        uint64_t bi = s_insn_trace[idx].block_idx;
+        uint32_t pc = s_insn_trace[idx].pc;
+        if (bi < from_bi || bi > to_bi) continue;
+        if (pc < pc_lo || pc > pc_hi) continue;
+        // Emit register values as hex strings, "?" when not pinned.
+        char a_buf[12], x_buf[12], y_buf[12], b_buf[12];
+        #define _FMT_REG(buf, val) do { \
+            if ((val) == 0xFFFFFFFFu) snprintf(buf, sizeof(buf), "\"?\""); \
+            else snprintf(buf, sizeof(buf), "\"0x%04x\"", (val) & 0xFFFFu); \
+        } while(0)
+        _FMT_REG(a_buf, s_insn_trace[idx].a);
+        _FMT_REG(x_buf, s_insn_trace[idx].x);
+        _FMT_REG(y_buf, s_insn_trace[idx].y);
+        _FMT_REG(b_buf, s_insn_trace[idx].b);
+        #undef _FMT_REG
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"bi\":%llu,\"pc\":\"0x%06x\",\"mnem\":%u,"
+            "\"a\":%s,\"x\":%s,\"y\":%s,\"b\":%s,\"m\":%u,\"xf\":%u}",
+            first ? "" : ",",
+            s_insn_trace[idx].frame,
+            (unsigned long long)bi, pc,
+            s_insn_trace[idx].mnem_id,
+            a_buf, x_buf, y_buf, b_buf,
+            (unsigned)s_insn_trace[idx].m_flag,
+            (unsigned)s_insn_trace[idx].x_flag);
+        first = 0;
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
+    send_line(buf);
+}
+
+// Mnemonic table: indices used in the insn ring map to these strings.
+// Recomp.py emits the same indices (kept in sync via the test
+// test_insn_hook_mnemonic_table_in_sync).
+static const char *const s_insn_mnemonics[] = {
+    "?",   "ADC", "AND", "ASL", "BCC", "BCS", "BEQ", "BIT", "BMI", "BNE",
+    "BPL", "BRA", "BRK", "BRL", "BVC", "BVS", "CLC", "CLD", "CLI", "CLV",
+    "CMP", "COP", "CPX", "CPY", "DEC", "DEX", "DEY", "EOR", "INC", "INX",
+    "INY", "JMP", "JML", "JSL", "JSR", "LDA", "LDX", "LDY", "LSR", "MVN",
+    "MVP", "NOP", "ORA", "PEA", "PEI", "PER", "PHA", "PHB", "PHD", "PHK",
+    "PHP", "PHX", "PHY", "PLA", "PLB", "PLD", "PLP", "PLX", "PLY", "REP",
+    "ROL", "ROR", "RTI", "RTL", "RTS", "SBC", "SEC", "SED", "SEI", "SEP",
+    "STA", "STP", "STX", "STY", "STZ", "TAX", "TAY", "TCD", "TCS", "TDC",
+    "TRB", "TSB", "TSC", "TSX", "TXA", "TXS", "TXY", "TYA", "TYX", "WAI",
+    "WDM", "XBA", "XCE",
+};
+#define INSN_MNEM_COUNT ((int)(sizeof(s_insn_mnemonics) / sizeof(s_insn_mnemonics[0])))
+
+static void cmd_get_insn_mnemonics(const char *args) {
+    (void)args;
+    static char buf[4096];
+    int pos = snprintf(buf, sizeof(buf), "{\"ok\":true,\"count\":%d,\"table\":[",
+                       INSN_MNEM_COUNT);
+    for (int i = 0; i < INSN_MNEM_COUNT; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s\"%s\"", i ? "," : "", s_insn_mnemonics[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+#endif /* SNESRECOMP_TIER4 */
+
+static void cmd_wram_first_change(const char *args) {
+    if (!args || !*args) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: wram_first_change <hex_addr> [from_block=0] [to_block=current]\"}");
+        return;
+    }
+    unsigned int addr = 0;
+    unsigned long long from_bi = 0, to_bi = (unsigned long long)g_block_counter;
+    int n = sscanf(args, "%x %llu %llu", &addr, &from_bi, &to_bi);
+    if (n < 1) {
+        send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
+        return;
+    }
+    int wstart = s_wram_trace.count < WRAM_TRACE_LOG_SIZE ? 0 :
+                 s_wram_trace.write_idx - WRAM_TRACE_LOG_SIZE;
+    for (int i = 0; i < s_wram_trace.count; i++) {
+        int idx = (wstart + i) % WRAM_TRACE_LOG_SIZE;
+        uint64_t bi = s_wram_trace.log[idx].block_idx;
+        if (bi < from_bi || bi > to_bi) continue;
+        uint32_t a = s_wram_trace.log[idx].adr;
+        uint8_t  w = s_wram_trace.log[idx].width;
+        // Match if the write touches `addr` (covers byte/word straddles).
+        if (a == addr || (w == 2 && a + 1 == addr)) {
+            send_fmt("{\"ok\":true,\"found\":true,\"bi\":%llu,\"frame\":%d,"
+                     "\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,"
+                     "\"func\":\"%s\",\"parent\":\"%s\"}",
+                     (unsigned long long)bi,
+                     s_wram_trace.log[idx].frame,
+                     a, s_wram_trace.log[idx].val,
+                     (unsigned)w,
+                     s_wram_trace.log[idx].func,
+                     s_wram_trace.log[idx].parent);
+            return;
+        }
+    }
+    send_fmt("{\"ok\":true,\"found\":false,\"addr\":\"0x%05x\","
+             "\"from_bi\":%llu,\"to_bi\":%llu}",
+             addr, from_bi, to_bi);
 }
 
 static void cmd_trace_blocks(const char *args) {
@@ -1314,12 +2028,24 @@ static void cmd_get_block_trace(const char *args) {
             uint32_t pc = s_block_trace.log[idx].pc;
             if (pc < pc_lo || pc > pc_hi) continue;
         }
+        // Format register values: hex if known, "?" if RDB_REG_UNKNOWN.
+        char a_buf[12], x_buf[12], y_buf[12];
+        if (s_block_trace.log[idx].a == 0xFFFFFFFFu) snprintf(a_buf, sizeof(a_buf), "\"?\"");
+        else snprintf(a_buf, sizeof(a_buf), "\"0x%04x\"", s_block_trace.log[idx].a & 0xFFFF);
+        if (s_block_trace.log[idx].x == 0xFFFFFFFFu) snprintf(x_buf, sizeof(x_buf), "\"?\"");
+        else snprintf(x_buf, sizeof(x_buf), "\"0x%04x\"", s_block_trace.log[idx].x & 0xFFFF);
+        if (s_block_trace.log[idx].y == 0xFFFFFFFFu) snprintf(y_buf, sizeof(y_buf), "\"?\"");
+        else snprintf(y_buf, sizeof(y_buf), "\"0x%04x\"", s_block_trace.log[idx].y & 0xFFFF);
+
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"d\":%d,\"pc\":\"0x%06x\",\"func\":\"%s\"}",
+            "%s{\"f\":%d,\"d\":%d,\"pc\":\"0x%06x\","
+            "\"a\":%s,\"x\":%s,\"y\":%s,\"bi\":%llu,\"func\":\"%s\"}",
             first ? "" : ",",
             f,
             s_block_trace.log[idx].depth,
             s_block_trace.log[idx].pc,
+            a_buf, x_buf, y_buf,
+            (unsigned long long)s_block_trace.log[idx].block_idx,
             s_block_trace.log[idx].func);
         first = 0;
         emitted++;
@@ -2272,6 +2998,25 @@ static const CmdEntry s_commands[] = {
     {"break_continue",     cmd_break_continue},
     {"step_block",         cmd_step_block},
     {"parked",             cmd_parked},
+    {"watch_add",          cmd_watch_add},
+    {"watch_clear",        cmd_watch_clear},
+    {"watch_list",         cmd_watch_list},
+    {"watch_continue",     cmd_watch_continue},
+    {"block_idx_now",      cmd_block_idx_now},
+    {"tier3_anchor_on",    cmd_tier3_anchor_on},
+    {"tier3_anchor_off",   cmd_tier3_anchor_off},
+    {"tier3_anchor_status",cmd_tier3_anchor_status},
+    {"wram_at_block",      cmd_wram_at_block},
+    {"wram_first_change",  cmd_wram_first_change},
+#if SNESRECOMP_TIER4
+    {"trace_insn",            cmd_trace_insn},
+    {"trace_insn_reset",      cmd_trace_insn_reset},
+    {"get_insn_trace",        cmd_get_insn_trace},
+    {"get_insn_mnemonics",    cmd_get_insn_mnemonics},
+    {"trace_wram_reads",      cmd_trace_wram_reads},
+    {"trace_wram_reads_reset",cmd_trace_wram_reads_reset},
+    {"get_wram_read_trace",   cmd_get_wram_read_trace},
+#endif
 #endif
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
@@ -2310,6 +3055,13 @@ static void process_command(char *line) {
     const char *args = "";
     if (space) { *space = 0; args = space + 1; }
 
+#ifdef ENABLE_ORACLE_BACKEND
+    // Pre-dispatch hook for the emulator-oracle family (emu_*). Keeps
+    // backend-specific code out of this file.
+    extern int emu_oracle_handle_cmd(const char *cmd, const char *args);
+    if (emu_oracle_handle_cmd(line, args)) return;
+#endif
+
     for (const CmdEntry *c = s_commands; c->name; c++) {
         if (strcmp(line, c->name) == 0) {
             c->handler(args);
@@ -2318,6 +3070,22 @@ static void process_command(char *line) {
     }
     send_fmt("{\"error\":\"unknown command\",\"cmd\":\"%s\"}", line);
 }
+
+#ifdef ENABLE_ORACLE_BACKEND
+// Non-static wrappers exposed for emu_oracle_cmds.c (another TU).
+// Preserves the "static send_line/send_fmt" internal convention for
+// the rest of this file while letting oracle handlers reuse the same
+// buffer + socket + newline framing.
+void debug_server_send_line(const char *line) { send_line(line); }
+void debug_server_send_fmt(const char *fmt, ...) {
+    char buf[8192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    send_line(buf);
+}
+#endif
 
 // ---- Public API ----
 

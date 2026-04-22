@@ -1,0 +1,76 @@
+diff --git a/cpuexec.cpp b/cpuexec.cpp
+index aa43b2f..5c2d4b4 100644
+--- a/cpuexec.cpp
++++ b/cpuexec.cpp
+@@ -64,6 +64,8 @@ void S9xMainLoop (void)
+ 				}
+ 
+ 				CHECK_FOR_IRQ_CHANGE();
++				/* Oracle NMI hook fires right before vector dispatch. */
++				if (s9x_nmi_hook) s9x_nmi_hook();
+ 				S9xOpcode_NMI();
+ 			}
+ 		}
+@@ -168,6 +170,12 @@ void S9xMainLoop (void)
+ 				Opcodes = S9xOpcodesSlow;
+ 		}
+ 
++		/* Oracle per-instruction hook. Captures PB:PC and the opcode
++		 * byte right before dispatch, so the bridge can record full
++		 * register state (Registers/CPU read directly) for trace.
++		 * Hot-path cost: one null-load + branch when not armed. */
++		if (s9x_insn_hook) s9x_insn_hook(Registers.PB, Registers.PCw, Op);
++
+ 		Registers.PCw++;
+ 		(*Opcodes[Op].S9xOpcode)();
+ 
+diff --git a/getset.h b/getset.h
+index ec55ea9..94ce91e 100644
+--- a/getset.h
++++ b/getset.h
+@@ -35,6 +35,26 @@
+ 
+ extern uint8	OpenBus;
+ 
++/* Oracle-mode WRAM write hook. Set from snes9x_bridge.cpp when the
++ * Oracle build instruments WRAM writes. NULL when not instrumented —
++ * hot-path cost is one null-load + branch per write. */
++extern void (*s9x_write_hook)(uint32 Address, uint8 Byte);
++
++/* Oracle-mode per-instruction hook. Called from S9xMainLoop right
++ * before each opcode dispatch with the just-fetched opcode byte and
++ * the current PC. The hook function reads Registers / CPU directly
++ * for full register-state capture. NULL when not instrumented; hot
++ * path is one null-load + branch per executed instruction. */
++/* NOTE: parameter names avoid PB/PC/PCw/PB-style macros from
++ * 65c816.h (`#define PB PC.B.xPB` etc). Use `bank`, `pc16`,
++ * `opcode` to dodge the macro-expansion collision. */
++extern void (*s9x_insn_hook)(uint8 bank, uint16 pc16, uint8 opcode);
++
++/* Oracle-mode NMI entry hook. Called from S9xOpcode_NMI right at
++ * NMI dispatch. Allows correlating recomp's NMI handler entries
++ * against hardware NMI timing. NULL when not instrumented. */
++extern void (*s9x_nmi_hook)(void);
++
+ static inline int32 memory_speed (uint32 address)
+ {
+ 	if (address & 0x408000)
+@@ -319,6 +339,7 @@ inline uint16 S9xGetWord (uint32 Address, enum s9xwrap_t w = WRAP_NONE)
+ 
+ inline void S9xSetByte (uint8 Byte, uint32 Address)
+ {
++	if (s9x_write_hook) s9x_write_hook(Address, Byte);
+ 	int		block = (Address & 0xffffff) >> MEMMAP_SHIFT;
+ 	uint8	*SetAddress = Memory.WriteMap[block];
+ 	int32	speed = memory_speed(Address);
+@@ -465,6 +486,10 @@ inline void S9xSetWord (uint16 Word, uint32 Address, enum s9xwrap_t w = WRAP_NON
+ 
+ 	if (SetAddress >= (uint8 *) CMemory::MAP_LAST)
+ 	{
++		if (s9x_write_hook) {
++			s9x_write_hook(Address, (uint8)Word);
++			s9x_write_hook(Address + 1, (uint8)(Word >> 8));
++		}
+ 		WRITE_WORD(SetAddress + (Address & 0xffff), Word);
+ 		addCyclesInMemoryAccess_x2;
+ 		return;

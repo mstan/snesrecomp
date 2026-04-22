@@ -1,0 +1,3 @@
+[submodule "runner/snes9x-core"]
+	path = runner/snes9x-core
+	url = https://github.com/libretro/snes9x.git

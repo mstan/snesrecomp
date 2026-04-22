@@ -45,7 +45,12 @@ uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs) {
 
 // Debug: recomp function call stack for watchdog diagnostics.
 const char *g_last_recomp_func = "(none)";
-#define RECOMP_STACK_DEPTH 16
+// Tier 1.5 call-trace depth cap. Originally 16; bumped to 64 because
+// SMW peak call depth is ~10 but Tier 1.5 attribution silently
+// degrades past the cap (g_last_recomp_func and parent fields go
+// stale). 64 gives 6x headroom for any conceivable call chain at
+// negligible memory cost (8 bytes/slot * 48 extra slots = 384 bytes).
+#define RECOMP_STACK_DEPTH 64
 const char *g_recomp_stack[RECOMP_STACK_DEPTH];
 int g_recomp_stack_top = 0;
 
@@ -59,7 +64,7 @@ void RecompStackPush(const char *name) {
 
 void RecompStackDump(void) {
   fprintf(stderr, "Recomp call stack (%d deep):\n", g_recomp_stack_top);
-  for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 16; i--)
+  for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - RECOMP_STACK_DEPTH; i--)
     fprintf(stderr, "  [%d] %s\n", g_recomp_stack_top - 1 - i, g_recomp_stack[i]);
 }
 

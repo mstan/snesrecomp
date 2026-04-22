@@ -55,21 +55,63 @@ $1BE6-$1CE5 during the invoke. Compare recomp's written values at
 iter 22 to what oracle would produce. If the first divergent value is
 in `BufferScrollingTiles_Layer1`'s inner loop, the tier closed the bug.
 
-### Tier 2 — block-level stepper
+### Tier 1.5 — call trace (shipped)
 
-**What it does.** `recomp.py` emits `debug_on_block_enter(block_id)`
-at every labeled block start. Debug server exposes:
+**What it does.** Per-`RecompStackPush` ring buffer, 65k entries.
+Each entry records `(frame, depth, func, parent)` at the moment of
+the call. Hooked into `debug_server_profile_push`, which is invoked
+from `RecompStackPush` unconditionally when `SNESRECOMP_REVERSE_DEBUG`
+is on.
 
-- `break_at <func> <block_id>` — arm a breakpoint.
-- `continue` — resume to next breakpoint.
-- `step_block` — run exactly one block then park.
-- `step_over_func` — run until the current function returns.
-- `get_state` — CPU snapshot + WRAM cursor.
+TCP:
+- `trace_calls` / `trace_calls_reset` — arm / reset the ring.
+- `get_call_trace` with filters `from`, `to`, `max_depth`, `contains`.
 
-Execution parks by spinning in `debug_on_block_enter` on a shared flag
-until the server releases it. `run_frame` can now be arbitrarily
-suspended mid-frame; that's fine because the game loop will re-enter
-it.
+**Caveat.** `RECOMP_STACK_DEPTH` caps at 16; beyond that, parent /
+depth fields become unreliable. Prefer Tier 2's `pc_lo`/`pc_hi`
+filter for attribution past that depth.
+
+### Tier 2 — block-level trace (shipped)
+
+**What it does.** `recomp.py --reverse-debug` emits
+`RDB_BLOCK_HOOK(pc)` at every basic-block boundary — function entry
+and every `label_xxxx:;`. The hook writes to a 256k-entry ring with
+`(frame, depth, pc, func)`. Bank 0 alone gets ~1362 hooks; ~104k
+blocks fire per attract-demo frame.
+
+TCP:
+- `trace_blocks` / `trace_blocks_reset` — arm / reset the ring.
+- `get_block_trace` with filters `from`, `to`, `func`, `pc_lo`, `pc_hi`.
+
+### Tier 2.5 — pause-on-block + WRAM watchpoints (shipped)
+
+**What it does.** Two pause primitives share the main thread's
+existing `s_paused` spin loop (`debug_server_wait_if_paused`).
+
+*Block breakpoints.* `s_rdb_break_pcs[16]` holds armed PCs.
+`debug_on_block_enter` checks `s_rdb_break_armed` (volatile-int fast
+path, almost always falls through); on hit, parks the main thread
+and exposes the parked PC via the `parked` command.
+
+*WRAM watchpoints.* `s_rdb_watches[16]` holds `(addr, match_val)`
+entries. `debug_on_wram_write_byte/word` check `s_rdb_watch_armed`
+after the trace record; on hit, park the main thread. Watch matches
+on exact address — word writes also match watches at `addr+1`. An
+optional `match_val` restricts the watch to one specific written
+value (e.g., "pause when $72 is written with 0x00"). The `parked`
+command reports `watch_addr`, `watch_val`, `watch_width`, and the
+writing function (captured from `g_last_recomp_func`).
+
+TCP:
+- `break_add <hex_pc>` / `break_clear` / `break_list` / `break_continue`
+- `step_block` — arm a one-shot pause at the very next block hook
+- `watch_add <hex_addr> [hex_val]` / `watch_clear` / `watch_list`
+  / `watch_continue`
+- `parked` — unified "why / where parked" report.
+
+Pause happens *after* trace recording, so the trace still captures
+the parked event. Continue commands just clear `s_paused`; any
+other armed breakpoints / watchpoints stay live for the next hit.
 
 **What it costs.** One flag test per block (~ns in the fast path). When
 paused, real wall time. When a breakpoint fires, the spin blocks the
