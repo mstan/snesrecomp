@@ -12,17 +12,34 @@ Phase 3 of the cfg-parser-overhaul. Two analysis passes:
      identically (no end:, no sig override, no other hints).
 
 WARNING: bulk --apply is NOT safe. Empirically, stripping these
-unconditionally regresses the gen-C: the recompiler's funcs_with_end
-fallback chain (next-non-skipped-start) does NOT match the
-discoverer's per-function end for cfg-declared entries today. Phase 2
-plumbed discoverer-end into auto-promoted entries only; extending it
-to all cfg entries breaks downstream sub-entry promotion and dispatch
-classification (validated 2026-04-22).
+unconditionally regresses the gen-C. Diagnosed on 2026-04-22: the
+cfg `end:X` directive bounds multiple recompiler passes, not just the
+single func's decode:
 
-Use this tool to SURVEY scope and to selectively strip individual
-directives the human author has reviewed and confirmed redundant. The
-broader plumbing fix (extend Phase 2 to cfg-declared entries safely)
-is a separate, deeper recompiler change.
+  1. decode_func's `pc >= end` termination for THIS function.
+  2. promote_sub_entries' enclosing-range check: a `name` line inside
+     [F_start, end) becomes a sub-entry of F. Without end:, the
+     effective range widens (to next-non-skip), so MORE `name` lines
+     get split out as sub-entries, changing parent/child decomposition
+     iteratively.
+  3. auto_promote_branch_targets' range check: a branch target
+     inside [F_start, end) gets an auto_BB_AAAA name generated.
+     Widening the range changes which targets get named.
+  4. _auto_detect_dispatch_helpers' body decode (Phase 2 plumbed
+     _next_addr_for here, but it's still pre-sub-entry-promotion).
+
+Passes 2-3 iterate, so "identity" of cfg_end == next-non-skip at
+parse-time doesn't survive the full pipeline. Attempted "safe" strip
+(cfg_end == next-non-skip including simulated auto-promote additions)
+still regressed 11 RECOMP_WARN defects because sub-entry promotion
+saw a different decomposition after the strip.
+
+Use this tool to SURVEY scope. Selective stripping of individual
+directives is possible but requires per-line human review plus a
+full regen-and-audit cycle. The broader plumbing fix — decoupling
+sub-entry promotion from the cfg func's range, so end: only bounds
+the single func's own decode and not downstream passes — is a
+substantial recompiler change (deferred).
 
 Usage:
     python snesrecomp/tools/cfg_strip_redundant.py --all          # dry-run survey
@@ -84,11 +101,54 @@ def _discoverer_ends(rom: bytes, bank: int) -> Dict[int, int]:
 
 
 def pass1_strip_redundant_end(rom: bytes, bank: int, apply: bool) -> Tuple[int, int]:
-    """Strip end:HHHH where the recompiler will compute the same (or wider).
+    """Strip end:HHHH only when HHHH == next-non-skipped-func-start (i.e.,
+    stripping the directive yields identical decode behavior — the default
+    fallback produces the same end).
+
+    Original, unsafe attempt: strip whenever derived_end >= cfg_end. That
+    regressed 7 RECOMP_WARN defects because for cfg-declared funcs whose
+    body extends past a sibling function (e.g. ParseLevelSpriteList_Entry2
+    crossing FindFreeNormalSpriteSlot_LowPriority to reach $ab78), the
+    discoverer's per-function walk stops at the sibling and reports a
+    narrower d_end than the real body. The manual end: exists precisely
+    for that case — stripping it deletes load-bearing information.
+
+    Identity strip is always safe: behavior does not change at all.
+
     Returns (stripped, kept)."""
     cp = CFG_DIR / f'bank{bank:02x}.cfg'
     if not cp.exists(): return (0, 0)
-    ends = _discoverer_ends(rom, bank)
+    cfg = recomp.parse_config(str(cp))
+    # Simulate the auto-promote pass so next-non-skip reflects the
+    # POST-auto-promote ordering that the emitter actually sees.
+    # Without this, cfg-declared entries can have cfg_end pointing at a
+    # sibling that the cfg author named, but the auto-promote pass
+    # subsequently inserts new auto_BB_AAAA entries between them. The
+    # emitter's next-non-skip falls on the auto entry (narrower than
+    # cfg_end), so stripping cfg_end regresses those decode ranges.
+    seeds = {a for _, a, *_ in cfg.funcs}
+    discovered, _ = discover.discover_bank(
+        rom, bank, external_seeds=seeds,
+        jsl_dispatch=set(cfg.jsl_dispatch or []),
+        jsl_dispatch_long=set(cfg.jsl_dispatch_long or []))
+    existing_addrs = {a for _, a, *_ in cfg.funcs}
+    existing_names = {a & 0xFFFF for a in cfg.names if (a >> 16) == bank}
+    simulated_auto_addrs = set()
+    for a in discovered:
+        if a in existing_addrs: continue
+        if a in existing_names: continue
+        if a in cfg.no_autodiscover: continue
+        if any(er_s <= a <= er_e for er_s, er_e in cfg.exclude_ranges):
+            continue
+        simulated_auto_addrs.add(a)
+    non_skip = sorted(
+        [a for n, a, *_ in cfg.funcs if n not in cfg.skip]
+        + list(simulated_auto_addrs)
+    )
+    def _next_non_skip(addr: int) -> int:
+        for a in non_skip:
+            if a > addr: return a
+        return 0x10000
     lines, nl = _read_cfg_lines(cp)
     stripped = 0
     kept = 0
@@ -102,18 +162,17 @@ def pass1_strip_redundant_end(rom: bytes, bank: int, apply: bool) -> Tuple[int, 
         except ValueError:
             out.append(line); continue
         rest = m.group('rest')
-        # Find an end: token in rest.
         em = re.search(r'(\s+)end:([0-9a-fA-F]+)\b', rest)
         if not em:
             out.append(line); continue
         cfg_end = int(em.group(2), 16)
-        derived_end = ends.get(addr)
-        if derived_end is None or derived_end < cfg_end:
-            # Discoverer can't reproduce or undershoots — keep the cfg's
-            # human-supplied bound.
+        nns = _next_non_skip(addr)
+        if cfg_end != nns:
+            # Stripping would change behavior — cfg_end is load-bearing.
             kept += 1
             out.append(line); continue
-        # Discoverer's end is >= cfg's end → safe to strip.
+        # cfg_end == next-non-skip: directive is documentation of the
+        # fallback. Strip safely.
         new_rest = rest[:em.start()] + rest[em.end():]
         new_line = f"{m.group('lead')}func {m.group('name')} {m.group('addr')}{new_rest}"
         out.append(new_line)
