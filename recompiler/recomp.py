@@ -755,6 +755,232 @@ def infer_live_in_regs(insns: List[Insn], start_addr: int,
     }
 
 
+# DP addresses worth scanning as potential live-in scratch slots. The
+# canonical SMW convention uses $00..$1F for per-function scratch
+# (r0, r2, r4, ... naming) — higher addresses are reserved for long-
+# pointer scratch ($6B..$6F) and are handled via pointer inference.
+_DP_LIVEIN_RANGE = range(0x00, 0x20)
+
+# Mnemonics that READ the DP operand. A direct-page mode operand gets
+# loaded / tested. Reads don't necessarily kill the live-in chain —
+# they establish it when the slot was not previously defined.
+_DP_READ_MNEMS = frozenset({
+    'LDA', 'LDX', 'LDY',
+    'ADC', 'SBC', 'AND', 'ORA', 'EOR',
+    'CMP', 'CPX', 'CPY', 'BIT',
+})
+# Mnemonics that WRITE the DP operand outright (8-bit or 16-bit).
+_DP_WRITE_MNEMS = frozenset({'STA', 'STX', 'STY', 'STZ'})
+# Read-modify-write: reads the DP operand, then writes back. For live-in
+# purposes treat as READ (the first read is live-in if the slot wasn't
+# defined yet). The write happens downstream so it kills further paths.
+_DP_RMW_MNEMS = frozenset({
+    'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR', 'TSB', 'TRB',
+})
+# M-flag-width mnemonics (16-bit under M=0). LDX/LDY/STX/STY/CPX/CPY
+# track X flag instead; everything else (LDA/STA/ADC/...) is M-flag.
+_X_FLAG_MNEMS = frozenset({'LDX', 'LDY', 'STX', 'STY', 'CPX', 'CPY'})
+
+
+def _dp_slot_bits(insn: Insn) -> int:
+    """Return 8 or 16 based on the insn's flag-dependent width.
+    LDX/LDY/STX/STY/CPX/CPY -> x flag; everything else -> m flag."""
+    flag = insn.x_flag if insn.mnem in _X_FLAG_MNEMS else insn.m_flag
+    return 8 if flag else 16
+
+
+def infer_dp_slot_live_in(insns: List[Insn], start_addr: int,
+                           callee_sigs: Optional[Dict[int, str]] = None,
+                           bank: int = 0) -> Dict[int, int]:
+    """Compute which DP slots in $00..$1F are live-in at function entry.
+
+    BFS over the in-function CFG (shared structure with `infer_live_in_regs`).
+    For each DP address: a read-before-write on ANY reachable path flags
+    the slot as a caller-supplied parameter. Width (8 or 16) is taken
+    from the M/X flag at the reading instruction.
+
+    Also honours callee_sigs: a JSR/JSL to a callee whose sig declares
+    `uint8_r0w`/`uint16_r2w` etc. reads the corresponding DP slots as
+    inputs. This catches trampolines that pass DP scratch through to a
+    sub-routine without touching it themselves.
+
+    Returns {dp_addr: width_bits} for live-in slots only.
+    """
+    callee_sigs = callee_sigs or {}
+    if not insns:
+        return {}
+    insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
+    sorted_addrs = sorted(insn_by_addr)
+    if not sorted_addrs:
+        return {}
+    addr_to_idx = {a: i for i, a in enumerate(sorted_addrs)}
+    start16 = start_addr & 0xFFFF
+    if start16 not in insn_by_addr:
+        start16 = sorted_addrs[0]
+
+    def _succs(addr: int) -> List[int]:
+        insn = insn_by_addr.get(addr)
+        if insn is None:
+            return []
+        mn = insn.mnem
+        if mn in ('RTS', 'RTL', 'RTI', 'BRK', 'STP'):
+            return []
+        if mn in ('JMP', 'BRA', 'BRL'):
+            if insn.mode == ABS and insn.operand in insn_by_addr:
+                return [insn.operand]
+            return []
+        succs = []
+        if mn in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC'):
+            if insn.operand in insn_by_addr:
+                succs.append(insn.operand)
+        idx = addr_to_idx.get(addr)
+        if idx is not None and idx + 1 < len(sorted_addrs):
+            succs.append(sorted_addrs[idx + 1])
+        return succs
+
+    def _slot_live_in(dp_addr: int) -> Optional[int]:
+        from collections import deque
+        queue = deque([(start16, False)])
+        visited = set()
+        while queue:
+            addr, defined = queue.popleft()
+            key = (addr, defined)
+            if key in visited:
+                continue
+            visited.add(key)
+            insn = insn_by_addr.get(addr)
+            if insn is None:
+                continue
+            reads_slot = False
+            writes_slot = False
+            # Direct-page operand with exact match — the narrow case worth
+            # propagating as a param. DP_X / DP_Y indexed reads are
+            # skipped; they'd mark a variable index through a table the
+            # caller's sig can't describe as a single param.
+            if insn.mode == DP and insn.operand == dp_addr:
+                if insn.mnem in _DP_READ_MNEMS:
+                    reads_slot = True
+                if insn.mnem in _DP_WRITE_MNEMS:
+                    writes_slot = True
+                if insn.mnem in _DP_RMW_MNEMS:
+                    reads_slot = True  # RMW reads first
+                # 16-bit DP op also touches the adjacent byte — a 16-bit
+                # LDA $01 reads $01-$02 but we index by base only. Callers
+                # of this function do the base-indexed lookup.
+            # JSR/JSL with a known callee that declares this DP slot as
+            # a param counts as a read — the caller sets it up before
+            # the call.
+            if insn.mnem in ('JSR', 'JSL'):
+                tgt = insn.operand
+                if insn.mnem == 'JSR':
+                    tgt = (bank << 16) | (tgt & 0xFFFF)
+                callee_sig = callee_sigs.get(tgt)
+                if callee_sig:
+                    _cret, cparams = parse_sig(callee_sig)
+                    for _pt, pn in cparams:
+                        pdp = _param_to_dp(pn)
+                        if pdp == dp_addr:
+                            reads_slot = True
+                            break
+            if reads_slot and not defined:
+                return _dp_slot_bits(insn)
+            new_defined = defined
+            if writes_slot:
+                new_defined = True
+            # JSR/JSL conservatively clobbers every DP slot — callees
+            # commonly scribble scratch. Without this the chain from a
+            # JSR's return to a subsequent read could propagate "param"
+            # for slots that were actually scratched by the JSR.
+            if insn.mnem in ('JSR', 'JSL'):
+                new_defined = True
+            for succ in _succs(addr):
+                queue.append((succ, new_defined))
+        return None
+
+    out: Dict[int, int] = {}
+    for dp_addr in _DP_LIVEIN_RANGE:
+        bits = _slot_live_in(dp_addr)
+        if bits is not None:
+            out[dp_addr] = bits
+    return out
+
+
+def _dp_slots_supplier_verified(rom: bytes, cfg, candidate_addr: int,
+                                  candidate_slots: Dict[int, int]) -> Dict[int, int]:
+    """Filter DP-slot live-in candidates down to the subset that is
+    actually supplied by the function's callers.
+
+    A body-only live-in test (read-before-write on DP $N) is necessary
+    but not sufficient — SMW's ISRs and main-dispatch loops read DP
+    scratch that callers never set up intentionally. Promoting those as
+    params breaks hand-written caller code (smw_rtl.c's NMI / IRQ
+    dispatchers can't pass args to what they treat as an ISR entry).
+
+    Supplier-driven rule: walk every intra-bank JSR/JSL call site to
+    the candidate. For each slot $N the candidate wants live-in, check
+    whether the caller's body writes $N (STA / STX / STY / STZ $N,
+    plain DP mode) AFTER the most-recent prior JSR and BEFORE the JSR
+    to the candidate. If ALL intra-bank callers write $N in that
+    window, the slot is genuinely supplied and we promote. If any
+    caller doesn't, the slot is scratch-leftover and stays hidden.
+
+    Skip the promotion entirely for functions with ZERO intra-bank
+    direct callers (pure dispatch / ISR / cross-bank-only) — the
+    supplier test has nothing to measure.
+    """
+    if not candidate_slots:
+        return {}
+    bank = cfg.bank
+    cand_local = candidate_addr & 0xFFFF
+    # Collect caller contexts: every intra-bank fn whose body has a
+    # JSR/JSL to cand_local.
+    callers: List[Tuple[int, List[Insn]]] = []
+    non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
+                if f not in cfg.skip]
+    non_skip.sort(key=lambda t: t[1])
+    for i, (_fname, saddr, _sig, eovr, mo, _h) in enumerate(non_skip):
+        end_addr = eovr if eovr is not None else (
+            non_skip[i + 1][1] if i + 1 < len(non_skip) else 0x10000)
+        try:
+            cinsns = decode_func(rom, bank, saddr, end=end_addr,
+                                  mode_overrides=mo or None,
+                                  validate_branches=False)
+        except Exception:
+            continue
+        for insn in cinsns:
+            if insn.mnem in ('JSR', 'JSL') and (insn.operand & 0xFFFF) == cand_local:
+                callers.append((insn.addr & 0xFFFF, cinsns))
+                break
+    if not callers:
+        return {}  # no direct intra-bank callers to measure
+
+    verified: Dict[int, int] = {}
+    WRITE_MNEMS = _DP_WRITE_MNEMS | _DP_RMW_MNEMS
+    for dp_addr, bits in candidate_slots.items():
+        all_supply = True
+        for jsr_pc, cinsns in callers:
+            # Walk backward from the JSR; a preceding STA/STX/STY/STZ to
+            # DP $N establishes supply for this caller. Give up at the
+            # prior JSR / any branch target boundary (conservative).
+            supplies = False
+            in_range = False
+            for insn in cinsns:
+                if (insn.addr & 0xFFFF) == jsr_pc:
+                    break
+                if insn.mnem in ('JSR', 'JSL'):
+                    supplies = False  # prior call clobbers / re-starts window
+                    continue
+                if (insn.mode == DP and insn.operand == dp_addr
+                        and insn.mnem in WRITE_MNEMS):
+                    supplies = True
+            if not supplies:
+                all_supply = False
+                break
+        if all_supply:
+            verified[dp_addr] = bits
+    return verified
+
+
 def _detect_register_restore_expr(insns: List[Insn], reg: str) -> Optional[str]:
     """Generalised version of _detect_x_restore_expr that works for any of
     A/X/Y. Returns the g_ram[0xXXXX] expression matching the most-recent
@@ -995,13 +1221,16 @@ def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
     return True
 
 
-def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int]]) -> Optional[str]:
-    """Add any live-in register parameters missing from `sig`.
+def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int]],
+                                dp_live_in: Optional[Dict[int, int]] = None) -> Optional[str]:
+    """Add any live-in register / DP-slot parameters missing from `sig`.
 
     Cfg/funcs.h sigs keep priority for types, struct returns, DP params, and
     any explicit `_a`/`_k`/`_j` params already declared. If inference finds
     A/X/Y live-in and the sig doesn't already pass it via a register param,
-    one is appended.
+    one is appended. Same rule for DP-slot live-in — a slot at DP $N that
+    the body reads before writing becomes `uint8_rN` (M=1) or
+    `uint16_rNw` (M=0, where N is lowercase hex).
 
     This pass only WIDENS: it never drops a param that's already in the
     sig, even when live-in says the register isn't consumed. Rationale:
@@ -1014,6 +1243,7 @@ def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int
       - A live-in -> append `uint8_a` / `uint16_a`.
       - X live-in -> append `uint8_k` / `uint16_k`.
       - Y live-in -> append `uint8_j` / `uint16_j`.
+      - DP $N live-in -> append `uint8_rN` (or `uint16_rNw` for 16-bit).
 
     Ordering within the argument list matches the order registers first
     become live, so callers using positional args stay consistent.
@@ -1029,6 +1259,14 @@ def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int
     have_a = any(pname == 'a' for _pt, pname in params)
     have_x = any(pname in ('k',) for _pt, pname in params)
     have_y = any(pname == 'j' for _pt, pname in params)
+    # Existing DP-slot params in the sig — match by the underlying DP
+    # address so a cfg sig with `uint8_r0` (or any alias that maps to
+    # $00) is NOT duplicated by the auto-inference.
+    existing_dp: Set[int] = set()
+    for _pt, pn in params:
+        dp = _param_to_dp(pn)
+        if dp is not None:
+            existing_dp.add(dp)
 
     new_params = list(params)
     if live_in.get('X') is not None and not have_x:
@@ -1040,6 +1278,16 @@ def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int
     if live_in.get('A') is not None and not have_a:
         t = 'uint16' if live_in['A'] == 16 else 'uint8'
         new_params.append((t, 'a'))
+    if dp_live_in:
+        # Deterministic order: ascending DP address.
+        for dp_addr in sorted(dp_live_in):
+            if dp_addr in existing_dp:
+                continue
+            bits = dp_live_in[dp_addr]
+            if bits == 16:
+                new_params.append(('uint16', f'r{dp_addr:x}w'))
+            else:
+                new_params.append(('uint8', f'r{dp_addr:x}'))
 
     if new_params == params:
         return sig
@@ -1938,6 +2186,17 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
         live_in = infer_live_in_regs(insns, start_addr, bank=cfg.bank,
                                      callee_sigs=cfg.sigs,
                                      callee_clobbers=getattr(cfg, 'clobbers', None))
+        # DP-slot live-in: body-only detection (read-before-write on $N)
+        # is necessary but not sufficient — SMW's ISRs / dispatch loops
+        # read DP scratch callers never set up intentionally. The
+        # supplier-driven filter below keeps only the slots that ALL
+        # intra-bank direct callers write before the JSR. Slots that
+        # fail the filter are scratch-leftover from the caller's own
+        # state, not real params.
+        dp_live_in_candidates = infer_dp_slot_live_in(
+            insns, start_addr, callee_sigs=cfg.sigs, bank=cfg.bank)
+        dp_live_in = _dp_slots_supplier_verified(
+            rom, cfg, start_addr, dp_live_in_candidates)
         # Fall-through to next function is a tail call. If the last decoded
         # instruction doesn't transfer control, the function falls through
         # into the next function in ROM order — whose sig's register
@@ -1985,7 +2244,7 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                     if body_writes:
                         continue
                     live_in[reg] = 8
-        new_sig = _augment_sig_with_livein(current_sig, live_in)
+        new_sig = _augment_sig_with_livein(current_sig, live_in, dp_live_in)
         # Record the pre-narrowing live-in for dispatch-union computation.
         # After narrowing caps a handler's sig to (uint8_k), looking at
         # cfg.sigs can no longer reveal that the handler originally
