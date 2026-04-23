@@ -133,6 +133,11 @@ static void h_emu_is_loaded(const char *args) {
                           g_active_backend ? g_active_backend->name : "");
 }
 
+/* Streams hex to handle up to full WRAM (128 KB). The prior 1024-byte clamp
+ * against a 4 KB stack hex buffer silently truncated larger requests — the
+ * same archetype as cmd_read_ram's clamp, found during the 2026-04-23
+ * tooling-audit. */
+extern void debug_server_send_raw(const void *data, int len);
 static void h_emu_read_wram(const char *args) {
     if (!g_active_backend) {
         debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
@@ -144,20 +149,26 @@ static void h_emu_read_wram(const char *args) {
         return;
     }
     if (len < 1) len = 1;
-    if (len > 1024) len = 1024;
+    if (len > 0x20000) len = 0x20000;  /* full WRAM */
     if (addr >= 0x20000u || addr + len > 0x20000u) {
         debug_server_send_fmt("{\"ok\":false,\"error\":\"wram range out of bounds\",\"addr\":\"0x%x\",\"len\":%u}", addr, len);
         return;
     }
     static uint8_t buf[0x20000];
     g_active_backend->get_wram(buf);
-    char hex[4096];
-    int pos = 0;
-    for (unsigned int i = 0; i < len && pos + 3 < (int)sizeof(hex); i++)
-        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", buf[addr + i]);
-    hex[pos] = 0;
-    debug_server_send_fmt("{\"ok\":true,\"addr\":\"0x%05x\",\"len\":%u,\"hex\":\"%s\"}",
-                          addr, len, hex);
+    char hdr[128];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "{\"ok\":true,\"addr\":\"0x%05x\",\"len\":%u,\"hex\":\"",
+                        addr, len);
+    debug_server_send_raw(hdr, hlen);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", buf[addr + i]);
+        debug_server_send_raw(chunk, pos);
+    }
+    debug_server_send_raw("\"}\n", 3);
 }
 
 /* Drive the active backend forward N frames without advancing the
@@ -400,6 +411,114 @@ static void h_emu_get_wram_trace(const char *args) {
     debug_server_send_line(buf);
 }
 
+/* find_first_divergence [subsystem=wram] [lo=0] [hi=0x1FFFF] [context=16]
+ *
+ * Compares the recompiled runtime's live state against the oracle backend's
+ * live state AT THE CURRENT FRAME. Returns the first byte offset where they
+ * differ, plus a window of surrounding bytes for context. Caller invokes
+ * this at whatever point they suspect divergence; the runtime and backend
+ * run in lock-step per frame, so "current frame" on both sides is the same.
+ *
+ * Subsystem: only `wram` is supported today. The backend interface also
+ * declares get_vram / get_cgram / get_oam slots, but no backend has shipped
+ * them yet; those return "not implemented" until the snes9x bridge (or
+ * another backend) fills them in.
+ *
+ * Scope note: this is the single-instant comparator. A frame-range
+ * stepping variant (walk forward N frames, stop at first divergence) is a
+ * natural follow-up once the backend exposes a blocking "run to frame N"
+ * entry point — today's TCP-handler-synchronous model can't drive recomp's
+ * main-loop frame advance from inside a command.
+ */
+extern uint8_t g_ram[0x20000];  /* recomp's 128 KB WRAM, see common_rtl.h */
+
+static void h_find_first_divergence(const char *args) {
+    if (!g_active_backend) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
+        return;
+    }
+
+    char subsystem[16] = "wram";
+    unsigned int lo = 0x00000, hi = 0x1FFFF;
+    int context = 16;
+    if (args && *args) {
+        /* Best-effort parse: <word> [hex_lo] [hex_hi] [dec_context]. All optional. */
+        const char *p = args;
+        while (*p == ' ') p++;
+        if (*p && *p != ' ') {
+            int i = 0;
+            while (*p && *p != ' ' && i < 15) subsystem[i++] = *p++;
+            subsystem[i] = 0;
+        }
+        sscanf(p, "%x %x %d", &lo, &hi, &context);
+    }
+    if (strcmp(subsystem, "wram") != 0) {
+        debug_server_send_fmt(
+            "{\"ok\":false,\"error\":\"subsystem not implemented\","
+            "\"subsystem\":\"%s\",\"supported\":[\"wram\"]}",
+            subsystem);
+        return;
+    }
+    if (hi >= 0x20000) hi = 0x1FFFF;
+    if (lo > hi) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"lo > hi\"}");
+        return;
+    }
+    if (context < 0) context = 0;
+    if (context > 256) context = 256;
+
+    /* Copy both sides into stable buffers, then scan. get_wram may run
+     * non-trivial work on the backend side; do it once. */
+    static uint8_t oracle_wram[0x20000];
+    g_active_backend->get_wram(oracle_wram);
+    const uint8_t *recomp_wram = g_ram;  /* live recomp WRAM */
+
+    int first_diff = -1;
+    int diff_count = 0;
+    for (unsigned int i = lo; i <= hi; i++) {
+        if (recomp_wram[i] != oracle_wram[i]) {
+            if (first_diff < 0) first_diff = (int)i;
+            diff_count++;
+        }
+    }
+
+    char buf[16384];
+    int pos;
+    if (first_diff < 0) {
+        pos = snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"match\":true,\"subsystem\":\"%s\","
+            "\"lo\":\"0x%05x\",\"hi\":\"0x%05x\",\"bytes_scanned\":%u}",
+            subsystem, lo, hi, (unsigned)(hi - lo + 1));
+    } else {
+        /* Context window: `context` bytes on each side of first_diff,
+         * clipped to [lo, hi]. */
+        int ctx_lo = first_diff - context;
+        int ctx_hi = first_diff + context;
+        if (ctx_lo < (int)lo) ctx_lo = (int)lo;
+        if (ctx_hi > (int)hi) ctx_hi = (int)hi;
+
+        pos = snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"match\":false,\"subsystem\":\"%s\","
+            "\"first_diff\":\"0x%05x\",\"recomp\":\"0x%02x\",\"oracle\":\"0x%02x\","
+            "\"diff_count\":%d,\"lo\":\"0x%05x\",\"hi\":\"0x%05x\","
+            "\"context\":[",
+            subsystem, (unsigned)first_diff,
+            recomp_wram[first_diff], oracle_wram[first_diff],
+            diff_count, lo, hi);
+        int first_emit = 1;
+        for (int i = ctx_lo; i <= ctx_hi && pos + 128 < (int)sizeof(buf); i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"adr\":\"0x%05x\",\"r\":\"0x%02x\",\"o\":\"0x%02x\",\"diff\":%s}",
+                first_emit ? "" : ",",
+                (unsigned)i, recomp_wram[i], oracle_wram[i],
+                (recomp_wram[i] != oracle_wram[i]) ? "true" : "false");
+            first_emit = 0;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    }
+    debug_server_send_line(buf);
+}
+
 static void h_emu_cpu_regs(const char *args) {
     (void)args;
     if (!g_active_backend) {
@@ -436,6 +555,7 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_insn_trace_count") == 0) { h_emu_insn_trace_count(args); return 1; }
     if (strcmp(cmd, "emu_nmi_count") == 0)        { h_emu_nmi_count(args);        return 1; }
     if (strcmp(cmd, "emu_get_insn_trace") == 0)   { h_emu_get_insn_trace(args);   return 1; }
+    if (strcmp(cmd, "find_first_divergence") == 0){ h_find_first_divergence(args); return 1; }
     return 0;
 }
 

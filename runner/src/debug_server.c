@@ -948,10 +948,42 @@ typedef struct {
     uint16_t fixedColor, vramPointer;
 } FramePpuSnap;
 
-// Per-frame DMA channel snapshot (8 bytes per channel)
+// Per-frame interrupt/timing snapshot. Added 2026-04-23 after the tooling-
+// audit found interrupt state completely unobservable post-interpreter-rip:
+// the Cpu struct's nmiWanted/irqWanted were deleted as write-only, but the
+// SNES struct's inNmi/inIrq/inVblank/timers are live and load-bearing.
 typedef struct {
-    uint8_t bAdr, aBank, mode, flags; // flags: bit0=dmaActive,1=hdmaActive,2=fixed,3=decrement,4=indirect,5=fromB
+    uint8_t inNmi;          // currently servicing NMI
+    uint8_t inIrq;          // currently servicing IRQ
+    uint8_t inVblank;       // inside vblank interval
+    uint8_t nmiEnabled;     // $4200 bit 7
+    uint8_t hIrqEnabled;    // $4200 bit 4
+    uint8_t vIrqEnabled;    // $4200 bit 5
+    uint8_t autoJoyRead;    // $4200 bit 0
+    uint8_t _pad;
+    uint16_t hPos;          // current H dot
+    uint16_t vPos;          // current V scanline
+    uint16_t hTimer;        // $4207/$4208
+    uint16_t vTimer;        // $4209/$420A
+    uint16_t autoJoyTimer;
+    uint16_t _pad2;
+} FrameIrqSnap;
+
+// Per-frame DMA channel snapshot (16 bytes per channel, incl. HDMA state).
+// HDMA fields (tableAdr, repCount, indBank, offIndex, doTransfer, terminated)
+// were added 2026-04-23 after the tooling-audit found HDMA was invisible in
+// frame history — any bug involving per-scanline HDMA sequencing was previously
+// undiagnosable from historical snapshots alone.
+typedef struct {
+    uint8_t bAdr, aBank, mode, flags;
+    // flags: bit0=dmaActive, 1=hdmaActive, 2=fixed, 3=decrement,
+    //        4=indirect, 5=fromB, 6=doTransfer, 7=terminated
     uint16_t aAdr, size;
+    uint16_t tableAdr;   // HDMA table pointer
+    uint8_t indBank;     // HDMA indirect bank
+    uint8_t repCount;    // HDMA line-repeat counter
+    uint8_t offIndex;    // HDMA offset index into table
+    uint8_t _pad[3];     // keep struct size a multiple of 8 bytes
 } FrameDmaChannelSnap;
 
 typedef struct {
@@ -962,6 +994,7 @@ typedef struct {
     FrameCpuSnap cpu;
     FramePpuSnap ppu;
     FrameDmaChannelSnap dma[8];
+    FrameIrqSnap irq;
     uint16_t cgram[0x100];    // 512 bytes (full palette)
     uint16_t oam[0x100];      // 512 bytes (main OAM table)
     uint8_t highOam[0x20];    // 32 bytes (high OAM table)
@@ -1056,21 +1089,48 @@ void debug_server_record_frame(int frame) {
         memset(r->highOam, 0, sizeof(r->highOam));
     }
 
-    // DMA channels
+    // DMA channels (incl. HDMA state)
     if (g_dma) {
         for (int ch = 0; ch < 8; ch++) {
             DmaChannel *dc = &g_dma->channel[ch];
             r->dma[ch].bAdr = dc->bAdr;
             r->dma[ch].aBank = dc->aBank;
             r->dma[ch].mode = dc->mode;
-            r->dma[ch].flags = (dc->dmaActive ? 1 : 0) | (dc->hdmaActive ? 2 : 0) |
-                                (dc->fixed ? 4 : 0) | (dc->decrement ? 8 : 0) |
-                                (dc->indirect ? 16 : 0) | (dc->fromB ? 32 : 0);
+            r->dma[ch].flags = (dc->dmaActive   ? 0x01 : 0)
+                             | (dc->hdmaActive  ? 0x02 : 0)
+                             | (dc->fixed       ? 0x04 : 0)
+                             | (dc->decrement   ? 0x08 : 0)
+                             | (dc->indirect    ? 0x10 : 0)
+                             | (dc->fromB       ? 0x20 : 0)
+                             | (dc->doTransfer  ? 0x40 : 0)
+                             | (dc->terminated  ? 0x80 : 0);
             r->dma[ch].aAdr = dc->aAdr;
             r->dma[ch].size = dc->size;
+            r->dma[ch].tableAdr = dc->tableAdr;
+            r->dma[ch].indBank  = dc->indBank;
+            r->dma[ch].repCount = dc->repCount;
+            r->dma[ch].offIndex = dc->offIndex;
         }
     } else {
         memset(r->dma, 0, sizeof(r->dma));
+    }
+
+    // Interrupt / timing state
+    if (g_snes) {
+        r->irq.inNmi       = g_snes->inNmi       ? 1 : 0;
+        r->irq.inIrq       = g_snes->inIrq       ? 1 : 0;
+        r->irq.inVblank    = g_snes->inVblank    ? 1 : 0;
+        r->irq.nmiEnabled  = g_snes->nmiEnabled  ? 1 : 0;
+        r->irq.hIrqEnabled = g_snes->hIrqEnabled ? 1 : 0;
+        r->irq.vIrqEnabled = g_snes->vIrqEnabled ? 1 : 0;
+        r->irq.autoJoyRead = g_snes->autoJoyRead ? 1 : 0;
+        r->irq.hPos         = g_snes->hPos;
+        r->irq.vPos         = g_snes->vPos;
+        r->irq.hTimer       = g_snes->hTimer;
+        r->irq.vTimer       = g_snes->vTimer;
+        r->irq.autoJoyTimer = g_snes->autoJoyTimer;
+    } else {
+        memset(&r->irq, 0, sizeof(r->irq));
     }
 
     // Zero page snapshot (WRAM $00-$FF) — backward-compat alias.
@@ -1157,36 +1217,45 @@ static void cmd_frame(const char *args) {
              g_last_recomp_func ? g_last_recomp_func : "?");
 }
 
+// read_ram: space-separated hex, streamed to handle arbitrary lengths up to
+// full WRAM (128 KB). Format kept for back-compat with existing probe scripts
+// that parse r['hex'].split(). Prior implementation silently clamped to 1024
+// bytes against a fixed 4 KB hex buffer, which masked divergences in any
+// probe requesting a larger range (most notably _probe_bug8_full_wram_diff.py
+// asking for 0x2000 bytes and only comparing the first 0x400).
 static void cmd_read_ram(const char *args) {
     unsigned int addr = 0, len = 16;
     sscanf(args, "%x %u", &addr, &len);
-    if (len > 1024) len = 1024;
+    if (len > 0x20000) len = 0x20000;  // 128 KB max — full WRAM
     if (!s_ram || addr + len > s_ram_size) {
         send_fmt("{\"error\":\"out of range\",\"addr\":\"0x%x\",\"max\":\"0x%x\"}", addr, s_ram_size);
         return;
     }
-    // Build hex string
-    char hex[4096];
-    int pos = 0;
-    for (unsigned int i = 0; i < len && pos < 4000; i++)
-        pos += snprintf(hex + pos, sizeof(hex) - pos, "%s%02x", i ? " " : "", s_ram[addr + i]);
-    send_fmt("{\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"%s\"}", addr, len, hex);
+    if (s_client_sock == SOCKET_INVALID) return;
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "{\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"", addr, len);
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%s%02x", (i == 0) ? "" : " ", s_ram[addr + i]);
+        send(s_client_sock, chunk, pos, 0);
+    }
+    send(s_client_sock, "\"}\n", 3, 0);
 }
 
-// dump_ram: large-range hex dump for oracle comparison.
+// dump_ram: compact (no-space) hex dump for oracle comparison. Same streaming
+// shape as read_ram; the two differ only in format (space-separated vs. tight).
 // Usage: dump_ram <start_hex> <len_decimal>
-// Returns hex bytes as a long string (up to 64KB).
 static void cmd_dump_ram(const char *args) {
     unsigned int addr = 0, len = 256;
     sscanf(args, "%x %u", &addr, &len);
-    if (len > 0x10000) len = 0x10000;  // 64KB max
+    if (len > 0x20000) len = 0x20000;  // 128 KB max — full WRAM
     if (!s_ram || addr + len > s_ram_size) {
         send_fmt("{\"error\":\"out of range\",\"addr\":\"0x%x\",\"len\":%u}", addr, len);
         return;
     }
-    // Send in chunks to avoid buffer overflow
-    // Format: {"addr":"0x...","len":...,"hex":"aabbcc..."}
-    // 64KB = 128K hex chars. Too big for one JSON line. Use chunked format.
     char hdr[128];
     snprintf(hdr, sizeof(hdr), "{\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"", addr, len);
     if (s_client_sock == SOCKET_INVALID) return;
@@ -2771,6 +2840,28 @@ static void cmd_get_ppu_state(const char *args) {
              p->evenFrame ? "true" : "false");
 }
 
+// Interrupt / timing state. Exposes the SNES-level fields that are
+// load-bearing for NMI/IRQ timing analysis (inNmi, inVblank, scanline,
+// IRQ enables, auto-joypad timer). These were invisible to the debugger
+// after the interpreter rip; the Cpu struct's nmiWanted/irqWanted were
+// deleted as write-only, but the SNES struct kept the meaningful state.
+static void cmd_get_interrupt_state(const char *args) {
+    if (!g_snes) { send_fmt("{\"error\":\"snes not available\"}"); return; }
+    Snes *s = g_snes;
+    send_fmt("{\"inNmi\":%s,\"inIrq\":%s,\"inVblank\":%s,"
+             "\"nmiEnabled\":%s,\"hIrqEnabled\":%s,\"vIrqEnabled\":%s,"
+             "\"autoJoyRead\":%s,\"hPos\":%u,\"vPos\":%u,"
+             "\"hTimer\":%u,\"vTimer\":%u,\"autoJoyTimer\":%u}",
+             s->inNmi       ? "true" : "false",
+             s->inIrq       ? "true" : "false",
+             s->inVblank    ? "true" : "false",
+             s->nmiEnabled  ? "true" : "false",
+             s->hIrqEnabled ? "true" : "false",
+             s->vIrqEnabled ? "true" : "false",
+             s->autoJoyRead ? "true" : "false",
+             s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer);
+}
+
 static void cmd_get_cpu_state(const char *args) {
     if (!g_cpu) { send_fmt("{\"error\":\"cpu not available\"}"); return; }
     Cpu *c = g_cpu;
@@ -2791,7 +2882,7 @@ static void cmd_get_cpu_state(const char *args) {
 
 static void cmd_get_dma_state(const char *args) {
     if (!g_dma) { send_fmt("{\"error\":\"dma not available\"}"); return; }
-    char buf[4096];
+    char buf[8192];
     int pos = snprintf(buf, sizeof(buf), "{\"channels\":[");
     for (int ch = 0; ch < 8; ch++) {
         DmaChannel *dc = &g_dma->channel[ch];
@@ -2799,12 +2890,17 @@ static void cmd_get_dma_state(const char *args) {
             "%s{\"ch\":%d,\"bAdr\":\"0x%02x\",\"aAdr\":\"0x%04x\",\"aBank\":\"0x%02x\","
             "\"size\":%d,\"mode\":%d,"
             "\"dmaActive\":%s,\"hdmaActive\":%s,\"fixed\":%s,"
-            "\"decrement\":%s,\"indirect\":%s,\"fromB\":%s}",
+            "\"decrement\":%s,\"indirect\":%s,\"fromB\":%s,"
+            "\"tableAdr\":\"0x%04x\",\"indBank\":\"0x%02x\","
+            "\"repCount\":%d,\"offIndex\":%d,"
+            "\"doTransfer\":%s,\"terminated\":%s}",
             ch ? "," : "", ch, dc->bAdr, dc->aAdr, dc->aBank,
             dc->size, dc->mode,
             dc->dmaActive ? "true" : "false", dc->hdmaActive ? "true" : "false",
             dc->fixed ? "true" : "false", dc->decrement ? "true" : "false",
-            dc->indirect ? "true" : "false", dc->fromB ? "true" : "false");
+            dc->indirect ? "true" : "false", dc->fromB ? "true" : "false",
+            dc->tableAdr, dc->indBank, dc->repCount, dc->offIndex,
+            dc->doTransfer ? "true" : "false", dc->terminated ? "true" : "false");
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
@@ -2888,16 +2984,37 @@ static void cmd_get_frame_extended(const char *args) {
         r->ppu.fixedColor, r->ppu.vramPointer);
     send(s_client_sock, buf, pos, 0);
 
-    // DMA channels
+    // DMA channels (incl. HDMA state fields captured per-frame)
     pos = snprintf(buf, sizeof(buf), "\"dma\":[");
     for (int ch = 0; ch < 8; ch++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s{\"bAdr\":\"0x%02x\",\"aBank\":\"0x%02x\",\"mode\":%d,\"flags\":\"0x%02x\","
-            "\"aAdr\":\"0x%04x\",\"size\":%d}",
+            "\"aAdr\":\"0x%04x\",\"size\":%d,"
+            "\"tableAdr\":\"0x%04x\",\"indBank\":\"0x%02x\","
+            "\"repCount\":%d,\"offIndex\":%d}",
             ch ? "," : "", r->dma[ch].bAdr, r->dma[ch].aBank, r->dma[ch].mode,
-            r->dma[ch].flags, r->dma[ch].aAdr, r->dma[ch].size);
+            r->dma[ch].flags, r->dma[ch].aAdr, r->dma[ch].size,
+            r->dma[ch].tableAdr, r->dma[ch].indBank,
+            r->dma[ch].repCount, r->dma[ch].offIndex);
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "],");
+    send(s_client_sock, buf, pos, 0);
+
+    // Interrupt / timing state
+    pos = snprintf(buf, sizeof(buf),
+        "\"irq\":{\"inNmi\":%s,\"inIrq\":%s,\"inVblank\":%s,"
+        "\"nmiEnabled\":%s,\"hIrqEnabled\":%s,\"vIrqEnabled\":%s,"
+        "\"autoJoyRead\":%s,\"hPos\":%u,\"vPos\":%u,"
+        "\"hTimer\":%u,\"vTimer\":%u,\"autoJoyTimer\":%u},",
+        r->irq.inNmi       ? "true" : "false",
+        r->irq.inIrq       ? "true" : "false",
+        r->irq.inVblank    ? "true" : "false",
+        r->irq.nmiEnabled  ? "true" : "false",
+        r->irq.hIrqEnabled ? "true" : "false",
+        r->irq.vIrqEnabled ? "true" : "false",
+        r->irq.autoJoyRead ? "true" : "false",
+        r->irq.hPos, r->irq.vPos, r->irq.hTimer, r->irq.vTimer,
+        r->irq.autoJoyTimer);
     send(s_client_sock, buf, pos, 0);
 
     // CGRAM as hex blob
@@ -3037,6 +3154,7 @@ static const CmdEntry s_commands[] = {
     {"get_ppu_state", cmd_get_ppu_state},
     {"get_cpu_state", cmd_get_cpu_state},
     {"get_dma_state", cmd_get_dma_state},
+    {"get_interrupt_state", cmd_get_interrupt_state},
     {"get_apu_state", cmd_get_apu_state},
     {"dump_apu_ram",  cmd_dump_apu_ram},
     {"screenshot",     cmd_screenshot},
@@ -3084,6 +3202,13 @@ void debug_server_send_fmt(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     send_line(buf);
+}
+// Raw byte send — no newline framing — for streaming large hex payloads
+// (the dump_ram / read_ram / find_first_divergence pattern). Caller is
+// responsible for any framing.
+void debug_server_send_raw(const void *data, int len) {
+    if (s_client_sock == SOCKET_INVALID) return;
+    send(s_client_sock, (const char *)data, len, 0);
 }
 #endif
 

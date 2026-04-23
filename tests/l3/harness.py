@@ -126,7 +126,8 @@ def snapshot(client: DebugClient) -> Dict[str, bytes]:
     (full 128KB). VRAM/CGRAM/OAM via dedicated dump commands if available.
     """
     out: Dict[str, bytes] = {}
-    # WRAM: read_ram chunks (command caps at 1024 bytes per call).
+    # WRAM: read_ram chunks. The server now accepts up to 128 KB per call,
+    # but we keep 1 KB chunks here so the split(' ') parse stays bounded.
     wram = bytearray(0x20000)
     chunk = 1024
     for off in range(0, 0x20000, chunk):
@@ -180,8 +181,8 @@ def diff_snapshots(a: Dict[str, bytes], b: Dict[str, bytes]) -> Dict[str, List[T
 # ---- the main entry point -------------------------------------------------
 
 def _read_wram_bytes(client: DebugClient, addr: int, length: int) -> bytes:
-    """Read an arbitrary WRAM range via read_ram (which caps at 1024
-    bytes per call). Stitches multiple calls if length exceeds that."""
+    """Read an arbitrary WRAM range via read_ram. The server accepts up to
+    128 KB per call; we stitch at 1 KB chunks so the parse stays bounded."""
     out = bytearray()
     while length > 0:
         chunk = min(1024, length)
