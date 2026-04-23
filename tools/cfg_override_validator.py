@@ -82,16 +82,23 @@ TOKEN_SPECS = {
     # the two-path dispatch.
     'exclude_range': ('line', r'^\s*exclude_range\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+.*$'),
     'no_autodiscover': ('line', r'^\s*no_autodiscover\s+[0-9a-fA-F]+.*$'),
+    # `name XXYYYY NameStr [sig:...]` — cross-bank alias. When stripped,
+    # the owning-cfg-bank's emitter may fall back to sibling-cfg-import
+    # (often the canonical `func` entry in bank XX.cfg carries the same
+    # name and sig). The strip is load-bearing only if the alias carries
+    # info the sibling import doesn't (e.g. non-matching sig, address
+    # that isn't a cfg'd func anywhere else).
+    'name': ('line', r'^\s*name\s+[0-9a-fA-F]+\s+\S+.*$'),
 }
 
 # Types whose strip-and-diff effects are strictly intra-bank — safe to
 # verify against the owning bank only, skipping the 9x all-banks cost.
-# exclude_range shifts data/code decoding within one bank; no cross-bank
-# live-in propagation unless the mis-decoded bytes happen to contain a
-# JSL to another bank AND that JSL's target is a new cross-bank name —
-# rare enough that owning-bank check is a pragmatic default. Callers
-# can force all-banks via the --all-banks flag if needed.
-INTRA_BANK_TYPES = frozenset({'exclude_range', 'no_autodiscover'})
+# exclude_range shifts data/code decoding within one bank.
+# no_autodiscover blocks an intra-bank auto-promote decision.
+# name: only the owning cfg file's gen-C can change; other banks read
+# the cross-bank name via sibling-cfg import which doesn't see the
+# stripped local override.
+INTRA_BANK_TYPES = frozenset({'exclude_range', 'no_autodiscover', 'name'})
 
 
 def bank_gen_path(bank: int) -> pathlib.Path:
