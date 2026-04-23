@@ -158,13 +158,20 @@ static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
 }
 static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
-  dst[0] = value;
 #if SNESRECOMP_REVERSE_DEBUG
   // Only fire the WRAM hook if the write actually landed in WRAM.
   // dst may point into ROM for in-ROM data-table writes (a NOP in practice
   // since ROM is read-only, but the ptr math still lands there).
-  if (dst >= g_ram && dst < g_ram + 0x20000)
-    debug_on_wram_write_byte((uint32_t)(dst - g_ram), value);
+  // Read old BEFORE the store so the Tier-1 log can emit old/new.
+  if (dst >= g_ram && dst < g_ram + 0x20000) {
+    uint8_t old_val = dst[0];
+    dst[0] = value;
+    debug_on_wram_write_byte((uint32_t)(dst - g_ram), old_val, value);
+  } else {
+    dst[0] = value;
+  }
+#else
+  dst[0] = value;
 #endif
 }
 
@@ -174,11 +181,19 @@ static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
 // always contiguous in the target region (WRAM or ROM-mirror).
 static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
+#if SNESRECOMP_REVERSE_DEBUG
+  if (dst >= g_ram && dst < g_ram + 0x20000) {
+    uint16_t old_val = (uint16_t)dst[0] | ((uint16_t)dst[1] << 8);
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    debug_on_wram_write_word((uint32_t)(dst - g_ram), old_val, value);
+  } else {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+  }
+#else
   dst[0] = (uint8_t)value;
   dst[1] = (uint8_t)(value >> 8);
-#if SNESRECOMP_REVERSE_DEBUG
-  if (dst >= g_ram && dst < g_ram + 0x20000)
-    debug_on_wram_write_word((uint32_t)(dst - g_ram), value);
 #endif
 }
 
@@ -188,15 +203,23 @@ static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
 #if SNESRECOMP_REVERSE_DEBUG
 static inline void rdb_indir_dbx_store8(uint8 dp_addr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtrDB(dp_addr, offs);
-  dst[0] = value;
-  if (dst >= g_ram && dst < g_ram + 0x20000)
-    debug_on_wram_write_byte((uint32_t)(dst - g_ram), value);
+  if (dst >= g_ram && dst < g_ram + 0x20000) {
+    uint8_t old_val = dst[0];
+    dst[0] = value;
+    debug_on_wram_write_byte((uint32_t)(dst - g_ram), old_val, value);
+  } else {
+    dst[0] = value;
+  }
 }
 static inline void rdb_indir_dbx_store16(uint8 dp_addr, uint16 offs, uint16 value) {
   uint8_t *dst = IndirPtrDB(dp_addr, offs);
-  *(uint16_t *)dst = value;
-  if (dst >= g_ram && dst < g_ram + 0x20000)
-    debug_on_wram_write_word((uint32_t)(dst - g_ram), value);
+  if (dst >= g_ram && dst < g_ram + 0x20000) {
+    uint16_t old_val = *(uint16_t *)dst;
+    *(uint16_t *)dst = value;
+    debug_on_wram_write_word((uint32_t)(dst - g_ram), old_val, value);
+  } else {
+    *(uint16_t *)dst = value;
+  }
 }
 #endif
 

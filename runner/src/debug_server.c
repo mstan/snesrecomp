@@ -339,8 +339,9 @@ static struct {
     struct {
         int frame;
         uint32_t adr;
-        uint16_t val;   // 16-bit to hold word writes; byte writes use low 8
-        uint8_t width;  // 1 = byte, 2 = word
+        uint16_t old_val; // value in WRAM BEFORE the store (added 2026-04-23)
+        uint16_t val;     // value after the store (16-bit to hold word writes)
+        uint8_t width;    // 1 = byte, 2 = word
         uint64_t block_idx;  // Tier 3: monotonic block counter at time of write
         char func[48];
         char parent[48];  // caller of `func` (one level up the recomp stack)
@@ -535,13 +536,14 @@ static inline int rdb_range_hit(uint32_t adr, uint8_t width) {
     return 0;
 }
 
-static inline void rdb_record(uint32_t adr, uint16_t val, uint8_t width) {
+static inline void rdb_record(uint32_t adr, uint16_t old_val, uint16_t new_val, uint8_t width) {
     if (!s_wram_trace.active) return;
     if (!rdb_range_hit(adr, width)) return;
     int idx = s_wram_trace.write_idx % WRAM_TRACE_LOG_SIZE;
     s_wram_trace.log[idx].frame = snes_frame_counter;
     s_wram_trace.log[idx].adr = adr;
-    s_wram_trace.log[idx].val = val;
+    s_wram_trace.log[idx].old_val = old_val;
+    s_wram_trace.log[idx].val = new_val;
     s_wram_trace.log[idx].width = width;
     s_wram_trace.log[idx].block_idx = g_block_counter;
     if (g_last_recomp_func)
@@ -567,12 +569,12 @@ static inline void rdb_record(uint32_t adr, uint16_t val, uint8_t width) {
 // Forward decl — watchpoint state + body live below the Tier 2.5 block.
 static void rdb_check_watch(uint32_t addr, uint16_t val, uint8_t width);
 
-void debug_on_wram_write_byte(uint32_t addr, uint8_t val) {
-    rdb_record(addr, val, 1);
+void debug_on_wram_write_byte(uint32_t addr, uint8_t old_val, uint8_t val) {
+    rdb_record(addr, old_val, val, 1);
     rdb_check_watch(addr, val, 1);
 }
-void debug_on_wram_write_word(uint32_t addr, uint16_t val) {
-    rdb_record(addr, val, 2);
+void debug_on_wram_write_word(uint32_t addr, uint16_t old_val, uint16_t val) {
+    rdb_record(addr, old_val, val, 2);
     rdb_check_watch(addr, val, 2);
 }
 
@@ -1527,11 +1529,13 @@ static void cmd_get_wram_trace(const char *args) {
     for (int i = 0; i < s_wram_trace.count && pos < budget; i++) {
         int idx = (start + i) % WRAM_TRACE_LOG_SIZE;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"f\":%d,\"adr\":\"0x%05x\",\"val\":\"0x%04x\",\"w\":%u,"
+            "%s{\"f\":%d,\"adr\":\"0x%05x\","
+            "\"old\":\"0x%04x\",\"val\":\"0x%04x\",\"w\":%u,"
             "\"bi\":%llu,\"func\":\"%s\",\"parent\":\"%s\"}",
             i ? "," : "",
             s_wram_trace.log[idx].frame,
             s_wram_trace.log[idx].adr,
+            s_wram_trace.log[idx].old_val,
             s_wram_trace.log[idx].val,
             (unsigned)s_wram_trace.log[idx].width,
             (unsigned long long)s_wram_trace.log[idx].block_idx,

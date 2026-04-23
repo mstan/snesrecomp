@@ -36,8 +36,12 @@ current bug, we stop. If it doesn't, we build the next one.
 
 **What it does.** Every generated `g_ram[x] = …` and every
 `*(uint16 *)(g_ram + x) = …` becomes a call to
-`debug_on_wram_write_byte(addr, new, func, block_id)` or
-`debug_on_wram_write_word(addr, new, func, block_id)`. Every hook call
+`debug_on_wram_write_byte(addr, old, new)` or
+`debug_on_wram_write_word(addr, old, new)`. The inline RDB_STORE8/16
+helpers read `g_ram[addr]` before the store to capture `old`, then
+store, then call the hook; `func` / `block_id` come from the
+`g_last_recomp_func` / `g_block_counter` globals inside the hook.
+Every hook call
 records to an in-memory ring buffer (capped at ~1M events), filtered
 by a TCP-configurable address range so we don't drown.
 

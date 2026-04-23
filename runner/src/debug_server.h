@@ -71,15 +71,24 @@ void debug_server_on_vram_write(uint16_t adr_word, uint16_t value);
 // bank-$7F writes into bank $7E and causes cross-bank state corruption
 // — classic latent 128KB-WRAM-over-16-bit-SNES-semantics bug.
 extern uint8_t g_ram[];
-void debug_on_wram_write_byte(uint32_t addr, uint8_t val);
-void debug_on_wram_write_word(uint32_t addr, uint16_t val);
+// Tier-1 write hooks take both the OLD value (what was in WRAM before the
+// store) and the NEW value. Capturing both lets `get_wram_trace` emit
+// old/new for every recorded entry — previously only `new` was kept,
+// which left the trace unable to answer "what was the value before this
+// function wrote?" without a separate per-frame sampling workaround.
+// The inline helpers read `g_ram[addr]` before the store to capture old,
+// then store, then call the hook. Added 2026-04-23.
+void debug_on_wram_write_byte(uint32_t addr, uint8_t old_val, uint8_t new_val);
+void debug_on_wram_write_word(uint32_t addr, uint16_t old_val, uint16_t new_val);
 static inline void rdb_store8(uint32_t addr, uint8_t val) {
+    uint8_t old_val = g_ram[addr];
     g_ram[addr] = val;
-    debug_on_wram_write_byte(addr, val);
+    debug_on_wram_write_byte(addr, old_val, val);
 }
 static inline void rdb_store16(uint32_t addr, uint16_t val) {
+    uint16_t old_val = *(uint16_t *)(g_ram + addr);
     *(uint16_t *)(g_ram + addr) = val;
-    debug_on_wram_write_word(addr, val);
+    debug_on_wram_write_word(addr, old_val, val);
 }
 #define RDB_STORE8(addr, val)  rdb_store8((uint32_t)(addr), (uint8_t)(val))
 #define RDB_STORE16(addr, val) rdb_store16((uint32_t)(addr), (uint16_t)(val))
