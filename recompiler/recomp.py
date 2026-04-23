@@ -875,13 +875,19 @@ def _looks_like_carry_return(insns: List[Insn]) -> bool:
     insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
     sorted_addrs = sorted(insn_by_addr)
     idx = {a: i for i, a in enumerate(sorted_addrs)}
-    # Any A writer disqualifies (the fn would be returning A, not carry).
+    CARRY_SETTERS = {'CLC', 'SEC', 'CMP', 'CPX', 'CPY'}
+    PASSTHROUGH = {'PLB', 'PHB', 'PLP', 'PHP', 'NOP', 'XCE'}
+    # Any A writer disqualifies. Relaxing this (to also allow CMP-with-
+    # A-scratch returns) over-promotes functions where A is the real
+    # return and the CMP just sets the final carry for an unrelated
+    # reason — those then get RetY from the follow-up pass and the
+    # emitter can't reconcile 'return (uint16)v1;' with a RetY sig.
+    # Kept strict; SMW's real carry_ret idioms either avoid A writes
+    # or are declared in cfg where the `carry_ret` hint wins.
     for insn in insns:
         _r, w = _insn_reg_use(insn, 'A')
         if w:
             return False
-    CARRY_SETTERS = {'CLC', 'SEC', 'CMP', 'CPX', 'CPY'}
-    PASSTHROUGH = {'PLB', 'PHB', 'PLP', 'PHP', 'NOP', 'XCE'}
     # Every RTS/RTL must be preceded by a carry-setting instruction via
     # the most recent non-passthrough op (on the linear decode order).
     # Pre-existing rule: CLC / SEC. Broadened to include comparison ops
@@ -1784,14 +1790,13 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         except Exception:
             continue
         for insn in insns:
-            # JSR is the primary call shape. JMP to a known-func is a
-            # tail call — the callee's Y return reaches the tail-caller's
-            # caller unchanged. Treating only JSR as a call-site missed
-            # Y-consumer evidence when a function's only consumer-context
-            # caller reaches the Y-returner via JMP (e.g. OWSpr04 chains).
-            if insn.mnem not in ('JSR', 'JMP'):
-                continue
-            if insn.mnem == 'JMP' and ((cfg.bank << 16) | (insn.operand & 0xFFFF)) not in known_func_addrs:
+            # Only JSR counts here. JMP is a tail-call — nothing in the
+            # caller executes after it, so there's no post-JSR-walk
+            # semantic to test. Tail-call Y propagation is handled
+            # separately by _y_effective_clobber's fall-through /
+            # JSR-edge inheritance pass above; duplicating it here
+            # caused false-positive RetY promotions that broke builds.
+            if insn.mnem != 'JSR':
                 continue
             tgt = insn.operand & 0xFFFF
             if tgt not in candidates:
