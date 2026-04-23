@@ -425,6 +425,9 @@ def _bisect_cascade_offenders(bank: int, candidates: List[Dict],
     bank that cascaded — tolerable.
 
     Returns the list of candidates that must be DEMOTED to load-bearing.
+    Returns [] when the cascade is an AB-pair / multi-element combination
+    that binary partition can't isolate — callers should fall back to
+    `_linear_greedy_safe_subset`.
     """
     offenders: List[Dict] = []
     mirror_cfg = mirror_cfg_path(mirror_recomp, bank)
@@ -470,6 +473,93 @@ def _bisect_cascade_offenders(bank: int, candidates: List[Dict],
     finally:
         mirror_cfg.write_text(original, encoding='utf-8')
     return offenders
+
+
+def _linear_greedy_safe_subset(candidates: List[Dict],
+                                all_banks: List[int],
+                                baselines: Dict[int, pathlib.Path],
+                                tmp_dir: pathlib.Path,
+                                mirror_recomp: pathlib.Path
+                                ) -> List[Dict]:
+    """Find the MAXIMAL subset of `candidates` whose simultaneous strip
+    keeps gen-C byte-identical across every bank.
+
+    Runs when bisection returns no single-offenders but apply-all still
+    cascades (multi-element / AB-pair cascade). Walks candidates linearly,
+    admitting each one only if adding it to the growing `keep` set still
+    regens clean across every bank.
+
+    Per-candidate cost: 9 bank regens (~45s). For 59 candidates that's
+    ~44 min; for 335 it's ~4 hours. Tolerable and deterministic.
+
+    Returns the admitted (safe-to-strip) subset. Candidates NOT in the
+    returned list are genuine cascade contributors and must stay in cfg.
+    """
+    # Build a mirror-state snapshot per-bank, so each trial resets
+    # cleanly before applying a fresh strip set.
+    originals = {
+        bank: mirror_cfg_path(mirror_recomp, bank).read_text(encoding='utf-8')
+        for bank in all_banks
+    }
+
+    def _apply_and_check(trial_set):
+        # Reset every mirror cfg to pristine, then strip the trial set.
+        for bank, orig in originals.items():
+            mirror_cfg_path(mirror_recomp, bank).write_text(orig, encoding='utf-8')
+        # Group trial by bank, strip.
+        by_bank: Dict[int, List[Dict]] = {}
+        for op in trial_set:
+            by_bank.setdefault(op['bank'], []).append(op)
+        for bank, ops in by_bank.items():
+            mirror_cfg = mirror_cfg_path(mirror_recomp, bank)
+            text = mirror_cfg.read_text(encoding='utf-8')
+            nl = '\r\n' if '\r\n' in text else '\n'
+            lines = text.split(nl)
+            for op in sorted(ops, key=lambda o: o['line_no'], reverse=True):
+                ln = op['line_no']
+                if ln >= len(lines):
+                    continue
+                # Line-kind strip: drop entire line when token matches body.
+                if lines[ln].strip() == op['token'].strip():
+                    del lines[ln]
+                    continue
+                tok_esc = re.escape(op['token'])
+                lines[ln] = re.sub(r'\s*' + tok_esc + r'(?!\S)', '',
+                                     lines[ln], count=1)
+            mirror_cfg.write_text(nl.join(lines), encoding='utf-8')
+        # Regen every bank, diff.
+        for bank in all_banks:
+            tmp_gen = tmp_dir / f'smw_{bank:02x}_lg.c'
+            ok = regen_bank_to(bank, mirror_cfg_path(mirror_recomp, bank), tmp_gen)
+            if not ok:
+                return False
+            if not diff_clean(tmp_gen, baselines[bank]):
+                return False
+        return True
+
+    try:
+        keep: List[Dict] = []
+        for i, c in enumerate(candidates):
+            trial = keep + [c]
+            if _apply_and_check(trial):
+                keep.append(c)
+                print(f'    [lg] {i+1}/{len(candidates)} admit ({len(keep)} safe)',
+                      flush=True)
+            else:
+                print(f'    [lg] {i+1}/{len(candidates)} reject '
+                      f'(cascade contributor)', flush=True)
+        return keep
+    finally:
+        # Restore mirror to pristine for later audit steps.
+        for bank, orig in originals.items():
+            mirror_cfg_path(mirror_recomp, bank).write_text(orig, encoding='utf-8')
+
+
+def diff_clean(a: pathlib.Path, b: pathlib.Path) -> bool:
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except FileNotFoundError:
+        return False
 
 
 def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> None:
@@ -527,22 +617,27 @@ def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> N
                       flush=True)
                 offenders = _bisect_cascade_offenders(
                     bank, candidates, baselines[bank], tmp_dir, mirror_recomp)
-                # Demote offenders: patch their all_results entry with the
-                # per-bank apply-all diff so they report load-bearing.
                 offender_keys = {(o['bank'], o['line_no'], o['token']) for o in offenders}
                 if not offender_keys:
                     # Bisection found 0 single offenders but apply-all still
-                    # cascaded — the cascade is a multi-element AB-pair (or
-                    # larger combination). Binary partition can't isolate
-                    # those. Conservatively demote ALL this bank's candidates
-                    # so the strip tool doesn't apply them blindly. A later
-                    # run of cfg_override_maximize.py can recover a safe
-                    # subset via linear greedy.
-                    offender_keys = {(c['bank'], c['line_no'], c['token'])
-                                     for c in candidates}
+                    # cascaded — multi-element AB-pair (or larger combination)
+                    # that binary partition can't isolate. Fall back to a
+                    # linear-greedy walk that admits each candidate only
+                    # when adding it still produces byte-identical gen-C
+                    # across every bank. The non-admitted subset is the
+                    # true cascade-offender set.
                     print(f'    bisection found no single offender — '
-                          f'conservatively demoting all {len(candidates)} '
-                          f'candidates in bank {bank:02x}', flush=True)
+                          f'running linear-greedy recovery on '
+                          f'{len(candidates)} candidates...', flush=True)
+                    safe_subset = _linear_greedy_safe_subset(
+                        candidates, banks, baselines, tmp_dir, mirror_recomp)
+                    safe_keys = {(s['bank'], s['line_no'], s['token']) for s in safe_subset}
+                    offender_keys = {(c['bank'], c['line_no'], c['token'])
+                                     for c in candidates
+                                     if (c['bank'], c['line_no'], c['token']) not in safe_keys}
+                    print(f'    linear-greedy: {len(safe_subset)} safe, '
+                          f'{len(offender_keys)} cascade-contributors',
+                          flush=True)
                 for r in all_results:
                     key = (r['bank'], r['line_no'], r['token'])
                     if key in offender_keys:
