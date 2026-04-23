@@ -661,11 +661,20 @@ static struct {
 } s_rdb_watches[RDB_MAX_WATCHES];
 static int s_rdb_watch_count = 0;
 // Parked state — observable via `parked` command.
+#define RDB_PARKED_STACK_DEPTH 16
 static volatile int      s_rdb_parked_watch_idx = -1; // -1 when not parked on watch
 static volatile uint32_t s_rdb_parked_watch_addr = 0;
 static volatile uint32_t s_rdb_parked_watch_val  = 0;
 static volatile uint8_t  s_rdb_parked_watch_width = 0;
 static char              s_rdb_parked_watch_func[48];
+// Full recomp stack snapshot taken at watch-hit (the single-name
+// `writer` above is g_last_recomp_func, which can be stale when a
+// callee doesn't set it; the full stack is what tells you the real
+// caller chain). Depths beyond RDB_PARKED_STACK_DEPTH are truncated;
+// s_rdb_parked_stack_depth reports the true depth so the client can
+// tell whether truncation happened.
+static char s_rdb_parked_stack[RDB_PARKED_STACK_DEPTH][48];
+static volatile int s_rdb_parked_stack_depth = 0;
 
 // Called from debug_on_wram_write_byte/word. Fast path: one volatile read.
 // Slow path: linear scan over at most RDB_MAX_WATCHES entries, parks main
@@ -702,9 +711,27 @@ static void rdb_check_watch(uint32_t addr, uint16_t val, uint8_t width) {
     } else {
         s_rdb_parked_watch_func[0] = 0;
     }
+    // Snapshot the full recomp stack so the client can resolve the
+    // actual caller chain even when g_last_recomp_func is stale.
+    {
+        int top = g_recomp_stack_top;
+        int want = top < RDB_PARKED_STACK_DEPTH ? top : RDB_PARKED_STACK_DEPTH;
+        int skip = top - want;
+        for (int s = 0; s < want; s++) {
+            const char *p = g_recomp_stack[skip + s];
+            if (p) {
+                strncpy(s_rdb_parked_stack[s], p, 47);
+                s_rdb_parked_stack[s][47] = 0;
+            } else {
+                s_rdb_parked_stack[s][0] = 0;
+            }
+        }
+        s_rdb_parked_stack_depth = top;
+    }
     s_paused = 1;
     debug_server_wait_if_paused();
     s_rdb_parked_watch_idx = -1;
+    s_rdb_parked_stack_depth = 0;
 }
 
 void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
@@ -1610,9 +1637,22 @@ static void cmd_parked(const char *args) {
                  (unsigned)s_rdb_parked_watch_width,
                  s_rdb_parked_watch_func);
     }
+    // Emit stack only when parked on a watch (snapshot was taken then).
+    char stack_buf[RDB_PARKED_STACK_DEPTH * 56 + 64] = {0};
+    if (watch_hit && s_rdb_parked_stack_depth > 0) {
+        int depth = s_rdb_parked_stack_depth;
+        int shown = depth < RDB_PARKED_STACK_DEPTH ? depth : RDB_PARKED_STACK_DEPTH;
+        int pos = snprintf(stack_buf, sizeof(stack_buf),
+                           ",\"stack_depth\":%d,\"stack\":[", depth);
+        for (int s = 0; s < shown && pos + 80 < (int)sizeof(stack_buf); s++) {
+            pos += snprintf(stack_buf + pos, sizeof(stack_buf) - pos,
+                            "%s\"%s\"", s ? "," : "", s_rdb_parked_stack[s]);
+        }
+        snprintf(stack_buf + pos, sizeof(stack_buf) - pos, "]");
+    }
     send_fmt("{\"parked\":%s,\"reason\":\"%s\",\"pc\":\"0x%06x\","
              "\"break_armed\":%d,\"step_pending\":%d,"
-             "\"watch_armed\":%d,\"watch_count\":%d%s}",
+             "\"watch_armed\":%d,\"watch_count\":%d%s%s}",
              (block_parked || watch_hit) ? "true" : "false",
              watch_hit ? "watch" : (block_parked ? "break" : "none"),
              s_rdb_parked_pc,
@@ -1620,7 +1660,8 @@ static void cmd_parked(const char *args) {
              s_rdb_step_pending,
              s_rdb_watch_armed,
              s_rdb_watch_count,
-             watch_buf);
+             watch_buf,
+             stack_buf);
 }
 
 // ---- Tier 2.5 WRAM-watchpoint TCP commands ----
