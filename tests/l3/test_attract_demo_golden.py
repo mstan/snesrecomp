@@ -1,43 +1,24 @@
 """Integration test: recomp attract-demo state vs oracle-recorded golden.
 
-Launches build/bin-x64-Release/smw.exe --paused, steps through the attract
-demo, and reads WRAM at the same addresses the golden fixture captured
-from the oracle. Reports every per-address divergence.
+v2 — state-based checkpoint sync.
 
-The fixture (fixtures/attract_demo_golden.json) was captured once from
-the Oracle build, where the embedded snes9x interprets the ROM directly.
-Any divergence IS recomp diverging from ROM-intended behavior — but
-some divergences are LEGITIMATE bugs (Bug #8 lives here), others are
-timing drift.
+Launches build/bin-x64-Release/smw.exe --paused, advances the attract
+demo to each checkpoint's (GameMode, dwell_frames) target, and reads
+recomp's WRAM. Compares against the golden fixture captured from the
+Oracle build. A divergence IS a bug — state-sync puts both sides at
+the same point in the attract-demo script regardless of boot-timing.
 
-v1 LIMITATIONS (see v2 plan below):
-  - Boot-timing drift: oracle's snes9x takes ~400 frames to complete
-    BIOS+reset; recomp memsets WRAM to 0 and enters game code at frame 1.
-    At any fixed wall-clock frame, the two sides are in DIFFERENT game
-    modes. GameMode sync gate skips these frames.
-  - Demo-progression drift: even when both sides reach GM=0x07, recomp
-    has been in that mode longer, so it's further along the attract
-    demo. Player X position differs greatly (recomp ~2x further), so
-    player state at the same frame is NOT apples-to-apples.
-  - This means the v1 test is EXPLORATORY, not a pass/fail regression
-    gate — it surfaces divergences for investigation, but many are
-    demo-progression artifacts not bugs.
+Sync semantics: checkpoint is `(wait_for_game_mode=X, dwell_frames=N)`.
+Each side separately steps until its own GameMode first equals X, then
+steps N more frames, then captures state. Since SMW's attract demo is
+gated by "frames-since-entering-current-mode" (not absolute time),
+both sides at dwell=N in mode=X are at the same frame of the demo
+script.
 
-v2 improvements (future):
-  - State-based checkpoints (e.g., "N frames after entering GM=0x07")
-    instead of absolute frame numbers.
-  - Tolerance per field: Mario X might differ by ~0-10 pixels legitimately;
-    Mario Y should match exactly when both are "stationary on ground".
-  - Allowlist of known-expected divergences.
+Exit 0 on match, 1 on any bug-level divergence. No more "v1 exploratory"
+noise — v2 is a real pass/fail regression gate.
 
-Bug #8 lives here AS OF 2026-04-23 at `frame 500 PlayerYPosNext
-(oracle=0x0150, recomp=0x0160)` — the 16-pixel Y offset that shows
-Mario rendered 1 tile inside the ground. When that fix lands, this
-entry should drop out.
-
-Exit code: always 0 in v1 even on divergence, so the test doesn't block
-CI during the exploratory phase. Flip to nonzero exit once v2 sync
-reduces noise to only-real-bugs.
+Bug #8 shows as: `title_dwell_90 PlayerYPosNext (oracle=0x0150, recomp=?)`.
 
 Usage:
   python test_attract_demo_golden.py
@@ -55,13 +36,15 @@ REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
 EXE  = REPO / 'build/bin-x64-Release/smw.exe'
 FIXTURE_PATH = REPO / 'snesrecomp/tests/l3/fixtures/attract_demo_golden.json'
 
+MODE_WAIT_MAX_FRAMES = 2000
+
 
 def cmd(sock, f, line):
     sock.sendall((line + '\n').encode())
     return json.loads(f.readline())
 
 
-def step_and_wait(sock, f, n):
+def step(sock, f, n):
     if n <= 0:
         return cmd(sock, f, 'frame').get('frame', 0)
     cur = cmd(sock, f, 'frame').get('frame', 0)
@@ -76,6 +59,24 @@ def step_and_wait(sock, f, n):
     return cmd(sock, f, 'frame').get('frame', 0)
 
 
+def read_recomp_game_mode(sock, f):
+    r = cmd(sock, f, 'dump_ram 0x100 1')
+    return int(r['hex'].replace(' ', ''), 16)
+
+
+def advance_until_mode(sock, f, target_mode):
+    start_frame = cmd(sock, f, 'frame').get('frame', 0)
+    for _ in range(MODE_WAIT_MAX_FRAMES):
+        gm = read_recomp_game_mode(sock, f)
+        if gm == target_mode:
+            return cmd(sock, f, 'frame').get('frame', 0)
+        step(sock, f, 1)
+    raise RuntimeError(
+        f'recomp GameMode never reached 0x{target_mode:02x} within '
+        f'{MODE_WAIT_MAX_FRAMES} frames of start_frame {start_frame}'
+    )
+
+
 def read_recomp(sock, f, addr, width):
     r = cmd(sock, f, f'dump_ram 0x{addr:x} {width}')
     hex_str = r.get('hex', '').replace(' ', '')
@@ -83,8 +84,6 @@ def read_recomp(sock, f, addr, width):
 
 
 def snapshot_recomp(sock, f, state_schema):
-    """state_schema is the per-checkpoint 'state' dict from the fixture —
-    we use its keys and addresses to know what to read."""
     out = {}
     for name, info in state_schema.items():
         addr = int(info['addr'], 16)
@@ -110,6 +109,10 @@ def main():
         return 1
 
     fixture = json.loads(FIXTURE_PATH.read_text())
+    if fixture.get('schema_version') != 2:
+        print(f'ERROR: fixture is schema v{fixture.get("schema_version")} '
+              f'— re-capture with v2', file=sys.stderr)
+        return 1
     checkpoints = fixture['checkpoints']
     if not checkpoints:
         print(f'ERROR: fixture has no checkpoints', file=sys.stderr)
@@ -137,37 +140,31 @@ def main():
             print(f'unexpected banner: {banner!r}', file=sys.stderr)
             return 1
 
+        prev_mode = None
+        prev_dwell = 0
         for cp in checkpoints:
-            target_frame = cp['frame']
+            name = cp['name']
+            target_mode = int(cp['wait_for_game_mode'], 16)
+            dwell = cp['dwell_frames']
+            # Mirror capture's "same mode → delta step, different mode → advance+step"
+            if prev_mode == target_mode:
+                step(sock, f, dwell - prev_dwell)
+            else:
+                advance_until_mode(sock, f, target_mode)
+                step(sock, f, dwell)
+            frame_at_checkpoint = cmd(sock, f, 'frame').get('frame', 0)
             golden_state = {k: v['value'] for k, v in cp['state'].items()}
-            cur_frame = cmd(sock, f, 'frame').get('frame', 0)
-            step_and_wait(sock, f, target_frame - cur_frame)
             recomp_state = snapshot_recomp(sock, f, cp['state'])
-            # GameMode sync gate: oracle's snes9x takes longer to boot than
-            # recomp (BIOS → reset → game code), so at the same wall-clock
-            # frame number the two sides are often in DIFFERENT game modes.
-            # Comparing player state across mismatched modes is noise —
-            # gate comparison on GameMode agreement. The gate is the chosen
-            # trade-off between "every byte must match" (too noisy) and
-            # "compare when meaningful" (signal).
-            if golden_state.get('GameMode') != recomp_state.get('GameMode'):
-                # Emit one summary note rather than 20 spurious byte diffs.
-                failures.append(
-                    f"frame {target_frame} SKIPPED — GameMode mismatch "
-                    f"(oracle={golden_state.get('GameMode')}, "
-                    f"recomp={recomp_state.get('GameMode')}); "
-                    f"boot-timing drift, not a bug at this checkpoint"
-                )
-                continue
-            # GameMode agrees — every remaining divergence is a real bug.
-            for name in golden_state:
-                expected = golden_state[name]
-                actual = recomp_state[name]
+            for addr_name in golden_state:
+                expected = golden_state[addr_name]
+                actual = recomp_state[addr_name]
                 if expected != actual:
                     failures.append(
-                        f"frame {target_frame} {name} "
-                        f"(oracle={expected}, recomp={actual})"
+                        f'{name} (recomp@f{frame_at_checkpoint}) '
+                        f'{addr_name} oracle={expected} recomp={actual}'
                     )
+            prev_mode = target_mode
+            prev_dwell = dwell
         sock.close()
     finally:
         proc.terminate()
@@ -177,16 +174,12 @@ def main():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if failures:
-        skipped = [m for m in failures if 'SKIPPED' in m]
-        real = [m for m in failures if 'SKIPPED' not in m]
-        print(f'{len(real)} real divergences + {len(skipped)} skipped checkpoints:')
-        for msg in skipped:
+        print(f'FAIL: {len(failures)} divergences from oracle-golden:')
+        for msg in failures:
             print(f'  {msg}')
-        for msg in real:
-            print(f'  {msg}')
-        # v1 exits 0 even on failure — exploratory phase, not a pass/fail gate.
-        return 0
-    print(f'OK: recomp matches oracle golden at all {len(checkpoints)} checkpoints.')
+        return 1
+    print(f'OK: recomp matches oracle golden at all {len(checkpoints)} '
+          f'state-sync checkpoints.')
     return 0
 
 
