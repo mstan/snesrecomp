@@ -1136,7 +1136,14 @@ def _infer_entry_mx_from_callers(rom: bytes, cfg) -> int:
             except (AssertionError, IndexError, Exception):
                 continue
             for insn in insns:
-                if insn.mnem == 'JSR' and insn.operand in func_entry_addrs:
+                # JSR/JSL (call) AND JMP/JML/BRL (tail-call / unconditional
+                # transfer) both propagate the caller's M/X state to the
+                # target's entry. JSR-only was too narrow: functions like
+                # $00:C0FB GenericPage01Tile are reached exclusively via
+                # JMP from a SEP/REP-setup block, so their entry state
+                # was invisible to the pass and forced a cfg `rep:` hint.
+                if insn.operand in func_entry_addrs and insn.mnem in (
+                        'JSR', 'JSL', 'JMP', 'JML', 'BRL'):
                     callsite_mx.setdefault(insn.operand, []).append(
                         (insn.m_flag, insn.x_flag))
 
