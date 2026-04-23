@@ -905,6 +905,187 @@ def infer_dp_slot_live_in(insns: List[Insn], start_addr: int,
     return out
 
 
+# Indirect addressing modes whose DP operand is the BASE of a pointer
+# the callee dereferences. INDIR_Y (dp),Y / DP_INDIR (dp) are 16-bit
+# ptr; INDIR_LY [dp],Y / INDIR_L [dp] are 24-bit long ptr. Either way,
+# the caller must set up the DP bytes before calling or the fetch
+# reads garbage.
+_DP_PTR_READ_MODES = frozenset({INDIR_Y, DP_INDIR, INDIR_LY, INDIR_L})
+
+
+def infer_dp_pointer_live_in(insns: List[Insn], start_addr: int,
+                              callee_sigs: Optional[Dict[int, str]] = None,
+                              bank: int = 0) -> Set[int]:
+    """Return the set of DP addresses used as POINTER sources live-in.
+
+    A pointer-source live-in is a DP address that the function reads
+    as a pointer BASE (via LDA [$XX],Y / LDA ($XX),Y / LDA [$XX]) before
+    any write to that address. Matches the \`*p0\`, \`*p6\`, \`*p8a\`
+    cfg convention where the caller sets up a DP-resident pointer
+    (long or 16-bit) before JSR-ing and the callee dereferences it.
+
+    Callee-sig flow-through: a JSR to a known callee that declares a
+    pointer param \`*pN\` reads DP $N as a pointer — useful for
+    trampolines that pass pointer scratch through.
+
+    Returns the set of DP addresses that are pointer-live-in (not a
+    dict; the width is implicit — the sig emitter picks between long
+    and 16-bit based on whether INDIR_LY/INDIR_L was seen, but for
+    sig-param purposes \`*pN\` captures both).
+    """
+    callee_sigs = callee_sigs or {}
+    if not insns:
+        return set()
+    insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
+    sorted_addrs = sorted(insn_by_addr)
+    if not sorted_addrs:
+        return set()
+    addr_to_idx = {a: i for i, a in enumerate(sorted_addrs)}
+    start16 = start_addr & 0xFFFF
+    if start16 not in insn_by_addr:
+        start16 = sorted_addrs[0]
+
+    def _succs(addr: int) -> List[int]:
+        insn = insn_by_addr.get(addr)
+        if insn is None:
+            return []
+        mn = insn.mnem
+        if mn in ('RTS', 'RTL', 'RTI', 'BRK', 'STP'):
+            return []
+        if mn in ('JMP', 'BRA', 'BRL'):
+            if insn.mode == ABS and insn.operand in insn_by_addr:
+                return [insn.operand]
+            return []
+        succs = []
+        if mn in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC'):
+            if insn.operand in insn_by_addr:
+                succs.append(insn.operand)
+        idx = addr_to_idx.get(addr)
+        if idx is not None and idx + 1 < len(sorted_addrs):
+            succs.append(sorted_addrs[idx + 1])
+        return succs
+
+    def _ptr_live_in(dp_addr: int) -> bool:
+        from collections import deque
+        queue = deque([(start16, False)])
+        visited = set()
+        while queue:
+            addr, defined = queue.popleft()
+            key = (addr, defined)
+            if key in visited:
+                continue
+            visited.add(key)
+            insn = insn_by_addr.get(addr)
+            if insn is None:
+                continue
+            reads_ptr = False
+            writes_slot = False
+            # Indirect modes that consume the pointer at DP $N.
+            if insn.mode in _DP_PTR_READ_MODES and insn.operand == dp_addr:
+                reads_ptr = True
+            # Direct-mode write to the same DP addr kills the pointer-
+            # live-in (caller's pointer setup is overwritten here).
+            if insn.mode == DP and insn.operand == dp_addr:
+                if insn.mnem in _DP_WRITE_MNEMS:
+                    writes_slot = True
+            # Callee-sig flow: JSR to a callee with \`*pN\` where N == dp_addr.
+            if insn.mnem in ('JSR', 'JSL'):
+                tgt = insn.operand
+                if insn.mnem == 'JSR':
+                    tgt = (bank << 16) | (tgt & 0xFFFF)
+                callee_sig = callee_sigs.get(tgt)
+                if callee_sig:
+                    _cret, cparams = parse_sig(callee_sig)
+                    for _pt, pn in cparams:
+                        if pn.startswith('*'):
+                            pdp = _param_to_dp(pn)
+                            if pdp == dp_addr:
+                                reads_ptr = True
+                                break
+            if reads_ptr and not defined:
+                return True
+            new_defined = defined
+            if writes_slot:
+                new_defined = True
+            # JSR/JSL conservatively clobbers DP — symmetric with scalar
+            # DP live-in. Caller can't know pointer survived.
+            if insn.mnem in ('JSR', 'JSL'):
+                new_defined = True
+            for succ in _succs(addr):
+                queue.append((succ, new_defined))
+        return False
+
+    out: Set[int] = set()
+    for dp_addr in _DP_LIVEIN_RANGE:
+        if _ptr_live_in(dp_addr):
+            out.add(dp_addr)
+    return out
+
+
+def _dp_ptrs_supplier_verified(rom: bytes, cfg, candidate_addr: int,
+                                 candidate_ptrs: Set[int]) -> Set[int]:
+    """Filter pointer-live-in candidates to those actually supplied by
+    every intra-bank direct caller.
+
+    Same shape as _dp_slots_supplier_verified: scan each JSR/JSL call
+    site's body backward, looking for STA/LDX-style setup of the DP
+    bytes that form the pointer. For a 16-bit pointer at $N the caller
+    typically does:
+      STA \$N ; STY \$N+1                 (two 8-bit stores), or
+      REP #$20 ; LDA #$xxxx ; STA \$N     (one 16-bit store at $N).
+
+    For a 24-bit long pointer at $N the third byte ($N+2, the bank)
+    gets set too. We don't differentiate here — any STA/STZ to $N
+    (DP mode) counts as supply, since the caller has touched the DP
+    base of the pointer.
+    """
+    if not candidate_ptrs:
+        return set()
+    bank = cfg.bank
+    cand_local = candidate_addr & 0xFFFF
+    callers: List[Tuple[int, List[Insn]]] = []
+    non_skip = [(f, a, s, e, mo, h) for f, a, s, e, mo, h in cfg.funcs
+                if f not in cfg.skip]
+    non_skip.sort(key=lambda t: t[1])
+    for i, (_fname, saddr, _sig, eovr, mo, _h) in enumerate(non_skip):
+        end_addr = eovr if eovr is not None else (
+            non_skip[i + 1][1] if i + 1 < len(non_skip) else 0x10000)
+        try:
+            cinsns = decode_func(rom, bank, saddr, end=end_addr,
+                                  mode_overrides=mo or None,
+                                  validate_branches=False)
+        except Exception:
+            continue
+        for insn in cinsns:
+            if insn.mnem in ('JSR', 'JSL') and (insn.operand & 0xFFFF) == cand_local:
+                callers.append((insn.addr & 0xFFFF, cinsns))
+                break
+    if not callers:
+        return set()
+
+    verified: Set[int] = set()
+    WRITE_MNEMS = _DP_WRITE_MNEMS | _DP_RMW_MNEMS
+    for dp_addr in candidate_ptrs:
+        all_supply = True
+        for jsr_pc, cinsns in callers:
+            supplies = False
+            for insn in cinsns:
+                if (insn.addr & 0xFFFF) == jsr_pc:
+                    break
+                if insn.mnem in ('JSR', 'JSL'):
+                    supplies = False
+                    continue
+                if (insn.mode == DP and insn.operand == dp_addr
+                        and insn.mnem in WRITE_MNEMS):
+                    supplies = True
+            if not supplies:
+                all_supply = False
+                break
+        if all_supply:
+            verified.add(dp_addr)
+    return verified
+
+
 def _dp_slots_supplier_verified(rom: bytes, cfg, candidate_addr: int,
                                   candidate_slots: Dict[int, int]) -> Dict[int, int]:
     """Filter DP-slot live-in candidates down to the subset that is
@@ -1222,7 +1403,8 @@ def _writes_register_without_save_restore(insns: List[Insn], reg: str) -> bool:
 
 
 def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int]],
-                                dp_live_in: Optional[Dict[int, int]] = None) -> Optional[str]:
+                                dp_live_in: Optional[Dict[int, int]] = None,
+                                dp_ptr_live_in: Optional[Set[int]] = None) -> Optional[str]:
     """Add any live-in register / DP-slot parameters missing from `sig`.
 
     Cfg/funcs.h sigs keep priority for types, struct returns, DP params, and
@@ -1288,6 +1470,16 @@ def _augment_sig_with_livein(sig: Optional[str], live_in: Dict[str, Optional[int
                 new_params.append(('uint16', f'r{dp_addr:x}w'))
             else:
                 new_params.append(('uint8', f'r{dp_addr:x}'))
+    if dp_ptr_live_in:
+        # Pointer-source DP slots → `*pN` params. Deterministic order.
+        # `p0` special-case mirrors the existing cfg convention: plain
+        # `p` is DP $00, `p6` is DP $06, `p8a` is DP $8A. Emit as
+        # uint8* typed for live-in purposes — structure-typed pointer
+        # params stay cfg-declared.
+        for dp_addr in sorted(dp_ptr_live_in):
+            if dp_addr in existing_dp:
+                continue
+            new_params.append(('uint8', f'*p{dp_addr:x}'))
 
     if new_params == params:
         return sig
@@ -2197,6 +2389,13 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
             insns, start_addr, callee_sigs=cfg.sigs, bank=cfg.bank)
         dp_live_in = _dp_slots_supplier_verified(
             rom, cfg, start_addr, dp_live_in_candidates)
+        # Pointer-param live-in: detect (dp),Y / [dp],Y / (dp) / [dp]
+        # reads whose pointer base wasn't written locally. Supplier-
+        # verified symmetrically with scalar DP live-in.
+        dp_ptr_candidates = infer_dp_pointer_live_in(
+            insns, start_addr, callee_sigs=cfg.sigs, bank=cfg.bank)
+        dp_ptr_live_in = _dp_ptrs_supplier_verified(
+            rom, cfg, start_addr, dp_ptr_candidates)
         # Fall-through to next function is a tail call. If the last decoded
         # instruction doesn't transfer control, the function falls through
         # into the next function in ROM order — whose sig's register
@@ -2244,7 +2443,8 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                     if body_writes:
                         continue
                     live_in[reg] = 8
-        new_sig = _augment_sig_with_livein(current_sig, live_in, dp_live_in)
+        new_sig = _augment_sig_with_livein(current_sig, live_in, dp_live_in,
+                                            dp_ptr_live_in)
         # Record the pre-narrowing live-in for dispatch-union computation.
         # After narrowing caps a handler's sig to (uint8_k), looking at
         # cfg.sigs can no longer reveal that the handler originally
