@@ -454,12 +454,24 @@ def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> N
                 # Demote offenders: patch their all_results entry with the
                 # per-bank apply-all diff so they report load-bearing.
                 offender_keys = {(o['bank'], o['line_no'], o['token']) for o in offenders}
+                if not offender_keys:
+                    # Bisection found 0 single offenders but apply-all still
+                    # cascaded — the cascade is a multi-element AB-pair (or
+                    # larger combination). Binary partition can't isolate
+                    # those. Conservatively demote ALL this bank's candidates
+                    # so the strip tool doesn't apply them blindly. A later
+                    # run of cfg_override_maximize.py can recover a safe
+                    # subset via linear greedy.
+                    offender_keys = {(c['bank'], c['line_no'], c['token'])
+                                     for c in candidates}
+                    print(f'    bisection found no single offender — '
+                          f'conservatively demoting all {len(candidates)} '
+                          f'candidates in bank {bank:02x}', flush=True)
                 for r in all_results:
                     key = (r['bank'], r['line_no'], r['token'])
                     if key in offender_keys:
-                        r['diff_line_count'] = diff  # surface the cascade size
                         r['cascade_offender'] = True
-                print(f'    demoted {len(offenders)} cascade-offenders in bank {bank:02x}',
+                print(f'    demoted {len(offender_keys)} cascade-offenders in bank {bank:02x}',
                       flush=True)
 
         # Summary counts.
