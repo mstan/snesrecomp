@@ -77,7 +77,21 @@ TOKEN_SPECS = {
     'restores_x':   ('value', r'restores_x:\S+'),
     'y_after':      ('value', r'y_after:\S+'),
     'x_after':      ('value', r'x_after:\S+'),
+    # Standalone-line directives — not `func`-line tokens. strip = remove
+    # the whole line. See find_overrides / build_cfg_without_override for
+    # the two-path dispatch.
+    'exclude_range': ('line', r'^\s*exclude_range\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+.*$'),
+    'no_autodiscover': ('line', r'^\s*no_autodiscover\s+[0-9a-fA-F]+.*$'),
 }
+
+# Types whose strip-and-diff effects are strictly intra-bank — safe to
+# verify against the owning bank only, skipping the 9x all-banks cost.
+# exclude_range shifts data/code decoding within one bank; no cross-bank
+# live-in propagation unless the mis-decoded bytes happen to contain a
+# JSL to another bank AND that JSL's target is a new cross-bank name —
+# rare enough that owning-bank check is a pragmatic default. Callers
+# can force all-banks via the --all-banks flag if needed.
+INTRA_BANK_TYPES = frozenset({'exclude_range', 'no_autodiscover'})
 
 
 def bank_gen_path(bank: int) -> pathlib.Path:
@@ -128,13 +142,40 @@ def find_overrides(bank: int, override_type: str) -> List[Dict]:
     """Scan bank cfg for every occurrence of the given override. Returns
     list of dicts with line_no, line_text, addr, name, token_match_span."""
     kind, pat = TOKEN_SPECS[override_type]
-    tok_re = re.compile(r'(?<!\S)(' + pat + r')(?!\S)')
     results = []
     cfg_path = bank_cfg_path(bank)
     if not cfg_path.exists():
         return results
     text = cfg_path.read_text(encoding='utf-8', errors='replace')
     lines = text.splitlines(keepends=True)
+    # Standalone-line directives: each matching line is one override, the
+    # whole line is the "token" (strip deletes the entire line). No addr /
+    # name extraction — those fields come from the line body itself.
+    if kind == 'line':
+        line_re = re.compile(pat)
+        for i, raw in enumerate(lines):
+            line = raw.rstrip('\r\n')
+            if not line_re.match(line):
+                continue
+            # For exclude_range / no_autodiscover the leading fields are
+            # the ADDR(s); keep the full line as token for strip idempotence.
+            parts = line.strip().split()
+            try:
+                addr = int(parts[1], 16) if len(parts) >= 2 else 0
+            except ValueError:
+                addr = 0
+            results.append({
+                'bank': bank,
+                'addr': addr,
+                'name': '',
+                'line_no': i,
+                'line_text': raw.rstrip('\n'),
+                'token': line,       # full line used as the "strip this" key
+                'token_value': '',
+                'override_type': override_type,
+            })
+        return results
+    tok_re = re.compile(r'(?<!\S)(' + pat + r')(?!\S)')
     for i, raw in enumerate(lines):
         line = raw.rstrip('\r\n')
         m = FUNC_RE.match(line)
@@ -174,7 +215,13 @@ def find_overrides(bank: int, override_type: str) -> List[Dict]:
 def build_cfg_without_override(bank: int, line_no: int, token: str) -> str:
     """Return cfg text with the specific token removed from line_no.
 
-    Preserves all other content including line endings."""
+    Preserves all other content including line endings. For token-kind
+    overrides (rep:X, sig:..., carry_ret) the token is removed from the
+    line; the line remains. For line-kind overrides (exclude_range,
+    no_autodiscover) the entire line is dropped — `token` in that case
+    is the whole line body and the heuristic below collapses to a line
+    delete.
+    """
     cfg_path = bank_cfg_path(bank)
     raw = cfg_path.read_bytes()
     nl = b'\r\n' if b'\r\n' in raw else b'\n'
@@ -182,9 +229,12 @@ def build_cfg_without_override(bank: int, line_no: int, token: str) -> str:
     if line_no >= len(lines):
         return raw.decode('utf-8', errors='replace')
     line = lines[line_no]
-    # Remove the token. Preserve surrounding whitespace conservatively —
-    # collapse any leading whitespace of the token (the decoder tolerates
-    # double-space).
+    # If the whole line matches the token (ignoring leading/trailing
+    # whitespace), it's a line-kind directive — delete the line entirely.
+    if line.strip() == token.strip():
+        del lines[line_no]
+        return nl.decode('utf-8').join(lines)
+    # Token-kind: strip the token substring from the line.
     tok_esc = re.escape(token)
     new_line = re.sub(r'\s*' + tok_esc + r'(?!\S)', '', line, count=1)
     lines[line_no] = new_line
@@ -433,9 +483,14 @@ def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> N
         for bank in banks:
             overrides = find_overrides(bank, override_type)
             print(f'  bank {bank:02x}: {len(overrides)} {override_type} overrides', flush=True)
+            # Intra-bank-only types (exclude_range, no_autodiscover) skip
+            # the cross-bank regen cost — their effects stay in one bank,
+            # so checking other banks is 8x wasted regen per candidate.
+            # Other types fall through to the full all-banks check.
+            check_banks = [bank] if override_type in INTRA_BANK_TYPES else banks
             for idx, ov in enumerate(overrides):
                 result = validate_override(bank, ov, baselines, tmp_dir,
-                                           mirror_recomp, banks)
+                                           mirror_recomp, check_banks)
                 all_results.append(result)
                 if idx % 25 == 0 and idx > 0:
                     print(f'    ...bank {bank:02x} {idx}/{len(overrides)}', flush=True)
