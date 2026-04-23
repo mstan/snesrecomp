@@ -74,6 +74,16 @@ typedef struct RetY {
   uint8 y;
 } RetY;
 
+// Returns A, X, and Y — for functions whose ROM body leaves all three
+// registers mutated on RTS. The canonical case is SMW's
+// GetPlayerLevelCollisionMap16ID_WallRun at $00F44D: its first two
+// instructions are INX INX, so callers rely on the +2 X-propagation
+// across the call. Without this return type, X's modification is
+// lost, producing wrong-indexed Map16 lookups down the chain.
+typedef struct RetAXY {
+  uint8 a, x, y;
+} RetAXY;
+
 typedef struct PointU16 {
   uint16 x, y;
 } PointU16;

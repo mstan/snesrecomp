@@ -2859,6 +2859,11 @@ class EmitCtx:
             a_val = self.A if self.A is not None else '0'
             y_val = self.Y if self.Y is not None else '0'
             return f'(RetAY){{ .a = {a_val}, .y = {y_val} }}'
+        if rt == 'RetAXY':
+            a_val = self.A if self.A is not None else '0'
+            x_val = self.X if self.X is not None else '0'
+            y_val = self.Y if self.Y is not None else '0'
+            return f'(RetAXY){{ .a = {a_val}, .x = {x_val}, .y = {y_val} }}'
         if rt == 'RetY':
             y_val = self.Y if self.Y is not None else '0'
             return f'(RetY){{ .y = {y_val} }}'
@@ -5081,6 +5086,23 @@ class EmitCtx:
                 self._emit(f'{y_tmp} = {tmp}.y;')
                 self.Y = y_tmp
                 self.flag_src = self.A
+            elif _ret == 'RetAXY':
+                # RetAXY returns via A (.a), X (.x), and Y (.y).
+                # Used for SMW's F44D (GetPlayerLevelCollisionMap16ID_WallRun)
+                # which does INX INX at entry — the X propagation is
+                # load-bearing for downstream Map16 lookup indices.
+                tmp = self._alloc(_ret)
+                self._emit(f'{tmp} = {fname}({call_args});')
+                a_tmp = self._alloc('uint8')
+                self._emit(f'{a_tmp} = {tmp}.a;')
+                self.A = a_tmp
+                x_tmp = self._alloc('uint8')
+                self._emit(f'{x_tmp} = {tmp}.x;')
+                self.X = x_tmp
+                y_tmp = self._alloc('uint8')
+                self._emit(f'{y_tmp} = {tmp}.y;')
+                self.Y = y_tmp
+                self.flag_src = self.A
             elif _ret == 'RetY':
                 # RetY returns via Y register only.
                 tmp = self._alloc(_ret)
@@ -5113,7 +5135,7 @@ class EmitCtx:
             # 65816.  Callers that need Y = A use explicit TAY.  Callees
             # that modify Y are handled by y_after / RetAY / RetY /
             # restores_x / explicit-clobber-set.
-            if _ret not in ('RetAY', 'RetY'):
+            if _ret not in ('RetAY', 'RetAXY', 'RetY'):
                 # If we've inferred that the callee writes Y without a
                 # PHY/PLY save-restore, the ROM's Y after the call is
                 # whatever the callee left behind, not our pre-call
