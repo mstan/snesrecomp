@@ -222,29 +222,43 @@ def mirror_cfg_path(mirror_recomp: pathlib.Path, bank: int) -> pathlib.Path:
     return mirror_recomp / f'bank{bank:02x}.cfg'
 
 
-def validate_override(bank: int, override: Dict, baseline_gen: pathlib.Path,
+def validate_override(bank: int, override: Dict, baselines: Dict[int, pathlib.Path],
                        tmp_dir: pathlib.Path,
-                       mirror_recomp: pathlib.Path) -> Dict:
-    """Strip a single override in the mirrored cfg, regen, diff, restore.
+                       mirror_recomp: pathlib.Path,
+                       all_banks: List[int]) -> Dict:
+    """Strip a single override in the mirrored cfg, regen ALL banks, diff
+    each bank vs its baseline, restore.
 
-    The cfg modification happens IN-PLACE inside the mirrored recomp/ dir
-    so recomp.py's sibling-cfg and funcs.h resolution behaves identically
-    to the baseline regen. The original (baseline) cfg is restored after
-    the test so subsequent tests start from a clean mirror.
+    Regenerates every bank — not just the one owning the override — because
+    cfg.sigs are imported bank-to-bank via the global-ns pass, and a sig
+    change in bank A can reshape live-in / emit in bank B. A narrower
+    per-bank check would label cross-bank cascade candidates as redundant
+    when they actually break other banks' gen-C on apply.
+
+    diff_line_count is the MAX over all banks (zero = truly safe,
+    otherwise the cascading bank drove the count).
     """
     mirror_cfg = mirror_cfg_path(mirror_recomp, bank)
     original_cfg_text = mirror_cfg.read_text(encoding='utf-8')
-    tmp_gen = tmp_dir / f'smw_{bank:02x}_test.c'
     new_cfg_text = build_cfg_without_override(bank, override['line_no'], override['token'])
     try:
         mirror_cfg.write_text(new_cfg_text, encoding='utf-8')
-        ok = regen_bank_to(bank, mirror_cfg, tmp_gen)
-        if not ok:
-            return dict(override, diff_line_count=-1, diff_byte_count=-1,
-                        regen_ok=False)
-        line_count, byte_count = diff_stats(tmp_gen, baseline_gen)
-        return dict(override, diff_line_count=line_count, diff_byte_count=byte_count,
-                    regen_ok=True)
+        worst_line = 0
+        worst_byte = 0
+        worst_bank = None
+        for b in all_banks:
+            tmp_gen = tmp_dir / f'smw_{b:02x}_test.c'
+            ok = regen_bank_to(b, mirror_cfg_path(mirror_recomp, b), tmp_gen)
+            if not ok:
+                return dict(override, diff_line_count=-1, diff_byte_count=-1,
+                            regen_ok=False, cascade_bank=b)
+            line_count, byte_count = diff_stats(tmp_gen, baselines[b])
+            if line_count > worst_line:
+                worst_line = line_count
+                worst_byte = byte_count
+                worst_bank = b
+        return dict(override, diff_line_count=worst_line, diff_byte_count=worst_byte,
+                    regen_ok=True, cascade_bank=worst_bank)
     finally:
         mirror_cfg.write_text(original_cfg_text, encoding='utf-8')
 
@@ -420,8 +434,8 @@ def run_audit(banks: List[int], override_type: str, out_json: pathlib.Path) -> N
             overrides = find_overrides(bank, override_type)
             print(f'  bank {bank:02x}: {len(overrides)} {override_type} overrides', flush=True)
             for idx, ov in enumerate(overrides):
-                result = validate_override(bank, ov, baselines[bank], tmp_dir,
-                                           mirror_recomp)
+                result = validate_override(bank, ov, baselines, tmp_dir,
+                                           mirror_recomp, banks)
                 all_results.append(result)
                 if idx % 25 == 0 and idx > 0:
                     print(f'    ...bank {bank:02x} {idx}/{len(overrides)}', flush=True)
