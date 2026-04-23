@@ -853,52 +853,55 @@ def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
 
 
 def _looks_like_carry_return(insns: List[Insn]) -> bool:
-    """Heuristic: the function only manipulates the carry flag (CLC/SEC)
-    and returns without ever writing A. The SMW idiom for "bool return
-    via carry" is:
+    """Heuristic: the function's return value is communicated via carry.
+    SMW idioms:
 
-        CLC          ; or SEC
-        RTS
+        CLC / SEC ; RTS            — explicit set/clear
+        CMP #$xx  ; RTS            — carry = (A >= xx)
+        CPX / CPY ; RTS            — carry = (X/Y >= operand)
+        BIT ; BCC/BCS branch ; RTS — carry propagated through conditional exit
 
-    Or a slightly longer variant where the function is a join point for
-    multiple early-return branches that all ultimately just set or clear
-    carry before returning. Such functions are best expressed as
-    `carry_ret` so the emitter returns the carry expression instead of
-    falling through to `return 0;` with an "A unknown at return" warning
-    when the cfg happens to declare `uint8()` return.
+    The body must not WRITE A anywhere (writing A would mean the function
+    is returning an A value, not carry). Every RTS/RTL must be preceded
+    by a carry-setting instruction OR be a shared exit that the earlier
+    conditional branches converged to.
 
-    Returns True when every exit's preceding instruction is CLC or SEC
-    and no A writer appears anywhere in the body.
+    Returns True when the function meets this shape — the `carry_ret`
+    emit path then returns the carry expression directly, which is what
+    the callers (BCC/BCS decision sites) need to see.
     """
     if not insns:
         return False
     insn_by_addr = {i.addr & 0xFFFF: i for i in insns}
     sorted_addrs = sorted(insn_by_addr)
     idx = {a: i for i, a in enumerate(sorted_addrs)}
-    # Any A writer disqualifies.
+    # Any A writer disqualifies (the fn would be returning A, not carry).
     for insn in insns:
         _r, w = _insn_reg_use(insn, 'A')
         if w:
             return False
-    # Every RTS/RTL must be preceded by CLC or SEC on some path.
+    CARRY_SETTERS = {'CLC', 'SEC', 'CMP', 'CPX', 'CPY'}
+    PASSTHROUGH = {'PLB', 'PHB', 'PLP', 'PHP', 'NOP', 'XCE'}
+    # Every RTS/RTL must be preceded by a carry-setting instruction via
+    # the most recent non-passthrough op (on the linear decode order).
+    # Pre-existing rule: CLC / SEC. Broadened to include comparison ops
+    # (CMP / CPX / CPY), which set carry based on their respective
+    # operand compared to A / X / Y. SMW uses these idiomatically to
+    # return "was X >= N?" via carry without ever writing A.
     for insn in insns:
         if insn.mnem not in ('RTS', 'RTL'):
             continue
         i = idx[insn.addr & 0xFFFF]
-        # Walk backward looking for a carry-affecting instruction as the
-        # most-recent operation. Skip pass-through ops (PLB/PHB/etc.)
-        # that don't touch carry or A.
         found_carry = False
         j = i - 1
         while j >= 0:
             cand = insn_by_addr[sorted_addrs[j]]
-            if cand.mnem in ('CLC', 'SEC'):
+            if cand.mnem in CARRY_SETTERS:
                 found_carry = True
                 break
-            if cand.mnem in ('PLB', 'PHB', 'PLP', 'PHP', 'NOP', 'XCE'):
+            if cand.mnem in PASSTHROUGH:
                 j -= 1
                 continue
-            # Any other instruction invalidates the pure-carry pattern.
             break
         if not found_carry:
             return False
@@ -1781,7 +1784,14 @@ def _promote_rety_from_caller_usage(rom: bytes, cfg) -> int:
         except Exception:
             continue
         for insn in insns:
-            if insn.mnem != 'JSR':
+            # JSR is the primary call shape. JMP to a known-func is a
+            # tail call — the callee's Y return reaches the tail-caller's
+            # caller unchanged. Treating only JSR as a call-site missed
+            # Y-consumer evidence when a function's only consumer-context
+            # caller reaches the Y-returner via JMP (e.g. OWSpr04 chains).
+            if insn.mnem not in ('JSR', 'JMP'):
+                continue
+            if insn.mnem == 'JMP' and ((cfg.bank << 16) | (insn.operand & 0xFFFF)) not in known_func_addrs:
                 continue
             tgt = insn.operand & 0xFFFF
             if tgt not in candidates:
