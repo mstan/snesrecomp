@@ -45,6 +45,7 @@ TEST_MODULES = [
     'test_phi_merge_x_param',
     'test_accumulator_shift_width',
     'test_memory_shift_rotate_width',
+    'test_tsb_trb_width',
 ]
 
 

@@ -4488,26 +4488,44 @@ class EmitCtx:
                 self.flag_src = None
 
         # -- TSB / TRB ----------------------------------------------------
+        # 65816: under M=0, TSB/TRB test the 16-bit accumulator against
+        # a 16-bit word in memory, then OR (TSB) or AND-NOT (TRB) A into
+        # the word and write both bytes back. Flags: Z set iff (A & mem) == 0
+        # using the same width as the RMW.
         elif mn == 'TSB':
             a = self._wrap(self.A) if self.A else '0'
-            mem = self._resolve_mem_rw(mode, v)
-            if mem:
-                new = self._emit_rmw8(mode, v, '{{cur}} | {a}'.format(a=a))
+            if wide_a and mode in (DP, ABS):
+                new = self._emit_rmw16(mode, v, '{{cur}} | {a}'.format(a=a))
                 if mode == DP:
                     self.dp_state.pop(v, None)
+                    self.dp_state.pop(v + 1, None)
                 self.flag_src = new
             else:
-                self._emit(f'/* TSB {MODE_STR.get(mode,"?")} ${v:x} */')
+                mem = self._resolve_mem_rw(mode, v)
+                if mem:
+                    new = self._emit_rmw8(mode, v, '{{cur}} | {a}'.format(a=a))
+                    if mode == DP:
+                        self.dp_state.pop(v, None)
+                    self.flag_src = new
+                else:
+                    self._emit(f'/* TSB {MODE_STR.get(mode,"?")} ${v:x} */')
         elif mn == 'TRB':
             a = self._wrap(self.A) if self.A else '0'
-            mem = self._resolve_mem_rw(mode, v)
-            if mem:
-                new = self._emit_rmw8(mode, v, '{{cur}} & ~({a})'.format(a=a))
+            if wide_a and mode in (DP, ABS):
+                new = self._emit_rmw16(mode, v, '{{cur}} & ~({a})'.format(a=a))
                 if mode == DP:
                     self.dp_state.pop(v, None)
+                    self.dp_state.pop(v + 1, None)
                 self.flag_src = new
             else:
-                self._emit(f'/* TRB {MODE_STR.get(mode,"?")} ${v:x} */')
+                mem = self._resolve_mem_rw(mode, v)
+                if mem:
+                    new = self._emit_rmw8(mode, v, '{{cur}} & ~({a})'.format(a=a))
+                    if mode == DP:
+                        self.dp_state.pop(v, None)
+                    self.flag_src = new
+                else:
+                    self._emit(f'/* TRB {MODE_STR.get(mode,"?")} ${v:x} */')
 
         # -- Branches -----------------------------------------------------
         elif mn in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC','BRA','BRL'):
