@@ -21,6 +21,7 @@ void    snes9x_bridge_run_frame(uint16_t joypad1, uint16_t joypad2);
 void    snes9x_bridge_shutdown(void);
 int     snes9x_bridge_is_loaded(void);
 void    snes9x_bridge_get_wram(uint8_t *out);          /* 128 KB */
+void    snes9x_bridge_get_vram(uint8_t *out);          /*  64 KB */
 uint8_t snes9x_bridge_cpu_read(uint32_t addr24);
 void    snes9x_bridge_get_cpu_regs(SnesCpuRegs *out);
 

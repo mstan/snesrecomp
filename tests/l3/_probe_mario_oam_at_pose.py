@@ -57,8 +57,8 @@ def main():
         wait_for(s, f, 'oracle', lambda: o_inair() != 0 and o_gm() == 7)
         print(f'  oracle stopped: InAir={o_inair():02x} Pose={o_pose():02x} GM={o_gm():02x}')
 
-        # 3) step both sides 2 more frames so OAM has been populated by rendering
-        for _ in range(2):
+        # 3) step both sides enough frames that OAM is populated by rendering
+        for _ in range(5):
             cmd(s, f, 'step 1'); cmd(s, f, 'emu_step 1')
 
         # full state dump & OAM
@@ -88,6 +88,22 @@ def main():
 
         print(f'\nOAM byte diffs ($0200-$03FF): {sum(1 for i in range(512) if r_oam[i]!=o_oam[i])}/512')
         print(f'OAM hi-table diffs ($0420-$043F): {sum(1 for i in range(32) if r_hi[i]!=o_hi[i])}/32')
+
+        # VRAM compare — read in 4KB chunks (TCP buffer friendly)
+        print('\n=== VRAM diff ===')
+        vram_diffs_by_region = {}
+        for chunk_start in range(0, 0x10000, 4096):
+            r_v = hb(cmd(s,f,f'dump_vram 0x{chunk_start:x} 4096'))
+            o_v = hb(cmd(s,f,f'emu_read_vram 0x{chunk_start:x} 4096'))
+            nd = sum(1 for i in range(4096) if r_v[i]!=o_v[i])
+            if nd:
+                vram_diffs_by_region[chunk_start] = (nd, r_v, o_v)
+        total_vram_diffs = sum(nd for (nd, _, _) in vram_diffs_by_region.values())
+        print(f'Total VRAM byte diffs: {total_vram_diffs}/65536')
+        for (cs, (nd, rv, ov)) in sorted(vram_diffs_by_region.items()):
+            # print first few byte diffs in this chunk
+            first_diffs = [(i, rv[i], ov[i]) for i in range(4096) if rv[i] != ov[i]][:8]
+            print(f'  $0x{cs:04x}-$0x{cs+0xfff:04x}: {nd} diffs; first={[(hex(cs+i), hex(rv), hex(ov)) for (i, rv, ov) in first_diffs]}')
 
         # Find Mario's slot (small-tile visible sprite)
         print('\n=== Mario-candidate slots (visible small-tile) ===')

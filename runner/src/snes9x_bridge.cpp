@@ -395,6 +395,14 @@ void snes9x_bridge_get_wram(uint8_t *out) {
     memcpy(out, Memory.RAM, 0x20000);
 }
 
+void snes9x_bridge_get_vram(uint8_t *out) {
+    if (!out) return;
+    if (!s_loaded) { memset(out, 0, 0x10000); return; }
+    /* snes9x's VRAM is Memory.VRAM[0x10000] — same layout as the
+     * SNES PPU's word-addressed VRAM (byte-indexed here). */
+    memcpy(out, Memory.VRAM, 0x10000);
+}
+
 uint8_t snes9x_bridge_cpu_read(uint32_t addr24) {
     if (!s_loaded) return 0xFF;
     return S9xGetByte(addr24);
@@ -534,6 +542,7 @@ const snes_oracle_backend_t g_snes9x_backend = {
     /* .get_wram      = */ snes9x_bridge_get_wram,
     /* .cpu_read      = */ snes9x_bridge_cpu_read,
     /* .get_cpu_regs  = */ snes9x_bridge_get_cpu_regs,
+    /* .get_vram      = */ snes9x_bridge_get_vram,
 };
 
 } /* extern "C" */

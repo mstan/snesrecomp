@@ -1350,9 +1350,26 @@ static void cmd_continue(const char *args) {
 static void cmd_step(const char *args) {
     int n = 1;
     if (args[0]) sscanf(args, "%d", &n);
+    int start_frame = snes_frame_counter;
     s_step_remaining = n;
     s_paused = 0;
-    send_fmt("{\"ok\":true,\"stepping\":%d,\"frame\":%d}", n, snes_frame_counter);
+    /* BLOCK until the main loop has run the requested frames and re-paused.
+     * Caps at ~5 s of wall-clock wait (150k × 30 µs) so a stuck main loop
+     * doesn't wedge the network thread forever — if the timeout hits,
+     * respond with what we have and let the caller diagnose. */
+    int waited = 0;
+    while (s_step_remaining > 0 && waited < 150000) {
+#ifdef _WIN32
+        Sleep(0);
+#else
+        struct timespec ts = {0, 30000};  /* 30 µs */
+        nanosleep(&ts, NULL);
+#endif
+        waited++;
+    }
+    send_fmt("{\"ok\":true,\"stepped\":%d,\"frame_before\":%d,\"frame_after\":%d%s}",
+             n, start_frame, snes_frame_counter,
+             (s_step_remaining > 0) ? ",\"timeout\":true" : "");
 }
 
 static void cmd_run_to_frame(const char *args) {

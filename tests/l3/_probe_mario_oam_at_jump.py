@@ -36,13 +36,26 @@ def main():
             cmd(s, f, 'emu_step 1')
             if int(cmd(s, f, 'emu_read_wram 0x100 1')['hex'].replace(' ',''),16) == 7: break
 
-        # dwell 60 frames (Mario mid-demo)
-        for _ in range(60):
+        # dwell 40 frames (Mario mid-demo, pre-death)
+        for _ in range(40):
             cmd(s, f, 'step 1'); cmd(s, f, 'emu_step 1')
 
         # read full OAM both sides
         r = hexbytes(cmd(s, f, 'dump_ram 0x200 512'))
         o = hexbytes(cmd(s, f, 'emu_read_wram 0x200 512'))
+
+        # VRAM diff — OBJ tile area is typically $6000-$7FFF word (=$C000-$FFFF byte) in SMW
+        print('\n=== VRAM diff (per 4KB region) ===')
+        total_vd = 0
+        for cs in range(0, 0x10000, 4096):
+            rv = hexbytes(cmd(s, f, f'dump_vram 0x{cs:x} 4096'))
+            ov = hexbytes(cmd(s, f, f'emu_read_vram 0x{cs:x} 4096'))
+            nd = sum(1 for i in range(4096) if rv[i]!=ov[i])
+            total_vd += nd
+            if nd:
+                fd = [(hex(cs+i), f'{rv[i]:02x}/{ov[i]:02x}') for i in range(4096) if rv[i]!=ov[i]][:5]
+                print(f'  VRAM $0x{cs:04x}-$0x{cs+0xfff:04x}: {nd:4d} diffs; first: {fd}')
+        print(f'Total VRAM diffs: {total_vd}/65536')
 
         print(f'=== full OAM diff at dwell 60 post-GM=0x07 ===')
         print(f'recomp OAM len={len(r)}, oracle OAM len={len(o)}')

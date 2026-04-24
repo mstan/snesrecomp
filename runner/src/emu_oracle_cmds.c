@@ -171,6 +171,48 @@ static void h_emu_read_wram(const char *args) {
     debug_server_send_raw("\"}\n", 3);
 }
 
+/* emu_read_vram <hex_addr> [len_decimal]
+ * Snapshot a byte range from the oracle backend's PPU VRAM.
+ * VRAM is 64 KB (byte-indexed; SNES hardware is word-indexed,
+ * so adr_word = adr_byte / 2). */
+static void h_emu_read_vram(const char *args) {
+    if (!g_active_backend) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
+        return;
+    }
+    if (!g_active_backend->get_vram) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"get_vram not implemented by backend\","
+                              "\"backend\":\"%s\"}", g_active_backend->name);
+        return;
+    }
+    unsigned int addr = 0, len = 1;
+    if (!args || sscanf(args, "%x %u", &addr, &len) < 1) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_read_vram <hex_addr> [len]\"}");
+        return;
+    }
+    if (len < 1) len = 1;
+    if (len > 0x10000) len = 0x10000;
+    if (addr >= 0x10000u || addr + len > 0x10000u) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"vram range out of bounds\",\"addr\":\"0x%x\",\"len\":%u}", addr, len);
+        return;
+    }
+    static uint8_t buf[0x10000];
+    g_active_backend->get_vram(buf);
+    char hdr[128];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "{\"ok\":true,\"addr\":\"0x%04x\",\"len\":%u,\"hex\":\"",
+                        addr, len);
+    debug_server_send_raw(hdr, hlen);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", buf[addr + i]);
+        debug_server_send_raw(chunk, pos);
+    }
+    debug_server_send_raw("\"}\n", 3);
+}
+
 /* Drive the active backend forward N frames without advancing the
  * recomp side. Used to re-sync the two runtimes when their boot
  * sequences progress at different rates. Capped to avoid runaway.
@@ -543,6 +585,7 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_select") == 0)    { h_emu_select(args);    return 1; }
     if (strcmp(cmd, "emu_is_loaded") == 0) { h_emu_is_loaded(args); return 1; }
     if (strcmp(cmd, "emu_read_wram") == 0) { h_emu_read_wram(args); return 1; }
+    if (strcmp(cmd, "emu_read_vram") == 0) { h_emu_read_vram(args); return 1; }
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }
