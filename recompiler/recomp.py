@@ -4609,6 +4609,25 @@ class EmitCtx:
                         self.A = narrow
                 else:
                     self.B = None
+            if mn == 'SEP' and (v & 0x10):
+                # Switching X/Y back to 8-bit. Mirror of the REP #$10
+                # promotion block above. Without this, INX/DEX/INY/DEY
+                # on a uint16-hoisted variable wrap at 65536 instead of
+                # 256, and CPX/CPY compares may see stale high bytes.
+                # Emit a narrowing assignment so the low 8 bits are
+                # preserved and the high byte is cleared. (On real
+                # hardware the high byte becomes undefined / preserved-
+                # from-hidden-register, but emulators and the snes9x
+                # oracle uniformly narrow to 8 bits for indexing.)
+                for reg in ('X', 'Y'):
+                    val = getattr(self, reg)
+                    if val is None:
+                        continue
+                    cur_t = self._hoisted.get(val) if self._simple(val) else None
+                    if cur_t == 'uint16':
+                        narrow = self._alloc('uint8')
+                        self._emit(f'{narrow} = (uint8)({val});')
+                        setattr(self, reg, narrow)
 
         # -- XBA ----------------------------------------------------------
         elif mn == 'XBA':
