@@ -4481,9 +4481,15 @@ class EmitCtx:
             mem = self._resolve_mem(mode, v, wide=wide_a)
             if mem is not None:
                 self.flag_src = f'{a} & {mem}'
-                # BIT sets V flag from bit 6 of the memory operand (not the AND result)
-                if mode != IMM:  # BIT #imm does NOT affect V on 65816
-                    self.overflow = f'({mem}) & 0x40'
+                # BIT sets V from the second-highest bit of the memory
+                # operand (not the AND result), and N from the top bit.
+                # Width-dependent per the M flag:
+                #   M=1 (8-bit):  V = bit 6  (mask 0x40)
+                #   M=0 (16-bit): V = bit 14 (mask 0x4000)
+                # BIT #imm does NOT affect V on 65816.
+                if mode != IMM:
+                    v_mask = 0x4000 if wide_a else 0x40
+                    self.overflow = f'({mem}) & 0x{v_mask:x}'
             else:
                 self.flag_src = None
 
