@@ -4322,7 +4322,8 @@ class EmitCtx:
             if mode == ACC:
                 an = self._materialize('A', a_type)
                 cv = self._alloc_tmp('uint8')
-                self._emit(f'{cv} = ({an} >> 7) & 1;')
+                top = 15 if a_type == 'uint16' else 7
+                self._emit(f'{cv} = ({an} >> {top}) & 1;')
                 self.carry = cv
                 self._emit(f'{an} <<= 1;')
                 self._invalidate_dp_aliases_to(an)
@@ -4369,7 +4370,8 @@ class EmitCtx:
             if mode == ACC:
                 an = self._materialize('A', a_type)
                 cv = self._alloc_tmp('uint8')
-                self._emit(f'{cv} = ({an} >> 7) & 1;')
+                top = 15 if a_type == 'uint16' else 7
+                self._emit(f'{cv} = ({an} >> {top}) & 1;')
                 self._emit(f'{an} = ({a_type})(({an} << 1) | {carry_in});')
                 self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
@@ -4391,8 +4393,9 @@ class EmitCtx:
             if mode == ACC:
                 an = self._materialize('A', a_type)
                 cv = self._alloc_tmp('uint8')
+                top = 15 if a_type == 'uint16' else 7
                 self._emit(f'{cv} = {an} & 1;')
-                self._emit(f'{an} = ({a_type})(({an} >> 1) | ({carry_in} << 7));')
+                self._emit(f'{an} = ({a_type})(({an} >> 1) | ({carry_in} << {top}));')
                 self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
