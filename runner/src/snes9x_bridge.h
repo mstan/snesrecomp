@@ -25,6 +25,18 @@ void    snes9x_bridge_get_vram(uint8_t *out);          /*  64 KB */
 uint8_t snes9x_bridge_cpu_read(uint32_t addr24);
 void    snes9x_bridge_get_cpu_regs(SnesCpuRegs *out);
 
+/* Phase B fuzz: execute a standalone 65816 snippet with seeded CPU
+ * state. Snippet is written to bank $00 PC $1800 (WRAM mirror),
+ * stepped opcode-by-opcode until it RTS's to a sentinel PC. Caller
+ * receives WRAM $0000-$1FFF after execution. Returns 0 on success,
+ * negative on error (bad length, runaway). */
+int     snes9x_bridge_fuzz_run_snippet(
+    const uint8_t *rom_bytes, int rom_len,
+    uint16_t seed_a, uint16_t seed_x, uint16_t seed_y,
+    uint16_t seed_s, uint16_t seed_d,
+    uint8_t seed_db, uint8_t seed_p,
+    uint8_t *out_wram_0_1fff);
+
 /* Report bytes that changed in the MOST RECENT retro_run(). Bounded
  * to [lo, hi] (inclusive). Writes into caller-provided parallel arrays
  * up to out_caps entries. Returns the number of entries written. */

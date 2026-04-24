@@ -174,6 +174,11 @@ def prologue(m_flag: int, x_flag: int, seed: dict) -> bytes:
 
     Always emits REP #$30 first to normalize (both 16-bit), then SEP
     the bits that should be 1 in the target state.
+
+    ALWAYS seeds A/X/Y (defaulting to 0 if the seed doesn't name them)
+    so the recomp emitter has a tracked value on entry. Without this,
+    INX/DEX/etc on an unseeded register become no-ops in the emitter
+    but decrement at hardware time, producing spurious divergences.
     """
     out = bytearray()
     # REP #$30 — clear both M and X (go to 16-bit)
@@ -182,28 +187,25 @@ def prologue(m_flag: int, x_flag: int, seed: dict) -> bytes:
     sep_mask = (m_flag & 1) << 5 | (x_flag & 1) << 4
     if sep_mask:
         out += bytes([0xE2, sep_mask])
-    # Seed A with LDA #imm.
-    if 'A' in seed:
-        val = seed['A']
-        if m_flag == 0:
-            out += bytes([0xA9, val & 0xFF, (val >> 8) & 0xFF])
-        else:
-            out += bytes([0xA9, val & 0xFF])
-    # Seed X.
-    if 'X' in seed:
-        val = seed['X']
-        if x_flag == 0:
-            out += bytes([0xA2, val & 0xFF, (val >> 8) & 0xFF])
-        else:
-            out += bytes([0xA2, val & 0xFF])
-    # Seed Y.
-    if 'Y' in seed:
-        val = seed['Y']
-        if x_flag == 0:
-            out += bytes([0xA0, val & 0xFF, (val >> 8) & 0xFF])
-        else:
-            out += bytes([0xA0, val & 0xFF])
-    # Seed carry.
+    # Seed A with LDA #imm (default 0).
+    val = seed.get('A', 0)
+    if m_flag == 0:
+        out += bytes([0xA9, val & 0xFF, (val >> 8) & 0xFF])
+    else:
+        out += bytes([0xA9, val & 0xFF])
+    # Seed X (default 0).
+    val = seed.get('X', 0)
+    if x_flag == 0:
+        out += bytes([0xA2, val & 0xFF, (val >> 8) & 0xFF])
+    else:
+        out += bytes([0xA2, val & 0xFF])
+    # Seed Y (default 0).
+    val = seed.get('Y', 0)
+    if x_flag == 0:
+        out += bytes([0xA0, val & 0xFF, (val >> 8) & 0xFF])
+    else:
+        out += bytes([0xA0, val & 0xFF])
+    # Seed carry (default: leave as-is).
     if seed.get('carry') == 1:
         out += bytes([0x38])  # SEC
     elif seed.get('carry') == 0:

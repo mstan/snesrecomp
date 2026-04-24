@@ -213,6 +213,91 @@ static void h_emu_read_vram(const char *args) {
     debug_server_send_raw("\"}\n", 3);
 }
 
+/* fuzz_run_snippet <rom_hex> <a> <x> <y> <s> <d> <db> <p>
+ *
+ * Phase B differential fuzz entry point. All integer args are decimal
+ * except rom_hex. Snippet bytes live in rom_hex (arbitrary length up
+ * to 256). Runs the snippet via snes9x_bridge_fuzz_run_snippet; on
+ * success, emits the WRAM $0000-$1FFF snapshot as a hex blob — the
+ * Python orchestrator computes the delta against the baseline.
+ *
+ * Only snes9x backend implements this today; others return error.
+ */
+extern int snes9x_bridge_fuzz_run_snippet(
+    const uint8_t *rom_bytes, int rom_len,
+    uint16_t seed_a, uint16_t seed_x, uint16_t seed_y,
+    uint16_t seed_s, uint16_t seed_d,
+    uint8_t seed_db, uint8_t seed_p,
+    uint8_t *out_wram);
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static void h_fuzz_run_snippet(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"fuzz requires snes9x backend\"}");
+        return;
+    }
+    if (!args) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: fuzz_run_snippet <hex> a x y s d db p\"}");
+        return;
+    }
+    /* Parse: first token is hex string; rest are decimal ints. */
+    char hex[512];
+    unsigned int a = 0, x = 0, y = 0, s = 0, d = 0, db = 0, p = 0;
+    int n = sscanf(args, "%511s %u %u %u %u %u %u %u",
+                   hex, &a, &x, &y, &s, &d, &db, &p);
+    if (n < 8) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"expected 8 args (hex a x y s d db p), got %d\"}", n);
+        return;
+    }
+    /* Decode hex into bytes. */
+    int hex_len = (int)strlen(hex);
+    if (hex_len % 2 != 0 || hex_len > 512) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"bad hex length %d\"}", hex_len);
+        return;
+    }
+    uint8_t rom[256];
+    int rom_len = hex_len / 2;
+    for (int i = 0; i < rom_len; i++) {
+        int hi = hex_nibble(hex[i*2]);
+        int lo = hex_nibble(hex[i*2 + 1]);
+        if (hi < 0 || lo < 0) {
+            debug_server_send_fmt("{\"ok\":false,\"error\":\"bad hex char at %d\"}", i*2);
+            return;
+        }
+        rom[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    static uint8_t wram_after[0x2000];
+    int rc = snes9x_bridge_fuzz_run_snippet(
+        rom, rom_len,
+        (uint16_t)a, (uint16_t)x, (uint16_t)y,
+        (uint16_t)s, (uint16_t)d,
+        (uint8_t)db, (uint8_t)p,
+        wram_after);
+    if (rc != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"fuzz_run returned %d\"}", rc);
+        return;
+    }
+    /* Emit WRAM as hex blob. Format mirrors emu_read_wram. */
+    char hdr[128];
+    int hlen = snprintf(hdr, sizeof(hdr), "{\"ok\":true,\"wram_hex\":\"");
+    debug_server_send_raw(hdr, hlen);
+    char chunk[4096];
+    for (int i = 0; i < 0x2000; ) {
+        int pos = 0;
+        for (; i < 0x2000 && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", wram_after[i]);
+        debug_server_send_raw(chunk, pos);
+    }
+    debug_server_send_raw("\"}\n", 3);
+}
+
 /* Drive the active backend forward N frames without advancing the
  * recomp side. Used to re-sync the two runtimes when their boot
  * sequences progress at different rates. Capped to avoid runaway.
@@ -586,6 +671,7 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_is_loaded") == 0) { h_emu_is_loaded(args); return 1; }
     if (strcmp(cmd, "emu_read_wram") == 0) { h_emu_read_wram(args); return 1; }
     if (strcmp(cmd, "emu_read_vram") == 0) { h_emu_read_vram(args); return 1; }
+    if (strcmp(cmd, "fuzz_run_snippet") == 0) { h_fuzz_run_snippet(args); return 1; }
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }

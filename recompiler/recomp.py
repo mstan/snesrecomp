@@ -3187,18 +3187,21 @@ class EmitCtx:
         return cur_expr
 
     def _emit_rmw16(self, mode, addr, expr_template) -> Optional[str]:
-        """16-bit read-modify-write to WRAM for ASL/LSR/ROL/ROR/TSB/TRB
-        under M=0. Reads the word at addr+idx, applies the expression,
-        writes the word back. Routes through RDB_LOAD16/RDB_STORE16
-        when --reverse-debug is on.
+        """16-bit read-modify-write to WRAM for ASL/LSR/ROL/ROR/INC/DEC/
+        TSB/TRB under M=0. Reads the word at addr+idx, applies the
+        expression, writes the word back. Routes through RDB_LOAD16/
+        RDB_STORE16 when --reverse-debug is on.
 
-        Parallel to _emit_rmw8 but word-width. Only DP and ABS (no
-        indexing) are defined by the 65816 ISA for these opcodes at
-        M=0; indexed variants fall through to None.
+        Parallel to _emit_rmw8 but word-width. Supports DP, ABS,
+        DP_X, ABS_X (the indexed variants are defined by the 65816
+        ISA for ASL/LSR/ROL/ROR/INC/DEC; TSB/TRB have no indexed
+        variants and the caller must not invoke with those). Y-indexed
+        forms don't exist for these opcodes, so DP_Y/ABS_Y not handled.
         """
-        if mode not in (DP, ABS):
+        idx_map = {DP: '0', ABS: '0', DP_X: self._idx('X'), ABS_X: self._idx('X')}
+        idx = idx_map.get(mode)
+        if idx is None:
             return None
-        idx = '0'
         cur_expr = self._wram16(addr, idx)
         new_expr = expr_template.format(cur=cur_expr)
         tmp = self._alloc_tmp('uint16')
@@ -4320,14 +4323,10 @@ class EmitCtx:
 
         # -- INC / DEC memory ---------------------------------------------
         elif mn == 'INC':
-            if wide_a and mode in (DP, ABS):
-                # 16-bit INC: operate on word
-                idx = '0'
-                w16 = self._wram16(v, idx)
-                tmp = self._alloc('uint16')
-                self._emit(f'{tmp} = {w16} + 1;')
-                self._wram16_write(v, idx, tmp)
-                self.flag_src = tmp
+            if wide_a and mode in (DP, ABS, DP_X, ABS_X):
+                # 16-bit INC on word — DP, ABS, DP_X, ABS_X all valid per ISA.
+                new = self._emit_rmw16(mode, v, '{cur} + 1')
+                self.flag_src = new
                 if mode == DP:
                     self.dp_state.pop(v, None)
                     self.dp_state.pop(v + 1, None)
@@ -4341,14 +4340,10 @@ class EmitCtx:
                 else:
                     self._emit(f'/* INC {MODE_STR.get(mode,"?")} ${v:x} */')
         elif mn == 'DEC':
-            if wide_a and mode in (DP, ABS):
-                # 16-bit DEC: operate on word
-                idx = '0'
-                w16 = self._wram16(v, idx)
-                tmp = self._alloc('uint16')
-                self._emit(f'{tmp} = {w16} - 1;')
-                self._wram16_write(v, idx, tmp)
-                self.flag_src = tmp
+            if wide_a and mode in (DP, ABS, DP_X, ABS_X):
+                # 16-bit DEC on word — DP, ABS, DP_X, ABS_X all valid per ISA.
+                new = self._emit_rmw16(mode, v, '{cur} - 1')
+                self.flag_src = new
                 if mode == DP:
                     self.dp_state.pop(v, None)
                     self.dp_state.pop(v + 1, None)
@@ -4375,8 +4370,9 @@ class EmitCtx:
                 self.flag_src = an
             else:
                 # M=0: 16-bit RMW on the word at addr (DP/ABS only per ISA).
-                if wide_a and mode in (DP, ABS):
-                    mem16 = self._wram16(v, '0')
+                if wide_a and mode in (DP, ABS, DP_X, ABS_X):
+                    idx = '0' if mode in (DP, ABS) else self._idx('X')
+                    mem16 = self._wram16(v, idx)
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = ({mem16} >> 15) & 1;')
                     self.carry = cv
@@ -4409,8 +4405,9 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.flag_src = an
             else:
-                if wide_a and mode in (DP, ABS):
-                    mem16 = self._wram16(v, '0')
+                if wide_a and mode in (DP, ABS, DP_X, ABS_X):
+                    idx = '0' if mode in (DP, ABS) else self._idx('X')
+                    mem16 = self._wram16(v, idx)
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = {mem16} & 1;')
                     self.carry = cv
@@ -4444,8 +4441,9 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
-                if wide_a and mode in (DP, ABS):
-                    mem16 = self._wram16(v, '0')
+                if wide_a and mode in (DP, ABS, DP_X, ABS_X):
+                    idx = '0' if mode in (DP, ABS) else self._idx('X')
+                    mem16 = self._wram16(v, idx)
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = ({mem16} >> 15) & 1;')
                     new = self._emit_rmw16(mode, v,
@@ -4478,8 +4476,9 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
-                if wide_a and mode in (DP, ABS):
-                    mem16 = self._wram16(v, '0')
+                if wide_a and mode in (DP, ABS, DP_X, ABS_X):
+                    idx = '0' if mode in (DP, ABS) else self._idx('X')
+                    mem16 = self._wram16(v, idx)
                     cv = self._alloc_tmp('uint8')
                     self._emit(f'{cv} = {mem16} & 1;')
                     new = self._emit_rmw16(mode, v,

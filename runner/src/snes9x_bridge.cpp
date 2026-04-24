@@ -403,6 +403,116 @@ void snes9x_bridge_get_vram(uint8_t *out) {
     memcpy(out, Memory.VRAM, 0x10000);
 }
 
+/* ---- Phase B differential fuzz snippet runner --------------------------
+ * Write a tiny 65816 snippet to WRAM, seed CPU registers, step opcodes
+ * until PC returns to a sentinel value, dump final WRAM. Used by the
+ * fuzz harness to produce an oracle-side execution trace for each
+ * generated snippet, for byte-level diff against recomp's output.
+ *
+ * The snippet is placed at bank $00 address $8000 by writing to the
+ * raw Memory.RAM (bank $7E) then setting ICPU.ShiftedPB/CPU.PCBase
+ * so snes9x reads from the buffer we control. Simpler alternative:
+ * write directly into Memory.RAM at an address reachable via PB=$00.
+ * Bank $00 $0000-$1FFF is a WRAM mirror, so writing $0000-$1FFF in
+ * Memory.RAM and setting PB=$00 PC=$XXXX in that range runs from
+ * WRAM. We use bank $00 PC $1800 (unused area below $1F00 state slot).
+ *
+ * Exit protocol: seed stack with sentinel return address $00DEAC;
+ * the snippet's terminating RTS pops PCL/PCH and increments PC by
+ * one, giving $00DEAD. The stepper exits when PCw reaches $DEAD.
+ */
+int snes9x_bridge_fuzz_run_snippet(
+    const uint8_t *rom_bytes, int rom_len,
+    uint16_t seed_a, uint16_t seed_x, uint16_t seed_y,
+    uint16_t seed_s, uint16_t seed_d,
+    uint8_t seed_db, uint8_t seed_p,
+    uint8_t *out_wram_0_1fff /* caller buffer sized 0x2000 */) {
+    if (!s_loaded) return -1;
+    if (rom_len <= 0 || rom_len > 0x100) return -2;
+
+    /* Snippet lives at bank $00 / PC $1800 via the bank-$00 WRAM
+     * mirror ($0000-$1FFF). Clear the mirror window first so a
+     * previous snippet's bytes don't leak into the next one. */
+    const uint16_t snippet_pc = 0x1800;
+    const uint16_t exit_pc    = 0xDEAD;
+
+    memset(&Memory.RAM[0x0000], 0, 0x2000);
+    memcpy(&Memory.RAM[snippet_pc], rom_bytes, rom_len);
+
+    /* Baseline WRAM fixtures the generator expects at $10/$11, $100/$101.
+     * The Python runner side uses the same baselines so deltas match. */
+    Memory.RAM[0x10]  = 0x55;
+    Memory.RAM[0x11]  = 0xAA;
+    Memory.RAM[0x100] = 0x33;
+    Memory.RAM[0x101] = 0xCC;
+
+    /* Seed registers. */
+    Registers.A.W   = seed_a;
+    Registers.X.W   = seed_x;
+    Registers.Y.W   = seed_y;
+    Registers.S.W   = seed_s;
+    Registers.D.W   = seed_d;
+    Registers.DB    = seed_db;
+    Registers.PB    = 0x00;
+    Registers.PCw   = snippet_pc;
+    Registers.P.B.l = seed_p;
+    /* Clear emulation-mode bit: snippets run in native mode. */
+    Registers.P.W  &= ~256u;
+
+    /* Seed return sentinel onto the stack: RTS pops PCL then PCH
+     * and adds 1, so we push (exit_pc - 1) = $DEAC as (hi, lo).
+     * In native mode S.W is the full 16-bit stack pointer; pages
+     * $00-$01 of bank $00 are WRAM-mirrored, so Memory.RAM[S.W]
+     * is the correct indexing. */
+    uint16_t ret = (uint16_t)(exit_pc - 1);
+    Memory.RAM[Registers.S.W] = (uint8_t)(ret >> 8);
+    Registers.S.W--;
+    Memory.RAM[Registers.S.W] = (uint8_t)(ret & 0xFF);
+    Registers.S.W--;
+
+    S9xUnpackStatus();
+    S9xFixCycles();
+    ICPU.ShiftedPB = 0;  /* PB=$00 */
+    S9xSetPCBase(snippet_pc);
+
+    /* Step opcodes until PC == exit_pc or we hit a safety budget. */
+    const int MAX_STEPS = 4096;
+    int steps = 0;
+    while (Registers.PBPC != ((uint32_t)0x00 << 16 | exit_pc)) {
+        if (steps++ >= MAX_STEPS) {
+            S9xPackStatus();
+            /* Dump WRAM anyway so the caller can observe partial state. */
+            if (out_wram_0_1fff) memcpy(out_wram_0_1fff, &Memory.RAM[0x0000], 0x2000);
+            /* Encode final PC24 into the negative return so the caller
+             * can diagnose without another trip. Negative values > -256
+             * stay reserved for clean error codes; PC goes into lower
+             * bits of a pattern below -1000. */
+            int32_t pc24 = (int32_t)(Registers.PBPC & 0xffffff);
+            return -1000 - pc24;
+        }
+        uint8_t Op;
+        if (CPU.PCBase) {
+            Op = CPU.PCBase[Registers.PCw];
+        } else {
+            Op = S9xGetByte(Registers.PBPC);
+            OpenBus = Op;
+        }
+        /* Recheck PCBase after a block-boundary cross. */
+        if ((Registers.PCw & MEMMAP_MASK) + ICPU.S9xOpLengths[Op] >= MEMMAP_BLOCK_SIZE) {
+            CPU.PCBase = S9xGetBasePointer(ICPU.ShiftedPB + ((uint16)(Registers.PCw + 4)));
+        }
+        Registers.PCw++;
+        (*ICPU.S9xOpcodes[Op].S9xOpcode)();
+    }
+    S9xPackStatus();
+
+    /* Dump WRAM $0000-$1FFF for the caller. */
+    if (out_wram_0_1fff) {
+        memcpy(out_wram_0_1fff, &Memory.RAM[0x0000], 0x2000);
+    }
+    return 0;
+}
+
 uint8_t snes9x_bridge_cpu_read(uint32_t addr24) {
     if (!s_loaded) return 0xFF;
     return S9xGetByte(addr24);
