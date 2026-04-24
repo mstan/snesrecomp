@@ -1,0 +1,4265 @@
+[
+  {
+    "opcode": 0,
+    "mnem": "BRK",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 1,
+    "mnem": "ORA",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 2,
+    "mnem": "COP",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 3,
+    "mnem": "ORA",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 4,
+    "mnem": "TSB",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 5,
+    "mnem": "ORA",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 6,
+    "mnem": "ASL",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 7,
+    "mnem": "ORA",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 8,
+    "mnem": "PHP",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 9,
+    "mnem": "ORA",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 10,
+    "mnem": "ASL",
+    "mode": "ACC",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 11,
+    "mnem": "PHD",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 12,
+    "mnem": "TSB",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 13,
+    "mnem": "ORA",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 14,
+    "mnem": "ASL",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 15,
+    "mnem": "ORA",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 16,
+    "mnem": "BPL",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 17,
+    "mnem": "ORA",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 18,
+    "mnem": "ORA",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 19,
+    "mnem": "ORA",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 20,
+    "mnem": "TRB",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 21,
+    "mnem": "ORA",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 22,
+    "mnem": "ASL",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 23,
+    "mnem": "ORA",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 24,
+    "mnem": "CLC",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "C"
+    ]
+  },
+  {
+    "opcode": 25,
+    "mnem": "ORA",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 26,
+    "mnem": "INC",
+    "mode": "ACC",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 27,
+    "mnem": "TCS",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 28,
+    "mnem": "TRB",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 29,
+    "mnem": "ORA",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 30,
+    "mnem": "ASL",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 31,
+    "mnem": "ORA",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 32,
+    "mnem": "JSR",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 33,
+    "mnem": "AND",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 34,
+    "mnem": "JSL",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 35,
+    "mnem": "AND",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 36,
+    "mnem": "BIT",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 37,
+    "mnem": "AND",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 38,
+    "mnem": "ROL",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 39,
+    "mnem": "AND",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 40,
+    "mnem": "PLP",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "D",
+      "I",
+      "M",
+      "N",
+      "V",
+      "X",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 41,
+    "mnem": "AND",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 42,
+    "mnem": "ROL",
+    "mode": "ACC",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 43,
+    "mnem": "PLD",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 44,
+    "mnem": "BIT",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 45,
+    "mnem": "AND",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 46,
+    "mnem": "ROL",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 47,
+    "mnem": "AND",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 48,
+    "mnem": "BMI",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 49,
+    "mnem": "AND",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 50,
+    "mnem": "AND",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 51,
+    "mnem": "AND",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 52,
+    "mnem": "BIT",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 53,
+    "mnem": "AND",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 54,
+    "mnem": "ROL",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 55,
+    "mnem": "AND",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 56,
+    "mnem": "SEC",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "C"
+    ]
+  },
+  {
+    "opcode": 57,
+    "mnem": "AND",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 58,
+    "mnem": "DEC",
+    "mode": "ACC",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 59,
+    "mnem": "TSC",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 60,
+    "mnem": "BIT",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 61,
+    "mnem": "AND",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 62,
+    "mnem": "ROL",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 63,
+    "mnem": "AND",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 64,
+    "mnem": "RTI",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "D",
+      "I",
+      "M",
+      "N",
+      "V",
+      "X",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 65,
+    "mnem": "EOR",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 66,
+    "mnem": "WDM",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 67,
+    "mnem": "EOR",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 68,
+    "mnem": "MVP",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 69,
+    "mnem": "EOR",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 70,
+    "mnem": "LSR",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 71,
+    "mnem": "EOR",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 72,
+    "mnem": "PHA",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 73,
+    "mnem": "EOR",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 74,
+    "mnem": "LSR",
+    "mode": "ACC",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 75,
+    "mnem": "PHK",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 76,
+    "mnem": "JMP",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 77,
+    "mnem": "EOR",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 78,
+    "mnem": "LSR",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 79,
+    "mnem": "EOR",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 80,
+    "mnem": "BVC",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 81,
+    "mnem": "EOR",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 82,
+    "mnem": "EOR",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 83,
+    "mnem": "EOR",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 84,
+    "mnem": "MVN",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 85,
+    "mnem": "EOR",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 86,
+    "mnem": "LSR",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 87,
+    "mnem": "EOR",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 88,
+    "mnem": "CLI",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "I"
+    ]
+  },
+  {
+    "opcode": 89,
+    "mnem": "EOR",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 90,
+    "mnem": "PHY",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 91,
+    "mnem": "TCD",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 92,
+    "mnem": "JMP",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 93,
+    "mnem": "EOR",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 94,
+    "mnem": "LSR",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 95,
+    "mnem": "EOR",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 96,
+    "mnem": "RTS",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 97,
+    "mnem": "ADC",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 98,
+    "mnem": "PER",
+    "mode": "REL16",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 99,
+    "mnem": "ADC",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 100,
+    "mnem": "STZ",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 101,
+    "mnem": "ADC",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 102,
+    "mnem": "ROR",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 103,
+    "mnem": "ADC",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 104,
+    "mnem": "PLA",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 105,
+    "mnem": "ADC",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 106,
+    "mnem": "ROR",
+    "mode": "ACC",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 107,
+    "mnem": "RTL",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 108,
+    "mnem": "JMP",
+    "mode": "INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 109,
+    "mnem": "ADC",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 110,
+    "mnem": "ROR",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 111,
+    "mnem": "ADC",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 112,
+    "mnem": "BVS",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 113,
+    "mnem": "ADC",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 114,
+    "mnem": "ADC",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 115,
+    "mnem": "ADC",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 116,
+    "mnem": "STZ",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 117,
+    "mnem": "ADC",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 118,
+    "mnem": "ROR",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 119,
+    "mnem": "ADC",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 120,
+    "mnem": "SEI",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "I"
+    ]
+  },
+  {
+    "opcode": 121,
+    "mnem": "ADC",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 122,
+    "mnem": "PLY",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 123,
+    "mnem": "TDC",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 124,
+    "mnem": "JMP",
+    "mode": "INDIR_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 125,
+    "mnem": "ADC",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 126,
+    "mnem": "ROR",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 127,
+    "mnem": "ADC",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 128,
+    "mnem": "BRA",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 129,
+    "mnem": "STA",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 130,
+    "mnem": "BRL",
+    "mode": "REL16",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 131,
+    "mnem": "STA",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 132,
+    "mnem": "STY",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 133,
+    "mnem": "STA",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 134,
+    "mnem": "STX",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 135,
+    "mnem": "STA",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 136,
+    "mnem": "DEY",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 137,
+    "mnem": "BIT",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 138,
+    "mnem": "TXA",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 139,
+    "mnem": "PHB",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 140,
+    "mnem": "STY",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 141,
+    "mnem": "STA",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 142,
+    "mnem": "STX",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 143,
+    "mnem": "STA",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 144,
+    "mnem": "BCC",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 145,
+    "mnem": "STA",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 146,
+    "mnem": "STA",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 147,
+    "mnem": "STA",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 148,
+    "mnem": "STY",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 149,
+    "mnem": "STA",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 150,
+    "mnem": "STX",
+    "mode": "DP_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 151,
+    "mnem": "STA",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 152,
+    "mnem": "TYA",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 153,
+    "mnem": "STA",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 154,
+    "mnem": "TXS",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 155,
+    "mnem": "TXY",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 156,
+    "mnem": "STZ",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 157,
+    "mnem": "STA",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 158,
+    "mnem": "STZ",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 159,
+    "mnem": "STA",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 160,
+    "mnem": "LDY",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": true,
+    "length": "variable",
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 161,
+    "mnem": "LDA",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 162,
+    "mnem": "LDX",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": true,
+    "length": "variable",
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 163,
+    "mnem": "LDA",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 164,
+    "mnem": "LDY",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 165,
+    "mnem": "LDA",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 166,
+    "mnem": "LDX",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 167,
+    "mnem": "LDA",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 168,
+    "mnem": "TAY",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 169,
+    "mnem": "LDA",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 170,
+    "mnem": "TAX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 171,
+    "mnem": "PLB",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 172,
+    "mnem": "LDY",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 173,
+    "mnem": "LDA",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 174,
+    "mnem": "LDX",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 175,
+    "mnem": "LDA",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 176,
+    "mnem": "BCS",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 177,
+    "mnem": "LDA",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 178,
+    "mnem": "LDA",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 179,
+    "mnem": "LDA",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 180,
+    "mnem": "LDY",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 181,
+    "mnem": "LDA",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 182,
+    "mnem": "LDX",
+    "mode": "DP_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 183,
+    "mnem": "LDA",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 184,
+    "mnem": "CLV",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "V"
+    ]
+  },
+  {
+    "opcode": 185,
+    "mnem": "LDA",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 186,
+    "mnem": "TSX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 187,
+    "mnem": "TYX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 188,
+    "mnem": "LDY",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 189,
+    "mnem": "LDA",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 190,
+    "mnem": "LDX",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 191,
+    "mnem": "LDA",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 192,
+    "mnem": "CPY",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": true,
+    "length": "variable",
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 193,
+    "mnem": "CMP",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 194,
+    "mnem": "REP",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "M",
+      "X"
+    ]
+  },
+  {
+    "opcode": 195,
+    "mnem": "CMP",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 196,
+    "mnem": "CPY",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 197,
+    "mnem": "CMP",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 198,
+    "mnem": "DEC",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 199,
+    "mnem": "CMP",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 200,
+    "mnem": "INY",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 201,
+    "mnem": "CMP",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 202,
+    "mnem": "DEX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 203,
+    "mnem": "WAI",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 204,
+    "mnem": "CPY",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": true,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 205,
+    "mnem": "CMP",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 206,
+    "mnem": "DEC",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 207,
+    "mnem": "CMP",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 208,
+    "mnem": "BNE",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 209,
+    "mnem": "CMP",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 210,
+    "mnem": "CMP",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 211,
+    "mnem": "CMP",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 212,
+    "mnem": "PEI",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 213,
+    "mnem": "CMP",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 214,
+    "mnem": "DEC",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 215,
+    "mnem": "CMP",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 216,
+    "mnem": "CLD",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "D"
+    ]
+  },
+  {
+    "opcode": 217,
+    "mnem": "CMP",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 218,
+    "mnem": "PHX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 219,
+    "mnem": "STP",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 220,
+    "mnem": "JMP",
+    "mode": "INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 221,
+    "mnem": "CMP",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 222,
+    "mnem": "DEC",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 223,
+    "mnem": "CMP",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 224,
+    "mnem": "CPX",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": true,
+    "length": "variable",
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 225,
+    "mnem": "SBC",
+    "mode": "INDIR_DPX",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 226,
+    "mnem": "SEP",
+    "mode": "IMM",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "M",
+      "X"
+    ]
+  },
+  {
+    "opcode": 227,
+    "mnem": "SBC",
+    "mode": "STK",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 228,
+    "mnem": "CPX",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 229,
+    "mnem": "SBC",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 230,
+    "mnem": "INC",
+    "mode": "DP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 231,
+    "mnem": "SBC",
+    "mode": "INDIR_L",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 232,
+    "mnem": "INX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 233,
+    "mnem": "SBC",
+    "mode": "IMM",
+    "m_dep": true,
+    "x_dep": false,
+    "length": "variable",
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 234,
+    "mnem": "NOP",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 235,
+    "mnem": "XBA",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 236,
+    "mnem": "CPX",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 237,
+    "mnem": "SBC",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 238,
+    "mnem": "INC",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 239,
+    "mnem": "SBC",
+    "mode": "LONG",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 240,
+    "mnem": "BEQ",
+    "mode": "REL",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": []
+  },
+  {
+    "opcode": 241,
+    "mnem": "SBC",
+    "mode": "INDIR_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 242,
+    "mnem": "SBC",
+    "mode": "DP_INDIR",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 243,
+    "mnem": "SBC",
+    "mode": "STK_IY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 244,
+    "mnem": "PEA",
+    "mode": "ABS",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 245,
+    "mnem": "SBC",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 246,
+    "mnem": "INC",
+    "mode": "DP_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 247,
+    "mnem": "SBC",
+    "mode": "INDIR_LY",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 2,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 248,
+    "mnem": "SED",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "D"
+    ]
+  },
+  {
+    "opcode": 249,
+    "mnem": "SBC",
+    "mode": "ABS_Y",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 250,
+    "mnem": "PLX",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": true,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 251,
+    "mnem": "XCE",
+    "mode": "IMP",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 1,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": false,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "M",
+      "X"
+    ]
+  },
+  {
+    "opcode": 252,
+    "mnem": "JSR",
+    "mode": "INDIR_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": false,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": []
+  },
+  {
+    "opcode": 253,
+    "mnem": "SBC",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 254,
+    "mnem": "INC",
+    "mode": "ABS_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 3,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": true,
+    "flags": [
+      "N",
+      "Z"
+    ]
+  },
+  {
+    "opcode": 255,
+    "mnem": "SBC",
+    "mode": "LONG_X",
+    "m_dep": false,
+    "x_dep": false,
+    "length": 4,
+    "touches_A": true,
+    "touches_X": false,
+    "touches_Y": false,
+    "reads_mem": true,
+    "writes_mem": false,
+    "flags": [
+      "C",
+      "N",
+      "V",
+      "Z"
+    ]
+  }
+]
