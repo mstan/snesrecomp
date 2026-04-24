@@ -4950,6 +4950,28 @@ class EmitCtx:
                 # Merge: assign current A to the earlier branch's variable
                 self._emit(f'{existing["A_var"]} = {self.A};')
                 branch_a = existing['A_var']  # use the same merge var
+            # Same phi merge for X. Without this, a second branch to the same
+            # target OVERWRITES the first branch's X_var (line assignment
+            # below), silently losing the first branch's X value when control
+            # takes that path. Canonical failure case: SMW's frozen-koopa
+            # bug (2026-04-23) — ParseLevelSpriteList_Entry2's slot-finder
+            # loop BEQ reached label_a93c with X=slot_var, but a later BEQ
+            # from a different predecessor overrode X_var to a stale local,
+            # and the slot_var's value never propagated.
+            if existing and existing.get('X_var') and branch_x and existing['X_var'] != branch_x:
+                # Skip the merge if the existing X_var is shared with Y —
+                # assigning to it would corrupt Y. Same caveat as the
+                # backward-branch X sync below.
+                existing_y = existing.get('Y_var')
+                if existing['X_var'] != existing_y:
+                    self._emit(f'{existing["X_var"]} = {self.X};')
+                    branch_x = existing['X_var']
+            # Same phi merge for Y.
+            if existing and existing.get('Y_var') and branch_y and existing['Y_var'] != branch_y:
+                existing_x = existing.get('X_var')
+                if existing['Y_var'] != existing_x:
+                    self._emit(f'{existing["Y_var"]} = {self.Y};')
+                    branch_y = existing['Y_var']
             self._branch_states[v] = {
                 'A_var': branch_a,
                 'X_var': branch_x,
