@@ -4067,33 +4067,41 @@ class EmitCtx:
             self.flag_width = 16 if wide_x else 8  # X-register flags
 
         # -- Stack push/pull ----------------------------------------------
+        # Width tracking (audit #7): each stack entry carries the width
+        # (1 or 2 bytes) at push time. PLX/PLY/PLA cross-check against
+        # the current M/X flag and emit a comment if they differ — a
+        # mismatched PHA(16)/PLA(8) pair miscompiles because the emitter
+        # tracks slots element-wise, not byte-wise.
         elif mn == 'PHX':
             # Save X value to a temp. PLX restores back into the SAME X variable.
             # Uses a single persistent save slot so loop re-entry reuses it.
             xn = self.X
+            push_w = 2 if wide_x else 1
             if xn is not None and self._simple(xn):
                 if not hasattr(self, '_phx_save') or self._phx_save is None:
                     self._phx_save = self._alloc(self._cur_x_type)
                 self._emit(f'{self._phx_save} = {xn};')
-                self.stack.append(('X', self._phx_save, xn))
+                self.stack.append(('X', self._phx_save, xn, push_w))
             else:
-                self.stack.append(('X', xn, xn))
+                self.stack.append(('X', xn, xn, push_w))
         elif mn == 'PHY':
             yn = self.Y
+            push_w = 2 if wide_x else 1
             if yn is not None and self._simple(yn):
                 if not hasattr(self, '_phy_save') or self._phy_save is None:
                     self._phy_save = self._alloc(self._cur_x_type)
                 self._emit(f'{self._phy_save} = {yn};')
-                self.stack.append(('Y', self._phy_save, yn))
+                self.stack.append(('Y', self._phy_save, yn, push_w))
             else:
-                self.stack.append(('Y', yn, yn))
+                self.stack.append(('Y', yn, yn, push_w))
         elif mn == 'PHA':
             # Materialize A before pushing --if A is a memory expression like
             # g_ram[0x1c], and the code modifies g_ram[0x1c] before PLA, the
             # pushed value would be stale. Snapshot into a variable.
             if self.A and not self._simple(self.A):
                 self._materialize('A', a_type)
-            self.stack.append(('A', self.A))
+            push_w = 2 if wide_a else 1
+            self.stack.append(('A', self.A, None, push_w))
             self._last_pha_val = self.A  # remember for branch-forked PLA
         elif mn == 'PHP':
             # Save an immutable snapshot of the current flag state.
@@ -4109,6 +4117,12 @@ class EmitCtx:
             if self.stack:
                 entry = self.stack.pop()
                 save_var = entry[1]
+                # audit #7: width-mismatch detection
+                pull_w = 2 if wide_x else 1
+                push_w = entry[3] if len(entry) > 3 else None
+                if push_w is not None and push_w != pull_w:
+                    self._emit(f'/* RECOMP_WARN: PLX at {pull_w}B pops a '
+                               f'{push_w}B push (width-mismatch bug class) */')
                 if entry[0] == 'X':
                     orig_var = entry[2] if len(entry) > 2 else save_var
                     if orig_var and save_var and self._simple(orig_var) and self._simple(save_var):
@@ -4135,6 +4149,11 @@ class EmitCtx:
             if self.stack and self.stack[-1][0] == 'Y':
                 entry = self.stack.pop()
                 save_var = entry[1]
+                pull_w = 2 if wide_x else 1
+                push_w = entry[3] if len(entry) > 3 else None
+                if push_w is not None and push_w != pull_w:
+                    self._emit(f'/* RECOMP_WARN: PLY at {pull_w}B pops a '
+                               f'{push_w}B push (width-mismatch bug class) */')
                 orig_var = entry[2] if len(entry) > 2 else save_var
                 if orig_var and save_var and self._simple(orig_var) and self._simple(save_var):
                     self._emit(f'{orig_var} = {save_var};')
@@ -4152,7 +4171,13 @@ class EmitCtx:
                 self._emit('/* PLY: stack empty */')
         elif mn == 'PLA':
             if self.stack and self.stack[-1][0] == 'A':
-                self.A = self.stack.pop()[1]
+                entry = self.stack.pop()
+                pull_w = 2 if wide_a else 1
+                push_w = entry[3] if len(entry) > 3 else None
+                if push_w is not None and push_w != pull_w:
+                    self._emit(f'/* RECOMP_WARN: PLA at {pull_w}B pops a '
+                               f'{push_w}B push (width-mismatch bug class) */')
+                self.A = entry[1]
             elif self.stack:
                 # Stack type mismatch --pop whatever is there
                 entry = self.stack.pop()
