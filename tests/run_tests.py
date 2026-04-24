@@ -43,6 +43,8 @@ TEST_MODULES = [
     'test_mx_inference_from_callers',
     'test_tail_call_x_restore',
     'test_phi_merge_x_param',
+    'test_accumulator_shift_width',
+    'test_memory_shift_rotate_width',
 ]
 
 

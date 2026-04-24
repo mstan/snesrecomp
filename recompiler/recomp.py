@@ -3186,6 +3186,26 @@ class EmitCtx:
         self._emit(f'{cur_expr} = (uint8)({new_expr});')
         return cur_expr
 
+    def _emit_rmw16(self, mode, addr, expr_template) -> Optional[str]:
+        """16-bit read-modify-write to WRAM for ASL/LSR/ROL/ROR/TSB/TRB
+        under M=0. Reads the word at addr+idx, applies the expression,
+        writes the word back. Routes through RDB_LOAD16/RDB_STORE16
+        when --reverse-debug is on.
+
+        Parallel to _emit_rmw8 but word-width. Only DP and ABS (no
+        indexing) are defined by the 65816 ISA for these opcodes at
+        M=0; indexed variants fall through to None.
+        """
+        if mode not in (DP, ABS):
+            return None
+        idx = '0'
+        cur_expr = self._wram16(addr, idx)
+        new_expr = expr_template.format(cur=cur_expr)
+        tmp = self._alloc_tmp('uint16')
+        self._emit(f'{tmp} = (uint16)({new_expr});')
+        self._wram16_write(addr, idx, tmp)
+        return tmp
+
     def _reg_for_hook(self, reg_value: Optional[str]) -> str:
         """Return a C expression suitable for the RDB_BLOCK_HOOK macro's
         a/x/y argument. Maps the recomp's abstract-register tracker
@@ -4329,17 +4349,29 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.flag_src = an
             else:
-                mem = self._resolve_mem_rw(mode, v)
-                if mem:
+                # M=0: 16-bit RMW on the word at addr (DP/ABS only per ISA).
+                if wide_a and mode in (DP, ABS):
+                    mem16 = self._wram16(v, '0')
                     cv = self._alloc_tmp('uint8')
-                    self._emit(f'{cv} = ({mem} >> 7) & 1;')
+                    self._emit(f'{cv} = ({mem16} >> 15) & 1;')
                     self.carry = cv
-                    new = self._emit_rmw8(mode, v, '{cur} << 1')
+                    new = self._emit_rmw16(mode, v, '{cur} << 1')
                     if mode == DP:
                         self.dp_state.pop(v, None)
+                        self.dp_state.pop(v + 1, None)
                     self.flag_src = new
                 else:
-                    self._emit(f'/* ASL {MODE_STR.get(mode,"?")} ${v:x} */')
+                    mem = self._resolve_mem_rw(mode, v)
+                    if mem:
+                        cv = self._alloc_tmp('uint8')
+                        self._emit(f'{cv} = ({mem} >> 7) & 1;')
+                        self.carry = cv
+                        new = self._emit_rmw8(mode, v, '{cur} << 1')
+                        if mode == DP:
+                            self.dp_state.pop(v, None)
+                        self.flag_src = new
+                    else:
+                        self._emit(f'/* ASL {MODE_STR.get(mode,"?")} ${v:x} */')
 
         # -- LSR ----------------------------------------------------------
         elif mn == 'LSR':
@@ -4352,17 +4384,28 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.flag_src = an
             else:
-                mem = self._resolve_mem_rw(mode, v)
-                if mem:
+                if wide_a and mode in (DP, ABS):
+                    mem16 = self._wram16(v, '0')
                     cv = self._alloc_tmp('uint8')
-                    self._emit(f'{cv} = {mem} & 1;')
+                    self._emit(f'{cv} = {mem16} & 1;')
                     self.carry = cv
-                    new = self._emit_rmw8(mode, v, '{cur} >> 1')
+                    new = self._emit_rmw16(mode, v, '{cur} >> 1')
                     if mode == DP:
                         self.dp_state.pop(v, None)
+                        self.dp_state.pop(v + 1, None)
                     self.flag_src = new
                 else:
-                    self._emit(f'/* LSR {MODE_STR.get(mode,"?")} ${v:x} */')
+                    mem = self._resolve_mem_rw(mode, v)
+                    if mem:
+                        cv = self._alloc_tmp('uint8')
+                        self._emit(f'{cv} = {mem} & 1;')
+                        self.carry = cv
+                        new = self._emit_rmw8(mode, v, '{cur} >> 1')
+                        if mode == DP:
+                            self.dp_state.pop(v, None)
+                        self.flag_src = new
+                    else:
+                        self._emit(f'/* LSR {MODE_STR.get(mode,"?")} ${v:x} */')
 
         # -- ROL ----------------------------------------------------------
         elif mn == 'ROL':
@@ -4376,16 +4419,27 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
-                mem = self._resolve_mem_rw(mode, v)
-                if mem:
+                if wide_a and mode in (DP, ABS):
+                    mem16 = self._wram16(v, '0')
                     cv = self._alloc_tmp('uint8')
-                    self._emit(f'{cv} = ({mem} >> 7) & 1;')
-                    new = self._emit_rmw8(mode, v, '({{cur}} << 1) | {ci}'.format(ci=carry_in))
+                    self._emit(f'{cv} = ({mem16} >> 15) & 1;')
+                    new = self._emit_rmw16(mode, v,
+                        '({{cur}} << 1) | {ci}'.format(ci=carry_in))
                     if mode == DP:
                         self.dp_state.pop(v, None)
+                        self.dp_state.pop(v + 1, None)
                     self.carry = cv; self.flag_src = new
                 else:
-                    self._emit(f'/* ROL {MODE_STR.get(mode,"?")} ${v:x} */')
+                    mem = self._resolve_mem_rw(mode, v)
+                    if mem:
+                        cv = self._alloc_tmp('uint8')
+                        self._emit(f'{cv} = ({mem} >> 7) & 1;')
+                        new = self._emit_rmw8(mode, v, '({{cur}} << 1) | {ci}'.format(ci=carry_in))
+                        if mode == DP:
+                            self.dp_state.pop(v, None)
+                        self.carry = cv; self.flag_src = new
+                    else:
+                        self._emit(f'/* ROL {MODE_STR.get(mode,"?")} ${v:x} */')
 
         # -- ROR ----------------------------------------------------------
         elif mn == 'ROR':
@@ -4399,16 +4453,27 @@ class EmitCtx:
                 self._invalidate_dp_aliases_to(an)
                 self.carry = cv; self.flag_src = an
             else:
-                mem = self._resolve_mem_rw(mode, v)
-                if mem:
+                if wide_a and mode in (DP, ABS):
+                    mem16 = self._wram16(v, '0')
                     cv = self._alloc_tmp('uint8')
-                    self._emit(f'{cv} = {mem} & 1;')
-                    new = self._emit_rmw8(mode, v, '({{cur}} >> 1) | ({ci} << 7)'.format(ci=carry_in))
+                    self._emit(f'{cv} = {mem16} & 1;')
+                    new = self._emit_rmw16(mode, v,
+                        '({{cur}} >> 1) | ({ci} << 15)'.format(ci=carry_in))
                     if mode == DP:
                         self.dp_state.pop(v, None)
+                        self.dp_state.pop(v + 1, None)
                     self.carry = cv; self.flag_src = new
                 else:
-                    self._emit(f'/* ROR {MODE_STR.get(mode,"?")} ${v:x} */')
+                    mem = self._resolve_mem_rw(mode, v)
+                    if mem:
+                        cv = self._alloc_tmp('uint8')
+                        self._emit(f'{cv} = {mem} & 1;')
+                        new = self._emit_rmw8(mode, v, '({{cur}} >> 1) | ({ci} << 7)'.format(ci=carry_in))
+                        if mode == DP:
+                            self.dp_state.pop(v, None)
+                        self.carry = cv; self.flag_src = new
+                    else:
+                        self._emit(f'/* ROR {MODE_STR.get(mode,"?")} ${v:x} */')
 
         # -- BIT ----------------------------------------------------------
         elif mn == 'BIT':
