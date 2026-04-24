@@ -41,6 +41,8 @@ TEST_MODULES = [
     'test_insn_hook_emits',
     'test_wram_read_trace',
     'test_mx_inference_from_callers',
+    'test_tail_call_x_restore',
+    'test_phi_merge_x_param',
 ]
 
 

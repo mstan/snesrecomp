@@ -1226,13 +1226,30 @@ def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
     sorted_addrs = sorted(insn_by_addr)
     idx = {a: i for i, a in enumerate(sorted_addrs)}
     restore_addrs: Set[int] = set()
-    for insn in insns:
-        if insn.mnem not in ('RTS', 'RTL'):
-            continue
-        i = idx[insn.addr & 0xFFFF]
-        # Walk backwards from the RTS looking for the most-recent insn
+
+    # Collect "exit points": every RTS/RTL is an exit. Additionally, if
+    # the last decoded instruction is non-terminal (the function falls
+    # through into the next function — a tail call), treat the position
+    # just AFTER the last instruction as a synthetic exit: the caller
+    # sees X set by whatever the pre-fall-through code last wrote.
+    # Without this, SMW's SubSprGfx1-style split (tail-caller reloads
+    # X from CurSpriteProcess, falls through to a continuation that
+    # doesn't touch X) leaves the tail-caller's restore pattern
+    # invisible to the detector. Indexed STAs in callers then use
+    # X=UNKNOWN (slot 0) instead of the restored slot value.
+    exit_indices = [idx[insn.addr & 0xFFFF] + 1 for insn in insns
+                    if insn.mnem in ('RTS', 'RTL')]
+    # Fall-through tail-call exit
+    if insns:
+        last = insns[-1]
+        if last.mnem not in ('RTS', 'RTL', 'RTI', 'JMP',
+                             'BRA', 'BRL', 'BRK', 'STP'):
+            exit_indices.append(len(sorted_addrs))
+
+    for i in exit_indices:
+        # Walk backwards from this exit looking for the most-recent insn
         # that WRITES X (not just reads it via indexed addressing). Code
-        # between the write and the RTS may use X via STA $xxxx,X etc.
+        # between the write and the exit may use X via STA $xxxx,X etc.
         # without disturbing it. If the most-recent writer is an
         # LDX DP/ABS, that's our deterministic restore.
         j = i - 1
@@ -1246,7 +1263,7 @@ def _detect_x_restore_expr(insns: List[Insn]) -> Optional[str]:
                 restore_addrs.add(cand.operand)
             else:
                 return None  # any other X-writer (TAX/TSX/TYX/PLX/INX/DEX)
-                             # means X at RTS is not a deterministic WRAM
+                             # means X at exit is not a deterministic WRAM
                              # load; bail so we don't pretend it is.
             break
         else:
@@ -2500,6 +2517,41 @@ def _augment_cfg_sigs_one_pass(rom: bytes, cfg) -> int:
                 # from the clobber set so live-in analysis can see
                 # through this call on subsequent passes.
                 cfg.clobbers[full_addr].discard('X')
+        # Tail-call X-restore inheritance: if this function ends in a
+        # tail transfer (fall-through into next ROM function, unconditional
+        # JMP/BRA/BRL to a known function) and has no local X-restore of
+        # its own, inherit the x_restore of the tail-call target. Needed
+        # because _detect_x_restore_expr walks back from RTS only — tail-
+        # calling functions have no RTS, so their effective X-on-return
+        # is whatever the tail-callee leaves X at.
+        #
+        # Canonical failure without this: SMW
+        # GenericGFXRtDraw2Tiles16x16sStacked_Sub ($019D67) falls through
+        # to GenericGFXRtDraw2Tiles16x16sStacked_019DA9 which ends with
+        # `LDX CurSpriteProcess ; RTS`. Callers of the _Sub entry (e.g.
+        # Spr0to13Gfx) need to see X restored to CurSpriteProcess after
+        # their JSR so the `PLA ; STA SpriteYPosLow,X` Y-restore pattern
+        # emits `RDB_STORE8(0xd8 + k, v)` instead of `+ 0 /* UNKNOWN */`
+        # (which corrupts slot 0 and lets slot k's Y drift by -0x10/frame).
+        # Converges across _augment_cfg_sigs multi-pass loop (up to 8
+        # iters) — the tail-callee must have been processed first.
+        if full_addr not in cfg.x_restores and insns:
+            tc_full = None
+            last = insns[-1]
+            is_terminal = last.mnem in (
+                'RTS', 'RTL', 'RTI', 'JMP', 'BRA', 'BRL', 'BRK', 'STP')
+            if not is_terminal and i + 1 < len(non_skip):
+                tc_full = (cfg.bank << 16) | non_skip[i + 1][1]
+            elif last.mnem == 'JMP' and last.mode == ABS:
+                tc_full = (cfg.bank << 16) | (last.operand & 0xFFFF)
+            elif last.mnem in ('BRA', 'BRL'):
+                nf_start = (last.operand & 0xFFFF)
+                if nf_start in cfg.names:
+                    tc_full = (cfg.bank << 16) | nf_start
+            if tc_full is not None and tc_full in cfg.x_restores:
+                cfg.x_restores[full_addr] = cfg.x_restores[tc_full]
+                if full_addr in cfg.clobbers:
+                    cfg.clobbers[full_addr].discard('X')
         # Dispatch-target guard: if this function is in any dispatch
         # table, its param list must match the shape the cast at the
         # dispatch site will pass through. The emitter picks among
@@ -2972,15 +3024,47 @@ class EmitCtx:
 
     def _ensure_mutable_x(self, x_type: str = 'uint8') -> Optional[str]:
         """Ensure X holds a mutable variable (not k/j parameter). If X is a
-        function parameter, create a mutable copy. Returns var name or None."""
+        function parameter, create a mutable copy. Returns var name or None.
+
+        Alias handling: bank01.cfg's `default_init_y = x` directive
+        initializes self.Y to the same string as self.X ('k'). When we
+        rewrite self.X to a mutable var:
+
+        - If Y is NOT aliased to xn: leave Y alone (it's tracking
+          something else).
+        - If Y IS aliased: give Y its OWN separate mutable copy (not a
+          pointer to X's new var). Sharing the var across X and Y would
+          cause label-pop phi-merges to cross-contaminate when X and Y
+          diverge on the fall-through (the existing special-case at
+          line ~3678 handles X-when-shared-with-Y but not vice-versa,
+          and even a symmetric check would just skip Y sync — leaving
+          the shared var's value correct for X but forcing Y to take
+          whatever value it happened to hold).
+          Giving Y its own var `= <param>;` keeps both registers
+          tracking the original param value at the branch site,
+          which is what was semantically intended by the alias.
+
+        Without either alias branch, Y keeps referring to 'k' while X
+        diverges, and downstream phi-merges at labels may emit
+        `k = <Y_local>;`, corrupting the sprite-slot parameter used
+        for indexing (canonical failure: first koopa-fix attempt
+        2026-04-24 that inverted Y in physics-update code).
+        """
         xn = self.X
         if xn is None:
             return None
         if xn in ('k', 'j'):
-            # Create a mutable copy of the parameter
+            # Create a mutable copy of the X-side param.
             name = self._alloc(x_type)
             self._emit(f'{name} = {xn};')
+            was_y_aliased = (self.Y == xn)
             self.X = name
+            if was_y_aliased:
+                # Y gets its own var also seeded from the param, so
+                # subsequent X and Y tracking stay independent.
+                y_name = self._alloc(x_type)
+                self._emit(f'{y_name} = {xn};')
+                self.Y = y_name
             return name
         if self._simple(xn):
             return xn
@@ -4929,6 +5013,9 @@ class EmitCtx:
                 self._ensure_mutable_x(self._cur_x_type)
             if self.A is not None and v in self.valid_branch_targets:
                 branch_a = self._materialize('A', self._cur_a_type)
+            # X-param phi-merge at forward branch (see test_phi_merge_x_param.py).
+            if v in self.valid_branch_targets and self.X in ('k', 'j'):
+                self._ensure_mutable_x(self._cur_x_type)
             if self.X is not None and v in self.valid_branch_targets:
                 branch_x = self._materialize('X', self._cur_x_type)
             if self.Y is not None and v in self.valid_branch_targets:
