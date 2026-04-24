@@ -248,6 +248,29 @@ def in_scope(e: dict) -> bool:
 
 # ----- Main -------------------------------------------------------------------
 
+def epilogue(m_flag_after: int, x_flag_after: int) -> bytes:
+    """After the test instruction, snapshot A/X/Y to reserved WRAM
+    so both recomp and oracle produce a comparable output even for
+    register-only opcodes. Width = width of A/X at this point in the
+    program. Note: the test insn may have changed M/X (via REP/SEP);
+    we assume it hasn't for the in-scope mnemonics. Snippets using
+    REP/SEP as the test insn are not generated today.
+
+    Epilogue addresses:
+      $1F00-$1F01  final A (word or byte)
+      $1F02-$1F03  final X (word or byte)
+      $1F04-$1F05  final Y (word or byte)
+    """
+    out = bytearray()
+    # STA $1F00 (ABS)
+    out += bytes([0x8D, 0x00, 0x1F])
+    # STX $1F02 (ABS)
+    out += bytes([0x8E, 0x02, 0x1F])
+    # STY $1F04 (ABS)
+    out += bytes([0x8C, 0x04, 0x1F])
+    return bytes(out)
+
+
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -275,6 +298,7 @@ def main():
                         rom += encode_insn(e['opcode'], e['mode'], m_flag, x_flag, e['mnem'])
                     except ValueError as exc:
                         continue
+                    rom += epilogue(m_flag, x_flag)
                     rom += bytes([0x60])  # RTS
                     snip = {
                         'id': f'{e["mnem"]}_{e["mode"]}_M{m_flag}_X{x_flag}_{seed_name}_op{e["opcode"]:02x}',
