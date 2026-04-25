@@ -105,12 +105,13 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     return ppu_read(g_ppu, adr);
   }
   if(adr < 0x80) {
-    // APU port read ($2140-$217F). Catch the APU up to the current
-    // cycle and return the live outPort value. RtlApuLock serialises
-    // us against the audio thread's render loop, which advances the
-    // APU under the same lock.
+    // APU port read ($2140-$217F). Catch the APU up based on the
+    // main-CPU cycles elapsed since the last APU sync, and return
+    // the live outPort value. RtlApuLock serialises us against the
+    // audio thread's render loop, which advances the APU under the
+    // same lock.
     RtlApuLock();
-    snes->apuCatchupCycles = 32;
+    rtl_accumulate_apu_catchup();
     snes_catchupApu(snes);
     uint8_t v = snes->apu->outPorts[adr & 0x3];
     RtlApuUnlock();

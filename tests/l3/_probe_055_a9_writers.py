@@ -74,10 +74,16 @@ def main():
             f = c.cmd('frame'); print(f'  frame: {f.get("frame", "?")}')
             for adr, name in [(0x71, 'PlayerXLo'), (0x73, 'PlayerYLo'),
                               (0x94, 'PlayerXLo2'), (0x96, 'PlayerYLo2'),
-                              (0x100, 'GameMode'), (0x13C6, 'SpawningSprite_idx'),
-                              (0x65, 'Layer1Data_lo'), (0x66, 'Layer1Data_mid'), (0x67, 'Layer1Data_hi')]:
+                              (0x100, 'GameMode'),
+                              (0x65, 'Layer1Data+0'), (0x66, 'Layer1Data+1'), (0x67, 'Layer1Data+2'),
+                              (0x68, 'Layer2Data+0'), (0x69, 'Layer2Data+1'), (0x6a, 'Layer2Data+2'),
+                              (0x6b, 'Map16Lo+0'), (0x6c, 'Map16Lo+1'), (0x6d, 'Map16Lo+2'),
+                              (0x6e, 'Map16Hi+0'), (0x6f, 'Map16Hi+1'), (0x70, 'Map16Hi+2'),
+                              (0x98, 'BlockYPos'), (0x9a, 'BlockXPos'),
+                              (0x187a, 'pause_screen'), (0x1931, 'water_flag')]:
                 r = c.cmd(f'read_ram {adr:x} 1')
-                print(f'  ${adr:04x} {name} = {r.get("data", "?")}')
+                d = r.get('hex', '?')
+                print(f'  ${adr:04x} {name} = {d}')
         except Exception as ex:
             print(f'state dump failed: {ex}')
 

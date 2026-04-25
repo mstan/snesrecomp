@@ -52,6 +52,8 @@ extern Ppu *g_ppu;
 extern Cpu *g_cpu;
 extern Dma *g_dma;
 extern Snes *g_snes;
+// APU pacing counter; defined in common_rtl.c.
+extern uint64_t g_main_cpu_cycles_estimate;
 extern uint8 g_ram[0x20000];
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 
@@ -739,6 +741,13 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
     // regardless of trace state, so WRAM writes can correlate to block
     // index even when the block trace itself isn't being recorded.
     g_block_counter++;
+
+    // APU pacing: bump the main-CPU cycle estimate. Average ~24 cycles
+    // per basic block (each block is typically 3-5 65816 instructions
+    // averaging ~6 cycles each). RtlApuWrite / snes_readBBus use this
+    // counter to drive realistic snes_catchupApu() so SMW's "wait for
+    // APU ack" loops actually wait. Plain unsigned add, no branch.
+    g_main_cpu_cycles_estimate += 24;
 
     // Tier 3 WRAM anchors: snapshot full WRAM every N blocks when armed.
     if (s_anchor_active && (g_block_counter % s_anchor_interval) == 0) {

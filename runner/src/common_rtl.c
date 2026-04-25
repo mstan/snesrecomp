@@ -14,6 +14,15 @@ const uint8 *g_rom;
 Ppu *g_ppu;
 Dma *g_dma;
 
+// Main-CPU cycle estimate, incremented per RDB_BLOCK_HOOK in debug_on_block_enter.
+// Used to pace APU catchup realistically: real SNES is ~3.58 MHz main / ~1.024 MHz APU,
+// ratio ~3.5:1. Prior code hardcoded apuCatchupCycles=32 per APU port touch regardless
+// of elapsed main-CPU time, which let APU stay artificially synchronized -- SMW boot's
+// "wait for APU ack" loops resolved instantly, racing through ~200 frames worth of game
+// logic in ~95 frames. Tracking real elapsed cycles makes those waits actually wait.
+uint64_t g_main_cpu_cycles_estimate = 0;
+uint64_t g_apu_last_sync_cycles = 0;
+
 // FILE-backed SaveLoadInfo. snes_saveload calls back into func() once per
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
@@ -37,6 +46,8 @@ static void file_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 
 void RtlReset(int mode) {
   snes_frame_counter = 0;
+  g_main_cpu_cycles_estimate = 0;
+  g_apu_last_sync_cycles = 0;
   snes_reset(g_snes, true);
   SnesEnterNativeMode();
   ppu_reset(g_ppu);
@@ -238,13 +249,29 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 
 /* IndirWriteByte is now inline in common_rtl.h */
 
+// Convert main-CPU cycle delta into APU cycles (ratio ~3.5:1) and accumulate
+// into apuCatchupCycles. Caller holds RtlApuLock and is responsible for the
+// snes_catchupApu() call. Sets g_apu_last_sync_cycles to the current main-CPU
+// estimate so subsequent calls only see incremental work.
+//
+// Public so snes.c's snes_readBBus (the APU read path) can use the same
+// pacing -- both reads and writes need to advance APU.
+void rtl_accumulate_apu_catchup(void) {
+  uint64_t delta = g_main_cpu_cycles_estimate - g_apu_last_sync_cycles;
+  g_apu_last_sync_cycles = g_main_cpu_cycles_estimate;
+  // 2/7 ≈ 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
+  // (back-to-back APU touches with no block hooks between them) just don't
+  // advance APU on this pass; cycles accumulate for the next touch.
+  g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
+}
+
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
   // Catch the APU up to the current cycle and write the port value
   // directly. Serialise with the audio thread via RtlApuLock — it
   // holds the same lock while cycling the APU in RtlRenderAudio.
   RtlApuLock();
-  g_snes->apuCatchupCycles = 32;
+  rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
   g_snes->apu->inPorts[adr & 0x3] = val;
   RtlApuUnlock();

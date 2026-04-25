@@ -30,6 +30,12 @@ extern const uint8 *g_rom;
 extern Ppu *g_ppu;
 extern Dma *g_dma;
 
+// Main-CPU cycle estimate for APU pacing. Incremented per RDB_BLOCK_HOOK.
+// See common_rtl.c rtl_accumulate_apu_catchup() for usage.
+extern uint64_t g_main_cpu_cycles_estimate;
+extern uint64_t g_apu_last_sync_cycles;
+void rtl_accumulate_apu_catchup(void);
+
 #define GET_BYTE(p) (*(uint8*)(p))
 
 extern int snes_frame_counter;
