@@ -6709,6 +6709,17 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
 
     # Verbatim and oracle fallback --deferred to after forward declarations
 
+    # Auto-detect ExecutePtr-style dispatch helpers BEFORE intra-bank
+    # auto-promote. Without this ordering, cfg.jsl_dispatch is empty when
+    # discover_bank runs, so inline dispatch tables don't get walked and
+    # their handler entries aren't seeded into _discovered_local. The
+    # main emit pass then truncates the dispatch tables at the first
+    # not-yet-promoted entry (cluster-break heuristic). Surfaced by
+    # koopa-shell-pop investigation: HandleSprite's kDispatch_8137 had
+    # 6 entries (statuses 0..5) instead of the ROM's 13 (statuses 0..C),
+    # so status=9 (Stunned) indexed OOB and the koopa effectively erased.
+    _auto_detect_dispatch_helpers(rom, cfg)
+
     # ── Intra-bank auto-promote (discover.py) ────────────────────────────
     # Walk the ROM's call graph from every existing cfg func as a seed, and
     # promote every newly-discovered intra-bank JSR/JSL target into a func
@@ -6747,6 +6758,15 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
                 _sib_cfg = parse_config(_sib_path)
             except Exception:
                 continue
+            # Auto-detect ExecutePtr-style dispatch helpers on the sibling
+            # too, so its dispatch tables get walked when discover runs
+            # below. Without this, sibling dispatch tables that point INTO
+            # this bank would be missed and we'd fail to seed the targets
+            # as incoming-from-siblings.
+            try:
+                _auto_detect_dispatch_helpers(rom, _sib_cfg)
+            except Exception:
+                pass
             _sib_seeds = {a for _, a, *_ in _sib_cfg.funcs}
             try:
                 _sib_local, _sib_cross = discover_bank(
@@ -6976,9 +6996,9 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # new callers.
     _infer_entry_mx_from_callers(rom, cfg)
 
-    # Auto-detect ExecutePtr-style dispatch helpers by ROM pattern. Unions
-    # with any cfg-provided hints so existing cfgs keep working.
-    _auto_detect_dispatch_helpers(rom, cfg)
+    # _auto_detect_dispatch_helpers was moved earlier (before the
+    # intra-bank auto-promote pass) so discover_bank sees the populated
+    # cfg.jsl_dispatch and walks inline dispatch tables. See note above.
 
     # --- Live-in register inference (Rule 0: recompiler is authoritative) --
     # Derive calling-convention parameters directly from the ROM. For each
