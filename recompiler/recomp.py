@@ -2837,6 +2837,14 @@ class EmitCtx:
         # Flag source for branches
         self.flag_src: Optional[str] = None
         self.flag_width: int = 8  # 8 or 16: width of last flag-setting operation
+        # n_src: optional override for the N flag's source. When None,
+        # BPL/BMI use flag_src (true for the vast majority of ops).
+        # Only ops where N comes from a DIFFERENT value than Z need
+        # this — BIT (N from mem, Z from A&mem) and TSB/TRB (N
+        # preserved unchanged, Z from A & pre_mem). Reset to None at
+        # every non-flag-preserving instruction so BIT/TSB/TRB's
+        # custom N doesn't leak past them.
+        self.n_src: Optional[str] = None
         self.overflow: Optional[str] = None  # V flag expression (bit 6 from BIT)
 
         # Branch merge tracking: when a conditional branch is taken, save the
@@ -3633,8 +3641,12 @@ class EmitCtx:
         if mnem == 'BEQ': return f'{s} == 0'
         if mnem == 'BNE': return f'{s} != 0'
         sign_t = 'int16' if self.flag_width == 16 else 'int8'
-        if mnem == 'BPL': return f'({sign_t}){s} >= 0'
-        if mnem == 'BMI': return f'({sign_t}){s} < 0'
+        # N source: prefer n_src if set (BIT/TSB/TRB override Z source
+        # only; N comes from a different value or is preserved).
+        n_fs = self.n_src if self.n_src is not None else self.flag_src
+        n_s = self._wrap(n_fs) if n_fs and not self._simple(n_fs) else (n_fs or '0 /* flags unknown */')
+        if mnem == 'BPL': return f'({sign_t}){n_s} >= 0'
+        if mnem == 'BMI': return f'({sign_t}){n_s} < 0'
         if mnem == 'BCS': return f'{self.carry} != 0' if self.carry else '/* carry? */ 0'
         if mnem == 'BCC': return f'{self.carry} == 0' if self.carry else '/* carry? */ 0'
         if mnem == 'BVS': return f'{self.overflow}' if self.overflow else '/* overflow? */ 0'
@@ -3662,11 +3674,23 @@ class EmitCtx:
         # (the 16-bit CMP → SEP → BPL pattern requires flag_width=16
         # to survive across the SEP).
         # Branch instructions consume flag_width, so they must not reset it.
-        _NO_FLAG_RESET = ('REP', 'SEP', 'BPL', 'BMI', 'BEQ', 'BNE', 'BCS', 'BCC', 'BVS', 'BVC')
+        # Non-flag-touching STORE instructions (STA/STX/STY/STZ) must
+        # ALSO not reset flag_width, because a pattern like
+        #   CPX #$42  (flag_width=8 when X-width=8)
+        #   STZ $abs  (doesn't touch flags, but would reset flag_width→16 when M=0)
+        #   BPL ...   (now reads wrong width)
+        # miscomputes the branch sign cast. Phase B fuzz caught this
+        # at CPX/CPY N captures with the STZ-based epilogue.
+        _NO_FLAG_RESET = ('REP', 'SEP', 'BPL', 'BMI', 'BEQ', 'BNE', 'BCS', 'BCC', 'BVS', 'BVC',
+                          'STA', 'STX', 'STY', 'STZ')
         if mn not in _NO_FLAG_RESET:
             # Set flag_width based on the CURRENT accumulator width for this
             # instruction, so 16-bit EOR/AND/ORA/ADC/SBC/LDA get int16 sign checks.
             self.flag_width = 16 if wide_a else 8
+            # n_src is a per-instruction override for the BIT/TSB/TRB
+            # special cases where N's source ≠ Z's source. Reset here
+            # so a stale override doesn't leak past those mnemonics.
+            self.n_src = None
 
         # Emit label with branch-merge
         if pc in branch_targets:
@@ -4231,7 +4255,9 @@ class EmitCtx:
         # -- SBC ----------------------------------------------------------
         elif mn == 'SBC':
             self._emit_sbc(mode, v, wide_a, a_type)
-            self.overflow = None  # SBC modifies V flag
+            # V flag is now computed inside _emit_sbc (standard signed-
+            # overflow formula). Previous code set self.overflow = None
+            # here, silently making every BVS/BVC after SBC degenerate.
 
         # -- AND / ORA / EOR ----------------------------------------------
         elif mn == 'AND':
@@ -4513,58 +4539,71 @@ class EmitCtx:
             a = self._wrap(self.A) if self.A else '0'
             mem = self._resolve_mem(mode, v, wide=wide_a)
             if mem is not None:
+                # Z comes from (A & mem); flag_src tracks Z source.
                 self.flag_src = f'{a} & {mem}'
                 # BIT sets V from the second-highest bit of the memory
                 # operand (not the AND result), and N from the top bit.
                 # Width-dependent per the M flag:
                 #   M=1 (8-bit):  V = bit 6  (mask 0x40)
                 #   M=0 (16-bit): V = bit 14 (mask 0x4000)
-                # BIT #imm does NOT affect V on 65816.
+                # BIT #imm does NOT affect V or N on 65816 (Z only).
                 if mode != IMM:
                     v_mask = 0x4000 if wide_a else 0x40
                     self.overflow = f'({mem}) & 0x{v_mask:x}'
+                    # N from mem's top bit — separate from Z source.
+                    self.n_src = mem
             else:
                 self.flag_src = None
 
         # -- TSB / TRB ----------------------------------------------------
         # 65816: under M=0, TSB/TRB test the 16-bit accumulator against
         # a 16-bit word in memory, then OR (TSB) or AND-NOT (TRB) A into
-        # the word and write both bytes back. Flags: Z set iff (A & mem) == 0
-        # using the same width as the RMW.
-        elif mn == 'TSB':
+        # the word and write both bytes back. Flags: ONLY Z is set,
+        # from (A & pre_mem) == 0 — the PRE-RMW memory value. N and V
+        # are NOT modified by TSB/TRB (the 65816 ref manual is explicit
+        # on this; the original setting of flag_src to the RMW result
+        # was wrong on two counts: it used post-RMW, and it implied N
+        # would be set from the sign bit of the stored value).
+        elif mn in ('TSB', 'TRB'):
             a = self._wrap(self.A) if self.A else '0'
+            # Capture the OLD N source before TSB/TRB runs the auto-reset
+            # loop above already cleared n_src to None. flag_src at this
+            # point still has the prior instruction's value, which is
+            # what hardware's preserved N reads.
+            preserved_n = self.flag_src
+            # Snapshot pre-RMW memory into a temp for the Z computation,
+            # so the flag computation references the ORIGINAL memory value.
             if wide_a and mode in (DP, ABS):
-                new = self._emit_rmw16(mode, v, '{{cur}} | {a}'.format(a=a))
+                pre_mem = self._wram16(v, '0')
+                z_type = 'uint16'
+            else:
+                pre_mem = self._wram(v, '0') if mode in (DP, ABS) else None
+                z_type = 'uint8'
+            z_tmp = None
+            if pre_mem is not None:
+                z_tmp = self._alloc_tmp(z_type)
+                self._emit(f'{z_tmp} = ({z_type})({a}) & {pre_mem};')
+            # Emit the RMW.
+            tmpl = '{{cur}} | {a}' if mn == 'TSB' else '{{cur}} & ~({a})'
+            if wide_a and mode in (DP, ABS):
+                self._emit_rmw16(mode, v, tmpl.format(a=a))
                 if mode == DP:
                     self.dp_state.pop(v, None)
                     self.dp_state.pop(v + 1, None)
-                self.flag_src = new
             else:
                 mem = self._resolve_mem_rw(mode, v)
                 if mem:
-                    new = self._emit_rmw8(mode, v, '{{cur}} | {a}'.format(a=a))
+                    self._emit_rmw8(mode, v, tmpl.format(a=a))
                     if mode == DP:
                         self.dp_state.pop(v, None)
-                    self.flag_src = new
                 else:
-                    self._emit(f'/* TSB {MODE_STR.get(mode,"?")} ${v:x} */')
-        elif mn == 'TRB':
-            a = self._wrap(self.A) if self.A else '0'
-            if wide_a and mode in (DP, ABS):
-                new = self._emit_rmw16(mode, v, '{{cur}} & ~({a})'.format(a=a))
-                if mode == DP:
-                    self.dp_state.pop(v, None)
-                    self.dp_state.pop(v + 1, None)
-                self.flag_src = new
-            else:
-                mem = self._resolve_mem_rw(mode, v)
-                if mem:
-                    new = self._emit_rmw8(mode, v, '{{cur}} & ~({a})'.format(a=a))
-                    if mode == DP:
-                        self.dp_state.pop(v, None)
-                    self.flag_src = new
-                else:
-                    self._emit(f'/* TRB {MODE_STR.get(mode,"?")} ${v:x} */')
+                    self._emit(f'/* {mn} {MODE_STR.get(mode,"?")} ${v:x} */')
+                    z_tmp = None  # fall back to no flag tracking
+            # Z from (A & pre_mem); N preserved from pre-TSB/TRB state;
+            # V unchanged (self.overflow not touched, hw doesn't modify).
+            if z_tmp is not None:
+                self.flag_src = z_tmp
+                self.n_src = preserved_n
 
         # -- Branches -----------------------------------------------------
         elif mn in ('BPL','BMI','BEQ','BNE','BCC','BCS','BVS','BVC','BRA','BRL'):
@@ -4660,7 +4699,12 @@ class EmitCtx:
         elif mn in ('NOP', 'CLD', 'SED', 'CLI', 'SEI', 'XCE'):
             pass
         elif mn == 'CLV':
-            self.overflow = None
+            # V is explicitly cleared. Track as '0' so a later BVC
+            # emits `!(0) == 1` (always taken) and BVS emits `0`
+            # (never taken). Previous code set this to None, making
+            # both branches emit `/* overflow? */ 0` — silently wrong
+            # when V's post-CLV state matters.
+            self.overflow = '0'
         elif mn in ('PHB', 'PLB', 'PHK', 'PHD', 'PLD'):
             pass
         elif mn == 'TSX':
@@ -5000,22 +5044,26 @@ class EmitCtx:
         # SBC with borrow: A = A - operand - (1 - carry)
         # When carry=1 (SEC or no borrow from previous): plain subtraction
         # When carry=0 (borrow from previous): subtract extra 1
+        #
+        # Always compute via the widened tname path so V (signed
+        # overflow) can reference the stored operands unambiguously.
+        widen = 'uint32' if wide else 'uint16'
+        sign_bit = 0x8000 if wide else 0x80
         if self.carry and self.carry != '1':
-            # Chained SBC: include borrow from previous operation
             borrow = f'(({self.carry}) ? 0 : 1)'
-            self.A = f'({a_type})({an} - {mem} - {borrow})'
-            # Carry out: 1 if no borrow occurred (result >= 0 in unsigned terms)
-            # Use wider type to detect underflow
-            widen = 'uint32' if wide else 'uint16'
-            tname = self._alloc_tmp(widen)
-            self._emit(f'{tname} = ({widen}){an} - {mem} - {borrow};')
-            self.A = f'({a_type})({tname})'
-            threshold = 65536 if wide else 256
-            self.carry = f'(({tname}) < {threshold})'  # no borrow if result fits
         else:
-            # First SBC after SEC (carry=1): simple subtraction
-            self.A = f'({a_type})({an} - {mem})'
-            self.carry = f'(({a_type}){an} >= ({a_type}){mem})'
+            borrow = '0'
+        tname = self._alloc_tmp(widen)
+        self._emit(f'{tname} = ({widen}){an} - {mem} - {borrow};')
+        self.A = f'({a_type})({tname})'
+        threshold = 65536 if wide else 256
+        # Carry out: 1 if no borrow (unsigned result didn't underflow).
+        self.carry = f'(({tname}) < {threshold})'
+        # V (signed overflow): for SBC, set when (A ^ result) & (A ^ operand)
+        # has the sign bit. This is the standard SBC V formula.
+        result_in_a = f'(({a_type})({tname}))'
+        self.overflow = (f'(((({a_type})({an}) ^ {result_in_a}) & '
+                         f'(({a_type})({an}) ^ ({a_type})({mem})) & 0x{sign_bit:x}) != 0)')
         self.flag_src = self.A
         self.carry_chain = None
 

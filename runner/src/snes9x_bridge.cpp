@@ -445,6 +445,12 @@ int snes9x_bridge_fuzz_run_snippet(
     Memory.RAM[0x11]  = 0xAA;
     Memory.RAM[0x100] = 0x33;
     Memory.RAM[0x101] = 0xCC;
+    /* Flag-capture slots $1F06-$1F09 pre-seeded to 0xFF so the
+     * conditional-STZ capture pattern in the snippet epilogue
+     * produces a distinguishable delta when a flag is set. See
+     * generate_snippets.py::epilogue() for the protocol. */
+    Memory.RAM[0x1F06] = 0xFF; Memory.RAM[0x1F07] = 0xFF;
+    Memory.RAM[0x1F08] = 0xFF; Memory.RAM[0x1F09] = 0xFF;
 
     /* Seed registers. */
     Registers.A.W   = seed_a;

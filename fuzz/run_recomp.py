@@ -169,6 +169,12 @@ int main(void) {{
         g_ram[0x11] = 0xAA;
         g_ram[0x100] = 0x33;
         g_ram[0x101] = 0xCC;
+        /* Flag-capture slots: pre-seed to 0xFF so conditional STZ
+           to these slots (when the corresponding flag is SET) writes
+           a distinguishable 0. Slot layout matches the snippet
+           epilogue — see generate_snippets.py::epilogue(). */
+        g_ram[0x1F06] = 0xFF; g_ram[0x1F07] = 0xFF;
+        g_ram[0x1F08] = 0xFF; g_ram[0x1F09] = 0xFF;
 
         s_snippets[i].fn();
 
@@ -182,6 +188,7 @@ int main(void) {{
             else if (a == 0x11) baseline = 0xAA;
             else if (a == 0x100) baseline = 0x33;
             else if (a == 0x101) baseline = 0xCC;
+            else if (a >= 0x1F06 && a <= 0x1F09) baseline = 0xFF;
             if (g_ram[a] != baseline) {{
                 if (!first) printf(",");
                 printf("\"0x%x\":%d", a, g_ram[a]);

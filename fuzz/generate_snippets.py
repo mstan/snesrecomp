@@ -219,11 +219,16 @@ def prologue(m_flag: int, x_flag: int, seed: dict) -> bytes:
         out += bytes([0xA0, val & 0xFF, (val >> 8) & 0xFF])
     else:
         out += bytes([0xA0, val & 0xFF])
-    # Seed carry (default: leave as-is).
+    # Seed carry (default: CLC, so C always starts at 0 rather than
+    # inheriting whatever snes9x had from the previous frame).
+    # Normalizing makes the flag-capture epilogue produce deterministic
+    # results across snippets that don't themselves modify C.
     if seed.get('carry') == 1:
         out += bytes([0x38])  # SEC
-    elif seed.get('carry') == 0:
+    else:
         out += bytes([0x18])  # CLC
+    # Always CLV so V starts at 0, for the same reason.
+    out += bytes([0xB8])      # CLV
     return bytes(out)
 
 
@@ -265,25 +270,64 @@ def in_scope(e: dict) -> bool:
 # ----- Main -------------------------------------------------------------------
 
 def epilogue(m_flag_after: int, x_flag_after: int) -> bytes:
-    """After the test instruction, snapshot A/X/Y to reserved WRAM
-    so both recomp and oracle produce a comparable output even for
-    register-only opcodes. Width = width of A/X at this point in the
-    program. Note: the test insn may have changed M/X (via REP/SEP);
-    we assume it hasn't for the in-scope mnemonics. Snippets using
-    REP/SEP as the test insn are not generated today.
+    """After the test instruction, snapshot A/X/Y AND capture the
+    four observable CPU flags (N, V, Z, C) into reserved WRAM so
+    both recomp and oracle produce a comparable output even for
+    register-only and flag-only opcodes.
 
-    Epilogue addresses:
-      $1F00-$1F01  final A (word or byte)
-      $1F02-$1F03  final X (word or byte)
-      $1F04-$1F05  final Y (word or byte)
+    Epilogue addresses (baseline: all 0xFF from the fuzz harness):
+      $1F00-$1F01  final A (word or byte, written by STA)
+      $1F02-$1F03  final X (word or byte, STX)
+      $1F04-$1F05  final Y (word or byte, STY)
+      $1F06        Carry:    0 if C set, 0xFF if clear
+      $1F07        Zero:     0 if Z set, 0xFF if clear
+      $1F08        Negative: 0 if N set, 0xFF if clear
+      $1F09        Overflow: 0 if V set, 0xFF if clear
+
+    Flag-capture technique: branch-conditional STZ. STZ $abs does
+    not modify flags, and conditional branches don't modify flags
+    either, so all four flag captures read the post-test-insn flag
+    state directly. Pattern:
+
+        BCC +3      ; if carry CLEAR, skip the STZ (leave slot 0xFF)
+        STZ $1F06   ; if we reach here, carry was SET — write 0
+
+    This avoids the PHP/PLA path, which doesn't work in the recomp
+    emitter: recomp doesn't synthesize a P byte (flag_src is a
+    value, not a packed P register), so PLA after PHP returns the
+    flag_src EXPRESSION instead of a real P byte.
+
+    Order: flag captures FIRST (while test insn's flags are fresh),
+    then A/X/Y snapshots last. (STA/STX/STY don't modify flags, but
+    the prologue's register-seed LDA/LDX/LDY don't either — we
+    just want to minimize distance between the test insn and the
+    flag captures.)
     """
     out = bytearray()
-    # STA $1F00 (ABS)
-    out += bytes([0x8D, 0x00, 0x1F])
-    # STX $1F02 (ABS)
-    out += bytes([0x8E, 0x02, 0x1F])
-    # STY $1F04 (ABS)
-    out += bytes([0x8C, 0x04, 0x1F])
+    # Register snapshots FIRST (at current test-insn M/X widths), so the
+    # A/X/Y values captured reflect the test insn's output width. Must
+    # come before the SEP #$20 below — SEP wouldn't change A/X/Y but
+    # narrows how STA serializes.
+    out += bytes([0x8D, 0x00, 0x1F])    # STA $1F00
+    out += bytes([0x8E, 0x02, 0x1F])    # STX $1F02
+    out += bytes([0x8C, 0x04, 0x1F])    # STY $1F04
+    # Force M=1 (8-bit A) for the flag captures. In M=0, STZ ABS
+    # writes a WORD, so STZ $1F06 clobbers both $1F06 AND $1F07 —
+    # the carry slot's STZ would wipe the zero slot too. SEP #$20
+    # preserves N/V/Z/C (it only sets the M flag), so the captures
+    # still read the test insn's fresh flag state.
+    out += bytes([0xE2, 0x20])          # SEP #$20
+    # BCC +3 skips STZ if carry clear → slot stays 0xFF (baseline).
+    #   branch_op is the "branch if flag CLEAR" variant.
+    flag_captures = [
+        (0x90, 0x1F06),  # BCC; C flag
+        (0xD0, 0x1F07),  # BNE; Z flag
+        (0x10, 0x1F08),  # BPL; N flag
+        (0x50, 0x1F09),  # BVC; V flag
+    ]
+    for branch_op, addr in flag_captures:
+        out += bytes([branch_op, 0x03])                       # B__ +3 skip STZ
+        out += bytes([0x9C, addr & 0xFF, (addr >> 8) & 0xFF]) # STZ abs
     return bytes(out)
 
 
