@@ -95,10 +95,24 @@ def seeds_for(mnem: str, mode: str, m_flag: int, x_flag: int):
             ('seed_a',      {'A': 0x1234 & a_mask, 'X': 0x56 & x_mask, 'Y': 0x78 & x_mask}),
         ]
     if mnem in ('INC', 'DEC', 'INX', 'INY', 'DEX', 'DEY'):
+        # For indexed-memory INC/DEC, large X drives the effective
+        # address into bank-$00 ROM space where snes9x NOPs writes
+        # and recomp writes WRAM (different class — needs bank-aware
+        # dispatch). Keep X small for memory-indexed cases; full X
+        # range only for register INC/DEC.
+        is_register_only = (mnem in ('INX', 'INY', 'DEX', 'DEY')
+                            or mode == 'ACC')
+        if is_register_only:
+            return [
+                ('zero',        {'A': 0, 'X': 0, 'Y': 0}),
+                ('boundary',    {'A': a_mask, 'X': x_mask, 'Y': x_mask}),
+                ('signwrap',    {'A': a_mask ^ (a_mask >> 1), 'X': x_mask ^ (x_mask >> 1)}),
+            ]
+        # Memory indexed: keep X/Y small enough that DP+X stays in WRAM.
         return [
             ('zero',        {'A': 0, 'X': 0, 'Y': 0}),
-            ('boundary',    {'A': a_mask, 'X': x_mask, 'Y': x_mask}),
-            ('signwrap',    {'A': a_mask ^ (a_mask >> 1), 'X': x_mask ^ (x_mask >> 1)}),
+            ('small_idx',   {'A': a_mask, 'X': 0x10, 'Y': 0x10}),
+            ('near_wrap',   {'A': a_mask ^ (a_mask >> 1), 'X': 0xF0, 'Y': 0xF0}),
         ]
     if mnem in ('BIT',):
         return [

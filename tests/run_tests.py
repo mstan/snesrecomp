@@ -47,6 +47,7 @@ TEST_MODULES = [
     'test_memory_shift_rotate_width',
     'test_tsb_trb_width',
     'test_bit_v_flag_width',
+    'test_wram_addr_wrap',
 ]
 
 

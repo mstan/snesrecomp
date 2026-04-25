@@ -3100,17 +3100,35 @@ class EmitCtx:
         name = _reg_symbols.get(addr)
         return f' /* {name} */' if name else ''
 
+    def _wram_addr_expr(self, addr: int, idx: str) -> str:
+        """Compose the WRAM byte-offset expression for addr+idx, applying
+        a 16-bit mask when indexed.
+
+        65816 semantics: DP, DP,X, DP,Y, (DP), (DP),Y, (DP,X) all wrap
+        the effective address within the 16-bit DP page. ABS,X and
+        ABS,Y wrap within the DB bank. For SMW (DB=0 or DB=\$7E), both
+        resolve to Memory.RAM offsets in [0, 0xFFFF], so masking the
+        summed address at 16 bits is correct for every WRAM addressing
+        mode this helper is used for. Non-indexed calls pass the bare
+        constant — no mask needed.
+
+        Phase B fuzz (2026-04-24) caught the unmasked form when X was
+        seeded to 0xFFFF: recomp computed g_ram[DP+X]=g_ram[0x1000F],
+        reading bank \$7F. The mask brings recomp into agreement with
+        snes9x's hardware-correct wrap.
+        """
+        if idx in ('0', '0x0'):
+            return f'0x{addr:x}'
+        return f'(uint16)(0x{addr:x} + {idx})'
+
     def _wram(self, addr: int, idx: str) -> str:
         """Returns a C expression for an 8-bit WRAM read at addr+idx.
         In --reverse-debug mode this routes through the RDB_LOAD8
         macro so the runtime can record the read; in non-debug mode
         it expands to a plain g_ram[X] access (byte-identical to
-        legacy codegen)."""
+        legacy codegen for non-indexed; indexed now masks at 16-bit)."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
-        if idx in ('0', '0x0'):
-            base = f'0x{addr:x}'
-        else:
-            base = f'0x{addr:x} + {idx}'
+        base = self._wram_addr_expr(addr, idx)
         if self._reverse_debug:
             return f'RDB_LOAD8({base}){sym}'
         return f'g_ram[{base}]{sym}'
@@ -3119,10 +3137,7 @@ class EmitCtx:
         """Returns a C expression for a 16-bit WRAM read at addr+idx.
         Routes through RDB_LOAD16 in --reverse-debug mode."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
-        if idx in ('0', '0x0'):
-            base = f'0x{addr:x}'
-        else:
-            base = f'0x{addr:x} + {idx}'
+        base = self._wram_addr_expr(addr, idx)
         if self._reverse_debug:
             return f'RDB_LOAD16({base}){sym}'
         return f'GET_WORD(g_ram + {base}){sym}'
@@ -3132,10 +3147,7 @@ class EmitCtx:
         routes through RDB_STORE8 so the runtime hook records it; otherwise
         emits a plain assignment identical to the legacy codegen."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
-        if idx in ('0', '0x0'):
-            addr_expr = f'0x{addr:x}'
-        else:
-            addr_expr = f'0x{addr:x} + {idx}'
+        addr_expr = self._wram_addr_expr(addr, idx)
         if self._reverse_debug:
             self._emit(f'RDB_STORE8({addr_expr}, {val});{sym}')
         else:
@@ -3144,10 +3156,7 @@ class EmitCtx:
     def _emit_wram_store16(self, addr: int, idx: str, val: str):
         """Emit a 16-bit WRAM store. Reverse-debug-aware; see _emit_wram_store8."""
         sym = self._sym(addr) if idx in ('0', '0x0') else ''
-        if idx in ('0', '0x0'):
-            addr_expr = f'0x{addr:x}'
-        else:
-            addr_expr = f'0x{addr:x} + {idx}'
+        addr_expr = self._wram_addr_expr(addr, idx)
         if self._reverse_debug:
             self._emit(f'RDB_STORE16({addr_expr}, {val});{sym}')
         else:

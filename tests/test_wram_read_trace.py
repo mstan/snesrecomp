@@ -36,8 +36,9 @@ def test_wram_read_uses_plain_array_in_non_reverse_debug():
 def test_wram_read_indexed_uses_rdb_load8_with_index_expr():
     ctx = _ctx(True)
     expr = ctx._wram(0x100, 'k')
-    # Macro arg can be any expression; addr+idx flows through fine.
-    assert 'RDB_LOAD8(0x100 + k)' in expr, f'indexed read shape wrong: {expr!r}'
+    # Indexed reads wrap at 16 bits so k=0xFFFF stays in bank $7E
+    # (Phase B fuzz: INC $10,X with X=0xFFFF). See test_wram_addr_wrap.
+    assert 'RDB_LOAD8((uint16)(0x100 + k))' in expr, f'indexed read shape wrong: {expr!r}'
 
 
 def test_wram16_read_uses_rdb_load16_in_reverse_debug():
