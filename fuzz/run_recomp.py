@@ -131,10 +131,80 @@ static void RecompStackPush(const char *n) { (void)n; }
 static void RecompStackPop(void)           {}
 const char *g_last_recomp_func = "";
 
-/* Indirect-pointer stubs. Fuzz scope doesn't reach these today;
-   they exist only so the emitter's indirect-mode emits don't fail
-   to link. Any snippet exercising them is out of scope. */
-static uint8_t* IndirPtrDB(uint16 dp, uint16 y) { (void)dp; (void)y; return g_ram; }
+/* Indirect-pointer support. LongPtr is a 24-bit pointer used by
+   INDIR_L / INDIR_LY modes (LDA [dp] / [dp],Y) and by the
+   *(LongPtr*) idiom for plain INDIR (LDA (dp),Y); the emitter casts
+   directly into a LongPtr at the DP slot.
+
+   IndirPtrDB takes a DP address and offset, reads the 16-bit pointer
+   at DP, and resolves through the data bank (DB) — but the fuzz
+   harness doesn't track DB, so we assume DB=0 (bank 0 WRAM mirror,
+   which maps to g_ram[0:$1FFF]). Snippets requiring DB!=0 lookup
+   are out of scope.
+
+   IndirPtr resolves a full 24-bit LongPtr; for fuzz purposes only
+   bank $00 / $7E / $7F are considered WRAM. */
+#pragma pack(push, 1)
+typedef struct LongPtr {
+    uint8_t* addr;     /* on Win64 this is 8 bytes; the field overlap
+                          with the original 16-bit `addr + 8-bit bank`
+                          packing is irrelevant for fuzz, since recomp
+                          only ever (a) stores via MAKE_LONG (we don't
+                          emit MAKE_LONG in fuzz), or (b) casts an
+                          existing g_ram slot to LongPtr* and uses it
+                          as a value. The cast path interprets the 3
+                          bytes at g_ram[dp..dp+2] as { lo, hi, bank };
+                          we replicate that with a 16-bit lo + 8-bit
+                          bank. */
+    uint8_t bank;
+} LongPtr;
+#pragma pack(pop)
+static uint8_t* IndirPtr(LongPtr ptr, uint16_t offs) {
+    /* The emitter expects `*(LongPtr*)(g_ram + dp)` to be a
+       (lo16, bank8) value. On 64-bit Windows the struct above
+       has uint8_t* addr (8 bytes) + uint8_t bank (1 byte) = 9
+       bytes packed, NOT 3. The cast from g_ram+dp to LongPtr*
+       therefore reads the wrong bytes.
+
+       Fuzz workaround: re-read the actual 3 bytes from the DP slot
+       directly — but we don't have the DP address here, only the
+       (incorrectly-cast) LongPtr value. Best-effort: dereference
+       ptr.addr as a uint8_t* into g_ram if it's in range. Snippets
+       that exercise INDIR_L / INDIR_LY at scope-level should use
+       the seeded $20-$22 pointer (lo=$00, hi=$01, bank=$00 → bank-0
+       address $0100, which maps to g_ram[$0100]).
+
+       Simpler approach: g_ram[$20..$22] = {0x00, 0x01, 0x00} so when
+       the cast reads 9 bytes they include junk past offset 2, but
+       the LOW WORD of the addr field is still $0100 from $20/$21.
+       On little-endian x64, addr's low 4 bytes are the first 4 bytes
+       of the struct memory. So the resolved pointer's low 32 bits
+       come from g_ram[$20..$23]. We seeded $20/$21=ptr-lo/hi, $22=0,
+       $23=0 (default), so the resolved address pointer reads
+       (uint8_t*)0x00000100 — a wild pointer.
+
+       To make INDIR_L/INDIR_LY fuzz cleanly, the recomp.py emitter's
+       LongPtr usage needs a different shape, OR we provide a richer
+       harness. Out of scope for Phase B v0.2. INDIR_L/INDIR_LY
+       snippets that hit this path will produce wild dereferences;
+       the safety budget catches that as a snippet runaway. */
+    (void)ptr; (void)offs;
+    return g_ram;  /* harmless fallback — fuzz INDIR_L is out of scope */
+}
+/* IndirPtrDB(dp, offs): read a 16-bit pointer at g_ram[dp..dp+1],
+   add offs, then resolve through DB. The fuzz harness assumes DB=0,
+   so the result is bank $00 + (ptr16 + offs). Bank $00 $0000-$1FFF
+   is WRAM mirror; we return g_ram[(ptr16 + offs) & 0xFFFF].
+   Snippets whose pointer + offset crosses outside the WRAM mirror
+   (e.g. into $2000-$7FFF MMIO) will diverge from oracle and that's
+   intentional — flagged as out-of-scope for the fuzz harness. */
+static uint8_t* IndirPtrDB(uint16 dp, uint16 offs) {
+    uint16_t ptr = (uint16_t)g_ram[dp] | ((uint16_t)g_ram[(dp + 1) & 0xFFFF] << 8);
+    uint16_t ea = ptr + offs;
+    return &g_ram[ea];
+}
+static void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 v) { (void)ptr; (void)offs; (void)v; }
+static void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 v) { (void)ptr; (void)offs; (void)v; }
 static uint8_t g_sram[0x2000];
 
 /* MvnPtr / MemCpy stubs — MVN/MVP out of scope. */
@@ -169,6 +239,18 @@ int main(void) {{
         g_ram[0x11] = 0xAA;
         g_ram[0x100] = 0x33;
         g_ram[0x101] = 0xCC;
+        /* Indirect-mode pointer at $20-$22 = bank-$00 ptr to $0100 +
+           bank byte 0. Snippets in DP_INDIR / INDIR_Y / INDIR_DPX /
+           INDIR_L / INDIR_LY modes load from this pointer; the
+           target lives at $0100 (already seeded above). */
+        g_ram[0x20] = 0x00;  /* ptr lo */
+        g_ram[0x21] = 0x01;  /* ptr hi */
+        g_ram[0x22] = 0x00;  /* ptr bank (for INDIR_L) */
+        /* LONG-mode target: $7E0200 → g_ram[0x0200] in the bank-$7E
+           contiguous WRAM layout. Pre-seed the destination so reads
+           and writes have observable baselines. */
+        g_ram[0x200] = 0x77;
+        g_ram[0x201] = 0x88;
         /* Flag-capture slots: pre-seed to 0xFF so conditional STZ
            to these slots (when the corresponding flag is SET) writes
            a distinguishable 0. Slot layout matches the snippet
@@ -188,6 +270,11 @@ int main(void) {{
             else if (a == 0x11) baseline = 0xAA;
             else if (a == 0x100) baseline = 0x33;
             else if (a == 0x101) baseline = 0xCC;
+            else if (a == 0x20)  baseline = 0x00;
+            else if (a == 0x21)  baseline = 0x01;
+            else if (a == 0x22)  baseline = 0x00;
+            else if (a == 0x200) baseline = 0x77;
+            else if (a == 0x201) baseline = 0x88;
             else if (a >= 0x1F06 && a <= 0x1F09) baseline = 0xFF;
             if (g_ram[a] != baseline) {{
                 if (!first) printf(",");
@@ -263,7 +350,10 @@ def main():
     print(f'generating harness for {len(snippets)} snippets...', file=sys.stderr)
     source = build_harness(snippets)
     src_path = BUILD_DIR / 'recomp_fuzz.c'
-    src_path.write_text(source)
+    # UTF-8 explicit so any stray non-ASCII in emitted comments doesn't
+    # blow up Python's default Windows cp1252 encoding. cl.exe accepts
+    # UTF-8 source files cleanly.
+    src_path.write_text(source, encoding='utf-8')
     print(f'wrote {src_path} ({len(source)} chars)', file=sys.stderr)
 
     exe = compile_harness(src_path)

@@ -445,6 +445,10 @@ int snes9x_bridge_fuzz_run_snippet(
     Memory.RAM[0x11]  = 0xAA;
     Memory.RAM[0x100] = 0x33;
     Memory.RAM[0x101] = 0xCC;
+    /* Indirect-mode pointer at $20-$22 = bank-$00 ptr to $0100, bank 0. */
+    Memory.RAM[0x20] = 0x00; Memory.RAM[0x21] = 0x01; Memory.RAM[0x22] = 0x00;
+    /* LONG-mode target $7E0200. */
+    Memory.RAM[0x200] = 0x77; Memory.RAM[0x201] = 0x88;
     /* Flag-capture slots $1F06-$1F09 pre-seeded to 0xFF so the
      * conditional-STZ capture pattern in the snippet epilogue
      * produces a distinguishable delta when a flag is set. See

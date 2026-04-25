@@ -145,7 +145,12 @@ def seeds_for(mnem: str, mode: str, m_flag: int, x_flag: int):
 
 # Chosen operand addresses. DP mode uses $10 (avoiding scratch $00-$0F which
 # the decoder and emitter use as parameter-passing area). ABS uses $0100.
+# Indirect modes need a SEPARATE DP slot ($20) holding a pointer to WRAM,
+# because the regular $10 baseline (0xAA55) would point at ROM. The
+# fuzz harness pre-seeds $20/$21 = $00/$01 (pointer to $0100) and
+# $22 = $00 (high byte for INDIR_L/INDIR_LY → bank $00 WRAM mirror).
 DP_OPERAND = 0x10
+DP_INDIR_OPERAND = 0x20  # holds 16-bit pointer (or 24-bit including $22)
 ABS_OPERAND = 0x0100
 LONG_OPERAND = 0x7E0200  # bank $7E WRAM
 REL_OPERAND = 0x00        # forward branch = 0 (skip nothing)
@@ -168,8 +173,11 @@ def encode_insn(opcode: int, mode: str, m_flag: int, x_flag: int, mnem: str) -> 
         if wide:
             return bytes([opcode, IMM_OPERAND_16 & 0xFF, (IMM_OPERAND_16 >> 8) & 0xFF])
         return bytes([opcode, IMM_OPERAND_8])
-    if mode in ('DP', 'DP_X', 'DP_Y', 'DP_INDIR', 'INDIR_Y', 'INDIR_L', 'INDIR_LY',
-                'INDIR_DPX', 'STK', 'STK_IY'):
+    if mode in ('DP_INDIR', 'INDIR_Y', 'INDIR_L', 'INDIR_LY', 'INDIR_DPX'):
+        # Indirect modes read pointer from DP_INDIR_OPERAND; that slot
+        # is pre-seeded by the harness to point at WRAM $0100.
+        return bytes([opcode, DP_INDIR_OPERAND])
+    if mode in ('DP', 'DP_X', 'DP_Y', 'STK', 'STK_IY'):
         return bytes([opcode, DP_OPERAND])
     if mode in ('ABS', 'ABS_X', 'ABS_Y', 'INDIR', 'INDIR_X'):
         return bytes([opcode, ABS_OPERAND & 0xFF, (ABS_OPERAND >> 8) & 0xFF])
@@ -254,12 +262,21 @@ SCOPE_MNEMS = {
     'XBA', 'CLC', 'SEC',
 }
 
-# Modes that need WRAM context. For now, also narrow: start with simple
-# addressing, then expand.
+# Modes covered by the fuzz. Phase B #4 (2026-04-24) added the
+# indirect modes (DP_INDIR / INDIR_Y / INDIR_DPX) and DP_Y / ABS_Y /
+# LONG / LONG_X. Each new mode bucket exercises a distinct codegen
+# path through _resolve_mem and per-mode branches in STA/STX/STY/LDA.
+#
+# INDIR_L / INDIR_LY (24-bit-indirect-via-long-pointer) are out of
+# scope for v0.2 — they require modeling the runtime's LongPtr
+# struct in the fuzz harness, which is invasive. Re-add when the
+# fuzz harness gets a proper LongPtr abstraction.
 SCOPE_MODES = {
     'IMP', 'ACC', 'IMM',
-    'DP', 'DP_X',
-    'ABS', 'ABS_X',
+    'DP', 'DP_X', 'DP_Y',
+    'ABS', 'ABS_X', 'ABS_Y',
+    'INDIR_Y', 'INDIR_DPX', 'DP_INDIR',
+    'LONG', 'LONG_X',
 }
 
 

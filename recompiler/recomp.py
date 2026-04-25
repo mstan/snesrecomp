@@ -4227,7 +4227,7 @@ class EmitCtx:
                 # PLA from empty stack = ReturnsTwice pattern (PLA PLA RTS).
                 self.A = '0xff'
                 self.Y = '0xff'
-                self._emit('/* PLA: stack empty — ReturnsTwice skip-caller pattern */')
+                self._emit('/* PLA: stack empty - ReturnsTwice skip-caller pattern */')
             self.flag_src = self.A
         elif mn == 'PLP':
             if self.stack and self.stack[-1][0] == 'P':
