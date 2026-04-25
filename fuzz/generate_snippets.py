@@ -397,6 +397,131 @@ def compound_snippets():
         '_compound': True,
     })
 
+    # ----- ADC carry-chain idioms (Phase B #7, 2026-04-25) -----
+    # These exercise recomp.py's "ADC #0 after carry chain" branch
+    # at _emit_adc — the path that fires when self.carry_chain is
+    # set by a prior ADC. Single-instruction fuzz can't reach it
+    # (carry_chain starts None each snippet). Closing this gap is
+    # what would have caught the koopa-stomp bug: the carry-fold
+    # emit forgot to wrap result in (a_type), so C int promotion
+    # made $FF + $01 = 256 instead of 0, Z flag wrong, BNE wrong.
+    #
+    # Each snippet ends with the standard fuzz epilogue's Z capture
+    # at $1F07. If recomp's flag_src tracks an un-truncated int, Z
+    # will diverge from snes9x.
+
+    # 1. Minimal carry-fold reproducer: A=$FF, carry-in via ADC #$80
+    #    overflow. Post-ADC #0: A=$00 (wraps), Z=1, C=1.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30])           # REP #$30 (16-bit init)
+    rom += bytes([0xE2, 0x30])           # SEP #$30 (back to 8-bit M+X)
+    rom += bytes([0xA2, 0x00])           # LDX #0
+    rom += bytes([0xA0, 0x00])           # LDY #0
+    rom += bytes([0x18])                 # CLC
+    rom += bytes([0xB8])                 # CLV
+    rom += bytes([0xA9, 0xF4])           # LDA #$F4
+    rom += bytes([0x69, 0x80])           # ADC #$80 (sets carry_chain, C=1)
+    rom += bytes([0xA9, 0xFF])           # LDA #$FF (carry_chain still set)
+    rom += bytes([0x69, 0x00])           # ADC #$00 (carry-fold branch)
+    out.append({
+        'id': 'compound_ADC_carry_fold_FF_to_zero',
+        'opcode': 0x69, 'mnem': 'ADC', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1,
+        'seed_name': 'ff_carry_in',
+        'seed': {'A': 0xF4, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False,
+        '_compound': True,
+    })
+
+    # 2. Carry-fold with A=$00, carry-in=1. Result: A=$01, Z=0, C=0.
+    #    Sanity: confirm the carry-fold path produces the right value
+    #    when the wrap-to-zero is NOT involved.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30])
+    rom += bytes([0xE2, 0x30])
+    rom += bytes([0xA2, 0x00])
+    rom += bytes([0xA0, 0x00])
+    rom += bytes([0x18])                 # CLC
+    rom += bytes([0xB8])                 # CLV
+    rom += bytes([0xA9, 0xF4])           # LDA #$F4
+    rom += bytes([0x69, 0x80])           # ADC #$80 (C=1)
+    rom += bytes([0xA9, 0x00])           # LDA #$00
+    rom += bytes([0x69, 0x00])           # ADC #$00 → A=$01
+    out.append({
+        'id': 'compound_ADC_carry_fold_zero_plus_carry',
+        'opcode': 0x69, 'mnem': 'ADC', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1,
+        'seed_name': 'zero_carry_in',
+        'seed': {'A': 0xF4, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False,
+        '_compound': True,
+    })
+
+    # 3. Carry-fold with NO carry-in (ADC #$80 didn't overflow).
+    #    A=$FF, no carry. Result: A=$FF, Z=0, C=0.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30])
+    rom += bytes([0xE2, 0x30])
+    rom += bytes([0xA2, 0x00])
+    rom += bytes([0xA0, 0x00])
+    rom += bytes([0x18])                 # CLC
+    rom += bytes([0xB8])                 # CLV
+    rom += bytes([0xA9, 0x40])           # LDA #$40
+    rom += bytes([0x69, 0x10])           # ADC #$10 → A=$50, C=0 (no overflow)
+    rom += bytes([0xA9, 0xFF])           # LDA #$FF
+    rom += bytes([0x69, 0x00])           # ADC #$00 → A=$FF, C=0
+    out.append({
+        'id': 'compound_ADC_carry_fold_no_overflow',
+        'opcode': 0x69, 'mnem': 'ADC', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1,
+        'seed_name': 'no_overflow',
+        'seed': {'A': 0x40, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False,
+        '_compound': True,
+    })
+
+    # 4. Full CheckForContact-style SBC + carry-fold idiom.
+    #    Inputs: low Mario=$57, low Sprite=$63 (Mario above sprite, lo
+    #    underflow); high Mario=$01, high Sprite=$01 (high underflow due
+    #    to lo borrow). Per ROM, this is the f269 koopa-stomp moment.
+    #    Expected: post-carry-fold A=$00, Z=1, C=1 (contact detected).
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30])
+    rom += bytes([0xE2, 0x30])
+    rom += bytes([0xA2, 0x00])
+    rom += bytes([0xA0, 0x00])
+    rom += bytes([0x18])
+    rom += bytes([0xB8])
+    rom += bytes([0x38])                 # SEC (SBC needs C=1)
+    rom += bytes([0xA9, 0x57])           # LDA #$57 (Mario Y lo)
+    rom += bytes([0xE9, 0x63])           # SBC #$63 → A=$F4, C=0 (borrow)
+    rom += bytes([0x48])                 # PHA
+    rom += bytes([0xA9, 0x01])           # LDA #$01 (Mario Y hi)
+    rom += bytes([0xE9, 0x01])           # SBC #$01 → A=$01-$01-1=$FF, C=0
+    rom += bytes([0x85, 0x0C])           # STA $0C ($C = $FF)
+    rom += bytes([0x68])                 # PLA → A=$F4
+    rom += bytes([0x18])                 # CLC
+    rom += bytes([0x69, 0x80])           # ADC #$80 → A=$74, C=1 (overflow)
+    rom += bytes([0xA5, 0x0C])           # LDA $0C → A=$FF
+    rom += bytes([0x69, 0x00])           # ADC #$00 → A=$00, Z=1, C=1
+    out.append({
+        'id': 'compound_CheckForContact_carry_fold_idiom',
+        'opcode': 0x69, 'mnem': 'ADC', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1,
+        'seed_name': 'check_for_contact',
+        'seed': {'A': 0, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': True,
+        '_compound': True,
+    })
+
     # SEP narrows A for subsequent 8-bit CMP. Test that the CMP
     # uses only A's low byte. End state: A = $CD (low byte of $ABCD),
     # CMP #$CD sets Z=1 (and C=1 since equal). M=1, X=0.

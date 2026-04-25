@@ -5013,11 +5013,36 @@ class EmitCtx:
             a_inner = self._wrap(an)
             self.A = f'({a_type})({a_inner} + {carry_hi})'
             self.carry_chain = None
-            # Carry out from the propagated ADC #0 is the overflow of the sum
-            self.carry = f'({chain["var"]} >= 256)' if not wide else f'({chain["var"]} >= 65536)'
-            # V flag for the propagated ADC #0 is hard to express precisely
-            # without re-materializing both operands; conservatively unknown.
-            self.overflow = None
+            # Carry out from the propagated ADC #0 is the overflow of THE
+            # FOLD itself (a + carry_in), not the prior chain's overflow.
+            # carry_in is 1 iff the prior chain overflowed; the fold then
+            # produces carry-out only if (a + carry_in) >= 256/65536. For
+            # most cases the prior chain DID overflow (carry_in==1) and a
+            # was $FF/$FFFF, making both equivalent — but when a < $FF or
+            # carry_in==0, the fold's C-out can differ from the prior's.
+            # (Without this, C was leaking the chain's overflow even when
+            # the fold didn't overflow. Surfaced by Phase B
+            # compound_ADC_carry_fold_zero_plus_carry fuzz, 2026-04-25.)
+            wider = 'uint32' if wide else 'uint16'
+            threshold_c = 65536 if wide else 256
+            carry_in_expr = (f'(({chain["var"]} >= 65536) ? 1 : 0)' if wide
+                             else f'(({chain["var"]} >= 256) ? 1 : 0)')
+            self.carry = (f'((({wider})({a_inner}) + {carry_in_expr}) '
+                          f'>= {threshold_c})')
+            # V flag for ADC #0 (operand=0). Standard formula is
+            #   V = ((a ^ result) & (operand ^ result) & sign_bit) != 0
+            # With operand==0 it simplifies to
+            #   V = ((a ^ result) & result & sign_bit) != 0
+            # which is set only when adding the carry-in flipped a from
+            # non-negative ($7F/$7FFF) to negative ($80/$8000).
+            # (Without this, V was left stale from the prior ADC — e.g.
+            # `ADC #$80` overflowing then `ADC #$00` left V=1 even when
+            # the carry-fold's actual V should be 0. Surfaced by Phase B
+            # compound_ADC_carry_fold_FF_to_zero fuzz, 2026-04-25.)
+            sign_bit_v = 0x8000 if wide else 0x80
+            result_expr = f'({a_type})({a_inner} + {carry_hi})'
+            self.overflow = (f'((({a_type})({a_inner}) ^ {result_expr}) '
+                             f'& {result_expr} & 0x{sign_bit_v:x}) != 0')
         else:
             # Start a new carry chain --works for ALL modes (IMM, DP, ABS, LONG, etc.)
             widen = 'uint32' if wide else 'uint16'
