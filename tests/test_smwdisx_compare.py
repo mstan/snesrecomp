@@ -13,7 +13,11 @@ import sys
 
 
 def _load_harness():
-    framework_root = pathlib.Path(__file__).resolve().parent.parent
+    # Use .absolute() rather than .resolve(): under the snesrecomp/
+    # junction layout (the framework lives inside a parent game repo),
+    # .resolve() walks out of the parent and the harness paths fail
+    # to exist, silently no-op'ing every test in this file.
+    framework_root = pathlib.Path(__file__).absolute().parent.parent
     game_root = framework_root.parent
     script = game_root / 'tools' / 'smwdisx_compare.py'
     smwdisx_dir = game_root / 'SMWDisX'
@@ -188,9 +192,19 @@ def test_parse_bank_mnems_ignores_data_regions():
         return
     mmap = sfc.parse_bank_mnems('05')
     # The dispatch table immediately after JSL ExecutePtrLong at
-    # $0588F4..$058974 is all `dl CODE_XXXX` data. None of these
-    # addresses should have mnemonics in the map.
-    data_range = range(0x0588F4, 0x058975)
+    # $0588F1 (4-byte JSL → table starts at $0588F5). The table runs
+    # until the next code label CODE_058955 — so $0588F5..$058954 is
+    # pure `dl <label>` data. None of these addresses should have
+    # mnemonics in the parser's map.
+    #
+    # Note: an earlier version of this test claimed $0588F4..$058974
+    # was all data, but $058955+ is in fact code (SEP/LDA/JSL for
+    # CODE_058955) and the range was wrong on both ends. Before the
+    # parser learned to handle inline anonymous-label prefixes, it
+    # silently lost PC tracking before reaching either bound, so the
+    # incorrect range still asserted clean. Recording the correct
+    # bounds here pins the actual invariant.
+    data_range = range(0x0588F5, 0x058955)
     present = [a for a in data_range if a in mmap]
     assert not present, (
         f'parser classified SMWDisX data bytes as code: {present!r}'
@@ -242,7 +256,8 @@ def test_check_function_flags_synthetic_mnem_mismatch():
     from snes65816 import load_rom
     from pathlib import Path
 
-    framework_root = pathlib.Path(__file__).resolve().parent.parent
+    # See _load_harness for the .absolute() rationale.
+    framework_root = pathlib.Path(__file__).absolute().parent.parent
     game_root = framework_root.parent
     rom = load_rom(str(game_root / 'smw.sfc'))
     cfgs = sfc.load_cfgs(rom)
@@ -250,13 +265,13 @@ def test_check_function_flags_synthetic_mnem_mismatch():
         return
     cfg = cfgs['05']
     labels = sfc.load_symbols()
-    mmap = sfc.parse_bank_mnems('05')
+    mmap, data_addrs = sfc.parse_bank('05')
     # BufferScrollingTiles_Layer1_Init at $0588EC really has SEP.
     # Inject a fake LDA claim at that address.
     fake = dict(mmap)
     fake[0x0588EC] = ('LDA', '.B')
     res = sfc.check_function(
-        rom, cfg, labels, fake,
+        rom, cfg, labels, fake, data_addrs,
         'BufferScrollingTiles_Layer1_Init', 0x88EC, 0x8955, None,
     )
     assert res.status == 'FAIL', (

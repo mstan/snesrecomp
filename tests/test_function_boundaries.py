@@ -179,7 +179,14 @@ def test_cross_function_branch_label_after_body():
     body = _extract_function(_read('05'), 'ChocIsld2_Layer1Handler')
     flat = ' '.join(body.split())
     i_push = flat.find('RecompStackPush("ChocIsld2_Layer1Handler")')
-    i_body = flat.find('g_ram[0x1422]')
+    # Accept either direct-array (`g_ram[0x1422]`) or reverse-debugger
+    # load-macro (`RDB_LOAD8(0x1422)`) form. Both denote the same body
+    # load of WRAM $1422 — the macro form arrived with the reverse
+    # debugger landing and is the current default. The structural
+    # assertion is "the body's $1422 read is positioned between push
+    # and the fall-through call," not which spelling emits it.
+    m_body = re.search(r'(?:g_ram\[0x1422\]|RDB_LOAD8\(0x1422\))', flat)
+    i_body = m_body.start() if m_body else -1
     m_fall = re.search(r'ChocIsld2_Shared_LoadPtrs\s*\(', flat)
     i_fall = m_fall.start() if m_fall else -1
     assert i_push != -1 and i_body != -1 and i_fall != -1, (
