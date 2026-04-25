@@ -4668,14 +4668,18 @@ class EmitCtx:
                 if self.A is not None:
                     # Use (uint8)(x >> 8) instead of HIBYTE() which requires an lvalue
                     self.B = f'(uint8)(({self.A}) >> 8)'
-                    # Narrow A to its low 8 bits. After SEP #$20 the hardware
-                    # only exposes A's low byte to 8-bit ops (CMP/ADC/SBC/AND/
-                    # ORA/EOR/BIT/STA), so subsequent reads of self.A must see
-                    # just that byte — otherwise a pre-SEP 16-bit value leaks
-                    # into 8-bit comparisons (e.g. HandleSPCUploads_Inner's
-                    # SPC-port poll, which never matches the 8-bit echo).
-                    cur_t = self._hoisted.get(self.A) if self._simple(self.A) else None
-                    if cur_t == 'uint16':
+                    # Narrow A to its low 8 bits if M was 0 before this SEP
+                    # (i.e. self.A was holding a 16-bit value). After SEP #$20
+                    # the hardware only exposes A's low byte to 8-bit ops
+                    # (CMP/ADC/SBC/AND/ORA/EOR/BIT/STA), so subsequent reads
+                    # of self.A must see just that byte — otherwise a pre-SEP
+                    # 16-bit value leaks into 8-bit comparisons.
+                    #
+                    # Use wide_a (computed from insn.m_flag at insn entry,
+                    # which reflects M *before* this SEP applies) rather than
+                    # the hoisted-type heuristic — literals like '0xABCD'
+                    # don't have a hoisted type but still hold 16-bit values.
+                    if wide_a:
                         narrow = self._alloc('uint8')
                         self._emit(f'{narrow} = (uint8)({self.A});')
                         self.A = narrow

@@ -199,6 +199,27 @@ def test_CPX_STZ_BPL_preserves_X_flag_width():
         'BPL must NOT use int16 cast at X-width=1; body line: ' + bpl_line)
 
 
+def test_SEP_M0_to_M1_narrows_literal_A():
+    # Phase B fuzz (2026-04-24) caught: REP #$20 ; LDA #$ABCD ;
+    # SEP #$20 ; CMP #$CD ; BEQ +2 ; RTS — the BEQ should be taken
+    # because A's low byte after SEP is $CD. Previously the emitter
+    # only narrowed A when its hoisted type was uint16; literals
+    # like '0xabcd' had no hoisted type, so the narrow was skipped
+    # and the CMP evaluated `0xabcd - 0xcd = 0xab00 != 0`.
+    rom = bytes([
+        0xC2, 0x20,
+        0xA9, 0xCD, 0xAB,        # LDA #$ABCD
+        0xE2, 0x20,              # SEP #$20
+        0xC9, 0xCD,              # CMP #$CD
+        0xF0, 0x02,              # BEQ
+        0x60, 0x60, 0x60,
+    ])
+    body = _emit_body(rom)
+    assert '= (uint8)(0xabcd)' in body, (
+        'SEP #$20 must narrow a literal-valued A from 16-bit to 8-bit '
+        'so subsequent 8-bit ops see only the low byte; body:\n' + body)
+
+
 def test_STA_does_not_reset_flag_width():
     # REP #$20 ; SEP #$10 ; CPX #$42 ; STA $00 ; BPL +2 ; RTS
     # M=0 X=1. CPX sets flag_width=8 (X-width). STA $00 must NOT

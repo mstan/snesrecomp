@@ -26,16 +26,23 @@ SNIPPETS = FUZZ_DIR / 'snippets' / 'snippets.json'
 
 
 # Oracle-side setup noise: snippet bytes written to WRAM at the
-# snippet PC range, plus the return-sentinel bytes on the stack.
-# Remove these from the oracle delta before comparing; recomp doesn't
-# write these addresses because it doesn't need to.
+# snippet PC range, plus the stack region above the snippet's working
+# space. Recomp doesn't write these addresses because it tracks the
+# stack logically rather than as bytes in memory.
 #
-# Snippet PC is bank $00 $1800; longest snippet is ~20 bytes, so
+# Snippet PC is bank $00 $1800; longest snippet is ~50 bytes, so
 # $1800-$18FF covers the snippet region safely.
-# Stack sentinel lives at S.W=0x1FF and 0x1FE (we push 2 bytes).
+# Stack region: the seeded sentinel lives at S.W=0x1FF and 0x1FE.
+# Compound snippets that PHA/PHX/PHY/PLA/PLX/PLY also touch lower
+# stack addresses ($1FC/$1FD/etc.) — filter the whole upper-page area
+# below the sentinel down to $1F00 (the flag-capture region).
 ORACLE_NOISE = set()
 ORACLE_NOISE.update(range(0x1800, 0x1900))
-ORACLE_NOISE.update([0x1FE, 0x1FF])
+# Stack page area touched by the snippet: seeded sentinel uses $1FE/$1FF,
+# compound PHA/PLA snippets dip a few bytes lower. Safe filter window:
+# $1F8-$1FF (won't intersect with the $0100/$0101 ABS test slots, which
+# are several pages away from the stack-page tail).
+ORACLE_NOISE.update(range(0x1F8, 0x200))
 
 
 def filter_delta(delta: dict, side: str) -> dict:

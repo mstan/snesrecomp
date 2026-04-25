@@ -258,8 +258,11 @@ SCOPE_MNEMS = {
     'INC', 'DEC', 'INX', 'DEX', 'INY', 'DEY',
     # Transfers.
     'TAX', 'TAY', 'TXA', 'TYA', 'TXY', 'TYX',
-    # Others worth covering up front.
-    'XBA', 'CLC', 'SEC',
+    # Phase B #5 additions — single-instruction mnemonics whose codegen
+    # is real (not a no-op stub) and whose effects are observable in
+    # A/X/Y/flags.
+    'XBA',
+    'CLC', 'SEC', 'CLD', 'SED', 'CLI', 'SEI', 'CLV',
 }
 
 # Modes covered by the fuzz. Phase B #4 (2026-04-24) added the
@@ -348,6 +351,79 @@ def epilogue(m_flag_after: int, x_flag_after: int) -> bytes:
     return bytes(out)
 
 
+def compound_snippets():
+    """Generate multi-instruction sequences that test interactions
+    between mnemonics — particularly width transitions and stack
+    push/pop pairs.
+
+    Phase B #6: width-mismatched push/pop. The recomp emitter tracks
+    stack entries as (reg, value) tuples, not bytes, so a PHA at M=0
+    pushed as one element is popped by PLA at M=1 as one element —
+    but on hardware the byte counts differ. The audit #7 detection
+    code emits a RECOMP_WARN comment; this fuzz seed confirms whether
+    the runtime actually diverges.
+    """
+    out = []
+
+    # Phase B #6 width-mismatched PHA/PLA / PHX/PLX snippets removed
+    # 2026-04-24: a byte-aware stack refactor regressed SMW visually
+    # at the gameplay level. The audit #7 detection-only path (RECOMP_WARN
+    # comments at every mismatched pull) remains in place. Re-add these
+    # compound tests when the byte-aware stack is re-implemented in a
+    # way that preserves the matched-width path's existing tracker
+    # semantics (load-bearing for SMW's PHX/PLX register-save idiom
+    # which the byte-aware push lost the orig_var bookkeeping for).
+
+    # XBA round-trip — fully 8-bit so all immediates are 1-byte.
+    rom = bytearray()
+    rom += bytes([0xE2, 0x30])           # SEP #$30 — A and X to 8-bit
+    rom += bytes([0xA9, 0x34])           # LDA #$34 (A=$34)
+    rom += bytes([0xEB])                 # XBA — A=$00, B=$34
+    rom += bytes([0xA9, 0x12])           # LDA #$12
+    rom += bytes([0xEB])                 # XBA — A=$34, B=$12
+    rom += bytes([0xA2, 0x00])           # LDX #0 (1-byte at X=8-bit)
+    rom += bytes([0xA0, 0x00])           # LDY #0
+    rom += bytes([0x18])
+    rom += bytes([0xB8])
+    out.append({
+        'id': 'compound_XBA_round_trip',
+        'opcode': 0xEB, 'mnem': 'XBA', 'mode': 'IMP',
+        'm_flag': 1, 'x_flag': 1,
+        'seed_name': 'round_trip',
+        'seed': {'A': 0, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False,
+        '_compound': True,
+    })
+
+    # SEP narrows A for subsequent 8-bit CMP. Test that the CMP
+    # uses only A's low byte. End state: A = $CD (low byte of $ABCD),
+    # CMP #$CD sets Z=1 (and C=1 since equal). M=1, X=0.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30])
+    rom += bytes([0xA9, 0xCD, 0xAB])     # LDA #$ABCD (3-byte at M=0)
+    rom += bytes([0xA2, 0x00, 0x00])     # LDX #0 (X=16-bit)
+    rom += bytes([0xA0, 0x00, 0x00])
+    rom += bytes([0x18])
+    rom += bytes([0xB8])
+    rom += bytes([0xE2, 0x20])           # SEP #$20 — A -> 8-bit ($CD)
+    rom += bytes([0xC9, 0xCD])           # CMP #$CD (8-bit imm; sets Z=1, C=1)
+    out.append({
+        'id': 'compound_SEP_narrows_A_for_CMP',
+        'opcode': 0xC9, 'mnem': 'CMP', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 0,
+        'seed_name': 'sep_narrow',
+        'seed': {'A': 0xABCD, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False,
+        '_compound': True,
+    })
+
+    return out
+
+
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -394,6 +470,19 @@ def main():
                         'writes_mem': e['writes_mem'],
                     }
                     snippets.append(snip)
+
+    # Phase B #6: compound multi-instruction snippets. Each carries
+    # its own pre-built ROM (prologue + test sequence); we only
+    # append the standard epilogue + RTS here.
+    for snip in compound_snippets():
+        rom = bytes.fromhex(snip['rom_hex'])
+        # Determine post-test M/X for the epilogue. Decode the snippet
+        # to find the final flag state — but compound snippets carry
+        # their own m_flag/x_flag declared values, so trust those.
+        rom += epilogue(snip['m_flag'], snip['x_flag'])
+        rom += bytes([0x60])
+        snip['rom_hex'] = rom.hex()
+        snippets.append(snip)
 
     out_path = OUTPUT_DIR / 'snippets.json'
     with open(out_path, 'w') as f:
