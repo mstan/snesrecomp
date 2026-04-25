@@ -28,6 +28,7 @@ TEST_MODULES = [
     'test_sig_augment',
     'test_sync_funcs_h',
     'test_smwdisx_compare',
+    'test_dispatch_extents',
     'test_mflag_width',
     'test_emit_order_fallthrough',
     'test_dp_indirect_uses_db',
