@@ -4999,11 +4999,19 @@ class EmitCtx:
             an = self.A
 
         if mode == IMM and v == 0 and self.carry_chain:
-            # ADC #0 after a carry chain: propagate carry high byte
+            # ADC #0 after a carry chain: propagate carry high byte.
+            # The outer (a_type) cast forces uint8/uint16 truncation so that
+            # subsequent BEQ/BNE flag tests see the wrapped result rather
+            # than the C-int-promoted sum. Without it, e.g. $FF + $01 reads
+            # as 256 (int) instead of 0 (uint8) -- breaking ROM semantics
+            # where ADC #$00 after carry-out is supposed to wrap A. Surfaced
+            # by koopa-stomp investigation: CheckForContact's high-byte
+            # carry-fold check at $03B72E was always taking the no-contact
+            # branch, so Mario could never collide with a sprite from above.
             chain = self.carry_chain
             carry_hi = f'({a_type})(({chain["var"]}) >> 8)'
             a_inner = self._wrap(an)
-            self.A = f'{a_inner} + {carry_hi}'
+            self.A = f'({a_type})({a_inner} + {carry_hi})'
             self.carry_chain = None
             # Carry out from the propagated ADC #0 is the overflow of the sum
             self.carry = f'({chain["var"]} >= 256)' if not wide else f'({chain["var"]} >= 65536)'
