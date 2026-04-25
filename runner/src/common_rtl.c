@@ -192,6 +192,15 @@ uint8 ReadReg(uint16 reg) {
     return snes_read(g_snes, reg);
   } else if (reg == 0x2180) {
     return snes_readBBus(g_snes, reg & 0xff);
+  } else if (reg == 0x4016 || reg == 0x4017) {
+    /* JOYSER0 / JOYSER1 — manual joypad-read serial registers.
+     * Routed through snes_readReg so the SNES core can return the
+     * controller-presence signature (bit 0 set after the implicit
+     * "16 reads done" state). Phase B koopa-stomp investigation
+     * (2026-04-24) found these reads were falling through to the
+     * default `return 0` and breaking SMW's CheckWhichControllers-
+     * ArePluggedIn detection. */
+    return snes_readReg(g_snes, reg);
   } else if (reg >= 0x4200 && reg < 0x4220) {
     return recomp_read_internal_reg(reg);
   } else if (reg >= 0x4300 && reg < 0x4380) {

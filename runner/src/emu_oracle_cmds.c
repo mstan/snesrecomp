@@ -298,15 +298,18 @@ static void h_fuzz_run_snippet(const char *args) {
     debug_server_send_raw("\"}\n", 3);
 }
 
-/* emu_func_snap_set <hex_pc24> — register a 24-bit PC; subsequent
- * frames will capture WRAM into a buffer at every dispatch whose
- * PB:PC matches. 0 disables. snes9x backend only.
- * emu_func_snap_get <hex_addr> [len] — read from the captured buffer.
+/* emu_func_snap_set <hex_pc24>     — arm 24-bit PC for snapshot ring.
+ * emu_func_snap_count               — current count + frame.
+ * emu_func_snap_get_n <call_idx> <hex_addr> [len]
+ *                                   — fetch slice from a historic snap.
  */
 extern void snes9x_bridge_func_snap_set(uint32_t pc24);
 extern int  snes9x_bridge_func_snap_count(void);
 extern int  snes9x_bridge_func_snap_frame(void);
-extern const uint8_t* snes9x_bridge_func_snap_buf(void);
+
+typedef struct { int call_idx; int frame; uint8_t wram_slice[0x2000]; } emu_snap_entry_c;
+extern const emu_snap_entry_c* snes9x_bridge_func_snap_lookup(int call_idx);
+extern int snes9x_bridge_func_snap_slice_len(void);
 
 static void h_emu_func_snap_set(const char *args) {
     if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
@@ -319,40 +322,49 @@ static void h_emu_func_snap_set(const char *args) {
     debug_server_send_fmt("{\"ok\":true,\"pc24\":\"0x%06x\"}", pc24);
 }
 
-static void h_emu_func_snap_get(const char *args) {
+static void h_emu_func_snap_count(const char *args) {
+    (void)args;
+    debug_server_send_fmt("{\"ok\":true,\"count\":%d,\"frame\":%d,\"ring_len\":256}",
+                          snes9x_bridge_func_snap_count(),
+                          snes9x_bridge_func_snap_frame());
+}
+
+static void h_emu_func_snap_get_n(const char *args) {
     if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
         debug_server_send_fmt("{\"ok\":false,\"error\":\"snap requires snes9x backend\"}");
         return;
     }
-    int frame = snes9x_bridge_func_snap_frame();
-    int count = snes9x_bridge_func_snap_count();
-    if (frame < 0) {
-        debug_server_send_fmt("{\"ok\":false,\"error\":\"no snapshot yet\","
-                              "\"count\":%d}", count);
+    int call_idx = -1;
+    unsigned int addr = 0, len = 1;
+    if (sscanf(args ? args : "", "%d %x %u", &call_idx, &addr, &len) < 2) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_func_snap_get_n <call_idx> <hex_addr> [len]\"}");
         return;
     }
-    unsigned int addr = 0, len = 1;
-    if (sscanf(args ? args : "", "%x %u", &addr, &len) < 1) {
-        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_func_snap_get <hex_addr> [len]\"}");
+    const emu_snap_entry_c *e = snes9x_bridge_func_snap_lookup(call_idx);
+    if (!e) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"call_idx %d not in ring\","
+                              "\"current_count\":%d}",
+                              call_idx, snes9x_bridge_func_snap_count());
         return;
     }
     if (len < 1) len = 1;
-    if (len > 0x20000) len = 0x20000;
-    if (addr >= 0x20000u || addr + len > 0x20000u) {
-        debug_server_send_fmt("{\"ok\":false,\"error\":\"addr range out of bounds\"}");
+    if (len > 0x2000) len = 0x2000;
+    if (addr >= 0x2000u || addr + len > 0x2000u) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"addr+len exceeds 8KB slice\"}");
         return;
     }
-    const uint8_t *buf = snes9x_bridge_func_snap_buf();
     char hdr[256];
     int hlen = snprintf(hdr, sizeof(hdr),
-        "{\"ok\":true,\"frame\":%d,\"count\":%d,\"addr\":\"0x%05x\",\"len\":%u,\"hex\":\"",
-        frame, count, addr, len);
+        "{\"ok\":true,\"call_idx\":%d,\"frame\":%d,"
+        "\"addr\":\"0x%04x\",\"len\":%u,\"hex\":\"",
+        e->call_idx, e->frame, addr, len);
     debug_server_send_raw(hdr, hlen);
     char chunk[4096];
     for (unsigned int i = 0; i < len; ) {
         int pos = 0;
         for (; i < len && pos < 4000; i++)
-            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", buf[addr + i]);
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x",
+                            e->wram_slice[addr + i]);
         debug_server_send_raw(chunk, pos);
     }
     debug_server_send_raw("\"}\n", 3);
@@ -732,8 +744,9 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_read_wram") == 0) { h_emu_read_wram(args); return 1; }
     if (strcmp(cmd, "emu_read_vram") == 0) { h_emu_read_vram(args); return 1; }
     if (strcmp(cmd, "fuzz_run_snippet") == 0) { h_fuzz_run_snippet(args); return 1; }
-    if (strcmp(cmd, "emu_func_snap_set") == 0) { h_emu_func_snap_set(args); return 1; }
-    if (strcmp(cmd, "emu_func_snap_get") == 0) { h_emu_func_snap_get(args); return 1; }
+    if (strcmp(cmd, "emu_func_snap_set") == 0)   { h_emu_func_snap_set(args); return 1; }
+    if (strcmp(cmd, "emu_func_snap_count") == 0) { h_emu_func_snap_count(args); return 1; }
+    if (strcmp(cmd, "emu_func_snap_get_n") == 0) { h_emu_func_snap_get_n(args); return 1; }
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }

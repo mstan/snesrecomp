@@ -3325,9 +3325,22 @@ class EmitCtx:
 
     @staticmethod
     def _is_hw_reg(addr: int) -> bool:
-        """True if addr is in a SNES hardware register range (absolute addressing)."""
-        return (0x2100 <= addr <= 0x21FF or   # PPU / APU ports
-                0x4200 <= addr <= 0x43FF)      # CPU / DMA / joypad
+        """True if addr is in a SNES hardware register range (absolute addressing).
+
+        Includes:
+          $2100-$21FF  PPU + APU ports
+          $4016-$4017  manual joypad-read (JOYSER0/JOYSER1)
+          $4200-$43FF  CPU internal regs + DMA channel regs
+
+        Phase B koopa-stomp investigation (2026-04-24) caught $4016/$4017
+        being routed through `g_ram[]` because they fell into the gap
+        between $2100-$21FF and $4200-$43FF. SMW's CheckWhichControllers-
+        ArePluggedIn at $00:$9A74 reads $4016/$4017 directly without
+        going through auto-joypad-read, so this gap mattered.
+        """
+        return (0x2100 <= addr <= 0x21FF or
+                0x4016 <= addr <= 0x4017 or
+                0x4200 <= addr <= 0x43FF)
 
     # -- Memory operand resolver (unified for ALU ops) ------------------------
 

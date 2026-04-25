@@ -191,6 +191,30 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return snes->multiplyResult & 0xff;
     case 0x4217:
       return snes->multiplyResult >> 8;
+    case 0x4016:  /* JOYSER0 — manual joypad read for controller 1. */
+    case 0x4017:  /* JOYSER1 — manual joypad read for controller 2. */
+      /* On real SNES, $4016/$4017 are the manual joypad-read serial
+       * shift registers. After a strobe write to $4016 (latch), 16
+       * sequential reads shift out the controller's 16-bit button
+       * state (LSB-first). After 16 reads, subsequent reads return
+       * bit 0 = 1 as the "controller present" signature for a
+       * standard pad. snes9x's S9xReadJOYSERn (controls.cpp:2917)
+       * implements this: in the no-latch state with read_idx>=16
+       * it returns `bits | 1`.
+       *
+       * Recomp's emulation core didn't handle these registers at
+       * all — the reads fell through to the default `return 0` path,
+       * which made SMW's CheckWhichControllersArePluggedIn at $00:9A74
+       * conclude "no controllers connected" and write $0DA0 = 0x00.
+       * That single byte then cascaded into ~250 downstream WRAM
+       * divergences over the attract demo, contributing to the
+       * koopa-stomp visible bug (Mario contacts the koopa from a
+       * different angle, dies instead of stomping).
+       *
+       * For correctness without full strobe-latch tracking, return
+       * 0x01 unconditionally — same effect as snes9x's post-latch
+       * read past 16 bits with a standard pad attached. */
+      return 0x01;
     case 0x4218:
       return SwapInputBits(snes->input1_currentState) & 0xff;
     case 0x4219:

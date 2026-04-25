@@ -58,17 +58,41 @@ int g_recomp_stack_top = 0;
 
 extern void debug_server_profile_push(const char *name);
 
-// Function-boundary WRAM snapshot (Phase B koopa-stomp investigation).
+// Function-boundary WRAM snapshot history (Phase B koopa-stomp).
 // When a TCP client sets g_recomp_snap_on_func to a non-NULL name,
-// every RecompStackPush whose name matches captures the WRAM
-// contents at that moment into g_recomp_snap_buf. The frame continues
-// executing normally; the snapshot reflects state AT function entry.
-// A frame counter records the most recent capture so probes can
-// detect "did the function fire this frame?".
+// every RecompStackPush whose name matches captures the LOW 8KB of
+// WRAM ($0000-$1FFF — DP + game-state region used by SMW for all
+// sprite/level/player state) into a ring buffer of 256 slots.
+//
+// Ring keeps the most recent 256 calls; older entries get overwritten.
+// Each slot has: absolute call index (the count at capture time),
+// frame number at capture, and the 8KB WRAM slice. Total: 256 × 8KB
+// = 2 MB per side. Fits comfortably; 256 calls ≈ 4 seconds at 60Hz
+// and ≈ 256 frames in SMW (one HandlePlayerPhysics call per frame).
+//
+// Probes use func_snap_get_n <call_idx> to fetch a specific historic
+// snapshot and bisect for the first diverging call.
+#define RECOMP_SNAP_SLICE_LEN  0x2000  /* $0000-$1FFF */
+#define RECOMP_SNAP_RING_LEN   256
+
 const char *g_recomp_snap_on_func = NULL;
-int        g_recomp_snap_count    = 0;
-int        g_recomp_snap_frame    = -1;
-uint8_t    g_recomp_snap_buf[0x20000];
+int        g_recomp_snap_count    = 0;     /* total calls observed */
+int        g_recomp_snap_frame    = -1;    /* most recent capture's frame */
+typedef struct {
+    int     call_idx;                       /* g_recomp_snap_count value at capture */
+    int     frame;
+    uint8_t wram_slice[RECOMP_SNAP_SLICE_LEN];
+} recomp_snap_entry;
+recomp_snap_entry g_recomp_snap_ring[RECOMP_SNAP_RING_LEN];
+
+/* Lookup an entry by absolute call index. Returns NULL if the index
+ * is out of the ring's current window. */
+const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
+    if (call_idx < 1) return NULL;
+    int slot = (call_idx - 1) % RECOMP_SNAP_RING_LEN;
+    if (g_recomp_snap_ring[slot].call_idx != call_idx) return NULL;
+    return &g_recomp_snap_ring[slot];
+}
 
 void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH)
@@ -91,9 +115,12 @@ void RecompStackPush(const char *name) {
       match = 0;
     }
     if (match) {
-      memcpy(g_recomp_snap_buf, g_ram, 0x20000);
       g_recomp_snap_count++;
       g_recomp_snap_frame = snes_frame_counter;
+      int slot = (g_recomp_snap_count - 1) % RECOMP_SNAP_RING_LEN;
+      g_recomp_snap_ring[slot].call_idx = g_recomp_snap_count;
+      g_recomp_snap_ring[slot].frame    = snes_frame_counter;
+      memcpy(g_recomp_snap_ring[slot].wram_slice, g_ram, RECOMP_SNAP_SLICE_LEN);
     }
   }
 }

@@ -1347,13 +1347,22 @@ static void cmd_continue(const char *args) {
     send_fmt("{\"ok\":true,\"paused\":false}");
 }
 
-/* func_snap_set <name> — register a function name; subsequent frames
- * will capture WRAM into a buffer at every entry of that function.
+/* func_snap_set <name>     — register a function name to snapshot.
+ *                             Subsequent calls populate a 256-deep
+ *                             ring buffer with 8KB WRAM slices.
+ * func_snap_count           — { count, frame } of latest entry.
+ * func_snap_get_n <call_idx> <hex_addr> [len]
+ *                          — fetch slice from the snapshot of the
+ *                             given absolute call index. Errors if
+ *                             call_idx is no longer in the ring or
+ *                             addr+len exceeds 8KB.
  * Empty name disables the snapshot. */
+typedef struct { int call_idx; int frame; uint8_t wram_slice[0x2000]; } recomp_snap_entry;
 extern const char *g_recomp_snap_on_func;
 extern int        g_recomp_snap_count;
 extern int        g_recomp_snap_frame;
-extern uint8_t    g_recomp_snap_buf[0x20000];
+extern recomp_snap_entry g_recomp_snap_ring[256];
+extern const recomp_snap_entry* recomp_snap_lookup(int call_idx);
 
 static char s_snap_name_buf[128];
 
@@ -1365,10 +1374,6 @@ static void cmd_func_snap_set(const char *args) {
         send_fmt("{\"ok\":true,\"cleared\":true}");
         return;
     }
-    /* Copy name into a stable buffer (the args pointer is freed when
-     * the cmd returns). g_recomp_snap_on_func will be cached to a
-     * .rodata string ptr by the first matching RecompStackPush, but
-     * until then we need the name in stable memory for strcmp. */
     int n = 0;
     while (args[n] && args[n] != '\n' && args[n] != '\r' && n < 127) {
         s_snap_name_buf[n] = args[n];
@@ -1381,33 +1386,37 @@ static void cmd_func_snap_set(const char *args) {
     send_fmt("{\"ok\":true,\"watching\":\"%s\"}", s_snap_name_buf);
 }
 
-/* func_snap_get <hex_addr> [len] — read bytes from the most-recent
- * function-entry WRAM snapshot. Returns ok=false if no snapshot has
- * been captured yet. */
-static void cmd_func_snap_get(const char *args) {
-    if (!g_recomp_snap_on_func || g_recomp_snap_frame < 0) {
-        send_fmt("{\"ok\":false,\"error\":\"no snapshot yet\","
-                 "\"watching\":\"%s\",\"count\":%d}",
-                 g_recomp_snap_on_func ? g_recomp_snap_on_func : "(none)",
-                 g_recomp_snap_count);
+static void cmd_func_snap_count(const char *args) {
+    (void)args;
+    send_fmt("{\"ok\":true,\"count\":%d,\"frame\":%d,\"ring_len\":256}",
+             g_recomp_snap_count, g_recomp_snap_frame);
+}
+
+static void cmd_func_snap_get_n(const char *args) {
+    int call_idx = -1;
+    unsigned int addr = 0, len = 1;
+    if (!args || sscanf(args, "%d %x %u", &call_idx, &addr, &len) < 2) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: func_snap_get_n <call_idx> <hex_addr> [len]\"}");
         return;
     }
-    unsigned int addr = 0, len = 1;
-    if (sscanf(args, "%x %u", &addr, &len) < 1) {
-        send_fmt("{\"ok\":false,\"error\":\"usage: func_snap_get <hex_addr> [len]\"}");
+    const recomp_snap_entry *e = recomp_snap_lookup(call_idx);
+    if (!e) {
+        send_fmt("{\"ok\":false,\"error\":\"call_idx %d not in ring\","
+                 "\"current_count\":%d}",
+                 call_idx, g_recomp_snap_count);
         return;
     }
     if (len < 1) len = 1;
-    if (len > 0x20000) len = 0x20000;
-    if (addr >= 0x20000u || addr + len > 0x20000u) {
-        send_fmt("{\"ok\":false,\"error\":\"addr range out of bounds\"}");
+    if (len > 0x2000) len = 0x2000;
+    if (addr >= 0x2000u || addr + len > 0x2000u) {
+        send_fmt("{\"ok\":false,\"error\":\"addr+len exceeds 8KB slice\"}");
         return;
     }
     char hdr[256];
     int hlen = snprintf(hdr, sizeof(hdr),
-        "{\"ok\":true,\"frame\":%d,\"count\":%d,"
-        "\"addr\":\"0x%05x\",\"len\":%u,\"hex\":\"",
-        g_recomp_snap_frame, g_recomp_snap_count, addr, len);
+        "{\"ok\":true,\"call_idx\":%d,\"frame\":%d,"
+        "\"addr\":\"0x%04x\",\"len\":%u,\"hex\":\"",
+        e->call_idx, e->frame, addr, len);
     if (s_client_sock == SOCKET_INVALID) return;
     send(s_client_sock, hdr, hlen, 0);
     char chunk[4096];
@@ -1415,7 +1424,7 @@ static void cmd_func_snap_get(const char *args) {
         int pos = 0;
         for (; i < len && pos < 4000; i++)
             pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x",
-                            g_recomp_snap_buf[addr + i]);
+                            e->wram_slice[addr + i]);
         send(s_client_sock, chunk, pos, 0);
     }
     send(s_client_sock, "\"}\n", 3, 0);
@@ -3219,8 +3228,9 @@ static const CmdEntry s_commands[] = {
     {"pause",         cmd_pause},
     {"continue",      cmd_continue},
     {"step",          cmd_step},
-    {"func_snap_set", cmd_func_snap_set},
-    {"func_snap_get", cmd_func_snap_get},
+    {"func_snap_set",   cmd_func_snap_set},
+    {"func_snap_count", cmd_func_snap_count},
+    {"func_snap_get_n", cmd_func_snap_get_n},
     {"run_to_frame",  cmd_run_to_frame},
     {"loadstate",     cmd_loadstate},
     {"save_state",    cmd_save_state},

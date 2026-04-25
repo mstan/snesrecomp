@@ -276,24 +276,44 @@ emu_insn_entry    s_emu_insn_trace[EMU_INSN_TRACE_SIZE];
 uint64_t s_emu_nmi_count = 0;
 int      s_emu_last_nmi_frame = -1;
 
-/* Function-boundary WRAM snapshot. Mirrors recomp's
- * g_recomp_snap_on_func: captures Memory.RAM into a buffer at every
- * dispatch where PB:PC == s_emu_snap_pc24. The buffer is queried
- * via the emu_func_snap_get TCP command for synchronous comparison
- * with the recomp side. */
+/* Function-boundary WRAM snapshot history. Mirrors recomp's
+ * g_recomp_snap_ring: captures the LOW 8KB of Memory.RAM into a
+ * 256-deep ring buffer at every dispatch where PB:PC == s_emu_snap_pc24.
+ * Each slot has the absolute call index + frame at capture. */
+#define EMU_SNAP_SLICE_LEN  0x2000
+#define EMU_SNAP_RING_LEN   256
+
 uint32_t s_emu_snap_pc24    = 0;  /* 0 = disabled */
 int      s_emu_snap_count   = 0;
 int      s_emu_snap_frame   = -1;
-uint8_t  s_emu_snap_buf[0x20000];
+
+struct emu_snap_entry {
+    int     call_idx;
+    int     frame;
+    uint8_t wram_slice[EMU_SNAP_SLICE_LEN];
+};
+emu_snap_entry s_emu_snap_ring[EMU_SNAP_RING_LEN];
+
+/* Public lookup, called from the TCP command. Returns nullptr if
+ * the requested call_idx is no longer in the ring window. */
+extern "C" const emu_snap_entry* emu_snap_lookup(int call_idx) {
+    if (call_idx < 1) return nullptr;
+    int slot = (call_idx - 1) % EMU_SNAP_RING_LEN;
+    if (s_emu_snap_ring[slot].call_idx != call_idx) return nullptr;
+    return &s_emu_snap_ring[slot];
+}
 
 void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
     /* Function-boundary snapshot fires regardless of insn-trace state. */
     if (s_emu_snap_pc24 != 0) {
         uint32_t cur = ((uint32_t)pb << 16) | pc;
         if (cur == s_emu_snap_pc24) {
-            memcpy(s_emu_snap_buf, Memory.RAM, 0x20000);
             s_emu_snap_count++;
             s_emu_snap_frame = (int)s_watch_frame;
+            int slot = (s_emu_snap_count - 1) % EMU_SNAP_RING_LEN;
+            s_emu_snap_ring[slot].call_idx = s_emu_snap_count;
+            s_emu_snap_ring[slot].frame    = (int)s_watch_frame;
+            memcpy(s_emu_snap_ring[slot].wram_slice, Memory.RAM, EMU_SNAP_SLICE_LEN);
         }
     }
     if (!s_emu_insn_active) return;
@@ -604,7 +624,13 @@ void snes9x_bridge_func_snap_set(uint32_t pc24) {
 
 int  snes9x_bridge_func_snap_count(void) { return s_emu_snap_count; }
 int  snes9x_bridge_func_snap_frame(void) { return s_emu_snap_frame; }
-const uint8_t* snes9x_bridge_func_snap_buf(void) { return s_emu_snap_buf; }
+/* Per-call lookup. Caller passes the absolute call index (1-based).
+ * Returns nullptr if no longer in ring. Slice length is fixed at
+ * 8KB; caller knows that, no need to expose. */
+extern "C" const emu_snap_entry* snes9x_bridge_func_snap_lookup(int call_idx) {
+    return emu_snap_lookup(call_idx);
+}
+extern "C" int snes9x_bridge_func_snap_slice_len(void) { return EMU_SNAP_SLICE_LEN; }
 
 void snes9x_bridge_insn_trace_off(void) {
     s_emu_insn_active = 0;
