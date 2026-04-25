@@ -6,6 +6,8 @@
 #include "snes/cpu.h"
 #include "snes/snes.h"
 #include "util.h"
+#include <setjmp.h>
+#include <string.h>
 #include <time.h>
 
 Snes *g_snes;
@@ -55,11 +57,45 @@ const char *g_recomp_stack[RECOMP_STACK_DEPTH];
 int g_recomp_stack_top = 0;
 
 extern void debug_server_profile_push(const char *name);
+
+// Function-boundary WRAM snapshot (Phase B koopa-stomp investigation).
+// When a TCP client sets g_recomp_snap_on_func to a non-NULL name,
+// every RecompStackPush whose name matches captures the WRAM
+// contents at that moment into g_recomp_snap_buf. The frame continues
+// executing normally; the snapshot reflects state AT function entry.
+// A frame counter records the most recent capture so probes can
+// detect "did the function fire this frame?".
+const char *g_recomp_snap_on_func = NULL;
+int        g_recomp_snap_count    = 0;
+int        g_recomp_snap_frame    = -1;
+uint8_t    g_recomp_snap_buf[0x20000];
+
 void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH)
     g_recomp_stack[g_recomp_stack_top++] = name;
   g_last_recomp_func = name;
   debug_server_profile_push(name);
+  // Function-boundary snapshot: if a client set a target function
+  // name, and this push matches it, capture WRAM. Frame execution
+  // continues afterward — no longjmp. Compare the snapshot at
+  // matching points across recomp + oracle for sub-frame-precise
+  // state diff regardless of NMI ordering.
+  if (g_recomp_snap_on_func) {
+    extern int snes_frame_counter;
+    int match;
+    if (name == g_recomp_snap_on_func) match = 1;
+    else if (strcmp(g_recomp_snap_on_func, name) == 0) {
+      g_recomp_snap_on_func = name;  /* cache pointer for fast path */
+      match = 1;
+    } else {
+      match = 0;
+    }
+    if (match) {
+      memcpy(g_recomp_snap_buf, g_ram, 0x20000);
+      g_recomp_snap_count++;
+      g_recomp_snap_frame = snes_frame_counter;
+    }
+  }
 }
 
 void RecompStackDump(void) {
@@ -76,7 +112,6 @@ void RecompStackPop(void) {
 
 // Frame watchdog: detect infinite loops in generated code.
 // Set before calling run_frame, checked by generated code periodically.
-#include <setjmp.h>
 static clock_t g_frame_start_clock;
 static int g_watchdog_enabled;
 static int g_watchdog_counter;

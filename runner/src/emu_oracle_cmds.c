@@ -298,6 +298,66 @@ static void h_fuzz_run_snippet(const char *args) {
     debug_server_send_raw("\"}\n", 3);
 }
 
+/* emu_func_snap_set <hex_pc24> — register a 24-bit PC; subsequent
+ * frames will capture WRAM into a buffer at every dispatch whose
+ * PB:PC matches. 0 disables. snes9x backend only.
+ * emu_func_snap_get <hex_addr> [len] — read from the captured buffer.
+ */
+extern void snes9x_bridge_func_snap_set(uint32_t pc24);
+extern int  snes9x_bridge_func_snap_count(void);
+extern int  snes9x_bridge_func_snap_frame(void);
+extern const uint8_t* snes9x_bridge_func_snap_buf(void);
+
+static void h_emu_func_snap_set(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"snap requires snes9x backend\"}");
+        return;
+    }
+    unsigned int pc24 = 0;
+    sscanf(args ? args : "", "%x", &pc24);
+    snes9x_bridge_func_snap_set(pc24);
+    debug_server_send_fmt("{\"ok\":true,\"pc24\":\"0x%06x\"}", pc24);
+}
+
+static void h_emu_func_snap_get(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"snap requires snes9x backend\"}");
+        return;
+    }
+    int frame = snes9x_bridge_func_snap_frame();
+    int count = snes9x_bridge_func_snap_count();
+    if (frame < 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no snapshot yet\","
+                              "\"count\":%d}", count);
+        return;
+    }
+    unsigned int addr = 0, len = 1;
+    if (sscanf(args ? args : "", "%x %u", &addr, &len) < 1) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_func_snap_get <hex_addr> [len]\"}");
+        return;
+    }
+    if (len < 1) len = 1;
+    if (len > 0x20000) len = 0x20000;
+    if (addr >= 0x20000u || addr + len > 0x20000u) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"addr range out of bounds\"}");
+        return;
+    }
+    const uint8_t *buf = snes9x_bridge_func_snap_buf();
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "{\"ok\":true,\"frame\":%d,\"count\":%d,\"addr\":\"0x%05x\",\"len\":%u,\"hex\":\"",
+        frame, count, addr, len);
+    debug_server_send_raw(hdr, hlen);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", buf[addr + i]);
+        debug_server_send_raw(chunk, pos);
+    }
+    debug_server_send_raw("\"}\n", 3);
+}
+
 /* Drive the active backend forward N frames without advancing the
  * recomp side. Used to re-sync the two runtimes when their boot
  * sequences progress at different rates. Capped to avoid runaway.
@@ -672,6 +732,8 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_read_wram") == 0) { h_emu_read_wram(args); return 1; }
     if (strcmp(cmd, "emu_read_vram") == 0) { h_emu_read_vram(args); return 1; }
     if (strcmp(cmd, "fuzz_run_snippet") == 0) { h_fuzz_run_snippet(args); return 1; }
+    if (strcmp(cmd, "emu_func_snap_set") == 0) { h_emu_func_snap_set(args); return 1; }
+    if (strcmp(cmd, "emu_func_snap_get") == 0) { h_emu_func_snap_get(args); return 1; }
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }

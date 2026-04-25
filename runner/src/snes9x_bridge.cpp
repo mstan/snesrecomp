@@ -276,7 +276,26 @@ emu_insn_entry    s_emu_insn_trace[EMU_INSN_TRACE_SIZE];
 uint64_t s_emu_nmi_count = 0;
 int      s_emu_last_nmi_frame = -1;
 
+/* Function-boundary WRAM snapshot. Mirrors recomp's
+ * g_recomp_snap_on_func: captures Memory.RAM into a buffer at every
+ * dispatch where PB:PC == s_emu_snap_pc24. The buffer is queried
+ * via the emu_func_snap_get TCP command for synchronous comparison
+ * with the recomp side. */
+uint32_t s_emu_snap_pc24    = 0;  /* 0 = disabled */
+int      s_emu_snap_count   = 0;
+int      s_emu_snap_frame   = -1;
+uint8_t  s_emu_snap_buf[0x20000];
+
 void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
+    /* Function-boundary snapshot fires regardless of insn-trace state. */
+    if (s_emu_snap_pc24 != 0) {
+        uint32_t cur = ((uint32_t)pb << 16) | pc;
+        if (cur == s_emu_snap_pc24) {
+            memcpy(s_emu_snap_buf, Memory.RAM, 0x20000);
+            s_emu_snap_count++;
+            s_emu_snap_frame = (int)s_watch_frame;
+        }
+    }
     if (!s_emu_insn_active) return;
     uint64_t idx = s_emu_insn_write_idx % EMU_INSN_TRACE_SIZE;
     auto &e = s_emu_insn_trace[idx];
@@ -566,6 +585,26 @@ void snes9x_bridge_insn_trace_on(void) {
     s9x_insn_hook = s9x_insn_hook_trampoline;
     s9x_nmi_hook  = s9x_nmi_hook_trampoline;
 }
+
+/* Function-boundary snapshot setter. Pass pc24=0 to disable; any
+ * non-zero value installs the snapshot at every dispatch where
+ * PB:PC matches. Activates the insn-hook trampoline even if the
+ * insn trace is off — the snapshot path runs unconditionally
+ * before the trace gate. */
+void snes9x_bridge_func_snap_set(uint32_t pc24) {
+    s_emu_snap_pc24  = pc24;
+    s_emu_snap_count = 0;
+    s_emu_snap_frame = -1;
+    if (pc24 != 0)
+        s9x_insn_hook = s9x_insn_hook_trampoline;
+    /* If both insn trace and snap are off, leave the hook installed
+     * — its overhead is just the early return + s_emu_snap_pc24 == 0
+     * check. Cheap. */
+}
+
+int  snes9x_bridge_func_snap_count(void) { return s_emu_snap_count; }
+int  snes9x_bridge_func_snap_frame(void) { return s_emu_snap_frame; }
+const uint8_t* snes9x_bridge_func_snap_buf(void) { return s_emu_snap_buf; }
 
 void snes9x_bridge_insn_trace_off(void) {
     s_emu_insn_active = 0;
