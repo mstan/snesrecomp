@@ -55,7 +55,14 @@ uint8_t   s_wram_before[0x20000] = {0};
  * filter even when hook is installed.
  */
 #define EMU_WATCH_MAX_RANGES 8
-#define EMU_WATCH_LOG_SIZE   16384
+// Always-on full-WRAM trace records every snes9x WRAM write from
+// process start. SMW writes ~500-1000 WRAM bytes per frame; a 16K
+// ring evicts early-boot writes within ~30 frames, hiding the very
+// init sequences we want to query backward in history. Mirror
+// recomp's WRAM_TRACE_LOG_SIZE = 1M; entry size is 16 bytes so
+// resident cost is ~16 MB. Acceptable for the Oracle build (debug-
+// only), and lets the ring hold ~thousands of frames before wrap.
+#define EMU_WATCH_LOG_SIZE   (1 << 20)
 
 struct emu_watch_range { uint32_t lo, hi; };
 struct emu_watch_entry {
@@ -377,6 +384,16 @@ int snes9x_bridge_init(const char *rom_path) {
     s_loaded = true;
     fprintf(stderr, "[snes9x] Oracle backend loaded (%zu bytes): %s\n",
             s_rom_bytes.size(), rom_path);
+
+    // Always-on WRAM trace: arm the s9x write-hook for the full 128 KB
+    // WRAM range BEFORE the first retro_run() so every store from
+    // snes9x's reset/boot sequence onward is recorded continuously.
+    // Probes query the ring backward in history and never need to
+    // arm-then-record (which loses early writes to attach latency).
+    extern int snes9x_bridge_watch_add(uint32_t lo, uint32_t hi);
+    snes9x_bridge_watch_add(0x00000, 0x1FFFF);
+    fprintf(stderr, "[snes9x] always-on WRAM trace armed for full $0..$1FFFF range\n");
+
     return 0;
 }
 

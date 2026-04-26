@@ -33,6 +33,7 @@ typedef int socket_t;
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <limits.h>
 #include "debug_server.h"
 
 // External references
@@ -2194,6 +2195,60 @@ static void cmd_wram_first_change(const char *args) {
              addr, from_bi, to_bi);
 }
 
+// Always-on WRAM trace query: list every recorded write that touches
+// `addr` within the given frame window. Probes use this instead of
+// `trace_wram` (arm-and-record), so they consume the always-on ring
+// without wiping it.
+//
+// Usage: wram_writes_at <hex_addr> [from_frame=0] [to_frame=current] [limit=64]
+static void cmd_wram_writes_at(const char *args) {
+    if (!args || !*args) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: wram_writes_at <hex_addr> [from_frame=0] [to_frame=current] [limit=64]\"}");
+        return;
+    }
+    unsigned int addr = 0;
+    int from_frame = 0;
+    int to_frame = INT_MAX;
+    int limit = 64;
+    int n = sscanf(args, "%x %d %d %d", &addr, &from_frame, &to_frame, &limit);
+    if (n < 1) {
+        send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
+        return;
+    }
+    if (limit > 256) limit = 256;
+    int wstart = s_wram_trace.count < WRAM_TRACE_LOG_SIZE ? 0 :
+                 s_wram_trace.write_idx - WRAM_TRACE_LOG_SIZE;
+    static char buf[65536];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"addr\":\"0x%05x\",\"from\":%d,\"to\":%d,\"matches\":[",
+        addr, from_frame, to_frame);
+    int matched = 0;
+    for (int i = 0; i < s_wram_trace.count && matched < limit; i++) {
+        int idx = (wstart + i) % WRAM_TRACE_LOG_SIZE;
+        uint32_t a = s_wram_trace.log[idx].adr;
+        uint8_t  w = s_wram_trace.log[idx].width;
+        int f = s_wram_trace.log[idx].frame;
+        if (f < from_frame || f > to_frame) continue;
+        if (a != addr && !(w == 2 && a + 1 == addr)) continue;
+        if (pos > (int)sizeof(buf) - 512) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"adr\":\"0x%05x\","
+            "\"old\":\"0x%04x\",\"val\":\"0x%04x\",\"w\":%u,"
+            "\"bi\":%llu,\"func\":\"%s\",\"parent\":\"%s\"}",
+            matched ? "," : "",
+            f, a,
+            s_wram_trace.log[idx].old_val,
+            s_wram_trace.log[idx].val,
+            (unsigned)w,
+            (unsigned long long)s_wram_trace.log[idx].block_idx,
+            s_wram_trace.log[idx].func,
+            s_wram_trace.log[idx].parent);
+        matched++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"count\":%d}", matched);
+    send_line(buf);
+}
+
 static void cmd_trace_blocks(const char *args) {
     (void)args;
     s_block_trace.active = 1;
@@ -3282,6 +3337,7 @@ static const CmdEntry s_commands[] = {
     {"tier3_anchor_status",cmd_tier3_anchor_status},
     {"wram_at_block",      cmd_wram_at_block},
     {"wram_first_change",  cmd_wram_first_change},
+    {"wram_writes_at",     cmd_wram_writes_at},
 #if SNESRECOMP_TIER4
     {"trace_insn",            cmd_trace_insn},
     {"trace_insn_reset",      cmd_trace_insn_reset},
@@ -3402,6 +3458,23 @@ int debug_server_init(int port) {
     set_nonblocking(s_listen_sock);
 
     memset(s_watchpoints, 0, sizeof(s_watchpoints));
+
+#if SNESRECOMP_REVERSE_DEBUG
+    // Always-on WRAM trace: arm a single full-WRAM range so every store
+    // is recorded continuously from process start. Probes query the ring
+    // backward in history; they never need to "arm trace; run workload;
+    // dump trace" — that pattern loses events to attach latency.
+    //
+    // Cost: WRAM_TRACE_LOG_SIZE = 1M entries × ~80 bytes = ~80 MB
+    // resident, plus the per-store hot-path filter. Both are gated on
+    // SNESRECOMP_REVERSE_DEBUG (Oracle build only); Release|x64 omits
+    // the trace path entirely so this is byte-clean for the shipping
+    // exe.
+    s_wram_trace.nranges = 1;
+    s_wram_trace.ranges[0].lo = 0x00000;
+    s_wram_trace.ranges[0].hi = 0x1FFFF;
+    s_wram_trace.active = 1;
+#endif
 
     // Spawn background network thread
 #ifdef _WIN32

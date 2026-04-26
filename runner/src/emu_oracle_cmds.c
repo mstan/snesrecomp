@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 /* Non-static wrappers around debug_server's internal send helpers. See
  * debug_server.c bottom. Signature matches send_fmt exactly. */
@@ -610,6 +611,59 @@ static void h_emu_get_wram_trace(const char *args) {
     debug_server_send_line(buf);
 }
 
+/* emu_wram_writes_at <hex_addr> [from_frame=0] [to_frame=current] [limit=64]
+ *
+ * Always-on snes9x WRAM trace query: list every recorded write that
+ * touches `addr` within the given frame window. Mirrors recomp's
+ * wram_writes_at; probes use this instead of arming/resetting the
+ * trace, so they consume the always-on ring without wiping it.
+ */
+static void h_emu_wram_writes_at(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"wram_trace requires snes9x backend\"}");
+        return;
+    }
+    if (!args || !*args) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_wram_writes_at <hex_addr> [from_frame=0] [to_frame=current] [limit=64]\"}");
+        return;
+    }
+    unsigned int addr = 0;
+    int from_frame = 0;
+    int to_frame = INT_MAX;
+    int limit = 64;
+    int n = sscanf(args, "%x %d %d %d", &addr, &from_frame, &to_frame, &limit);
+    if (n < 1) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
+        return;
+    }
+    if (limit > 256) limit = 256;
+    extern int snes9x_bridge_watch_count(void);
+    extern int snes9x_bridge_watch_get(int, uint32_t *, uint32_t *, uint32_t *,
+                                       uint8_t *, uint8_t *, uint8_t *);
+    int total = snes9x_bridge_watch_count();
+    static char buf[65536];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"addr\":\"0x%05x\",\"from\":%d,\"to\":%d,\"matches\":[",
+        addr, from_frame, to_frame);
+    int matched = 0;
+    int budget = (int)sizeof(buf) - 256;
+    for (int i = 0; i < total && matched < limit && pos < budget; i++) {
+        uint32_t f = 0, ev_addr = 0, pc = 0;
+        uint8_t before = 0, after = 0, bank = 0;
+        if (!snes9x_bridge_watch_get(i, &f, &ev_addr, &pc, &before, &after, &bank)) break;
+        if ((int)f < from_frame || (int)f > to_frame) continue;
+        if (ev_addr != addr) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%u,\"adr\":\"0x%05x\",\"pc\":\"0x%06x\","
+            "\"before\":\"0x%02x\",\"after\":\"0x%02x\",\"bank_src\":\"0x%02x\"}",
+            matched ? "," : "",
+            (unsigned)f, ev_addr, pc, before, after, bank);
+        matched++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"count\":%d}", matched);
+    debug_server_send_line(buf);
+}
+
 /* find_first_divergence [subsystem=wram] [lo=0] [hi=0x1FFFF] [context=16]
  *
  * Compares the recompiled runtime's live state against the oracle backend's
@@ -753,6 +807,7 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_wram_trace_add") == 0)   { h_emu_wram_trace_add(args);   return 1; }
     if (strcmp(cmd, "emu_wram_trace_reset") == 0) { h_emu_wram_trace_reset(args); return 1; }
     if (strcmp(cmd, "emu_get_wram_trace") == 0)   { h_emu_get_wram_trace(args);   return 1; }
+    if (strcmp(cmd, "emu_wram_writes_at") == 0)   { h_emu_wram_writes_at(args);   return 1; }
     if (strcmp(cmd, "emu_insn_trace_on") == 0)    { h_emu_insn_trace_on(args);    return 1; }
     if (strcmp(cmd, "emu_insn_trace_off") == 0)   { h_emu_insn_trace_off(args);   return 1; }
     if (strcmp(cmd, "emu_insn_trace_reset") == 0) { h_emu_insn_trace_reset(args); return 1; }
