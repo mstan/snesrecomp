@@ -6666,6 +6666,33 @@ def run_config(rom: bytes, cfg: Config, out_path: Optional[str],
     # decl_ret_overrides so the declared function still matches funcs.h.
     decl_ret_overrides: Dict[int, str] = {}
     if funcs_h_sigs:
+        # Cross-bank auto-promoted-entry import. funcs.h is the
+        # authoritative cross-bank sig channel: after a full regen +
+        # sync_funcs_h.py, every bank's auto_BB_AAAA entries are
+        # declared with the sig that bank's livein-inference computed.
+        # The cfg-file-based cross-bank import (in main()) only sees
+        # entries literally written in sibling .cfg files — auto-
+        # promoted entries are synthesized at runtime and are absent.
+        # Without this pass, a thunk in this bank that calls a cross-
+        # bank auto-promoted helper sees the callee's sig as void(),
+        # so live-in inference treats the JSL as register-clobbering
+        # and the thunk's own sig stays void() despite the callee
+        # actually consuming X/Y/A. Result: C2198 too-few-arguments
+        # at every thunk callsite. Pull cross-bank auto-promoted sigs
+        # directly from funcs.h to close that gap.
+        _auto_re = re.compile(r'^auto_([0-9A-Fa-f]{2})_([0-9A-Fa-f]{4})$')
+        for fname, fh_sig in funcs_h_sigs.items():
+            m_auto = _auto_re.match(fname)
+            if not m_auto:
+                continue
+            xbank = int(m_auto.group(1), 16)
+            if xbank == cfg.bank:
+                continue  # own bank — already in cfg.names
+            xaddr = (xbank << 16) | int(m_auto.group(2), 16)
+            if xaddr in cfg.names:
+                continue  # already imported via sibling .cfg parse
+            cfg.names[xaddr] = fname
+            cfg.sigs[xaddr] = fh_sig
         for addr, name in cfg.names.items():
             fh_sig = funcs_h_sigs.get(name)
             cfg_sig = cfg.sigs.get(addr)
