@@ -375,6 +375,89 @@ static void h_emu_func_snap_get_n(const char *args) {
  * recomp side. Used to re-sync the two runtimes when their boot
  * sequences progress at different rates. Capped to avoid runaway.
  * Max N is 100000 (~28 minutes at 60 Hz). */
+/* emu_history: returns count, oldest, newest frame numbers
+ * present in the snes9x per-frame WRAM history ring. */
+static void h_emu_history(const char *args) {
+    (void)args;
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    extern int snes9x_bridge_history_count(void);
+    extern int snes9x_bridge_history_oldest_frame(void);
+    extern int snes9x_bridge_history_newest_frame(void);
+    debug_server_send_fmt(
+        "{\"ok\":true,\"count\":%d,\"oldest\":%d,\"newest\":%d}",
+        snes9x_bridge_history_count(),
+        snes9x_bridge_history_oldest_frame(),
+        snes9x_bridge_history_newest_frame());
+}
+
+/* emu_wram_at_frame <frame> <addr>: returns the byte at the
+ * given bank-7E WRAM offset at the given history frame. */
+static void h_emu_wram_at_frame(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    unsigned int frame = 0, addr = 0;
+    if (!args || sscanf(args, "%u %x", &frame, &addr) < 2) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_wram_at_frame <frame> <hex_addr>\"}");
+        return;
+    }
+    extern int snes9x_bridge_history_byte_at(uint32_t, uint32_t, uint8_t *);
+    uint8_t v = 0;
+    int hit = snes9x_bridge_history_byte_at((uint32_t)frame,
+                                            (uint32_t)addr, &v);
+    if (!hit) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"frame not in history\","
+                              "\"frame\":%u,\"addr\":\"0x%05x\"}", frame, addr);
+        return;
+    }
+    debug_server_send_fmt("{\"ok\":true,\"frame\":%u,\"addr\":\"0x%05x\","
+                          "\"val\":\"0x%02x\"}", frame, addr, v);
+}
+
+/* emu_history_find <addr> <hex_val>: returns the most recent
+ * frame in history where wram[addr] == val, or -1. Useful for
+ * waypoint queries. */
+static void h_emu_history_find(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    unsigned int addr = 0, val = 0;
+    if (!args || sscanf(args, "%x %x", &addr, &val) < 2) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_history_find <hex_addr> <hex_val>\"}");
+        return;
+    }
+    extern int snes9x_bridge_history_find_value(uint32_t, uint8_t);
+    int frame = snes9x_bridge_history_find_value((uint32_t)addr, (uint8_t)val);
+    debug_server_send_fmt("{\"ok\":true,\"addr\":\"0x%05x\","
+                          "\"val\":\"0x%02x\",\"frame\":%d}", addr, val, frame);
+}
+
+/* emu_history_find_word <addr> <hex_val>: 16-bit (little-endian)
+ * variant. SMW position fields are word-sized; matching the full
+ * word avoids low-byte collisions across different X-high values. */
+static void h_emu_history_find_word(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    unsigned int addr = 0, val = 0;
+    if (!args || sscanf(args, "%x %x", &addr, &val) < 2) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_history_find_word <hex_addr> <hex_val16>\"}");
+        return;
+    }
+    extern int snes9x_bridge_history_find_word(uint32_t, uint16_t);
+    int frame = snes9x_bridge_history_find_word((uint32_t)addr,
+                                                 (uint16_t)(val & 0xFFFF));
+    debug_server_send_fmt("{\"ok\":true,\"addr\":\"0x%05x\","
+                          "\"val\":\"0x%04x\",\"frame\":%d}",
+                          addr, val & 0xFFFF, frame);
+}
+
 /* emu_frame: return snes9x's bridge frame counter (s_watch_frame).
  * Each snes9x_bridge_run_frame call increments it by 1; reading it
  * lets a probe verify "have we actually advanced N frames" vs the
@@ -821,6 +904,10 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
     if (strcmp(cmd, "emu_frame") == 0)     { h_emu_frame(args);     return 1; }
+    if (strcmp(cmd, "emu_history") == 0)   { h_emu_history(args);   return 1; }
+    if (strcmp(cmd, "emu_wram_at_frame") == 0) { h_emu_wram_at_frame(args); return 1; }
+    if (strcmp(cmd, "emu_history_find") == 0) { h_emu_history_find(args); return 1; }
+    if (strcmp(cmd, "emu_history_find_word") == 0) { h_emu_history_find_word(args); return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }
     if (strcmp(cmd, "emu_wram_trace_add") == 0)   { h_emu_wram_trace_add(args);   return 1; }
     if (strcmp(cmd, "emu_wram_trace_reset") == 0) { h_emu_wram_trace_reset(args); return 1; }

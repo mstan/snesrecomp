@@ -82,6 +82,37 @@ int      s_watch_write_idx = 0;
 int      s_watch_count = 0;
 emu_watch_entry s_watch_log[EMU_WATCH_LOG_SIZE] = {};
 
+/* ---- Per-frame WRAM history ring (snes9x analog of recomp's
+ * s_frame_history) ----
+ *
+ * Captures Memory.RAM[$0000-$1FFF] (bank 7E low WRAM = SMW's
+ * gameplay state region) after each retro_run. Probes can query
+ * "what was emu's $D3 (Mario Y) at the frame where emu's $D1
+ * (Mario X) was just written to value X?" — equivalent to recomp's
+ * existing FrameRecord lookups.
+ *
+ * Sized to match recomp's history ring (6000 frames). 8KB per
+ * frame × 6000 frames = ~48 MB resident — acceptable for the
+ * Oracle build (debug-only). Release|x64 doesn't link the bridge,
+ * so this is not in the shipping exe.
+ *
+ * Larger slices (full bank 7E + bank 7F = 128KB/frame × 6000 =
+ * 768MB) are intentionally not captured here; a separate query
+ * shape can use the always-on WRAM trace ring for higher-address
+ * writes if needed.
+ */
+#define EMU_FRAME_HIST_SIZE   6000
+#define EMU_FRAME_HIST_SLICE  0x2000   /* bank 7E $0000-$1FFF */
+
+struct emu_frame_history_entry {
+    uint32_t frame;                          /* s_watch_frame at capture */
+    uint8_t  wram[EMU_FRAME_HIST_SLICE];
+};
+
+static emu_frame_history_entry s_emu_frame_hist[EMU_FRAME_HIST_SIZE];
+static int  s_emu_frame_hist_write_idx = 0;
+static int  s_emu_frame_hist_count = 0;
+
 /* Map an incoming 24-bit CPU bus address to a 20-bit WRAM offset if
  * it targets bank 7E/7F or a WRAM-mirror. Returns 0xFFFFFFFF if the
  * address is not WRAM. */
@@ -461,8 +492,85 @@ void snes9x_bridge_run_frame(uint16_t joypad1, uint16_t joypad2) {
     for (int i = 0; i < MAX_RETRO_RUNS; i++) {
         s_watch_frame++;
         retro_run();
+        /* Capture into the per-frame history ring AFTER each
+         * retro_run so the slice reflects post-frame state. */
+        {
+            int slot = s_emu_frame_hist_write_idx % EMU_FRAME_HIST_SIZE;
+            s_emu_frame_hist[slot].frame = s_watch_frame;
+            memcpy(s_emu_frame_hist[slot].wram, Memory.RAM, EMU_FRAME_HIST_SLICE);
+            s_emu_frame_hist_write_idx++;
+            if (s_emu_frame_hist_count < EMU_FRAME_HIST_SIZE)
+                s_emu_frame_hist_count++;
+        }
         if (s_emu_nmi_count != nmi_before) break;          /* NMI fired */
     }
+}
+
+/* Public C accessors for the per-frame history. Returns 0 on
+ * miss, 1 on hit. addr is bank-7E offset (0..$1FFF). */
+extern "C" int snes9x_bridge_history_count(void) {
+    return s_emu_frame_hist_count;
+}
+extern "C" int snes9x_bridge_history_oldest_frame(void) {
+    if (s_emu_frame_hist_count == 0) return -1;
+    int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
+                 + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+    return (int)s_emu_frame_hist[start].frame;
+}
+extern "C" int snes9x_bridge_history_newest_frame(void) {
+    if (s_emu_frame_hist_count == 0) return -1;
+    int idx = (s_emu_frame_hist_write_idx - 1 + EMU_FRAME_HIST_SIZE)
+              % EMU_FRAME_HIST_SIZE;
+    return (int)s_emu_frame_hist[idx].frame;
+}
+extern "C" int snes9x_bridge_history_byte_at(uint32_t frame, uint32_t addr,
+                                              uint8_t *out_val) {
+    if (addr >= EMU_FRAME_HIST_SLICE) return 0;
+    if (s_emu_frame_hist_count == 0) return 0;
+    int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
+                 + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+    for (int i = 0; i < s_emu_frame_hist_count; i++) {
+        int idx = (start + i) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].frame == frame) {
+            if (out_val) *out_val = s_emu_frame_hist[idx].wram[addr];
+            return 1;
+        }
+    }
+    return 0;
+}
+/* Find the latest frame in history where wram[addr] matches val.
+ * Returns the frame number, or -1 if not found. Useful for
+ * waypoint queries: "what was the most recent frame where
+ * Memory.RAM[$D1] == 0xC7?" */
+extern "C" int snes9x_bridge_history_find_value(uint32_t addr, uint8_t val) {
+    if (addr >= EMU_FRAME_HIST_SLICE) return -1;
+    if (s_emu_frame_hist_count == 0) return -1;
+    /* Walk newest-first so we return the most recent match. */
+    for (int i = s_emu_frame_hist_count - 1; i >= 0; i--) {
+        int idx = (s_emu_frame_hist_write_idx - 1 - (s_emu_frame_hist_count - 1 - i)
+                   + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].wram[addr] == val)
+            return (int)s_emu_frame_hist[idx].frame;
+    }
+    return -1;
+}
+
+/* Find the latest frame in history where the 16-bit little-endian
+ * word at wram[addr]:wram[addr+1] equals val. The common shape for
+ * waypoint sync: SMW position fields are 16-bit (X/Y high/low). */
+extern "C" int snes9x_bridge_history_find_word(uint32_t addr, uint16_t val) {
+    if (addr + 1 >= EMU_FRAME_HIST_SLICE) return -1;
+    if (s_emu_frame_hist_count == 0) return -1;
+    uint8_t lo = (uint8_t)(val & 0xFF);
+    uint8_t hi = (uint8_t)((val >> 8) & 0xFF);
+    for (int i = s_emu_frame_hist_count - 1; i >= 0; i--) {
+        int idx = (s_emu_frame_hist_write_idx - 1 - (s_emu_frame_hist_count - 1 - i)
+                   + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].wram[addr] == lo
+            && s_emu_frame_hist[idx].wram[addr + 1] == hi)
+            return (int)s_emu_frame_hist[idx].frame;
+    }
+    return -1;
 }
 
 /* Report bytes that changed in the most-recent retro_run(). out_buf
