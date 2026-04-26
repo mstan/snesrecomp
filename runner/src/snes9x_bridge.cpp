@@ -718,6 +718,8 @@ void snes9x_bridge_watch_clear(void) {
 
 int snes9x_bridge_watch_count(void) { return s_watch_count; }
 
+uint32_t snes9x_bridge_get_frame(void) { return s_watch_frame; }
+
 int snes9x_bridge_watch_get(int i, uint32_t *frame, uint32_t *addr,
                             uint32_t *pc24, uint8_t *before, uint8_t *after,
                             uint8_t *bank_source) {

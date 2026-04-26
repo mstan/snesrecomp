@@ -375,6 +375,23 @@ static void h_emu_func_snap_get_n(const char *args) {
  * recomp side. Used to re-sync the two runtimes when their boot
  * sequences progress at different rates. Capped to avoid runaway.
  * Max N is 100000 (~28 minutes at 60 Hz). */
+/* emu_frame: return snes9x's bridge frame counter (s_watch_frame).
+ * Each snes9x_bridge_run_frame call increments it by 1; reading it
+ * lets a probe verify "have we actually advanced N frames" vs the
+ * count of emu_step calls issued. Disambiguates whether one
+ * emu_step is one emulated frame or whether retro_run cycles
+ * multiple internal frame ticks per call. */
+static void h_emu_frame(const char *args) {
+    (void)args;
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"emu_frame requires snes9x backend\"}");
+        return;
+    }
+    extern uint32_t snes9x_bridge_get_frame(void);
+    debug_server_send_fmt("{\"ok\":true,\"frame\":%u}",
+                          (unsigned)snes9x_bridge_get_frame());
+}
+
 static void h_emu_step(const char *args) {
     if (!g_active_backend) {
         debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
@@ -803,6 +820,7 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_func_snap_get_n") == 0) { h_emu_func_snap_get_n(args); return 1; }
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
+    if (strcmp(cmd, "emu_frame") == 0)     { h_emu_frame(args);     return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }
     if (strcmp(cmd, "emu_wram_trace_add") == 0)   { h_emu_wram_trace_add(args);   return 1; }
     if (strcmp(cmd, "emu_wram_trace_reset") == 0) { h_emu_wram_trace_reset(args); return 1; }
