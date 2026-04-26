@@ -6174,8 +6174,12 @@ def emit_function(name: str, insns: List[Insn], bank: int,
         ctx.emit(insn, valid_branch_targets)
 
     # Build output with hoisted declarations (HANDOFF requirement D)
-    # Add stack-relative variables to hoisted declarations
-    for sv in ctx._stk_vars:
+    # Add stack-relative variables to hoisted declarations.
+    # Sort: _stk_vars is a set, so iteration order is hash-randomized
+    # under Python's hash-randomization → two consecutive regens would
+    # emit the stk_XX hoists in different orders, producing pure-
+    # cosmetic diff noise that defeats regen idempotency.
+    for sv in sorted(ctx._stk_vars):
         ctx._hoisted[sv] = 'uint16'
 
     lines = [f'{c_ret_type} {name}({param_str}) {{  // {start:06x}']
@@ -6543,7 +6547,7 @@ def _validate_function_output(fname: str, lines: List[str], bank: int) -> List[s
     garbled_rom = re.findall(r'RomPtr_([0-9A-Fa-f]{2})\(', '\n'.join(body_lines))
     invalid_banks = [b for b in garbled_rom if int(b, 16) not in valid_banks]
     if invalid_banks:
-        reasons.append(f'RomPtr with invalid banks ({",".join(set(invalid_banks))}) --data decoded as code')
+        reasons.append(f'RomPtr with invalid banks ({",".join(sorted(set(invalid_banks)))}) --data decoded as code')
 
     return reasons
 
