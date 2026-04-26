@@ -397,15 +397,72 @@ int snes9x_bridge_init(const char *rom_path) {
     return 0;
 }
 
+/* Yield-on-logical-frame wrapper around retro_run.
+ *
+ * Recomp's "1 step" = 1 SmwRunOneFrameOfGame call = 1 NMI body + 1
+ * main-loop body iteration = 1 SMW logical frame.
+ *
+ * Snes9x's retro_run = 1 wall-clock 60Hz frame of cycles. During
+ * NMI-enabled stages this captures 1 NMI-driven RunGameMode call,
+ * same logical unit as recomp. During NMI-disabled stages (GM=$03,
+ * $04 boot uploads) the handler body executes inline without NMI;
+ * one retro_run captures only a fraction of one such body, taking
+ * 20-55 retro_runs to traverse a single handler invocation. That
+ * mismatch means lockstep state-sync vs recomp is invalid in those
+ * stages — recomp completes the body in 1 step.
+ *
+ * Fix: loop retro_run until ONE of:
+ *   1. NMI fires (s_emu_nmi_count increments) — covers NMI-enabled
+ *      stages; matches recomp's 1-NMI-per-step.
+ *   2. GameMode ($0100) changes — covers NMI-disabled stages where
+ *      the handler INC's GameMode at completion.
+ *   3. Max iterations reached (escape hatch for genuinely stuck
+ *      states; 240 = 4 wall-clock seconds is well past any boot
+ *      stage's natural completion time).
+ *
+ * Result: per-step semantics are "1 SMW logical-frame iteration of
+ * progress" on both sides regardless of NMI state.
+ *
+ * The wall-clock-frame counter `s_watch_frame` still increments per
+ * retro_run call to keep the trace ring's `f` field meaningful as
+ * "wall-clock frames of cycles consumed since boot." Probes that
+ * compare logical-frame counts use rec_steps and the GameMode
+ * transition log; probes that need wall-clock cycles use s_watch_frame.
+ */
 void snes9x_bridge_run_frame(uint16_t joypad1, uint16_t joypad2) {
     if (!s_loaded) return;
     s_joypad[0] = joypad1;
     s_joypad[1] = joypad2;
-    /* Snapshot WRAM so emu_wram_delta can report which bytes the
-     * frame's execution changed. Cheap (128 KB memcpy per frame). */
+    /* Snapshot WRAM (full 128KB) so emu_wram_delta can report what
+     * the LOGICAL frame changed — captured before the loop, not
+     * before each retro_run, so the delta covers the full unit. */
     memcpy(s_wram_before, Memory.RAM, 0x20000);
-    s_watch_frame++;
-    retro_run();
+
+    uint64_t nmi_before = s_emu_nmi_count;
+
+    /* MAX_RETRO_RUNS budget. SMW's GM=$04 (PrepareTitleScreen)
+     * takes ~55 wall-clock frames on snes9x with NMI disabled.
+     * Cap at 80 to give headroom without ballooning probe wall-
+     * clock time. NMI-enabled stages exit after 1 retro_run.
+     *
+     * NMI-disabled stages will exhaust the budget without firing
+     * NMI — accepted; snes9x doesn't fully traverse the long
+     * handler body in one step, but the next step continues from
+     * where this left off. Total step count to traverse the stage
+     * still doesn't exactly match recomp (which does the body
+     * in 1 step) but is closer than the original 1-retro_run
+     * model.
+     *
+     * Note we don't watch $0100 (GameMode) for transition signals
+     * because $0100 is on the stack page and gets clobbered by
+     * stack pushes — produces spurious GM=$34/$00/etc. transitions
+     * mid-handler. NMI is the clean signal. */
+    enum { MAX_RETRO_RUNS = 80 };
+    for (int i = 0; i < MAX_RETRO_RUNS; i++) {
+        s_watch_frame++;
+        retro_run();
+        if (s_emu_nmi_count != nmi_before) break;          /* NMI fired */
+    }
 }
 
 /* Report bytes that changed in the most-recent retro_run(). out_buf
