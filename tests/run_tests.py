@@ -53,6 +53,7 @@ TEST_MODULES = [
     'test_bit_v_flag_width',
     'test_wram_addr_wrap',
     'test_flag_tracking',
+    'test_rmw_hw_register_dispatch',
 ]
 
 

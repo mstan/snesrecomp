@@ -3175,21 +3175,36 @@ class EmitCtx:
         self._emit_wram_store16(addr, idx, val)
 
     def _emit_rmw8(self, mode, addr, expr_template) -> Optional[str]:
-        """Emit a 8-bit read-modify-write to WRAM, routing through the
-        Tier-1 hook wrapper when --reverse-debug is on. INC/DEC/ASL/
-        LSR/ROL/ROR/TRB/TSB previously emitted in-place `mem++`-style
-        statements that bypassed RDB_STORE8, hiding their writes from
-        the WRAM trace. This helper makes them honest.
+        """Emit a 8-bit read-modify-write, routing the read/write through
+        the right backing store for the address:
+          * Absolute address in HW-register range → ReadReg/WriteReg
+            (otherwise SMW's `ASL HW_RDMPY` reads g_ram[$4216] which is
+            random WRAM, not the multiply hardware).
+          * Otherwise → WRAM via the Tier-1 hook wrapper (when
+            --reverse-debug) or direct g_ram (legacy).
 
         expr_template uses `{cur}` for the pre-modification value.
-        Returns the C expression that holds the post-modification
-        value (suitable for flag_src), or None if the mode is
-        unsupported (caller should fall back to a /* comment */).
+        Returns the C expression holding the post-modification value
+        (suitable for flag_src), or None if the mode is unsupported.
         """
         idx_map = {DP: '0', DP_X: self._idx('X'), ABS: '0', ABS_X: self._idx('X')}
         idx = idx_map.get(mode)
         if idx is None:
             return None
+        # HW-register dispatch only applies to absolute modes (DP is
+        # always WRAM in 65816 — direct page lives in $0000-$1FFF).
+        if mode in (ABS, ABS_X) and self._is_hw_reg(addr):
+            if idx == '0':
+                read_expr = f'ReadReg(0x{addr:x})'
+                write_addr = f'0x{addr:x}'
+            else:
+                read_expr = f'ReadReg(0x{addr:x} + {idx})'
+                write_addr = f'(uint16)(0x{addr:x} + {idx})'
+            new_expr = expr_template.format(cur=read_expr)
+            tmp = self._alloc_tmp('uint8')
+            self._emit(f'{tmp} = (uint8)({new_expr});')
+            self._emit(f'WriteReg({write_addr}, {tmp});')
+            return tmp
         cur_expr = self._wram(addr, idx)
         new_expr = expr_template.format(cur=cur_expr)
         if self._reverse_debug:
@@ -4778,14 +4793,29 @@ class EmitCtx:
     # -- Sub-emitters ---------------------------------------------------------
 
     def _resolve_mem_rw(self, mode: int, v: int) -> Optional[str]:
-        """Resolve a read-modify-write memory operand (for INC/DEC/ASL/LSR/ROL/ROR).
-        Note: hardware registers (INC $21xx, DEC $43xx) are rare and typically
-        only meaningful for WRAM-mirrored addresses. We still route through g_ram
-        here because read-modify-write on true MMIO is unusual and g_ram serves as
-        the shadow register storage."""
-        if mode in (DP, ABS):
+        """Resolve the READ side of a read-modify-write memory operand
+        (for INC/DEC/ASL/LSR/ROL/ROR/TSB/TRB carry/N/Z extraction).
+
+        Absolute addressing in the HW-register range routes through
+        ReadReg — SMW's `ASL HW_RDMPY` (at bank_02:11433/11448/16374/
+        16392 and bank_03:3303/3321) reads the multiply hardware
+        register, not g_ram[$4216]. Direct-page modes never hit MMIO
+        (DP is always $0000-$00FF on the 65816 in-bank).
+
+        The matching WRITE side is in `_emit_rmw8` / `_emit_rmw16`,
+        which performs the same dispatch.
+        """
+        if mode == DP:
             return self._wram(v, '0')
-        elif mode in (DP_X, ABS_X):
+        elif mode == ABS:
+            if self._is_hw_reg(v):
+                return f'ReadReg(0x{v:x})'
+            return self._wram(v, '0')
+        elif mode == DP_X:
+            return self._wram(v, self._idx('X'))
+        elif mode == ABS_X:
+            if self._is_hw_reg(v):
+                return f'ReadReg(0x{v:x} + {self._idx("X")})'
             return self._wram(v, self._idx('X'))
         elif mode in (DP_Y,):
             return self._wram(v, self._idx('Y'))
