@@ -2215,10 +2215,11 @@ static void cmd_wram_writes_at(const char *args) {
         send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
         return;
     }
-    if (limit > 256) limit = 256;
+    if (limit > 4096) limit = 4096;
     int wstart = s_wram_trace.count < WRAM_TRACE_LOG_SIZE ? 0 :
                  s_wram_trace.write_idx - WRAM_TRACE_LOG_SIZE;
-    static char buf[65536];
+    static char buf[1048576];   /* 1MB — accommodates up to 4096 entries
+                                   each ~250 bytes JSON */
     int pos = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"addr\":\"0x%05x\",\"from\":%d,\"to\":%d,\"matches\":[",
         addr, from_frame, to_frame);

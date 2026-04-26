@@ -1,44 +1,33 @@
-"""Issue B interactive watchdog.
+"""Issue B history-query probe.
 
-Connects to a RUNNING Release|x64 smw.exe (the live exe, no
-oracle). Polls Mario's Y position. When Mario "sinks" — defined
-as Y crossing below ground level by > 8 pixels (i.e. Y > Y_GROUND
-+ 8 = $0158) for >= 3 consecutive samples — pauses the recomp
-and dumps the most recent writers to $D3/$D4 from the always-on
-WRAM-trace ring.
+Don't WATCH for the sink — QUERY THE RING for it. The always-on
+Tier-1 WRAM trace records every $D3/$D4 write since process
+start with frame number, function, and parent. Run this probe
+against any live exe (with or without playing) and it walks the
+ring backward for sink-shaped events: writes that move Mario's Y
+to a value below the canonical ground ($0150) at any frame in
+recorded history.
 
-Usage:
-  1. Launch the exe: ./build/bin-x64-Release/smw.exe
-  2. In the game window, walk Mario toward the Yoshi ?-block.
-  3. Run this probe in another terminal: python <this file>
-  4. The probe attaches to the running TCP server on port 4377
-     and watches Mario's Y. When Mario sinks at the bug site,
-     it pauses + dumps the trace.
+Then dumps full attribution per sink event so we can identify
+which function wrote the underground value, and what Mario's
+state was just before / after.
 
-  No --paused flag, no oracle, just the live exe + Mario's eyes.
+This shape is correct per the project's "always consume ring
+buffers, never time/attach to catch events" rule. The previous
+poll-based watchdog was the wrong shape — events get caught by
+querying history backward, not by attaching forward.
 """
 from __future__ import annotations
-import json, pathlib, socket, sys, time
+import json, pathlib, socket, sys
 
 PORT = 4377
 GROUND_Y = 0x0150
-SINK_THRESHOLD_Y = GROUND_Y + 8       # > this = "Mario underground"
-CONSECUTIVE_REQUIRED = 3              # how many samples in a row to confirm
-POLL_INTERVAL_S = 0.1                 # poll Mario state every 100ms
+SINK_THRESHOLD_Y = GROUND_Y          # any write moving Y past ground
 
 
 def cmd(sock, f, line):
     sock.sendall((line + '\n').encode())
     return json.loads(f.readline())
-
-
-def _read_byte(sock, f, addr):
-    h = cmd(sock, f, f'dump_ram 0x{addr:x} 1').get('hex', '').replace(' ', '')
-    return int(h, 16) if h else -1
-
-
-def _read_word(sock, f, addr):
-    return (_read_byte(sock, f, addr + 1) << 8) | _read_byte(sock, f, addr)
 
 
 def main():
@@ -52,58 +41,96 @@ def main():
         sys.exit(1)
     f = sock.makefile('r')
     f.readline()  # consume banner
-    print('  attached. monitoring Mario Y...')
-    print(f'  trigger: Y > ${SINK_THRESHOLD_Y:04x} for {CONSECUTIVE_REQUIRED}+ samples')
-    print()
+    print('  attached. querying always-on ring backward for sink events...')
 
-    consec = 0
-    last_print = 0
-    while True:
-        rx = _read_word(sock, f, 0xD1)
-        ry = _read_word(sock, f, 0xD3)
-        gm = _read_byte(sock, f, 0x100)
+    # Pull the entire $D4 ($D3+1, the high byte of Mario's Y) trace.
+    # When Y high goes above $01 (i.e., low ground = $0150), Mario is
+    # below the visible play area. When Y goes from $0150 to a value
+    # whose post-write low byte is > $50 with hi=$01, that's a sink-
+    # shaped event.
+    r = cmd(sock, f, 'wram_writes_at d3 0 999999 4096')
+    d3_writes = r.get('matches', [])
+    print(f'  $D3 writes recorded: {len(d3_writes)}')
 
-        # Print status occasionally so the operator knows it's alive.
-        now = time.time()
-        if now - last_print > 2.0:
-            print(f'  [t={now:.1f}] GM=${gm:02x} X=${rx:04x} Y=${ry:04x}')
-            last_print = now
-
-        if ry > SINK_THRESHOLD_Y and gm in (0x14, 0x15, 0x16):  # in-level
-            consec += 1
-            if consec >= CONSECUTIVE_REQUIRED:
-                print(f'\n*** MARIO SINK DETECTED ***')
-                print(f'  X=${rx:04x} Y=${ry:04x} (ground=${GROUND_Y:04x})')
-                cmd(sock, f, 'pause')
-                # Query writers to $D3 and $D4 (most recent).
-                for addr in (0xD3, 0xD4):
-                    r = cmd(sock, f, f'wram_writes_at {addr:x} 0 999999 30')
-                    writes = r.get('matches', [])
-                    print(f'\n--- last 20 writes to ${addr:02x} ---')
-                    for e in writes[-20:]:
-                        print(f'  f={e["f"]:5} val={e["val"]:>6} '
-                              f'func={e["func"][:32]:32} '
-                              f'parent={e["parent"][:25]}')
-                # Player physics neighbors.
-                print(f'\n--- player state at sink ---')
-                for label, addr in [('YPos', 0xD3), ('YPosHi', 0xD4),
-                                    ('YPosNext', 0x96), ('YPosNextHi', 0x97),
-                                    ('YSpd', 0x7D), ('YSubSpd', 0x7E),
-                                    ('OnGround', 0x13EF),
-                                    ('PlayerInAir', 0x72),
-                                    ('PlayerBlockedDir', 0x77),
-                                    ('TempPlayerGround', 0x8D),
-                                    ('PlayerBlockMoveY', 0x91),
-                                    ('PlayerYPosInBlock', 0x90),
-                                    ('Pose', 0x13E0)]:
-                    v = _read_byte(sock, f, addr)
-                    print(f'  ${addr:04x} {label:22} = ${v:02x}')
-                print('\n[paused] use TCP `continue` to resume.')
-                return
+    # Find sink-shaped events: Y low byte transitions from <= $50
+    # (ground or above) to > $58 (1+ tile underground), with hi byte
+    # constant at $01. Also accept word writes where the new value
+    # is > $0158.
+    sinks = []
+    prev_lo = None
+    for e in d3_writes:
+        try:
+            v = int(e.get('val', '0x0'), 16)
+        except ValueError:
+            continue
+        # Word writes carry both bytes; byte writes carry just the
+        # low byte. Use w field to disambiguate.
+        if e.get('w') == 2:
+            new_y = v & 0xFFFF
         else:
-            consec = 0
+            # Byte write to $D3 = low byte change. Reconstruct using
+            # the most recent observed low (best effort).
+            new_y = 0x0100 + (v & 0xFF)  # assume Y hi = 0x01
+        if new_y > SINK_THRESHOLD_Y + 8:
+            sinks.append((e, new_y))
 
-        time.sleep(POLL_INTERVAL_S)
+    # UpdateCurrentPlayerPositionRAM is a one-line copy ($D3 = $96).
+    # The bug seed is upstream in $96 (PlayerYPosNext). Trace $96
+    # writers and find sink events there too.
+    r = cmd(sock, f, 'wram_writes_at 96 0 999999 4096')
+    py_writes = r.get('matches', [])
+    print(f'  $96 (PlayerYPosNext) writes recorded: {len(py_writes)}')
+
+    py_sinks = []
+    for e in py_writes:
+        try: v = int(e.get('val', '0x0'), 16)
+        except ValueError: continue
+        if e.get('w') == 2:
+            new_y = v & 0xFFFF
+        else:
+            new_y = 0x0100 + (v & 0xFF)
+        if new_y > SINK_THRESHOLD_Y + 8:
+            py_sinks.append((e, new_y))
+
+    print(f'\n=== $96 sink-shaped writes (PlayerYPosNext > ${SINK_THRESHOLD_Y + 8:04x}): {len(py_sinks)} ===')
+    from collections import Counter
+    by_func_96 = Counter(e["func"] for e, y in py_sinks)
+    by_parent_96 = Counter(e["parent"] for e, y in py_sinks)
+    print(f'  by writer function:')
+    for func, n in by_func_96.most_common(10):
+        print(f'    {n:5}  {func}')
+    print(f'  by parent function:')
+    for par, n in by_parent_96.most_common(10):
+        print(f'    {n:5}  {par}')
+
+    # Find the FIRST sink-shaped write to $96 — that's the seed.
+    if py_sinks:
+        first_sink = py_sinks[0]
+        print(f'\n=== FIRST sink-shaped $96 write ===')
+        e, y = first_sink
+        print(f'  frame {e["f"]}: $96 -> ${e["val"]} (Y~${y:04x})')
+        print(f'  func={e["func"]}')
+        print(f'  parent={e["parent"]}')
+        print(f'  block_idx={e["bi"]}')
+
+        # Show the 5 writes BEFORE this seed (what state led to it).
+        first_idx = py_writes.index(e)
+        prelude = py_writes[max(0, first_idx-5):first_idx+1]
+        print(f'\n=== prelude: 5 writes to $96 immediately before the first sink ===')
+        for ev in prelude:
+            try: v = int(ev["val"], 16)
+            except ValueError: v = -1
+            print(f'  f={ev["f"]:5} val={ev["val"]:>6} '
+                  f'func={ev["func"][:32]:32} '
+                  f'parent={ev["parent"][:25]}')
+
+    # $D3 sink summary too.
+    print(f'\n=== $D3 sink summary ===')
+    print(f'  total sink-shaped $D3 writes: {len(sinks)}')
+    by_func_d3 = Counter(e["func"] for e, y in sinks)
+    print(f'  by writer:')
+    for func, n in by_func_d3.most_common(10):
+        print(f'    {n:5}  {func}')
 
 
 if __name__ == '__main__':

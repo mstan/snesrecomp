@@ -736,12 +736,12 @@ static void h_emu_wram_writes_at(const char *args) {
         debug_server_send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
         return;
     }
-    if (limit > 256) limit = 256;
+    if (limit > 4096) limit = 4096;
     extern int snes9x_bridge_watch_count(void);
     extern int snes9x_bridge_watch_get(int, uint32_t *, uint32_t *, uint32_t *,
                                        uint8_t *, uint8_t *, uint8_t *);
     int total = snes9x_bridge_watch_count();
-    static char buf[65536];
+    static char buf[1048576];   /* 1MB to hold up to 4096 JSON entries */
     int pos = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"addr\":\"0x%05x\",\"from\":%d,\"to\":%d,\"matches\":[",
         addr, from_frame, to_frame);
