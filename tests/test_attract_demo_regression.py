@@ -172,6 +172,36 @@ def _yoshi_spawns_at_some_frame(c):
     return has_yoshi, f'sprite_type=$009E=[{types.hex()}] has_yoshi={has_yoshi}'
 
 
+def _yoshi_does_not_float_up(c):
+    """Issue C closure (2026-04-26): after Yoshi spawns from a ?-block
+    he must obey gravity, not rise indefinitely. Pre-fix, phantom auto-
+    promotion at $01:ECEC fragmented Spr035_Yoshi's body and re-applied
+    the on-ground init `Y velocity = $F0` (= -16, upward) every frame.
+    Post-fix the natural-fall-through predicate suppresses the phantom
+    tail-call.
+
+    Check: at frame 950 (≈50f after Yoshi spawn at frame 900), Yoshi's
+    Y position must be at or below where he spawned. Y addresses are
+    $00D8 (lo) / $14D4 (hi) per slot, indexed by the slot holding type
+    $35.
+    """
+    types = _read_bytes(c, 0x009E, 12)
+    slot = next((i for i, t in enumerate(types) if t == 0x35), None)
+    if slot is None:
+        return False, f'no Yoshi slot at frame 950; types={types.hex()}'
+    y_lo = _read_bytes(c, 0x00D8 + slot, 1)[0]
+    y_hi = _read_bytes(c, 0x14D4 + slot, 1)[0]
+    y = (y_hi << 8) | y_lo
+    # Yoshi-floats-up bug pushes Y far above the screen (toward 0 or
+    # underflow toward $FFFF). On-ground Yoshi sits roughly at Y=$00B0
+    # in the ?-block scene. Pre-fix this hit Y < $0080 within ~40
+    # frames; post-fix Y stays ≥ $00A0. Pin a permissive lower bound
+    # so unrelated Y-physics tweaks don't trip the test.
+    ok = y >= 0x0080
+    return ok, (f'yoshi slot={slot} y=${y:04X} (must stay >= $0080 '
+                f'i.e. not floated above screen)')
+
+
 def _mario_x_advances(start_frame, end_frame):
     """Returns a predicate that captures Mario's X at construction
     and asserts at predicate-call time that X > captured. Used to
@@ -211,16 +241,21 @@ INVARIANTS: List[Inv] = [
             'to catch at fixed frames; final-Yoshi presence is the '
             'observable proxy.)',
     ),
+    Inv(
+        name='yoshi_does_not_float_up',
+        frame=950,
+        predicate=_yoshi_does_not_float_up,
+        why='Issue C closure: after spawn, Yoshi obeys gravity instead '
+            'of rising forever. User-confirmed visually 2026-04-26 '
+            'after the natural-fall-through predicate suppressed the '
+            'phantom auto_01_ECEC tail-call.',
+    ),
     # NOT YET INVARIANT (open bugs — DO NOT lock in):
     #   - koopa-visible-on-2nd-attract-cycle (Issue A): the visible
     #     bug is rendering, not state — needs OAM/CGRAM check.
     #   - mario-Y-stable-near-?-block (Issue B): visible Y bug, but
     #     Mario's Y oscillates normally during demo — need a
     #     specific frame range where he should be on flat ground.
-    #   - yoshi-y-velocity-non-negative-after-spawn (Issue C
-    #     "floats upward" — would fail today). Once fixed: assert
-    #     $00AA at slot-of-Yoshi is >= 0 (signed) some frames after
-    #     spawn.
     #   - bg-slope-no-spurious-dirt-tiles (Issue D): tile state, not
     #     sprite state — needs VRAM/tilemap check.
     # Add each as an Inv(...) entry once visually confirmed fixed.

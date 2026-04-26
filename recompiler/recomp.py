@@ -6085,16 +6085,52 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                 ctx._emit_backedge_phi(phys_next)
                 ctx._emit(f'goto label_{phys_next:04x};  /* ROM fall-through */')
 
-    # Fall-through detection: use the last instruction BEFORE end_addr.
-    # Also check if the skipped boundary instruction was terminal (the function's
-    # actual last instruction might be an RTS/JMP at end_addr that the decoder
-    # placed at the next function's start for branch resolution).
+    # Fall-through detection: a fall-through into the next function is only
+    # legitimate when some non-terminal instruction in the body has its
+    # natural ROM successor (addr+length) landing EXACTLY on end_addr.
+    #
+    # The previous heuristic ("is the highest-PC body insn terminal?") was
+    # too coarse — it fired when phantom auto-promotion capped end_addr
+    # mid-instruction (e.g. inside a JSR's operand bytes). The body's last
+    # JSR was non-terminal, but its physical fall-through landed at
+    # end_addr+1, NOT end_addr — so no real fall-through path existed,
+    # yet a spurious tail-call to the phantom function was emitted.
+    # See test_natural_end_fallthrough.py + ISSUES.md (Issue C / Yoshi).
+    #
+    # When the body is structurally non-terminal (last insn isn't RTS/RTL
+    # /RTI/BRA/BRL/JMP-abs) but no insn falls through exactly to end_addr,
+    # we still need to close the function with RecompStackPop + return —
+    # otherwise control falls off the function in C. We achieve this by
+    # forcing next_func to None, so the existing "non-terminal + no
+    # next_func" branch below emits the close-out.
     last = last_before_end
     boundary_insn = next((i for i in insns if end_addr and (i.addr & 0xFFFF) == end_addr), None)
     is_terminal = (last.mnem in ('RTL', 'RTS', 'RTI', 'JMP', 'BRA', 'BRL')
                    or getattr(last, 'dispatch_terminal', False))
     if boundary_insn and boundary_insn.mnem in ('RTL', 'RTS', 'RTI', 'JMP', 'BRA', 'BRL'):
         is_terminal = True  # the boundary instruction was the real terminator
+    if end_addr and not is_terminal and next_func:
+        # Predicate: does any non-terminal body insn fall through exactly
+        # to end_addr? If not, the next_func tail-call is bogus (phantom
+        # promotion / mid-instruction end_addr / similar). Drop next_func
+        # so the body closes with RecompStackPop + return below.
+        _has_real_fallthrough = False
+        for _ins in insns:
+            _pc16 = _ins.addr & 0xFFFF
+            if _pc16 >= end_addr or (start16 and _pc16 < start16):
+                continue
+            if ((_pc16 + _ins.length) & 0xFFFF) != end_addr:
+                continue
+            if _ins.mnem in ('RTL', 'RTS', 'RTI', 'BRA', 'BRL'):
+                continue
+            if _ins.mnem == 'JMP' and _ins.mode in (ABS, LONG, INDIR, INDIR_X, INDIR_L):
+                continue
+            if getattr(_ins, 'dispatch_terminal', False):
+                continue
+            _has_real_fallthrough = True
+            break
+        if not _has_real_fallthrough:
+            next_func = None
     if not is_terminal and not next_func:
         # Non-terminal body with no valid fall-through target: the cfg
         # deliberately ended this function here (typically because the
