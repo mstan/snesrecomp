@@ -375,6 +375,25 @@ static void h_emu_func_snap_get_n(const char *args) {
  * recomp side. Used to re-sync the two runtimes when their boot
  * sequences progress at different rates. Capped to avoid runaway.
  * Max N is 100000 (~28 minutes at 60 Hz). */
+/* emu_write_wram <hex_addr> <hex_val>: write a single byte to
+ * snes9x's WRAM at the given offset. Used by state-injection
+ * probes that synchronize Mario's position on both sides. */
+static void h_emu_write_wram(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    unsigned int addr = 0, val = 0;
+    if (!args || sscanf(args, "%x %x", &addr, &val) < 2) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_write_wram <hex_addr> <hex_val>\"}");
+        return;
+    }
+    extern int snes9x_bridge_write_wram(uint32_t, uint8_t);
+    int ok = snes9x_bridge_write_wram((uint32_t)addr, (uint8_t)(val & 0xFF));
+    debug_server_send_fmt("{\"ok\":%s,\"addr\":\"0x%05x\",\"val\":\"0x%02x\"}",
+                          ok ? "true" : "false", addr, val & 0xFF);
+}
+
 /* emu_history: returns count, oldest, newest frame numbers
  * present in the snes9x per-frame WRAM history ring. */
 static void h_emu_history(const char *args) {
@@ -904,6 +923,7 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_cpu_regs") == 0)  { h_emu_cpu_regs(args);  return 1; }
     if (strcmp(cmd, "emu_step") == 0)      { h_emu_step(args);      return 1; }
     if (strcmp(cmd, "emu_frame") == 0)     { h_emu_frame(args);     return 1; }
+    if (strcmp(cmd, "emu_write_wram") == 0){ h_emu_write_wram(args); return 1; }
     if (strcmp(cmd, "emu_history") == 0)   { h_emu_history(args);   return 1; }
     if (strcmp(cmd, "emu_wram_at_frame") == 0) { h_emu_wram_at_frame(args); return 1; }
     if (strcmp(cmd, "emu_history_find") == 0) { h_emu_history_find(args); return 1; }

@@ -511,6 +511,16 @@ void snes9x_bridge_run_frame(uint16_t joypad1, uint16_t joypad2) {
 extern "C" int snes9x_bridge_history_count(void) {
     return s_emu_frame_hist_count;
 }
+
+/* Write a byte to snes9x's WRAM at the given offset (0..$1FFFF).
+ * Used by input-injection / state-injection probes that need to
+ * synchronize Mario's position on both sides for collision-physics
+ * comparison. */
+extern "C" int snes9x_bridge_write_wram(uint32_t offset, uint8_t val) {
+    if (offset >= 0x20000) return 0;
+    Memory.RAM[offset] = val;
+    return 1;
+}
 extern "C" int snes9x_bridge_history_oldest_frame(void) {
     if (s_emu_frame_hist_count == 0) return -1;
     int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
