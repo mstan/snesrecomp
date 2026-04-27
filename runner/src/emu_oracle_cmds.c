@@ -18,6 +18,40 @@
 #include <string.h>
 #include <limits.h>
 
+/* Backend access serialization.
+ *
+ * emu_oracle_run_frame is called from the main thread once per frame
+ * (src/main.c after RtlRunFrame). emu_oracle_handle_cmd is called from
+ * the debug_server network thread when an emu_* command arrives.
+ * Both paths reach into the same backend (snes9x globals are not
+ * thread-safe), so any overlap can corrupt internal state — most
+ * acutely when a probe issues `emu_step` while the main thread is
+ * mid-`run_frame`.
+ *
+ * One non-recursive mutex serializes both paths. Initialized in
+ * snes_oracle_init_default; held for the duration of run_frame and
+ * for the duration of each handle_cmd dispatch.
+ */
+#ifdef _WIN32
+#  include <windows.h>
+static CRITICAL_SECTION s_backend_mutex;
+static int s_backend_mutex_inited = 0;
+static void backend_lock(void)   { if (s_backend_mutex_inited) EnterCriticalSection(&s_backend_mutex); }
+static void backend_unlock(void) { if (s_backend_mutex_inited) LeaveCriticalSection(&s_backend_mutex); }
+static void backend_mutex_init(void) {
+    if (!s_backend_mutex_inited) {
+        InitializeCriticalSection(&s_backend_mutex);
+        s_backend_mutex_inited = 1;
+    }
+}
+#else
+#  include <pthread.h>
+static pthread_mutex_t s_backend_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void backend_lock(void)   { pthread_mutex_lock(&s_backend_mutex); }
+static void backend_unlock(void) { pthread_mutex_unlock(&s_backend_mutex); }
+static void backend_mutex_init(void) { /* statically initialized */ }
+#endif
+
 /* Non-static wrappers around debug_server's internal send helpers. See
  * debug_server.c bottom. Signature matches send_fmt exactly. */
 extern void debug_server_send_line(const char *line);
@@ -50,6 +84,7 @@ const char *snes_oracle_rom_path(void) {
 
 int snes_oracle_init_default(const char *rom_path) {
     if (!rom_path || !*rom_path) return -1;
+    backend_mutex_init();
     strncpy(s_cached_rom_path, rom_path, sizeof(s_cached_rom_path) - 1);
     s_cached_rom_path[sizeof(s_cached_rom_path) - 1] = 0;
 
@@ -82,10 +117,14 @@ int snes_oracle_select(const char *name) {
 }
 
 /* Called from main.c after RtlRunFrame each frame. No-op when no
- * backend is active. */
+ * backend is active. Serialized against emu_oracle_handle_cmd so a
+ * probe-issued emu_step on the network thread cannot overlap the
+ * main thread's per-frame advance. */
 void emu_oracle_run_frame(uint16_t joypad1, uint16_t joypad2) {
     if (!g_active_backend) return;
-    g_active_backend->run_frame(joypad1, joypad2);
+    backend_lock();
+    if (g_active_backend) g_active_backend->run_frame(joypad1, joypad2);
+    backend_unlock();
 }
 
 /* ---- TCP command handlers ----
@@ -908,9 +947,22 @@ static void h_emu_cpu_regs(const char *args) {
 }
 
 /* Dispatcher. Returns 1 if the command was one of ours and was
- * handled, 0 to let the standard s_commands[] scan continue. */
+ * handled, 0 to let the standard s_commands[] scan continue.
+ *
+ * Acquires the backend mutex for the entire handler dispatch so
+ * snes9x globals are not touched concurrently with the main
+ * thread's emu_oracle_run_frame. The handlers themselves remain
+ * lock-naive — every emu_* command takes the lock the same way. */
+static int emu_oracle_dispatch_locked(const char *cmd, const char *args);
 int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (!cmd) return 0;
+    backend_lock();
+    int rc = emu_oracle_dispatch_locked(cmd, args);
+    backend_unlock();
+    return rc;
+}
+
+static int emu_oracle_dispatch_locked(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_list") == 0)      { h_emu_list(args);      return 1; }
     if (strcmp(cmd, "emu_select") == 0)    { h_emu_select(args);    return 1; }
     if (strcmp(cmd, "emu_is_loaded") == 0) { h_emu_is_loaded(args); return 1; }

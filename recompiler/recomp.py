@@ -3275,26 +3275,75 @@ class EmitCtx:
 
     def _emit_backedge_phi(self, target_pc: int):
         """Emit `{label_var} = {current_reg};` assignments before a
-        goto that jumps BACK to an earlier-emitted loop header. The
-        loop header's code reads the register values from named vars
-        captured at label-emit time; for the next iteration to see
-        the new register state, each changed register must be copied
-        into the header's named var here.
+        goto whose target reads named A/B/X/Y vars captured at the
+        label. For the path's register values to reach the label
+        body, each register must be copied into the header's named
+        var here.
 
         Handles A, B, X, Y. B matters because REP #$20 at a loop
         header merges (B, A_low) into a 16-bit accumulator — if the
         loop body updates B (e.g. via XBA after a fresh LDA), the
         new byte must propagate to the header's B-var before the
         back-edge goto.
+
+        Forward-goto-into-not-yet-emitted-label case: when
+        target_pc's `_label_*` bindings don't exist yet, the
+        emission walk hasn't laid down the label, but a goto path
+        already needs to provide phi values. Pre-allocate fresh
+        phi vars now and store them under `_label_*[target_pc]`;
+        the label-emission code below picks these up instead of
+        capturing whatever fall-through state happens to be in
+        self.A/X/Y/B at label-emit time. Diagonal-ledge sinking
+        (Issue B 2026-04-27) was driven by this case: JMP $0DB836
+        at $0DB820 emitted a goto with no phi because label_b836
+        wasn't laid down yet; v31/v32 (the label's A/Y vars) stayed
+        zero on the first inner-loop iteration, and label_b82e read
+        those zeros into SetMap16HighByteForCurrentObject_Page00.
         """
-        la = getattr(self, '_label_a', {}).get(target_pc)
+        if not hasattr(self, '_label_a'):
+            self._label_a = {}
+            self._label_b = {}
+            self._label_x = {}
+            self._label_y = {}
+        if not hasattr(self, '_phi_preallocated'):
+            self._phi_preallocated = set()
+        # Pre-allocate phi vars only for TRUE merge points: labels that
+        # have 2+ static predecessors. Single-predecessor labels don't
+        # need phi — the unique entry path's register state captured at
+        # label-emit time is correct, and pre-allocating for them
+        # introduces a phi-var that may be left zero-init when the
+        # path's X/Y can't be simply propagated. Initial broad version
+        # (2026-04-27 morning) regressed yoshi-spawn + Mario sprites
+        # because it touched every forward goto. The multi-predecessor
+        # criterion narrows the fix to actual SSA merge points like
+        # diagonal-ledge $0DB836 (3 preds) without disturbing
+        # sprite-handler dispatches that have single-entry forward
+        # jumps into trampolines.
+        is_multi_pred = (hasattr(self, '_multi_pred_targets')
+                         and target_pc in self._multi_pred_targets)
+        if target_pc not in self._label_a and is_multi_pred:
+            # Materialize non-simple X/Y first: the X/Y phi assignment
+            # below requires both label-var and self.X/self.Y to be
+            # simple (otherwise it skips). For pre-allocation, skipping
+            # leaves the pre-allocated var at zero-init.
+            if self.X is not None and not self._simple(self.X):
+                self._materialize('X', self._cur_x_type)
+            if self.Y is not None and not self._simple(self.Y):
+                self._materialize('Y', self._cur_x_type)
+            self._label_a[target_pc] = self._alloc(self._cur_a_type)
+            self._label_b[target_pc] = self._alloc('uint8')
+            self._label_x[target_pc] = self._alloc(self._cur_x_type)
+            self._label_y[target_pc] = self._alloc(self._cur_x_type)
+            self._phi_preallocated.add(target_pc)
+
+        la = self._label_a.get(target_pc)
         if la and self.A and la != self.A and self._simple(la):
             self._emit(f'{la} = {self.A};')
-        lb = getattr(self, '_label_b', {}).get(target_pc)
+        lb = self._label_b.get(target_pc)
         if lb and self.B and lb != self.B and self._simple(lb):
             self._emit(f'{lb} = {self.B};')
-        lx = getattr(self, '_label_x', {}).get(target_pc)
-        ly = getattr(self, '_label_y', {}).get(target_pc)
+        lx = self._label_x.get(target_pc)
+        ly = self._label_y.get(target_pc)
         if lx and self.X and lx != self.X and self._simple(lx) and self._simple(self.X):
             if lx != ly:
                 self._emit(f'{lx} = {self.X};')
@@ -3838,6 +3887,60 @@ class EmitCtx:
                                 self._emit(f'{phi} = {f_val};')
                             merged.append((b_entry[0], phi))
                     self.stack = merged
+            # Phi-var adoption MUST happen before the label and the
+            # block hook: any pre-allocated phi vars become the label
+            # body's A/X/Y/B, and the RDB_BLOCK_HOOK below must
+            # reference the pre-allocated names so probes see the
+            # correct vars. Fall-through merge assignments also go
+            # before the label so they're only on the fall-through
+            # path (goto entries already emitted phi at the goto site
+            # via _emit_backedge_phi).
+            if not hasattr(self, '_label_x'):
+                self._label_x = {}
+                self._label_y = {}
+                self._label_a = {}
+                self._label_b = {}
+            if not hasattr(self, '_phi_preallocated'):
+                self._phi_preallocated = set()
+            if pc in self._phi_preallocated:
+                pre_a = self._label_a[pc]
+                pre_b = self._label_b[pc]
+                pre_x = self._label_x[pc]
+                pre_y = self._label_y[pc]
+                # Materialize non-simple X/Y at fall-through merge so
+                # the assignment below isn't skipped (mirrors the
+                # goto-site logic in _emit_backedge_phi). Without this
+                # the label body reads pre_x/pre_y at zero-init for
+                # any fall-through path where X/Y is held in a
+                # complex expression like g_ram[…] — this was the
+                # berries-as-?-blocks / yoshi-egg-hatch regression.
+                if self.X is not None and not self._simple(self.X):
+                    self._materialize('X', self._cur_x_type)
+                if self.Y is not None and not self._simple(self.Y):
+                    self._materialize('Y', self._cur_x_type)
+                # A/B: only the LHS needs to be simple; non-simple RHS
+                # is fine (matches goto-site rule).
+                if self.A and self.A != pre_a:
+                    self._emit(f'{pre_a} = {self.A};')
+                if self.B and self.B != pre_b:
+                    self._emit(f'{pre_b} = {self.B};')
+                # X/Y: both must be simple (X/Y require _simple on RHS
+                # to avoid embedding e.g. dispatch-table indexing
+                # inside the phi merge).
+                if self.X and self.X != pre_x and self._simple(self.X):
+                    self._emit(f'{pre_x} = {self.X};')
+                if self.Y and self.Y != pre_y and self._simple(self.Y):
+                    self._emit(f'{pre_y} = {self.Y};')
+                self.A = pre_a
+                self.B = pre_b
+                self.X = pre_x
+                self.Y = pre_y
+                self._phi_preallocated.discard(pc)
+            else:
+                self._label_x[pc] = self.X
+                self._label_y[pc] = self.Y
+                self._label_a[pc] = self.A
+                self._label_b[pc] = self.B
             self.lines.append(f'  label_{pc:04x}:;')
             if self._reverse_debug:
                 full_pc = (self.bank << 16) | pc
@@ -3850,26 +3953,6 @@ class EmitCtx:
             # Multiple paths can reach a label with different DP values cached,
             # so we must not use stale cached values after a merge point.
             self.dp_state.clear()
-            # Record A/B/X/Y at EVERY label so any back-edge (explicit
-            # backward BRA, or implicit ROM-fall-through from an insn
-            # decoded later than the label) can reassign the header's
-            # tracked variables before the goto. Cheap memory; required
-            # for correctness of fall-through loops like the NextByte
-            # → StartTransfer wrap in HandleSPCUploads_Inner.
-            # B is tracked because REP #$20 at a loop header merges A+B
-            # into the 16-bit accumulator — if B carries a value the
-            # loop-body refreshes (e.g. LDA[_0],Y → XBA → new byte sits
-            # in B), the back-edge must assign to whatever var the
-            # header captured as B.
-            if not hasattr(self, '_label_x'):
-                self._label_x = {}
-                self._label_y = {}
-                self._label_a = {}
-                self._label_b = {}
-            self._label_x[pc] = self.X
-            self._label_y[pc] = self.Y
-            self._label_a[pc] = self.A
-            self._label_b[pc] = self.B
             if pc in self._backward_branch_targets:
                 self._emit('WatchdogCheck();')
 
@@ -5917,6 +6000,21 @@ def emit_function(name: str, insns: List[Insn], bank: int,
         if found:
             outer_loop_headers.add(ft_addr)
 
+    # Multi-predecessor labels — needed for SSA phi-var pre-allocation
+    # at forward gotos into not-yet-emitted labels. A label with a single
+    # predecessor doesn't need a phi (the unique entry's register state
+    # captured at label-emit time is sufficient). A label with 2+
+    # predecessors is a real merge point; if any predecessor emits before
+    # the label, _emit_backedge_phi must pre-allocate phi vars so the
+    # label-body uses a stable name across all paths.
+    pred_counts: dict = {}
+    for insn in insns:
+        a = insn.addr & 0xFFFF
+        for s in _successors(a):
+            pred_counts[s] = pred_counts.get(s, 0) + 1
+    multi_pred_targets = {p for p, n in pred_counts.items()
+                          if n >= 2 and p in valid_branch_targets}
+
     ctx = EmitCtx(bank, func_names, func_sigs=func_sigs,
                   init_x=init_x, init_a=init_a, init_b=init_b, init_carry=init_carry,
                   ret_type=ret_type,
@@ -5929,6 +6027,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                   x_after_map=x_after_map,
                   callee_clobbers=callee_clobbers,
                   reverse_debug=reverse_debug)
+    ctx._multi_pred_targets = multi_pred_targets
     ctx._ret_y = hints.get('ret_y', '0') != '0'
     ctx.end_addr = end_addr
 
