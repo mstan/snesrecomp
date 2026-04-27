@@ -425,6 +425,14 @@ int snes9x_bridge_init(const char *rom_path) {
     snes9x_bridge_watch_add(0x00000, 0x1FFFF);
     fprintf(stderr, "[snes9x] always-on WRAM trace armed for full $0..$1FFFF range\n");
 
+    // Always-on per-instruction trace. Mirrors the WRAM trace above:
+    // probes query the ring backward in history rather than arm-then-
+    // record. emu_insn_trace_on / _off remain available for explicit
+    // toggling, but the default is armed so any probe — including the
+    // ring-driven differ — finds populated data the moment it attaches.
+    snes9x_bridge_insn_trace_on();
+    fprintf(stderr, "[snes9x] always-on insn trace armed\n");
+
     return 0;
 }
 
