@@ -5176,6 +5176,7 @@ class EmitCtx:
     def _emit_branch(self, mn: str, v: int):
         # Detect always-taken branches (e.g. LDX #$01; BNE)
         if self._is_always_taken(mn) and v in self.valid_branch_targets:
+            self._emit_backedge_phi(v)
             self._emit(f'goto label_{v:04x};  /* {mn} always taken */')
             return
 
@@ -5371,6 +5372,16 @@ class EmitCtx:
                            f"Add 'end:{v:04X}' or 'name {(self.bank<<16)|v:06X} <Name>' to cfg")
                 self._emit_return_for_current_sig()
             else:
+                # JMP ABS to a decoded label may be a back-edge in emission
+                # order (target label was laid down earlier). Sync register
+                # tracker to the label's captured A/B/X/Y vars before the
+                # goto, identical to the BRA back-edge path. Without this,
+                # X-mutations inside intermediate blocks (e.g. the LDX $1
+                # at $0DB847 inside DiagonalLedge's BPL loop) never reach
+                # the loop header on the JMP path, and DEX at the header
+                # wraps 0->0xFF, looping ~256 times instead of the
+                # intended count.
+                self._emit_backedge_phi(v)
                 self._emit(f'goto label_{v:04x};')
         elif mode == LONG:
             fname = self._callee(v)
@@ -6079,6 +6090,7 @@ def emit_function(name: str, insns: List[Insn], bank: int,
                     next_addr = sorted_addrs[cur_idx + 1]
                     if (next_addr in outer_loop_headers
                             and not ctx._is_always_taken(insn.mnem)):
+                        ctx._emit_backedge_phi(next_addr)
                         ctx._emit(f'goto label_{next_addr:04x};  /* outer loop */')
                         _outer_loop_goto_emitted = True
 
