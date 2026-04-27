@@ -98,14 +98,41 @@ def main():
             print('No common TitleInputIndex values yet; demo needs more steps.')
             return
 
-        # Pick the LAST common value as the latest synchronized
-        # demo moment — both sides have just transitioned to this
-        # demo entry. Compare full DP-state at this moment.
-        target = common[-1]
-        rec_f = rec_byval[target]
-        emu_f = emu_byval[target]
-        print(f'\nSyncing on last-common TitleInputIndex=${target:02x}')
-        print(f'  rec_frame={rec_f}, emu_frame={emu_f}')
+        # Probe state at EVERY common TI value, using each side's
+        # historical frame snapshot. rec uses dump_frame_wram;
+        # emu uses emu_wram_at_frame. Both queries pin to the
+        # frame at which TI was just set on that side.
+        def rec_byte_at(rec_f, addr):
+            r = cmd(sock, f, f'dump_frame_wram {rec_f} {addr:x} 1')
+            h = r.get('hex', '').replace(' ', '')
+            return int(h, 16) if h else -1
+
+        def emu_byte_at(emu_f, addr):
+            r = cmd(sock, f, f'emu_wram_at_frame {emu_f} {addr:x}')
+            return int(r.get('val', '0x0'), 16) if r.get('ok') else -1
+
+        print()
+        for target in common:
+            rec_f = rec_byval[target]
+            emu_f = emu_byval[target]
+            print(f'\n=== TI=${target:02x} (rec_frame={rec_f}, emu_frame={emu_f}) ===')
+            labels = [
+                (0xD1, 'XLo'), (0xD2, 'XHi'),
+                (0xD3, 'YLo'), (0xD4, 'YHi'),
+                (0x94, 'XNextLo'), (0x96, 'YNextLo'),
+                (0x7B, 'XSpd'), (0x7D, 'YSpd'),
+                (0x72, 'PlayerInAir'), (0x77, 'PlayerBlockedDir'),
+                (0x100, 'GameMode'), (0x1422, 'LevelMode'),
+            ]
+            diffs = 0
+            for addr, label in labels:
+                r = rec_byte_at(rec_f, addr)
+                e = emu_byte_at(emu_f, addr)
+                if r != e:
+                    diffs += 1
+                    print(f'  ${addr:04x} {label:18} rec=${r:02x}  emu=${e:02x}  DIFF')
+            if diffs == 0:
+                print('  (all sampled fields match)')
 
         # Read rec WRAM RIGHT NOW (since the ring tells us its
         # most-recent state). Better: read state from rec at
