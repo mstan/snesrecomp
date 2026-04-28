@@ -169,6 +169,13 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
     case 0x4210: {
       uint8_t val = 0x2; // CPU version (4 bit)
       val |= snes->inNmi << 7;
+      // Real hardware clears the NMI-pending latch on read. Without this
+      // a stale `inNmi=true` would persist across NMI handler exit and
+      // produce a spurious second-read=true if anything re-reads $4210
+      // before the next NMI fires. (SMW happens to discard the loaded
+      // value, but a hardware-correct read-clear costs one store and
+      // is the right contract for game #2.)
+      snes->inNmi = false;
       return val;
     }
     case 0x4211: {
@@ -177,6 +184,12 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return val;
     }
     case 0x4212: {
+      // Static-recomp h-counter model: real hardware updates hPos every
+      // dot-clock; recomp has no dot-clock, so each $4212 read advances
+      // hPos by a fixed step. Calibrated so a typical busy-wait crosses
+      // both edges in ~10-20 reads. Bit 6 = hblank (dots ~1024..1364 of
+      // a 1364-dot scanline). See docs/VIRTUAL_HW_CONTRACT.md.
+      snes->hPos = (snes->hPos + 64) % 1364;
       uint8_t val = (snes->autoJoyTimer > 0);
       val |= (snes->hPos >= 1024) << 6;
       val |= snes->inVblank << 7;

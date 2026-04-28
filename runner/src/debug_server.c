@@ -2215,10 +2215,11 @@ static void cmd_wram_writes_at(const char *args) {
         send_fmt("{\"ok\":false,\"error\":\"bad args\"}");
         return;
     }
-    if (limit > 256) limit = 256;
+    if (limit > 4096) limit = 4096;
     int wstart = s_wram_trace.count < WRAM_TRACE_LOG_SIZE ? 0 :
                  s_wram_trace.write_idx - WRAM_TRACE_LOG_SIZE;
-    static char buf[65536];
+    static char buf[1048576];   /* 1MB — accommodates up to 4096 entries
+                                   each ~250 bytes JSON */
     int pos = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"addr\":\"0x%05x\",\"from\":%d,\"to\":%d,\"matches\":[",
         addr, from_frame, to_frame);
@@ -2268,9 +2269,24 @@ static void cmd_get_block_trace(const char *args) {
     uint32_t pc_lo = 0, pc_hi = 0xFFFFFF;
     int pc_filter_set = 0;
     char func_filter[48] = {0};
+    // Index-based pagination (relative to the live ring, oldest=0).
+    // Distinct from from=/to= which filter by snes_frame_counter range.
+    // -1 means "not set"; idx_lim defaults to ring max so legacy callers
+    // that don't pass it get the same behavior they did before.
+    int idx_from = 0;
+    int idx_lim  = BLOCK_TRACE_LOG_SIZE;
     if (args) {
-        const char *p = strstr(args, "from=");
-        if (p) sscanf(p + 5, "%d", &from_frame);
+        // Parse idx_* BEFORE the from=/to= scan because strstr("from=")
+        // would otherwise match the substring inside "idx_from=".
+        const char *p = strstr(args, "idx_from=");
+        if (p) sscanf(p + 9, "%d", &idx_from);
+        p = strstr(args, "idx_lim=");
+        if (p) sscanf(p + 8, "%d", &idx_lim);
+
+        // Frame-range filter (legacy semantics).
+        p = strstr(args, "from=");
+        // Skip if this 'from=' is actually inside 'idx_from='.
+        if (p && (p == args || p[-1] != '_')) sscanf(p + 5, "%d", &from_frame);
         p = strstr(args, "to=");
         if (p) sscanf(p + 3, "%d", &to_frame);
         p = strstr(args, "func=");
@@ -2289,6 +2305,8 @@ static void cmd_get_block_trace(const char *args) {
         p = strstr(args, "pc_hi=");
         if (p) { sscanf(p + 6, "%x", &pc_hi); pc_filter_set = 1; }
     }
+    if (idx_from < 0) idx_from = 0;
+    if (idx_lim  < 1) idx_lim  = 1;
     static char buf[524288];
     int pos = snprintf(buf, sizeof(buf), "{\"entries\":%d,\"log\":[", s_block_trace.count);
     int start = s_block_trace.count < BLOCK_TRACE_LOG_SIZE ? 0 :
@@ -2296,7 +2314,9 @@ static void cmd_get_block_trace(const char *args) {
     int budget = (int)sizeof(buf) - 4096;
     int first = 1;
     int emitted = 0;
-    for (int i = 0; i < s_block_trace.count && pos < budget; i++) {
+    int last_i = idx_from - 1;
+    for (int i = idx_from; i < s_block_trace.count && pos < budget && emitted < idx_lim; i++) {
+        last_i = i;
         int idx = (start + i) % BLOCK_TRACE_LOG_SIZE;
         int f = s_block_trace.log[idx].frame;
         if (from_frame >= 0 && f < from_frame) continue;
@@ -2328,7 +2348,11 @@ static void cmd_get_block_trace(const char *args) {
         first = 0;
         emitted++;
     }
-    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
+    // next_idx is the resume cursor for the next idx_from= page; equals
+    // last_i+1 so the caller can paginate without inferring it client-side.
+    snprintf(buf + pos, sizeof(buf) - pos,
+             "],\"emitted\":%d,\"next_idx\":%d,\"total\":%d}",
+             emitted, last_i + 1, s_block_trace.count);
     send_line(buf);
 }
 
@@ -3474,6 +3498,12 @@ int debug_server_init(int port) {
     s_wram_trace.ranges[0].lo = 0x00000;
     s_wram_trace.ranges[0].hi = 0x1FFFF;
     s_wram_trace.active = 1;
+
+    // Always-on Tier-2 block-entry trace. Same rationale as the WRAM
+    // ring above: probes query the buffer backward; never arm-then-
+    // record. cmd_trace_blocks / cmd_trace_blocks_reset still let
+    // explicit callers toggle, but the default starts armed.
+    s_block_trace.active = 1;
 #endif
 
     // Spawn background network thread

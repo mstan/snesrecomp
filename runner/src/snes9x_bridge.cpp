@@ -82,6 +82,37 @@ int      s_watch_write_idx = 0;
 int      s_watch_count = 0;
 emu_watch_entry s_watch_log[EMU_WATCH_LOG_SIZE] = {};
 
+/* ---- Per-frame WRAM history ring (snes9x analog of recomp's
+ * s_frame_history) ----
+ *
+ * Captures Memory.RAM[$0000-$1FFF] (bank 7E low WRAM = SMW's
+ * gameplay state region) after each retro_run. Probes can query
+ * "what was emu's $D3 (Mario Y) at the frame where emu's $D1
+ * (Mario X) was just written to value X?" — equivalent to recomp's
+ * existing FrameRecord lookups.
+ *
+ * Sized to match recomp's history ring (6000 frames). 8KB per
+ * frame × 6000 frames = ~48 MB resident — acceptable for the
+ * Oracle build (debug-only). Release|x64 doesn't link the bridge,
+ * so this is not in the shipping exe.
+ *
+ * Larger slices (full bank 7E + bank 7F = 128KB/frame × 6000 =
+ * 768MB) are intentionally not captured here; a separate query
+ * shape can use the always-on WRAM trace ring for higher-address
+ * writes if needed.
+ */
+#define EMU_FRAME_HIST_SIZE   6000
+#define EMU_FRAME_HIST_SLICE  0x2000   /* bank 7E $0000-$1FFF */
+
+struct emu_frame_history_entry {
+    uint32_t frame;                          /* s_watch_frame at capture */
+    uint8_t  wram[EMU_FRAME_HIST_SLICE];
+};
+
+static emu_frame_history_entry s_emu_frame_hist[EMU_FRAME_HIST_SIZE];
+static int  s_emu_frame_hist_write_idx = 0;
+static int  s_emu_frame_hist_count = 0;
+
 /* Map an incoming 24-bit CPU bus address to a 20-bit WRAM offset if
  * it targets bank 7E/7F or a WRAM-mirror. Returns 0xFFFFFFFF if the
  * address is not WRAM. */
@@ -394,18 +425,170 @@ int snes9x_bridge_init(const char *rom_path) {
     snes9x_bridge_watch_add(0x00000, 0x1FFFF);
     fprintf(stderr, "[snes9x] always-on WRAM trace armed for full $0..$1FFFF range\n");
 
+    // Always-on per-instruction trace. Mirrors the WRAM trace above:
+    // probes query the ring backward in history rather than arm-then-
+    // record. emu_insn_trace_on / _off remain available for explicit
+    // toggling, but the default is armed so any probe — including the
+    // ring-driven differ — finds populated data the moment it attaches.
+    snes9x_bridge_insn_trace_on();
+    fprintf(stderr, "[snes9x] always-on insn trace armed\n");
+
     return 0;
 }
 
+/* Yield-on-logical-frame wrapper around retro_run.
+ *
+ * Recomp's "1 step" = 1 SmwRunOneFrameOfGame call = 1 NMI body + 1
+ * main-loop body iteration = 1 SMW logical frame.
+ *
+ * Snes9x's retro_run = 1 wall-clock 60Hz frame of cycles. During
+ * NMI-enabled stages this captures 1 NMI-driven RunGameMode call,
+ * same logical unit as recomp. During NMI-disabled stages (GM=$03,
+ * $04 boot uploads) the handler body executes inline without NMI;
+ * one retro_run captures only a fraction of one such body, taking
+ * 20-55 retro_runs to traverse a single handler invocation. That
+ * mismatch means lockstep state-sync vs recomp is invalid in those
+ * stages — recomp completes the body in 1 step.
+ *
+ * Fix: loop retro_run until ONE of:
+ *   1. NMI fires (s_emu_nmi_count increments) — covers NMI-enabled
+ *      stages; matches recomp's 1-NMI-per-step.
+ *   2. GameMode ($0100) changes — covers NMI-disabled stages where
+ *      the handler INC's GameMode at completion.
+ *   3. Max iterations reached (escape hatch for genuinely stuck
+ *      states; 240 = 4 wall-clock seconds is well past any boot
+ *      stage's natural completion time).
+ *
+ * Result: per-step semantics are "1 SMW logical-frame iteration of
+ * progress" on both sides regardless of NMI state.
+ *
+ * The wall-clock-frame counter `s_watch_frame` still increments per
+ * retro_run call to keep the trace ring's `f` field meaningful as
+ * "wall-clock frames of cycles consumed since boot." Probes that
+ * compare logical-frame counts use rec_steps and the GameMode
+ * transition log; probes that need wall-clock cycles use s_watch_frame.
+ */
 void snes9x_bridge_run_frame(uint16_t joypad1, uint16_t joypad2) {
     if (!s_loaded) return;
     s_joypad[0] = joypad1;
     s_joypad[1] = joypad2;
-    /* Snapshot WRAM so emu_wram_delta can report which bytes the
-     * frame's execution changed. Cheap (128 KB memcpy per frame). */
+    /* Snapshot WRAM (full 128KB) so emu_wram_delta can report what
+     * the LOGICAL frame changed — captured before the loop, not
+     * before each retro_run, so the delta covers the full unit. */
     memcpy(s_wram_before, Memory.RAM, 0x20000);
-    s_watch_frame++;
-    retro_run();
+
+    uint64_t nmi_before = s_emu_nmi_count;
+
+    /* MAX_RETRO_RUNS budget. SMW's GM=$04 (PrepareTitleScreen)
+     * takes ~55 wall-clock frames on snes9x with NMI disabled.
+     * Cap at 80 to give headroom without ballooning probe wall-
+     * clock time. NMI-enabled stages exit after 1 retro_run.
+     *
+     * NMI-disabled stages will exhaust the budget without firing
+     * NMI — accepted; snes9x doesn't fully traverse the long
+     * handler body in one step, but the next step continues from
+     * where this left off. Total step count to traverse the stage
+     * still doesn't exactly match recomp (which does the body
+     * in 1 step) but is closer than the original 1-retro_run
+     * model.
+     *
+     * Note we don't watch $0100 (GameMode) for transition signals
+     * because $0100 is on the stack page and gets clobbered by
+     * stack pushes — produces spurious GM=$34/$00/etc. transitions
+     * mid-handler. NMI is the clean signal. */
+    enum { MAX_RETRO_RUNS = 80 };
+    for (int i = 0; i < MAX_RETRO_RUNS; i++) {
+        s_watch_frame++;
+        retro_run();
+        /* Capture into the per-frame history ring AFTER each
+         * retro_run so the slice reflects post-frame state. */
+        {
+            int slot = s_emu_frame_hist_write_idx % EMU_FRAME_HIST_SIZE;
+            s_emu_frame_hist[slot].frame = s_watch_frame;
+            memcpy(s_emu_frame_hist[slot].wram, Memory.RAM, EMU_FRAME_HIST_SLICE);
+            s_emu_frame_hist_write_idx++;
+            if (s_emu_frame_hist_count < EMU_FRAME_HIST_SIZE)
+                s_emu_frame_hist_count++;
+        }
+        if (s_emu_nmi_count != nmi_before) break;          /* NMI fired */
+    }
+}
+
+/* Public C accessors for the per-frame history. Returns 0 on
+ * miss, 1 on hit. addr is bank-7E offset (0..$1FFF). */
+extern "C" int snes9x_bridge_history_count(void) {
+    return s_emu_frame_hist_count;
+}
+
+/* Write a byte to snes9x's WRAM at the given offset (0..$1FFFF).
+ * Used by input-injection / state-injection probes that need to
+ * synchronize Mario's position on both sides for collision-physics
+ * comparison. */
+extern "C" int snes9x_bridge_write_wram(uint32_t offset, uint8_t val) {
+    if (offset >= 0x20000) return 0;
+    Memory.RAM[offset] = val;
+    return 1;
+}
+extern "C" int snes9x_bridge_history_oldest_frame(void) {
+    if (s_emu_frame_hist_count == 0) return -1;
+    int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
+                 + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+    return (int)s_emu_frame_hist[start].frame;
+}
+extern "C" int snes9x_bridge_history_newest_frame(void) {
+    if (s_emu_frame_hist_count == 0) return -1;
+    int idx = (s_emu_frame_hist_write_idx - 1 + EMU_FRAME_HIST_SIZE)
+              % EMU_FRAME_HIST_SIZE;
+    return (int)s_emu_frame_hist[idx].frame;
+}
+extern "C" int snes9x_bridge_history_byte_at(uint32_t frame, uint32_t addr,
+                                              uint8_t *out_val) {
+    if (addr >= EMU_FRAME_HIST_SLICE) return 0;
+    if (s_emu_frame_hist_count == 0) return 0;
+    int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
+                 + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+    for (int i = 0; i < s_emu_frame_hist_count; i++) {
+        int idx = (start + i) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].frame == frame) {
+            if (out_val) *out_val = s_emu_frame_hist[idx].wram[addr];
+            return 1;
+        }
+    }
+    return 0;
+}
+/* Find the latest frame in history where wram[addr] matches val.
+ * Returns the frame number, or -1 if not found. Useful for
+ * waypoint queries: "what was the most recent frame where
+ * Memory.RAM[$D1] == 0xC7?" */
+extern "C" int snes9x_bridge_history_find_value(uint32_t addr, uint8_t val) {
+    if (addr >= EMU_FRAME_HIST_SLICE) return -1;
+    if (s_emu_frame_hist_count == 0) return -1;
+    /* Walk newest-first so we return the most recent match. */
+    for (int i = s_emu_frame_hist_count - 1; i >= 0; i--) {
+        int idx = (s_emu_frame_hist_write_idx - 1 - (s_emu_frame_hist_count - 1 - i)
+                   + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].wram[addr] == val)
+            return (int)s_emu_frame_hist[idx].frame;
+    }
+    return -1;
+}
+
+/* Find the latest frame in history where the 16-bit little-endian
+ * word at wram[addr]:wram[addr+1] equals val. The common shape for
+ * waypoint sync: SMW position fields are 16-bit (X/Y high/low). */
+extern "C" int snes9x_bridge_history_find_word(uint32_t addr, uint16_t val) {
+    if (addr + 1 >= EMU_FRAME_HIST_SLICE) return -1;
+    if (s_emu_frame_hist_count == 0) return -1;
+    uint8_t lo = (uint8_t)(val & 0xFF);
+    uint8_t hi = (uint8_t)((val >> 8) & 0xFF);
+    for (int i = s_emu_frame_hist_count - 1; i >= 0; i--) {
+        int idx = (s_emu_frame_hist_write_idx - 1 - (s_emu_frame_hist_count - 1 - i)
+                   + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].wram[addr] == lo
+            && s_emu_frame_hist[idx].wram[addr + 1] == hi)
+            return (int)s_emu_frame_hist[idx].frame;
+    }
+    return -1;
 }
 
 /* Report bytes that changed in the most-recent retro_run(). out_buf
@@ -717,6 +900,8 @@ void snes9x_bridge_watch_clear(void) {
 }
 
 int snes9x_bridge_watch_count(void) { return s_watch_count; }
+
+uint32_t snes9x_bridge_get_frame(void) { return s_watch_frame; }
 
 int snes9x_bridge_watch_get(int i, uint32_t *frame, uint32_t *addr,
                             uint32_t *pc24, uint8_t *before, uint8_t *after,

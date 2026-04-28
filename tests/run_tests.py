@@ -47,12 +47,15 @@ TEST_MODULES = [
     'test_mx_inference_from_callers',
     'test_tail_call_x_restore',
     'test_phi_merge_x_param',
+    'test_phi_merge_jmp_back_edge',
+    'test_diagonal_ledge_jmp_phi',
     'test_accumulator_shift_width',
     'test_memory_shift_rotate_width',
     'test_tsb_trb_width',
     'test_bit_v_flag_width',
     'test_wram_addr_wrap',
     'test_flag_tracking',
+    'test_rmw_hw_register_dispatch',
 ]
 
 
