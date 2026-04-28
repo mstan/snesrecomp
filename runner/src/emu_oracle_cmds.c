@@ -476,6 +476,60 @@ static void h_emu_wram_at_frame(const char *args) {
                           "\"val\":\"0x%02x\"}", frame, addr, v);
 }
 
+/* emu_dump_frame_wram <frame> [hex_addr] [len_decimal]
+ *
+ * Bulk WRAM dump from a historical frame in the per-frame ring.
+ * Mirrors recomp's dump_frame_wram exactly so the cascade-finder
+ * probe can issue parallel queries on both rings and compare blobs.
+ *
+ * addr defaults to 0; len defaults to full 128KB (0x20000). The
+ * frame number must be present in the ring (use emu_history to
+ * discover oldest/newest). Returns hex blob on success, error
+ * envelope on miss / bounds. */
+static void h_emu_dump_frame_wram(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    unsigned int frame = 0, addr = 0, len = 0x20000;
+    int n = args ? sscanf(args, "%u %x %u", &frame, &addr, &len) : 0;
+    if (n < 1) {
+        debug_server_send_fmt(
+            "{\"ok\":false,\"error\":\"usage: emu_dump_frame_wram <frame> [hex_addr] [len]\"}");
+        return;
+    }
+    if (n < 3) len = 0x20000 - addr;
+    if (len < 1) len = 1;
+    if (len > 0x20000) len = 0x20000;
+    if (addr >= 0x20000u || addr + len > 0x20000u) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"wram range out of bounds\","
+                              "\"addr\":\"0x%x\",\"len\":%u}", addr, len);
+        return;
+    }
+    extern int snes9x_bridge_history_range_at(uint32_t, uint32_t, uint32_t, uint8_t *);
+    static uint8_t buf[0x20000];
+    if (!snes9x_bridge_history_range_at(frame, addr, len, buf)) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"frame not in history\","
+                              "\"frame\":%u,\"addr\":\"0x%05x\",\"len\":%u}",
+                              frame, addr, len);
+        return;
+    }
+    char hdr[160];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "{\"ok\":true,\"frame\":%u,\"addr\":\"0x%05x\","
+                        "\"len\":%u,\"hex\":\"",
+                        frame, addr, len);
+    debug_server_send_raw(hdr, hlen);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", buf[i]);
+        debug_server_send_raw(chunk, pos);
+    }
+    debug_server_send_raw("\"}\n", 3);
+}
+
 /* emu_history_find <addr> <hex_val>: returns the most recent
  * frame in history where wram[addr] == val, or -1. Useful for
  * waypoint queries. */
@@ -978,6 +1032,7 @@ static int emu_oracle_dispatch_locked(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_write_wram") == 0){ h_emu_write_wram(args); return 1; }
     if (strcmp(cmd, "emu_history") == 0)   { h_emu_history(args);   return 1; }
     if (strcmp(cmd, "emu_wram_at_frame") == 0) { h_emu_wram_at_frame(args); return 1; }
+    if (strcmp(cmd, "emu_dump_frame_wram") == 0) { h_emu_dump_frame_wram(args); return 1; }
     if (strcmp(cmd, "emu_history_find") == 0) { h_emu_history_find(args); return 1; }
     if (strcmp(cmd, "emu_history_find_word") == 0) { h_emu_history_find_word(args); return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }

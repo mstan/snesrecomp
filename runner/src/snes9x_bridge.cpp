@@ -82,27 +82,46 @@ int      s_watch_write_idx = 0;
 int      s_watch_count = 0;
 emu_watch_entry s_watch_log[EMU_WATCH_LOG_SIZE] = {};
 
+/* Logical-frame counter — increments once per snes9x_bridge_run_frame
+ * call, regardless of how many retro_runs that loop executes. This is
+ * the counter that maps 1:1 to recomp's snes_frame_counter, since
+ * main.c calls emu_oracle_run_frame exactly once per RtlRunFrame.
+ *
+ * s_watch_frame (above) keeps the wall-clock retro_run counter for
+ * the WRAM-write trace ring, which wants per-instruction timing
+ * granularity. The two must NOT be conflated for cross-process state
+ * alignment: probes that ask "which logical frame matches recomp's
+ * frame N?" need the logical counter; probes that ask "between which
+ * retro_run cycles did this byte change?" need the wall-clock one.
+ */
+uint32_t s_emu_logical_frame = 0;
+
 /* ---- Per-frame WRAM history ring (snes9x analog of recomp's
  * s_frame_history) ----
  *
- * Captures Memory.RAM[$0000-$1FFF] (bank 7E low WRAM = SMW's
- * gameplay state region) after each retro_run. Probes can query
- * "what was emu's $D3 (Mario Y) at the frame where emu's $D1
- * (Mario X) was just written to value X?" — equivalent to recomp's
- * existing FrameRecord lookups.
+ * Captures the full 128 KB of bank 7E + 7F (Memory.RAM[$00000-$1FFFF])
+ * after each retro_run, mirroring recomp's FrameRecord.wram. This is
+ * what enables Option A's per-frame full-WRAM cascade triage: at any
+ * historical logical frame, both sides can dump matching byte ranges
+ * and a probe can find the FIRST upstream divergence between them.
  *
- * Sized to match recomp's history ring (6000 frames). 8KB per
- * frame × 6000 frames = ~48 MB resident — acceptable for the
- * Oracle build (debug-only). Release|x64 doesn't link the bridge,
- * so this is not in the shipping exe.
+ * Sizing: 1500 frames × 128KB = 192MB resident. The earlier 3000-
+ * frame layout pushed the Oracle exe's SizeOfImage to 2009 MB, just
+ * over the Windows loader threshold (CreateProcess returned WinError
+ * 193 on Popen even though the file was a valid PE). 1500 frames is
+ * enough to cover an anchor at emu frame ~1500 plus the trailing
+ * 600 frames the ring keeps capturing while a cascade scan runs
+ * (~10 s at 60 Hz). Release|x64 doesn't link the bridge, so this
+ * is not in the shipping exe.
  *
- * Larger slices (full bank 7E + bank 7F = 128KB/frame × 6000 =
- * 768MB) are intentionally not captured here; a separate query
- * shape can use the always-on WRAM trace ring for higher-address
- * writes if needed.
+ * The previous 6000 × 8KB layout (0x2000 slice = bank 7E $0000-$1FFF
+ * only) was insufficient: codegen divergences in the cascade can
+ * surface anywhere in $7E:$0000-$7F:$FFFF (sprite tables at $14C8,
+ * Map16 at $7F:9C7B, etc.), and selective-region probes miss them.
+ * Full-slice resolves that class of false-negative.
  */
-#define EMU_FRAME_HIST_SIZE   6000
-#define EMU_FRAME_HIST_SLICE  0x2000   /* bank 7E $0000-$1FFF */
+#define EMU_FRAME_HIST_SIZE   1500
+#define EMU_FRAME_HIST_SLICE  0x20000  /* full bank 7E + 7F (128 KB) */
 
 struct emu_frame_history_entry {
     uint32_t frame;                          /* s_watch_frame at capture */
@@ -416,6 +435,24 @@ int snes9x_bridge_init(const char *rom_path) {
     fprintf(stderr, "[snes9x] Oracle backend loaded (%zu bytes): %s\n",
             s_rom_bytes.size(), rom_path);
 
+    // Canonical reset-state injection (Option A Half 1).
+    //
+    // snes9x's cold-reset path fills bank 7E + 7F with 0x55 (the
+    // libretro core's default uninitialized-WRAM pattern). Recomp's
+    // g_ram[0x20000] is BSS-initialized to 0x00. SMW's I_RESET
+    // explicitly clears most gameplay state but does NOT cover every
+    // byte (some scratch / unused regions stay at the fill pattern
+    // forever). Without alignment, every untouched byte shows up as a
+    // permanent divergence in any cross-process WRAM diff — hiding
+    // the actual codegen divergences underneath.
+    //
+    // Zero-fill Memory.RAM AFTER snes9x's reset path completes so the
+    // post-init state matches recomp's BSS layout. The next retro_run
+    // executes I_RESET starting from this canonical zero state, same
+    // as recomp.
+    memset(Memory.RAM, 0, 0x20000);
+    fprintf(stderr, "[snes9x] WRAM zeroed for canonical-reset alignment with recomp\n");
+
     // Always-on WRAM trace: arm the s9x write-hook for the full 128 KB
     // WRAM range BEFORE the first retro_run() so every store from
     // snes9x's reset/boot sequence onward is recorded continuously.
@@ -500,17 +537,27 @@ void snes9x_bridge_run_frame(uint16_t joypad1, uint16_t joypad2) {
     for (int i = 0; i < MAX_RETRO_RUNS; i++) {
         s_watch_frame++;
         retro_run();
-        /* Capture into the per-frame history ring AFTER each
-         * retro_run so the slice reflects post-frame state. */
-        {
-            int slot = s_emu_frame_hist_write_idx % EMU_FRAME_HIST_SIZE;
-            s_emu_frame_hist[slot].frame = s_watch_frame;
-            memcpy(s_emu_frame_hist[slot].wram, Memory.RAM, EMU_FRAME_HIST_SLICE);
-            s_emu_frame_hist_write_idx++;
-            if (s_emu_frame_hist_count < EMU_FRAME_HIST_SIZE)
-                s_emu_frame_hist_count++;
-        }
         if (s_emu_nmi_count != nmi_before) break;          /* NMI fired */
+    }
+
+    /* Capture into the per-frame history ring ONCE per logical frame,
+     * keyed on s_emu_logical_frame (incremented immediately below).
+     * Per-logical-frame keying is required for cross-process state
+     * alignment with recomp: main.c calls emu_oracle_run_frame exactly
+     * once per RtlRunFrame, so logical frames are 1:1.
+     *
+     * Capturing at end-of-frame (post-NMI / post-retro_run-budget)
+     * matches recomp's debug_server_record_frame, which fires from
+     * RtlRunFrame after the frame's run_frame() returns. Both rings
+     * therefore observe the same "post-frame" snapshot. */
+    s_emu_logical_frame++;
+    {
+        int slot = s_emu_frame_hist_write_idx % EMU_FRAME_HIST_SIZE;
+        s_emu_frame_hist[slot].frame = s_emu_logical_frame;
+        memcpy(s_emu_frame_hist[slot].wram, Memory.RAM, EMU_FRAME_HIST_SLICE);
+        s_emu_frame_hist_write_idx++;
+        if (s_emu_frame_hist_count < EMU_FRAME_HIST_SIZE)
+            s_emu_frame_hist_count++;
     }
 }
 
@@ -551,6 +598,30 @@ extern "C" int snes9x_bridge_history_byte_at(uint32_t frame, uint32_t addr,
         int idx = (start + i) % EMU_FRAME_HIST_SIZE;
         if (s_emu_frame_hist[idx].frame == frame) {
             if (out_val) *out_val = s_emu_frame_hist[idx].wram[addr];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Copy a contiguous WRAM byte range from the per-frame history slice.
+ * Returns 1 on hit (frame in ring, addr+len in bounds), 0 on miss.
+ * Caller-owned out_buf must be sized >= len. Used by emu_dump_frame_wram
+ * to stream a full-WRAM blob for a historical frame without N round
+ * trips. */
+extern "C" int snes9x_bridge_history_range_at(uint32_t frame, uint32_t addr,
+                                              uint32_t len, uint8_t *out_buf) {
+    if (!out_buf) return 0;
+    if (len == 0) return 0;
+    if (addr >= EMU_FRAME_HIST_SLICE) return 0;
+    if (addr + len > EMU_FRAME_HIST_SLICE) return 0;
+    if (s_emu_frame_hist_count == 0) return 0;
+    int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
+                 + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+    for (int i = 0; i < s_emu_frame_hist_count; i++) {
+        int idx = (start + i) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].frame == frame) {
+            memcpy(out_buf, s_emu_frame_hist[idx].wram + addr, len);
             return 1;
         }
     }
