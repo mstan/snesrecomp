@@ -56,6 +56,17 @@ typedef struct CpuState {
     uint8  x_flag;
     uint8  emulation;
 
+    /* Per-flag bit mirrors. v2 codegen reads/writes `cpu->_flag_C`
+     * etc. directly (rather than masking P each access). They MUST be
+     * kept in sync with `P` via cpu_p_to_mirrors / cpu_mirrors_to_p
+     * on every operation that updates P (REP/SEP/PLP/RTI). */
+    uint8  _flag_N;
+    uint8  _flag_V;
+    uint8  _flag_Z;
+    uint8  _flag_C;
+    uint8  _flag_I;
+    uint8  _flag_D;
+
     /* RAM. Points at the runtime's `g_ram[]` 128KB region — same bytes
      * the existing hand-written runtime reads/writes. v2 codegen will
      * issue cpu_readN / cpu_writeN against this pointer so DB / D / S
@@ -74,15 +85,29 @@ typedef struct CpuState {
 #define CPU_P_N  0x80u  /* Negative */
 
 /* Sync P <-> mirrors. Codegen calls these whenever P is touched in a
- * way that updates M/X (REP, SEP, PLP, RTI). */
+ * way that updates the bit mirrors (REP, SEP, PLP, RTI). */
 static inline void cpu_p_to_mirrors(CpuState *cpu) {
-    cpu->m_flag = (cpu->P & CPU_P_M) ? 1 : 0;
-    cpu->x_flag = (cpu->P & CPU_P_X) ? 1 : 0;
+    cpu->m_flag  = (cpu->P & CPU_P_M) ? 1 : 0;
+    cpu->x_flag  = (cpu->P & CPU_P_X) ? 1 : 0;
+    cpu->_flag_C = (cpu->P & CPU_P_C) ? 1 : 0;
+    cpu->_flag_Z = (cpu->P & CPU_P_Z) ? 1 : 0;
+    cpu->_flag_I = (cpu->P & CPU_P_I) ? 1 : 0;
+    cpu->_flag_D = (cpu->P & CPU_P_D) ? 1 : 0;
+    cpu->_flag_V = (cpu->P & CPU_P_V) ? 1 : 0;
+    cpu->_flag_N = (cpu->P & CPU_P_N) ? 1 : 0;
 }
 
 static inline void cpu_mirrors_to_p(CpuState *cpu) {
-    if (cpu->m_flag) cpu->P |= CPU_P_M; else cpu->P &= ~CPU_P_M;
-    if (cpu->x_flag) cpu->P |= CPU_P_X; else cpu->P &= ~CPU_P_X;
+    cpu->P = (uint8)(
+        (cpu->m_flag  ? CPU_P_M : 0) |
+        (cpu->x_flag  ? CPU_P_X : 0) |
+        (cpu->_flag_C ? CPU_P_C : 0) |
+        (cpu->_flag_Z ? CPU_P_Z : 0) |
+        (cpu->_flag_I ? CPU_P_I : 0) |
+        (cpu->_flag_D ? CPU_P_D : 0) |
+        (cpu->_flag_V ? CPU_P_V : 0) |
+        (cpu->_flag_N ? CPU_P_N : 0)
+    );
 }
 
 /* ── Memory access ──────────────────────────────────────────────────────── */

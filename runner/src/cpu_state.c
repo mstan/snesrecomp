@@ -70,5 +70,12 @@ void cpu_state_init(CpuState *cpu, uint8 *ram) {
     cpu->m_flag = 1;
     cpu->x_flag = 1;
     cpu->emulation = 1;
+    /* Per-flag mirrors initialised to match P. */
+    cpu->_flag_N = 0;
+    cpu->_flag_V = 0;
+    cpu->_flag_Z = 0;
+    cpu->_flag_C = 0;
+    cpu->_flag_I = 1;
+    cpu->_flag_D = 0;
     cpu->ram = ram;
 }

@@ -97,6 +97,17 @@ def emit_function(rom: bytes, bank: int, start: int,
         if k not in visited:
             block_order.append(k)
 
+    # Set of labels that actually correspond to blocks in this function.
+    # Successors that don't resolve to a local block (cross-bank, past `end:`,
+    # indirect dispatch with unknown table) become a `return; /* unresolved */`.
+    local_labels = {_label_for(k) for k in block_order}
+
+    def _goto_or_return(target: DecodeKey, prefix: str = "") -> str:
+        label = _label_for(target)
+        if label in local_labels:
+            return f"{prefix}goto {label};"
+        return f"{prefix}return; /* {label} unresolved (cross-fn / cross-bank / past end:) */"
+
     for key in block_order:
         block = cfg.blocks[key]
         lines: List[str] = []
@@ -109,22 +120,19 @@ def emit_function(rom: bytes, bank: int, start: int,
                     succs = block.successors
                     fall = succs[0] if len(succs) >= 1 else None
                     taken = succs[1] if len(succs) >= 2 else None
-                    cond_emit = emit_op(op)
-                    # cond_emit currently produces only a placeholder line; we
-                    # rewrite it with real labels here.
-                    pred = (
-                        f"{_reg_for_flag(op.flag)} == {op.take_if}"
-                    )
+                    pred = f"{_reg_for_flag(op.flag)} == {op.take_if}"
                     if taken is not None:
-                        lines.append(f"if ({pred}) goto {_label_for(taken)};")
+                        # `if (cond) <stmt>;` where stmt is goto/return.
+                        # Wrap in braces so the conditional return doesn't
+                        # accidentally swallow the next line.
+                        target_stmt = _goto_or_return(taken)
+                        lines.append(f"if ({pred}) {{ {target_stmt} }}")
                     if fall is not None:
-                        # Fall-through is implicit if the next block in
-                        # block_order matches `fall`; otherwise emit goto.
-                        lines.append(f"goto {_label_for(fall)}; /* fall-through */")
+                        lines.append(_goto_or_return(fall) + " /* fall-through */")
                 elif isinstance(op, Goto):
                     succs = block.successors
                     if len(succs) >= 1:
-                        lines.append(f"goto {_label_for(succs[0])};")
+                        lines.append(_goto_or_return(succs[0]))
                     else:
                         lines.append(f"return; /* Goto with no successor */")
                 elif isinstance(op, Call):

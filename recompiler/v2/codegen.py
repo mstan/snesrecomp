@@ -157,25 +157,32 @@ def _emit_consti(op: ConstI) -> List[str]:
 
 
 def _emit_alu(op: Alu) -> List[str]:
+    """Emit an ALU op. Internal `_t` temp is named per-output-vid (or
+    per-lhs-vid for CMP which has no out) so multiple ALU ops in the
+    same C function don't conflict on `_t`."""
+    # Unique temp suffix per op call site:
+    if op.out is not None:
+        tname = f"_t{op.out.vid}"
+    else:
+        tname = f"_tc{op.lhs.vid}_{op.rhs.vid}"  # CMP: no out
+
     lines = []
     if op.op == AluOp.ADD:
-        # ADC: lhs + rhs + C; updates N/V/Z/C.
         lines.append(
-            f"uint32 _t = (uint32){_v(op.lhs)} + (uint32){_v(op.rhs)} + cpu->_flag_C;"
+            f"uint32 {tname} = (uint32){_v(op.lhs)} + (uint32){_v(op.rhs)} + cpu->_flag_C;"
         )
         if op.out is not None:
-            lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)})_t;")
+            lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)}){tname};")
         mask = "0x100" if op.width == 1 else "0x10000"
-        lines.append(f"cpu->_flag_C = (_t & {mask}) ? 1 : 0;")
+        lines.append(f"cpu->_flag_C = ({tname} & {mask}) ? 1 : 0;")
     elif op.op == AluOp.SUB:
-        # SBC: lhs - rhs - !C; updates N/V/Z/C.
         lines.append(
-            f"uint32 _t = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)} - (1 - cpu->_flag_C);"
+            f"uint32 {tname} = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)} - (1 - cpu->_flag_C);"
         )
         if op.out is not None:
-            lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)})_t;")
+            lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)}){tname};")
         mask = "0x100" if op.width == 1 else "0x10000"
-        lines.append(f"cpu->_flag_C = (_t & {mask}) ? 0 : 1;")
+        lines.append(f"cpu->_flag_C = ({tname} & {mask}) ? 0 : 1;")
     elif op.op == AluOp.AND:
         lines.append(
             f"{_ctype(op.width)} {_v(op.out)} = "
@@ -192,17 +199,15 @@ def _emit_alu(op: Alu) -> List[str]:
             f"({_ctype(op.width)})({_v(op.lhs)} ^ {_v(op.rhs)});"
         )
     elif op.op == AluOp.CMP:
-        # No destination; flags only.
         lines.append(
-            f"uint32 _t = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)};"
+            f"uint32 {tname} = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)};"
         )
         sign = "0x80" if op.width == 1 else "0x8000"
         lines.append(f"cpu->_flag_C = ({_v(op.lhs)} >= {_v(op.rhs)}) ? 1 : 0;")
-        lines.append(f"cpu->_flag_Z = (({_ctype(op.width)})_t == 0) ? 1 : 0;")
-        lines.append(f"cpu->_flag_N = ((_t & {sign}) != 0) ? 1 : 0;")
-        return lines  # CMP doesn't set N/Z below
+        lines.append(f"cpu->_flag_Z = (({_ctype(op.width)}){tname} == 0) ? 1 : 0;")
+        lines.append(f"cpu->_flag_N = (({tname} & {sign}) != 0) ? 1 : 0;")
+        return lines
 
-    # Common N/Z update for non-CMP ops.
     if op.out is not None:
         sign = "0x80" if op.width == 1 else "0x8000"
         lines.append(f"cpu->_flag_Z = ({_v(op.out)} == 0) ? 1 : 0;")
@@ -260,11 +265,15 @@ def _emit_increg(op: IncReg) -> List[str]:
 def _emit_bittest(op: BitTest) -> List[str]:
     sign = "0x80" if op.width == 1 else "0x8000"
     overflow = "0x40" if op.width == 1 else "0x4000"
+    # Wrap in a block to scope the local — multiple BIT in the same
+    # function would otherwise collide on `_bt`.
     return [
-        f"{_ctype(op.width)} _bt = ({_ctype(op.width)})(cpu->A & {_v(op.operand)});",
-        f"cpu->_flag_Z = (_bt == 0) ? 1 : 0;",
-        f"cpu->_flag_N = (({_v(op.operand)} & {sign}) != 0) ? 1 : 0;",
-        f"cpu->_flag_V = (({_v(op.operand)} & {overflow}) != 0) ? 1 : 0;",
+        "{",
+        f"  {_ctype(op.width)} _bt = ({_ctype(op.width)})(cpu->A & {_v(op.operand)});",
+        f"  cpu->_flag_Z = (_bt == 0) ? 1 : 0;",
+        f"  cpu->_flag_N = (({_v(op.operand)} & {sign}) != 0) ? 1 : 0;",
+        f"  cpu->_flag_V = (({_v(op.operand)} & {overflow}) != 0) ? 1 : 0;",
+        "}",
     ]
 
 
@@ -273,9 +282,11 @@ def _emit_bitsetmem(op: BitSetMem) -> List[str]:
     fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"
     fn_w = "cpu_write8" if op.width == 1 else "cpu_write16"
     return [
-        f"{_ctype(op.width)} _m = {fn_r}(cpu, {bank}, {addr});",
-        f"cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
-        f"{fn_w}(cpu, {bank}, {addr}, ({_ctype(op.width)})(_m | cpu->A));",
+        "{",
+        f"  {_ctype(op.width)} _m = {fn_r}(cpu, {bank}, {addr});",
+        f"  cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
+        f"  {fn_w}(cpu, {bank}, {addr}, ({_ctype(op.width)})(_m | cpu->A));",
+        "}",
     ]
 
 
@@ -284,9 +295,11 @@ def _emit_bitclearmem(op: BitClearMem) -> List[str]:
     fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"
     fn_w = "cpu_write8" if op.width == 1 else "cpu_write16"
     return [
-        f"{_ctype(op.width)} _m = {fn_r}(cpu, {bank}, {addr});",
-        f"cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
-        f"{fn_w}(cpu, {bank}, {addr}, ({_ctype(op.width)})(_m & ~cpu->A));",
+        "{",
+        f"  {_ctype(op.width)} _m = {fn_r}(cpu, {bank}, {addr});",
+        f"  cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
+        f"  {fn_w}(cpu, {bank}, {addr}, ({_ctype(op.width)})(_m & ~cpu->A));",
+        "}",
     ]
 
 
@@ -475,10 +488,12 @@ def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
         ]
     if op.seg.kind == SegKind.DP_INDIRECT:
         return [
-            f"uint16 _v = cpu_read16(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
-            "cpu->S = (uint16)(cpu->S - 1);",
-            "cpu_write16(cpu, 0x00, cpu->S, _v);",
-            "cpu->S = (uint16)(cpu->S - 1);",
+            "{",
+            f"  uint16 _peival = cpu_read16(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
+            "  cpu->S = (uint16)(cpu->S - 1);",
+            "  cpu_write16(cpu, 0x00, cpu->S, _peival);",
+            "  cpu->S = (uint16)(cpu->S - 1);",
+            "}",
         ]
     return ["/* TODO PushEffectiveAddress unsupported kind */"]
 
