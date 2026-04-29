@@ -3459,7 +3459,17 @@ class EmitCtx:
         loop body updates B (e.g. via XBA after a fresh LDA), the
         new byte must propagate to the header's B-var before the
         back-edge goto.
+
+        Step 4 of Phase 5 SSA rollout: when ssa_mode is True, ALSO
+        emit SSA phi assignments here (heuristic _label_* assignments
+        below ALSO run in parallel — Step 7 deletes the heuristic
+        once SSA is verified to be functionally equivalent).
         """
+        # SSA shadow path (Step 4). Layered ON TOP of heuristic — both
+        # run in parallel until Step 7 deletes the heuristic.
+        if self.ssa_mode:
+            self._emit_ssa_phi_assignments(target_pc)
+        # Heuristic path (still primary in Steps 4-6).
         la = getattr(self, '_label_a', {}).get(target_pc)
         if la and self.A and la != self.A and self._simple(la):
             self._emit(f'{la} = {self.A};')
@@ -5511,6 +5521,14 @@ class EmitCtx:
                 if ly and self.Y and ly != self.Y and self._simple(ly) and self._simple(self.Y):
                     if ly != lx:  # don't sync Y into a var shared with X
                         self._emit(f'{ly} = {self.Y};')
+            # SSA shadow path (Step 4 of Phase 5 SSA rollout). When
+            # ssa_mode is True, emit phi assignments for any registers
+            # with an SSA phi at v. Layered ON TOP of the heuristic
+            # branch_states / _label_* machinery above — both run in
+            # parallel until Step 7 deletes the heuristic. No-op when
+            # ssa_mode is False.
+            if self.ssa_mode:
+                self._emit_ssa_phi_assignments(v)
             # If branch target is past the function end (another function), emit
             # a conditional tail call instead of a goto.  But if the decoder
             # already decoded the target (it's in valid_branch_targets), the
