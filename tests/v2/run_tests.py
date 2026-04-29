@@ -21,6 +21,7 @@ TEST_MODULES = [
     'test_decoder_mode_split',
     'test_decoder_repsep_independent_bits',
     'test_decoder_immediate_length_per_state',
+    'test_cfg_mode_split_blocks',
 ]
 
 
