@@ -32,7 +32,7 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from decoder import (  # noqa: E402
+from v2.decoder import (  # noqa: E402
     DecodeKey, DecodedInsn, FunctionDecodeGraph,
 )
 
