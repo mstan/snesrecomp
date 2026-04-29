@@ -24,6 +24,7 @@ TEST_MODULES = [
     'test_cfg_mode_split_blocks',
     'test_lowering_coverage',
     'test_lowering_per_op_smoke',
+    'test_codegen_per_op_smoke',
 ]
 
 
