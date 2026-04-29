@@ -35,6 +35,16 @@ from snes65816 import (
 )
 from discover import discover_bank
 
+# SSA construction modules (analysis-only here — Step 2 wires
+# setup_ssa() but ssa_mode is False by default, so no behavior
+# change). Subsequent steps wire SSA into emit_function for actual
+# phi merging.
+from cfg import build_cfg as _ssa_build_cfg
+from ssa_placement import (
+    compute_register_defs as _ssa_compute_register_defs,
+    compute_phi_placements as _ssa_compute_phi_placements,
+)
+
 # Backward compat alias (internal uses of _validate_decoded_insns)
 _validate_decoded_insns = validate_decoded_insns
 
@@ -2785,7 +2795,8 @@ class EmitCtx:
                  y_after_map: Dict[int, int] = None,
                  x_after_map: Dict[int, int] = None,
                  callee_clobbers: Dict[int, Set[str]] = None,
-                 reverse_debug: bool = False):
+                 reverse_debug: bool = False,
+                 ssa_mode: bool = False):
         self.bank = bank
         self.func_names = func_names
         self.func_sigs = func_sigs or {}
@@ -2852,6 +2863,27 @@ class EmitCtx:
         # the fall-through state differs, emit a conditional (phi node).
         # Maps target_pc -> {'A': expr, 'X': expr, 'Y': expr, 'carry': expr, 'cond': expr}
         self._branch_states: Dict[int, dict] = {}
+
+        # SSA construction infrastructure (Step 2 of Phase 5 SSA
+        # rollout — see plan in C:\Users\Matthew\.claude\plans\
+        # warm-seeking-trinket.md). When ssa_mode is False (default),
+        # all SSA fields stay empty / None — no functional change.
+        # When True, setup_ssa() builds CFG + dominance frontiers +
+        # phi placements via cfg.py + ssa_placement.py and pre-
+        # allocates one hoisted phi var per (block_pc, register).
+        # Subsequent steps wire this into goto-site emit + label
+        # adoption to replace the heuristic _branch_states /
+        # _label_a/b/x/y wholesale.
+        self.ssa_mode: bool = ssa_mode
+        self._ssa_phi_vars: Dict[Tuple[int, str], str] = {}
+        self._ssa_cfg = None
+        self._ssa_placements: Dict[str, frozenset] = {}
+        self._mx_at_pc: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+        # Per-target snapshot of self.<R> at every goto site. Used by
+        # label-emit code to recover register state on goto-arrived
+        # paths when no SSA phi exists at the label (single-pred
+        # case). Keyed by target_pc.
+        self._target_entry_state: Dict[int, dict] = {}
 
         # DP write tracking for parameter passing (HANDOFF requirement E)
         self.dp_state: Dict[int, str] = {}
@@ -2932,6 +2964,75 @@ class EmitCtx:
         if self.A is None:
             self._warn('A unknown at return --returning 0')
         return self.A if self.A is not None else '0'
+
+    # -- SSA setup (Step 2) ------------------------------------------------
+
+    def setup_ssa(self, insns: 'List[Insn]') -> None:
+        """Build CFG, compute phi placements, pre-allocate phi vars.
+
+        No-op when self.ssa_mode is False. Called by emit_function
+        AFTER EmitCtx is constructed (so valid_branch_targets /
+        x_restores_map / _alloc are available) and BEFORE the per-
+        instruction emission walk begins.
+
+        Step 2 only allocates the phi vars; subsequent steps wire
+        them into goto-site emit + label-emit adoption to actually
+        replace the heuristic _branch_states / _label_a/b/x/y.
+        """
+        if not self.ssa_mode:
+            return
+        cfg_obj = _ssa_build_cfg(
+            insns,
+            valid_branch_targets=self.valid_branch_targets,
+            bank=self.bank,
+            func_start=self.func_start,
+        )
+        self._ssa_cfg = cfg_obj
+        defs = _ssa_compute_register_defs(
+            cfg_obj,
+            registers=('A', 'X', 'Y', 'B'),
+            x_restores_callees=set(self.x_restores_map.keys()),
+            bank=self.bank,
+        )
+        # Implicit entry-block def for every register (Cytron 1991
+        # §5.1). Without this, a phi placed at a merge has no value
+        # to assign on paths that bring the entry value (rather than
+        # a real def) — common in functions with parameter-passed
+        # registers (X = 'k').
+        if cfg_obj.entry_pc in cfg_obj.blocks:
+            for reg in ('A', 'X', 'Y', 'B'):
+                defs[reg].add(cfg_obj.entry_pc)
+        placements = _ssa_compute_phi_placements(cfg_obj, defs)
+        self._ssa_placements = placements
+        # Per-block M/X state — phi var width follows the M/X state
+        # at the placement block (NOT function entry). REP/SEP between
+        # entry and the placement point can change live width of
+        # A/B (M flag) and X/Y (X flag).
+        self._mx_at_pc = {(insn.addr & 0xFFFF): (insn.m_flag, insn.x_flag)
+                          for insn in insns}
+        for reg, blocks in placements.items():
+            for block_pc in blocks:
+                key = (block_pc, reg)
+                if key in self._ssa_phi_vars:
+                    continue
+                m, x = self._mx_at_pc.get(block_pc, (None, None))
+                if reg in ('A', 'B'):
+                    if m == 0:
+                        type_ = 'uint16'
+                    elif m == 1:
+                        type_ = 'uint8'
+                    else:
+                        type_ = self._cur_a_type
+                elif reg in ('X', 'Y'):
+                    if x == 0:
+                        type_ = 'uint16'
+                    elif x == 1:
+                        type_ = 'uint8'
+                    else:
+                        type_ = self._cur_x_type
+                else:
+                    type_ = 'uint8'
+                self._ssa_phi_vars[key] = self._alloc(type_)
 
     def _emit_return_for_current_sig(self):
         """Emit the C `return [expr];` line for the current ret_type."""
@@ -6037,6 +6138,12 @@ def emit_function(name: str, insns: List[Insn], bank: int,
     # place a `return` before the fall-through, making the fall-through
     # unreachable. We defer them to _past_start_buf and flush after the
     # fall-through emit below.
+    # SSA setup (Step 2 of Phase 5 SSA rollout). No-op when ctx.ssa_mode
+    # is False (default) — pure infrastructure call. When True, builds
+    # CFG + dominance frontiers + phi placements and pre-allocates one
+    # hoisted phi var per (block_pc, register).
+    ctx.setup_ssa(insns)
+
     last_before_end = insns[-1]
     _last_pc = -1
     _past_start_lines = None
