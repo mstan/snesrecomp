@@ -27,6 +27,7 @@ TEST_MODULES = [
     'test_codegen_per_op_smoke',
     'test_emit_function_smoke',
     'test_emit_bank_smoke',
+    'test_cfg_loader',
 ]
 
 
