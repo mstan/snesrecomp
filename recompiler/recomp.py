@@ -3034,6 +3034,78 @@ class EmitCtx:
                     type_ = 'uint8'
                 self._ssa_phi_vars[key] = self._alloc(type_)
 
+    def _emit_ssa_phi_assignments(self, target_pc: int) -> None:
+        """Emit `{phi_var} = {self.<R>};` for each register R that has
+        an SSA phi at target_pc.
+
+        Step 3 (off by default): defines the helper. No call sites yet.
+        Subsequent steps wire this into BRA/BRL goto sites, conditional
+        branch goto sites, JMP ABS goto sites, and fall-through into a
+        phi label.
+
+        Behavior:
+        * For each R in (A, B, X, Y), look up phi var allocated by
+          setup_ssa for (target_pc, R). Skip if no phi.
+        * If self.<R> is None on this path (entry value not redefined
+          on the path to here), fall back to init_<r> (or '0' if no
+          init) — the implicit "register holds entry value" def.
+          Required for paths that reach a phi-merge without ever
+          defining R inside the function.
+        * For X/Y, materialize first if self.<R> is non-simple — avoids
+          embedding mutating expressions in the phi var.
+        * Width derives from M/X state at target_pc (via _mx_at_pc),
+          NOT emit-point. SEP/REP between goto and target can change
+          live width.
+        * Always snapshot self.<R> in self._target_entry_state[target_pc]
+          for single-pred labels with no SSA phi (where the label-emit
+          code adopts this snapshot when _prev_terminal indicates no
+          fall-through).
+        """
+        if not self.ssa_mode:
+            return
+
+        def _val_or_init(cur, init):
+            if cur is not None:
+                return cur
+            if init is not None:
+                return init
+            return '0'
+
+        # Phi var widths follow M/X at target_pc (the placement point);
+        # materialization width must match.
+        m_t, x_t = self._mx_at_pc.get(target_pc, (None, None))
+        x_type = 'uint16' if x_t == 0 else ('uint8' if x_t == 1 else self._cur_x_type)
+
+        a_phi = self._ssa_phi_vars.get((target_pc, 'A'))
+        if a_phi is not None:
+            val = _val_or_init(self.A, self._init_a)
+            if a_phi != val:
+                self._emit(f'{a_phi} = {val};')
+        b_phi = self._ssa_phi_vars.get((target_pc, 'B'))
+        if b_phi is not None:
+            val = _val_or_init(self.B, self._init_b)
+            if b_phi != val:
+                self._emit(f'{b_phi} = {val};')
+        x_phi = self._ssa_phi_vars.get((target_pc, 'X'))
+        if x_phi is not None:
+            if self.X is not None and not self._simple(self.X):
+                self._materialize('X', x_type)
+            val = _val_or_init(self.X, self._init_x)
+            if (self._simple(val) or val == '0') and x_phi != val:
+                self._emit(f'{x_phi} = {val};')
+        y_phi = self._ssa_phi_vars.get((target_pc, 'Y'))
+        if y_phi is not None:
+            if self.Y is not None and not self._simple(self.Y):
+                self._materialize('Y', x_type)
+            init_y = getattr(self, '_init_y', None)
+            val = _val_or_init(self.Y, init_y)
+            if (self._simple(val) or val == '0') and y_phi != val:
+                self._emit(f'{y_phi} = {val};')
+        # Snapshot for single-pred / no-phi labels.
+        self._target_entry_state[target_pc] = {
+            'A': self.A, 'B': self.B, 'X': self.X, 'Y': self.Y,
+        }
+
     def _emit_return_for_current_sig(self):
         """Emit the C `return [expr];` line for the current ret_type."""
         expr = self._return_value_expr()
