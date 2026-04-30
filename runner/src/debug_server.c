@@ -48,9 +48,8 @@ extern int snes_frame_counter;
 #include "snes/spc.h"
 #include "snes/snes.h"
 #include "snes/saveload.h"
-#include "../../../src/gen/recomp_func_registry.h"
 extern Ppu *g_ppu;
-extern Cpu *g_cpu;
+extern Cpu *g_snes_cpu;
 extern Dma *g_dma;
 extern Snes *g_snes;
 // APU pacing counter; defined in common_rtl.c.
@@ -1084,19 +1083,19 @@ void debug_server_record_frame(int frame) {
     // --- Extended state snapshots ---
 
     // CPU registers
-    if (g_cpu) {
-        r->cpu.a = g_cpu->a;
-        r->cpu.x = g_cpu->x;
-        r->cpu.y = g_cpu->y;
-        r->cpu.sp = g_cpu->sp;
-        r->cpu.pc = g_cpu->pc;
-        r->cpu.dp = g_cpu->dp;
-        r->cpu.k = g_cpu->k;
-        r->cpu.db = g_cpu->db;
-        r->cpu.flags = (g_cpu->c ? 1 : 0) | (g_cpu->z ? 2 : 0) | (g_cpu->v ? 4 : 0) |
-                        (g_cpu->n ? 8 : 0) | (g_cpu->i ? 16 : 0) | (g_cpu->d ? 32 : 0) |
-                        (g_cpu->xf ? 64 : 0) | (g_cpu->mf ? 128 : 0);
-        r->cpu.e = g_cpu->e ? 1 : 0;
+    if (g_snes_cpu) {
+        r->cpu.a = g_snes_cpu->a;
+        r->cpu.x = g_snes_cpu->x;
+        r->cpu.y = g_snes_cpu->y;
+        r->cpu.sp = g_snes_cpu->sp;
+        r->cpu.pc = g_snes_cpu->pc;
+        r->cpu.dp = g_snes_cpu->dp;
+        r->cpu.k = g_snes_cpu->k;
+        r->cpu.db = g_snes_cpu->db;
+        r->cpu.flags = (g_snes_cpu->c ? 1 : 0) | (g_snes_cpu->z ? 2 : 0) | (g_snes_cpu->v ? 4 : 0) |
+                        (g_snes_cpu->n ? 8 : 0) | (g_snes_cpu->i ? 16 : 0) | (g_snes_cpu->d ? 32 : 0) |
+                        (g_snes_cpu->xf ? 64 : 0) | (g_snes_cpu->mf ? 128 : 0);
+        r->cpu.e = g_snes_cpu->e ? 1 : 0;
     } else {
         memset(&r->cpu, 0, sizeof(r->cpu));
     }
@@ -2651,16 +2650,16 @@ static void cmd_set_cpu(const char *args) {
         int nread = 0;
         if (sscanf(p, "%x%n", &val, &nread) != 1) break;
         p += nread;
-        if      (strcmp(keybuf, "a")  == 0) g_cpu->a  = (uint16_t)val;
-        else if (strcmp(keybuf, "x")  == 0) g_cpu->x  = (uint16_t)val;
-        else if (strcmp(keybuf, "y")  == 0) g_cpu->y  = (uint16_t)val;
-        else if (strcmp(keybuf, "sp") == 0) g_cpu->sp = (uint16_t)val;
-        else if (strcmp(keybuf, "dp") == 0) g_cpu->dp = (uint16_t)val;
-        else if (strcmp(keybuf, "db") == 0) g_cpu->db = (uint8_t)val;
-        else if (strcmp(keybuf, "pb") == 0) g_cpu->k  = (uint8_t)val;
-        else if (strcmp(keybuf, "pc") == 0) g_cpu->pc = (uint16_t)val;
-        else if (strcmp(keybuf, "p")  == 0) cpu_setFlags(g_cpu, (uint8_t)val);
-        else if (strcmp(keybuf, "e")  == 0) g_cpu->e  = (val != 0);
+        if      (strcmp(keybuf, "a")  == 0) g_snes_cpu->a  = (uint16_t)val;
+        else if (strcmp(keybuf, "x")  == 0) g_snes_cpu->x  = (uint16_t)val;
+        else if (strcmp(keybuf, "y")  == 0) g_snes_cpu->y  = (uint16_t)val;
+        else if (strcmp(keybuf, "sp") == 0) g_snes_cpu->sp = (uint16_t)val;
+        else if (strcmp(keybuf, "dp") == 0) g_snes_cpu->dp = (uint16_t)val;
+        else if (strcmp(keybuf, "db") == 0) g_snes_cpu->db = (uint8_t)val;
+        else if (strcmp(keybuf, "pb") == 0) g_snes_cpu->k  = (uint8_t)val;
+        else if (strcmp(keybuf, "pc") == 0) g_snes_cpu->pc = (uint16_t)val;
+        else if (strcmp(keybuf, "p")  == 0) cpu_setFlags(g_snes_cpu, (uint8_t)val);
+        else if (strcmp(keybuf, "e")  == 0) g_snes_cpu->e  = (val != 0);
         else { send_fmt("{\"error\":\"unknown cpu field: %s\"}", keybuf); return; }
         count++;
     }
@@ -2668,37 +2667,12 @@ static void cmd_set_cpu(const char *args) {
 }
 
 // ---- L3 harness: invoke one recompiled function by name ----
-// invoke_recomp <name>
-//
-// Looks the name up in the generated registry (gen_func_registry.py output)
-// and dispatches via the matching sig. For MVP we handle argc=0 (void())
-// and argc=1 (void(uint8), arg read from g_cpu->a low byte). Other sigs
-// error out with the detected sig so the test can mark itself skipped.
+// v1 ABI dispatch (void() / void(uint8)) — disabled in v2 builds where
+// every recompiled function takes CpuState*. A v2 registry will replace
+// this in a follow-up.
 static void cmd_invoke_recomp(const char *args) {
-    char name[128];
-    if (sscanf(args, "%127s", name) != 1) {
-        send_fmt("{\"error\":\"usage: invoke_recomp <name>\"}");
-        return;
-    }
-    const RecompFuncEntry *e = recomp_func_registry_lookup(name);
-    if (!e) {
-        send_fmt("{\"error\":\"unknown function: %s\"}", name);
-        return;
-    }
-    if (e->argc == 0) {
-        ((void (*)(void))e->fn)();
-    } else if (e->argc == 1) {
-        uint8_t a = (uint8_t)(g_cpu->a & 0xFF);
-        ((void (*)(uint8_t))e->fn)(a);
-    } else {
-        send_fmt("{\"error\":\"unsupported sig for L3 invoke\","
-                 "\"name\":\"%s\",\"argc\":%d}",
-                 e->name, e->argc);
-        return;
-    }
-    send_fmt("{\"ok\":true,\"name\":\"%s\",\"argc\":%d,"
-             "\"rom_addr\":\"0x%06x\"}",
-             e->name, e->argc, e->rom_addr);
+    (void)args;
+    send_fmt("{\"error\":\"invoke_recomp disabled in v2 build\"}");
 }
 
 static void cmd_load_state(const char *args) {
@@ -3096,8 +3070,8 @@ static void cmd_get_interrupt_state(const char *args) {
 }
 
 static void cmd_get_cpu_state(const char *args) {
-    if (!g_cpu) { send_fmt("{\"error\":\"cpu not available\"}"); return; }
-    Cpu *c = g_cpu;
+    if (!g_snes_cpu) { send_fmt("{\"error\":\"cpu not available\"}"); return; }
+    Cpu *c = g_snes_cpu;
     send_fmt("{\"a\":\"0x%04x\",\"x\":\"0x%04x\",\"y\":\"0x%04x\","
              "\"sp\":\"0x%04x\",\"pc\":\"0x%04x\",\"dp\":\"0x%04x\","
              "\"k\":\"0x%02x\",\"db\":\"0x%02x\","

@@ -353,7 +353,12 @@ def _h_jmp(insn, vf):
 def _h_jsr(insn, vf):
     if insn.mode == INDIR_X:
         return [Call(target=None, long=False, indirect=True)]
-    return [Call(target=insn.operand, long=False)]
+    # JSR is a same-bank short call; insn.operand is the 16-bit local PC.
+    # Combine with the source bank from insn.addr so codegen can resolve
+    # the cross-bank call name (e.g. bank_0C_944C, not bank_00_944C).
+    src_bank = (insn.addr >> 16) & 0xFF
+    target = (src_bank << 16) | (insn.operand & 0xFFFF)
+    return [Call(target=target, long=False)]
 
 
 def _h_jsl(insn, vf):

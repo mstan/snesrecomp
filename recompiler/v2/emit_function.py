@@ -111,6 +111,7 @@ def emit_function(rom: bytes, bank: int, start: int,
     for key in block_order:
         block = cfg.blocks[key]
         lines: List[str] = []
+        block_terminated = False  # True if last op was branch/goto/return/call
         for di in block.insns:
             ir_ops = lower(di.insn, value_factory=vf)
             for op in ir_ops:
@@ -122,46 +123,65 @@ def emit_function(rom: bytes, bank: int, start: int,
                     taken = succs[1] if len(succs) >= 2 else None
                     pred = f"{_reg_for_flag(op.flag)} == {op.take_if}"
                     if taken is not None:
-                        # `if (cond) <stmt>;` where stmt is goto/return.
-                        # Wrap in braces so the conditional return doesn't
-                        # accidentally swallow the next line.
                         target_stmt = _goto_or_return(taken)
                         lines.append(f"if ({pred}) {{ {target_stmt} }}")
                     if fall is not None:
                         lines.append(_goto_or_return(fall) + " /* fall-through */")
+                        block_terminated = True
                 elif isinstance(op, Goto):
                     succs = block.successors
                     if len(succs) >= 1:
                         lines.append(_goto_or_return(succs[0]))
                     else:
                         lines.append(f"return; /* Goto with no successor */")
-                elif isinstance(op, Call):
-                    # Codegen produces a function-call string already.
-                    for ln in emit_op(op):
-                        lines.append(ln)
+                    block_terminated = True
                 elif isinstance(op, Return):
                     for ln in emit_op(op):
                         lines.append(ln)
+                    block_terminated = True
                 elif isinstance(op, IndirectGoto):
-                    # Indirect — for now stub. v1 has dispatch-table-driven
-                    # resolution we don't yet model.
                     for ln in emit_op(op):
                         lines.append(ln)
                     lines.append("return; /* IndirectGoto: dispatch table */")
+                    block_terminated = True
                 else:
+                    # Call, ReadReg, ALU, Read/Write, etc. — non-terminating.
                     for ln in emit_op(op):
                         lines.append(ln)
+        # Block didn't end with a control-flow op. Emit the explicit edge
+        # to its lone CFG successor (linear fall-through) — never rely on
+        # textual fall-through into whatever block_order put next, which
+        # may have already been emitted earlier in DFS order. Without
+        # this, e.g. L_809F's "fall through to L_80A0" silently became
+        # "fall through to the function epilogue" for any block whose
+        # successor was visited first.
+        if not block_terminated:
+            succs = block.successors
+            if len(succs) >= 1:
+                lines.append(_goto_or_return(succs[0]) + " /* implicit fall-through */")
+            else:
+                lines.append("return; /* no terminator, no successor */")
         block_lines[key] = lines
 
     # Compose the function source with labels per block.
     src: List[str] = []
     src.append(f"void {func_name}(CpuState *cpu) {{")
+    # Diagnostics — same call-stack plumbing v1 emitted, so the runtime
+    # debug_server's `call_stack` cmd and crash-handler attribution work.
+    src.append(f'  extern const char *g_last_recomp_func;')
+    src.append(f'  g_last_recomp_func = "{func_name}";')
+    src.append(f'  RecompStackPush("{func_name}");')
     for i, key in enumerate(block_order):
         src.append(f"  {_label_for(key)}:")
         for ln in block_lines[key]:
+            # Inject RecompStackPop before any return so the stack stays balanced.
+            stripped = ln.strip()
+            if stripped.startswith("return"):
+                src.append(f"    RecompStackPop();")
             src.append(f"    {ln}")
     # Defensive trailing return so a missing terminator doesn't fall off
     # the end of the function in the C compiler's view.
+    src.append("  RecompStackPop();")
     src.append("  return;")
     src.append("}")
     return "\n".join(src) + "\n"

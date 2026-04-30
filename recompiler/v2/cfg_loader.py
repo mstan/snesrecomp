@@ -189,4 +189,20 @@ def load_bank_cfg(path: str) -> BankCfg:
     if cfg.bank < 0:
         raise ValueError(f"{path}: missing 'bank = NN' line")
 
+    # Auto-promote in-bank `name <addr> <friendly>` declarations to emit
+    # entries. v1's recompiler auto-promoted JSL/JSR targets into their
+    # own functions; v2 doesn't, so JSR/JSL targets named in cfg but
+    # without an explicit `func` entry would otherwise be referenced
+    # without a definition. (Cross-bank `name` lines stay declaration-
+    # only — their owning bank's cfg is responsible for emitting them.)
+    existing_starts = {e.start & 0xFFFF for e in cfg.entries}
+    for nd in cfg.names:
+        if (nd.addr_24 >> 16) & 0xFF != cfg.bank:
+            continue
+        local_pc = nd.addr_24 & 0xFFFF
+        if local_pc in existing_starts:
+            continue
+        cfg.entries.append(BankEntry(name=nd.name, start=local_pc))
+        existing_starts.add(local_pc)
+
     return cfg

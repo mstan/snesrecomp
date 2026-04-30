@@ -11,7 +11,7 @@
 #include <time.h>
 
 Snes *g_snes;
-Cpu *g_cpu;
+Cpu *g_snes_cpu;
 
 bool g_fail;
 const RtlGameInfo *g_rtl_game_info;
@@ -27,13 +27,13 @@ uint8_t *SnesRomPtr(uint32 v) {
 // Apply the native-mode CPU state the real ROM's reset vector would
 // have established. See header comment.
 void SnesEnterNativeMode(void) {
-  g_cpu->e = false;
-  g_cpu->sp = 0x01FF;
-  g_cpu->dp = 0;
-  g_cpu->mf = false;
-  g_cpu->xf = false;
-  g_cpu->d = false;
-  g_cpu->i = true;
+  g_snes_cpu->e = false;
+  g_snes_cpu->sp = 0x01FF;
+  g_snes_cpu->dp = 0;
+  g_snes_cpu->mf = false;
+  g_snes_cpu->xf = false;
+  g_snes_cpu->d = false;
+  g_snes_cpu->i = true;
 }
 
 // Resolve a 16-bit-indirect-through-DP pointer using the current
@@ -41,7 +41,7 @@ void SnesEnterNativeMode(void) {
 // matters for `(dp)`, `(dp),Y`, `(dp,X)` addressing modes.
 uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs) {
   LongPtr p = MAKE_LONG((uint16)g_ram[dp_addr] | ((uint16)g_ram[dp_addr + 1] << 8),
-                        g_cpu->db);
+                        g_snes_cpu->db);
   return IndirPtr(p, offs);
 }
 
@@ -183,7 +183,7 @@ void WatchdogCheck(void) {
 
 Snes *SnesInit(const uint8 *data, int data_size) {
   g_snes = snes_init(g_ram);
-  g_cpu = g_snes->cpu;
+  g_snes_cpu = g_snes->cpu;
   g_dma = g_snes->dma;
   g_ppu = g_snes->ppu;
 

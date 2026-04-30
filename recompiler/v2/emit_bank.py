@@ -72,6 +72,18 @@ def emit_bank(rom: bytes, bank: int,
 
     parts: List[str] = [file_header, ""]
 
+    # Forward decls for every in-bank entry. Within one TU, calls to
+    # later-defined functions need a prior declaration; the file header
+    # only includes funcs.h (which carries v2_sync_funcs_h's friendly-
+    # name declarations) so synthetic auto-promoted `bank_BB_AAAA`
+    # entries — which never make it to funcs.h — still need a forward
+    # decl here.
+    parts.append("/* Forward declarations for in-bank entries. */")
+    for entry in entries:
+        name = entry.name or _default_func_name_local(bank, entry.start)
+        parts.append(f"void {name}(CpuState *cpu);")
+    parts.append("")
+
     for entry in entries:
         src = emit_function(
             rom=rom,
@@ -86,6 +98,10 @@ def emit_bank(rom: bytes, bank: int,
         parts.append("")  # blank line between functions
 
     return "\n".join(parts)
+
+
+def _default_func_name_local(bank: int, start: int) -> str:
+    return f"bank_{bank:02X}_{start:04X}"
 
 
 def _default_file_header(bank: int) -> str:

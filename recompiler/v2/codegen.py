@@ -32,7 +32,36 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from typing import List  # noqa: E402
+from typing import Dict, List  # noqa: E402
+
+# Resolver: 24-bit address (bank << 16 | pc) -> friendly C function name.
+# Populated by emit_bank before each bank emit (a process-wide map of every
+# `func`/`name` declaration across all banks loaded so far). When a Call op
+# resolves to one of these addresses, codegen emits the friendly name; else
+# it falls back to the synthetic `bank_BB_AAAA` form.
+_NAME_RESOLVER: Dict[int, str] = {}
+
+# Set of 24-bit Call targets (bank << 16 | pc) emitted with the synthetic
+# `bank_BB_AAAA` form because no friendly name was registered. v2_regen
+# reads + clears this between passes to auto-promote unresolved targets
+# into emit entries (mirrors v1's JSL/JSR auto-promote).
+_UNRESOLVED_CALL_TARGETS: set = set()
+
+
+def set_name_resolver(name_map: Dict[int, str]) -> None:
+    """Replace the call-target name resolver. Pass an empty dict to clear."""
+    global _NAME_RESOLVER
+    _NAME_RESOLVER = dict(name_map)
+
+
+def take_unresolved_call_targets() -> set:
+    """Return + clear the set of synthetic-name Call targets seen since
+    the last call. Used by v2_regen for iterative auto-promote."""
+    global _UNRESOLVED_CALL_TARGETS
+    out = _UNRESOLVED_CALL_TARGETS
+    _UNRESOLVED_CALL_TARGETS = set()
+    return out
+
 
 from v2.ir import (  # noqa: E402
     IROp, IRBlock,
@@ -174,7 +203,15 @@ def _emit_alu(op: Alu) -> List[str]:
         if op.out is not None:
             lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)}){tname};")
         mask = "0x100" if op.width == 1 else "0x10000"
+        sign = "0x80" if op.width == 1 else "0x8000"
         lines.append(f"cpu->_flag_C = ({tname} & {mask}) ? 1 : 0;")
+        # V flag for ADC: set when sign of result differs from sign of both
+        # operands (i.e., (lhs ^ result) & (rhs ^ result) & sign_bit).
+        if op.out is not None:
+            lines.append(
+                f"cpu->_flag_V = ((({_v(op.lhs)} ^ {_v(op.out)}) & "
+                f"({_v(op.rhs)} ^ {_v(op.out)}) & {sign}) != 0) ? 1 : 0;"
+            )
     elif op.op == AluOp.SUB:
         lines.append(
             f"uint32 {tname} = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)} - (1 - cpu->_flag_C);"
@@ -182,7 +219,15 @@ def _emit_alu(op: Alu) -> List[str]:
         if op.out is not None:
             lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)}){tname};")
         mask = "0x100" if op.width == 1 else "0x10000"
+        sign = "0x80" if op.width == 1 else "0x8000"
         lines.append(f"cpu->_flag_C = ({tname} & {mask}) ? 0 : 1;")
+        # V flag for SBC: set when sign of (lhs ^ rhs) differs and sign of
+        # result differs from sign of lhs (overflow into sign bit).
+        if op.out is not None:
+            lines.append(
+                f"cpu->_flag_V = ((({_v(op.lhs)} ^ {_v(op.rhs)}) & "
+                f"({_v(op.lhs)} ^ {_v(op.out)}) & {sign}) != 0) ? 1 : 0;"
+            )
     elif op.op == AluOp.AND:
         lines.append(
             f"{_ctype(op.width)} {_v(op.out)} = "
@@ -254,11 +299,37 @@ def _emit_shift(op: Shift) -> List[str]:
 def _emit_increg(op: IncReg) -> List[str]:
     field = _reg(op.reg)
     delta = "1" if op.delta == +1 else "-1"
+    # 65816 width semantics:
+    #   INC A: width follows M (0=16-bit, 1=8-bit)
+    #   INX / INY / DEX / DEY: width follows X (0=16-bit, 1=8-bit)
+    # When the register is 8-bit, only the LOW byte changes; the high
+    # byte must be preserved (for X/Y, hardware zeros the high byte
+    # when SEP #$10 is executed but otherwise it carries through). Most
+    # importantly, INC A in M=1 wrapping past $FF must NOT carry into
+    # the B half of the accumulator pair.
+    if op.reg == Reg.A:
+        flag = "cpu->m_flag"
+    elif op.reg in (Reg.X, Reg.Y):
+        flag = "cpu->x_flag"
+    else:
+        flag = None
+    if flag is None:
+        return [
+            f"{field} = ({field}) + ({delta});",
+            f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+        ]
     return [
-        f"{field} = ({field}) + ({delta});",
-        # N/Z update uses the appropriate width for the register.
-        f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
-        f"cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+        f"if ({flag}) {{",
+        f"  uint8 _lo8 = (uint8)(({field} & 0xFF) + ({delta}));",
+        f"  {field} = (uint16)(({field} & 0xFF00) | _lo8);",
+        f"  cpu->_flag_Z = (_lo8 == 0) ? 1 : 0;",
+        f"  cpu->_flag_N = ((_lo8 & 0x80) != 0) ? 1 : 0;",
+        f"}} else {{",
+        f"  {field} = (uint16)(({field}) + ({delta}));",
+        f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+        f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+        f"}}",
     ]
 
 
@@ -304,7 +375,20 @@ def _emit_bitclearmem(op: BitClearMem) -> List[str]:
 
 
 def _emit_setflag(op: SetFlag) -> List[str]:
-    return [f"{_reg(op.flag)} = {op.value};"]
+    # Update both the per-flag mirror and the canonical cpu->P bit,
+    # so subsequent PHP / direct cpu->P reads see a consistent byte.
+    flag_to_p_mask = {
+        Reg.C: "0x01", Reg.ZF: "0x02", Reg.I: "0x04", Reg.DF: "0x08",
+        Reg.XF: "0x10", Reg.M: "0x20", Reg.V: "0x40", Reg.N: "0x80",
+    }
+    mask = flag_to_p_mask.get(op.flag)
+    lines = [f"{_reg(op.flag)} = {op.value};"]
+    if mask is not None:
+        if op.value:
+            lines.append(f"cpu->P = (uint8)(cpu->P | {mask});")
+        else:
+            lines.append(f"cpu->P = (uint8)(cpu->P & ~{mask});")
+    return lines
 
 
 def _emit_repflags(op: RepFlags) -> List[str]:
@@ -349,7 +433,18 @@ def _emit_pushreg(op: PushReg) -> List[str]:
     field = _reg(op.reg)
     # Push is 1 or 2 bytes depending on register; for now treat A/B/X/Y/D as
     # following m/x widths and S/DB/PB as 1-byte. P is 1 byte. D is 16-bit.
-    if op.reg in (Reg.DB, Reg.PB, Reg.P):
+    if op.reg == Reg.P:
+        # Sync per-flag mirrors INTO cpu->P first — otherwise a flag set
+        # via SetFlag (SEI, CLC, CLD, etc.) without a corresponding P
+        # update would push a stale P byte, and the matching PLP would
+        # restore the wrong flags. Critical for the SPC upload's BVS at
+        # $80D8 which relies on V flowing through a PHP/PLP pair.
+        return [
+            "cpu_mirrors_to_p(cpu);",
+            f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
+            "cpu->S = (uint16)(cpu->S - 1);",
+        ]
+    if op.reg in (Reg.DB, Reg.PB):
         return [
             f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
             "cpu->S = (uint16)(cpu->S - 1);",
@@ -451,12 +546,14 @@ def _emit_call(op: Call) -> List[str]:
         return ["/* Call indirect — caller dispatches */"]
     if op.target is None:
         return ["/* Call: target unknown — caller dispatches */"]
-    bank = (op.target >> 16) & 0xFF
-    pc = op.target & 0xFFFF
-    if op.long:
-        return [f"bank_{bank:02X}_{pc:04X}(cpu);"]
-    # Short JSR: same-bank call. Caller's bank should match insn.addr's bank.
-    return [f"bank_{bank:02X}_{pc:04X}(cpu);"]
+    addr = op.target & 0xFFFFFF
+    name = _NAME_RESOLVER.get(addr)
+    if name is None:
+        bank = (addr >> 16) & 0xFF
+        pc = addr & 0xFFFF
+        name = f"bank_{bank:02X}_{pc:04X}"
+        _UNRESOLVED_CALL_TARGETS.add(addr)
+    return [f"{name}(cpu);"]
 
 
 def _emit_return(op: Return) -> List[str]:

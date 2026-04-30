@@ -38,7 +38,7 @@ struct Cpu {
   bool e;
 };
 
-extern struct Cpu *g_cpu;
+extern struct Cpu *g_snes_cpu;
 
 Cpu* cpu_init(void);
 void cpu_free(Cpu* cpu);

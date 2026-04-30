@@ -10,7 +10,7 @@ typedef struct Snes Snes;
 typedef struct Cpu Cpu;
 
 extern Snes *g_snes;
-extern Cpu *g_cpu;
+extern Cpu *g_snes_cpu;
 extern bool g_fail;
 
 Snes *SnesInit(const uint8 *data, int data_size);
