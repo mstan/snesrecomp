@@ -178,7 +178,24 @@ def _emit_readreg(op: ReadReg) -> List[str]:
 
 
 def _emit_writereg(op: WriteReg) -> List[str]:
-    return [f"{_reg(op.reg)} = {_v(op.src)};"]
+    # Width-respecting write into A / X / Y. When the controlling flag
+    # (m_flag for A, x_flag for X/Y) says 8-bit, only the LOW byte is
+    # mutated and the HIGH byte must be preserved. v1 codegen relied on
+    # the recompiler tracking M/X at emit time; v2 dispatches at runtime
+    # via the cpu->m_flag / cpu->x_flag fields.
+    field = _reg(op.reg)
+    if op.reg == Reg.A:
+        flag = "cpu->m_flag"
+    elif op.reg in (Reg.X, Reg.Y):
+        flag = "cpu->x_flag"
+    else:
+        flag = None
+    if flag is None:
+        return [f"{field} = {_v(op.src)};"]
+    return [
+        f"if ({flag}) {{ {field} = (uint16)(({field} & 0xFF00) | (({_v(op.src)}) & 0xFF)); }} "
+        f"else {{ {field} = (uint16)({_v(op.src)}); }}"
+    ]
 
 
 def _emit_consti(op: ConstI) -> List[str]:

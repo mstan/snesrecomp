@@ -239,6 +239,17 @@ void WriteRegWord(uint16 reg, uint16 value) {
     WriteVramWord(g_ppu, value);
     return;
   }
+  // APU port quirk: 16-bit STA $2140 transfers data via $2141 (hi)
+  // and the ack-trigger via $2140 (lo). On real hardware both bytes
+  // hit the bus together; SMW's SPC IPL upload protocol reads $2141
+  // the moment it sees $2140 change. If we write lo first the IPL
+  // latches stale $2141. Order hi-then-lo so $2141 is in place
+  // before $2140 fires the trigger.
+  if (reg >= 0x2140 && reg <= 0x217F) {
+    WriteReg(reg + 1, value >> 8);
+    WriteReg(reg, (uint8)value);
+    return;
+  }
   WriteReg(reg, (uint8)value);
   WriteReg(reg + 1, value >> 8);
 }

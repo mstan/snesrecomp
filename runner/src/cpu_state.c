@@ -57,41 +57,55 @@ static int is_hw_reg(uint8 bank, uint16 addr) {
  * doesn't care about precise timing — it just needs *some* cycles to
  * elapse so the IPL ROM runs to the point of writing $BBAA. */
 #include <stdio.h>
+/* APU pacing: every HW-register touch advances the main-CPU cycle
+ * estimate. v1 did this in `debug_on_block_enter`; v2 doesn't emit
+ * those, so without this bump the SPC never advances and SMW's
+ * "wait for $2140 == $BBAA" handshake spins forever.
+ *
+ * The 256-cycle increment is tuned to roughly match v1's per-block
+ * pacing amortised over the recomp's tight CPU read loops. The
+ * minimum-cycle floor in snes_catchupApu (snes.c) ensures the SPC
+ * actually progresses on each call. */
 static inline void cpu_pace_cycles(void) {
-    g_main_cpu_cycles_estimate += 24;
+    g_main_cpu_cycles_estimate += 256;
 }
 
-/* DEBUG: tally HW-reg accesses + last-touched address so we can tell
- * whether a hang is "spinning thousands of polls" vs "stuck in a non-
- * HW-reg loop" without having to launch + attach. Counts get printed
- * on a millionth-access basis. */
+/* Optional debug — disabled in release. Set BUILD_CPU_HW_LOG=1 in the
+ * build to enable verbose per-touch logging. */
+#define BUILD_CPU_HW_LOG 0
 static uint64_t s_hw_touch_count = 0;
 static uint16 s_last_hw_addr = 0;
 static int s_last_hw_was_read = 0;
 static int s_apu_writes_logged = 0;
-static int s_apu_writes_summary_at_2k = 0;
+
+/* Logger reachable from generated code. Disabled at release. */
+void cpu_dbg_funcname(const char *name) {
+    (void)name;
+#if BUILD_CPU_HW_LOG
+    static int n = 0;
+    if (n++ < 50) {
+        fprintf(stderr, "[func#%d] %s (touch=%llu)\n",
+                n, name, (unsigned long long)s_hw_touch_count);
+        fflush(stderr);
+    }
+#endif
+}
 static void cpu_hw_log(uint16 addr, int is_read, uint16 val) {
     s_last_hw_addr = addr;
     s_last_hw_was_read = is_read;
-    /* Log first 50 APU writes verbatim; then every 2000th. */
     if (!is_read && addr >= 0x2140 && addr <= 0x2143) {
         s_apu_writes_logged++;
-        if (s_apu_writes_logged <= 50 ||
-            (s_apu_writes_logged - 50) >= s_apu_writes_summary_at_2k * 2000) {
-            if (s_apu_writes_logged > 50) s_apu_writes_summary_at_2k++;
-            fprintf(stderr, "[apu-write #%d] $%04X = $%02X (touch=%llu)\n",
-                    s_apu_writes_logged, addr, val & 0xFF,
-                    (unsigned long long)s_hw_touch_count);
-            fflush(stderr);
-        }
     }
-    if (++s_hw_touch_count % 1000000 == 0) {
-        fprintf(stderr, "[hw-pace] touches=%llu apu-writes=%d last=%c$%04X $2140=%02X $2141=%02X $2142=%02X $2143=%02X\n",
-                (unsigned long long)s_hw_touch_count, s_apu_writes_logged,
-                is_read ? 'R' : 'W', addr,
-                ReadReg(0x2140), ReadReg(0x2141), ReadReg(0x2142), ReadReg(0x2143));
+    s_hw_touch_count++;
+#if BUILD_CPU_HW_LOG
+    (void)val;
+    if (s_hw_touch_count % 1000000 == 0) {
+        fprintf(stderr, "[hw-pace] touches=%llu\n", (unsigned long long)s_hw_touch_count);
         fflush(stderr);
     }
+#else
+    (void)val;
+#endif
 }
 
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {

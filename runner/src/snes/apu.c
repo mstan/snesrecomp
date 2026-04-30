@@ -69,6 +69,7 @@ void apu_cycle(Apu* apu) {
   }
 
   // handle timers
+  extern uint64_t g_apu_timer0_total_ticks;
   for(int i = 0; i < 3; i++) {
     if(apu->timer[i].cycles == 0) {
       apu->timer[i].cycles = i == 2 ? 16 : 128;
@@ -78,6 +79,7 @@ void apu_cycle(Apu* apu) {
           apu->timer[i].divider = 0;
           apu->timer[i].counter++;
           apu->timer[i].counter &= 0xf;
+          if (i == 0) g_apu_timer0_total_ticks++;
         }
       }
     }

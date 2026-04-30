@@ -88,16 +88,28 @@ void snes_reset(Snes* snes, bool hard) {
   snes->divideResult = 0x101;
 }
 
+static uint64_t s_catchup_calls = 0;
+static uint64_t s_catchup_cycles_total = 0;
+uint64_t g_apu_timer0_total_ticks = 0;
 void snes_catchupApu(Snes* snes) {
   if (snes->apuCatchupCycles > 10000)
     snes->apuCatchupCycles = 10000;
 
   int catchupCycles = (int) snes->apuCatchupCycles;
+  if (catchupCycles < 1024) catchupCycles = 1024;
 
   for(int i = 0; i < catchupCycles; i++) {
     apu_cycle(snes->apu);
   }
   snes->apuCatchupCycles -= (double) catchupCycles;
+  if (snes->apuCatchupCycles < 0.0) snes->apuCatchupCycles = 0.0;
+  s_catchup_calls++;
+  s_catchup_cycles_total += (uint64_t)catchupCycles;
+}
+
+void snes_catchup_stats(uint64_t *calls, uint64_t *cycles) {
+  if (calls) *calls = s_catchup_calls;
+  if (cycles) *cycles = s_catchup_cycles_total;
 }
 
 uint8_t snes_readBBus(Snes* snes, uint8_t adr) {

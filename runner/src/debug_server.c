@@ -48,6 +48,7 @@ extern int snes_frame_counter;
 #include "snes/spc.h"
 #include "snes/snes.h"
 #include "snes/saveload.h"
+#include "cpu_state.h"
 extern Ppu *g_ppu;
 extern Cpu *g_snes_cpu;
 extern Dma *g_dma;
@@ -3069,6 +3070,33 @@ static void cmd_get_interrupt_state(const char *args) {
              s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer);
 }
 
+extern void snes_catchup_stats(uint64_t *calls, uint64_t *cycles);
+extern uint64_t g_apu_timer0_total_ticks;
+static void cmd_get_v2_cpu(const char *args) {
+    uint64_t cu_calls = 0, cu_cycles = 0;
+    snes_catchup_stats(&cu_calls, &cu_cycles);
+    send_fmt("{\"A\":\"0x%04x\",\"B\":\"0x%02x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+             "\"S\":\"0x%04x\",\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"PB\":\"0x%02x\","
+             "\"P\":\"0x%02x\",\"m\":%d,\"x\":%d,\"e\":%d,"
+             "\"N\":%d,\"V\":%d,\"Z\":%d,\"C\":%d,\"I\":%d,\"D_flag\":%d,"
+             "\"main_cycles\":%llu,\"catchup_calls\":%llu,\"catchup_cycles\":%llu,"
+             "\"spc_pc\":\"0x%04x\",\"timer0_ticks\":%llu,"
+             "\"timer0_target\":%d,\"timer0_div\":%d,\"timer0_cnt\":%d,\"timer0_en\":%d}",
+             g_cpu.A, g_cpu.B, g_cpu.X, g_cpu.Y,
+             g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB,
+             g_cpu.P, g_cpu.m_flag, g_cpu.x_flag, g_cpu.emulation,
+             g_cpu._flag_N, g_cpu._flag_V, g_cpu._flag_Z, g_cpu._flag_C,
+             g_cpu._flag_I, g_cpu._flag_D,
+             (unsigned long long)g_main_cpu_cycles_estimate,
+             (unsigned long long)cu_calls, (unsigned long long)cu_cycles,
+             g_snes && g_snes->apu && g_snes->apu->spc ? g_snes->apu->spc->pc : 0,
+             (unsigned long long)g_apu_timer0_total_ticks,
+             g_snes && g_snes->apu ? g_snes->apu->timer[0].target : 0,
+             g_snes && g_snes->apu ? g_snes->apu->timer[0].divider : 0,
+             g_snes && g_snes->apu ? g_snes->apu->timer[0].counter : 0,
+             g_snes && g_snes->apu ? g_snes->apu->timer[0].enabled : 0);
+}
+
 static void cmd_get_cpu_state(const char *args) {
     if (!g_snes_cpu) { send_fmt("{\"error\":\"cpu not available\"}"); return; }
     Cpu *c = g_snes_cpu;
@@ -3281,6 +3309,7 @@ static void cmd_get_frame_range_extended(const char *args) {
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"ping",          cmd_ping},
+    {"get_v2_cpu",    cmd_get_v2_cpu},
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},

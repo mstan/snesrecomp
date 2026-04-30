@@ -144,6 +144,9 @@ void cpu_state_init(CpuState *cpu, uint8 *ram);
  * thread `cpu` explicitly. */
 extern CpuState g_cpu;
 
+/* Diagnostic — generated functions can call this to log entry. */
+void cpu_dbg_funcname(const char *name);
+
 #ifdef __cplusplus
 }
 #endif

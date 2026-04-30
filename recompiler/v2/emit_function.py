@@ -171,6 +171,7 @@ def emit_function(rom: bytes, bank: int, start: int,
     src.append(f'  extern const char *g_last_recomp_func;')
     src.append(f'  g_last_recomp_func = "{func_name}";')
     src.append(f'  RecompStackPush("{func_name}");')
+    src.append(f'  cpu_dbg_funcname("{func_name}");')
     for i, key in enumerate(block_order):
         src.append(f"  {_label_for(key)}:")
         for ln in block_lines[key]:
