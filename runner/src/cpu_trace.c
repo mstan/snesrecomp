@@ -188,6 +188,147 @@ void cpu_trace_set_func_watch(const char *name) {
     g_func_watch_hash = name ? fnv1a_extern(name) : 0;
 }
 
+/* WRAM-address watches.
+ *
+ * The check loop in cpu_trace_wram_write_check is on the hot path of
+ * every gen-code byte/word store, so it has to be cheap. The big lever
+ * is `g_wram_watch_any`: when no watches are armed it returns instantly.
+ * Once a watch is armed, the linear scan over CPU_WRAM_WATCH_MAX slots
+ * is fine — typical use has <4 watches and the slot count is tiny.
+ *
+ * SNES WRAM mirroring: low banks $00-$3F:0000-1FFF and bank $7E:0000-1FFF
+ * alias the same physical RAM. We store the canonical g_ram offset in
+ * the watch and compare against the offset the caller computed; that
+ * way (bank=$7E, addr=$008c) and (bank=$00, addr=$008c) trip the same
+ * watch without us having to know about mirroring at check time. */
+WramWatch g_wram_watches[CPU_WRAM_WATCH_MAX];
+uint8_t   g_wram_watch_any = 0;
+
+/* Compute the g_ram offset for a (bank, addr) pair. Mirrors the logic
+ * in cpu_state.c::cpu_ram_offset; duplicated here so we can resolve a
+ * watch's offset at arming time without including cpu_state internals. */
+static int32_t wram_offset(uint8_t bank, uint16_t addr) {
+    if (bank == 0x7E) return (int32_t)addr;
+    if (bank == 0x7F) return 0x10000 + (int32_t)addr;
+    if (addr < 0x2000 && (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF))) {
+        return (int32_t)addr;
+    }
+    return -1;
+}
+
+void cpu_trace_set_wram_watch(uint8_t bank, uint16_t addr, int width,
+                              int match_value, uint8_t value, int enabled) {
+    int32_t off = wram_offset(bank, addr);
+    if (off < 0) {
+        fprintf(stderr, "[cpu_trace] WRAM-watch IGNORED: $%02X:%04X is not WRAM\n",
+                bank, addr);
+        fflush(stderr);
+        return;
+    }
+    /* If an existing slot matches (offset, match_value, value), update
+     * its enabled state — don't double-arm the same watch. */
+    int slot = -1;
+    for (int i = 0; i < CPU_WRAM_WATCH_MAX; i++) {
+        WramWatch *w = &g_wram_watches[i];
+        if (w->enabled && w->ram_offset == off &&
+            (uint8_t)(match_value ? 1 : 0) == w->match_value &&
+            (!match_value || w->value == value)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < CPU_WRAM_WATCH_MAX; i++) {
+            if (!g_wram_watches[i].enabled) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "[cpu_trace] WRAM-watch table FULL (max=%d)\n",
+                CPU_WRAM_WATCH_MAX);
+        fflush(stderr);
+        return;
+    }
+    WramWatch *w = &g_wram_watches[slot];
+    w->enabled     = enabled ? 1 : 0;
+    w->match_value = (uint8_t)(match_value ? 1 : 0);
+    w->value       = value;
+    w->width       = (width == 2) ? 2 : 1;
+    w->ram_offset  = off;
+    w->bank        = bank;
+    w->addr        = addr;
+    /* Refresh global "any" flag. */
+    int any = 0;
+    for (int i = 0; i < CPU_WRAM_WATCH_MAX; i++) {
+        if (g_wram_watches[i].enabled) { any = 1; break; }
+    }
+    g_wram_watch_any = (uint8_t)any;
+    fprintf(stderr, "[cpu_trace] WRAM-watch %s slot=%d $%02X:%04X off=%05X "
+                    "%s%s%02X width=%d\n",
+            enabled ? "ARMED" : "DISARMED",
+            slot, bank, addr, (uint32_t)off,
+            match_value ? "==" : "any",
+            match_value ? "$" : "",
+            match_value ? value : 0,
+            w->width);
+    fflush(stderr);
+}
+
+void cpu_trace_clear_wram_watches(void) {
+    memset(g_wram_watches, 0, sizeof(g_wram_watches));
+    g_wram_watch_any = 0;
+}
+
+void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
+                                int32_t ram_off, uint16_t new_val, int width) {
+    if (!g_wram_watch_any || ram_off < 0) return;
+    /* Always-on recorder. Every write to a watched offset goes into the
+     * main trace ring as a CPU_TR_WRAM_WRITE event. The watch does NOT
+     * disarm on record — by the time anyone connects to query, the
+     * earliest writes (e.g. boot-time stores) are already in the ring,
+     * and the user reads backward from "now" to find the writer of
+     * interest. (This is the always-on-ring-buffer pattern in
+     * CLAUDE.md: never time/attach for observability.)
+     *
+     * The match_value flag is now a TRIPWIRE-ONLY add-on: when set, the
+     * first write whose value matches `value` ALSO auto-dumps the
+     * trace+dbpb rings to stderr and disarms the tripwire (NOT the
+     * recording — the slot stays armed and keeps recording subsequent
+     * writes). Tripwires are useful when you know the bad value
+     * up-front and want a stderr dump at the exact instant of the
+     * corruption. Without a tripwire, query the ring via debug-server
+     * commands. */
+    uint8_t b0 = (uint8_t)(new_val & 0xFF);
+    uint8_t b1 = (uint8_t)(new_val >> 8);
+    for (int i = 0; i < CPU_WRAM_WATCH_MAX; i++) {
+        WramWatch *w = &g_wram_watches[i];
+        if (!w->enabled) continue;
+        int hit_byte = -1;        /* 0 = low byte, 1 = high byte */
+        if (w->ram_offset == ram_off) hit_byte = 0;
+        else if (width == 2 && w->ram_offset == ram_off + 1) hit_byte = 1;
+        if (hit_byte < 0) continue;
+        uint8_t hit_val = (hit_byte == 0) ? b0 : b1;
+        /* Always record. extra0 = new value, extra1 = (bank<<8) | hit_byte. */
+        uint32_t pc24 = ((uint32_t)cpu->PB << 16); /* low 16 unknown at write site */
+        capture(cpu, pc24, CPU_TR_WRAM_WRITE, hit_val,
+                (uint16_t)(((uint16_t)bank << 8) | (uint16_t)hit_byte));
+        /* Tripwire branch: only if match_value is set AND the value matches.
+         * The tripwire is one-shot to avoid stderr spam on tight write
+         * loops; recording continues regardless. */
+        if (w->match_value && hit_val == w->value) {
+            char tag[160];
+            snprintf(tag, sizeof(tag),
+                     "WRAM-TRIP HIT $%02X:%04X[%d]=$%02X (width=%d) "
+                     "at PC ~$%02X:???? slot=%d",
+                     bank, addr, hit_byte, hit_val, width, cpu->PB, i);
+            cpu_trace_dump_dbpb(tag);
+            cpu_trace_dump_recent(tag, 256);
+            w->match_value = 0;  /* one-shot tripwire; record stays on */
+        }
+        /* Don't `return` — multiple watches can cover the same offset
+         * (e.g. bytewise + wordwise) and each gets its own recording. */
+    }
+}
+
 /* Off-rails dump: ONE dump per (tag, distinct hint) — silent for repeat
  * hits of the same kind. The first occurrence captures the chain;
  * additional repeats add nothing. Burning tokens on millions of
@@ -249,9 +390,22 @@ void cpu_trace_arm_default_watches(void) {
     /* Empty fallback stub from bank03.cfg — if reached, codegen has
      * routed past the dispatch HLE. */
     cpu_trace_set_func_watch("GameMode14_InLevel_0086DF");
+    /* WRAM recorder for known-investigation addresses. These slots
+     * always-on-record every write to the offset; user reads backward.
+     * $7E:008c — high byte of GraphicsCompPtr (decompressor bank).
+     *   $00:B888 should write $08; if anything else writes here we want
+     *   the writer in the ring. No tripwire (match_value=0) so we keep
+     *   recording past the first event. */
+    cpu_trace_set_wram_watch(0x7E, 0x008C, 1, 0, 0, 1);
+    /* $7E:008a/$7E:008b — low/mid bytes of GraphicsCompPtr. The
+     * fetch-byte routine INCs $8c only when the low pair wraps, so
+     * having the full triplet in the ring lets us reconstruct ptr
+     * advancement vs out-of-band corruption. */
+    cpu_trace_set_wram_watch(0x7E, 0x008A, 1, 0, 0, 1);
+    cpu_trace_set_wram_watch(0x7E, 0x008B, 1, 0, 0, 1);
     fprintf(stderr, "[cpu_trace] default watches armed: "
             "DB high banks + odd middle, PB!=0, S out-of-$01XX-$1FFF, "
-            "GameMode14_InLevel_0086DF\n");
+            "GameMode14_InLevel_0086DF, WRAM recorders on $7E:008A/8B/8C\n");
     fflush(stderr);
 }
 
@@ -278,6 +432,7 @@ static const char *event_name(uint8_t et) {
         case CPU_TR_DB_WRITE: return "DB-WR";
         case CPU_TR_PB_WRITE: return "PB-WR";
         case CPU_TR_FUNC_ENTRY: return "FUNC";
+        case CPU_TR_WRAM_WRITE: return "WRAM";
         default:              return "?";
     }
 }
@@ -314,9 +469,71 @@ void cpu_trace_dump_recent(const char *tag, int n) {
             case CPU_TR_FUNC_ENTRY:
                 fprintf(stderr, "  hash=%08X", e->native_func_id_or_hash);
                 break;
+            case CPU_TR_WRAM_WRITE:
+                fprintf(stderr, "  bank=%02X byte=%u newval=$%02X",
+                        (uint8_t)(e->extra1 >> 8),
+                        (uint8_t)(e->extra1 & 0xFF), e->extra0);
+                break;
         }
         fprintf(stderr, "\n");
     }
+    fflush(stderr);
+}
+
+void cpu_trace_dump_wram(const char *tag, int scan_n) {
+    int total = (int)((g_cpu_trace_idx < CPU_TRACE_RING_LEN) ?
+                      g_cpu_trace_idx : CPU_TRACE_RING_LEN);
+    if (scan_n <= 0 || scan_n > total) scan_n = total;
+    fprintf(stderr, "=== %s — WRAM-WRITE events in last %d ring entries (newest first) ===\n",
+            tag ? tag : "wram", scan_n);
+    /* Walk backward and remember the most-recent BLOCK / FUNC for each
+     * WRAM_WRITE we emit, so the caller can attribute each write to a
+     * function context without dumping the entire ring. */
+    int wram_count = 0;
+    for (int i = 0; i < scan_n && wram_count < 256; i++) {
+        uint64_t abs_idx = g_cpu_trace_idx - 1 - (uint64_t)i;
+        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        CpuTraceEvent *e = &g_cpu_trace_ring[slot];
+        if (e->event_type != CPU_TR_WRAM_WRITE) continue;
+        wram_count++;
+        uint8_t hit_bank = (uint8_t)(e->extra1 >> 8);
+        uint8_t hit_byte = (uint8_t)(e->extra1 & 0xFF);
+        fprintf(stderr,
+                "  [WRAM] idx=%llu PC≈$%02X:???? bank=$%02X byte=%u newval=$%02X "
+                "DB=%02X PB=%02X A=%04X X=%04X Y=%04X S=%04X D=%04X m=%u x=%u",
+                (unsigned long long)abs_idx, (uint8_t)(e->pc24 >> 16),
+                hit_bank, hit_byte, e->extra0,
+                e->DB, e->PB, e->A, e->X, e->Y, e->S, e->D, e->M, e->XF);
+        /* Find the most-recent FUNC entry preceding this write. Walk
+         * forward in time from the WRAM event toward newer events first
+         * (no — we want what was running, so walk OLDER). Actually want
+         * most-recent FUNC AT OR BEFORE this WRAM event. */
+        for (int j = 1; j <= 4096; j++) {
+            uint64_t prev_abs = abs_idx - (uint64_t)j;
+            if (prev_abs >= g_cpu_trace_idx) break;  /* underflow guard */
+            int prev_slot = (int)(prev_abs & (CPU_TRACE_RING_LEN - 1));
+            CpuTraceEvent *p = &g_cpu_trace_ring[prev_slot];
+            if (p->event_type == CPU_TR_FUNC_ENTRY) {
+                fprintf(stderr, "  in func@$%06X hash=%08X",
+                        p->pc24, p->native_func_id_or_hash);
+                break;
+            }
+        }
+        /* Also find most-recent BLOCK at or before this event. */
+        for (int j = 1; j <= 256; j++) {
+            uint64_t prev_abs = abs_idx - (uint64_t)j;
+            if (prev_abs >= g_cpu_trace_idx) break;
+            int prev_slot = (int)(prev_abs & (CPU_TRACE_RING_LEN - 1));
+            CpuTraceEvent *p = &g_cpu_trace_ring[prev_slot];
+            if (p->event_type == CPU_TR_BLOCK) {
+                fprintf(stderr, "  block@$%06X", p->pc24);
+                break;
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "  (%d WRAM-WRITE events found in last %d entries)\n",
+            wram_count, scan_n);
     fflush(stderr);
 }
 

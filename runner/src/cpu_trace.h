@@ -53,6 +53,7 @@ enum {
     CPU_TR_DB_WRITE = 11,  /* any direct cpu->DB mutation */
     CPU_TR_PB_WRITE = 12,  /* any direct cpu->PB mutation */
     CPU_TR_FUNC_ENTRY = 13,  /* generated function entry */
+    CPU_TR_WRAM_WRITE = 14,  /* watched WRAM byte/word write */
 };
 
 typedef struct CpuTraceEvent {
@@ -84,11 +85,12 @@ typedef struct CpuDbpbEvent {
 } CpuDbpbEvent;
 
 /* Ring sizes: with always-on continuous capture there's no reason to
- * keep these tight. 64K main events @ ~64B/entry = ~4MB; well within
- * any modern host's idle memory budget, and gives roughly 30+ frames
- * of execution history for backwards investigation even at high block
- * rates. Keep DB/PB ring smaller because mutations are rare. */
-#define CPU_TRACE_RING_LEN  (64 * 1024)
+ * keep these tight. 1M main events @ ~32B/entry = ~32MB; fine on
+ * modern hosts and big enough to hold the entire boot phase plus
+ * many seconds of game state for backwards investigation, even at
+ * high block rates. Keep DB/PB ring smaller because mutations are
+ * rare. */
+#define CPU_TRACE_RING_LEN  (1024 * 1024)
 #define CPU_DBPB_RING_LEN   1024
 
 #if SNESRECOMP_TRACE
@@ -118,6 +120,47 @@ void cpu_trace_pb_change(CpuState *cpu, uint32_t pc24, uint8_t old_pb,
 void cpu_trace_set_db_watch(uint8_t db_byte, int enabled);
 void cpu_trace_set_pb_watch(uint8_t pb_byte, int enabled);
 void cpu_trace_set_s_range_watch(uint16_t s_lo, uint16_t s_hi, int enabled);
+
+/* WRAM-address watch.
+ *
+ * Fires when a watched WRAM byte/word is written through cpu_write8 /
+ * cpu_write16. Up to CPU_WRAM_WATCH_MAX simultaneous watches are
+ * supported; if `match_value` is non-zero, the watch only fires when
+ * the new low byte equals `value` (so you can ask "tell me when $7E:008c
+ * becomes $57" instead of "tell me every write to $7E:008c").
+ *
+ * The watch hooks the cpu_write* path, so it captures gen-code stores
+ * but NOT direct g_ram[off] writes from hand-body C. Hand bodies that
+ * matter should route through CPU_WRAM_WRITE_TRACE() (see common_rtl).
+ *
+ * The bank field is matched modulo SNES WRAM mirroring: a watch at
+ * ($7E, $008c) also fires for writes to ($00, $008c) etc. — they hit the
+ * same g_ram offset. */
+#define CPU_WRAM_WATCH_MAX 16
+
+typedef struct WramWatch {
+    uint8_t  enabled;
+    uint8_t  match_value;   /* 0 = any, 1 = only when new_val == value */
+    uint8_t  value;
+    uint8_t  width;         /* 1 or 2 (informational; check happens per-byte) */
+    int32_t  ram_offset;    /* g_ram offset; -1 = not WRAM */
+    uint8_t  bank;          /* original bank for dump display */
+    uint16_t addr;          /* original addr for dump display */
+} WramWatch;
+
+extern WramWatch g_wram_watches[CPU_WRAM_WATCH_MAX];
+
+void cpu_trace_set_wram_watch(uint8_t bank, uint16_t addr, int width,
+                              int match_value, uint8_t value, int enabled);
+void cpu_trace_clear_wram_watches(void);
+/* Called from cpu_write8 / cpu_write16 AFTER the store completes. The
+ * RAM offset has already been computed by the caller; pass it through
+ * so we don't recompute the bank/addr → offset map here. `width` is 1
+ * or 2 (the call site decides). For 16-bit writes the helper checks
+ * each watched offset against off and off+1 separately so a watch on
+ * the high byte still fires when STZ touches both bytes. */
+void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
+                                int32_t ram_off, uint16_t new_val, int width);
 /* If `name` matches a function entry, fire a one-shot trace dump and
  * disarm. Useful for "did the empty fallback stub get called?" probes
  * (e.g. arm on "GameMode14_InLevel_0086DF" to catch the next miss). */
@@ -139,6 +182,12 @@ void cpu_trace_clear(void);
 void cpu_trace_dump_recent(const char *tag, int n);
 /* Dump the entire dbpb ring (newest first). */
 void cpu_trace_dump_dbpb(const char *tag);
+/* Filtered dump: walk backward over the main ring (up to `scan_n` events)
+ * and print only CPU_TR_WRAM_WRITE events plus the most-recent BLOCK or
+ * FUNC_ENTRY that PRECEDED each (so we know who was running when the
+ * write happened). When `scan_n <= 0`, scans the entire ring.
+ * Newest-first ordering. */
+void cpu_trace_dump_wram(const char *tag, int scan_n);
 
 #else  /* SNESRECOMP_TRACE = 0 */
 
@@ -153,12 +202,16 @@ static inline void cpu_trace_pb_change(CpuState *cpu, uint32_t pc24, uint8_t o,
 static inline void cpu_trace_set_db_watch(uint8_t b, int e)                 { (void)b; (void)e; }
 static inline void cpu_trace_set_pb_watch(uint8_t b, int e)                 { (void)b; (void)e; }
 static inline void cpu_trace_set_s_range_watch(uint16_t l, uint16_t h, int e){ (void)l; (void)h; (void)e; }
+static inline void cpu_trace_set_wram_watch(uint8_t b, uint16_t a, int w, int mv, uint8_t v, int e) { (void)b; (void)a; (void)w; (void)mv; (void)v; (void)e; }
+static inline void cpu_trace_clear_wram_watches(void) { }
+static inline void cpu_trace_wram_write_check(CpuState *c, uint8_t b, uint16_t a, int32_t off, uint16_t nv, int w) { (void)c; (void)b; (void)a; (void)off; (void)nv; (void)w; }
 static inline void cpu_trace_set_func_watch(const char *n)                  { (void)n; }
 static inline void cpu_trace_arm_default_watches(void)                       { }
 static inline void cpu_trace_offrails(const char *t, uint32_t h)            { (void)t; (void)h; }
 static inline void cpu_trace_clear(void)                                    { }
 static inline void cpu_trace_dump_recent(const char *tag, int n)            { (void)tag; (void)n; }
 static inline void cpu_trace_dump_dbpb(const char *tag)                     { (void)tag; }
+static inline void cpu_trace_dump_wram(const char *tag, int n)              { (void)tag; (void)n; }
 
 #endif
 

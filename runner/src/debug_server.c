@@ -3360,6 +3360,56 @@ static void cmd_arm_watches(const char *args) {
     send_fmt("{\"ok\":true,\"armed\":\"defaults\"}");
 }
 
+/* Arm a WRAM-address watch.
+ * args: "<bank-hex> <addr-hex> <width> [match_value=0|1] [value-hex] [enable=1]"
+ *   bank      e.g. 7E
+ *   addr      e.g. 008c
+ *   width     1 or 2
+ *   match_value  0 = fire on any write, 1 = only when new low byte == value
+ *   value     hex byte to match against (only used when match_value==1)
+ *   enable    0 = disarm matching slot, 1 = arm
+ * Example for "fire when $7E:008c becomes $57":
+ *   set_wram_watch 7E 008c 1 1 57 1
+ * Example for "fire on any write to $7E:008c":
+ *   set_wram_watch 7E 008c 1
+ */
+static void cmd_set_wram_watch(const char *args) {
+    unsigned int bank = 0, addr = 0, width = 1, match_value = 0, value = 0;
+    int enable = 1;
+    int n = sscanf(args ? args : "", "%x %x %u %u %x %d",
+                   &bank, &addr, &width, &match_value, &value, &enable);
+    if (n < 3) {
+        send_fmt("{\"error\":\"usage: set_wram_watch <bank> <addr> "
+                 "<width 1|2> [match_value 0|1] [value-hex] [enable 0|1]\"}");
+        return;
+    }
+    cpu_trace_set_wram_watch((uint8_t)bank, (uint16_t)addr, (int)width,
+                             (int)match_value, (uint8_t)value, enable);
+    send_fmt("{\"ok\":true,\"bank\":\"0x%02X\",\"addr\":\"0x%04X\","
+             "\"width\":%u,\"match_value\":%u,\"value\":\"0x%02X\","
+             "\"enabled\":%d}",
+             bank & 0xFF, addr & 0xFFFF, width, match_value,
+             value & 0xFF, enable);
+}
+
+static void cmd_clear_wram_watches(const char *args) {
+    (void)args;
+    cpu_trace_clear_wram_watches();
+    send_fmt("{\"ok\":true,\"cleared\":true}");
+}
+
+/* Dump only WRAM_WRITE events from the trace ring. Each event includes
+ * the most-recent function + block context preceding it, so you can
+ * attribute the write without dumping the whole ring. Output goes to
+ * stderr (the SMW process). args: "<scan_n>" — how far back to scan;
+ * 0 = entire ring. */
+static void cmd_trace_dump_wram(const char *args) {
+    int n = 0;
+    sscanf(args ? args : "", "%d", &n);
+    cpu_trace_dump_wram("wram cmd", n);
+    send_fmt("{\"ok\":true,\"scanned\":%d}", n);
+}
+
 /* SPC PC histogram so we can see *exactly* which engine PCs the SPC
  * spends time in. apu.c samples spc->pc once per apu_cycle when SPC
  * starts a new opcode (cpuCyclesLeft was 0). */
@@ -3470,6 +3520,9 @@ static const CmdEntry s_commands[] = {
     {"trace_clear",    cmd_trace_clear},
     {"set_db_watch",   cmd_set_db_watch},
     {"arm_watches",    cmd_arm_watches},
+    {"set_wram_watch", cmd_set_wram_watch},
+    {"clear_wram_watches", cmd_clear_wram_watches},
+    {"trace_dump_wram", cmd_trace_dump_wram},
     {"get_spc_writes", cmd_get_spc_writes},
     {"get_spc_pc_hist", cmd_get_spc_pc_hist},
     {"get_apu_misc",   cmd_get_apu_misc},

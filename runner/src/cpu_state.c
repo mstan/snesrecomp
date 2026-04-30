@@ -20,6 +20,7 @@
 
 #include "cpu_state.h"
 #include "common_rtl.h"
+#include "cpu_trace.h"
 
 CpuState g_cpu;
 
@@ -128,7 +129,11 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
 
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     int off = cpu_ram_offset(bank, addr);
-    if (off >= 0) { cpu->ram[off] = v; return; }
+    if (off >= 0) {
+        cpu->ram[off] = v;
+        cpu_trace_wram_write_check(cpu, bank, addr, off, v, 1);
+        return;
+    }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
     /* ROM / unmapped write: drop. */
 }
@@ -138,6 +143,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     if (off >= 0 && off + 1 < 0x20000) {
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
+        cpu_trace_wram_write_check(cpu, bank, addr, off, v, 2);
         return;
     }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
