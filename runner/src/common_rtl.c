@@ -5,9 +5,11 @@
 #include "util.h"
 #include "config.h"
 #include "snes/snes.h"
+#include "snes/apu.h"
 #include "debug_server.h"
 
 uint8 g_ram[0x20000];
+int g_force_apu_bbaa = 0;
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
@@ -221,6 +223,33 @@ uint8 ReadReg(uint16 reg) {
 }
 
 uint16 ReadRegWord(uint16 reg) {
+  // APU port quirk: 16-bit CMP $2140 must see a CONSISTENT outPorts
+  // snapshot. Two separate ReadReg calls would each catch the APU
+  // up — between them the SPC could write only the LO byte (port 0)
+  // before host has read HI (port 1), so host sees a torn value. Read
+  // both ports atomically (single catchup) for the APU-port range.
+  if (reg >= 0x2140 && reg <= 0x217F) {
+    extern void rtl_accumulate_apu_catchup(void);
+    void RtlApuLock(void); void RtlApuUnlock(void);
+    void snes_catchupApu(Snes* snes);
+    extern Snes *g_snes;
+    extern int g_force_apu_bbaa;
+    RtlApuLock();
+    rtl_accumulate_apu_catchup();
+    snes_catchupApu(g_snes);
+    uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
+    uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
+    RtlApuUnlock();
+    /* TEMP DIAGNOSTIC: persistent force of BBAA into outPorts[0..1]
+     * for the 16-bit read path at $2140. If host's CMP $2140==BBAA
+     * poll is broken, this won't help. If it's correct, it'll fire
+     * the BNE-not-taken and Inner will progress. */
+    if (g_force_apu_bbaa && reg == 0x2140) {
+      lo = 0xAA;
+      hi = 0xBB;
+    }
+    return (uint16_t)lo | ((uint16_t)hi << 8);
+  }
   uint16_t rv = ReadReg(reg);
   rv |= ReadReg(reg + 1) << 8;
   return rv;

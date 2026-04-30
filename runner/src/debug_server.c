@@ -3306,10 +3306,22 @@ static void cmd_get_frame_range_extended(const char *args) {
     send_line(buf);
 }
 
+/* Persistent BBAA injection: every 16-bit read of $2140 returns
+ * $BBAA when set. Helps isolate whether boot is hung on engine-not-
+ * writing vs host-poll-broken. */
+extern int g_force_apu_bbaa;
+static void cmd_force_apu_bbaa(const char *args) {
+    int v = 1;
+    sscanf(args ? args : "", "%d", &v);
+    g_force_apu_bbaa = v;
+    send_fmt("{\"ok\":true,\"force\":%d}", g_force_apu_bbaa);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"ping",          cmd_ping},
     {"get_v2_cpu",    cmd_get_v2_cpu},
+    {"force_apu_bbaa", cmd_force_apu_bbaa},
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
