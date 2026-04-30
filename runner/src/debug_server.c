@@ -3317,11 +3317,60 @@ static void cmd_force_apu_bbaa(const char *args) {
     send_fmt("{\"ok\":true,\"force\":%d}", g_force_apu_bbaa);
 }
 
+/* Dump write counts for SPC apu_cpuWrite addresses. Shows whether
+ * engine ever touches $F4-$F7 (outPorts), $F1 (control/timer enable), etc. */
+extern uint64_t g_spc_write_counts[0x100];
+extern uint64_t g_spc_outport_value_counts[4 * 256];
+typedef struct { uint8_t adr; uint8_t val; } SpcWriteRec;
+extern SpcWriteRec g_spc_recent_outport_writes[32];
+extern int g_spc_recent_outport_idx;
+
+static void cmd_get_spc_writes(const char *args) {
+    /* Dump (a) per-address counts $F0-$FF, (b) top 8 most-written values
+     * for each outPort, (c) recent 32 outPort writes. */
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "{\"writes\":{");
+    for (int a = 0xF0; a <= 0xFF; a++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s\"0x%02X\":%llu",
+                        (a == 0xF0) ? "" : ",",
+                        a, (unsigned long long)g_spc_write_counts[a]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "},\"top_vals\":[");
+    for (int port = 0; port < 4; port++) {
+        if (port) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        /* Find values with non-zero counts. */
+        int count = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"port\":%d,\"vals\":{", port);
+        for (int v = 0; v < 256; v++) {
+            uint64_t c = g_spc_outport_value_counts[port * 256 + v];
+            if (c > 0) {
+                if (count) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "\"0x%02X\":%llu", v, (unsigned long long)c);
+                count++;
+                if (count > 8) break;
+            }
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "}}");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"recent\":[");
+    for (int i = 0; i < 32; i++) {
+        int idx = (g_spc_recent_outport_idx - 32 + i) & 31;
+        if (i) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "[\"0x%02X\",\"0x%02X\"]",
+                        g_spc_recent_outport_writes[idx].adr,
+                        g_spc_recent_outport_writes[idx].val);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"ping",          cmd_ping},
     {"get_v2_cpu",    cmd_get_v2_cpu},
     {"force_apu_bbaa", cmd_force_apu_bbaa},
+    {"get_spc_writes", cmd_get_spc_writes},
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},

@@ -126,7 +126,25 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
   return apu->ram[adr];
 }
 
+/* Diagnostic counters: track SPC writes to specific addresses so we
+ * can see whether the engine is touching outPorts at all. */
+uint64_t g_spc_write_counts[0x100] = {0};
+/* Per-value count for outPorts $F4-$F7. Index = (port_idx * 256) + val. */
+uint64_t g_spc_outport_value_counts[4 * 256] = {0};
+/* Last 32 outPort writes as a ring buffer: [adr, val] pairs. */
+typedef struct { uint8_t adr; uint8_t val; } SpcWriteRec;
+SpcWriteRec g_spc_recent_outport_writes[32];
+int g_spc_recent_outport_idx = 0;
+
 void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
+  if (adr < 0x100) g_spc_write_counts[adr]++;
+  if (adr >= 0xF4 && adr <= 0xF7) {
+    int port = adr - 0xF4;
+    g_spc_outport_value_counts[port * 256 + val]++;
+    int i = g_spc_recent_outport_idx++ & 31;
+    g_spc_recent_outport_writes[i].adr = (uint8_t)adr;
+    g_spc_recent_outport_writes[i].val = val;
+  }
   switch(adr) {
     case 0xf0: {
       break; // test register

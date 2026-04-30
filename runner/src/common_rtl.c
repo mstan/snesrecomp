@@ -9,6 +9,11 @@
 #include "debug_server.h"
 
 uint8 g_ram[0x20000];
+/* Diag flag — set via debug_server `force_apu_bbaa <0|1>` cmd. When 1,
+ * every 16-bit read of $2140 returns $BBAA, satisfying the host's
+ * SPC-handshake poll. Useful for proving the host-side compare logic
+ * is correct (with this on, host advances into the SPC upload data
+ * loop) and for isolating remaining engine-side issues. Default off. */
 int g_force_apu_bbaa = 0;
 uint8 *g_sram;
 int g_sram_size;
