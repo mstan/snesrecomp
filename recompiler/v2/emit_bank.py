@@ -73,16 +73,14 @@ def emit_bank(rom: bytes, bank: int,
 
     parts: List[str] = [file_header, ""]
 
-    # Forward decls for every in-bank entry. Within one TU, calls to
-    # later-defined functions need a prior declaration; the file header
-    # only includes funcs.h (which carries v2_sync_funcs_h's friendly-
-    # name declarations) so synthetic auto-promoted `bank_BB_AAAA`
-    # entries — which never make it to funcs.h — still need a forward
-    # decl here.
+    # Forward decls for every in-bank entry. Each entry emits at the
+    # variant-mangled name (`Foo_M{m}X{x}`); calls to later-defined
+    # functions need the suffixed declaration to satisfy C lookup.
     parts.append("/* Forward declarations for in-bank entries. */")
     for entry in entries:
-        name = entry.name or _default_func_name_local(bank, entry.start)
-        parts.append(f"void {name}(CpuState *cpu);")
+        base = entry.name or _default_func_name_local(bank, entry.start)
+        suffix = _variant_suffix(entry.entry_m, entry.entry_x)
+        parts.append(f"void {base}{suffix}(CpuState *cpu);")
     parts.append("")
 
     for entry in entries:
@@ -99,11 +97,38 @@ def emit_bank(rom: bytes, bank: int,
         parts.append(src)
         parts.append("")  # blank line between functions
 
+    # Aliases for cfg-named entries — un-suffixed wrapper that calls
+    # into one specific variant. Hand-written entry-point shims (e.g.
+    # smw_rtl.c calling `I_RESET(&g_cpu)`) bind to these. The alias
+    # picks the cfg-declared (entry_m, entry_x) — i.e. the canonical
+    # entry for that name. If a function has multiple (m,x) variants
+    # only one alias is emitted (the cfg-default); other variants are
+    # reachable only through gen-emitted Call ops that mangle names.
+    aliased: set = set()
+    for entry in entries:
+        if not entry.name:
+            continue
+        if entry.name in aliased:
+            continue
+        suffix = _variant_suffix(entry.entry_m, entry.entry_x)
+        aliased.add(entry.name)
+        parts.append(
+            f"void {entry.name}(CpuState *cpu) {{ {entry.name}{suffix}(cpu); }}"
+        )
+    if aliased:
+        parts.append("")
+
     return "\n".join(parts)
 
 
 def _default_func_name_local(bank: int, start: int) -> str:
     return f"bank_{bank:02X}_{start:04X}"
+
+
+def _variant_suffix(m: int, x: int) -> str:
+    """Mirror of codegen._variant_suffix — duplicated to avoid the
+    cross-module import cycle. Must stay in sync."""
+    return f"_M{m & 1}X{x & 1}"
 
 
 def _default_file_header(bank: int) -> str:

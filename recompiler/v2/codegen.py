@@ -41,11 +41,36 @@ from typing import Dict, List  # noqa: E402
 # it falls back to the synthetic `bank_BB_AAAA` form.
 _NAME_RESOLVER: Dict[int, str] = {}
 
-# Set of 24-bit Call targets (bank << 16 | pc) emitted with the synthetic
-# `bank_BB_AAAA` form because no friendly name was registered. v2_regen
-# reads + clears this between passes to auto-promote unresolved targets
-# into emit entries (mirrors v1's JSL/JSR auto-promote).
+# Set of (24-bit Call target, entry_m, entry_x) tuples for EVERY Call
+# emitted, regardless of whether the friendly name resolved. v2_regen
+# diffs this against the set of (addr, m, x) variants actually emitted
+# and adds missing entries to cover any unmet demand.
+#
+# Why track ALL targets, not just unresolved ones: cfg-named targets
+# (e.g. UpdateEntirePalette) might only have an M1X1 entry in cfg, but
+# get called from M0X0 callers. The Call site needs UpdateEntirePalette
+# _M0X0 to exist; tracking the (target, m, x) tuple lets v2_regen
+# discover the unmet variant and clone the cfg entry at the new (m, x).
+#
+# Per-(m, x) tracking: a 65816 function decoded with M=1 X=1 is a
+# different instruction stream than M=1 X=0 because LDX #imm consumes
+# 2 vs 3 bytes (and LDA/LDY immediates similarly with M). So a single
+# ROM function reachable from contexts with different (m, x) must emit
+# multiple C bodies.
 _UNRESOLVED_CALL_TARGETS: set = set()
+
+
+def _variant_suffix(m: int, x: int) -> str:
+    """Return the `_M{m}X{x}` suffix used for per-variant function names.
+
+    Centralised so emit_function, _emit_call, and the cross-tool
+    sync_funcs_h regen all agree on the mangling. Suffix is universal
+    in v2 — every gen function name carries it, every call site
+    appends it. Hand-written entry-point shims (e.g. I_RESET in
+    smw_rtl.c) rely on cfg-emitted aliases that drop the suffix for
+    the cfg-default (m,x).
+    """
+    return f"_M{m & 1}X{x & 1}"
 
 
 def set_name_resolver(name_map: Dict[int, str]) -> None:
@@ -679,6 +704,14 @@ def _emit_dispatch(insn) -> List[str]:
     entries = insn.dispatch_entries
     kind = getattr(insn, 'dispatch_kind', 'short')
     n = len(entries)
+    # The dispatched handlers are entered with the dispatcher's (m, x)
+    # at the JSL site — same rule as _emit_call. The dispatch helper
+    # itself doesn't touch M/X before transferring control. Take the
+    # JSL insn's m_flag/x_flag (set by the decoder under whichever
+    # entry-state reached this body).
+    em = getattr(insn, 'm_flag', 1) & 1
+    ex = getattr(insn, 'x_flag', 1) & 1
+    suffix = _variant_suffix(em, ex)
     lines = ["{ /* JSL dispatch — short=2B / long=3B table */"]
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append("  uint16 _idx = (uint16)(cpu->A & 0xFF);")
@@ -696,10 +729,12 @@ def _emit_dispatch(insn) -> List[str]:
             target_bank = bank
             local_pc = e & 0xFFFF
             tgt_addr = (bank << 16) | local_pc
-        name = _NAME_RESOLVER.get(tgt_addr)
-        if name is None:
-            name = f"bank_{target_bank:02X}_{local_pc:04X}"
-            _UNRESOLVED_CALL_TARGETS.add(tgt_addr)
+        base_name = _NAME_RESOLVER.get(tgt_addr)
+        if base_name is None:
+            base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
+        # Record demand for both resolved and synthetic targets.
+        _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+        name = f"{base_name}{suffix}"
         lines.append(
             f"    case {i}: {{ uint8 _saved_pb = cpu->PB; "
             f"cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL); "
@@ -721,12 +756,16 @@ def _emit_call(op: Call) -> List[str]:
     if op.target is None:
         return ["/* Call: target unknown — caller dispatches */"]
     addr = op.target & 0xFFFFFF
-    name = _NAME_RESOLVER.get(addr)
-    if name is None:
+    suffix = _variant_suffix(op.entry_m, op.entry_x)
+    base_name = _NAME_RESOLVER.get(addr)
+    if base_name is None:
         bank = (addr >> 16) & 0xFF
         pc = addr & 0xFFFF
-        name = f"bank_{bank:02X}_{pc:04X}"
-        _UNRESOLVED_CALL_TARGETS.add(addr)
+        base_name = f"bank_{bank:02X}_{pc:04X}"
+    # Always record demand — cfg-named targets need their (m, x)
+    # variants discovered too, not just synthetic-named auto-promotes.
+    _UNRESOLVED_CALL_TARGETS.add((addr, op.entry_m & 1, op.entry_x & 1))
+    name = f"{base_name}{suffix}"
     target_bank = (addr >> 16) & 0xFF
     if op.long:
         # JSL: real hardware sets PB to the target bank for the call's

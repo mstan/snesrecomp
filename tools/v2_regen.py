@@ -154,6 +154,150 @@ def main() -> int:
     print(f"  detected {classified['short']} short + {classified['long']} long dispatch helpers "
           f"(scanned {len(jsl_targets)} JSL/JML targets)")
 
+    # Pre-pass: discover (callee_addr_24, m, x) variants needed.
+    #
+    # The (M, X) flags affect 65816 instruction byte counts (LDA #imm
+    # is 3 bytes when M=0, 2 bytes when M=1; same shape for LDX/LDY +
+    # X). A function reached from contexts with different (m, x)
+    # decodes to a literally different instruction stream and must be
+    # emitted as a separate C body. This pre-pass scans every cfg
+    # entry's Call ops and collects all per-(m, x) variants that
+    # caller code asks for, so later emit can synthesise BankEntries
+    # with the right entry_m/entry_x — instead of letting auto-promote
+    # default everything to (1, 1) and emit a single body that's wrong
+    # for half its callers.
+    #
+    # Without this pre-pass the FetchByte class of bug recurs: cfg
+    # declares `func DecompressTo_FetchByte b983` (entry default 1,1),
+    # decoder emits one M1X1 body, but DecompressTo callers run x=0
+    # and the M1X1 body misdecodes LDX #$8000 as LDX #$00 + falling
+    # opcode bytes.
+    print()
+    print("Discovering per-(m,x) variants (fixed-point)...")
+    # variants: dict[addr_24 -> set[(m, x)]]
+    #
+    # Iterate to a fixed point. Each pass decodes every (entry_addr, m, x)
+    # we haven't decoded yet, scans its Call ops for callee (m, x)
+    # demands, and adds any new (callee_addr, m, x) tuples to the queue.
+    # Without iteration, Call ops INSIDE auto-promoted variants would
+    # not contribute to discovery — so e.g. cfg declares Foo at M1X1,
+    # we discover Bar needs M0X0, but Bar(M0X0)'s body's Calls into Baz
+    # at M0X0 stay invisible until Bar(M0X0) is itself decoded.
+    variants: dict[int, set] = {}
+    # Seed with cfg-default entries.
+    queue: list[tuple[int, int, int, int, "Optional[int]"]] = []  # (bank, start, m, x, end)
+    addr_to_end: dict[int, "Optional[int]"] = {}
+    addr_to_bank: dict[int, int] = {}
+    for bank, _cfg_path, cfg in parsed:
+        for entry in cfg.entries:
+            addr = (bank << 16) | (entry.start & 0xFFFF)
+            addr_to_end[addr] = entry.end
+            addr_to_bank[addr] = bank
+            mx = (entry.entry_m & 1, entry.entry_x & 1)
+            if mx not in variants.setdefault(addr, set()):
+                variants[addr].add(mx)
+                queue.append((bank, entry.start, mx[0], mx[1], entry.end))
+
+    decoded: set = set()  # (addr, m, x) already decoded for variant discovery
+    iterations = 0
+    # Cap is generous: ~2000 entries × 4 (m, x) variants = 8000 max
+    # decode budget; double that for headroom.
+    while queue:
+        iterations += 1
+        if iterations > 100000:
+            print(f"  variant discovery loop overran 100000 iterations — bailing")
+            break
+        bank, start, em, ex, end = queue.pop()
+        addr = (bank << 16) | (start & 0xFFFF)
+        if (addr, em, ex) in decoded:
+            continue
+        decoded.add((addr, em, ex))
+        try:
+            graph = decode_function(rom, bank, start,
+                                    entry_m=em, entry_x=ex,
+                                    end=end,
+                                    dispatch_helpers=dispatch_helpers)
+        except Exception:
+            continue
+        for di in graph.insns.values():
+            ins = di.insn
+            # JSR ABS (length 3) and JSL (length 4) — both produce a
+            # Call IR. Indirect-X JSR has no static target.
+            if ins.mnem == 'JSR' and ins.length == 3:
+                src_bank = (ins.addr >> 16) & 0xFF
+                target = ((src_bank << 16) | (ins.operand & 0xFFFF))
+            elif ins.mnem == 'JSL':
+                target = ins.operand & 0xFFFFFF
+            elif ins.mnem == 'JMP' and ins.length == 4:
+                # JML is a tail-call equivalent; treat similarly.
+                target = ins.operand & 0xFFFFFF
+            else:
+                # Dispatch tables on this insn still demand variants.
+                target = None
+            if target is not None:
+                em2 = ins.m_flag & 1
+                ex2 = ins.x_flag & 1
+                if (em2, ex2) not in variants.setdefault(target, set()):
+                    variants[target].add((em2, ex2))
+                    # Queue decode of this variant if it's an in-cfg target.
+                    if target in addr_to_end:
+                        tb = addr_to_bank[target]
+                        ts = target & 0xFFFF
+                        queue.append((tb, ts, em2, ex2, addr_to_end[target]))
+            # Dispatch tables: each entry is also a callee with the
+            # dispatcher's (m, x).
+            for d_target in getattr(ins, 'dispatch_entries', None) or []:
+                if d_target == 0:
+                    continue
+                if getattr(ins, 'dispatch_kind', 'short') == 'long':
+                    d_addr = d_target & 0xFFFFFF
+                else:
+                    d_addr = ((ins.addr >> 16) & 0xFF) << 16 | (d_target & 0xFFFF)
+                em2 = ins.m_flag & 1
+                ex2 = ins.x_flag & 1
+                if (em2, ex2) not in variants.setdefault(d_addr, set()):
+                    variants[d_addr].add((em2, ex2))
+                    if d_addr in addr_to_end:
+                        tb = addr_to_bank[d_addr]
+                        ts = d_addr & 0xFFFF
+                        queue.append((tb, ts, em2, ex2, addr_to_end[d_addr]))
+    multi_count = sum(1 for v in variants.values() if len(v) > 1)
+    print(f"  variants for {len(variants)} unique callee targets; "
+          f"{multi_count} multi-(m,x); decoded {len(decoded)} (addr, m, x) tuples")
+
+    # Apply per-(m,x) variants to existing cfg entries: for each cfg
+    # entry whose target address has more than its declared (m, x)
+    # variant, clone the entry with each additional (m, x). The
+    # cfg-declared variant remains the "canonical" one (the alias in
+    # emit_bank points to it); other variants exist only as gen
+    # bodies referenced by mangled-name Call ops.
+    for bank, _cfg_path, cfg in parsed:
+        new_entries: list = []
+        seen_keys: set = set()
+        for entry in cfg.entries:
+            addr = (bank << 16) | (entry.start & 0xFFFF)
+            decl_mx = (entry.entry_m & 1, entry.entry_x & 1)
+            seen_keys.add((addr, decl_mx))
+            new_entries.append(entry)
+            extras = variants.get(addr, set()) - {decl_mx}
+            for em, ex in sorted(extras):
+                key = (addr, (em, ex))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                # Clone with the extra (m,x). Same name and end:; the
+                # variant suffix is applied at emit time so two cfg
+                # entries with the same `name` resolve to two distinct
+                # C symbols (`<name>_M1X0`, `<name>_M1X1`).
+                new_entries.append(BankEntry(
+                    name=entry.name,
+                    start=entry.start,
+                    end=entry.end,
+                    entry_m=em,
+                    entry_x=ex,
+                ))
+        cfg.entries = new_entries
+
     total = len(parsed)
     succeeded = 0
     failed = []
@@ -201,14 +345,18 @@ def main() -> int:
             break
 
         added = 0
-        # Bucket unresolved targets by owning bank, then dedupe against
-        # each bank's existing entries (PC + friendly name).
-        by_bank: dict[int, list[int]] = {}
-        for addr in unresolved:
-            by_bank.setdefault((addr >> 16) & 0xFF, []).append(addr & 0xFFFF)
+        # Bucket Call-demand (addr, m, x) tuples by owning bank.
+        # Codegen now records ALL Call demands (resolved + synthetic),
+        # so this includes cfg-named targets whose new (m, x) variant
+        # hasn't been emitted yet.
+        by_bank: dict[int, list[tuple[int, int, int]]] = {}
+        for addr, em, ex in unresolved:
+            by_bank.setdefault((addr >> 16) & 0xFF, []).append(
+                (addr & 0xFFFF, em, ex)
+            )
 
         bank_index = {b: cfg for (b, _p, cfg) in parsed}
-        for bank, pcs in by_bank.items():
+        for bank, items in by_bank.items():
             cfg = bank_index.get(bank)
             if cfg is None:
                 # Cross-bank target whose owning bank has no cfg in this
@@ -216,13 +364,43 @@ def main() -> int:
                 # unresolved (later passes will keep flagging it but the
                 # set is per-pass so we exit).
                 continue
-            existing_starts = {e.start & 0xFFFF for e in cfg.entries}
-            for pc in pcs:
-                if pc in existing_starts:
+            # Existing-entry index by start PC so we can clone an
+            # already-named cfg entry at a new (m, x). Without this,
+            # cfg-named targets would only ever emit at their cfg-
+            # default (m, x) and gen would reference unresolved
+            # variants like UpdateEntirePalette_M0X0.
+            existing_keys: set = {
+                (e.start & 0xFFFF, e.entry_m & 1, e.entry_x & 1)
+                for e in cfg.entries
+            }
+            entries_by_pc: dict[int, "BankEntry"] = {}
+            for e in cfg.entries:
+                entries_by_pc.setdefault(e.start & 0xFFFF, e)
+            for pc, em, ex in items:
+                key = (pc, em, ex)
+                if key in existing_keys:
                     continue
-                synth_name = f"bank_{bank:02X}_{pc:04X}"
-                cfg.entries.append(BankEntry(name=synth_name, start=pc))
-                existing_starts.add(pc)
+                # If there's an existing entry at this PC (any (m, x)),
+                # clone its name + end so the new variant emits as
+                # `<name>_M{em}X{ex}`. Otherwise synthesize.
+                base_entry = entries_by_pc.get(pc)
+                if base_entry is not None:
+                    cfg.entries.append(BankEntry(
+                        name=base_entry.name,
+                        start=pc,
+                        end=base_entry.end,
+                        entry_m=em,
+                        entry_x=ex,
+                    ))
+                else:
+                    synth_name = f"bank_{bank:02X}_{pc:04X}"
+                    new_entry = BankEntry(
+                        name=synth_name, start=pc,
+                        entry_m=em, entry_x=ex,
+                    )
+                    cfg.entries.append(new_entry)
+                    entries_by_pc[pc] = new_entry
+                existing_keys.add(key)
                 added += 1
 
         if added == 0:
@@ -234,13 +412,13 @@ def main() -> int:
     # that produced a JSL into bank $24/$67/etc.). Emit one shared stub
     # file with empty bodies so the linker is happy. Real execution
     # paths shouldn't reach these; if they do, the stubs are no-ops.
-    by_bank: dict[int, list[int]] = {}
+    by_bank: dict[int, set] = {}
     bank_set = {b for (b, _p, _c) in parsed}
-    for addr in last_unresolved:
+    for addr, em, ex in last_unresolved:
         bank = (addr >> 16) & 0xFF
         if bank in bank_set:
             continue
-        by_bank.setdefault(bank, []).append(addr & 0xFFFF)
+        by_bank.setdefault(bank, set()).add((addr & 0xFFFF, em & 1, ex & 1))
     if by_bank:
         stub_path = out_dir / 'unresolved_stubs_v2.c'
         lines = [
@@ -250,18 +428,21 @@ def main() -> int:
             ' * in the cfg set. These are typically data decoded as code',
             ' * (garbled JSL operands). Real execution paths should never',
             ' * reach them; the stubs exist solely so the linker resolves.',
+            ' * One stub per (target, m, x) variant requested by the gen.',
             ' */',
             '',
             '#include "cpu_state.h"',
             '',
         ]
+        total_stubs = 0
         for bank in sorted(by_bank):
-            for pc in sorted(set(by_bank[bank])):
+            for pc, em, ex in sorted(by_bank[bank]):
                 lines.append(
-                    f'void bank_{bank:02X}_{pc:04X}(CpuState *cpu) {{ (void)cpu; }}'
+                    f'void bank_{bank:02X}_{pc:04X}_M{em}X{ex}(CpuState *cpu) {{ (void)cpu; }}'
                 )
+                total_stubs += 1
         stub_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-        print(f"  emitted stubs for {sum(len(v) for v in by_bank.values())} cross-ROM-bank targets -> {stub_path}")
+        print(f"  emitted stubs for {total_stubs} cross-ROM-bank (target, m, x) variants -> {stub_path}")
 
     print()
     print(f"v2_regen: {succeeded}/{total} banks emitted")

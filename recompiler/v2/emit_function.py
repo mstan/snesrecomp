@@ -50,6 +50,12 @@ def _default_func_name(bank: int, start: int) -> str:
     return f"bank_{bank:02X}_{start:04X}"
 
 
+def _variant_suffix(m: int, x: int) -> str:
+    """Mirror of codegen._variant_suffix — kept duplicated to avoid the
+    cross-module import cycle. Must stay in sync."""
+    return f"_M{m & 1}X{x & 1}"
+
+
 def emit_function(rom: bytes, bank: int, start: int,
                   entry_m: int, entry_x: int,
                   *, end: Optional[int] = None,
@@ -71,6 +77,13 @@ def emit_function(rom: bytes, bank: int, start: int,
 
     if func_name is None:
         func_name = _default_func_name(bank, start)
+    # Always append the (m, x) variant suffix. A 65816 function reached
+    # from contexts with different (m, x) is literally a different
+    # instruction stream (LDA/LDX/LDY immediate widths change), so each
+    # variant gets its own C body. Hand-written entry points (I_RESET,
+    # I_NMI, etc.) call into the cfg-default variant via aliases that
+    # emit_bank produces.
+    func_name = f"{func_name}{_variant_suffix(entry_m, entry_x)}"
 
     # Mint a per-function value-id counter shared across all blocks.
     counter = [0]

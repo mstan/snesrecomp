@@ -313,10 +313,22 @@ class Call(IROp):
     """JSR ABS / JSR (abs,X) / JSL — pushes return + transfers to target.
 
     `target` is the resolved 24-bit address for ABS and LONG; None for
-    indirect-X dispatch where the surrounding cfg supplies the table."""
+    indirect-X dispatch where the surrounding cfg supplies the table.
+
+    `entry_m` / `entry_x` are the (m, x) flag values the callee enters
+    with. JSR/JSL don't change M/X, so these mirror the caller's
+    (m, x) at the JSR/JSL instruction. They drive per-variant body
+    selection in codegen — the same target may have multiple C bodies
+    when reachable from contexts with different (m, x) (a 65816
+    function decoded under M1X1 vs M1X0 is literally a different
+    instruction stream because LDA/LDX/LDY immediates change byte
+    counts). Default 1, 1 matches 65816 reset state.
+    """
     target: Optional[int]
     long: bool                 # True for JSL (24-bit return), False for JSR
     indirect: bool = False     # True for JSR (abs,X)
+    entry_m: int = 1
+    entry_x: int = 1
 
 
 @dataclass(frozen=True)

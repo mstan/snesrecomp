@@ -360,18 +360,26 @@ def _h_jmp(insn, vf):
 
 
 def _h_jsr(insn, vf):
+    # Caller's (m, x) at the JSR site = callee's entry (m, x) (JSR
+    # doesn't touch the status register's M/X bits). Pass them through
+    # so codegen can resolve to the correct per-variant body.
+    em = getattr(insn, 'm_flag', 1)
+    ex = getattr(insn, 'x_flag', 1)
     if insn.mode == INDIR_X:
-        return [Call(target=None, long=False, indirect=True)]
+        return [Call(target=None, long=False, indirect=True,
+                     entry_m=em, entry_x=ex)]
     # JSR is a same-bank short call; insn.operand is the 16-bit local PC.
     # Combine with the source bank from insn.addr so codegen can resolve
     # the cross-bank call name (e.g. bank_0C_944C, not bank_00_944C).
     src_bank = (insn.addr >> 16) & 0xFF
     target = (src_bank << 16) | (insn.operand & 0xFFFF)
-    return [Call(target=target, long=False)]
+    return [Call(target=target, long=False, entry_m=em, entry_x=ex)]
 
 
 def _h_jsl(insn, vf):
-    return [Call(target=insn.operand, long=True)]
+    em = getattr(insn, 'm_flag', 1)
+    ex = getattr(insn, 'x_flag', 1)
+    return [Call(target=insn.operand, long=True, entry_m=em, entry_x=ex)]
 
 
 def _h_rts(insn, vf): return [Return(long=False)]
