@@ -6,6 +6,7 @@
 #include "config.h"
 #include "snes/snes.h"
 #include "snes/apu.h"
+#include "snes/cart.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 
@@ -17,8 +18,9 @@ int g_force_apu_bbaa = 0;
 /* Brutal hack: when 1, ALL APU port reads return a value derived from
  * the v2 CpuState's A register so polls always succeed. Lets us see
  * how much of the rest of the recompiled boot path works when the SPC
- * handshake is short-circuited. */
-int g_apu_autoack = 0;
+ * handshake is short-circuited. TEMP default-on for visual boot test —
+ * remove once real SPC engine handshake works. */
+int g_apu_autoack = 1;
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
@@ -168,7 +170,17 @@ uint8 *RomPtr(uint32_t addr) {
       g_fail = true;
     }
   }
-  return (uint8 *)&g_rom[(((addr >> 16) << 15) | (addr & 0x7fff)) & 0x3fffff];
+  /* Compute LoROM offset, then mirror against ACTUAL ROM size. SMW is
+   * 512KB but the original `& 0x3fffff` mask assumed 4MB, so reads at
+   * high banks (e.g. $FF:0100 — bogus pointer values from data-as-code
+   * regions or unmapped ARAM) computed index 0x7F8100, FAR past
+   * g_rom's 0x80000 bytes — instant SIGSEGV. The right behaviour:
+   * mirror to actual ROM size, matching real SNES bank-mirroring. */
+  extern Snes *g_snes;
+  uint32_t off = (((addr >> 16) << 15) | (addr & 0x7fff));
+  uint32_t rom_size = g_snes && g_snes->cart ? (uint32_t)g_snes->cart->romSize : 0x80000;
+  if (rom_size == 0) rom_size = 0x80000;
+  return (uint8 *)&g_rom[off % rom_size];
 }
 
 // MVN/MVP block-move pointer: resolves (bank, addr) per 65816 LoROM rules.
