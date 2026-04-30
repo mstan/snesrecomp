@@ -467,25 +467,31 @@ def _emit_setnz(op) -> List[str]:
 
 def _emit_repflags(op: RepFlags) -> List[str]:
     return [
-        f"cpu->P = (uint8)(cpu->P & ~{op.mask:#04x});",
-        "cpu_p_to_mirrors(cpu);",
+        "{ uint8 _old_p = cpu->P;",
+        f"  cpu->P = (uint8)(cpu->P & ~{op.mask:#04x});",
+        "  cpu_p_to_mirrors(cpu);",
+        "  cpu_trace_px_record(cpu, 0, 0 /*REP*/, _old_p, cpu->P); }",
     ]
 
 
 def _emit_sepflags(op: SepFlags) -> List[str]:
     return [
-        f"cpu->P = (uint8)(cpu->P | {op.mask:#04x});",
-        "cpu_p_to_mirrors(cpu);",
+        "{ uint8 _old_p = cpu->P;",
+        f"  cpu->P = (uint8)(cpu->P | {op.mask:#04x});",
+        "  cpu_p_to_mirrors(cpu);",
+        "  cpu_trace_px_record(cpu, 0, 1 /*SEP*/, _old_p, cpu->P); }",
     ]
 
 
 def _emit_xce(op: XCE) -> List[str]:
     return [
         "{",
+        "  uint8 _old_p = cpu->P;",
         "  uint8 _t = cpu->emulation;",
         "  cpu->emulation = cpu->_flag_C;",
         "  cpu->_flag_C = _t;",
         "  if (cpu->emulation) { cpu->m_flag = 1; cpu->x_flag = 1; cpu_mirrors_to_p(cpu); }",
+        "  cpu_trace_px_record(cpu, 0, 7 /*XCE*/, _old_p, cpu->P);",
         "}",
     ]
 
@@ -508,11 +514,14 @@ def _emit_pushreg(op: PushReg) -> List[str]:
     # Push is 1 or 2 bytes depending on register; for now treat A/B/X/Y/D as
     # following m/x widths and S/DB/PB as 1-byte. P is 1 byte. D is 16-bit.
     if op.reg == Reg.P:
+        # PHP itself doesn't change P, but record it so the snapshot's
+        # P-mutation ring shows context (what P was pushed).
         return [
             "cpu_mirrors_to_p(cpu);",
             f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
             "cpu->S = (uint16)(cpu->S - 1);",
             f"cpu_trace_event(cpu, 0, CPU_TR_PHP, cpu->P, 0);",
+            f"cpu_trace_px_record(cpu, 0, 4 /*PHP*/, cpu->P, cpu->P);",
         ]
     if op.reg == Reg.DB:
         return [
@@ -568,7 +577,8 @@ def _emit_pullreg(op: PullReg) -> List[str]:
             "  cpu->S = (uint16)(cpu->S + 1);",
             f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
             "  cpu_p_to_mirrors(cpu);",
-            f"  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P); }}",
+            f"  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P);",
+            "  cpu_trace_px_record(cpu, 0, 2 /*PLP*/, _old_p, cpu->P); }",
         ]
     if op.reg == Reg.DB:
         # PLB sets N/Z from popped value.

@@ -245,6 +245,108 @@ void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
                                    uint16_t addr_hi, const char *scope_substr);
 void cpu_trace_disarm_scoped_tripwire(void);
 
+/* ── P.X tripwire (non-rotating snapshot) ─────────────────────────────────
+ *
+ * Distinct from the WRAM ScopedTripwire above. Arms BEFORE the rotating
+ * trace ring evicts boot-time events. Fires the FIRST time P.X (status
+ * register bit 4) transitions from 1 → 0. Captures a snapshot that
+ * survives ring rotation: full CpuState, recomp stack, last-N P-mutation
+ * events copied OUT of the rotating ring into a frozen ring inside the
+ * snapshot.
+ *
+ * Hooked into:
+ *   - cpu_trace_p_change(): every gen-emitted REP/SEP/PLP/RTI calls this
+ *     to log packed-P mutations.
+ *   - cpu_trace_p_sync_check(): runtime helper sync helpers (P-from-mirrors)
+ *     call this to verify nothing else clears X without going through gen.
+ *
+ * The breadcrumb ring lives INSIDE the tripwire snapshot itself, so even
+ * if the main g_cpu_trace_ring rotates a million times, the captured
+ * P-mutation history at trip-time is preserved.
+ */
+#define PX_TRIPWIRE_PMUT_RING  64
+#define PX_TRIPWIRE_STACK_DEPTH 16
+#define PX_TRIPWIRE_FUNC_LEN   48
+
+typedef struct PxPMutEvent {
+    uint32_t pc24;            /* PC of the instruction causing the mutation */
+    uint8_t  source_kind;     /* 0=REP, 1=SEP, 2=PLP, 3=RTI, 4=PHP, 5=p_to_mirrors, 6=mirrors_to_p, 7=other */
+    uint8_t  old_p;
+    uint8_t  new_p;
+    uint8_t  old_x_flag;
+    uint8_t  new_x_flag;
+    uint16_t S;
+    uint16_t pad;
+} PxPMutEvent;
+
+typedef struct PxBreadcrumb {
+    uint32_t marker;          /* user-supplied tag id */
+    uint8_t  P;
+    uint8_t  m_flag;
+    uint8_t  x_flag;
+    uint8_t  e_flag;
+    uint16_t A;
+    uint16_t X;
+    uint16_t Y;
+    uint16_t S;
+    uint16_t D;
+    uint8_t  DB;
+    uint8_t  PB;
+    uint8_t  pad[2];
+    char     label[PX_TRIPWIRE_FUNC_LEN];
+} PxBreadcrumb;
+
+#define PX_BREADCRUMB_MAX 32
+
+typedef struct PxTripwire {
+    uint8_t  armed;
+    uint8_t  triggered;
+    uint8_t  pad[2];
+
+    /* P-mutation ring inside the snapshot. Filled continuously while
+     * armed (regardless of trip); on trip, contents are FROZEN by setting
+     * triggered=1 (further mutations stop being recorded). */
+    PxPMutEvent pmut_ring[PX_TRIPWIRE_PMUT_RING];
+    uint32_t    pmut_write_idx;     /* monotonic; modulo PX_TRIPWIRE_PMUT_RING */
+    uint32_t    pmut_count;         /* min(write_idx, RING_LEN) */
+
+    /* Reset-tail breadcrumbs — explicit checkpoints user code adds via
+     * cpu_trace_px_breadcrumb(marker, "label"). Linear, no rotation. */
+    PxBreadcrumb breadcrumbs[PX_BREADCRUMB_MAX];
+    uint32_t     breadcrumb_count;
+
+    /* Captured at trip time */
+    PxPMutEvent  trip_event;        /* the mutation that caused the trip */
+    uint32_t     trip_trace_idx;    /* g_cpu_trace_idx at trip */
+
+    /* Full CpuState at trip */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+
+    /* Recomp stack snapshot */
+    int      stack_depth;
+    char     stack[PX_TRIPWIRE_STACK_DEPTH][PX_TRIPWIRE_FUNC_LEN];
+    char     last_func[PX_TRIPWIRE_FUNC_LEN];
+} PxTripwire;
+
+extern PxTripwire g_px_tripwire;
+
+/* Arm the P.X tripwire. Fires once on first P.X 1→0 transition. */
+void cpu_trace_arm_px_tripwire(void);
+void cpu_trace_disarm_px_tripwire(void);
+void cpu_trace_clear_px_tripwire(void);
+
+/* Called by gen / helpers when packed P is mutated. source_kind picks the
+ * tag printed in the snapshot (REP/SEP/PLP/RTI/PHP/sync/other).
+ * Cheap when not armed — single load+branch on g_px_tripwire.armed. */
+void cpu_trace_px_record(CpuState *cpu, uint32_t pc24, uint8_t source_kind,
+                         uint8_t old_p, uint8_t new_p);
+
+/* Coarse breadcrumb — emit a labelled checkpoint into the tripwire's
+ * non-rotating breadcrumb array. Use these around suspect call sites in
+ * I_RESET / smw_rtl. Cheap (memcpy of CpuState fields). */
+void cpu_trace_px_breadcrumb(CpuState *cpu, uint32_t marker, const char *label);
+
 /* Dump the last `n` events of the main ring to stderr, prefixed by `tag`. */
 void cpu_trace_dump_recent(const char *tag, int n);
 /* Dump the entire dbpb ring (newest first). */
@@ -281,6 +383,11 @@ static inline void cpu_trace_dump_dbpb(const char *tag)                     { (v
 static inline void cpu_trace_dump_wram(const char *tag, int n)              { (void)tag; (void)n; }
 static inline void cpu_trace_arm_scoped_tripwire(uint8_t b, uint16_t l, uint16_t h, const char *s) { (void)b; (void)l; (void)h; (void)s; }
 static inline void cpu_trace_disarm_scoped_tripwire(void) { }
+static inline void cpu_trace_arm_px_tripwire(void) { }
+static inline void cpu_trace_disarm_px_tripwire(void) { }
+static inline void cpu_trace_clear_px_tripwire(void) { }
+static inline void cpu_trace_px_record(CpuState *c, uint32_t p, uint8_t k, uint8_t o, uint8_t n) { (void)c; (void)p; (void)k; (void)o; (void)n; }
+static inline void cpu_trace_px_breadcrumb(CpuState *c, uint32_t m, const char *l) { (void)c; (void)m; (void)l; }
 
 #endif
 

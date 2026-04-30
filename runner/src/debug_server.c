@@ -3530,6 +3530,120 @@ static void cmd_tripwire_disarm(const char *args) {
     send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
 #endif
 }
+
+/* P.X tripwire commands. The tripwire is auto-armed at process startup
+ * (in cpu_trace_arm_default_watches), so by the time TCP connects, the
+ * snapshot may already be frozen. pxwatch_get fetches the captured
+ * snapshot whether or not it's already triggered. */
+static void cmd_pxwatch_arm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_arm_px_tripwire();
+    send_fmt("{\"ok\":true}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_pxwatch_disarm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_disarm_px_tripwire();
+    send_fmt("{\"ok\":true}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_pxwatch_clear(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_clear_px_tripwire();
+    send_fmt("{\"ok\":true}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_pxwatch_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    PxTripwire *t = &g_px_tripwire;
+    static const char *kind_name[] = {
+        "REP", "SEP", "PLP", "RTI", "PHP", "p_to_mirrors", "mirrors_to_p", "XCE"
+    };
+    static char buf[65536];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"triggered\":%u,\"pmut_count\":%u,\"breadcrumb_count\":%u",
+        t->armed, t->triggered,
+        (unsigned)t->pmut_count, (unsigned)t->breadcrumb_count);
+
+    if (t->triggered) {
+        const char *src = (t->trip_event.source_kind < 8)
+            ? kind_name[t->trip_event.source_kind] : "?";
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"trip\":{\"pc24\":\"0x%06x\",\"source\":\"%s\","
+            "\"old_p\":\"0x%02x\",\"new_p\":\"0x%02x\","
+            "\"old_x_flag\":%u,\"new_x_flag\":%u,\"S\":\"0x%04x\","
+            "\"trace_idx\":%u,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"PB\":\"0x%02x\","
+            "\"P\":\"0x%02x\",\"m\":%u,\"x\":%u,\"e\":%u,"
+            "\"last_func\":\"%s\",\"stack\":[",
+            t->trip_event.pc24, src,
+            t->trip_event.old_p, t->trip_event.new_p,
+            t->trip_event.old_x_flag, t->trip_event.new_x_flag,
+            t->trip_event.S, t->trip_trace_idx,
+            t->A, t->X, t->Y, t->D, t->DB, t->PB,
+            t->P, t->m_flag, t->x_flag, t->e_flag,
+            t->last_func);
+        for (int i = 0; i < t->stack_depth; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", t->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    }
+
+    /* Emit P-mutation ring (newest-first within the snapshot's own ring) */
+    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"pmut\":[");
+    uint32_t emit_count = t->pmut_count;
+    if (emit_count > 0) {
+        uint32_t newest = (t->pmut_write_idx - 1) % PX_TRIPWIRE_PMUT_RING;
+        for (uint32_t i = 0; i < emit_count; i++) {
+            uint32_t slot = (newest + PX_TRIPWIRE_PMUT_RING - i) % PX_TRIPWIRE_PMUT_RING;
+            PxPMutEvent *e = &t->pmut_ring[slot];
+            const char *src = (e->source_kind < 8) ? kind_name[e->source_kind] : "?";
+            if (pos > (int)sizeof(buf) - 256) break;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"pc24\":\"0x%06x\",\"source\":\"%s\","
+                "\"old_p\":\"0x%02x\",\"new_p\":\"0x%02x\","
+                "\"old_x\":%u,\"new_x\":%u,\"S\":\"0x%04x\"}",
+                i ? "," : "",
+                e->pc24, src, e->old_p, e->new_p,
+                e->old_x_flag, e->new_x_flag, e->S);
+        }
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"breadcrumbs\":[");
+    for (uint32_t i = 0; i < t->breadcrumb_count; i++) {
+        PxBreadcrumb *bc = &t->breadcrumbs[i];
+        if (pos > (int)sizeof(buf) - 256) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"label\":\"%s\",\"marker\":\"0x%08x\","
+            "\"P\":\"0x%02x\",\"m\":%u,\"x\":%u,\"e\":%u,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\"}",
+            i ? "," : "",
+            bc->label, bc->marker,
+            bc->P, bc->m_flag, bc->x_flag, bc->e_flag,
+            bc->A, bc->X, bc->Y, bc->S, bc->D, bc->DB, bc->PB);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
 static void cmd_trace_dbpb(const char *args) {
     (void)args;
     cpu_trace_dump_dbpb("dbpb cmd");
@@ -3720,6 +3834,10 @@ static const CmdEntry s_commands[] = {
     {"tripwire_arm",   cmd_tripwire_arm},
     {"tripwire_get",   cmd_tripwire_get},
     {"tripwire_disarm", cmd_tripwire_disarm},
+    {"pxwatch_arm",    cmd_pxwatch_arm},
+    {"pxwatch_disarm", cmd_pxwatch_disarm},
+    {"pxwatch_clear",  cmd_pxwatch_clear},
+    {"pxwatch_get",    cmd_pxwatch_get},
     {"set_db_watch",   cmd_set_db_watch},
     {"arm_watches",    cmd_arm_watches},
     {"set_wram_watch", cmd_set_wram_watch},

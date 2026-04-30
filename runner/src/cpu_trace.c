@@ -14,6 +14,134 @@ uint64_t      g_cpu_dbpb_idx = 0;
 uint8_t       g_db_watch_set = 0;
 uint32_t      g_db_watch_bits[8] = {0};
 ScopedTripwire g_scoped_tripwire = {0};
+PxTripwire     g_px_tripwire = {0};
+
+/* Externs used by px tripwire + scoped tripwire bodies. Defined in
+ * common_cpu_infra.c / debug_server.c. Hoisted to file scope so the
+ * px tripwire functions (which appear above the existing scoped
+ * tripwire externs) can reference them. */
+extern const char *g_last_recomp_func;
+extern const char *g_recomp_stack[];
+extern int         g_recomp_stack_top;
+
+void cpu_trace_arm_px_tripwire(void) {
+    /* Reset trip + pmut ring + frozen state so re-arming after a benign
+     * earlier trip starts fresh. Preserve the breadcrumbs array — those
+     * are the user's checkpoint history. */
+    g_px_tripwire.armed = 1;
+    g_px_tripwire.triggered = 0;
+    g_px_tripwire.pmut_write_idx = 0;
+    g_px_tripwire.pmut_count = 0;
+    memset(&g_px_tripwire.trip_event, 0, sizeof(g_px_tripwire.trip_event));
+    g_px_tripwire.trip_trace_idx = 0;
+    g_px_tripwire.A = g_px_tripwire.X = g_px_tripwire.Y = 0;
+    g_px_tripwire.S = g_px_tripwire.D = 0;
+    g_px_tripwire.DB = g_px_tripwire.PB = g_px_tripwire.P = 0;
+    g_px_tripwire.m_flag = g_px_tripwire.x_flag = g_px_tripwire.e_flag = 0;
+    g_px_tripwire.stack_depth = 0;
+    g_px_tripwire.last_func[0] = 0;
+}
+
+void cpu_trace_disarm_px_tripwire(void) {
+    g_px_tripwire.armed = 0;
+}
+
+void cpu_trace_clear_px_tripwire(void) {
+    memset(&g_px_tripwire, 0, sizeof(g_px_tripwire));
+}
+
+void cpu_trace_px_record(CpuState *cpu, uint32_t pc24, uint8_t source_kind,
+                         uint8_t old_p, uint8_t new_p) {
+    if (!g_px_tripwire.armed) return;
+
+    /* Always log into the per-tripwire P-mutation ring (independent of
+     * the rotating g_cpu_trace_ring). Stops growing once triggered so the
+     * snapshot remains stable. */
+    if (!g_px_tripwire.triggered) {
+        uint32_t slot = g_px_tripwire.pmut_write_idx % PX_TRIPWIRE_PMUT_RING;
+        PxPMutEvent *e = &g_px_tripwire.pmut_ring[slot];
+        e->pc24 = pc24;
+        e->source_kind = source_kind;
+        e->old_p = old_p;
+        e->new_p = new_p;
+        e->old_x_flag = (old_p & 0x10) ? 1 : 0;
+        e->new_x_flag = (new_p & 0x10) ? 1 : 0;
+        e->S = cpu ? cpu->S : 0;
+        g_px_tripwire.pmut_write_idx++;
+        if (g_px_tripwire.pmut_count < PX_TRIPWIRE_PMUT_RING) {
+            g_px_tripwire.pmut_count++;
+        }
+    }
+
+    /* Fire on first P.X 1→0 transition. */
+    uint8_t old_x = (old_p & 0x10) ? 1 : 0;
+    uint8_t new_x = (new_p & 0x10) ? 1 : 0;
+    if (g_px_tripwire.triggered) return;
+    if (!(old_x == 1 && new_x == 0)) return;
+
+    g_px_tripwire.triggered = 1;
+    g_px_tripwire.trip_event.pc24 = pc24;
+    g_px_tripwire.trip_event.source_kind = source_kind;
+    g_px_tripwire.trip_event.old_p = old_p;
+    g_px_tripwire.trip_event.new_p = new_p;
+    g_px_tripwire.trip_event.old_x_flag = old_x;
+    g_px_tripwire.trip_event.new_x_flag = new_x;
+    g_px_tripwire.trip_event.S = cpu ? cpu->S : 0;
+    g_px_tripwire.trip_trace_idx = (uint32_t)g_cpu_trace_idx;
+
+    if (cpu) {
+        g_px_tripwire.A = cpu->A;
+        g_px_tripwire.X = cpu->X;
+        g_px_tripwire.Y = cpu->Y;
+        g_px_tripwire.S = cpu->S;
+        g_px_tripwire.D = cpu->D;
+        g_px_tripwire.DB = cpu->DB;
+        g_px_tripwire.PB = cpu->PB;
+        g_px_tripwire.P = cpu->P;
+        g_px_tripwire.m_flag = cpu->m_flag;
+        g_px_tripwire.x_flag = cpu->x_flag;
+        g_px_tripwire.e_flag = cpu->emulation;
+    }
+
+    if (g_last_recomp_func) {
+        strncpy(g_px_tripwire.last_func, g_last_recomp_func,
+                PX_TRIPWIRE_FUNC_LEN - 1);
+        g_px_tripwire.last_func[PX_TRIPWIRE_FUNC_LEN - 1] = 0;
+    }
+
+    int depth = g_recomp_stack_top;
+    if (depth > PX_TRIPWIRE_STACK_DEPTH) depth = PX_TRIPWIRE_STACK_DEPTH;
+    g_px_tripwire.stack_depth = depth;
+    int skip = g_recomp_stack_top - depth;
+    for (int i = 0; i < depth; i++) {
+        const char *p = g_recomp_stack[skip + i];
+        if (p) {
+            strncpy(g_px_tripwire.stack[i], p, PX_TRIPWIRE_FUNC_LEN - 1);
+            g_px_tripwire.stack[i][PX_TRIPWIRE_FUNC_LEN - 1] = 0;
+        } else {
+            g_px_tripwire.stack[i][0] = 0;
+        }
+    }
+}
+
+void cpu_trace_px_breadcrumb(CpuState *cpu, uint32_t marker, const char *label) {
+    if (g_px_tripwire.breadcrumb_count >= PX_BREADCRUMB_MAX) return;
+    PxBreadcrumb *bc = &g_px_tripwire.breadcrumbs[g_px_tripwire.breadcrumb_count++];
+    bc->marker = marker;
+    if (cpu) {
+        bc->P = cpu->P;
+        bc->m_flag = cpu->m_flag;
+        bc->x_flag = cpu->x_flag;
+        bc->e_flag = cpu->emulation;
+        bc->A = cpu->A; bc->X = cpu->X; bc->Y = cpu->Y;
+        bc->S = cpu->S; bc->D = cpu->D;
+        bc->DB = cpu->DB; bc->PB = cpu->PB;
+    }
+    if (label) {
+        strncpy(bc->label, label, PX_TRIPWIRE_FUNC_LEN - 1);
+        bc->label[PX_TRIPWIRE_FUNC_LEN - 1] = 0;
+    }
+}
 
 /* External symbols from common_cpu_infra / debug_server. */
 extern const char *g_last_recomp_func;
@@ -536,6 +664,10 @@ void cpu_trace_arm_default_watches(void) {
     fprintf(stderr, "[cpu_trace] default watches armed: "
             "DB high banks + odd middle, PB!=0, S out-of-$01XX-$1FFF, "
             "GameMode14_InLevel_0086DF, WRAM recorders on $7E:008A/8B/8C\n");
+    /* Arm P.X tripwire at startup so the first 1→0 transition is caught
+     * even before TCP attaches. The snapshot doesn't rotate. */
+    cpu_trace_arm_px_tripwire();
+    fprintf(stderr, "[cpu_trace] P.X tripwire armed (first 1→0 transition caught)\n");
     fflush(stderr);
 }
 
