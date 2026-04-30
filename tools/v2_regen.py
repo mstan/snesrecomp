@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO / 'recompiler'))
 from snes65816 import load_rom  # noqa: E402
 from v2.cfg_loader import load_bank_cfg  # noqa: E402
 from v2.codegen import set_name_resolver, take_unresolved_call_targets  # noqa: E402
+from v2.decoder import classify_dispatch_helper, decode_function  # noqa: E402
 from v2.emit_bank import emit_bank  # noqa: E402
 
 
@@ -116,6 +117,43 @@ def main() -> int:
 
     set_name_resolver(name_map)
 
+    # Auto-detect dispatch helpers across ALL banks: scan every
+    # cfg-declared function for JSL/JML targets, classify each by
+    # subroutine signature (PLA/PLY + indirect JMP). Result: a
+    # global {target_addr_24 -> 'short'|'long'} map passed into
+    # emit_bank so the decoder treats bytes-after-JSL as a TABLE
+    # instead of garbage instructions.
+    print()
+    print("Auto-detecting JSL dispatch helpers...")
+    dispatch_helpers: dict = {}
+    jsl_targets: set = set()
+    for bank, _cfg_path, cfg in parsed:
+        for entry in cfg.entries:
+            try:
+                graph = decode_function(rom, bank, entry.start,
+                                        entry_m=entry.entry_m,
+                                        entry_x=entry.entry_x,
+                                        end=entry.end)
+            except Exception:
+                continue
+            for di in graph.insns.values():
+                ins = di.insn
+                # JSL or JML (JMP LONG)
+                if ins.mnem == 'JSL':
+                    jsl_targets.add(ins.operand & 0xFFFFFF)
+                elif ins.mnem == 'JMP' and ins.length == 4:
+                    jsl_targets.add(ins.operand & 0xFFFFFF)
+    classified = {'short': 0, 'long': 0}
+    for tgt in jsl_targets:
+        tbank = (tgt >> 16) & 0xFF
+        taddr = tgt & 0xFFFF
+        kind = classify_dispatch_helper(rom, tbank, taddr)
+        if kind:
+            dispatch_helpers[tgt] = kind
+            classified[kind] += 1
+    print(f"  detected {classified['short']} short + {classified['long']} long dispatch helpers "
+          f"(scanned {len(jsl_targets)} JSL/JML targets)")
+
     total = len(parsed)
     succeeded = 0
     failed = []
@@ -146,7 +184,8 @@ def main() -> int:
             try:
                 if cfg.bank != bank:
                     print(f"  {cfg_path.name}: bank field ${cfg.bank:02X} doesn't match filename ${bank:02X}; using filename")
-                src = emit_bank(rom, bank=bank, entries=cfg.entries)
+                src = emit_bank(rom, bank=bank, entries=cfg.entries,
+                                dispatch_helpers=dispatch_helpers)
                 out_path.write_text(src, encoding='utf-8')
                 if pass_idx == 0:
                     print(f"  OK    bank ${bank:02X}: {len(cfg.entries)} entries -> {out_path}")

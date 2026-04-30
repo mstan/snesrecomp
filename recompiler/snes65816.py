@@ -46,7 +46,7 @@ MODE_STR = {
 
 class Insn:
     __slots__ = ('addr', 'opcode', 'mnem', 'mode', 'operand', 'length',
-                 'dispatch_entries', 'm_flag', 'x_flag', 'dispatch_terminal')
+                 'dispatch_entries', 'dispatch_kind', 'm_flag', 'x_flag', 'dispatch_terminal')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
         self.addr = addr
@@ -56,6 +56,7 @@ class Insn:
         self.operand = operand
         self.length = length
         self.dispatch_entries = None
+        self.dispatch_kind = None
         self.dispatch_terminal = False
         self.m_flag = 1
         self.x_flag = 1

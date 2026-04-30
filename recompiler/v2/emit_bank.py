@@ -54,7 +54,8 @@ class BankEntry:
 def emit_bank(rom: bytes, bank: int,
               entries: List[BankEntry],
               *,
-              file_header: Optional[str] = None) -> str:
+              file_header: Optional[str] = None,
+              dispatch_helpers=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -93,6 +94,7 @@ def emit_bank(rom: bytes, bank: int,
             entry_x=entry.entry_x,
             end=entry.end,
             func_name=entry.name,
+            dispatch_helpers=dispatch_helpers,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

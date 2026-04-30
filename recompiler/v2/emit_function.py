@@ -53,7 +53,8 @@ def _default_func_name(bank: int, start: int) -> str:
 def emit_function(rom: bytes, bank: int, start: int,
                   entry_m: int, entry_x: int,
                   *, end: Optional[int] = None,
-                  func_name: Optional[str] = None) -> str:
+                  func_name: Optional[str] = None,
+                  dispatch_helpers=None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
     Pipeline:
@@ -64,7 +65,8 @@ def emit_function(rom: bytes, bank: int, start: int,
             emit_op(op)  → C lines
         block-end op → goto / fall-through wiring
     """
-    graph = decode_function(rom, bank, start, entry_m, entry_x, end=end)
+    graph = decode_function(rom, bank, start, entry_m, entry_x, end=end,
+                            dispatch_helpers=dispatch_helpers)
     cfg = build_cfg(graph)
 
     if func_name is None:

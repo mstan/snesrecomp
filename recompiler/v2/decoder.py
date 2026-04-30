@@ -165,32 +165,101 @@ def _successors(insn: Insn, key: DecodeKey, bank: int) -> List[DecodeKey]:
     return [DecodeKey(addr24(bank, next_pc), post_m, post_x)]
 
 
+def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
+    """Identify whether the subroutine at (bank, addr) is a JSL-jump-table
+    dispatch helper. Returns 'short' (16-bit table entries), 'long'
+    (24-bit table entries), or None.
+
+    Pattern (canonical SMW + general 65816 ExecutePtr-style):
+      - body PULAs/PLYs the JSL return PC off the SNES stack
+      - body computes a table index and JMPs through (table,X) / [abs]
+      - between the first `ASL A` and the next `TAY/TAX`, the presence
+        of `ADC` distinguishes 24-bit vs 16-bit entries
+
+    Ported from v1 recomp.py:_classify_dispatch_helper. Tracks REP/SEP
+    so AND #imm decodes at correct width — without that tracking, the
+    AND #$FFFF in $00:86DF gets sliced into AND #$FF + BRK $0A, eating
+    the ASL A that's the classifier's signature.
+    """
+    from snes65816 import (decode_insn, lorom_offset, ACC, INDIR, INDIR_X,
+                            INDIR_L)
+    insns = []
+    pc = addr & 0xFFFF
+    m, x = 1, 1
+    safety = 0
+    while safety < 256:
+        safety += 1
+        if not (0x8000 <= pc <= 0xFFFF):
+            return None
+        try:
+            offset = lorom_offset(bank, pc)
+        except AssertionError:
+            return None
+        if offset >= len(rom):
+            return None
+        try:
+            ins = decode_insn(rom, offset, pc, bank, m=m, x=x)
+        except Exception:
+            return None
+        if ins is None:
+            return None
+        insns.append(ins)
+        # Update mode for subsequent decodes.
+        if ins.mnem == 'REP':
+            if ins.operand & 0x20: m = 0
+            if ins.operand & 0x10: x = 0
+        elif ins.mnem == 'SEP':
+            if ins.operand & 0x20: m = 1
+            if ins.operand & 0x10: x = 1
+        if ins.mnem in ('RTS', 'RTL', 'RTI', 'BRA', 'BRL', 'JMP', 'JML', 'STP'):
+            break
+        pc = (pc + ins.length) & 0xFFFF
+
+    if not insns:
+        return None
+    # Must pull return address off stack.
+    if not any(i.mnem in ('PLA', 'PLY') for i in insns):
+        return None
+    # Must end with an indirect jump.
+    last = insns[-1]
+    if not (last.mnem in ('JMP', 'JML') and
+            last.mode in (INDIR, INDIR_X, INDIR_L)):
+        return None
+    # Width: ASL A ... TAY/TAX, with ADC in between → long.
+    asl_seen = False
+    has_adc = False
+    for ins in insns:
+        if not asl_seen:
+            if ins.mnem == 'ASL' and ins.mode == ACC:
+                asl_seen = True
+            continue
+        if ins.mnem == 'ADC':
+            has_adc = True
+        if ins.mnem in ('TAY', 'TAX'):
+            return 'long' if has_adc else 'short'
+    return None
+
+
 def decode_function(rom: bytes, bank: int, start: int,
                     entry_m: int, entry_x: int,
                     *, end: Optional[int] = None,
-                    max_insns: int = 4000) -> FunctionDecodeGraph:
+                    max_insns: int = 4000,
+                    dispatch_helpers: Optional[Dict[int, str]] = None) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
 
     Worklist over DecodeKey tuples. Each key is decoded at most once;
     same PC with divergent (m, x) produces multiple keys → multiple
     DecodedInsn records.
 
-    Args:
-        rom: the full LoROM image (bytes).
-        bank: 8-bit bank number.
-        start: 16-bit local PC; must be in $8000–$FFFF for LoROM mapping.
-        entry_m, entry_x: entry mode state (each 0 or 1).
-        end: optional exclusive end PC. Worklist items at or past `end`
-            are dropped (the caller declares the next function start).
-        max_insns: safety cap; raises RuntimeError if exceeded.
-
-    Returns:
-        FunctionDecodeGraph populated with all reachable (pc, m, x)
-        decoding instances.
-
-    Raises:
-        ValueError on unknown opcode bytes.
-        RuntimeError if max_insns exceeded.
+    `dispatch_helpers`: optional map of {target_addr_24 -> 'short'|'long'}.
+    When a JSL/JML hits a target in this map, the bytes immediately AFTER
+    the JSL are decoded as a function-pointer TABLE (not as instructions).
+    Each table entry is recorded as a successor key (so the dispatched
+    handlers get decoded too) and the ORIGINAL JSL is marked with
+    `insn.dispatch_entries` for downstream codegen. Decode resumes
+    AFTER the table (not at the JSL+length offset). Without this hook,
+    SMW's "JSL Foo; .dw target0, target1, ..." pattern at $00:9325 would
+    decode the TABLE BYTES as garbage instructions.
     """
     entry_m &= 1
     entry_x &= 1
@@ -234,6 +303,62 @@ def decode_function(rom: bytes, bank: int, start: int,
         # codegen) see the entry state without needing the DecodeKey.
         insn.m_flag = key.m
         insn.x_flag = key.x
+
+        # JSL/JML dispatch-table detection: if the call target is a
+        # registered dispatch helper, decode the bytes immediately
+        # following as the target table and record successors.
+        is_jsl_or_jml = (insn.mnem == 'JSL' or
+                         (insn.mnem == 'JMP' and insn.length == 4))  # JML
+        helper_kind = None
+        if dispatch_helpers and is_jsl_or_jml:
+            helper_kind = dispatch_helpers.get(insn.operand & 0xFFFFFF)
+        if helper_kind is not None:
+            entries = []
+            entry_size = 3 if helper_kind == 'long' else 2
+            tbl_pc = (pc + insn.length) & 0xFFFF
+            while len(entries) < 256 and tbl_pc + entry_size - 1 <= 0xFFFF:
+                try:
+                    tbl_off = lorom_offset(bank, tbl_pc)
+                except AssertionError:
+                    break
+                if tbl_off + entry_size - 1 >= len(rom):
+                    break
+                lo = rom[tbl_off]
+                hi = rom[tbl_off + 1]
+                addr16 = lo | (hi << 8)
+                if helper_kind == 'long':
+                    eb = rom[tbl_off + 2]
+                    if addr16 == 0 and eb == 0:
+                        entries.append(0)
+                        tbl_pc += entry_size
+                        continue
+                    if addr16 < 0x8000 or eb != bank:
+                        break
+                    full_entry = (eb << 16) | addr16
+                else:
+                    if addr16 == 0:
+                        entries.append(0)
+                        tbl_pc += entry_size
+                        continue
+                    if addr16 < 0x8000:
+                        break
+                    full_entry = (bank << 16) | addr16
+                if end is not None and not (start <= addr16 < end):
+                    # Outside the function range — likely past the table end.
+                    break
+                entries.append(full_entry if helper_kind == 'long' else addr16)
+                tbl_pc += entry_size
+            if entries:
+                # Stash on the insn for codegen. Don't add dispatch
+                # entries as decode successors — they're CROSS-FUNCTION
+                # calls (auto-promote will pick them up). The JSL itself
+                # is a TERMINATOR (no fall-through past the table because
+                # the dispatcher returns to the dispatched handler's
+                # caller, not to bytes after the JSL).
+                insn.dispatch_entries = entries
+                insn.dispatch_kind = helper_kind
+                graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
+                continue
 
         succ = _successors(insn, key, bank)
         graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)

@@ -662,6 +662,59 @@ def _emit_indirect_goto(op: IndirectGoto) -> List[str]:
     return [f"/* IndirectGoto: target = ({bank}, {addr}) — caller dispatches */"]
 
 
+def _emit_dispatch(insn) -> List[str]:
+    """Emit a JSL-jump-table dispatch as a static function-pointer
+    array indexed by A. The 65816 dispatcher pops its return PC,
+    indexes the table at that PC by A (×2 for short, ×3 for long),
+    and JMPs through. Effective semantics: select handler by A then
+    call. After return, this insn is a TERMINATOR (control returns
+    to JSL's caller's caller, not to the bytes after this JSL).
+
+    For each table entry:
+      - non-zero, in this bank: emit handler call by friendly name
+        (or synthetic bank_BB_AAAA), update PB save/restore, etc.
+      - zero: emit a `default: break;` which becomes RTS-style return
+    """
+    bank = (insn.addr >> 16) & 0xFF
+    entries = insn.dispatch_entries
+    kind = getattr(insn, 'dispatch_kind', 'short')
+    n = len(entries)
+    lines = ["{ /* JSL dispatch — short=2B / long=3B table */"]
+    lines.append(f"  static const uint16 _disp_n = {n};")
+    lines.append("  uint16 _idx = (uint16)(cpu->A & 0xFF);")
+    lines.append("  if (_idx >= _disp_n) { return; /* dispatch OOB */ }")
+    lines.append("  switch (_idx) {")
+    for i, e in enumerate(entries):
+        if e == 0:
+            lines.append(f"    case {i}: break;  /* null entry */")
+            continue
+        if kind == 'long':
+            target_bank = (e >> 16) & 0xFF
+            local_pc = e & 0xFFFF
+            tgt_addr = e
+        else:
+            target_bank = bank
+            local_pc = e & 0xFFFF
+            tgt_addr = (bank << 16) | local_pc
+        name = _NAME_RESOLVER.get(tgt_addr)
+        if name is None:
+            name = f"bank_{target_bank:02X}_{local_pc:04X}"
+            _UNRESOLVED_CALL_TARGETS.add(tgt_addr)
+        lines.append(
+            f"    case {i}: {{ uint8 _saved_pb = cpu->PB; "
+            f"cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL); "
+            f"cpu->PB = {target_bank:#04x}; "
+            f"{name}(cpu); "
+            f"cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL); "
+            f"cpu->PB = _saved_pb; }} break;"
+        )
+    lines.append("    default: break;")
+    lines.append("  }")
+    lines.append("  return; /* dispatch is a terminator */")
+    lines.append("}")
+    return lines
+
+
 def _emit_call(op: Call) -> List[str]:
     if op.indirect:
         return ["/* Call indirect — caller dispatches */"]
