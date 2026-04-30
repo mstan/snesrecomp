@@ -91,7 +91,7 @@ def take_unresolved_call_targets() -> set:
 from v2.ir import (  # noqa: E402
     IROp, IRBlock,
     Read, Write, ReadReg, WriteReg, ConstI,
-    Alu, AluOp, Shift, ShiftOp, IncReg,
+    Alu, AluOp, Shift, ShiftOp, IncReg, IncMem,
     BitTest, BitSetMem, BitClearMem,
     SetFlag, SetNZ, RepFlags, SepFlags, XCE,
     Push, Pull, PushReg, PullReg, BlockMove,
@@ -372,6 +372,27 @@ def _emit_increg(op: IncReg) -> List[str]:
         f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
         f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
         f"}}",
+    ]
+
+
+def _emit_incmem(op: IncMem) -> List[str]:
+    """INC/DEC memory: result = mem + delta (no carry-in); set Z/N from
+    result; leave C and V untouched. 65816 hw spec for INC/DEC abs/dp.
+    Distinct from ADC/SBC (Alu.ADD/SUB) which DO carry-in and update C/V."""
+    bank, addr = _segref_addr_expr(op.seg)
+    fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"
+    fn_w = "cpu_write8" if op.width == 1 else "cpu_write16"
+    sign = "0x80" if op.width == 1 else "0x8000"
+    delta = "+1" if op.delta == +1 else "-1"
+    ctype = _ctype(op.width)
+    return [
+        "{",
+        f"  {ctype} _im = {fn_r}(cpu, {bank}, {addr});",
+        f"  _im = ({ctype})(_im {delta});",
+        f"  {fn_w}(cpu, {bank}, {addr}, _im);",
+        f"  cpu->_flag_Z = (_im == 0) ? 1 : 0;",
+        f"  cpu->_flag_N = ((_im & {sign}) != 0) ? 1 : 0;",
+        "}",
     ]
 
 
@@ -881,7 +902,7 @@ _DISPATCH = {
     Read: _emit_read, Write: _emit_write,
     ReadReg: _emit_readreg, WriteReg: _emit_writereg,
     ConstI: _emit_consti,
-    Alu: _emit_alu, Shift: _emit_shift, IncReg: _emit_increg,
+    Alu: _emit_alu, Shift: _emit_shift, IncReg: _emit_increg, IncMem: _emit_incmem,
     BitTest: _emit_bittest, BitSetMem: _emit_bitsetmem, BitClearMem: _emit_bitclearmem,
     SetFlag: _emit_setflag, SetNZ: _emit_setnz,
     RepFlags: _emit_repflags, SepFlags: _emit_sepflags,

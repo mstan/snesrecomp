@@ -1,5 +1,6 @@
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
+#include <setjmp.h>
 #include "recomp_hw.h"
 #include "framedump.h"
 #include "util.h"
@@ -85,7 +86,15 @@ bool RtlRunFrame(uint32 inputs) {
   g_snes->input2_currentState = (inputs >> 12) & 0xfff;
 
   WatchdogFrameStart();
-  g_rtl_game_info->run_frame();
+  // Watchdog guard: WatchdogCheck() (called per-block in v2 gen) longjmps
+  // here when a frame exceeds 5s, so an infinite loop in recompiled code
+  // doesn't freeze the runtime indefinitely. Without this setjmp the
+  // longjmp would dereference an uninitialized jmp_buf and crash.
+  if (setjmp(g_watchdog_jmp) == 0) {
+    g_rtl_game_info->run_frame();
+  }
+  // If g_watchdog_tripped is set, frame was abandoned mid-execution;
+  // continue to the next frame so the user can interrupt cleanly.
   if (g_framedump_callback)
     g_framedump_callback(snes_frame_counter, g_ram);
   {

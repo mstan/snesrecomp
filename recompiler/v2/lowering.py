@@ -38,7 +38,7 @@ from snes65816 import (  # noqa: E402
 
 from v2.ir import (  # noqa: E402
     IROp, Read, Write, ReadReg, WriteReg, ConstI, Alu, AluOp, Shift,
-    ShiftOp, IncReg, BitTest, BitSetMem, BitClearMem,
+    ShiftOp, IncReg, IncMem, BitTest, BitSetMem, BitClearMem,
     SetFlag, SetNZ, RepFlags, SepFlags, XCE, Push, Pull, PushReg, PullReg,
     BlockMove, CondBranch, Goto, IndirectGoto, Call, Return,
     Transfer, XBA, Nop, Break, Stop, PushEffectiveAddress,
@@ -256,29 +256,13 @@ def _shift_handler(op: ShiftOp):
 def _h_inc(insn, vf):
     if insn.mode == ACC:
         return [IncReg(reg=Reg.A, delta=+1)]
-    width = _width_a(insn)
-    seg = _segref_for(insn)
-    src = vf()
-    one = vf()
-    out = vf()
-    return [Read(seg=seg, width=width, out=src),
-            ConstI(value=1, width=width, out=one),
-            Alu(op=AluOp.ADD, lhs=src, rhs=one, width=width, out=out),
-            Write(seg=seg, src=out, width=width)]
+    return [IncMem(seg=_segref_for(insn), width=_width_a(insn), delta=+1)]
 
 
 def _h_dec(insn, vf):
     if insn.mode == ACC:
         return [IncReg(reg=Reg.A, delta=-1)]
-    width = _width_a(insn)
-    seg = _segref_for(insn)
-    src = vf()
-    one = vf()
-    out = vf()
-    return [Read(seg=seg, width=width, out=src),
-            ConstI(value=1, width=width, out=one),
-            Alu(op=AluOp.SUB, lhs=src, rhs=one, width=width, out=out),
-            Write(seg=seg, src=out, width=width)]
+    return [IncMem(seg=_segref_for(insn), width=_width_a(insn), delta=-1)]
 
 
 def _h_inx(insn, vf): return [IncReg(reg=Reg.X, delta=+1)]

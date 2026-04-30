@@ -189,6 +189,16 @@ class IncReg(IROp):
     delta: int                 # +1 / -1 (INX/DEX/INY/DEY/INC A/DEC A)
 
 
+# Increment / decrement of memory (INC dp / INC abs / DEC dp / DEC abs).
+# 65816 hw spec: result = mem + delta with NO carry-in; sets Z/N from result;
+# leaves C and V untouched. Distinct from Alu(ADD/SUB) which is ADC/SBC.
+@dataclass(frozen=True)
+class IncMem(IROp):
+    seg: SegRef
+    width: int                 # 1 or 2
+    delta: int                 # +1 / -1
+
+
 # Bit test / set / clear (flags only or memory write)
 @dataclass(frozen=True)
 class BitTest(IROp):

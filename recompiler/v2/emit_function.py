@@ -210,6 +210,11 @@ def emit_function(rom: bytes, bank: int, start: int,
         # Trace block entry — gives us the SNES PC chain in the trace ring.
         block_pc24 = (bank << 16) | (key.pc & 0xFFFF)
         src.append(f'    cpu_trace_block(cpu, 0x{block_pc24:06X});')
+        # Watchdog: per-block heartbeat so tight inner loops trip the 5s
+        # frame timeout instead of freezing the runtime indefinitely.
+        # Cheap (counter bump + branch); v1 emitted at loop headers, v2
+        # gets it at every block since we don't yet identify back-edges.
+        src.append(f'    WatchdogCheck();')
         for ln in block_lines[key]:
             # Inject RecompStackPop before any return so the stack stays balanced.
             stripped = ln.strip()
