@@ -37,6 +37,20 @@ static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
     capture(cpu, pc24, CPU_TR_BLOCK, 0, 0);
+    /* Stack-range tripwire — fires once when S first leaves the
+     * configured range. Disarms after firing to avoid spam. */
+    extern uint8_t  g_s_watch_set;
+    extern uint16_t g_s_watch_lo;
+    extern uint16_t g_s_watch_hi;
+    if (g_s_watch_set && (cpu->S < g_s_watch_lo || cpu->S > g_s_watch_hi)) {
+        g_s_watch_set = 0;  /* one-shot */
+        char tag[96];
+        snprintf(tag, sizeof(tag),
+                 "S-WATCH HIT S=$%04X (range $%04X-$%04X) at PC $%06X",
+                 cpu->S, g_s_watch_lo, g_s_watch_hi, pc24);
+        cpu_trace_dump_dbpb(tag);
+        cpu_trace_dump_recent(tag, 128);
+    }
 }
 
 /* Tiny FNV-1a over a NUL-terminated function name. */
@@ -53,7 +67,8 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
     int slot = (int)(g_cpu_trace_idx++ & (CPU_TRACE_RING_LEN - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
-    e->native_func_id_or_hash = name ? fnv1a(name) : 0;
+    uint32_t h = name ? fnv1a(name) : 0;
+    e->native_func_id_or_hash = h;
     e->A = cpu->A;
     e->X = cpu->X;
     e->Y = cpu->Y;
@@ -67,6 +82,17 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
     e->event_type = CPU_TR_FUNC_ENTRY;
     e->extra0 = 0;
     e->extra1 = 0;
+    /* Function-name tripwire: one-shot dump if entered. */
+    extern uint32_t g_func_watch_hash;
+    extern const char *g_func_watch_name;
+    if (g_func_watch_hash && g_func_watch_hash == h) {
+        char tag[120];
+        snprintf(tag, sizeof(tag), "FUNC-WATCH HIT %s at PC $%06X",
+                 g_func_watch_name ? g_func_watch_name : "?", pc24);
+        g_func_watch_hash = 0;  /* one-shot */
+        cpu_trace_dump_dbpb(tag);
+        cpu_trace_dump_recent(tag, 128);
+    }
 }
 
 void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t event_type,
@@ -123,6 +149,88 @@ void cpu_trace_set_db_watch(uint8_t db_byte, int enabled) {
         for (int i = 0; i < 8; i++) if (g_db_watch_bits[i]) { any = 1; break; }
         g_db_watch_set = (uint8_t)any;
     }
+}
+
+/* PB tripwire (mirror of DB). cpu_trace_pb_change checks against this. */
+uint8_t       g_pb_watch_set = 0;
+uint32_t      g_pb_watch_bits[8] = {0};
+void cpu_trace_set_pb_watch(uint8_t pb_byte, int enabled) {
+    if (enabled) {
+        g_pb_watch_bits[pb_byte >> 5] |= (1u << (pb_byte & 0x1F));
+        g_pb_watch_set = 1;
+    } else {
+        g_pb_watch_bits[pb_byte >> 5] &= ~(1u << (pb_byte & 0x1F));
+        int any = 0;
+        for (int i = 0; i < 8; i++) if (g_pb_watch_bits[i]) { any = 1; break; }
+        g_pb_watch_set = (uint8_t)any;
+    }
+}
+
+/* Stack-pointer-range tripwire — fires when S leaves the configured
+ * range. SMW's normal stack lives in $0100-$1FFF. Excursions outside
+ * that mean either MVN/MVP gone wild, TXS with bad X, or unbalanced
+ * push/pull from the C-call vs SNES-stack mismatch. */
+uint8_t  g_s_watch_set = 0;
+uint16_t g_s_watch_lo = 0x0100;
+uint16_t g_s_watch_hi = 0x1FFF;
+void cpu_trace_set_s_range_watch(uint16_t s_lo, uint16_t s_hi, int enabled) {
+    g_s_watch_lo = s_lo;
+    g_s_watch_hi = s_hi;
+    g_s_watch_set = enabled ? 1 : 0;
+}
+
+/* Function-name watch (matched by FNV-1a hash inside cpu_trace_func_entry). */
+uint32_t g_func_watch_hash = 0;
+const char *g_func_watch_name = NULL;
+void cpu_trace_set_func_watch(const char *name) {
+    extern uint32_t fnv1a_extern(const char *s);
+    g_func_watch_name = name;
+    g_func_watch_hash = name ? fnv1a_extern(name) : 0;
+}
+
+/* Off-rails dump rate-limit: only dump once per 64 hits to avoid burying
+ * the trace under endless repeats of the same fail. */
+static uint64_t s_offrails_count = 0;
+void cpu_trace_offrails(const char *tag, uint32_t hint) {
+    s_offrails_count++;
+    if (s_offrails_count == 1 || (s_offrails_count & 0x3F) == 0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "OFF-RAILS [%s] hit#%llu hint=$%08X",
+                 tag ? tag : "?", (unsigned long long)s_offrails_count,
+                 hint);
+        cpu_trace_dump_dbpb(buf);
+        cpu_trace_dump_recent(buf, 64);
+    }
+}
+
+/* Public wrapper so debug_server / other TUs can hash names. */
+uint32_t fnv1a_extern(const char *s) { return fnv1a(s); }
+
+void cpu_trace_arm_default_watches(void) {
+    /* Watch every high bank that SMW should never use as DB at boot.
+     * SMW uses DB ∈ {$00, $01, $02, $03, $04, $05, $07, $0C, $0D, $7E,
+     * $7F}. Anything outside that — especially the high-ROM-bank
+     * mirrors $80-$FF — is poisoning. */
+    for (int b = 0x80; b <= 0xFF; b++) cpu_trace_set_db_watch((uint8_t)b, 1);
+    /* Also watch the specific garbage values seen in trace runs. */
+    for (int b = 0x10; b <= 0x7D; b++) {
+        /* Skip known-good DBs. */
+        if (b == 0x00 || b == 0x01 || b == 0x02 || b == 0x03 || b == 0x04 ||
+            b == 0x05 || b == 0x07 || b == 0x0C || b == 0x0D) continue;
+        cpu_trace_set_db_watch((uint8_t)b, 1);
+    }
+    /* PB should always be $00 in v2 (we set PB explicitly via JSL emit;
+     * it should restore on RTL). Watch every NON-zero PB. */
+    for (int b = 1; b <= 0xFF; b++) cpu_trace_set_pb_watch((uint8_t)b, 1);
+    /* Stack range: $0100-$1FFF (SMW normal native-stack region). */
+    cpu_trace_set_s_range_watch(0x0100, 0x1FFF, 1);
+    /* Empty fallback stub from bank03.cfg — if reached, codegen has
+     * routed past the dispatch HLE. */
+    cpu_trace_set_func_watch("GameMode14_InLevel_0086DF");
+    fprintf(stderr, "[cpu_trace] default watches armed: "
+            "DB high banks + odd middle, PB!=0, S out-of-$01XX-$1FFF, "
+            "GameMode14_InLevel_0086DF\n");
+    fflush(stderr);
 }
 
 void cpu_trace_clear(void) {

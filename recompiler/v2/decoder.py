@@ -343,9 +343,16 @@ def decode_function(rom: bytes, bank: int, start: int,
                     if addr16 < 0x8000:
                         break
                     full_entry = (bank << 16) | addr16
-                if end is not None and not (start <= addr16 < end):
-                    # Outside the function range — likely past the table end.
-                    break
+                # NOTE: do NOT bound the entry value by the dispatching
+                # function's [start, end) range. The TABLE bytes live in
+                # the function's range, but the table ENTRIES point to
+                # OTHER handlers (e.g. GameMode00 at \$00:9391, well past
+                # the dispatcher's $937D end). v1's recomp.py applied a
+                # similar range check ONLY as a fallback when the entry
+                # wasn't in `dispatch_known_addrs`; v2 doesn't have that
+                # set yet, so any range bound here would terminate the
+                # table at zero entries — exactly what was happening to
+                # the SMW GameMode dispatch at $00:9325 before this fix.
                 entries.append(full_entry if helper_kind == 'long' else addr16)
                 tbl_pc += entry_size
             if entries:

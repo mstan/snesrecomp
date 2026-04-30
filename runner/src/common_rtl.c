@@ -8,6 +8,7 @@
 #include "snes/apu.h"
 #include "snes/cart.h"
 #include "cpu_state.h"
+#include "cpu_trace.h"
 #include "debug_server.h"
 
 uint8 g_ram[0x20000];
@@ -169,6 +170,10 @@ uint8 *RomPtr(uint32_t addr) {
     if (!g_fail) {
       g_fail = true;
     }
+    /* Off-rails dump (rate-limited): the FIRST bad RomPtr access plus
+     * every 64th after triggers a backwards trace dump so we see the
+     * chain that produced the bad pointer, not just its symptom. */
+    cpu_trace_offrails("RomPtr-invalid", addr);
   }
   /* Compute LoROM offset, then mirror against ACTUAL ROM size. SMW is
    * 512KB but the original `& 0x3fffff` mask assumed 4MB, so reads at

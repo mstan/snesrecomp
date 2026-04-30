@@ -71,6 +71,8 @@ void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
   }
 }
 
+#include "../cpu_trace.h"
+
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
   if(((bank >= 0x70 && bank < 0x7e) || bank >= 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
     // banks 70-7e and f0-ff, adr 0000-7fff
@@ -88,6 +90,8 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
    * return 0 so boot keeps progressing and the trace ring + DB-watch
    * tripwires can identify the upstream issue without dying. */
   printf("cart_readLorom: out-of-range 0x%x — returning 0\n", bank << 16 | adr);
+  /* Arm backwards-trace dump (rate-limited via cpu_trace_offrails). */
+  cpu_trace_offrails("cart_readLorom", (uint32_t)bank << 16 | adr);
   return 0;
 }
 

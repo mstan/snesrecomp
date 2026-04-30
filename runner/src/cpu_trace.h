@@ -83,8 +83,13 @@ typedef struct CpuDbpbEvent {
     uint16_t pad;
 } CpuDbpbEvent;
 
-#define CPU_TRACE_RING_LEN  4096
-#define CPU_DBPB_RING_LEN   64
+/* Ring sizes: with always-on continuous capture there's no reason to
+ * keep these tight. 64K main events @ ~64B/entry = ~4MB; well within
+ * any modern host's idle memory budget, and gives roughly 30+ frames
+ * of execution history for backwards investigation even at high block
+ * rates. Keep DB/PB ring smaller because mutations are rare. */
+#define CPU_TRACE_RING_LEN  (64 * 1024)
+#define CPU_DBPB_RING_LEN   1024
 
 #if SNESRECOMP_TRACE
 
@@ -111,6 +116,23 @@ void cpu_trace_pb_change(CpuState *cpu, uint32_t pc24, uint8_t old_pb,
                          uint8_t new_pb, uint8_t event_type);
 
 void cpu_trace_set_db_watch(uint8_t db_byte, int enabled);
+void cpu_trace_set_pb_watch(uint8_t pb_byte, int enabled);
+void cpu_trace_set_s_range_watch(uint16_t s_lo, uint16_t s_hi, int enabled);
+/* If `name` matches a function entry, fire a one-shot trace dump and
+ * disarm. Useful for "did the empty fallback stub get called?" probes
+ * (e.g. arm on "GameMode14_InLevel_0086DF" to catch the next miss). */
+void cpu_trace_set_func_watch(const char *name);
+
+/* Arm the standard SMW v2-boot watch set: high-bank DBs ($A0-$FF), any
+ * PB != 0, S outside $0100-$1FFF, and known fallback stub names.
+ * Called at process startup so the watcher is USEFUL by default —
+ * without this, tripwires sit idle until manually armed. */
+void cpu_trace_arm_default_watches(void);
+
+/* Called by RomPtr-invalid + cart_readLorom-out-of-range + any other
+ * "off-the-rails" softfail to dump the trace ONCE per N events. Avoids
+ * burying the trace under repeats of the same fail. */
+void cpu_trace_offrails(const char *tag, uint32_t hint);
 void cpu_trace_clear(void);
 
 /* Dump the last `n` events of the main ring to stderr, prefixed by `tag`. */
@@ -129,6 +151,11 @@ static inline void cpu_trace_db_change(CpuState *cpu, uint32_t pc24, uint8_t o,
 static inline void cpu_trace_pb_change(CpuState *cpu, uint32_t pc24, uint8_t o,
                                        uint8_t n, uint8_t et)               { (void)cpu; (void)pc24; (void)o; (void)n; (void)et; }
 static inline void cpu_trace_set_db_watch(uint8_t b, int e)                 { (void)b; (void)e; }
+static inline void cpu_trace_set_pb_watch(uint8_t b, int e)                 { (void)b; (void)e; }
+static inline void cpu_trace_set_s_range_watch(uint16_t l, uint16_t h, int e){ (void)l; (void)h; (void)e; }
+static inline void cpu_trace_set_func_watch(const char *n)                  { (void)n; }
+static inline void cpu_trace_arm_default_watches(void)                       { }
+static inline void cpu_trace_offrails(const char *t, uint32_t h)            { (void)t; (void)h; }
 static inline void cpu_trace_clear(void)                                    { }
 static inline void cpu_trace_dump_recent(const char *tag, int n)            { (void)tag; (void)n; }
 static inline void cpu_trace_dump_dbpb(const char *tag)                     { (void)tag; }

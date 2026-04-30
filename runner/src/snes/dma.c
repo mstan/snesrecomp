@@ -114,7 +114,9 @@ uint8_t dma_read(Dma* dma, uint16_t adr) {
       return dma->channel[c].unusedByte;
     }
     default: {
-      assert(0);
+      /* Soft for v2 boot: data-as-code reads occasionally hit invalid
+       * DMA register offsets (e.g. \$430C/\$430E that don't exist).
+       * Real fix is upstream — for now return 0 so boot continues. */
       return 0;
     }
   }

@@ -146,8 +146,23 @@ def emit_function(rom: bytes, bank: int, start: int,
                         lines.append(ln)
                     lines.append("return; /* IndirectGoto: dispatch table */")
                     block_terminated = True
+                elif isinstance(op, Call):
+                    # Dispatch-helper JSL: the decoder marked the insn
+                    # with `dispatch_entries`. Route through _emit_dispatch
+                    # — the helper itself never returns to the JSL caller;
+                    # it returns to the dispatched handler. So this is
+                    # a TERMINATOR.
+                    insn = di.insn
+                    if getattr(insn, 'dispatch_entries', None):
+                        from v2.codegen import _emit_dispatch
+                        for ln in _emit_dispatch(insn):
+                            lines.append(ln)
+                        block_terminated = True
+                    else:
+                        for ln in emit_op(op):
+                            lines.append(ln)
                 else:
-                    # Call, ReadReg, ALU, Read/Write, etc. — non-terminating.
+                    # ReadReg, ALU, Read/Write, etc. — non-terminating.
                     for ln in emit_op(op):
                         lines.append(ln)
         # Block didn't end with a control-flow op. Emit the explicit edge

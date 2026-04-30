@@ -3354,6 +3354,12 @@ static void cmd_set_db_watch(const char *args) {
     send_fmt("{\"ok\":true,\"db\":\"0x%02X\",\"enabled\":%d}", byte & 0xFF, enable);
 }
 
+static void cmd_arm_watches(const char *args) {
+    (void)args;
+    cpu_trace_arm_default_watches();
+    send_fmt("{\"ok\":true,\"armed\":\"defaults\"}");
+}
+
 /* SPC PC histogram so we can see *exactly* which engine PCs the SPC
  * spends time in. apu.c samples spc->pc once per apu_cycle when SPC
  * starts a new opcode (cpuCyclesLeft was 0). */
@@ -3463,6 +3469,7 @@ static const CmdEntry s_commands[] = {
     {"trace_dbpb",     cmd_trace_dbpb},
     {"trace_clear",    cmd_trace_clear},
     {"set_db_watch",   cmd_set_db_watch},
+    {"arm_watches",    cmd_arm_watches},
     {"get_spc_writes", cmd_get_spc_writes},
     {"get_spc_pc_hist", cmd_get_spc_pc_hist},
     {"get_apu_misc",   cmd_get_apu_misc},
