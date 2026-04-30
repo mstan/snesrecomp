@@ -57,8 +57,15 @@ void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
   spc_saveload(apu->spc, sli);
 }
 
+extern uint64_t g_spc_pc_histogram[0x10000];
+extern int g_spc_pc_max_seen;
+
 void apu_cycle(Apu* apu) {
   if(apu->cpuCyclesLeft == 0) {
+    /* Sample PC right BEFORE running the opcode — so PC reflects the
+     * instruction we're about to execute, not the post-opcode PC. */
+    g_spc_pc_histogram[apu->spc->pc]++;
+    if (apu->spc->pc > g_spc_pc_max_seen) g_spc_pc_max_seen = apu->spc->pc;
     apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
   }
   apu->cpuCyclesLeft--;
@@ -129,6 +136,11 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
 /* Diagnostic counters: track SPC writes to specific addresses so we
  * can see whether the engine is touching outPorts at all. */
 uint64_t g_spc_write_counts[0x100] = {0};
+
+/* SPC PC histogram. Sampled once per apu_cycle that starts a new
+ * opcode. Lets us answer "which PCs does the SPC spend time in?" */
+uint64_t g_spc_pc_histogram[0x10000] = {0};
+int g_spc_pc_max_seen = 0;
 /* Per-value count for outPorts $F4-$F7. Index = (port_idx * 256) + val. */
 uint64_t g_spc_outport_value_counts[4 * 256] = {0};
 /* Last 32 outPort writes as a ring buffer: [adr, val] pairs. */

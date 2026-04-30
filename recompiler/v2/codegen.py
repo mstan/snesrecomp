@@ -68,7 +68,7 @@ from v2.ir import (  # noqa: E402
     Read, Write, ReadReg, WriteReg, ConstI,
     Alu, AluOp, Shift, ShiftOp, IncReg,
     BitTest, BitSetMem, BitClearMem,
-    SetFlag, RepFlags, SepFlags, XCE,
+    SetFlag, SetNZ, RepFlags, SepFlags, XCE,
     Push, Pull, PushReg, PullReg, BlockMove,
     CondBranch, Goto, IndirectGoto, Call, Return,
     Transfer, XBA, Nop, Break, Stop, PushEffectiveAddress,
@@ -408,6 +408,17 @@ def _emit_setflag(op: SetFlag) -> List[str]:
     return lines
 
 
+def _emit_setnz(op) -> List[str]:
+    """Update N/Z mirrors and cpu->P bits based on op.src's bits."""
+    sign = "0x80" if op.width == 1 else "0x8000"
+    mask = "0xFF" if op.width == 1 else "0xFFFF"
+    return [
+        f"cpu->_flag_Z = ((({_v(op.src)}) & {mask}) == 0) ? 1 : 0;",
+        f"cpu->_flag_N = ((({_v(op.src)}) & {sign}) != 0) ? 1 : 0;",
+        f"cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
+    ]
+
+
 def _emit_repflags(op: RepFlags) -> List[str]:
     return [
         f"cpu->P = (uint8)(cpu->P & ~{op.mask:#04x});",
@@ -664,7 +675,8 @@ _DISPATCH = {
     ConstI: _emit_consti,
     Alu: _emit_alu, Shift: _emit_shift, IncReg: _emit_increg,
     BitTest: _emit_bittest, BitSetMem: _emit_bitsetmem, BitClearMem: _emit_bitclearmem,
-    SetFlag: _emit_setflag, RepFlags: _emit_repflags, SepFlags: _emit_sepflags,
+    SetFlag: _emit_setflag, SetNZ: _emit_setnz,
+    RepFlags: _emit_repflags, SepFlags: _emit_sepflags,
     XCE: _emit_xce, XBA: _emit_xba,
     Push: _emit_push, Pull: _emit_pull,
     PushReg: _emit_pushreg, PullReg: _emit_pullreg,

@@ -39,7 +39,7 @@ from snes65816 import (  # noqa: E402
 from v2.ir import (  # noqa: E402
     IROp, Read, Write, ReadReg, WriteReg, ConstI, Alu, AluOp, Shift,
     ShiftOp, IncReg, BitTest, BitSetMem, BitClearMem,
-    SetFlag, RepFlags, SepFlags, XCE, Push, Pull, PushReg, PullReg,
+    SetFlag, SetNZ, RepFlags, SepFlags, XCE, Push, Pull, PushReg, PullReg,
     BlockMove, CondBranch, Goto, IndirectGoto, Call, Return,
     Transfer, XBA, Nop, Break, Stop, PushEffectiveAddress,
     Reg, SegRef, SegKind, Value,
@@ -139,36 +139,45 @@ def lower(insn: Insn, *, value_factory: ValueFactory) -> List[IROp]:
 # ── Per-mnemonic handlers ───────────────────────────────────────────────────
 
 def _h_lda(insn, vf):
+    w = _width_a(insn)
     if insn.mode == IMM:
         v = vf()
-        return [ConstI(value=insn.operand, width=_width_a(insn), out=v),
-                WriteReg(reg=Reg.A, src=v)]
+        return [ConstI(value=insn.operand, width=w, out=v),
+                WriteReg(reg=Reg.A, src=v),
+                SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
     v = vf()
-    return [Read(seg=seg, width=_width_a(insn), out=v),
-            WriteReg(reg=Reg.A, src=v)]
+    return [Read(seg=seg, width=w, out=v),
+            WriteReg(reg=Reg.A, src=v),
+            SetNZ(src=v, width=w)]
 
 
 def _h_ldx(insn, vf):
+    w = _width_x(insn)
     if insn.mode == IMM:
         v = vf()
-        return [ConstI(value=insn.operand, width=_width_x(insn), out=v),
-                WriteReg(reg=Reg.X, src=v)]
+        return [ConstI(value=insn.operand, width=w, out=v),
+                WriteReg(reg=Reg.X, src=v),
+                SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
     v = vf()
-    return [Read(seg=seg, width=_width_x(insn), out=v),
-            WriteReg(reg=Reg.X, src=v)]
+    return [Read(seg=seg, width=w, out=v),
+            WriteReg(reg=Reg.X, src=v),
+            SetNZ(src=v, width=w)]
 
 
 def _h_ldy(insn, vf):
+    w = _width_x(insn)
     if insn.mode == IMM:
         v = vf()
-        return [ConstI(value=insn.operand, width=_width_x(insn), out=v),
-                WriteReg(reg=Reg.Y, src=v)]
+        return [ConstI(value=insn.operand, width=w, out=v),
+                WriteReg(reg=Reg.Y, src=v),
+                SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
     v = vf()
-    return [Read(seg=seg, width=_width_x(insn), out=v),
-            WriteReg(reg=Reg.Y, src=v)]
+    return [Read(seg=seg, width=w, out=v),
+            WriteReg(reg=Reg.Y, src=v),
+            SetNZ(src=v, width=w)]
 
 
 def _h_sta(insn, vf):

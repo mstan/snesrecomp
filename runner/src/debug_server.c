@@ -3310,11 +3310,69 @@ static void cmd_get_frame_range_extended(const char *args) {
  * $BBAA when set. Helps isolate whether boot is hung on engine-not-
  * writing vs host-poll-broken. */
 extern int g_force_apu_bbaa;
+extern int g_apu_autoack;
 static void cmd_force_apu_bbaa(const char *args) {
     int v = 1;
     sscanf(args ? args : "", "%d", &v);
     g_force_apu_bbaa = v;
     send_fmt("{\"ok\":true,\"force\":%d}", g_force_apu_bbaa);
+}
+static void cmd_apu_autoack(const char *args) {
+    int v = 1;
+    sscanf(args ? args : "", "%d", &v);
+    g_apu_autoack = v;
+    send_fmt("{\"ok\":true,\"autoack\":%d}", g_apu_autoack);
+}
+
+/* SPC PC histogram so we can see *exactly* which engine PCs the SPC
+ * spends time in. apu.c samples spc->pc once per apu_cycle when SPC
+ * starts a new opcode (cpuCyclesLeft was 0). */
+extern uint64_t g_spc_pc_histogram[0x10000];
+extern int g_spc_pc_max_seen;
+
+static void cmd_get_apu_misc(const char *args) {
+    if (!g_snes || !g_snes->apu) { send_fmt("{\"error\":\"apu n/a\"}"); return; }
+    send_fmt("{\"romReadable\":%s,\"cycles\":%llu,\"cpuCyclesLeft\":%d}",
+             g_snes->apu->romReadable ? "true" : "false",
+             (unsigned long long)g_snes->apu->cycles,
+             g_snes->apu->cpuCyclesLeft);
+}
+
+static void cmd_get_spc_pc_hist(const char *args) {
+    /* Find top-32 hottest PCs and report them with their counts. */
+    int top_n = 64;
+    int top_pcs[64] = {0};
+    uint64_t top_counts[64] = {0};
+    for (int pc = 0; pc < 0x10000; pc++) {
+        uint64_t c = g_spc_pc_histogram[pc];
+        if (c == 0) continue;
+        /* Insert into top list. */
+        int slot = -1;
+        for (int s = 0; s < top_n; s++) {
+            if (c > top_counts[s]) { slot = s; break; }
+        }
+        if (slot >= 0) {
+            for (int s = top_n - 1; s > slot; s--) {
+                top_pcs[s] = top_pcs[s-1];
+                top_counts[s] = top_counts[s-1];
+            }
+            top_pcs[slot] = pc;
+            top_counts[slot] = c;
+        }
+    }
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "{\"max_pc\":\"0x%04x\",\"top\":[", g_spc_pc_max_seen);
+    int first = 1;
+    for (int i = 0; i < top_n; i++) {
+        if (top_counts[i] == 0) break;
+        if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        first = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "[\"0x%04x\",%llu]", top_pcs[i],
+                        (unsigned long long)top_counts[i]);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
 }
 
 /* Dump write counts for SPC apu_cpuWrite addresses. Shows whether
@@ -3370,7 +3428,10 @@ static const CmdEntry s_commands[] = {
     {"ping",          cmd_ping},
     {"get_v2_cpu",    cmd_get_v2_cpu},
     {"force_apu_bbaa", cmd_force_apu_bbaa},
+    {"apu_autoack",    cmd_apu_autoack},
     {"get_spc_writes", cmd_get_spc_writes},
+    {"get_spc_pc_hist", cmd_get_spc_pc_hist},
+    {"get_apu_misc",   cmd_get_apu_misc},
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},

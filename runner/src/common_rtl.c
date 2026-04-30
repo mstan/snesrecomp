@@ -6,15 +6,19 @@
 #include "config.h"
 #include "snes/snes.h"
 #include "snes/apu.h"
+#include "cpu_state.h"
 #include "debug_server.h"
 
 uint8 g_ram[0x20000];
 /* Diag flag — set via debug_server `force_apu_bbaa <0|1>` cmd. When 1,
- * every 16-bit read of $2140 returns $BBAA, satisfying the host's
- * SPC-handshake poll. Useful for proving the host-side compare logic
- * is correct (with this on, host advances into the SPC upload data
- * loop) and for isolating remaining engine-side issues. Default off. */
+ * every 16-bit read of $2140 returns $BBAA. Useful for proving the
+ * host-side compare logic is correct. */
 int g_force_apu_bbaa = 0;
+/* Brutal hack: when 1, ALL APU port reads return a value derived from
+ * the v2 CpuState's A register so polls always succeed. Lets us see
+ * how much of the rest of the recompiled boot path works when the SPC
+ * handshake is short-circuited. */
+int g_apu_autoack = 0;
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
@@ -206,6 +210,15 @@ uint8 ReadReg(uint16 reg) {
   if (reg >= 0x2100 && reg < 0x2140) {
     return ppu_read(g_ppu, reg & 0xff);
   } else if (reg >= 0x2140 && reg < 0x2180) {
+    if (g_apu_autoack) {
+      /* Auto-ack: return v2 CpuState's current A low byte for $2140
+       * (which is what L_80D3 / L_80AA / L_809A wait for), and BB/AA
+       * for $2141 to keep the BBAA poll satisfied. */
+      extern struct CpuState g_cpu;
+      if (reg == 0x2140) return (uint8)(g_cpu.A & 0xFF);
+      if (reg == 0x2141) return 0xBB;
+      return 0;
+    }
     // APU read — need emulator for this since APU is emulated
     return snes_read(g_snes, reg);
   } else if (reg == 0x2180) {
@@ -239,16 +252,18 @@ uint16 ReadRegWord(uint16 reg) {
     void snes_catchupApu(Snes* snes);
     extern Snes *g_snes;
     extern int g_force_apu_bbaa;
+    extern int g_apu_autoack;
+    extern struct CpuState g_cpu;
+    if (g_apu_autoack && reg == 0x2140) {
+      /* Auto-ack 16-bit: return $BBAA always for the BBAA poll. */
+      return 0xBBAA;
+    }
     RtlApuLock();
     rtl_accumulate_apu_catchup();
     snes_catchupApu(g_snes);
     uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
     uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
     RtlApuUnlock();
-    /* TEMP DIAGNOSTIC: persistent force of BBAA into outPorts[0..1]
-     * for the 16-bit read path at $2140. If host's CMP $2140==BBAA
-     * poll is broken, this won't help. If it's correct, it'll fire
-     * the BNE-not-taken and Inner will progress. */
     if (g_force_apu_bbaa && reg == 0x2140) {
       lo = 0xAA;
       hi = 0xBB;

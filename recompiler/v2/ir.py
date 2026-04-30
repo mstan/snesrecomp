@@ -219,6 +219,16 @@ class SetFlag(IROp):
 
 
 @dataclass(frozen=True)
+class SetNZ(IROp):
+    """Update N/Z flags based on the given Value's bits.
+    width: 1 (8-bit, mask $80 for N) or 2 (16-bit, mask $8000 for N).
+    Used after LDA/LDX/LDY/Transfer/Pull where 65816 hw sets N/Z from the
+    moved value."""
+    src: 'Value'
+    width: int
+
+
+@dataclass(frozen=True)
 class RepFlags(IROp):
     """REP #imm — clear bits set in `mask`. Updates M, XF, plus other P bits if requested."""
     mask: int
