@@ -188,19 +188,41 @@ void cpu_trace_set_func_watch(const char *name) {
     g_func_watch_hash = name ? fnv1a_extern(name) : 0;
 }
 
-/* Off-rails dump rate-limit: only dump once per 64 hits to avoid burying
- * the trace under endless repeats of the same fail. */
-static uint64_t s_offrails_count = 0;
+/* Off-rails dump: ONE dump per (tag, distinct hint) — silent for repeat
+ * hits of the same kind. The first occurrence captures the chain;
+ * additional repeats add nothing. Burning tokens on millions of
+ * identical "RomPtr - Invalid 0x570000..0x57FFFF" lines is the
+ * exact failure mode the ring buffer was built to avoid. */
+#define OFFRAILS_TAG_MAX 16
+static struct {
+    uint64_t hash;       /* fnv1a(tag) ^ (hint scrambled) */
+    uint64_t count;
+} s_offrails_seen[OFFRAILS_TAG_MAX];
+static int s_offrails_used = 0;
+
 void cpu_trace_offrails(const char *tag, uint32_t hint) {
-    s_offrails_count++;
-    if (s_offrails_count == 1 || (s_offrails_count & 0x3F) == 0) {
-        char buf[96];
-        snprintf(buf, sizeof(buf), "OFF-RAILS [%s] hit#%llu hint=$%08X",
-                 tag ? tag : "?", (unsigned long long)s_offrails_count,
-                 hint);
-        cpu_trace_dump_dbpb(buf);
-        cpu_trace_dump_recent(buf, 64);
+    /* Cheap key — collision-tolerant, just needs to dedupe spam. */
+    uint64_t k = fnv1a(tag ? tag : "");
+    k = (k * 0x100000001B3ull) ^ (uint64_t)hint;
+    /* Group by (tag, high bytes of hint) so a sweep through
+     * \$57:0000-\$57:FFFF dedupes to one dump per page. */
+    uint64_t group_k = fnv1a(tag ? tag : "");
+    group_k = (group_k * 0x100000001B3ull) ^ ((uint64_t)hint & 0xFFFF0000u);
+    for (int i = 0; i < s_offrails_used; i++) {
+        if (s_offrails_seen[i].hash == group_k) {
+            s_offrails_seen[i].count++;
+            return;  /* silent dedup */
+        }
     }
+    if (s_offrails_used >= OFFRAILS_TAG_MAX) return;  /* table full, silent */
+    s_offrails_seen[s_offrails_used].hash = group_k;
+    s_offrails_seen[s_offrails_used].count = 1;
+    s_offrails_used++;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "OFF-RAILS [%s] FIRST hint=$%08X",
+             tag ? tag : "?", hint);
+    cpu_trace_dump_dbpb(buf);
+    cpu_trace_dump_recent(buf, 64);
 }
 
 /* Public wrapper so debug_server / other TUs can hash names. */

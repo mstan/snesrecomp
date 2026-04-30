@@ -83,14 +83,9 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
     // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
     return cart->rom[((bank << 15) | (adr & 0x7fff)) & (cart->romSize - 1)];
   }
-  /* Out-of-range cart read. v2 boot path occasionally lands here via
-   * data-decoded-as-code reads with garbage pointers. Real fix is
-   * upstream (find why the recompiled code reads from bank<$40 +
-   * addr<$8000 = the WRAM/HW-reg region routed to cart). For now,
-   * return 0 so boot keeps progressing and the trace ring + DB-watch
-   * tripwires can identify the upstream issue without dying. */
-  printf("cart_readLorom: out-of-range 0x%x — returning 0\n", bank << 16 | adr);
-  /* Arm backwards-trace dump (rate-limited via cpu_trace_offrails). */
+  /* Out-of-range cart read. No printf — the ring buffer is the
+   * channel. cpu_trace_offrails dumps trace at hit#1 + every 64th
+   * so we see the chain WITHOUT million-line stderr floods. */
   cpu_trace_offrails("cart_readLorom", (uint32_t)bank << 16 | adr);
   return 0;
 }

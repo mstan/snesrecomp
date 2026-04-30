@@ -164,15 +164,11 @@ bool Unreachable(void) {
 }
 
 uint8 *RomPtr(uint32_t addr) {
-  extern const char *g_last_recomp_func;
   if (!(addr & 0x8000) || addr >= 0x7e0000) {
-    printf("RomPtr - Invalid access 0x%x in %s!\n", addr, g_last_recomp_func ? g_last_recomp_func : "?");
-    if (!g_fail) {
-      g_fail = true;
-    }
-    /* Off-rails dump (rate-limited): the FIRST bad RomPtr access plus
-     * every 64th after triggers a backwards trace dump so we see the
-     * chain that produced the bad pointer, not just its symptom. */
+    if (!g_fail) g_fail = true;
+    /* No printf — the ring buffer + cpu_trace_offrails is the
+     * channel for backwards investigation. printf'ing every bad
+     * read floods stderr with millions of identical lines. */
     cpu_trace_offrails("RomPtr-invalid", addr);
   }
   /* Compute LoROM offset, then mirror against ACTUAL ROM size. SMW is
