@@ -114,5 +114,6 @@ def _default_file_header(bank: int) -> str:
  */
 
 #include "cpu_state.h"
+#include "cpu_trace.h"
 #include "funcs.h"
 """

@@ -172,8 +172,14 @@ def emit_function(rom: bytes, bank: int, start: int,
     src.append(f'  g_last_recomp_func = "{func_name}";')
     src.append(f'  RecompStackPush("{func_name}");')
     src.append(f'  cpu_dbg_funcname("{func_name}");')
+    # Trace ring: function entry (carries name hash) — first entry per call.
+    fn_entry_pc = (bank << 16) | (start & 0xFFFF)
+    src.append(f'  cpu_trace_func_entry(cpu, 0x{fn_entry_pc:06X}, "{func_name}");')
     for i, key in enumerate(block_order):
         src.append(f"  {_label_for(key)}:")
+        # Trace block entry — gives us the SNES PC chain in the trace ring.
+        block_pc24 = (bank << 16) | (key.pc & 0xFFFF)
+        src.append(f'    cpu_trace_block(cpu, 0x{block_pc24:06X});')
         for ln in block_lines[key]:
             # Inject RecompStackPop before any return so the stack stays balanced.
             stripped = ln.strip()

@@ -49,6 +49,7 @@ extern int snes_frame_counter;
 #include "snes/snes.h"
 #include "snes/saveload.h"
 #include "cpu_state.h"
+#include "cpu_trace.h"
 extern Ppu *g_ppu;
 extern Cpu *g_snes_cpu;
 extern Dma *g_dma;
@@ -3324,6 +3325,35 @@ static void cmd_apu_autoack(const char *args) {
     send_fmt("{\"ok\":true,\"autoack\":%d}", g_apu_autoack);
 }
 
+/* v2 trace ring access via debug-server. */
+static void cmd_trace_dump(const char *args) {
+    int n = 256;
+    sscanf(args ? args : "", "%d", &n);
+    cpu_trace_dump_recent("trace cmd", n);
+    send_fmt("{\"ok\":true,\"dumped\":%d}", n);
+}
+static void cmd_trace_dbpb(const char *args) {
+    (void)args;
+    cpu_trace_dump_dbpb("dbpb cmd");
+    send_fmt("{\"ok\":true}");
+}
+static void cmd_trace_clear(const char *args) {
+    (void)args;
+    cpu_trace_clear();
+    send_fmt("{\"ok\":true}");
+}
+static void cmd_set_db_watch(const char *args) {
+    /* args: "<hex byte> [enable=1]" — sets the tripwire on that DB value */
+    unsigned int byte = 0;
+    int enable = 1;
+    if (sscanf(args ? args : "", "%x %d", &byte, &enable) < 1) {
+        send_fmt("{\"error\":\"usage: set_db_watch <hex byte> [0|1]\"}");
+        return;
+    }
+    cpu_trace_set_db_watch((uint8_t)byte, enable);
+    send_fmt("{\"ok\":true,\"db\":\"0x%02X\",\"enabled\":%d}", byte & 0xFF, enable);
+}
+
 /* SPC PC histogram so we can see *exactly* which engine PCs the SPC
  * spends time in. apu.c samples spc->pc once per apu_cycle when SPC
  * starts a new opcode (cpuCyclesLeft was 0). */
@@ -3429,6 +3459,10 @@ static const CmdEntry s_commands[] = {
     {"get_v2_cpu",    cmd_get_v2_cpu},
     {"force_apu_bbaa", cmd_force_apu_bbaa},
     {"apu_autoack",    cmd_apu_autoack},
+    {"trace_dump",     cmd_trace_dump},
+    {"trace_dbpb",     cmd_trace_dbpb},
+    {"trace_clear",    cmd_trace_clear},
+    {"set_db_watch",   cmd_set_db_watch},
     {"get_spc_writes", cmd_get_spc_writes},
     {"get_spc_pc_hist", cmd_get_spc_pc_hist},
     {"get_apu_misc",   cmd_get_apu_misc},

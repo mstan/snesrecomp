@@ -462,20 +462,25 @@ def _emit_pushreg(op: PushReg) -> List[str]:
     # Push is 1 or 2 bytes depending on register; for now treat A/B/X/Y/D as
     # following m/x widths and S/DB/PB as 1-byte. P is 1 byte. D is 16-bit.
     if op.reg == Reg.P:
-        # Sync per-flag mirrors INTO cpu->P first — otherwise a flag set
-        # via SetFlag (SEI, CLC, CLD, etc.) without a corresponding P
-        # update would push a stale P byte, and the matching PLP would
-        # restore the wrong flags. Critical for the SPC upload's BVS at
-        # $80D8 which relies on V flowing through a PHP/PLP pair.
         return [
             "cpu_mirrors_to_p(cpu);",
             f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
             "cpu->S = (uint16)(cpu->S - 1);",
+            f"cpu_trace_event(cpu, 0, CPU_TR_PHP, cpu->P, 0);",
         ]
-    if op.reg in (Reg.DB, Reg.PB):
+    if op.reg == Reg.DB:
         return [
             f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
             "cpu->S = (uint16)(cpu->S - 1);",
+            f"cpu_trace_event(cpu, 0, CPU_TR_PHB, cpu->DB, cpu->DB);",
+        ]
+    if op.reg == Reg.PB:
+        # PHK pushes the program-bank K. Critical hook: a stale PB here
+        # is the suspected root cause of bogus DB after PLB.
+        return [
+            f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
+            "cpu->S = (uint16)(cpu->S - 1);",
+            f"cpu_trace_event(cpu, 0, CPU_TR_PHK, cpu->PB, cpu->PB);",
         ]
     if op.reg == Reg.D:
         return [
@@ -513,18 +518,34 @@ def _emit_pullreg(op: PullReg) -> List[str]:
     field = _reg(op.reg)
     if op.reg == Reg.P:
         return [
-            "cpu->S = (uint16)(cpu->S + 1);",
-            f"{field} = cpu_read8(cpu, 0x00, cpu->S);",
-            "cpu_p_to_mirrors(cpu);",
+            "{ uint8 _old_p = cpu->P;",
+            "  cpu->S = (uint16)(cpu->S + 1);",
+            f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
+            "  cpu_p_to_mirrors(cpu);",
+            f"  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P); }}",
         ]
-    if op.reg in (Reg.DB, Reg.PB):
-        # PLB / (PLK doesn't exist). PLB sets N/Z from popped value.
+    if op.reg == Reg.DB:
+        # PLB sets N/Z from popped value.
         return [
-            "cpu->S = (uint16)(cpu->S + 1);",
-            f"{field} = cpu_read8(cpu, 0x00, cpu->S);",
-            f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
-            f"cpu->_flag_N = (({field} & 0x80) != 0) ? 1 : 0;",
-            "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
+            "{ uint8 _old_db = cpu->DB;",
+            "  cpu->S = (uint16)(cpu->S + 1);",
+            f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
+            f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = (({field} & 0x80) != 0) ? 1 : 0;",
+            "  cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
+            f"  cpu_trace_db_change(cpu, 0, _old_db, cpu->DB, CPU_TR_PLB); }}",
+        ]
+    if op.reg == Reg.PB:
+        # PLK doesn't exist on the 65816, but the IR currently routes
+        # any PullReg(PB) here. Emit symmetric tracing for safety.
+        return [
+            "{ uint8 _old_pb = cpu->PB;",
+            "  cpu->S = (uint16)(cpu->S + 1);",
+            f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
+            f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = (({field} & 0x80) != 0) ? 1 : 0;",
+            "  cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
+            f"  cpu_trace_pb_change(cpu, 0, _old_pb, cpu->PB, CPU_TR_PB_WRITE); }}",
         ]
     if op.reg == Reg.D:
         # PLD: 16-bit, sets N/Z from popped 16-bit value.
@@ -582,8 +603,16 @@ def _emit_transfer(op: Transfer) -> List[str]:
     src = _reg(op.src)
     dst = _reg(op.dst)
     # TXS, TCS: no flag update, no width check (S is always 16-bit native).
+    # TXS only transfers low byte of X (S high stays); TCS transfers all 16
+    # bits. v1 emit didn't distinguish. Trace S changes for hunt-the-bug.
     if op.dst == Reg.S:
-        return [f"{dst} = {src};"]
+        return [
+            "{ uint16 _old_s = cpu->S;",
+            f"  {dst} = {src};",
+            "  /* trace_event uses extra0/extra1 for old/new S high bytes */",
+            "  cpu_trace_event(cpu, 0, CPU_TR_DB_WRITE,",
+            "                  (uint8)(_old_s >> 8), cpu->S); }",
+        ]
     # Determine destination width from controlling flag.
     if op.dst == Reg.A:
         flag = "cpu->m_flag"
@@ -645,12 +674,31 @@ def _emit_call(op: Call) -> List[str]:
         pc = addr & 0xFFFF
         name = f"bank_{bank:02X}_{pc:04X}"
         _UNRESOLVED_CALL_TARGETS.add(addr)
+    target_bank = (addr >> 16) & 0xFF
+    if op.long:
+        # JSL: real hardware sets PB to the target bank for the call's
+        # duration, then RTL restores it. Emit explicit PB save/restore
+        # so PHK inside the callee pushes the CORRECT bank — without
+        # this, PHK; PLB inside a JSL'd function poisons DB to the
+        # CALLER's bank instead of the callee's (= currently $00 always).
+        return [
+            "{ uint8 _saved_pb = cpu->PB;",
+            f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
+            f"  cpu->PB = {target_bank:#04x};",
+            f"  {name}(cpu);",
+            f"  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
+            f"  cpu->PB = _saved_pb; }}",
+        ]
+    # JSR: same-bank short call. PB doesn't change.
     return [f"{name}(cpu);"]
 
 
 def _emit_return(op: Return) -> List[str]:
     if op.interrupt:
-        return ["return; /* RTI */"]
+        return [
+            "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);",
+            "return; /* RTI */",
+        ]
     return ["return; /* RTL */" if op.long else "return; /* RTS */"]
 
 
@@ -689,10 +737,13 @@ def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
 
 def _emit_blockmove(op: BlockMove) -> List[str]:
     delta = "+1" if op.direction == "mvn" else "-1"
+    et = "CPU_TR_MVN" if op.direction == "mvn" else "CPU_TR_MVP"
     return [
         "{",
         f"  uint8 _src_b = {op.src_bank:#04x};",
         f"  uint8 _dst_b = {op.dst_bank:#04x};",
+        "  uint8 _old_db = cpu->DB;",
+        f"  cpu_trace_event(cpu, 0, {et}, _src_b, _dst_b);",
         "  while (cpu->A != 0xFFFF) {",
         "    uint8 _b = cpu_read8(cpu, _src_b, cpu->X);",
         "    cpu_write8(cpu, _dst_b, cpu->Y, _b);",
@@ -701,6 +752,7 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
         "    cpu->A = (uint16)(cpu->A - 1);",
         "  }",
         "  cpu->DB = _dst_b;",
+        f"  cpu_trace_db_change(cpu, 0, _old_db, _dst_b, {et});",
         "}",
     ]
 
