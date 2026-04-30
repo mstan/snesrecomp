@@ -13,6 +13,124 @@ CpuDbpbEvent  g_cpu_dbpb_ring[CPU_DBPB_RING_LEN];
 uint64_t      g_cpu_dbpb_idx = 0;
 uint8_t       g_db_watch_set = 0;
 uint32_t      g_db_watch_bits[8] = {0};
+ScopedTripwire g_scoped_tripwire = {0};
+
+/* External symbols from common_cpu_infra / debug_server. */
+extern const char *g_last_recomp_func;
+extern const char *g_recomp_stack[];
+extern int         g_recomp_stack_top;
+extern int         snes_frame_counter;
+extern uint64_t          g_main_cpu_cycles_estimate;
+extern volatile uint64_t g_block_counter;
+extern uint8_t     g_ram[];
+
+void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
+                                   uint16_t addr_hi, const char *scope_substr) {
+    memset(&g_scoped_tripwire, 0, sizeof(g_scoped_tripwire));
+    g_scoped_tripwire.armed = 1;
+    g_scoped_tripwire.bank = bank;
+    g_scoped_tripwire.addr_lo = addr_lo;
+    g_scoped_tripwire.addr_hi = addr_hi;
+    if (scope_substr) {
+        strncpy(g_scoped_tripwire.scope_substr, scope_substr,
+                SCOPED_TRIPWIRE_FUNC_LEN - 1);
+        g_scoped_tripwire.scope_substr[SCOPED_TRIPWIRE_FUNC_LEN - 1] = 0;
+    }
+}
+
+void cpu_trace_disarm_scoped_tripwire(void) {
+    g_scoped_tripwire.armed = 0;
+}
+
+/* Walk backward over the trace ring to find the most recent BLOCK and
+ * FUNC_ENTRY events before `before_idx`. Records their pc24 into the
+ * tripwire snapshot so the client can locate the writer in source. */
+static void scoped_tripwire_collect_recent_context(uint64_t before_idx) {
+    g_scoped_tripwire.recent_block_pc24 = 0;
+    g_scoped_tripwire.recent_func_pc24 = 0;
+    int got_block = 0, got_func = 0;
+    /* Limit to last 4096 events to bound work. */
+    int scan = 4096;
+    for (int i = 1; i <= scan && (got_block == 0 || got_func == 0); i++) {
+        if ((uint64_t)i > before_idx) break;
+        uint64_t abs_idx = before_idx - i;
+        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        CpuTraceEvent *e = &g_cpu_trace_ring[slot];
+        if (!got_block && e->event_type == CPU_TR_BLOCK) {
+            g_scoped_tripwire.recent_block_pc24 = e->pc24;
+            got_block = 1;
+        }
+        if (!got_func && e->event_type == CPU_TR_FUNC_ENTRY) {
+            g_scoped_tripwire.recent_func_pc24 = e->pc24;
+            got_func = 1;
+        }
+    }
+}
+
+/* Called from cpu_trace_wram_write_check on every match. Returns 1 if
+ * armed-and-fired (caller can skip future checks for this watch). */
+static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
+                                      uint16_t addr, uint8_t hit_byte_in_word,
+                                      uint8_t hit_val, int width) {
+    ScopedTripwire *t = &g_scoped_tripwire;
+    if (!t->armed || t->triggered) return 0;
+    if (bank != t->bank) return 0;
+    if (addr < t->addr_lo || addr > t->addr_hi) return 0;
+    /* Scope check: substring of any recomp stack entry. */
+    if (t->scope_substr[0]) {
+        int found = 0;
+        for (int i = 0; i < g_recomp_stack_top && !found; i++) {
+            const char *p = g_recomp_stack[i];
+            if (p && strstr(p, t->scope_substr)) found = 1;
+        }
+        if (!found) return 0;
+    }
+    /* Trigger: capture full snapshot. */
+    t->triggered = 1;
+    t->frame = snes_frame_counter;
+    t->main_cycles = g_main_cpu_cycles_estimate;
+    t->trace_idx = g_cpu_trace_idx;  /* points one PAST the WRAM_WRITE event */
+    t->block_counter = g_block_counter;
+    t->hit_addr = addr;
+    t->hit_val = hit_val;
+    t->hit_byte_in_word = hit_byte_in_word;
+    t->width_seen = (uint8_t)width;
+    t->A = cpu->A; t->X = cpu->X; t->Y = cpu->Y;
+    t->S = cpu->S; t->D = cpu->D;
+    t->DB = cpu->DB; t->PB = cpu->PB; t->P = cpu->P;
+    t->m_flag = cpu->m_flag; t->x_flag = cpu->x_flag;
+    t->e_flag = cpu->emulation;
+
+    scoped_tripwire_collect_recent_context(t->trace_idx);
+
+    if (g_last_recomp_func) {
+        strncpy(t->last_func_name, g_last_recomp_func,
+                SCOPED_TRIPWIRE_CONTEXT_FN - 1);
+        t->last_func_name[SCOPED_TRIPWIRE_CONTEXT_FN - 1] = 0;
+    }
+
+    /* Recomp stack snapshot (deepest first; matches g_recomp_stack order). */
+    int depth = g_recomp_stack_top;
+    if (depth > SCOPED_TRIPWIRE_STACK_DEPTH) depth = SCOPED_TRIPWIRE_STACK_DEPTH;
+    t->stack_depth = depth;
+    int skip = g_recomp_stack_top - depth;
+    for (int i = 0; i < depth; i++) {
+        const char *p = g_recomp_stack[skip + i];
+        if (p) {
+            strncpy(t->stack[i], p, SCOPED_TRIPWIRE_FUNC_LEN - 1);
+            t->stack[i][SCOPED_TRIPWIRE_FUNC_LEN - 1] = 0;
+        } else {
+            t->stack[i][0] = 0;
+        }
+    }
+
+    /* DP region snapshot ($7E:0080-009F = WRAM offset 0x0080) */
+    memcpy(t->dp_snapshot, &g_ram[0x0080], SCOPED_TRIPWIRE_DP_BYTES);
+    /* GameMode region snapshot ($7E:0100-010F = WRAM offset 0x0100) */
+    memcpy(t->gm_snapshot, &g_ram[0x0100], SCOPED_TRIPWIRE_GM_BYTES);
+
+    return 1;
+}
 
 static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                     uint8_t extra0, uint16_t extra1) {
@@ -280,6 +398,18 @@ void cpu_trace_clear_wram_watches(void) {
 
 void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
                                 int32_t ram_off, uint16_t new_val, int width) {
+    /* Scoped tripwire fires regardless of g_wram_watch_any — it has its
+     * own armed/triggered gate. Check it here BEFORE the early-out so a
+     * client can arm a tripwire without needing a parallel cpu_trace
+     * watch slot. */
+    if (g_scoped_tripwire.armed && !g_scoped_tripwire.triggered && ram_off >= 0) {
+        uint8_t b0 = (uint8_t)(new_val & 0xFF);
+        uint8_t b1 = (uint8_t)(new_val >> 8);
+        scoped_tripwire_maybe_fire(cpu, bank, addr, 0, b0, width);
+        if (width == 2 && !g_scoped_tripwire.triggered) {
+            scoped_tripwire_maybe_fire(cpu, bank, (uint16_t)(addr + 1), 1, b1, width);
+        }
+    }
     if (!g_wram_watch_any || ram_off < 0) return;
     /* Always-on recorder. Every write to a watched offset goes into the
      * main trace ring as a CPU_TR_WRAM_WRITE event. The watch does NOT

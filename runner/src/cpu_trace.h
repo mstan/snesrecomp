@@ -178,6 +178,73 @@ void cpu_trace_arm_default_watches(void);
 void cpu_trace_offrails(const char *tag, uint32_t hint);
 void cpu_trace_clear(void);
 
+/* ── Scoped one-shot tripwire (TCP-readable) ──────────────────────────────
+ *
+ * Arm with a (bank, addr_lo, addr_hi) WRAM range and an optional substring
+ * the recomp stack must contain. On the FIRST cpu_write* hit that matches
+ * BOTH criteria, capture a snapshot and disarm. The snapshot is intended
+ * for TCP query — debug_server reads g_scoped_tripwire and emits JSON
+ * including the triggering event, recomp stack at trip time, DP region
+ * snapshot, and the absolute trace ring index so the client can query
+ * surrounding events.
+ *
+ * Distinct from `cpu_trace_set_wram_watch(..., match_value=1, value=V)`
+ * which fires a STDERR dump on a value-match. This tripwire fires on
+ * any write inside the address range while a named function is on the
+ * stack, captures structured data, and stays captured until the client
+ * reads or rearms.
+ */
+#define SCOPED_TRIPWIRE_STACK_DEPTH 16
+#define SCOPED_TRIPWIRE_DP_BYTES    32     /* $7E:0080-$009F snapshot */
+#define SCOPED_TRIPWIRE_GM_BYTES    16     /* $7E:0100-$010F snapshot */
+#define SCOPED_TRIPWIRE_FUNC_LEN    48
+#define SCOPED_TRIPWIRE_CONTEXT_FN  48     /* most-recent func name @ trip */
+
+typedef struct ScopedTripwire {
+    /* Arming state */
+    uint8_t  armed;
+    uint8_t  triggered;
+    uint8_t  bank;
+    uint8_t  width_seen;        /* 1 or 2 — width of the triggering write */
+    uint16_t addr_lo;
+    uint16_t addr_hi;
+    char     scope_substr[SCOPED_TRIPWIRE_FUNC_LEN];
+
+    /* Captured at trip time */
+    int      frame;
+    uint64_t main_cycles;
+    uint64_t trace_idx;          /* absolute g_cpu_trace_idx at trip */
+    uint64_t block_counter;
+
+    uint16_t hit_addr;           /* the byte offset that matched */
+    uint8_t  hit_val;
+    uint8_t  hit_byte_in_word;   /* 0=low, 1=high — for 16-bit writes */
+
+    /* Full CpuState at trip */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+
+    /* Most-recent context */
+    uint32_t recent_block_pc24;  /* last cpu_trace_block PC before trip */
+    uint32_t recent_func_pc24;   /* last cpu_trace_func_entry PC before trip */
+    char     last_func_name[SCOPED_TRIPWIRE_CONTEXT_FN];
+
+    /* Recomp stack snapshot (deepest on top, [0] is bottom-of-stack) */
+    int      stack_depth;
+    char     stack[SCOPED_TRIPWIRE_STACK_DEPTH][SCOPED_TRIPWIRE_FUNC_LEN];
+
+    /* DP/GM region snapshots */
+    uint8_t  dp_snapshot[SCOPED_TRIPWIRE_DP_BYTES];   /* $7E:0080-009F */
+    uint8_t  gm_snapshot[SCOPED_TRIPWIRE_GM_BYTES];   /* $7E:0100-010F */
+} ScopedTripwire;
+
+extern ScopedTripwire g_scoped_tripwire;
+
+/* Arm the tripwire. Pass scope_substr=NULL for "any stack". */
+void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
+                                   uint16_t addr_hi, const char *scope_substr);
+void cpu_trace_disarm_scoped_tripwire(void);
+
 /* Dump the last `n` events of the main ring to stderr, prefixed by `tag`. */
 void cpu_trace_dump_recent(const char *tag, int n);
 /* Dump the entire dbpb ring (newest first). */
@@ -212,6 +279,8 @@ static inline void cpu_trace_clear(void)                                    { }
 static inline void cpu_trace_dump_recent(const char *tag, int n)            { (void)tag; (void)n; }
 static inline void cpu_trace_dump_dbpb(const char *tag)                     { (void)tag; }
 static inline void cpu_trace_dump_wram(const char *tag, int n)              { (void)tag; (void)n; }
+static inline void cpu_trace_arm_scoped_tripwire(uint8_t b, uint16_t l, uint16_t h, const char *s) { (void)b; (void)l; (void)h; (void)s; }
+static inline void cpu_trace_disarm_scoped_tripwire(void) { }
 
 #endif
 

@@ -3332,6 +3332,204 @@ static void cmd_trace_dump(const char *args) {
     cpu_trace_dump_recent("trace cmd", n);
     send_fmt("{\"ok\":true,\"dumped\":%d}", n);
 }
+
+/* TCP-readable query of the always-on g_cpu_trace_ring. Walks BACKWARDS
+ * from the most-recent event (idx=g_cpu_trace_idx-1) up to `count`
+ * events, optionally filtered by event_type and bank/addr range.
+ *
+ * Args (whitespace-separated, all optional, all hex unless prefixed):
+ *     count=N             — max events to emit (default 64, max 4096)
+ *     skip=N              — skip first N matching events (default 0)
+ *     event=N             — only events with this event_type (CPU_TR_* enum)
+ *     bank=XX             — for WRAM_WRITE: extra1>>8 must equal bank
+ *     addr_lo=XXXX        — for WRAM_WRITE: addr (low 16 of pc24) >= lo
+ *     addr_hi=XXXX        — for WRAM_WRITE: addr <= hi
+ *     before_idx=N        — start scan from absolute idx N-1 (default = g_cpu_trace_idx)
+ *
+ * Each emitted event is JSON: idx, event, pc24, A,X,Y,S,D, DB,PB,P,m,x,
+ * extra0, extra1.
+ */
+static void cmd_trace_get_v2(const char *args) {
+#if SNESRECOMP_TRACE
+    int count = 64;
+    int skip = 0;
+    int event_filter = -1;
+    int bank_filter = -1;
+    unsigned int addr_lo = 0, addr_hi = 0xFFFF;
+    long long before_idx_arg = -1;
+    if (args) {
+        const char *p;
+        if ((p = strstr(args, "count=")) != NULL) sscanf(p + 6, "%d", &count);
+        if ((p = strstr(args, "skip=")) != NULL) sscanf(p + 5, "%d", &skip);
+        if ((p = strstr(args, "event=")) != NULL) sscanf(p + 6, "%d", &event_filter);
+        if ((p = strstr(args, "bank=")) != NULL) { unsigned int b = 0; if (sscanf(p + 5, "%x", &b) == 1) bank_filter = (int)b; }
+        if ((p = strstr(args, "addr_lo=")) != NULL) sscanf(p + 8, "%x", &addr_lo);
+        if ((p = strstr(args, "addr_hi=")) != NULL) sscanf(p + 8, "%x", &addr_hi);
+        if ((p = strstr(args, "before_idx=")) != NULL) sscanf(p + 11, "%lld", &before_idx_arg);
+    }
+    if (count > 4096) count = 4096;
+    if (count < 1) count = 1;
+
+    extern uint64_t g_cpu_trace_idx;
+    uint64_t end_idx = (before_idx_arg >= 0)
+        ? (uint64_t)before_idx_arg
+        : g_cpu_trace_idx;
+
+    static char buf[1048576];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"end_idx\":%llu,\"events\":[",
+        (unsigned long long)end_idx);
+    int emitted = 0;
+    int seen_matching = 0;
+    /* Bound scan distance to avoid crawling the whole 1M ring on bad filter. */
+    int max_scan = CPU_TRACE_RING_LEN;
+    for (int i = 1; i <= max_scan && emitted < count; i++) {
+        if ((uint64_t)i > end_idx) break;
+        uint64_t abs_idx = end_idx - i;
+        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        CpuTraceEvent *e = &g_cpu_trace_ring[slot];
+        /* Skip if filter mismatches. */
+        if (event_filter >= 0 && e->event_type != (uint8_t)event_filter) continue;
+        if (e->event_type == CPU_TR_WRAM_WRITE) {
+            uint8_t b = (uint8_t)(e->extra1 >> 8);
+            uint16_t a = (uint16_t)(e->pc24 & 0xFFFF);  /* extra1 hit-byte; pc24 has bank, not addr */
+            /* WRAM_WRITE pc24 is (PB<<16); the actual write address isn't
+             * preserved per-event. The cpu_trace path stores hit_byte_in_word
+             * in extra1's low byte but not the addr. For range filtering on
+             * WRAM_WRITE, use the most recent BLOCK event's PC as
+             * approximation OR rely on event_type filter only.
+             *
+             * For now: bank filter applies; addr range filter skipped on
+             * WRAM_WRITE because the addr isn't stored. Clients should use
+             * the scoped tripwire (trip_get) for write-localized capture. */
+            (void)a;
+            if (bank_filter >= 0 && b != (uint8_t)bank_filter) continue;
+            (void)addr_lo; (void)addr_hi;
+        }
+        if (skip > 0 && seen_matching < skip) { seen_matching++; continue; }
+        seen_matching++;
+
+        if (pos > (int)sizeof(buf) - 512) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"idx\":%llu,\"event\":%u,\"pc24\":\"0x%06x\","
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,"
+            "\"extra0\":\"0x%02x\",\"extra1\":\"0x%04x\","
+            "\"hash\":\"0x%08x\"}",
+            emitted ? "," : "",
+            (unsigned long long)abs_idx,
+            (unsigned)e->event_type, e->pc24,
+            e->A, e->X, e->Y, e->S, e->D,
+            e->DB, e->PB, e->P, e->M, e->XF,
+            e->extra0, e->extra1,
+            e->native_func_id_or_hash);
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
+    send_line(buf);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+/* Arm the scoped one-shot WRAM tripwire. Captures structured snapshot
+ * on first matching write that has scope_substr in the recomp stack. */
+static void cmd_tripwire_arm(const char *args) {
+#if SNESRECOMP_TRACE
+    if (!args || !*args) {
+        send_fmt("{\"error\":\"usage: tripwire_arm bank addr_lo addr_hi [scope=<substr>]\"}");
+        return;
+    }
+    unsigned int bank = 0, addr_lo = 0, addr_hi = 0;
+    int n = sscanf(args, "%x %x %x", &bank, &addr_lo, &addr_hi);
+    if (n < 3) {
+        send_fmt("{\"error\":\"usage: tripwire_arm bank addr_lo addr_hi [scope=<substr>]\"}");
+        return;
+    }
+    char scope[SCOPED_TRIPWIRE_FUNC_LEN] = {0};
+    const char *p = strstr(args, "scope=");
+    if (p) {
+        p += 6;
+        int i = 0;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && i < SCOPED_TRIPWIRE_FUNC_LEN - 1) {
+            scope[i++] = *p++;
+        }
+    }
+    cpu_trace_arm_scoped_tripwire((uint8_t)bank, (uint16_t)addr_lo,
+                                  (uint16_t)addr_hi, scope[0] ? scope : NULL);
+    send_fmt("{\"ok\":true,\"bank\":\"0x%02x\",\"addr_lo\":\"0x%04x\","
+             "\"addr_hi\":\"0x%04x\",\"scope\":\"%s\"}",
+             bank & 0xFF, addr_lo & 0xFFFF, addr_hi & 0xFFFF, scope);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_tripwire_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    ScopedTripwire *t = &g_scoped_tripwire;
+    static char buf[16384];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"triggered\":%u,\"scope\":\"%s\","
+        "\"bank\":\"0x%02x\",\"addr_lo\":\"0x%04x\",\"addr_hi\":\"0x%04x\"",
+        t->armed, t->triggered, t->scope_substr,
+        t->bank, t->addr_lo, t->addr_hi);
+    if (t->triggered) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"main_cycles\":%llu,\"trace_idx\":%llu,"
+            "\"block_counter\":%llu,"
+            "\"hit_addr\":\"0x%04x\",\"hit_val\":\"0x%02x\","
+            "\"hit_byte_in_word\":%u,\"width\":%u,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,\"e\":%u,"
+            "\"recent_block_pc24\":\"0x%06x\","
+            "\"recent_func_pc24\":\"0x%06x\","
+            "\"last_func\":\"%s\",\"stack\":[",
+            t->frame, (unsigned long long)t->main_cycles,
+            (unsigned long long)t->trace_idx,
+            (unsigned long long)t->block_counter,
+            t->hit_addr, t->hit_val, t->hit_byte_in_word, t->width_seen,
+            t->A, t->X, t->Y, t->S, t->D,
+            t->DB, t->PB, t->P, t->m_flag, t->x_flag, t->e_flag,
+            t->recent_block_pc24, t->recent_func_pc24,
+            t->last_func_name);
+        for (int i = 0; i < t->stack_depth; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", t->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"dp_0080\":\"");
+        for (int i = 0; i < SCOPED_TRIPWIRE_DP_BYTES; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x", t->dp_snapshot[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\",\"gm_0100\":\"");
+        for (int i = 0; i < SCOPED_TRIPWIRE_GM_BYTES; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x", t->gm_snapshot[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\"");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_tripwire_disarm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_disarm_scoped_tripwire();
+    send_fmt("{\"ok\":true}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
 static void cmd_trace_dbpb(const char *args) {
     (void)args;
     cpu_trace_dump_dbpb("dbpb cmd");
@@ -3518,6 +3716,10 @@ static const CmdEntry s_commands[] = {
     {"trace_dump",     cmd_trace_dump},
     {"trace_dbpb",     cmd_trace_dbpb},
     {"trace_clear",    cmd_trace_clear},
+    {"trace_get_v2",   cmd_trace_get_v2},
+    {"tripwire_arm",   cmd_tripwire_arm},
+    {"tripwire_get",   cmd_tripwire_get},
+    {"tripwire_disarm", cmd_tripwire_disarm},
     {"set_db_watch",   cmd_set_db_watch},
     {"arm_watches",    cmd_arm_watches},
     {"set_wram_watch", cmd_set_wram_watch},
