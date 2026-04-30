@@ -511,45 +511,109 @@ def _emit_pushreg(op: PushReg) -> List[str]:
 
 def _emit_pullreg(op: PullReg) -> List[str]:
     field = _reg(op.reg)
-    if op.reg in (Reg.DB, Reg.PB, Reg.P):
+    if op.reg == Reg.P:
         return [
             "cpu->S = (uint16)(cpu->S + 1);",
             f"{field} = cpu_read8(cpu, 0x00, cpu->S);",
-            "cpu_p_to_mirrors(cpu);" if op.reg == Reg.P else "",
+            "cpu_p_to_mirrors(cpu);",
+        ]
+    if op.reg in (Reg.DB, Reg.PB):
+        # PLB / (PLK doesn't exist). PLB sets N/Z from popped value.
+        return [
+            "cpu->S = (uint16)(cpu->S + 1);",
+            f"{field} = cpu_read8(cpu, 0x00, cpu->S);",
+            f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"cpu->_flag_N = (({field} & 0x80) != 0) ? 1 : 0;",
+            "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
         ]
     if op.reg == Reg.D:
+        # PLD: 16-bit, sets N/Z from popped 16-bit value.
         return [
             "cpu->S = (uint16)(cpu->S + 1);",
             f"{field} = cpu_read16(cpu, 0x00, cpu->S);",
             "cpu->S = (uint16)(cpu->S + 1);",
+            f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+            "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
         ]
     if op.reg == Reg.A:
+        # PLA: width follows M, sets N/Z from popped value.
         return [
             "if (cpu->m_flag) {",
             "  cpu->S = (uint16)(cpu->S + 1);",
-            f"  {field} = (uint16)(({field} & 0xFF00) | cpu_read8(cpu, 0x00, cpu->S));",
+            "  uint8 _v = cpu_read8(cpu, 0x00, cpu->S);",
+            f"  {field} = (uint16)(({field} & 0xFF00) | _v);",
+            "  cpu->_flag_Z = (_v == 0) ? 1 : 0;",
+            "  cpu->_flag_N = ((_v & 0x80) != 0) ? 1 : 0;",
             "} else {",
             "  cpu->S = (uint16)(cpu->S + 1);",
             f"  {field} = cpu_read16(cpu, 0x00, cpu->S);",
             "  cpu->S = (uint16)(cpu->S + 1);",
+            f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
             "}",
+            "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
         ]
     if op.reg in (Reg.X, Reg.Y):
         return [
             "if (cpu->x_flag) {",
             "  cpu->S = (uint16)(cpu->S + 1);",
-            f"  {field} = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
+            "  uint8 _v = cpu_read8(cpu, 0x00, cpu->S);",
+            f"  {field} = (uint16)(({field} & 0xFF00) | _v);",
+            "  cpu->_flag_Z = (_v == 0) ? 1 : 0;",
+            "  cpu->_flag_N = ((_v & 0x80) != 0) ? 1 : 0;",
             "} else {",
             "  cpu->S = (uint16)(cpu->S + 1);",
             f"  {field} = cpu_read16(cpu, 0x00, cpu->S);",
             "  cpu->S = (uint16)(cpu->S + 1);",
+            f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
             "}",
+            "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
         ]
     return [f"/* TODO PullReg({op.reg}) */"]
 
 
 def _emit_transfer(op: Transfer) -> List[str]:
-    return [f"{_reg(op.dst)} = {_reg(op.src)};"]
+    """65816 register-transfer with width-respecting destination AND
+    N/Z flag update on the transferred value. TXS / TCS DON'T set
+    flags; TCS specifically is a 16-bit copy without flag update.
+    Everything else does."""
+    src = _reg(op.src)
+    dst = _reg(op.dst)
+    # TXS, TCS: no flag update, no width check (S is always 16-bit native).
+    if op.dst == Reg.S:
+        return [f"{dst} = {src};"]
+    # Determine destination width from controlling flag.
+    if op.dst == Reg.A:
+        flag = "cpu->m_flag"
+    elif op.dst in (Reg.X, Reg.Y):
+        flag = "cpu->x_flag"
+    elif op.dst == Reg.D or op.dst == Reg.S:
+        flag = None  # always 16-bit
+    else:
+        flag = None
+    if flag is None:
+        # Full-width transfer (D, etc.)
+        return [
+            f"{dst} = {src};",
+            f"cpu->_flag_Z = ({dst} == 0) ? 1 : 0;",
+            f"cpu->_flag_N = (({dst} & 0x8000) != 0) ? 1 : 0;",
+            "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
+        ]
+    return [
+        f"if ({flag}) {{",
+        f"  uint8 _v = (uint8)({src} & 0xFF);",
+        f"  {dst} = (uint16)(({dst} & 0xFF00) | _v);",
+        f"  cpu->_flag_Z = (_v == 0) ? 1 : 0;",
+        f"  cpu->_flag_N = ((_v & 0x80) != 0) ? 1 : 0;",
+        f"}} else {{",
+        f"  {dst} = (uint16)({src});",
+        f"  cpu->_flag_Z = ({dst} == 0) ? 1 : 0;",
+        f"  cpu->_flag_N = (({dst} & 0x8000) != 0) ? 1 : 0;",
+        f"}}",
+        "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
+    ]
 
 
 def _emit_condbranch(op: CondBranch) -> List[str]:

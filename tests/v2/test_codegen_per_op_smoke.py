@@ -152,7 +152,10 @@ def test_pullreg_p_calls_mirrors_sync():
 def test_transfer_a_to_x():
     op = Transfer(src=Reg.A, dst=Reg.X)
     s = _joined(emit_op(op))
-    assert "cpu->X = cpu->A" in s
+    # v2 transfer is width-aware (X width follows x_flag) and updates N/Z.
+    assert "cpu->X" in s and "cpu->A" in s
+    assert "x_flag" in s
+    assert "_flag_Z" in s and "_flag_N" in s
 
 
 def test_call_long_emits_function_call():
