@@ -28,6 +28,7 @@ TEST_MODULES = [
     'test_emit_function_smoke',
     'test_emit_bank_smoke',
     'test_cfg_loader',
+    'test_v2_emit_lint',
 ]
 
 
