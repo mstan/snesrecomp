@@ -433,6 +433,13 @@ int snes9x_bridge_init(const char *rom_path) {
     snes9x_bridge_insn_trace_on();
     fprintf(stderr, "[snes9x] always-on insn trace armed\n");
 
+    // Always-on VRAM byte-write trace. The recompiler-side ring + the
+    // oracle-side ring together let cmd_vram_write_diff mechanically
+    // identify the first divergent (addr, byte) pair across the two
+    // write streams without anyone hand-reading SMWDisX.
+    snes9x_bridge_vram_hook_arm();
+    fprintf(stderr, "[snes9x] always-on VRAM-write trace armed\n");
+
     return 0;
 }
 
@@ -835,6 +842,26 @@ extern "C" void s9x_insn_hook_trampoline(uint8_t pb, uint16_t pc, uint8_t op) {
 }
 extern "C" void s9x_nmi_hook_trampoline(void) {
     s9x_bridge_nmi_hook();
+}
+
+/* VRAM byte-write hook pointer. ppu.h's S9xVRAMByteWrite chokepoint
+ * fires this for every CPU-visible VRAM byte write (REGISTER_2118
+ * + REGISTER_2119 + tile/linear variants). Always-on once
+ * s9x_vram_hook_arm installs it; the recording side
+ * (debug_server.c::debug_server_on_oracle_vram_write) gates on its
+ * own active flag so untriggered builds pay just one null-load +
+ * branch per VRAM write. */
+extern "C" void (*s9x_vram_hook)(uint32_t byte_addr, uint8_t value) = nullptr;
+
+/* Forward decl of the C-side recorder; defined in debug_server.c. */
+extern "C" void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value);
+
+extern "C" void s9x_vram_hook_trampoline(uint32_t byte_addr, uint8_t value) {
+    debug_server_on_oracle_vram_write(byte_addr, value);
+}
+
+void snes9x_bridge_vram_hook_arm(void) {
+    s9x_vram_hook = s9x_vram_hook_trampoline;
 }
 
 /* ---- Per-instruction trace public API ---- */

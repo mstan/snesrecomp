@@ -53,11 +53,20 @@ void debug_server_set_ram(uint8_t *ram, uint32_t ram_size);
 // Disabled by default; enable via the "trace_reg <lo> <hi>" TCP command.
 void debug_server_on_reg_write(uint16_t adr, uint8_t val);
 
-// VRAM-word write trace. Call from every path that mutates ppu->vram —
+// VRAM byte-write trace. Call from every path that mutates ppu->vram —
 // ppu_write $2118/$2119 cases, WriteVramWord, and any hand-written code
 // that writes g_ppu->vram directly (e.g. LoadStripeImage_UploadToVRAM).
-// Disabled by default; enable via "trace_vram <lo> <hi>" (word addresses).
-void debug_server_on_vram_write(uint16_t adr_word, uint16_t value);
+// byte_addr is the byte address into the 64KB VRAM (0..$FFFF); $2118
+// targets even bytes, $2119 odd. Default-armed for the full byte range
+// in Oracle builds so probes can query the ring backward in history.
+void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value);
+
+// Oracle-side VRAM byte-write trace. Same shape as the recomp ring
+// above but written by the snes9x trampoline; no recomp-side
+// attribution because snes9x is the reference. cmd_vram_write_diff
+// walks the two rings forward in lockstep to identify the first
+// divergent (byte_addr, value) pair across the streams.
+void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value);
 
 #if SNESRECOMP_REVERSE_DEBUG
 // Tier-1 reverse-debugger WRAM write hooks. Called from every WRAM store

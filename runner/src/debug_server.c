@@ -242,55 +242,162 @@ static struct {
     } log[REG_TRACE_LOG_SIZE];
 } s_reg_trace = {0};
 
-// ---- VRAM-word write trace ----
-// Captures every word-address write to PPU VRAM with attribution. Unlike
-// reg trace this sees *all* writes, including LoadStripeImage_UploadToVRAM
-// and other hand-code that bypasses $2118/$2119 and writes g_ppu->vram
-// directly. Enabled via "trace_vram <lo> <hi>" (word addresses, up to
-// MAX_VRAM_TRACE_RANGES disjoint ranges); read via "get_vram_trace";
-// cleared via "trace_vram_reset".
-#define VRAM_TRACE_LOG_SIZE 65536
+// ---- VRAM byte-write trace ----
+// Captures every CPU-visible byte write to PPU VRAM with full recomp-
+// side attribution (frame, function, recomp-call stack). Byte-addressed
+// (matching the oracle ring) so cmd_vram_write_diff can walk the two
+// rings as parallel byte-pair sequences. Each $2118 STA adds one event
+// at byte_addr = (vramPointer << 1) + 0; each $2119 STA adds one event
+// at byte_addr = (vramPointer << 1) + 1; WriteVramWord adds both.
+//
+// Enabled via "trace_vram <lo> <hi>" (BYTE addresses 0..$FFFF) up to
+// MAX_VRAM_TRACE_RANGES disjoint ranges; read via "get_vram_trace";
+// cleared via "trace_vram_reset". The default-armed range covers all
+// of byte-VRAM ($0000-$FFFF), so probes never need to re-arm.
+/* HEAP-allocated rings (calloc'd at debug_server_init) instead of
+ * static BSS. Sized to ~1.34 GB total resident (recomp ~1.28 GB +
+ * oracle ~64 MB) so the always-on capture stays well under 1.5 GB
+ * while spanning many minutes of attract-demo. The Oracle build's
+ * existing BSS already runs ~1.85 GB (s_frame_history alone is
+ * 1.2 GB), and the linker+loader stop accepting PE images near
+ * 2 GB; heap-allocation sidesteps that ceiling entirely.
+ *
+ * Default 8M entries × ~160 bytes ≈ 1.28 GB recomp + 8M × 8 bytes
+ * ≈ 64 MB oracle. Coverage estimate: ~16 000 frames at boot peak
+ * (~500 writes/frame), ~400 000 frames at attract steady state
+ * (~20 writes/frame). Override with SNESRECOMP_VRAM_RING_ENTRIES
+ * if a smaller box can't spare the RAM. */
+#define VRAM_TRACE_DEFAULT_ENTRIES (8u * 1024u * 1024u)
 #define MAX_VRAM_TRACE_RANGES 8
+
+typedef struct {
+    int frame;
+    uint16_t adr_byte;
+    uint8_t  val;
+    uint8_t  pad;
+    /* CpuState snapshot at write time. Lets the differ surface
+     * "what was X when this byte was written" — usually the
+     * difference between "bug is somewhere upstream" and "bug is
+     * a width-mask in function F at index G". */
+    uint16_t A;
+    uint16_t X;
+    uint16_t Y;
+    uint16_t D;
+    uint8_t  DB;
+    uint8_t  P;
+    uint8_t  m_flag;
+    uint8_t  x_flag;
+    char func[64];
+    const char *stack[TRACE_STACK_DEPTH];
+    int stack_depth;
+} VramTraceEntry;
+
 static struct {
     int active;
     int nranges;
     struct { uint16_t lo, hi; } ranges[MAX_VRAM_TRACE_RANGES];
-    int write_idx;
-    int count;
-    struct {
-        int frame;
-        uint16_t adr;
-        uint16_t val;
-        char func[64];
-        const char *stack[TRACE_STACK_DEPTH];
-        int stack_depth;
-    } log[VRAM_TRACE_LOG_SIZE];
+    uint64_t write_idx;
+    uint64_t count;
+    uint64_t capacity;          /* set at vram_trace_alloc time */
+    VramTraceEntry *log;        /* heap-allocated; calloc'd at init */
 } s_vram_trace = {0};
 
-void debug_server_on_vram_write(uint16_t adr_word, uint16_t value) {
-    if (!s_vram_trace.active) return;
+void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) {
+    if (!s_vram_trace.active || !s_vram_trace.log) return;
+    uint16_t adr_b = (uint16_t)(byte_addr & 0xFFFF);
     int hit = 0;
     for (int i = 0; i < s_vram_trace.nranges; i++)
-        if (adr_word >= s_vram_trace.ranges[i].lo &&
-            adr_word <= s_vram_trace.ranges[i].hi) { hit = 1; break; }
+        if (adr_b >= s_vram_trace.ranges[i].lo &&
+            adr_b <= s_vram_trace.ranges[i].hi) { hit = 1; break; }
     if (!hit) return;
     extern const char *g_recomp_stack[];
     extern int g_recomp_stack_top;
-    int idx = s_vram_trace.write_idx % VRAM_TRACE_LOG_SIZE;
-    s_vram_trace.log[idx].frame = snes_frame_counter;
-    s_vram_trace.log[idx].adr = adr_word;
-    s_vram_trace.log[idx].val = value;
+    uint64_t idx = s_vram_trace.write_idx % s_vram_trace.capacity;
+    VramTraceEntry *e = &s_vram_trace.log[idx];
+    e->frame = snes_frame_counter;
+    e->adr_byte = adr_b;
+    e->val = value;
+    e->A = g_cpu.A;
+    e->X = g_cpu.X;
+    e->Y = g_cpu.Y;
+    e->D = g_cpu.D;
+    e->DB = g_cpu.DB;
+    e->P = g_cpu.P;
+    e->m_flag = g_cpu.m_flag;
+    e->x_flag = g_cpu.x_flag;
     if (g_last_recomp_func)
-        strncpy(s_vram_trace.log[idx].func, g_last_recomp_func, 63);
+        strncpy(e->func, g_last_recomp_func, 63);
     else
-        strcpy(s_vram_trace.log[idx].func, "(none)");
-    s_vram_trace.log[idx].func[63] = 0;
+        strcpy(e->func, "(none)");
+    e->func[63] = 0;
     int depth = g_recomp_stack_top < TRACE_STACK_DEPTH ? g_recomp_stack_top : TRACE_STACK_DEPTH;
-    s_vram_trace.log[idx].stack_depth = depth;
+    e->stack_depth = depth;
     for (int s = 0; s < depth; s++)
-        s_vram_trace.log[idx].stack[s] = g_recomp_stack[g_recomp_stack_top - depth + s];
+        e->stack[s] = g_recomp_stack[g_recomp_stack_top - depth + s];
     s_vram_trace.write_idx++;
-    if (s_vram_trace.count < VRAM_TRACE_LOG_SIZE) s_vram_trace.count++;
+    if (s_vram_trace.count < s_vram_trace.capacity) s_vram_trace.count++;
+}
+
+// ---- Oracle-side VRAM byte-write trace ----
+// Mirrors s_vram_trace above but byte-addressed (snes9x stores bytes,
+// not words) and without function/stack attribution: snes9x is the
+// reference; we trust its writes are correct. The differ
+// (cmd_vram_write_diff) walks both rings forward and reports the first
+// mismatched (addr, value) pair restricted to a requested byte-address
+// range — that mechanically pinpoints which recomp-side function
+// produced the divergent VRAM byte.
+//
+// Heap-allocated to match the recomp ring; capacity set at init.
+
+typedef struct {
+    int      frame;
+    uint16_t adr_byte;
+    uint8_t  val;
+    uint8_t  pad;
+} OracleVramTraceEntry;
+
+static struct {
+    int active;
+    uint64_t write_idx;
+    uint64_t count;
+    uint64_t capacity;
+    OracleVramTraceEntry *log;
+} s_oracle_vram_trace = {0};
+
+void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value) {
+    if (!s_oracle_vram_trace.active || !s_oracle_vram_trace.log) return;
+    uint64_t idx = s_oracle_vram_trace.write_idx % s_oracle_vram_trace.capacity;
+    s_oracle_vram_trace.log[idx].frame = snes_frame_counter;
+    s_oracle_vram_trace.log[idx].adr_byte = (uint16_t)(byte_addr & 0xFFFF);
+    s_oracle_vram_trace.log[idx].val = value;
+    s_oracle_vram_trace.write_idx++;
+    if (s_oracle_vram_trace.count < s_oracle_vram_trace.capacity)
+        s_oracle_vram_trace.count++;
+}
+
+/* Heap-allocate the recomp + oracle VRAM rings. Honors
+ * SNESRECOMP_VRAM_RING_ENTRIES env override (decimal entries; clamped
+ * to [1<<16, 1<<28] to keep math sane). Returns the chosen capacity
+ * so callers can log it. Idempotent — second call frees + reallocs. */
+static uint64_t vram_trace_alloc_rings(void) {
+    uint64_t cap = VRAM_TRACE_DEFAULT_ENTRIES;
+    const char *env = getenv("SNESRECOMP_VRAM_RING_ENTRIES");
+    if (env && *env) {
+        unsigned long long v = strtoull(env, NULL, 0);
+        if (v >= (1ULL << 16) && v <= (1ULL << 28)) cap = (uint64_t)v;
+    }
+    if (s_vram_trace.log) free(s_vram_trace.log);
+    if (s_oracle_vram_trace.log) free(s_oracle_vram_trace.log);
+    s_vram_trace.log = (VramTraceEntry *)calloc((size_t)cap, sizeof(VramTraceEntry));
+    s_vram_trace.capacity = s_vram_trace.log ? cap : 0;
+    s_vram_trace.write_idx = 0;
+    s_vram_trace.count = 0;
+    s_oracle_vram_trace.log = (OracleVramTraceEntry *)
+        calloc((size_t)cap, sizeof(OracleVramTraceEntry));
+    s_oracle_vram_trace.capacity = s_oracle_vram_trace.log ? cap : 0;
+    s_oracle_vram_trace.write_idx = 0;
+    s_oracle_vram_trace.count = 0;
+    return cap;
 }
 
 /* Expose arm-with-default-ranges so cpu_trace_arm_default_watches can
@@ -1740,27 +1847,51 @@ static void cmd_get_vram_trace(const char *args) {
             "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
             s_vram_trace.ranges[i].lo, s_vram_trace.ranges[i].hi);
     pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "],\"entries\":%d,\"log\":[", s_vram_trace.count);
-    int start = s_vram_trace.count < VRAM_TRACE_LOG_SIZE ? 0 :
-                s_vram_trace.write_idx - VRAM_TRACE_LOG_SIZE;
+        "],\"entries\":%llu,\"log\":[",
+        (unsigned long long)s_vram_trace.count);
+    uint64_t cap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
+    uint64_t start = s_vram_trace.count < cap ?
+                     0 : s_vram_trace.write_idx - cap;
     int budget = (int)sizeof(buf) - 4096;
-    for (int i = 0; i < s_vram_trace.count && pos < budget; i++) {
-        int idx = (start + i) % VRAM_TRACE_LOG_SIZE;
+    for (uint64_t i = 0; i < s_vram_trace.count && pos < budget; i++) {
+        uint64_t idx = (start + i) % cap;
         if (nostack) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"func\":\"%s\"}",
+                "%s{\"f\":%d,\"adr_byte\":\"0x%04x\",\"val\":\"0x%02x\","
+                "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+                "\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"P\":\"0x%02x\","
+                "\"m\":%u,\"x\":%u,\"func\":\"%s\"}",
                 i ? "," : "",
                 s_vram_trace.log[idx].frame,
-                s_vram_trace.log[idx].adr,
+                s_vram_trace.log[idx].adr_byte,
                 s_vram_trace.log[idx].val,
+                s_vram_trace.log[idx].A,
+                s_vram_trace.log[idx].X,
+                s_vram_trace.log[idx].Y,
+                s_vram_trace.log[idx].D,
+                s_vram_trace.log[idx].DB,
+                s_vram_trace.log[idx].P,
+                (unsigned)s_vram_trace.log[idx].m_flag,
+                (unsigned)s_vram_trace.log[idx].x_flag,
                 s_vram_trace.log[idx].func);
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%04x\",\"func\":\"%s\",\"stack\":[",
+                "%s{\"f\":%d,\"adr_byte\":\"0x%04x\",\"val\":\"0x%02x\","
+                "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+                "\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"P\":\"0x%02x\","
+                "\"m\":%u,\"x\":%u,\"func\":\"%s\",\"stack\":[",
                 i ? "," : "",
                 s_vram_trace.log[idx].frame,
-                s_vram_trace.log[idx].adr,
+                s_vram_trace.log[idx].adr_byte,
                 s_vram_trace.log[idx].val,
+                s_vram_trace.log[idx].A,
+                s_vram_trace.log[idx].X,
+                s_vram_trace.log[idx].Y,
+                s_vram_trace.log[idx].D,
+                s_vram_trace.log[idx].DB,
+                s_vram_trace.log[idx].P,
+                (unsigned)s_vram_trace.log[idx].m_flag,
+                (unsigned)s_vram_trace.log[idx].x_flag,
                 s_vram_trace.log[idx].func);
             for (int s = 0; s < s_vram_trace.log[idx].stack_depth; s++) {
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -1769,6 +1900,237 @@ static void cmd_get_vram_trace(const char *args) {
             }
             pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
         }
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+/* Walk the recomp VRAM byte-write ring BACKWARD from write_idx and
+ * return the most recent entry whose byte_addr == requested address.
+ * Avoids the "fetch entire ring; filter in Python" pattern that hits
+ * the JSON-buffer cap of ~7400 entries.
+ *
+ * Usage: last_vram_write_to <byte_addr_hex>
+ *
+ * Reply (found):
+ *   {"ok":true, "found":true, "f":F, "adr_byte":"0x..", "val":"0x..",
+ *    "A":"0x..", "X":"0x..", "Y":"0x..", "D":"0x..", "DB":"0x..",
+ *    "P":"0x..", "m":N, "x":N,
+ *    "func":"...", "stack":[...]}
+ *
+ * Reply (none in ring):
+ *   {"ok":true, "found":false, "ring_depth":N}
+ */
+static void cmd_last_vram_write_to(const char *args) {
+    unsigned int target = 0;
+    if (!args || sscanf(args, "%x", &target) != 1 || target > 0xFFFF) {
+        send_fmt("{\"error\":\"usage: last_vram_write_to <byte_addr_hex> "
+                 "(0..0xFFFF)\"}"); return;
+    }
+    if (!s_vram_trace.active) {
+        send_fmt("{\"error\":\"recomp vram trace inactive\"}"); return;
+    }
+    uint16_t want = (uint16_t)target;
+    uint64_t write_idx = s_vram_trace.write_idx;
+    uint64_t depth = s_vram_trace.count;
+    uint64_t cap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
+    /* Walk backward from the most-recent entry. */
+    for (uint64_t step = 1; step <= depth; step++) {
+        uint64_t abs = write_idx - step;
+        uint64_t idx = abs % cap;
+        if (s_vram_trace.log[idx].adr_byte != want) continue;
+        static char buf[8192];
+        int pos = snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"found\":true,\"f\":%d,"
+            "\"adr_byte\":\"0x%04x\",\"val\":\"0x%02x\","
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,"
+            "\"func\":\"%s\",\"stack\":[",
+            s_vram_trace.log[idx].frame,
+            s_vram_trace.log[idx].adr_byte,
+            s_vram_trace.log[idx].val,
+            s_vram_trace.log[idx].A,
+            s_vram_trace.log[idx].X,
+            s_vram_trace.log[idx].Y,
+            s_vram_trace.log[idx].D,
+            s_vram_trace.log[idx].DB,
+            s_vram_trace.log[idx].P,
+            (unsigned)s_vram_trace.log[idx].m_flag,
+            (unsigned)s_vram_trace.log[idx].x_flag,
+            s_vram_trace.log[idx].func);
+        for (int s = 0; s < s_vram_trace.log[idx].stack_depth; s++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", s ? "," : "",
+                s_vram_trace.log[idx].stack[s] ?
+                    s_vram_trace.log[idx].stack[s] : "?");
+        }
+        snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        send_line(buf);
+        return;
+    }
+    send_fmt("{\"ok\":true,\"found\":false,\"ring_depth\":%llu}",
+             (unsigned long long)depth);
+}
+
+/* Walk recomp + oracle VRAM byte-write rings forward in lockstep and
+ * report the first divergent (byte_addr, value) pair within the
+ * caller-supplied byte-address range. Entries outside the range are
+ * skipped on each ring independently before the pair-up.
+ *
+ * Usage: vram_write_diff <lo_hex> <hi_hex>   (byte addresses)
+ *
+ * Reply (divergence):
+ *   {"ok":true, "diverged":true, "first_diff_idx":N,
+ *    "matched_pairs_before":N,
+ *    "recomp":{"f":F,"adr_byte":"0x..","val":"0x..",
+ *              "func":"...","stack":[...]},
+ *    "oracle":{"f":F,"adr_byte":"0x..","val":"0x.."}}
+ *
+ * Reply (clean):
+ *   {"ok":true, "diverged":false, "matched_pairs":N}
+ *
+ * Reply (one ring exhausted before any divergence inside range):
+ *   {"ok":true, "diverged":false, "matched_pairs":N,
+ *    "recomp_exhausted":true|false, "oracle_exhausted":true|false}
+ */
+static void cmd_vram_write_diff(const char *args) {
+    unsigned int lo_u = 0, hi_u = 0;
+    if (!args || sscanf(args, "%x %x", &lo_u, &hi_u) != 2 ||
+        hi_u > 0xFFFF || hi_u < lo_u) {
+        send_fmt("{\"error\":\"usage: vram_write_diff <lo_hex> <hi_hex> "
+                 "(byte addresses, lo<=hi<=0xFFFF)\"}");
+        return;
+    }
+    if (!s_vram_trace.active) {
+        send_fmt("{\"error\":\"recomp vram trace inactive\"}"); return;
+    }
+    if (!s_oracle_vram_trace.active) {
+        send_fmt("{\"error\":\"oracle vram trace inactive (Oracle build only)\"}");
+        return;
+    }
+    uint16_t lo = (uint16_t)lo_u, hi = (uint16_t)hi_u;
+
+    /* Ring base + bound for each side. The ring is a circular buffer:
+     * entries [start, write_idx) are valid; older entries have been
+     * evicted. We iterate by absolute index and modulo into the buffer
+     * on each access. */
+    uint64_t rcap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
+    uint64_t ocap = s_oracle_vram_trace.capacity ? s_oracle_vram_trace.capacity : 1;
+    uint64_t rec_start = s_vram_trace.count < rcap ?
+                         0 : s_vram_trace.write_idx - rcap;
+    uint64_t rec_end   = s_vram_trace.write_idx;
+    uint64_t ora_start = s_oracle_vram_trace.count < ocap ?
+                         0 : s_oracle_vram_trace.write_idx - ocap;
+    uint64_t ora_end   = s_oracle_vram_trace.write_idx;
+
+    uint64_t i_rec = rec_start;
+    uint64_t i_ora = ora_start;
+    uint64_t matched = 0;
+
+    for (;;) {
+        /* Advance recomp side to next in-range entry. */
+        while (i_rec < rec_end) {
+            uint64_t idx = i_rec % rcap;
+            uint16_t a = s_vram_trace.log[idx].adr_byte;
+            if (a >= lo && a <= hi) break;
+            i_rec++;
+        }
+        /* Advance oracle side to next in-range entry. */
+        while (i_ora < ora_end) {
+            uint64_t idx = i_ora % ocap;
+            uint16_t a = s_oracle_vram_trace.log[idx].adr_byte;
+            if (a >= lo && a <= hi) break;
+            i_ora++;
+        }
+        if (i_rec >= rec_end || i_ora >= ora_end) {
+            /* One side exhausted with no divergence. */
+            send_fmt("{\"ok\":true,\"diverged\":false,\"matched_pairs\":%llu,"
+                     "\"recomp_exhausted\":%s,\"oracle_exhausted\":%s}",
+                     (unsigned long long)matched,
+                     i_rec >= rec_end ? "true" : "false",
+                     i_ora >= ora_end ? "true" : "false");
+            return;
+        }
+        uint64_t r_idx = i_rec % rcap;
+        uint64_t o_idx = i_ora % ocap;
+        uint16_t r_a = s_vram_trace.log[r_idx].adr_byte;
+        uint8_t  r_v = s_vram_trace.log[r_idx].val;
+        uint16_t o_a = s_oracle_vram_trace.log[o_idx].adr_byte;
+        uint8_t  o_v = s_oracle_vram_trace.log[o_idx].val;
+        if (r_a != o_a || r_v != o_v) {
+            /* Mismatch — emit attribution-rich record. */
+            static char buf[8192];
+            int pos = snprintf(buf, sizeof(buf),
+                "{\"ok\":true,\"diverged\":true,\"first_diff_idx\":%llu,"
+                "\"matched_pairs_before\":%llu,"
+                "\"recomp\":{\"f\":%d,\"adr_byte\":\"0x%04x\","
+                "\"val\":\"0x%02x\","
+                "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+                "\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"P\":\"0x%02x\","
+                "\"m\":%u,\"x\":%u,"
+                "\"func\":\"%s\",\"stack\":[",
+                (unsigned long long)matched,
+                (unsigned long long)matched,
+                s_vram_trace.log[r_idx].frame,
+                r_a, r_v,
+                s_vram_trace.log[r_idx].A,
+                s_vram_trace.log[r_idx].X,
+                s_vram_trace.log[r_idx].Y,
+                s_vram_trace.log[r_idx].D,
+                s_vram_trace.log[r_idx].DB,
+                s_vram_trace.log[r_idx].P,
+                (unsigned)s_vram_trace.log[r_idx].m_flag,
+                (unsigned)s_vram_trace.log[r_idx].x_flag,
+                s_vram_trace.log[r_idx].func);
+            for (int s = 0; s < s_vram_trace.log[r_idx].stack_depth; s++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%s\"%s\"", s ? "," : "",
+                    s_vram_trace.log[r_idx].stack[s] ?
+                        s_vram_trace.log[r_idx].stack[s] : "?");
+            }
+            snprintf(buf + pos, sizeof(buf) - pos,
+                "]},\"oracle\":{\"f\":%d,\"adr_byte\":\"0x%04x\","
+                "\"val\":\"0x%02x\"}}",
+                s_oracle_vram_trace.log[o_idx].frame,
+                o_a, o_v);
+            send_line(buf);
+            return;
+        }
+        matched++;
+        i_rec++;
+        i_ora++;
+    }
+}
+
+/* Oracle-side VRAM byte-write ring reader. Returns ALL entries within
+ * the JSON budget; entries are byte-addressed and lack func/stack
+ * (snes9x is the reference, no attribution needed). Use the index
+ * field to correlate with cmd_get_vram_trace's recomp-side log. */
+static void cmd_get_oracle_vram_trace(const char *args) {
+    (void)args;
+    if (!s_oracle_vram_trace.active) {
+        send_fmt("{\"error\":\"oracle vram trace inactive (Oracle build only)\"}");
+        return;
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"entries\":%llu,\"write_idx\":%llu,\"log\":[",
+        (unsigned long long)s_oracle_vram_trace.count,
+        (unsigned long long)s_oracle_vram_trace.write_idx);
+    uint64_t cap = s_oracle_vram_trace.capacity ? s_oracle_vram_trace.capacity : 1;
+    uint64_t start = s_oracle_vram_trace.count < cap ?
+                     0 :
+                     s_oracle_vram_trace.write_idx - cap;
+    int budget = (int)sizeof(buf) - 4096;
+    for (uint64_t i = 0; i < s_oracle_vram_trace.count && pos < budget; i++) {
+        uint64_t idx = (start + i) % cap;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"adr_byte\":\"0x%04x\",\"val\":\"0x%02x\"}",
+            i ? "," : "",
+            s_oracle_vram_trace.log[idx].frame,
+            s_oracle_vram_trace.log[idx].adr_byte,
+            s_oracle_vram_trace.log[idx].val);
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
@@ -4092,6 +4454,9 @@ static const CmdEntry s_commands[] = {
     {"trace_vram",    cmd_trace_vram},
     {"trace_vram_reset", cmd_trace_vram_reset},
     {"get_vram_trace", cmd_get_vram_trace},
+    {"get_oracle_vram_trace", cmd_get_oracle_vram_trace},
+    {"vram_write_diff", cmd_vram_write_diff},
+    {"last_vram_write_to", cmd_last_vram_write_to},
 #if SNESRECOMP_REVERSE_DEBUG
     {"trace_wram",        cmd_trace_wram},
     {"trace_wram_reset",  cmd_trace_wram_reset},
@@ -4262,15 +4627,35 @@ int debug_server_init(int port) {
     // explicit callers toggle, but the default starts armed.
     s_block_trace.active = 1;
 
-    // Always-on VRAM trace: capture every word-VRAM write continuously
-    // so probes can attribute Layer-3 / OBJ tile-graphics corruption
-    // backward in history. Same rationale as WRAM. Ring covers the full
-    // word-address range $0000-$FFFF; VRAM_TRACE_LOG_SIZE = 65536 ×
-    // ~140B ≈ 9 MB resident. Gated on SNESRECOMP_REVERSE_DEBUG.
-    s_vram_trace.nranges = 1;
-    s_vram_trace.ranges[0].lo = 0x0000;
-    s_vram_trace.ranges[0].hi = 0xFFFF;
-    s_vram_trace.active = 1;
+    // Always-on VRAM byte-write trace (recomp + oracle paired). Heap-
+    // allocated to escape the 2 GB PE image cap — the existing
+    // s_frame_history alone consumes ~1.2 GB of BSS, leaving little
+    // room for additional always-on rings. Default capacity ≈ 16M
+    // entries × ~160 bytes ≈ 2.6 GB recomp + 128 MB oracle, covering
+    // ~30 000 frames (~8 minutes at 60 Hz). Override via
+    // SNESRECOMP_VRAM_RING_ENTRIES (decimal). Gated on
+    // SNESRECOMP_REVERSE_DEBUG so Release|x64 stays clean.
+    {
+        uint64_t cap = vram_trace_alloc_rings();
+        if (s_vram_trace.log && s_oracle_vram_trace.log) {
+            s_vram_trace.nranges = 1;
+            s_vram_trace.ranges[0].lo = 0x0000;
+            s_vram_trace.ranges[0].hi = 0xFFFF;
+            s_vram_trace.active = 1;
+            s_oracle_vram_trace.active = 1;
+            fprintf(stderr,
+                "[debug_server] VRAM rings allocated: %llu entries each "
+                "(recomp ~%llu MB, oracle ~%llu MB)\n",
+                (unsigned long long)cap,
+                (unsigned long long)((cap * sizeof(VramTraceEntry)) >> 20),
+                (unsigned long long)((cap * sizeof(OracleVramTraceEntry)) >> 20));
+        } else {
+            fprintf(stderr,
+                "[debug_server] WARNING: failed to allocate VRAM rings "
+                "(%llu entries); reduce SNESRECOMP_VRAM_RING_ENTRIES.\n",
+                (unsigned long long)cap);
+        }
+    }
 #endif
 
     // Spawn background network thread

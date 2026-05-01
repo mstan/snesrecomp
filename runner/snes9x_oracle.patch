@@ -1,5 +1,5 @@
 diff --git a/cpuexec.cpp b/cpuexec.cpp
-index aa43b2f..5c2d4b4 100644
+index aa43b2ff..5c2d4b4c 100644
 --- a/cpuexec.cpp
 +++ b/cpuexec.cpp
 @@ -64,6 +64,8 @@ void S9xMainLoop (void)
@@ -25,10 +25,10 @@ index aa43b2f..5c2d4b4 100644
  		(*Opcodes[Op].S9xOpcode)();
  
 diff --git a/getset.h b/getset.h
-index ec55ea9..94ce91e 100644
+index ec55ea91..badd1372 100644
 --- a/getset.h
 +++ b/getset.h
-@@ -35,6 +35,26 @@
+@@ -35,6 +35,34 @@
  
  extern uint8	OpenBus;
  
@@ -52,10 +52,18 @@ index ec55ea9..94ce91e 100644
 + * against hardware NMI timing. NULL when not instrumented. */
 +extern void (*s9x_nmi_hook)(void);
 +
++/* Oracle-mode VRAM write hook. Called from REGISTER_2118 / 2119
++ * variants in ppu.h after each Memory.VRAM[address] = Byte;
++ * write. Address is the byte address (not the word address that
++ * VMA.Address tracks); value is the just-written byte. NULL when
++ * not instrumented; hot path is one null-load + branch per VRAM
++ * byte write. */
++extern void (*s9x_vram_hook)(uint32 byte_addr, uint8 value);
++
  static inline int32 memory_speed (uint32 address)
  {
  	if (address & 0x408000)
-@@ -319,6 +339,7 @@ inline uint16 S9xGetWord (uint32 Address, enum s9xwrap_t w = WRAP_NONE)
+@@ -319,6 +347,7 @@ inline uint16 S9xGetWord (uint32 Address, enum s9xwrap_t w = WRAP_NONE)
  
  inline void S9xSetByte (uint8 Byte, uint32 Address)
  {
@@ -63,7 +71,7 @@ index ec55ea9..94ce91e 100644
  	int		block = (Address & 0xffffff) >> MEMMAP_SHIFT;
  	uint8	*SetAddress = Memory.WriteMap[block];
  	int32	speed = memory_speed(Address);
-@@ -465,6 +486,10 @@ inline void S9xSetWord (uint16 Word, uint32 Address, enum s9xwrap_t w = WRAP_NON
+@@ -465,6 +494,10 @@ inline void S9xSetWord (uint16 Word, uint32 Address, enum s9xwrap_t w = WRAP_NON
  
  	if (SetAddress >= (uint8 *) CMemory::MAP_LAST)
  	{
@@ -74,3 +82,180 @@ index ec55ea9..94ce91e 100644
  		WRITE_WORD(SetAddress + (Address & 0xffff), Word);
  		addCyclesInMemoryAccess_x2;
  		return;
+diff --git a/ppu.h b/ppu.h
+index f5b0e0aa..077b76ad 100644
+--- a/ppu.h
++++ b/ppu.h
+@@ -352,20 +352,20 @@ static inline void REGISTER_2104 (uint8 Byte)
+ 	}
+ #endif
+ 
+-static inline void REGISTER_2118 (uint8 Byte)
++/* Oracle-mode VRAM byte-write hook. Defined in snes9x_bridge.cpp;
++ * declared again here (in addition to getset.h) because ppu.h does
++ * not include getset.h and the helper below references it. */
++extern void (*s9x_vram_hook)(uint32 byte_addr, uint8 value);
++
++/* Chokepoint for every CPU-visible VRAM byte write. The 6
++ * REGISTER_211[89]_* variants below all converge here after
++ * computing their final byte address — write + cache-invalidate +
++ * oracle-hook live in one place so there's exactly one site to
++ * extend when a new VRAM observability feature lands. */
++static inline void S9xVRAMByteWrite (uint32 address, uint8 Byte)
+ {
+-	CHECK_INBLANK();
+-
+-	uint32	address;
+-
+-	if (PPU.VMA.FullGraphicCount)
+-	{
+-		uint32 rem = PPU.VMA.Address & PPU.VMA.Mask1;
+-		address = (((PPU.VMA.Address & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) & 0xffff;
+-		Memory.VRAM[address] = Byte;
+-	}
+-	else
+-		Memory.VRAM[address = (PPU.VMA.Address << 1) & 0xffff] = Byte;
++	Memory.VRAM[address] = Byte;
++	if (s9x_vram_hook) s9x_vram_hook(address, Byte);
+ 
+ 	IPPU.TileCached[TILE_2BIT][address >> 4] = FALSE;
+ 	IPPU.TileCached[TILE_4BIT][address >> 5] = FALSE;
+@@ -378,6 +378,23 @@ static inline void REGISTER_2118 (uint8 Byte)
+ 	IPPU.TileCached[TILE_4BIT_EVEN][((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
+ 	IPPU.TileCached[TILE_4BIT_ODD] [address >> 5] = FALSE;
+ 	IPPU.TileCached[TILE_4BIT_ODD] [((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
++}
++
++static inline void REGISTER_2118 (uint8 Byte)
++{
++	CHECK_INBLANK();
++
++	uint32	address;
++
++	if (PPU.VMA.FullGraphicCount)
++	{
++		uint32 rem = PPU.VMA.Address & PPU.VMA.Mask1;
++		address = (((PPU.VMA.Address & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) & 0xffff;
++	}
++	else
++		address = (PPU.VMA.Address << 1) & 0xffff;
++
++	S9xVRAMByteWrite(address, Byte);
+ 
+ 	if (!PPU.VMA.High)
+ 	{
+@@ -396,19 +413,7 @@ static inline void REGISTER_2118_tile (uint8 Byte)
+ 	uint32 rem = PPU.VMA.Address & PPU.VMA.Mask1;
+ 	uint32 address = (((PPU.VMA.Address & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) & 0xffff;
+ 
+-	Memory.VRAM[address] = Byte;
+-
+-	IPPU.TileCached[TILE_2BIT][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_4BIT][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_8BIT][address >> 6] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
++	S9xVRAMByteWrite(address, Byte);
+ 
+ 	if (!PPU.VMA.High)
+ 		PPU.VMA.Address += PPU.VMA.Increment;
+@@ -418,21 +423,9 @@ static inline void REGISTER_2118_linear (uint8 Byte)
+ {
+ 	CHECK_INBLANK();
+ 
+-	uint32	address;
+-
+-	Memory.VRAM[address = (PPU.VMA.Address << 1) & 0xffff] = Byte;
++	uint32 address = (PPU.VMA.Address << 1) & 0xffff;
+ 
+-	IPPU.TileCached[TILE_2BIT][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_4BIT][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_8BIT][address >> 6] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
++	S9xVRAMByteWrite(address, Byte);
+ 
+ 	if (!PPU.VMA.High)
+ 		PPU.VMA.Address += PPU.VMA.Increment;
+@@ -469,22 +462,11 @@ static inline void REGISTER_2119 (uint8 Byte)
+ 	{
+ 		uint32 rem = PPU.VMA.Address & PPU.VMA.Mask1;
+ 		address = ((((PPU.VMA.Address & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) + 1) & 0xffff;
+-		Memory.VRAM[address] = Byte;
+ 	}
+ 	else
+-		Memory.VRAM[address = ((PPU.VMA.Address << 1) + 1) & 0xffff] = Byte;
++		address = ((PPU.VMA.Address << 1) + 1) & 0xffff;
+ 
+-	IPPU.TileCached[TILE_2BIT][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_4BIT][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_8BIT][address >> 6] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
++	S9xVRAMByteWrite(address, Byte);
+ 
+ 	if (PPU.VMA.High)
+ 	{
+@@ -503,19 +485,7 @@ static inline void REGISTER_2119_tile (uint8 Byte)
+ 	uint32 rem = PPU.VMA.Address & PPU.VMA.Mask1;
+ 	uint32 address = ((((PPU.VMA.Address & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) + 1) & 0xffff;
+ 
+-	Memory.VRAM[address] = Byte;
+-
+-	IPPU.TileCached[TILE_2BIT][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_4BIT][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_8BIT][address >> 6] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
++	S9xVRAMByteWrite(address, Byte);
+ 
+ 	if (PPU.VMA.High)
+ 		PPU.VMA.Address += PPU.VMA.Increment;
+@@ -525,21 +495,9 @@ static inline void REGISTER_2119_linear (uint8 Byte)
+ {
+ 	CHECK_INBLANK();
+ 
+-	uint32	address;
+-
+-	Memory.VRAM[address = ((PPU.VMA.Address << 1) + 1) & 0xffff] = Byte;
++	uint32 address = ((PPU.VMA.Address << 1) + 1) & 0xffff;
+ 
+-	IPPU.TileCached[TILE_2BIT][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_4BIT][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_8BIT][address >> 6] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_EVEN][((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [address >> 4] = FALSE;
+-	IPPU.TileCached[TILE_2BIT_ODD] [((address >> 4) - 1) & (MAX_2BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_EVEN][((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [address >> 5] = FALSE;
+-	IPPU.TileCached[TILE_4BIT_ODD] [((address >> 5) - 1) & (MAX_4BIT_TILES - 1)] = FALSE;
++	S9xVRAMByteWrite(address, Byte);
+ 
+ 	if (PPU.VMA.High)
+ 		PPU.VMA.Address += PPU.VMA.Increment;

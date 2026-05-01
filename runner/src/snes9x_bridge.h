@@ -57,6 +57,13 @@ int     snes9x_bridge_watch_get(int i, uint32_t *frame, uint32_t *addr,
                                 uint32_t *pc24, uint8_t *before, uint8_t *after,
                                 uint8_t *bank_source);
 
+/* VRAM byte-write hook arming. Installs the trampoline pointer that
+ * ppu.h's S9xVRAMByteWrite chokepoint dispatches through. Always-on
+ * once armed; the recording side gates on its own active flag, so
+ * the cost when recording is off is one null-load + branch per VRAM
+ * byte write. */
+void     snes9x_bridge_vram_hook_arm(void);
+
 /* Per-instruction trace. Captures (frame, pc24, op, A, X, Y, S, D,
  * DB, P_W, cycles) at every CPU dispatch. Ring of 1M entries
  * (~24 MB). NMI counter ticks separately and persists across
