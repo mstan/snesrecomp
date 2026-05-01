@@ -742,6 +742,17 @@ void cpu_trace_arm_default_watches(void) {
      * value yet. */
     cpu_trace_arm_scoped_tripwire_v(0x7E, 0x1930, 0x1930, NULL, 0xFA);
     fprintf(stderr, "[cpu_trace] scoped tripwire armed on $7E:1930 (match_val=$FA)\n");
+    /* Auto-arm the MMIO register-write trace at boot so the FIRST
+     * DMA-related setups (which fire around frame ~94 — too early
+     * for TCP attach + manual `trace_reg`) end up in the always-on
+     * 32K ring. Plus arm a targeted DMA tripwire that fires on the
+     * specific bad upload pattern (VRAM dst in $7000-$8FFF + DMA
+     * source bank $05). 2026-04-30. */
+    extern void debug_server_arm_default_reg_trace(void);
+    extern void debug_server_arm_default_dma_tripwire(void);
+    debug_server_arm_default_reg_trace();
+    debug_server_arm_default_dma_tripwire();
+    fprintf(stderr, "[cpu_trace] reg_trace + dma_tripwire armed at boot\n");
     /* Per-byte recorder on the surrounding region $7E:1925-$1930 so the
      * WRM ring captures the COMPLETE timeline of writes around the
      * corruption site. Walk backward from the trip to see which

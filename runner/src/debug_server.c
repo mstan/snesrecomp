@@ -293,7 +293,161 @@ void debug_server_on_vram_write(uint16_t adr_word, uint16_t value) {
     if (s_vram_trace.count < VRAM_TRACE_LOG_SIZE) s_vram_trace.count++;
 }
 
+/* Expose arm-with-default-ranges so cpu_trace_arm_default_watches can
+ * turn on the MMIO ring at process startup, BEFORE the first frame
+ * runs. Used 2026-04-30 to capture the boot-time DMA setup that
+ * uploads ROM bank $05 bytes to VRAM $7000-$8FFF — that DMA fires
+ * around frame 94, before TCP attach can manually arm. */
+void debug_server_arm_default_reg_trace(void) {
+    s_reg_trace.nranges = 0;
+    /* PPU VRAM control + CGRAM control */
+    s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x2115;
+    s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x2119; s_reg_trace.nranges++;
+    s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x2121;
+    s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x2122; s_reg_trace.nranges++;
+    /* DMA channel descriptors */
+    s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x4300;
+    s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x437F; s_reg_trace.nranges++;
+    /* DMA / HDMA enable triggers */
+    s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x420B;
+    s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x420C; s_reg_trace.nranges++;
+    s_reg_trace.active = 1;
+}
+
+/* Targeted DMA tripwire — fires the FIRST time a $420B (DMA-trigger)
+ * write happens with a channel whose VRAM destination falls in
+ * $7000-$8FFF AND whose source bank is $05. Captures rich snapshot.
+ *
+ * The check decodes the active channels from the FillRAM-equivalent
+ * register shadow inside the runtime (we read $4310-$4317 etc. via
+ * cpu->ram cache).
+ *
+ * Investigation 2026-04-30: VRAM $7000-$8FFF in recomp contains raw
+ * ROM bytes from $05:CACC..$05:DBCC. The recomp WRAM is byte-clean
+ * vs oracle, so the DMA was ROM->VRAM directly. This tripwire pins
+ * the writer PC. */
+typedef struct {
+    uint8_t  armed;
+    uint8_t  triggered;
+    int      frame;
+    uint64_t main_cycles;
+    uint64_t trace_idx;
+    uint8_t  channel;
+    uint8_t  dmap;        /* $43x0 */
+    uint8_t  bbus;        /* $43x1 */
+    uint16_t a_addr;      /* $43x2/$43x3 */
+    uint8_t  a_bank;      /* $43x4 */
+    uint16_t size;        /* $43x5/$43x6 */
+    uint16_t vram_addr;   /* from $2116/$2117 */
+    uint8_t  vmain;       /* $2115 */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag;
+    char     last_func[48];
+    int      stack_depth;
+    char     stack[16][48];
+    uint8_t  dma_regs_snap[0x80];   /* full $4300-$437F */
+    uint8_t  dp_low_snap[32];       /* $7E:0000-001F */
+} DmaTripwire;
+static DmaTripwire s_dma_tripwire = {0};
+
+/* Forward decl — defined below in the cmds section. */
+static void dma_tripwire_arm_default(void);
+/* Public — exposed to cpu_trace.c for boot-time arm. */
+void debug_server_arm_default_dma_tripwire(void) { dma_tripwire_arm_default(); }
+
+extern uint8_t g_ram[];
+/* Read the RAM shadow of an MMIO register. SMW gen code STAs to
+ * $43xx and $21xx with DB=$00 — those addresses are in the LoROM
+ * page-0 mirror, NOT in g_ram. The simplest reliable shadow is to
+ * keep our own table updated on every cpu_trace_set_reg call. The
+ * existing trace_reg ring records writes — re-walk it backward to
+ * find the latest value of each register. */
+static uint8_t reg_latest_value(uint16_t adr) {
+    /* Scan s_reg_trace from the most recent write backward. */
+    int n = s_reg_trace.count < REG_TRACE_LOG_SIZE ? s_reg_trace.count : REG_TRACE_LOG_SIZE;
+    int start = s_reg_trace.write_idx;
+    for (int i = 1; i <= n; i++) {
+        int idx = (start - i + REG_TRACE_LOG_SIZE) % REG_TRACE_LOG_SIZE;
+        if (s_reg_trace.log[idx].adr == adr) return s_reg_trace.log[idx].val;
+    }
+    return 0;
+}
+
+/* g_cpu_trace_idx is declared (non-volatile) in cpu_trace.h; do not
+ * redeclare here. snes_frame_counter and g_main_cpu_cycles_estimate
+ * have other extern declarations earlier in this file. */
+
+static void dma_tripwire_check(uint8_t mdmaen);
+static void dma_tripwire_arm_default(void) {
+    memset(&s_dma_tripwire, 0, sizeof(s_dma_tripwire));
+    s_dma_tripwire.armed = 1;
+}
+
+/* Called from debug_server_on_reg_write when adr==$420B. Walks each
+ * enabled channel in mdmaen and snapshots the FIRST one matching the
+ * (vram_dst in $7000-$8FFF) AND (a_bank == $05) criteria. */
+static void dma_tripwire_check(uint8_t mdmaen) {
+    if (!s_dma_tripwire.armed || s_dma_tripwire.triggered) return;
+    uint16_t vram_addr_word = (uint16_t)reg_latest_value(0x2116) |
+                              ((uint16_t)reg_latest_value(0x2117) << 8);
+    uint16_t vram_addr_byte = (uint16_t)(vram_addr_word << 1);
+    /* DMA target VRAM is bbus $18 or $19 ($2118/$2119). */
+    for (int ch = 0; ch < 8; ch++) {
+        if (!(mdmaen & (1u << ch))) continue;
+        uint16_t base = (uint16_t)(0x4300 + (ch << 4));
+        uint8_t bbus  = reg_latest_value((uint16_t)(base + 1));
+        uint8_t a_bk  = reg_latest_value((uint16_t)(base + 4));
+        if (bbus != 0x18 && bbus != 0x19) continue;
+        /* VRAM dst in [$7000, $8FFF]? */
+        if (vram_addr_byte < 0x7000 || vram_addr_byte > 0x8FFF) continue;
+        if (a_bk != 0x05) continue;
+        /* MATCH — snapshot. */
+        s_dma_tripwire.triggered = 1;
+        s_dma_tripwire.frame = snes_frame_counter;
+        s_dma_tripwire.main_cycles = g_main_cpu_cycles_estimate;
+        s_dma_tripwire.trace_idx = g_cpu_trace_idx;
+        s_dma_tripwire.channel = (uint8_t)ch;
+        s_dma_tripwire.dmap   = reg_latest_value((uint16_t)(base + 0));
+        s_dma_tripwire.bbus   = bbus;
+        s_dma_tripwire.a_addr = (uint16_t)reg_latest_value((uint16_t)(base + 2)) |
+                                ((uint16_t)reg_latest_value((uint16_t)(base + 3)) << 8);
+        s_dma_tripwire.a_bank = a_bk;
+        s_dma_tripwire.size   = (uint16_t)reg_latest_value((uint16_t)(base + 5)) |
+                                ((uint16_t)reg_latest_value((uint16_t)(base + 6)) << 8);
+        s_dma_tripwire.vram_addr = vram_addr_byte;
+        s_dma_tripwire.vmain     = reg_latest_value(0x2115);
+        s_dma_tripwire.A = g_cpu.A; s_dma_tripwire.X = g_cpu.X; s_dma_tripwire.Y = g_cpu.Y;
+        s_dma_tripwire.S = g_cpu.S; s_dma_tripwire.D = g_cpu.D;
+        s_dma_tripwire.DB = g_cpu.DB; s_dma_tripwire.PB = g_cpu.PB; s_dma_tripwire.P = g_cpu.P;
+        s_dma_tripwire.m_flag = g_cpu.m_flag; s_dma_tripwire.x_flag = g_cpu.x_flag;
+        if (g_last_recomp_func) {
+            strncpy(s_dma_tripwire.last_func, g_last_recomp_func, 47);
+            s_dma_tripwire.last_func[47] = 0;
+        }
+        int depth = g_recomp_stack_top;
+        if (depth > 16) depth = 16;
+        s_dma_tripwire.stack_depth = depth;
+        int skip = g_recomp_stack_top - depth;
+        for (int i = 0; i < depth; i++) {
+            const char *p = g_recomp_stack[skip + i];
+            if (p) { strncpy(s_dma_tripwire.stack[i], p, 47);
+                     s_dma_tripwire.stack[i][47] = 0; }
+        }
+        /* Snapshot all DMA register shadows so the client can see all
+         * 8 channels' setup, not just the one that matched. */
+        for (int i = 0; i < 0x80; i++)
+            s_dma_tripwire.dma_regs_snap[i] = reg_latest_value((uint16_t)(0x4300 + i));
+        memcpy(s_dma_tripwire.dp_low_snap, &g_ram[0x0000], 32);
+        return;
+    }
+}
+
 void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
+    /* Hot path: ALWAYS feed the DMA tripwire on $420B writes (DMA
+     * trigger), regardless of whether the trace ring is active. The
+     * tripwire is one-shot; this avoids missing the boot-time setup
+     * because the ring wasn't yet armed. */
+    if (adr == 0x420B && val != 0) dma_tripwire_check(val);
     if (!s_reg_trace.active) return;
     int hit = 0;
     for (int i = 0; i < s_reg_trace.nranges; i++)
@@ -3535,6 +3689,53 @@ static void cmd_tripwire_disarm(const char *args) {
 #endif
 }
 
+/* DMA tripwire — fires on the FIRST $420B write where any active
+ * channel has VRAM destination in $7000-$8FFF AND source bank $05.
+ * Captures rich snapshot for offline analysis. */
+static void cmd_dma_trip_get(const char *args) {
+    (void)args;
+    DmaTripwire *t = &s_dma_tripwire;
+    static char buf[16384];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"triggered\":%u",
+        t->armed, t->triggered);
+    if (t->triggered) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"main_cycles\":%llu,\"trace_idx\":%llu,"
+            "\"channel\":%u,\"dmap\":\"0x%02x\",\"bbus\":\"0x%02x\","
+            "\"a_addr\":\"0x%04x\",\"a_bank\":\"0x%02x\","
+            "\"size\":\"0x%04x\","
+            "\"vram_addr\":\"0x%04x\",\"vmain\":\"0x%02x\","
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,"
+            "\"last_func\":\"%s\",\"stack\":[",
+            t->frame, (unsigned long long)t->main_cycles,
+            (unsigned long long)t->trace_idx,
+            t->channel, t->dmap, t->bbus, t->a_addr, t->a_bank,
+            t->size, t->vram_addr, t->vmain,
+            t->A, t->X, t->Y, t->S, t->D,
+            t->DB, t->PB, t->P, t->m_flag, t->x_flag,
+            t->last_func);
+        for (int i = 0; i < t->stack_depth; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", t->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"dma_regs\":\"");
+        for (int i = 0; i < 0x80; i++)
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x",
+                            t->dma_regs_snap[i]);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\",\"dp_low\":\"");
+        for (int i = 0; i < 32; i++)
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x",
+                            t->dp_low_snap[i]);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\"");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    send_line(buf);
+}
+
 /* P.X tripwire commands. The tripwire is auto-armed at process startup
  * (in cpu_trace_arm_default_watches), so by the time TCP connects, the
  * snapshot may already be frozen. pxwatch_get fetches the captured
@@ -3838,6 +4039,7 @@ static const CmdEntry s_commands[] = {
     {"tripwire_arm",   cmd_tripwire_arm},
     {"tripwire_get",   cmd_tripwire_get},
     {"tripwire_disarm", cmd_tripwire_disarm},
+    {"dma_trip_get",   cmd_dma_trip_get},
     {"pxwatch_arm",    cmd_pxwatch_arm},
     {"pxwatch_disarm", cmd_pxwatch_disarm},
     {"pxwatch_clear",  cmd_pxwatch_clear},
