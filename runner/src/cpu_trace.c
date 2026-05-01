@@ -159,6 +159,16 @@ static int32_t wram_offset(uint8_t bank, uint16_t addr);
 
 void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
                                    uint16_t addr_hi, const char *scope_substr) {
+    cpu_trace_arm_scoped_tripwire_v(bank, addr_lo, addr_hi, scope_substr, 0);
+    /* Disable value-match (the v-variant defaults match_enabled=1; we
+     * call it with 0 here but the v-variant treats the value-arg as
+     * "match anything when match_enabled=0"). Set explicitly. */
+    g_scoped_tripwire.match_enabled = 0;
+}
+
+void cpu_trace_arm_scoped_tripwire_v(uint8_t bank, uint16_t addr_lo,
+                                     uint16_t addr_hi, const char *scope_substr,
+                                     uint8_t match_val) {
     memset(&g_scoped_tripwire, 0, sizeof(g_scoped_tripwire));
     g_scoped_tripwire.armed = 1;
     g_scoped_tripwire.bank = bank;
@@ -177,6 +187,8 @@ void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
                 SCOPED_TRIPWIRE_FUNC_LEN - 1);
         g_scoped_tripwire.scope_substr[SCOPED_TRIPWIRE_FUNC_LEN - 1] = 0;
     }
+    g_scoped_tripwire.match_enabled = 1;
+    g_scoped_tripwire.match_val = match_val;
 }
 
 void cpu_trace_disarm_scoped_tripwire(void) {
@@ -222,6 +234,11 @@ static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
     int32_t off = wram_offset(bank, addr);
     if (off < 0) return 0;
     if (off < t->ram_off_lo || off > t->ram_off_hi) return 0;
+    /* Optional value-match: only fire when the byte that lands at the
+     * watched offset equals match_val. For 16-bit STAs this checks the
+     * specific byte (low or high) — same hit_val that the per-watch
+     * recorder records. */
+    if (t->match_enabled && hit_val != t->match_val) return 0;
     /* Scope check: substring of any recomp stack entry. */
     if (t->scope_substr[0]) {
         int found = 0;
@@ -710,19 +727,29 @@ void cpu_trace_arm_default_watches(void) {
      * want the FIRST real palette-load writer, not the zero-fill that
      * runs first. Snapshot survives ring rotation; query via
      * `tripwire_get` even if TCP attaches at frame ~1000. */
-    /* Narrow target: $7E:0707, the first byte of MainPalette where
-     * recomp diverges from oracle (recomp has 8 extra "ce 6a 42 39 08
-     * 52 ce 6a" bytes inserted starting at this offset). LoadCol8Pal
-     * writes at $0705/$0725/... (stride 32), so $0707 is written by a
-     * DIFFERENT palette routine — and that's the buggy writer we want
-     * to attribute. */
-    cpu_trace_arm_scoped_tripwire(0x7E, 0x0707, 0x0707, "Palette");
-    fprintf(stderr, "[cpu_trace] scoped tripwire armed on $7E:0707 (scope=*Palette*)\n");
-    /* Single recorder slot at $7E:0707 — every write at that exact
-     * offset records one WRM event with full register state. This
-     * gives an unambiguous timeline of the writers that landed bytes
-     * at the first divergent palette offset. */
-    cpu_trace_set_wram_watch(0x7E, 0x0707, 1, 0, 0, 1);
+    /* Narrow target: catch the FIRST write of $FA at $7E:1930.
+     * Investigation 2026-04-30: recomp's palette source pointer is
+     * 8 bytes off because $7E:1930 = $FA in recomp vs $02 in oracle.
+     * The recomp pattern "e0 fe fa" at $192E..$1930 strongly suggests
+     * an OVERLAPPING 16-bit STA at $192F storing $FAFE (low $FE at
+     * $192F, high $FA at $1930). The value-match tripwire fires on
+     * exactly that high-byte event AND on a direct STA $1930 of $FA,
+     * so either pattern is captured. The full snapshot includes
+     * CPU state, recomp stack, DP $00-$1F, recent block PC, and the
+     * trace_idx so the client can pull the last-128 trace events.
+     *
+     * No scope filter — we don't know which function writes the bad
+     * value yet. */
+    cpu_trace_arm_scoped_tripwire_v(0x7E, 0x1930, 0x1930, NULL, 0xFA);
+    fprintf(stderr, "[cpu_trace] scoped tripwire armed on $7E:1930 (match_val=$FA)\n");
+    /* Per-byte recorder on the surrounding region $7E:1925-$1930 so the
+     * WRM ring captures the COMPLETE timeline of writes around the
+     * corruption site. Walk backward from the trip to see which
+     * preceding bytes ($192E, $192F) were written legitimately and
+     * which were collateral from the bad 16-bit STA. */
+    for (int a = 0x1925; a <= 0x1930; a++) {
+        cpu_trace_set_wram_watch(0x7E, (uint16_t)a, 1, 0, 0, 1);
+    }
     fflush(stderr);
 }
 

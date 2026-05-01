@@ -327,34 +327,45 @@ def _emit_alu(op: Alu) -> List[str]:
 
 def _emit_shift(op: Shift) -> List[str]:
     sign = "0x80" if op.width == 1 else "0x8000"
+    # Mask src to op width. ReadReg always emits a uint16 read of
+    # cpu->A/X/Y, so when width=1 the high byte (B for A; hardware-zero
+    # for X/Y after our 8-bit-X/Y zero-extend fix in b39e99b) carries
+    # whatever was there from a prior 16-bit context. Right-shifts then
+    # leak high bits into the low byte; left-shift carry-bit selection
+    # tests bit 7 of the wrong byte. Concrete bug: LoadLevelHeader at
+    # $05:84E3 does `TXA ; LSR A x5 ; STA $1930` in m=1 — recomp's A.high
+    # leaked through the right-shift cascade and produced $FA at $1930
+    # instead of $02 (correct: $47 >> 5 = $02). Fixed 2026-04-30.
+    op_mask = "0xFF" if op.width == 1 else "0xFFFF"
+    src_m = f"({_v(op.src)} & {op_mask})"
     if op.op == ShiftOp.ASL:
         return [
-            f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)})({_v(op.src)} << 1);",
-            f"cpu->_flag_C = (({_v(op.src)} & {sign}) != 0) ? 1 : 0;",
+            f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)})({src_m} << 1);",
+            f"cpu->_flag_C = (({src_m} & {sign}) != 0) ? 1 : 0;",
             f"cpu->_flag_Z = ({_v(op.out)} == 0) ? 1 : 0;",
             f"cpu->_flag_N = (({_v(op.out)} & {sign}) != 0) ? 1 : 0;",
         ]
     if op.op == ShiftOp.LSR:
         return [
-            f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)})({_v(op.src)} >> 1);",
-            f"cpu->_flag_C = ({_v(op.src)} & 1) ? 1 : 0;",
+            f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)})({src_m} >> 1);",
+            f"cpu->_flag_C = ({src_m} & 1) ? 1 : 0;",
             f"cpu->_flag_Z = ({_v(op.out)} == 0) ? 1 : 0;",
             f"cpu->_flag_N = (({_v(op.out)} & {sign}) != 0) ? 1 : 0;",
         ]
     if op.op == ShiftOp.ROL:
         return [
             f"{_ctype(op.width)} {_v(op.out)} = "
-            f"({_ctype(op.width)})(({_v(op.src)} << 1) | cpu->_flag_C);",
-            f"cpu->_flag_C = (({_v(op.src)} & {sign}) != 0) ? 1 : 0;",
+            f"({_ctype(op.width)})(({src_m} << 1) | cpu->_flag_C);",
+            f"cpu->_flag_C = (({src_m} & {sign}) != 0) ? 1 : 0;",
             f"cpu->_flag_Z = ({_v(op.out)} == 0) ? 1 : 0;",
             f"cpu->_flag_N = (({_v(op.out)} & {sign}) != 0) ? 1 : 0;",
         ]
     if op.op == ShiftOp.ROR:
         return [
             f"{_ctype(op.width)} {_v(op.out)} = "
-            f"({_ctype(op.width)})(({_v(op.src)} >> 1) | "
+            f"({_ctype(op.width)})(({src_m} >> 1) | "
             f"((uint{op.width*8})cpu->_flag_C << {op.width * 8 - 1}));",
-            f"cpu->_flag_C = ({_v(op.src)} & 1) ? 1 : 0;",
+            f"cpu->_flag_C = ({src_m} & 1) ? 1 : 0;",
             f"cpu->_flag_Z = ({_v(op.out)} == 0) ? 1 : 0;",
             f"cpu->_flag_N = (({_v(op.out)} & {sign}) != 0) ? 1 : 0;",
         ]

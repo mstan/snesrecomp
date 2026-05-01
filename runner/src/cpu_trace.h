@@ -216,6 +216,15 @@ typedef struct ScopedTripwire {
     int32_t  ram_off_lo;
     int32_t  ram_off_hi;
     char     scope_substr[SCOPED_TRIPWIRE_FUNC_LEN];
+    /* Optional value-match: when match_enabled=1, the trip only fires
+     * when the byte that lands at the watched offset equals match_val.
+     * Catches both 8-bit STA (low byte) and 16-bit STA at addr-1 (high
+     * byte) — the cpu_write* check loop handles both cases via
+     * hit_byte_in_word. Use case 2026-04-30: catch the rare write of
+     * $FA into $7E:1930 (corruption) without the tripwire firing on
+     * the dozens of legitimate prior writes of other values. */
+    uint8_t  match_enabled;
+    uint8_t  match_val;
 
     /* Captured at trip time */
     int      frame;
@@ -254,6 +263,12 @@ extern ScopedTripwire g_scoped_tripwire;
 /* Arm the tripwire. Pass scope_substr=NULL for "any stack". */
 void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
                                    uint16_t addr_hi, const char *scope_substr);
+/* Arm the tripwire with a value-match. Trip only fires when the byte
+ * landing at the watched offset == match_val. Catches both 8-bit STA
+ * and the high byte of an overlapping 16-bit STA. */
+void cpu_trace_arm_scoped_tripwire_v(uint8_t bank, uint16_t addr_lo,
+                                     uint16_t addr_hi, const char *scope_substr,
+                                     uint8_t match_val);
 void cpu_trace_disarm_scoped_tripwire(void);
 
 /* ── P.X tripwire (non-rotating snapshot) ─────────────────────────────────
