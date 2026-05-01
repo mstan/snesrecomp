@@ -203,24 +203,35 @@ def _emit_readreg(op: ReadReg) -> List[str]:
 
 
 def _emit_writereg(op: WriteReg) -> List[str]:
-    # Width-respecting write into A / X / Y. When the controlling flag
-    # (m_flag for A, x_flag for X/Y) says 8-bit, only the LOW byte is
-    # mutated and the HIGH byte must be preserved. v1 codegen relied on
-    # the recompiler tracking M/X at emit time; v2 dispatches at runtime
-    # via the cpu->m_flag / cpu->x_flag fields.
+    # Width-respecting write into A / X / Y. The 65816 has different
+    # hardware semantics for A vs X/Y in 8-bit mode:
+    #
+    # A (m=1): preserve high byte. The "high byte" of A is the B
+    #   register and persists across SEP #$20 (TBA/TAB exists to swap).
+    #
+    # X/Y (x=1): hardware FORCES the high byte to 0. SEP #$10 zeros
+    #   X.high/Y.high at the flag-transition; subsequent 8-bit
+    #   register ops can't physically write to the high byte. Old
+    #   codegen "preserved" the high byte across 8-bit X/Y writes,
+    #   which is wrong: stale 16-bit residuals from before SEP #$10
+    #   leaked through and produced enormous indexed addresses (e.g.
+    #   LoadStripeImage's `LDY $12` at $00:85D2 inherited Y=$20XX
+    #   from a 16-bit caller, then `LDA $84D0,Y` read $00:A4D0
+    #   instead of $00:84D0 — wrong stripe pointer, NMI took 30k+
+    #   loop iterations per call). Fixed 2026-04-30.
     field = _reg(op.reg)
     if op.reg == Reg.A:
-        flag = "cpu->m_flag"
-    elif op.reg in (Reg.X, Reg.Y):
-        flag = "cpu->x_flag"
-    else:
-        flag = None
-    if flag is None:
-        return [f"{field} = {_v(op.src)};"]
-    return [
-        f"if ({flag}) {{ {field} = (uint16)(({field} & 0xFF00) | (({_v(op.src)}) & 0xFF)); }} "
-        f"else {{ {field} = (uint16)({_v(op.src)}); }}"
-    ]
+        return [
+            f"if (cpu->m_flag) {{ {field} = (uint16)(({field} & 0xFF00) | (({_v(op.src)}) & 0xFF)); }} "
+            f"else {{ {field} = (uint16)({_v(op.src)}); }}"
+        ]
+    if op.reg in (Reg.X, Reg.Y):
+        # 8-bit X/Y writes zero-extend; 16-bit writes use the full value.
+        return [
+            f"if (cpu->x_flag) {{ {field} = (uint16)(({_v(op.src)}) & 0xFF); }} "
+            f"else {{ {field} = (uint16)({_v(op.src)}); }}"
+        ]
+    return [f"{field} = {_v(op.src)};"]
 
 
 def _emit_consti(op: ConstI) -> List[str]:
@@ -356,34 +367,44 @@ def _emit_increg(op: IncReg) -> List[str]:
     # 65816 width semantics:
     #   INC A: width follows M (0=16-bit, 1=8-bit)
     #   INX / INY / DEX / DEY: width follows X (0=16-bit, 1=8-bit)
-    # When the register is 8-bit, only the LOW byte changes; the high
-    # byte must be preserved (for X/Y, hardware zeros the high byte
-    # when SEP #$10 is executed but otherwise it carries through). Most
-    # importantly, INC A in M=1 wrapping past $FF must NOT carry into
-    # the B half of the accumulator pair.
+    # A high byte is the B register; INC A in m=1 must NOT carry into B.
+    # X/Y high byte is HARDWARE-ZERO in x=1 mode (SEP #$10 zeros it at
+    # the flag transition; subsequent 8-bit ops can't physically write
+    # to it). Old codegen preserved X/Y high across 8-bit increments,
+    # which is wrong: stale 16-bit residuals leaked through. Indexed
+    # addressing then read from base + (stale_high<<8 | new_low) and
+    # NMI's LoadStripeImage spun for 30k+ iterations on garbage stripe
+    # data. Fixed 2026-04-30.
     if op.reg == Reg.A:
-        flag = "cpu->m_flag"
-    elif op.reg in (Reg.X, Reg.Y):
-        flag = "cpu->x_flag"
-    else:
-        flag = None
-    if flag is None:
         return [
-            f"{field} = ({field}) + ({delta});",
-            f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
-            f"cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+            f"if (cpu->m_flag) {{",
+            f"  uint8 _lo8 = (uint8)(({field} & 0xFF) + ({delta}));",
+            f"  {field} = (uint16)(({field} & 0xFF00) | _lo8);",
+            f"  cpu->_flag_Z = (_lo8 == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = ((_lo8 & 0x80) != 0) ? 1 : 0;",
+            f"}} else {{",
+            f"  {field} = (uint16)(({field}) + ({delta}));",
+            f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+            f"}}",
+        ]
+    if op.reg in (Reg.X, Reg.Y):
+        return [
+            f"if (cpu->x_flag) {{",
+            f"  uint8 _lo8 = (uint8)(({field} & 0xFF) + ({delta}));",
+            f"  {field} = (uint16)_lo8;  /* x=1 zeros high byte (hw contract) */",
+            f"  cpu->_flag_Z = (_lo8 == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = ((_lo8 & 0x80) != 0) ? 1 : 0;",
+            f"}} else {{",
+            f"  {field} = (uint16)(({field}) + ({delta}));",
+            f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+            f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
+            f"}}",
         ]
     return [
-        f"if ({flag}) {{",
-        f"  uint8 _lo8 = (uint8)(({field} & 0xFF) + ({delta}));",
-        f"  {field} = (uint16)(({field} & 0xFF00) | _lo8);",
-        f"  cpu->_flag_Z = (_lo8 == 0) ? 1 : 0;",
-        f"  cpu->_flag_N = ((_lo8 & 0x80) != 0) ? 1 : 0;",
-        f"}} else {{",
-        f"  {field} = (uint16)(({field}) + ({delta}));",
-        f"  cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
-        f"  cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
-        f"}}",
+        f"{field} = ({field}) + ({delta});",
+        f"cpu->_flag_Z = ({field} == 0) ? 1 : 0;",
+        f"cpu->_flag_N = (({field} & 0x8000) != 0) ? 1 : 0;",
     ]
 
 
@@ -654,11 +675,13 @@ def _emit_pullreg(op: PullReg) -> List[str]:
             "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
         ]
     if op.reg in (Reg.X, Reg.Y):
+        # PLX/PLY in x=1 zero-extends — high byte hardware-zero. See
+        # _emit_writereg comment. 2026-04-30.
         return [
             "if (cpu->x_flag) {",
             "  cpu->S = (uint16)(cpu->S + 1);",
             "  uint8 _v = cpu_read8(cpu, 0x00, cpu->S);",
-            f"  {field} = (uint16)(({field} & 0xFF00) | _v);",
+            f"  {field} = (uint16)_v;  /* x=1 zeros high byte (hw contract) */",
             "  cpu->_flag_Z = (_v == 0) ? 1 : 0;",
             "  cpu->_flag_N = ((_v & 0x80) != 0) ? 1 : 0;",
             "} else {",
@@ -708,10 +731,17 @@ def _emit_transfer(op: Transfer) -> List[str]:
             f"cpu->_flag_N = (({dst} & 0x8000) != 0) ? 1 : 0;",
             "cpu->P = (uint8)((cpu->P & ~0x82) | (cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));",
         ]
+    # X/Y dest in x=1 zero-extends (high byte hardware-zero); A dest in
+    # m=1 preserves high byte (= B register). See _emit_writereg comment
+    # for the LoadStripeImage failure that motivated this. 2026-04-30.
+    if op.dst in (Reg.X, Reg.Y):
+        dst_8bit = f"{dst} = (uint16)_v;  /* x=1 zeros high byte (hw contract) */"
+    else:
+        dst_8bit = f"{dst} = (uint16)(({dst} & 0xFF00) | _v);"
     return [
         f"if ({flag}) {{",
         f"  uint8 _v = (uint8)({src} & 0xFF);",
-        f"  {dst} = (uint16)(({dst} & 0xFF00) | _v);",
+        f"  {dst_8bit}",
         f"  cpu->_flag_Z = (_v == 0) ? 1 : 0;",
         f"  cpu->_flag_N = ((_v & 0x80) != 0) ? 1 : 0;",
         f"}} else {{",
