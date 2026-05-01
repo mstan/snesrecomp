@@ -36,7 +36,7 @@ import re
 import sys
 
 SCAN_ROOT = pathlib.Path(__file__).resolve().parent.parent / "recompiler" / "v2"
-ALLOWED = {"widths.py"}
+ALLOWED = {"widths.py", "emitter_helpers.py"}
 
 # Patterns that ARE bugs — width-mask emissions outside widths.py.
 PATTERNS = [
@@ -64,6 +64,11 @@ PATTERNS = [
      "ad-hoc cpu_read dispatch — use widths.read_fn(width)"),
     (r'"cpu_write8"\s+if\s+.*\s+else\s+"cpu_write16"',
      "ad-hoc cpu_write dispatch — use widths.write_fn(width)"),
+    # Per-emitter inlined JSL bank save+restore (Follow-up B). The
+    # tell-tale signature is the literal `_saved_pb = cpu->PB` — only
+    # emitter_helpers.call_with_pb_save should write that.
+    (r'_saved_pb\s*=\s*cpu->PB',
+     "ad-hoc JSL bank save/restore — use emitter_helpers.call_with_pb_save"),
 ]
 
 

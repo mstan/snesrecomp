@@ -89,6 +89,7 @@ def take_unresolved_call_targets() -> set:
 
 
 from v2 import widths  # noqa: E402
+from v2 import emitter_helpers  # noqa: E402
 from v2.ir import (  # noqa: E402
     IROp, IRBlock,
     Read, Write, ReadReg, WriteReg, ConstI,
@@ -776,14 +777,10 @@ def _emit_dispatch(insn) -> List[str]:
         # Record demand for both resolved and synthetic targets.
         _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
         name = f"{base_name}{suffix}"
-        lines.append(
-            f"    case {i}: {{ uint8 _saved_pb = cpu->PB; "
-            f"cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL); "
-            f"cpu->PB = {target_bank:#04x}; "
-            f"{name}(cpu); "
-            f"cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL); "
-            f"cpu->PB = _saved_pb; }} break;"
-        )
+        # Single-line case body: join the 6 PB-save/restore statements
+        # with spaces so the switch case stays readable in the gen.
+        env = emitter_helpers.call_with_pb_save(target_bank, name)
+        lines.append(f"    case {i}: {{ {' '.join(env)} }} break;")
     lines.append("    default: break;")
     lines.append("  }")
     lines.append("  return; /* dispatch is a terminator */")
@@ -814,14 +811,8 @@ def _emit_call(op: Call) -> List[str]:
         # so PHK inside the callee pushes the CORRECT bank — without
         # this, PHK; PLB inside a JSL'd function poisons DB to the
         # CALLER's bank instead of the callee's (= currently $00 always).
-        return [
-            "{ uint8 _saved_pb = cpu->PB;",
-            f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
-            f"  cpu->PB = {target_bank:#04x};",
-            f"  {name}(cpu);",
-            f"  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
-            f"  cpu->PB = _saved_pb; }}",
-        ]
+        env = emitter_helpers.call_with_pb_save(target_bank, name)
+        return ["{"] + [f"  {s}" for s in env] + ["}"]
     # JSR: same-bank short call. PB doesn't change.
     return [f"{name}(cpu);"]
 

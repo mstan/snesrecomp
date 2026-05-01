@@ -247,3 +247,20 @@ def test_bitclearmem_8bit_dispatch():
     out = _join(_emit_bitclearmem(BitClearMem(seg=seg, width=1)))
     assert "cpu_read8(" in out and "cpu_write8(" in out, (
         f"BitClearMem width=1 must use 8-bit read+write:\n{out}")
+
+
+# ── JSL bank save/restore envelope (Follow-up B) ────────────────────────
+
+def test_call_with_pb_save_returns_six_statements():
+    from v2.emitter_helpers import call_with_pb_save
+    env = call_with_pb_save(0x05, "MyFn_M1X1")
+    assert len(env) == 6, (
+        f"call_with_pb_save must return 6 statements (got {len(env)}):\n{env}")
+    # Order matters: save -> trace JSL -> set PB -> call -> trace RTL -> restore
+    text = "\n".join(env)
+    assert "_saved_pb = cpu->PB" in env[0], f"stmt 1 must save PB:\n{env[0]}"
+    assert "CPU_TR_JSL" in env[1], f"stmt 2 must be JSL trace:\n{env[1]}"
+    assert "cpu->PB = 0x05" in env[2], f"stmt 3 must set PB to target:\n{env[2]}"
+    assert "MyFn_M1X1(cpu);" == env[3], f"stmt 4 must be the callee:\n{env[3]}"
+    assert "CPU_TR_RTL" in env[4], f"stmt 5 must be RTL trace:\n{env[4]}"
+    assert "cpu->PB = _saved_pb" in env[5], f"stmt 6 must restore PB:\n{env[5]}"
