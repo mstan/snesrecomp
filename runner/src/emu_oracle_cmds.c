@@ -214,6 +214,111 @@ static void h_emu_read_vram(const char *args) {
     debug_server_send_raw("\"}\n", 3);
 }
 
+/* Helper: stream a buffer slice as a JSON hex blob. Mirrors the body of
+ * h_emu_read_vram but parametrized; used by emu_read_cgram/oam/ppu/dma. */
+static void emit_hex_slice(const char *label, unsigned int addr, unsigned int len,
+                           const uint8_t *buf, unsigned int buf_size) {
+    if (len < 1) len = 1;
+    if (addr >= buf_size || addr + len > buf_size) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"%s range out of bounds\",\"addr\":\"0x%x\",\"len\":%u}",
+                              label, addr, len);
+        return;
+    }
+    char hdr[160];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "{\"ok\":true,\"label\":\"%s\",\"addr\":\"0x%04x\",\"len\":%u,\"hex\":\"",
+                        label, addr, len);
+    debug_server_send_raw(hdr, hlen);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", buf[addr + i]);
+        debug_server_send_raw(chunk, pos);
+    }
+    debug_server_send_raw("\"}\n", 3);
+}
+
+/* emu_read_cgram [hex_addr] [len_decimal]
+ * Defaults: addr=0, len=512 (full CGRAM). 256 BGR15 colors = 512 bytes. */
+static void h_emu_read_cgram(const char *args) {
+    if (!g_active_backend) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
+        return;
+    }
+    if (!g_active_backend->get_cgram) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"get_cgram not implemented by backend\","
+                              "\"backend\":\"%s\"}", g_active_backend->name);
+        return;
+    }
+    unsigned int addr = 0, len = 512;
+    if (args) sscanf(args, "%x %u", &addr, &len);
+    static uint8_t buf[512];
+    g_active_backend->get_cgram(buf);
+    emit_hex_slice("cgram", addr, len, buf, 512);
+}
+
+/* emu_read_oam [hex_addr] [len_decimal]
+ * Defaults: addr=0, len=544 (full OAM = 512 main + 32 high). */
+static void h_emu_read_oam(const char *args) {
+    if (!g_active_backend) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
+        return;
+    }
+    if (!g_active_backend->get_oam) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"get_oam not implemented by backend\","
+                              "\"backend\":\"%s\"}", g_active_backend->name);
+        return;
+    }
+    unsigned int addr = 0, len = 544;
+    if (args) sscanf(args, "%x %u", &addr, &len);
+    static uint8_t buf[544];
+    g_active_backend->get_oam(buf);
+    emit_hex_slice("oam", addr, len, buf, 544);
+}
+
+/* emu_get_ppu_regs [hex_offset] [len_decimal]
+ * Snapshot of PPU MMIO register shadow. snes9x stores last-write
+ * values in Memory.FillRAM[$2100..$21FF]. The "offset" arg is into
+ * that 256-byte window (0 = $2100, 0x21 = $2121, etc.). Default
+ * dumps the whole 256 bytes. */
+static void h_emu_get_ppu_regs(const char *args) {
+    if (!g_active_backend) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
+        return;
+    }
+    if (!g_active_backend->get_ppu_regs) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"get_ppu_regs not implemented by backend\","
+                              "\"backend\":\"%s\"}", g_active_backend->name);
+        return;
+    }
+    unsigned int addr = 0, len = 0x100;
+    if (args) sscanf(args, "%x %u", &addr, &len);
+    static uint8_t buf[0x100];
+    g_active_backend->get_ppu_regs(buf, sizeof(buf));
+    emit_hex_slice("ppu", addr, len, buf, 0x100);
+}
+
+/* emu_get_dma_regs [hex_offset] [len_decimal]
+ * Snapshot of DMA channel shadow. $4300..$437F = 8 channels × 16
+ * bytes each. Default dumps the whole 128 bytes. */
+static void h_emu_get_dma_regs(const char *args) {
+    if (!g_active_backend) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"no active backend\"}");
+        return;
+    }
+    if (!g_active_backend->get_dma_regs) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"get_dma_regs not implemented by backend\","
+                              "\"backend\":\"%s\"}", g_active_backend->name);
+        return;
+    }
+    unsigned int addr = 0, len = 0x80;
+    if (args) sscanf(args, "%x %u", &addr, &len);
+    static uint8_t buf[0x80];
+    g_active_backend->get_dma_regs(buf, sizeof(buf));
+    emit_hex_slice("dma", addr, len, buf, 0x80);
+}
+
 /* fuzz_run_snippet <rom_hex> <a> <x> <y> <s> <d> <db> <p>
  *
  * Phase B differential fuzz entry point. All integer args are decimal
@@ -916,6 +1021,10 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_is_loaded") == 0) { h_emu_is_loaded(args); return 1; }
     if (strcmp(cmd, "emu_read_wram") == 0) { h_emu_read_wram(args); return 1; }
     if (strcmp(cmd, "emu_read_vram") == 0) { h_emu_read_vram(args); return 1; }
+    if (strcmp(cmd, "emu_read_cgram") == 0) { h_emu_read_cgram(args); return 1; }
+    if (strcmp(cmd, "emu_read_oam") == 0)   { h_emu_read_oam(args);   return 1; }
+    if (strcmp(cmd, "emu_get_ppu_regs") == 0) { h_emu_get_ppu_regs(args); return 1; }
+    if (strcmp(cmd, "emu_get_dma_regs") == 0) { h_emu_get_dma_regs(args); return 1; }
     if (strcmp(cmd, "fuzz_run_snippet") == 0) { h_fuzz_run_snippet(args); return 1; }
     if (strcmp(cmd, "emu_func_snap_set") == 0)   { h_emu_func_snap_set(args); return 1; }
     if (strcmp(cmd, "emu_func_snap_count") == 0) { h_emu_func_snap_count(args); return 1; }

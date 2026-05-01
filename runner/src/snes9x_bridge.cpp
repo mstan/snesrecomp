@@ -642,6 +642,45 @@ void snes9x_bridge_get_vram(uint8_t *out) {
     memcpy(out, Memory.VRAM, 0x10000);
 }
 
+extern "C" void snes9x_bridge_get_cgram(uint8_t *out) {
+    if (!out) return;
+    if (!s_loaded) { memset(out, 0, 512); return; }
+    /* snes9x stores CGRAM as 256 16-bit BGR15 words in PPU.CGDATA[].
+     * Recomp's g_ppu->cgram is a flat byte array (256*2 bytes = 512).
+     * Marshal to byte-array layout for direct comparison. */
+    for (int i = 0; i < 256; i++) {
+        out[i * 2 + 0] = (uint8_t)(PPU.CGDATA[i] & 0xFF);
+        out[i * 2 + 1] = (uint8_t)((PPU.CGDATA[i] >> 8) & 0xFF);
+    }
+}
+
+extern "C" void snes9x_bridge_get_oam(uint8_t *out) {
+    if (!out) return;
+    if (!s_loaded) { memset(out, 0, 544); return; }
+    /* PPU.OAMData = 512 main + 32 high bytes, contiguous. Same shape
+     * as recomp's g_ppu->oam (512) + g_ppu->highOam (32). */
+    memcpy(out, PPU.OAMData, 544);
+}
+
+/* PPU/DMA register shadow — snes9x mirrors the most recent CPU write
+ * to each MMIO register in Memory.FillRAM[]. FillRAM[0x2100..0x21FF]
+ * covers every PPU register; FillRAM[0x4300..0x437F] covers all 8 DMA
+ * channels (16 bytes each). Recomp's runtime keeps an equivalent
+ * shadow so byte-by-byte diff is meaningful. */
+extern "C" void snes9x_bridge_get_ppu_regs(uint8_t *out, int len) {
+    if (!out || len < 1) return;
+    if (!s_loaded) { memset(out, 0, len); return; }
+    if (len > 0x100) len = 0x100;
+    memcpy(out, &Memory.FillRAM[0x2100], len);
+}
+
+extern "C" void snes9x_bridge_get_dma_regs(uint8_t *out, int len) {
+    if (!out || len < 1) return;
+    if (!s_loaded) { memset(out, 0, len); return; }
+    if (len > 0x80) len = 0x80;
+    memcpy(out, &Memory.FillRAM[0x4300], len);
+}
+
 /* ---- Phase B differential fuzz snippet runner --------------------------
  * Write a tiny 65816 snippet to WRAM, seed CPU registers, step opcodes
  * until PC returns to a sentinel value, dump final WRAM. Used by the
@@ -930,6 +969,10 @@ const snes_oracle_backend_t g_snes9x_backend = {
     /* .cpu_read      = */ snes9x_bridge_cpu_read,
     /* .get_cpu_regs  = */ snes9x_bridge_get_cpu_regs,
     /* .get_vram      = */ snes9x_bridge_get_vram,
+    /* .get_cgram     = */ snes9x_bridge_get_cgram,
+    /* .get_oam       = */ snes9x_bridge_get_oam,
+    /* .get_ppu_regs  = */ snes9x_bridge_get_ppu_regs,
+    /* .get_dma_regs  = */ snes9x_bridge_get_dma_regs,
 };
 
 } /* extern "C" */

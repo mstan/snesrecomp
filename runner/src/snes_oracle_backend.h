@@ -41,8 +41,10 @@ typedef struct snes_oracle_backend {
     uint8_t (*cpu_read)(uint32_t addr24);               /* full 24-bit bus read */
     void    (*get_cpu_regs)(SnesCpuRegs *out);
     void    (*get_vram)(uint8_t *out_64k);              /* PPU VRAM, 64 KB */
-    /* get_cgram / get_oam / get_framebuf_argb / get_ppu_regs added
-     * here as the matching emu_* TCP commands ship. */
+    void    (*get_cgram)(uint8_t *out_512);             /* CGRAM, 512 bytes */
+    void    (*get_oam)(uint8_t *out_544);               /* OAM, 544 bytes */
+    void    (*get_ppu_regs)(uint8_t *out, int len);     /* MMIO $2100-$21FF shadow */
+    void    (*get_dma_regs)(uint8_t *out, int len);     /* MMIO $4300-$437F shadow */
 } snes_oracle_backend_t;
 
 /* The currently-selected backend. NULL before first init, or if no
