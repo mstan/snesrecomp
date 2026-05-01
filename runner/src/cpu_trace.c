@@ -272,6 +272,9 @@ static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
 
     /* DP region snapshot ($7E:0080-009F = WRAM offset 0x0080) */
     memcpy(t->dp_snapshot, &g_ram[0x0080], SCOPED_TRIPWIRE_DP_BYTES);
+    /* DP-low snapshot ($7E:0000-001F) — captures source ptrs used by
+     * palette/stripe loops (DP $00-$02 = 24-bit ptr in many SMW routines). */
+    memcpy(t->dp_low_snapshot, &g_ram[0x0000], 32);
     /* GameMode region snapshot ($7E:0100-010F = WRAM offset 0x0100) */
     memcpy(t->gm_snapshot, &g_ram[0x0100], SCOPED_TRIPWIRE_GM_BYTES);
 
@@ -693,12 +696,33 @@ void cpu_trace_arm_default_watches(void) {
      * even before TCP attaches. The snapshot doesn't rotate. */
     cpu_trace_arm_px_tripwire();
     fprintf(stderr, "[cpu_trace] P.X tripwire armed (first 1→0 transition caught)\n");
-    /* Auto-arm scoped WRAM tripwire on the GameMode region $7E:0100-$010F
-     * so the FIRST write across boot is captured even if TCP doesn't attach
-     * until ~frame 1000. The snapshot survives ring rotation. Ring-buffer
-     * pattern: query the snapshot at attach time, do not arm-then-run. */
-    cpu_trace_arm_scoped_tripwire(0x7E, 0x0100, 0x010F, NULL);
-    fprintf(stderr, "[cpu_trace] scoped tripwire armed on $7E:0100-$010F (GameMode region)\n");
+    /* Auto-arm scoped WRAM tripwire on the BG palette buffer
+     * $7E:0700-$070F, the first 16 colors of MainPalette/BackgroundColor.
+     *
+     * Investigation 2026-04-30: oracle-vs-recomp WRAM diff showed
+     * recomp's MainPalette ($7E:0703+) has 8 EXTRA bytes inserted
+     * between offset 4 and 12 of the buffer ("ce 6a 42 39 08 52 ce 6a"),
+     * shifting subsequent bytes forward. Class: dest-pointer increment
+     * or loop counter wrong by one iteration in a palette copy loop.
+     *
+     * We scope to function names containing "Palette" so the BSS-clear
+     * loop in InitializeFirst8KBOfRAM / ClearMemory is skipped — we
+     * want the FIRST real palette-load writer, not the zero-fill that
+     * runs first. Snapshot survives ring rotation; query via
+     * `tripwire_get` even if TCP attaches at frame ~1000. */
+    /* Narrow target: $7E:0707, the first byte of MainPalette where
+     * recomp diverges from oracle (recomp has 8 extra "ce 6a 42 39 08
+     * 52 ce 6a" bytes inserted starting at this offset). LoadCol8Pal
+     * writes at $0705/$0725/... (stride 32), so $0707 is written by a
+     * DIFFERENT palette routine — and that's the buggy writer we want
+     * to attribute. */
+    cpu_trace_arm_scoped_tripwire(0x7E, 0x0707, 0x0707, "Palette");
+    fprintf(stderr, "[cpu_trace] scoped tripwire armed on $7E:0707 (scope=*Palette*)\n");
+    /* Single recorder slot at $7E:0707 — every write at that exact
+     * offset records one WRM event with full register state. This
+     * gives an unambiguous timeline of the writers that landed bytes
+     * at the first divergent palette offset. */
+    cpu_trace_set_wram_watch(0x7E, 0x0707, 1, 0, 0, 1);
     fflush(stderr);
 }
 

@@ -243,6 +243,10 @@ typedef struct ScopedTripwire {
     /* DP/GM region snapshots */
     uint8_t  dp_snapshot[SCOPED_TRIPWIRE_DP_BYTES];   /* $7E:0080-009F */
     uint8_t  gm_snapshot[SCOPED_TRIPWIRE_GM_BYTES];   /* $7E:0100-010F */
+    /* DP-low snapshot $7E:0000-001F. Many palette/stripe loops use
+     * DP $00-$02 as the 24-bit source pointer; at trip we want the
+     * actual pointer value to compare against the oracle. */
+    uint8_t  dp_low_snapshot[32];                       /* $7E:0000-001F */
 } ScopedTripwire;
 
 extern ScopedTripwire g_scoped_tripwire;

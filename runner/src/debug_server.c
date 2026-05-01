@@ -3512,6 +3512,10 @@ static void cmd_tripwire_get(const char *args) {
         for (int i = 0; i < SCOPED_TRIPWIRE_GM_BYTES; i++) {
             pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x", t->gm_snapshot[i]);
         }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\",\"dp_low\":\"");
+        for (int i = 0; i < 32; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x", t->dp_low_snapshot[i]);
+        }
         pos += snprintf(buf + pos, sizeof(buf) - pos, "\"");
     }
     snprintf(buf + pos, sizeof(buf) - pos, "}");
