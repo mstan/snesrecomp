@@ -466,8 +466,16 @@ def _emit_setnz(op) -> List[str]:
 
 
 def _emit_repflags(op: RepFlags) -> List[str]:
+    # IMPORTANT: sync mirrors → P BEFORE modifying P. Many ALU ops update
+    # _flag_Z/N/V/C without resyncing cpu->P, so cpu->P can be stale at
+    # this point. If we modify P directly and then call cpu_p_to_mirrors,
+    # the stale P-bits clobber freshly-set mirrors. Concrete bug:
+    # DEC.W $8D updates _flag_Z=1; the trailing SEP #$20 then ran
+    # cpu_p_to_mirrors which read P-bit 1 (still 0) and overwrote
+    # _flag_Z back to 0, making BNE always loop. Fixed 2026-04-30.
     return [
         "{ uint8 _old_p = cpu->P;",
+        "  cpu_mirrors_to_p(cpu);",
         f"  cpu->P = (uint8)(cpu->P & ~{op.mask:#04x});",
         "  cpu_p_to_mirrors(cpu);",
         "  cpu_trace_px_record(cpu, 0, 0 /*REP*/, _old_p, cpu->P); }",
@@ -475,8 +483,10 @@ def _emit_repflags(op: RepFlags) -> List[str]:
 
 
 def _emit_sepflags(op: SepFlags) -> List[str]:
+    # See _emit_repflags for rationale on the pre-sync.
     return [
         "{ uint8 _old_p = cpu->P;",
+        "  cpu_mirrors_to_p(cpu);",
         f"  cpu->P = (uint8)(cpu->P | {op.mask:#04x});",
         "  cpu_p_to_mirrors(cpu);",
         "  cpu_trace_px_record(cpu, 0, 1 /*SEP*/, _old_p, cpu->P); }",

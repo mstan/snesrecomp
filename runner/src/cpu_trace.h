@@ -136,7 +136,7 @@ void cpu_trace_set_s_range_watch(uint16_t s_lo, uint16_t s_hi, int enabled);
  * The bank field is matched modulo SNES WRAM mirroring: a watch at
  * ($7E, $008c) also fires for writes to ($00, $008c) etc. — they hit the
  * same g_ram offset. */
-#define CPU_WRAM_WATCH_MAX 16
+#define CPU_WRAM_WATCH_MAX 32
 
 typedef struct WramWatch {
     uint8_t  enabled;
@@ -204,10 +204,17 @@ typedef struct ScopedTripwire {
     /* Arming state */
     uint8_t  armed;
     uint8_t  triggered;
-    uint8_t  bank;
+    uint8_t  bank;              /* "armed" bank — used for JSON readback only */
     uint8_t  width_seen;        /* 1 or 2 — width of the triggering write */
     uint16_t addr_lo;
     uint16_t addr_hi;
+    /* Canonical ram_off range: any write whose ram_off lands in this
+     * inclusive range fires the tripwire, regardless of which mirror
+     * bank the gen code wrote through. SMW commonly writes to low DP
+     * via DB=$00 ($00:0100), which `cpu_ram_offset` maps to the same
+     * g_ram offset as $7E:0100. Bank-strict matching missed those. */
+    int32_t  ram_off_lo;
+    int32_t  ram_off_hi;
     char     scope_substr[SCOPED_TRIPWIRE_FUNC_LEN];
 
     /* Captured at trip time */

@@ -152,6 +152,11 @@ extern uint64_t          g_main_cpu_cycles_estimate;
 extern volatile uint64_t g_block_counter;
 extern uint8_t     g_ram[];
 
+/* Forward decl — definition below in this TU. The arm function needs it
+ * to canonicalize (bank, addr) → ram_off at arm time so the fire path
+ * can compare a single integer instead of replaying mirror logic. */
+static int32_t wram_offset(uint8_t bank, uint16_t addr);
+
 void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
                                    uint16_t addr_hi, const char *scope_substr) {
     memset(&g_scoped_tripwire, 0, sizeof(g_scoped_tripwire));
@@ -159,6 +164,14 @@ void cpu_trace_arm_scoped_tripwire(uint8_t bank, uint16_t addr_lo,
     g_scoped_tripwire.bank = bank;
     g_scoped_tripwire.addr_lo = addr_lo;
     g_scoped_tripwire.addr_hi = addr_hi;
+    /* Pre-compute canonical ram_off range using the same mapping cpu_write*
+     * uses, so writes through DB-mirror banks (e.g. $00:0100) fire too. */
+    g_scoped_tripwire.ram_off_lo = wram_offset(bank, addr_lo);
+    g_scoped_tripwire.ram_off_hi = wram_offset(bank, addr_hi);
+    if (g_scoped_tripwire.ram_off_lo < 0 || g_scoped_tripwire.ram_off_hi < 0) {
+        /* Bad range — disarm to avoid surprise misses. */
+        g_scoped_tripwire.armed = 0;
+    }
     if (scope_substr) {
         strncpy(g_scoped_tripwire.scope_substr, scope_substr,
                 SCOPED_TRIPWIRE_FUNC_LEN - 1);
@@ -202,8 +215,13 @@ static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
                                       uint8_t hit_val, int width) {
     ScopedTripwire *t = &g_scoped_tripwire;
     if (!t->armed || t->triggered) return 0;
-    if (bank != t->bank) return 0;
-    if (addr < t->addr_lo || addr > t->addr_hi) return 0;
+    /* Use canonical ram_off, not (bank, addr). Bank-strict matching
+     * silently missed writes routed through DB-mirror banks ($00:0100,
+     * $80:0100, ...), which is the dominant SMW pattern for low-DP
+     * stores. */
+    int32_t off = wram_offset(bank, addr);
+    if (off < 0) return 0;
+    if (off < t->ram_off_lo || off > t->ram_off_hi) return 0;
     /* Scope check: substring of any recomp stack entry. */
     if (t->scope_substr[0]) {
         int found = 0;
@@ -661,6 +679,13 @@ void cpu_trace_arm_default_watches(void) {
      * advancement vs out-of-band corruption. */
     cpu_trace_set_wram_watch(0x7E, 0x008A, 1, 0, 0, 1);
     cpu_trace_set_wram_watch(0x7E, 0x008B, 1, 0, 0, 1);
+    /* $7E:0100-$010F — GameMode region. Investigation 2026-04-30:
+     * region reads $FF post-boot but BSS is $00. With per-byte WRAM
+     * recorders here, the ring captures EVERY write to the region;
+     * walk backward from "now" to find the last writer and the value. */
+    for (int a = 0x0100; a <= 0x010F; a++) {
+        cpu_trace_set_wram_watch(0x7E, (uint16_t)a, 1, 0, 0, 1);
+    }
     fprintf(stderr, "[cpu_trace] default watches armed: "
             "DB high banks + odd middle, PB!=0, S out-of-$01XX-$1FFF, "
             "GameMode14_InLevel_0086DF, WRAM recorders on $7E:008A/8B/8C\n");
@@ -668,6 +693,12 @@ void cpu_trace_arm_default_watches(void) {
      * even before TCP attaches. The snapshot doesn't rotate. */
     cpu_trace_arm_px_tripwire();
     fprintf(stderr, "[cpu_trace] P.X tripwire armed (first 1→0 transition caught)\n");
+    /* Auto-arm scoped WRAM tripwire on the GameMode region $7E:0100-$010F
+     * so the FIRST write across boot is captured even if TCP doesn't attach
+     * until ~frame 1000. The snapshot survives ring rotation. Ring-buffer
+     * pattern: query the snapshot at attach time, do not arm-then-run. */
+    cpu_trace_arm_scoped_tripwire(0x7E, 0x0100, 0x010F, NULL);
+    fprintf(stderr, "[cpu_trace] scoped tripwire armed on $7E:0100-$010F (GameMode region)\n");
     fflush(stderr);
 }
 
