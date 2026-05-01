@@ -4261,6 +4261,16 @@ int debug_server_init(int port) {
     // record. cmd_trace_blocks / cmd_trace_blocks_reset still let
     // explicit callers toggle, but the default starts armed.
     s_block_trace.active = 1;
+
+    // Always-on VRAM trace: capture every word-VRAM write continuously
+    // so probes can attribute Layer-3 / OBJ tile-graphics corruption
+    // backward in history. Same rationale as WRAM. Ring covers the full
+    // word-address range $0000-$FFFF; VRAM_TRACE_LOG_SIZE = 65536 ×
+    // ~140B ≈ 9 MB resident. Gated on SNESRECOMP_REVERSE_DEBUG.
+    s_vram_trace.nranges = 1;
+    s_vram_trace.ranges[0].lo = 0x0000;
+    s_vram_trace.ranges[0].hi = 0xFFFF;
+    s_vram_trace.active = 1;
 #endif
 
     // Spawn background network thread
