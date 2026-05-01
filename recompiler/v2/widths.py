@@ -170,3 +170,27 @@ def low_byte(field: str) -> str:
     """Cast `(uint8)(field & 0xFF)` — extract low byte for an 8-bit
     op operating on a 16-bit register storage."""
     return f"(uint8)({field} & 0xFF)"
+
+
+# ── Memory-access function dispatch helpers ────────────────────────────
+#
+# `cpu_read8` / `cpu_read16` and `cpu_write8` / `cpu_write16` are the
+# runtime memory-access primitives. The width-bound dispatch
+# `fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"` was duplicated
+# at every memory-op emitter. Same risk class as the operand-mask bug:
+# forget the dispatch and slip a `cpu_read8` into a 16-bit op (or vice
+# versa) — the latter would silently truncate the high byte from any
+# 16-bit RMW.
+#
+# The lint extends to ban raw `"cpu_read8"` / `"cpu_read16"` /
+# `"cpu_write8"` / `"cpu_write16"` C-string emissions outside this
+# module. New emitters must call `widths.read_fn(width)` etc.
+
+def read_fn(width: int) -> str:
+    """C function name for a width-bound memory read."""
+    return "cpu_read8" if width == 1 else "cpu_read16"
+
+
+def write_fn(width: int) -> str:
+    """C function name for a width-bound memory write."""
+    return "cpu_write8" if width == 1 else "cpu_write16"

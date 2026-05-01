@@ -54,6 +54,16 @@ PATTERNS = [
      "raw '& 0xFF' in emitted C — use widths.masked(expr, 1) or widths.low_byte"),
     (r'"\&\s*0xFFFF\b',
      "raw '& 0xFFFF' in emitted C — use widths.masked(expr, 2)"),
+    # Per-emitter ad-hoc cpu_read/cpu_write dispatch (Follow-up A).
+    # Catches both `fn = "cpu_read8" if … else "cpu_read16"` and the
+    # `fn_r =`/`fn_w =` variants. FIXED-WIDTH cpu_read8/cpu_read16
+    # calls (e.g. for DP-indirect pointer reads, which are always 16-bit
+    # regardless of m_flag) are NOT flagged — only the width-conditional
+    # dispatch is.
+    (r'"cpu_read8"\s+if\s+.*\s+else\s+"cpu_read16"',
+     "ad-hoc cpu_read dispatch — use widths.read_fn(width)"),
+    (r'"cpu_write8"\s+if\s+.*\s+else\s+"cpu_write16"',
+     "ad-hoc cpu_write dispatch — use widths.write_fn(width)"),
 ]
 
 

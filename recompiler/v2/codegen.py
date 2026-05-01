@@ -189,14 +189,13 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
 
 def _emit_read(op: Read) -> List[str]:
     bank, addr = _segref_addr_expr(op.seg)
-    fn = "cpu_read8" if op.width == 1 else "cpu_read16"
-    return [f"{_ctype(op.width)} {_v(op.out)} = {fn}(cpu, {bank}, {addr});"]
+    return [f"{widths.ctype(op.width)} {_v(op.out)} = "
+            f"{widths.read_fn(op.width)}(cpu, {bank}, {addr});"]
 
 
 def _emit_write(op: Write) -> List[str]:
     bank, addr = _segref_addr_expr(op.seg)
-    fn = "cpu_write8" if op.width == 1 else "cpu_write16"
-    return [f"{fn}(cpu, {bank}, {addr}, {_v(op.src)});"]
+    return [f"{widths.write_fn(op.width)}(cpu, {bank}, {addr}, {_v(op.src)});"]
 
 
 def _emit_readreg(op: ReadReg) -> List[str]:
@@ -393,15 +392,13 @@ def _emit_incmem(op: IncMem) -> List[str]:
     result; leave C and V untouched. 65816 hw spec for INC/DEC abs/dp.
     Distinct from ADC/SBC (Alu.ADD/SUB) which DO carry-in and update C/V."""
     bank, addr = _segref_addr_expr(op.seg)
-    fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"
-    fn_w = "cpu_write8" if op.width == 1 else "cpu_write16"
     delta = "+1" if op.delta == +1 else "-1"
     ctype = widths.ctype(op.width)
     lines = [
         "{",
-        f"  {ctype} _im = {fn_r}(cpu, {bank}, {addr});",
+        f"  {ctype} _im = {widths.read_fn(op.width)}(cpu, {bank}, {addr});",
         f"  _im = ({ctype})(_im {delta});",
-        f"  {fn_w}(cpu, {bank}, {addr}, _im);",
+        f"  {widths.write_fn(op.width)}(cpu, {bank}, {addr}, _im);",
     ]
     lines.extend(f"  {s}" for s in widths.set_nz_no_p("_im", op.width))
     lines.append("}")
@@ -429,26 +426,24 @@ def _emit_bittest(op: BitTest) -> List[str]:
 
 def _emit_bitsetmem(op: BitSetMem) -> List[str]:
     bank, addr = _segref_addr_expr(op.seg)
-    fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"
-    fn_w = "cpu_write8" if op.width == 1 else "cpu_write16"
+    ctype = widths.ctype(op.width)
     return [
         "{",
-        f"  {_ctype(op.width)} _m = {fn_r}(cpu, {bank}, {addr});",
+        f"  {ctype} _m = {widths.read_fn(op.width)}(cpu, {bank}, {addr});",
         f"  cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
-        f"  {fn_w}(cpu, {bank}, {addr}, ({_ctype(op.width)})(_m | cpu->A));",
+        f"  {widths.write_fn(op.width)}(cpu, {bank}, {addr}, ({ctype})(_m | cpu->A));",
         "}",
     ]
 
 
 def _emit_bitclearmem(op: BitClearMem) -> List[str]:
     bank, addr = _segref_addr_expr(op.seg)
-    fn_r = "cpu_read8" if op.width == 1 else "cpu_read16"
-    fn_w = "cpu_write8" if op.width == 1 else "cpu_write16"
+    ctype = widths.ctype(op.width)
     return [
         "{",
-        f"  {_ctype(op.width)} _m = {fn_r}(cpu, {bank}, {addr});",
+        f"  {ctype} _m = {widths.read_fn(op.width)}(cpu, {bank}, {addr});",
         f"  cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
-        f"  {fn_w}(cpu, {bank}, {addr}, ({_ctype(op.width)})(_m & ~cpu->A));",
+        f"  {widths.write_fn(op.width)}(cpu, {bank}, {addr}, ({ctype})(_m & ~cpu->A));",
         "}",
     ]
 

@@ -25,12 +25,14 @@ sys.path.insert(0, str(REPO_ROOT / 'recompiler'))
 from v2.codegen import (
     _emit_alu, _emit_shift, _emit_bittest, _emit_setnz,
     _emit_writereg, _emit_pullreg, _emit_transfer, _emit_increg,
-    _emit_pushreg,
+    _emit_pushreg, _emit_read, _emit_write, _emit_incmem,
+    _emit_bitsetmem, _emit_bitclearmem,
 )
 from v2.ir import (
     Alu, AluOp, Shift, ShiftOp, BitTest, SetNZ,
     WriteReg, PullReg, Transfer, IncReg, PushReg,
-    Reg, Value,
+    Read, Write, IncMem, BitSetMem, BitClearMem,
+    Reg, Value, SegRef, SegKind,
 )
 
 
@@ -188,3 +190,60 @@ def test_pushreg_a_m1_pushes_low_byte_only():
         # m=1 branch must use cpu_write8 + low-byte mask.
         assert "cpu_write8" in m_branch, f"PHA m=1 must push 1 byte:\n{out}"
         assert "& 0xFF" in m_branch, f"PHA m=1 must mask low byte:\n{out}"
+
+
+# ── Memory-access dispatch (Follow-up A) ────────────────────────────────
+
+def test_read_8bit_uses_cpu_read8():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_read(Read(seg=seg, width=1, out=_v(1))))
+    assert "cpu_read8(" in out, f"Read width=1 must use cpu_read8:\n{out}"
+    assert "cpu_read16" not in out, f"Read width=1 must NOT use cpu_read16:\n{out}"
+
+
+def test_read_16bit_uses_cpu_read16():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_read(Read(seg=seg, width=2, out=_v(1))))
+    assert "cpu_read16(" in out, f"Read width=2 must use cpu_read16:\n{out}"
+    # cpu_read8 may appear in DP-indirect address resolution but NOT
+    # for the actual data-byte read.
+
+
+def test_write_8bit_uses_cpu_write8():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_write(Write(seg=seg, src=_v(1), width=1)))
+    assert "cpu_write8(" in out, f"Write width=1 must use cpu_write8:\n{out}"
+
+
+def test_write_16bit_uses_cpu_write16():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_write(Write(seg=seg, src=_v(1), width=2)))
+    assert "cpu_write16(" in out, f"Write width=2 must use cpu_write16:\n{out}"
+
+
+def test_incmem_8bit_uses_8bit_dispatch():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_incmem(IncMem(seg=seg, width=1, delta=1)))
+    assert "cpu_read8(" in out, f"IncMem width=1 must read 8-bit:\n{out}"
+    assert "cpu_write8(" in out, f"IncMem width=1 must write 8-bit:\n{out}"
+
+
+def test_incmem_16bit_uses_16bit_dispatch():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_incmem(IncMem(seg=seg, width=2, delta=-1)))
+    assert "cpu_read16(" in out, f"IncMem width=2 must read 16-bit:\n{out}"
+    assert "cpu_write16(" in out, f"IncMem width=2 must write 16-bit:\n{out}"
+
+
+def test_bitsetmem_16bit_dispatch():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_bitsetmem(BitSetMem(seg=seg, width=2)))
+    assert "cpu_read16(" in out and "cpu_write16(" in out, (
+        f"BitSetMem width=2 must use 16-bit read+write:\n{out}")
+
+
+def test_bitclearmem_8bit_dispatch():
+    seg = SegRef(kind=SegKind.DIRECT, offset=0x10)
+    out = _join(_emit_bitclearmem(BitClearMem(seg=seg, width=1)))
+    assert "cpu_read8(" in out and "cpu_write8(" in out, (
+        f"BitClearMem width=1 must use 8-bit read+write:\n{out}")
