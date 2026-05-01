@@ -36,16 +36,23 @@ def test_write_emits_cpu_write_call():
 
 
 def test_readreg_emits_cpustate_field():
+    """ReadReg of A should route through the typed helper cpu_read_a16
+    rather than reaching into cpu->A directly. Same value, but the
+    helper name carries the hardware contract and the lint can spot
+    bypass attempts."""
     op = ReadReg(reg=Reg.A, out=Value(vid=3))
     s = _joined(emit_op(op))
-    assert "cpu->A" in s
+    assert "cpu_read_a16(cpu)" in s
     assert "_v3" in s
 
 
 def test_writereg_emits_cpustate_assignment():
+    """WriteReg of X should route through cpu_write_x_x — the helper
+    encodes the x-flag-driven 8-vs-16-bit dispatch + zero-extend
+    semantics that distinguish X/Y writes from A writes."""
     op = WriteReg(reg=Reg.X, src=Value(vid=4))
     s = _joined(emit_op(op))
-    assert "cpu->X" in s
+    assert "cpu_write_x_x(cpu" in s
     assert "_v4" in s
 
 
@@ -174,11 +181,13 @@ def test_xba_independent_of_b_shadow():
         "ReadReg(Reg.B) must not emit a literal cpu->B read; the canonical "
         "form is `(cpu->A >> 8) & 0xFF`."
     )
-    # Spot-check: ReadReg(Reg.A) still uses cpu->A, so the test isn't
-    # silently passing because nothing has any field reference at all.
+    # Spot-check: ReadReg(Reg.A) routes through the typed helper, so the
+    # test isn't silently passing because nothing has any A reference at
+    # all. The helper carries the cpu->A access internally; emit text
+    # references the helper, not the field directly.
     op_a = ReadReg(reg=Reg.A, out=Value(vid=98))
     s_a = _joined(emit_op(op_a))
-    assert "cpu->A" in s_a
+    assert "cpu_read_a16" in s_a
 
 
 def test_pushreg_a_uses_m_flag_path():

@@ -90,6 +90,118 @@ static inline uint8 cpu_read_b(const CpuState *cpu) {
     return (uint8)((cpu->A >> 8) & 0xFF);
 }
 
+/* ── Typed register access ────────────────────────────────────────────────
+ *
+ * The 65816 accumulator/index registers carry semantic width via M/X
+ * flags. The hardware contracts:
+ *   - A (m=1):  ops touch only A.low; A.high (= B) is preserved.
+ *   - A (m=0):  ops touch full 16 bits.
+ *   - X/Y (x=1): ops touch only the low byte; the high byte is FORCED
+ *                to 0 on write (hw contract — distinct from A).
+ *   - X/Y (x=0): full 16-bit.
+ *
+ * Use the typed helpers below at every codegen site that reads or
+ * writes A/X/Y. The function name encodes the width explicitly:
+ *
+ *   cpu_read_a8 / a16 / x8 / x16 / y8 / y16     (bare-width readers)
+ *   cpu_write_a8 / a16 / x8 / x16 / y8 / y16    (bare-width writers)
+ *   cpu_read_a_m  / x_x  / y_x                   (M/X-flag dispatching reads)
+ *   cpu_write_a_m / x_x  / y_x                   (M/X-flag dispatching writes)
+ *
+ * Why typed helpers instead of raw `cpu->A`:
+ *   1. The READ TYPE forces the caller to think about width. A bare
+ *      `cpu->A` returns 16 bits even in M=1 contexts; the caller can
+ *      forget to mask, and the bug only surfaces when the high byte
+ *      happens to be non-zero (the SMW XBA stale-shadow class).
+ *   2. The WRITE semantics differ between A (preserve high) and X/Y
+ *      (zero high). Encoding it in the helper name removes the foot-gun
+ *      of a contributor copy-pasting the wrong shape.
+ *   3. M/X-flag dispatch lives in ONE place (the helper) rather than
+ *      inline at every emit site. If a future hardware nuance is
+ *      discovered, it lands in the helper and every site picks it up.
+ */
+
+/* ── A-register typed access ── */
+
+static inline uint8  cpu_read_a8(const CpuState *cpu) {
+    return (uint8)(cpu->A & 0xFF);
+}
+static inline uint16 cpu_read_a16(const CpuState *cpu) {
+    return cpu->A;
+}
+/* M-flag-driven read. Returns A.low zero-extended in m=1, full A in m=0.
+ * Matches what `LDA` would observe when reading the accumulator at the
+ * current width. */
+static inline uint16 cpu_read_a_m(const CpuState *cpu) {
+    return cpu->m_flag ? (uint16)cpu_read_a8(cpu) : cpu_read_a16(cpu);
+}
+
+/* 8-bit A write — preserve high byte (= B). 65816 hw contract: in M=1
+ * mode, ops on A leave the high half untouched (XBA / TDC observe the
+ * preserved value). Distinct from cpu_write_x8 which ZEROS the high. */
+static inline void cpu_write_a8(CpuState *cpu, uint8 v) {
+    cpu->A = (uint16)((cpu->A & 0xFF00) | (uint16)v);
+}
+static inline void cpu_write_a16(CpuState *cpu, uint16 v) {
+    cpu->A = v;
+}
+/* M-flag-driven write. 8-bit semantics in m=1 (preserve high), full
+ * 16-bit in m=0. Caller passes a 16-bit value; we mask in m=1. */
+static inline void cpu_write_a_m(CpuState *cpu, uint16 v) {
+    if (cpu->m_flag) cpu_write_a8(cpu, (uint8)(v & 0xFF));
+    else             cpu_write_a16(cpu, v);
+}
+
+/* ── X-register typed access ── */
+
+static inline uint8  cpu_read_x8(const CpuState *cpu) {
+    return (uint8)(cpu->X & 0xFF);
+}
+static inline uint16 cpu_read_x16(const CpuState *cpu) {
+    return cpu->X;
+}
+static inline uint16 cpu_read_x_x(const CpuState *cpu) {
+    return cpu->x_flag ? (uint16)cpu_read_x8(cpu) : cpu_read_x16(cpu);
+}
+
+/* 8-bit X write — ZEROS high byte (65816 hw contract for x=1). This is
+ * the critical difference vs cpu_write_a8 (which preserves high). The
+ * historical "8-bit X/Y zero-extend" bug class (snesrecomp 6o, b39e99b)
+ * happened because emitters treated X/Y like A and let stale high bytes
+ * leak through indexed reads. */
+static inline void cpu_write_x8(CpuState *cpu, uint8 v) {
+    cpu->X = (uint16)v;
+}
+static inline void cpu_write_x16(CpuState *cpu, uint16 v) {
+    cpu->X = v;
+}
+static inline void cpu_write_x_x(CpuState *cpu, uint16 v) {
+    if (cpu->x_flag) cpu_write_x8(cpu, (uint8)(v & 0xFF));
+    else             cpu_write_x16(cpu, v);
+}
+
+/* ── Y-register typed access (mirrors X) ── */
+
+static inline uint8  cpu_read_y8(const CpuState *cpu) {
+    return (uint8)(cpu->Y & 0xFF);
+}
+static inline uint16 cpu_read_y16(const CpuState *cpu) {
+    return cpu->Y;
+}
+static inline uint16 cpu_read_y_x(const CpuState *cpu) {
+    return cpu->x_flag ? (uint16)cpu_read_y8(cpu) : cpu_read_y16(cpu);
+}
+static inline void cpu_write_y8(CpuState *cpu, uint8 v) {
+    cpu->Y = (uint16)v;  /* x=1 zeros high */
+}
+static inline void cpu_write_y16(CpuState *cpu, uint16 v) {
+    cpu->Y = v;
+}
+static inline void cpu_write_y_x(CpuState *cpu, uint16 v) {
+    if (cpu->x_flag) cpu_write_y8(cpu, (uint8)(v & 0xFF));
+    else             cpu_write_y16(cpu, v);
+}
+
 /* P-bit positions (matches 65816 hardware). */
 #define CPU_P_C  0x01u  /* Carry */
 #define CPU_P_Z  0x02u  /* Zero */

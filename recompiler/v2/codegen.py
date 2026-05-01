@@ -208,40 +208,54 @@ def _emit_write(op: Write) -> List[str]:
 
 
 def _emit_readreg(op: ReadReg) -> List[str]:
+    """Emit a 16-bit read of A/X/Y/etc. For A, X, Y we route through
+    cpu_read_{a,x,y}16 helpers — same value, but the helper name carries
+    the hardware contract and the lint can spot bypass attempts. For
+    Reg.B the _REG_FIELD mapping returns the derived `(cpu->A >> 8)`
+    expression directly.
+
+    NOTE: This always emits a 16-bit uint. Callers that want 8-bit must
+    mask via widths.masked(). Width-aware callers (e.g. ALU, BIT, INC)
+    already do this at op-level. The 8-bit-direct helpers
+    (cpu_read_a8/x8/y8) exist for hand-written runtime code, not v2
+    codegen output."""
+    if op.reg == Reg.A:
+        return [f"uint16 {_v(op.out)} = cpu_read_a16(cpu);"]
+    if op.reg == Reg.X:
+        return [f"uint16 {_v(op.out)} = cpu_read_x16(cpu);"]
+    if op.reg == Reg.Y:
+        return [f"uint16 {_v(op.out)} = cpu_read_y16(cpu);"]
     return [f"uint16 {_v(op.out)} = (uint16){_reg(op.reg)};"]
 
 
 def _emit_writereg(op: WriteReg) -> List[str]:
-    # Width-respecting write into A / X / Y. The 65816 has different
-    # hardware semantics for A vs X/Y in 8-bit mode:
-    #
-    # A (m=1): preserve high byte. The "high byte" of A is the B
-    #   register and persists across SEP #$20 (TBA/TAB exists to swap).
-    #
-    # X/Y (x=1): hardware FORCES the high byte to 0. SEP #$10 zeros
-    #   X.high/Y.high at the flag-transition; subsequent 8-bit
-    #   register ops can't physically write to the high byte. Old
-    #   codegen "preserved" the high byte across 8-bit X/Y writes,
-    #   which is wrong: stale 16-bit residuals from before SEP #$10
-    #   leaked through and produced enormous indexed addresses (e.g.
-    #   LoadStripeImage's `LDY $12` at $00:85D2 inherited Y=$20XX
-    #   from a 16-bit caller, then `LDA $84D0,Y` read $00:A4D0
-    #   instead of $00:84D0 — wrong stripe pointer, NMI took 30k+
-    #   loop iterations per call). Fixed 2026-04-30.
-    field = _reg(op.reg)
+    """Width-respecting write into A / X / Y, routed through the typed
+    helpers in cpu_state.h. The helpers encapsulate the hardware
+    contract:
+
+    - cpu_write_a_m: in m=1, preserve A.high (= B). In m=0, full
+      16-bit replace. Callers don't have to remember the asymmetry
+      vs X/Y.
+
+    - cpu_write_x_x / cpu_write_y_x: in x=1, ZERO the high byte (hw
+      contract). In x=0, full 16-bit replace. The historical "8-bit
+      X/Y zero-extend" bug class (snesrecomp 6o, b39e99b) was
+      contributors copy-pasting the A shape onto X/Y and letting
+      stale 16-bit residuals leak through indexed reads. The helper
+      makes that copy-paste impossible — the hardware contract is
+      part of the function name.
+
+    Other registers (S, D, DB, PB, P) use direct field assignment;
+    they have a single canonical width.
+    """
     src = _v(op.src)
     if op.reg == Reg.A:
-        return [
-            f"if (cpu->m_flag) {{ {field} = {widths.preserve_high(field, src)}; }} "
-            f"else {{ {field} = (uint16)({src}); }}"
-        ]
-    if op.reg in (Reg.X, Reg.Y):
-        # 8-bit X/Y writes zero-extend; 16-bit writes use the full value.
-        return [
-            f"if (cpu->x_flag) {{ {field} = {widths.zero_extend_lo(src)}; }} "
-            f"else {{ {field} = (uint16)({src}); }}"
-        ]
-    return [f"{field} = {src};"]
+        return [f"cpu_write_a_m(cpu, (uint16)({src}));"]
+    if op.reg == Reg.X:
+        return [f"cpu_write_x_x(cpu, (uint16)({src}));"]
+    if op.reg == Reg.Y:
+        return [f"cpu_write_y_x(cpu, (uint16)({src}));"]
+    return [f"{_reg(op.reg)} = {src};"]
 
 
 def _emit_consti(op: ConstI) -> List[str]:

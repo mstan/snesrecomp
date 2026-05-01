@@ -139,6 +139,46 @@ static inline uint8 cpu_read_b(const CpuState *cpu) {
     return (uint8)((cpu->A >> 8) & 0xFF);
 }
 
+/* Typed register-access helpers — mirror the cpu_state.h definitions.
+ * Kept inline here so fuzz harnesses don't need to link cpu_state.c. */
+static inline uint8  cpu_read_a8(const CpuState *cpu)  { return (uint8)(cpu->A & 0xFF); }
+static inline uint16 cpu_read_a16(const CpuState *cpu) { return cpu->A; }
+static inline uint16 cpu_read_a_m(const CpuState *cpu) {
+    return cpu->m_flag ? (uint16)cpu_read_a8(cpu) : cpu_read_a16(cpu);
+}
+static inline void cpu_write_a8(CpuState *cpu, uint8 v) {
+    cpu->A = (uint16)((cpu->A & 0xFF00) | (uint16)v);
+}
+static inline void cpu_write_a16(CpuState *cpu, uint16 v) { cpu->A = v; }
+static inline void cpu_write_a_m(CpuState *cpu, uint16 v) {
+    if (cpu->m_flag) cpu_write_a8(cpu, (uint8)(v & 0xFF));
+    else             cpu_write_a16(cpu, v);
+}
+
+static inline uint8  cpu_read_x8(const CpuState *cpu)  { return (uint8)(cpu->X & 0xFF); }
+static inline uint16 cpu_read_x16(const CpuState *cpu) { return cpu->X; }
+static inline uint16 cpu_read_x_x(const CpuState *cpu) {
+    return cpu->x_flag ? (uint16)cpu_read_x8(cpu) : cpu_read_x16(cpu);
+}
+static inline void cpu_write_x8(CpuState *cpu, uint8 v)  { cpu->X = (uint16)v; }
+static inline void cpu_write_x16(CpuState *cpu, uint16 v) { cpu->X = v; }
+static inline void cpu_write_x_x(CpuState *cpu, uint16 v) {
+    if (cpu->x_flag) cpu_write_x8(cpu, (uint8)(v & 0xFF));
+    else             cpu_write_x16(cpu, v);
+}
+
+static inline uint8  cpu_read_y8(const CpuState *cpu)  { return (uint8)(cpu->Y & 0xFF); }
+static inline uint16 cpu_read_y16(const CpuState *cpu) { return cpu->Y; }
+static inline uint16 cpu_read_y_x(const CpuState *cpu) {
+    return cpu->x_flag ? (uint16)cpu_read_y8(cpu) : cpu_read_y16(cpu);
+}
+static inline void cpu_write_y8(CpuState *cpu, uint8 v)  { cpu->Y = (uint16)v; }
+static inline void cpu_write_y16(CpuState *cpu, uint16 v) { cpu->Y = v; }
+static inline void cpu_write_y_x(CpuState *cpu, uint16 v) {
+    if (cpu->x_flag) cpu_write_y8(cpu, (uint8)(v & 0xFF));
+    else             cpu_write_y16(cpu, v);
+}
+
 /* WRAM bank routing — same map as cpu_state.c::cpu_ram_offset. */
 static int cpu_ram_offset(uint8 bank, uint16 addr) {
     if (bank == 0x7E) return (int)addr;
