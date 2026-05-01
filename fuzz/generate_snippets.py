@@ -802,6 +802,343 @@ def compound_snippets():
         'rom_hex': bytes(rom).hex(),
         'touches_A': True, 'touches_X': False, 'touches_Y': False,
         'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'rotate_carry',
+    })
+
+    # ── DRY_REFACTOR.md Step 4 multi-insn snippets ──────────────────────
+    # Producer/consumer pairs the per-emitter shape tests can't catch.
+    # Each one stresses a specific carry/flag chain across emit boundaries.
+
+    # ── Shift carry chains ────────────────────────────────────────────
+    # ASL→ROL chain: shift A out bit-7 into C, then ROL B (or another A)
+    # to bring that C into bit-0. If shift width-mask was wrong (the
+    # 8f9369d class) the carry from ASL might be bit-15 instead of bit-7.
+    # 14. ASL A then ROL A: A=$80 → ASL → A=$00, C=1 → ROL → A=$01, C=0.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x80])
+    rom += bytes([0x0A])                 # ASL A → A=$00, C=1
+    rom += bytes([0x2A])                 # ROL A → A=$01, C=0
+    out.append({
+        'id': 'compound_ASL_then_ROL_carry_chain',
+        'opcode': 0x2A, 'mnem': 'ROL', 'mode': 'ACC',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'asl_then_rol',
+        'seed': {'A': 0x80, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'shift_carry_chain',
+    })
+
+    # 15. LSR A then ROR A: A=$01 → LSR → A=$00, C=1 → ROR → A=$80, C=0.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x01])
+    rom += bytes([0x4A])                 # LSR A → A=$00, C=1
+    rom += bytes([0x6A])                 # ROR A → A=$80, C=0
+    out.append({
+        'id': 'compound_LSR_then_ROR_carry_chain',
+        'opcode': 0x6A, 'mnem': 'ROR', 'mode': 'ACC',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'lsr_then_ror',
+        'seed': {'A': 0x01, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'shift_carry_chain',
+    })
+
+    # 16. 3-step shift chain ASL→ASL→ROL: A=$40 → $80 (C=0) → $00 (C=1)
+    #     → ROL → $01, C=0. Three boundary crossings.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x40])
+    rom += bytes([0x0A, 0x0A])           # ASL A; ASL A → A=$00, C=1
+    rom += bytes([0x2A])                 # ROL A → A=$01, C=0
+    out.append({
+        'id': 'compound_ASL_ASL_ROL_three_step',
+        'opcode': 0x2A, 'mnem': 'ROL', 'mode': 'ACC',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'asl_asl_rol',
+        'seed': {'A': 0x40, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'shift_carry_chain',
+    })
+
+    # 17. m=0 (16-bit A) shift chain: ASL→ROL with $8000.
+    #     A=$8000 → ASL → A=$0000, C=1 → ROL → A=$0001, C=0. Verifies
+    #     the 16-bit carry-bit is bit-15, not bit-7 (8f9369d's domain).
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xA2, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x00, 0x80])     # LDA #$8000 (16-bit)
+    rom += bytes([0x0A])                 # ASL A → A=$0000, C=1
+    rom += bytes([0x2A])                 # ROL A → A=$0001, C=0
+    out.append({
+        'id': 'compound_ASL_ROL_M0_16bit_carry',
+        'opcode': 0x2A, 'mnem': 'ROL', 'mode': 'ACC',
+        'm_flag': 0, 'x_flag': 0, 'seed_name': 'asl_rol_m0',
+        'seed': {'A': 0x8000, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'shift_carry_chain',
+    })
+
+    # ── BIT-then-branch ──────────────────────────────────────────────
+    # 18. BIT then BNE: BIT $0100 against $40 with A=$00 → A&mem = 0,
+    #     Z=1 → BNE NOT taken; epilogue's Z capture should read Z=1.
+    #     Tests that BIT's Z-from-(A AND mem) is correct after the
+    #     widths-layer mask fix to cpu->A.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x40, 0x8D, 0x00, 0x01])  # mem[$0100] = $40
+    rom += bytes([0xA9, 0x00])           # A = $00
+    rom += bytes([0x2C, 0x00, 0x01])     # BIT $0100 → A&mem = 0, Z=1
+    out.append({
+        'id': 'compound_BIT_then_BNE_zero_path',
+        'opcode': 0x2C, 'mnem': 'BIT', 'mode': 'ABS',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'bit_z_zero',
+        'seed': {'A': 0, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': True, 'writes_mem': True, '_compound': True,
+        'category': 'bit_branch',
+    })
+
+    # 19. BIT then BMI: bit-7 of mem set ($80) → N=1; subsequent BMI
+    #     would branch. The flag captures the post-BIT N flag.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x80, 0x8D, 0x00, 0x01])
+    rom += bytes([0xA9, 0xFF])
+    rom += bytes([0x2C, 0x00, 0x01])     # BIT $0100 → N=1 (mem bit 7)
+    out.append({
+        'id': 'compound_BIT_N_from_mem_bit7',
+        'opcode': 0x2C, 'mnem': 'BIT', 'mode': 'ABS',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'bit_n_set',
+        'seed': {'A': 0xFF, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': True, 'writes_mem': True, '_compound': True,
+        'category': 'bit_branch',
+    })
+
+    # 20. BIT-16: m=0, mem=$4000 — V comes from bit 14, not bit 6.
+    #     Tests overflow_bit(2) = $4000 selection in widths.py.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xA2, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x00, 0x40])     # LDA #$4000 (16-bit)
+    rom += bytes([0x8D, 0x00, 0x01])     # STA $0100 (writes 16-bit)
+    rom += bytes([0xA9, 0xFF, 0xFF])
+    rom += bytes([0x2C, 0x00, 0x01])     # BIT $0100 → V from bit 14 = $4000
+    out.append({
+        'id': 'compound_BIT_M0_V_from_bit14',
+        'opcode': 0x2C, 'mnem': 'BIT', 'mode': 'ABS',
+        'm_flag': 0, 'x_flag': 1, 'seed_name': 'bit_m0_v14',
+        'seed': {'A': 0xFFFF, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': True, 'writes_mem': True, '_compound': True,
+        'category': 'bit_branch',
+    })
+
+    # ── Mode boundary (SEP/REP regression class — 44c96a7) ────────────
+    # 21. SEP #$20 followed immediately by an ALU op. Old SEP/REP
+    #     codegen clobbered freshly-set _flag_Z by reading stale cpu->P.
+    #     This snippet: ADC sets Z=0 → SEP #$20 (no actual change) →
+    #     verify Z is still 0 in the epilogue capture.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x10])
+    rom += bytes([0x69, 0x20])           # ADC #$20 → A=$30, Z=0
+    rom += bytes([0xE2, 0x20])           # SEP #$20 (m already 1; no transition)
+    out.append({
+        'id': 'compound_ADC_then_SEP_preserves_Z',
+        'opcode': 0xE2, 'mnem': 'SEP', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'sep_after_alu',
+        'seed': {'A': 0x10, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'mode_boundary',
+    })
+
+    # 22. ALU sets Z=1, then SEP #$20, then BNE-not-taken path. If
+    #     SEP/REP clobbered Z back to 0, BNE would WRONGLY take.
+    #     A=$10 SBC #$10 (with C=1) → A=$00, Z=1.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0xB8])
+    rom += bytes([0x38])                 # SEC
+    rom += bytes([0xA9, 0x10])
+    rom += bytes([0xE9, 0x10])           # SBC #$10 → A=$00, Z=1
+    rom += bytes([0xE2, 0x20])           # SEP #$20 (must not clobber Z)
+    out.append({
+        'id': 'compound_SBC_zero_then_SEP_keeps_Z',
+        'opcode': 0xE2, 'mnem': 'SEP', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'sep_after_zero',
+        'seed': {'A': 0x10, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'mode_boundary',
+    })
+
+    # 23. REP→ALU→SEP→ALU (full mode-cycle). Verifies that mirror
+    #     state survives both transitions without clobber. m=0 ADC
+    #     produces Z=0, then SEP→m=1, then SBC consumes/produces flags.
+    rom = bytearray()
+    rom += bytes([0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xC2, 0x20])           # REP #$20 (A→16-bit)
+    rom += bytes([0xA9, 0x00, 0x10])     # LDA #$1000
+    rom += bytes([0x69, 0x00, 0x20])     # ADC #$2000 → A=$3000, Z=0
+    rom += bytes([0xE2, 0x20])           # SEP #$20 (A→8-bit)
+    rom += bytes([0xC9, 0x00])           # CMP #$00 against A.low=$00 → Z=1
+    out.append({
+        'id': 'compound_REP_ADC_SEP_CMP_full_cycle',
+        'opcode': 0xC9, 'mnem': 'CMP', 'mode': 'IMM',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'rep_alu_sep_alu',
+        'seed': {'A': 0x1000, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'mode_boundary',
+    })
+
+    # ── Transfer-then-flag ───────────────────────────────────────────
+    # 24. LDX #$80 then TXA: A.low becomes $80 → N=1 from the transferred
+    #     value (TXA sets N/Z from the new A's value). Catches a slip
+    #     where TXA's flag setting reads the wrong byte.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA2, 0x80])           # LDX #$80
+    rom += bytes([0x8A])                 # TXA → A=$80 (low), N=1
+    out.append({
+        'id': 'compound_LDX_TXA_negative',
+        'opcode': 0x8A, 'mnem': 'TXA', 'mode': 'IMP',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'txa_neg',
+        'seed': {'A': 0, 'X': 0x80, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'transfer_flag',
+    })
+
+    # 25. LDA #$00 then TAX: X=$00 → Z=1.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0xFF, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x00])
+    rom += bytes([0xAA])                 # TAX → X=$00, Z=1
+    out.append({
+        'id': 'compound_LDA_zero_TAX_zero_flag',
+        'opcode': 0xAA, 'mnem': 'TAX', 'mode': 'IMP',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'tax_zero',
+        'seed': {'A': 0, 'X': 0xFF, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': True, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'transfer_flag',
+    })
+
+    # 26. m=0 TXY: high byte of X copies to Y when both 16-bit.
+    #     Tests that Transfer width follows x_flag, not m_flag.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xA0, 0x00, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA2, 0x34, 0x12])     # LDX #$1234 (16-bit)
+    rom += bytes([0x9B])                 # TXY → Y=$1234, N=0, Z=0
+    out.append({
+        'id': 'compound_TXY_M0_X0_full_word',
+        'opcode': 0x9B, 'mnem': 'TXY', 'mode': 'IMP',
+        'm_flag': 0, 'x_flag': 0, 'seed_name': 'txy_full_word',
+        'seed': {'A': 0, 'X': 0x1234, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': True,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'transfer_flag',
+    })
+
+    # ── INC/DEC mem then branch ───────────────────────────────────────
+    # 27. INC dp from $FF → $00 → Z=1. Catches off-by-one in the Z
+    #     derivation in _emit_incmem.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0xFF, 0x85, 0x10])  # mem[$10] = $FF
+    rom += bytes([0xE6, 0x10])           # INC $10 → mem=$00, Z=1
+    out.append({
+        'id': 'compound_INC_dp_wraps_to_zero',
+        'opcode': 0xE6, 'mnem': 'INC', 'mode': 'DP',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'inc_to_zero',
+        'seed': {'A': 0xFF, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': True, 'writes_mem': True, '_compound': True,
+        'category': 'incdec_branch',
+    })
+
+    # 28. DEC dp from $01 → $00 → Z=1.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xE2, 0x30, 0xA2, 0x00, 0xA0, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x01, 0x85, 0x10])
+    rom += bytes([0xC6, 0x10])           # DEC $10 → mem=$00, Z=1
+    out.append({
+        'id': 'compound_DEC_dp_to_zero',
+        'opcode': 0xC6, 'mnem': 'DEC', 'mode': 'DP',
+        'm_flag': 1, 'x_flag': 1, 'seed_name': 'dec_to_zero',
+        'seed': {'A': 0x01, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': True, 'writes_mem': True, '_compound': True,
+        'category': 'incdec_branch',
+    })
+
+    # 29. m=0 INC abs from $FFFF → $0000 → Z=1. 16-bit wrap.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xA2, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0xFF, 0xFF, 0x8D, 0x00, 0x01])  # mem16[$0100] = $FFFF
+    rom += bytes([0xEE, 0x00, 0x01])     # INC $0100 → mem=$0000, Z=1
+    out.append({
+        'id': 'compound_INC_abs_M0_wraps_to_zero',
+        'opcode': 0xEE, 'mnem': 'INC', 'mode': 'ABS',
+        'm_flag': 0, 'x_flag': 1, 'seed_name': 'inc_m0_wrap',
+        'seed': {'A': 0xFFFF, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': True, 'writes_mem': True, '_compound': True,
+        'category': 'incdec_branch',
+    })
+
+    # ── m=0 ALU coverage (16-bit operand mask) ────────────────────────
+    # 30. CMP at m=0 with A=$1234 vs imm=$1234. Tests widths.masked(...,2)
+    #     produces $FFFF mask, not $FF.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xA2, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x34, 0x12])     # LDA #$1234
+    rom += bytes([0xC9, 0x34, 0x12])     # CMP #$1234 → Z=1, C=1
+    out.append({
+        'id': 'compound_CMP_M0_equal_16bit',
+        'opcode': 0xC9, 'mnem': 'CMP', 'mode': 'IMM',
+        'm_flag': 0, 'x_flag': 1, 'seed_name': 'cmp_m0_eq',
+        'seed': {'A': 0x1234, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': False, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'm0_alu',
+    })
+
+    # 31. ADC at m=0 with carry-out at bit-15. A=$8000 + $8000 = $0000,
+    #     C=1. Tests carry_bit($10000) selection.
+    rom = bytearray()
+    rom += bytes([0xC2, 0x30, 0xA2, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x18, 0xB8])
+    rom += bytes([0xA9, 0x00, 0x80])
+    rom += bytes([0x69, 0x00, 0x80])     # ADC #$8000 → A=$0000, C=1, Z=1, V=1
+    out.append({
+        'id': 'compound_ADC_M0_carry_at_bit15',
+        'opcode': 0x69, 'mnem': 'ADC', 'mode': 'IMM',
+        'm_flag': 0, 'x_flag': 1, 'seed_name': 'adc_m0_overflow',
+        'seed': {'A': 0x8000, 'X': 0, 'Y': 0},
+        'rom_hex': bytes(rom).hex(),
+        'touches_A': True, 'touches_X': False, 'touches_Y': False,
+        'reads_mem': False, 'writes_mem': False, '_compound': True,
+        'category': 'm0_alu',
     })
 
     return out
