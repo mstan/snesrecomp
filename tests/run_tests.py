@@ -56,11 +56,21 @@ TEST_MODULES = [
     'test_wram_addr_wrap',
     'test_flag_tracking',
     'test_rmw_hw_register_dispatch',
+    'test_emitter_mask_shape',
 ]
 
 
 def main() -> int:
     sys.path.insert(0, str(TESTS_DIR))
+    # Width-mask DRY lint runs first — load-bearing gate. Fast-fails the
+    # test loop if any new emitter slipped raw width literals past the
+    # widths.py chokepoint. Plan source: DRY_REFACTOR.md Step 3.
+    lint_path = REPO_ROOT / 'tools' / 'lint_codegen_widths.py'
+    if lint_path.exists():
+        rc = subprocess.call([sys.executable, str(lint_path)])
+        if rc != 0:
+            print('lint_codegen_widths failed — aborting test loop')
+            return rc
     passed = 0
     failed = 0
     fail_log = []

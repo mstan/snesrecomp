@@ -1,0 +1,190 @@
+"""Per-emitter mask-shape tests — DRY_REFACTOR.md Step 5.
+
+Each test asserts that an emitter routes its width-bound operands
+through `widths.masked` (i.e. the emitted C contains the canonical
+"& 0xFF" / "& 0xFFFF" pattern, with the right one for the IR width).
+
+Together with the lint at tools/lint_codegen_widths.py, this gives a
+pair of constraints that mechanically prevent the next sibling-class
+bug:
+  - lint says: no raw mask literals outside widths.py
+  - shape tests say: every emitter contains a mask of the expected
+    width
+
+Both must pass. Either failing means a future emitter forgot to mask,
+or worse, a prior emitter regressed.
+"""
+import pathlib
+import sys
+
+# Set up sys.path the same way run_tests.py does so v2.* imports work
+TESTS_DIR = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = TESTS_DIR.parent
+sys.path.insert(0, str(REPO_ROOT / 'recompiler'))
+
+from v2.codegen import (
+    _emit_alu, _emit_shift, _emit_bittest, _emit_setnz,
+    _emit_writereg, _emit_pullreg, _emit_transfer, _emit_increg,
+    _emit_pushreg,
+)
+from v2.ir import (
+    Alu, AluOp, Shift, ShiftOp, BitTest, SetNZ,
+    WriteReg, PullReg, Transfer, IncReg, PushReg,
+    Reg, Value,
+)
+
+
+def _v(vid):
+    return Value(vid=vid)
+
+
+def _join(lines):
+    return "\n".join(lines)
+
+
+# ── ALU width masks ─────────────────────────────────────────────────────
+
+def test_alu_cmp_8bit_masks_both_operands():
+    out = _join(_emit_alu(Alu(op=AluOp.CMP, lhs=_v(1), rhs=_v(2),
+                              width=1, out=None)))
+    assert "& 0xFF" in out, f"missing 8-bit mask on CMP operands:\n{out}"
+    assert "& 0xFFFF" not in out, f"unexpected 16-bit mask on CMP-8:\n{out}"
+
+
+def test_alu_cmp_16bit_uses_16bit_mask():
+    out = _join(_emit_alu(Alu(op=AluOp.CMP, lhs=_v(1), rhs=_v(2),
+                              width=2, out=None)))
+    assert "& 0xFFFF" in out, f"missing 16-bit mask on CMP-16:\n{out}"
+
+
+def test_alu_add_8bit_masks_carry_path():
+    out = _join(_emit_alu(Alu(op=AluOp.ADD, lhs=_v(1), rhs=_v(2),
+                              width=1, out=_v(3))))
+    # ADC needs both the operand mask AND the 8-bit carry-bit ($0x100).
+    assert "& 0xFF" in out, f"missing 8-bit mask on ADC operands:\n{out}"
+    assert "0x100" in out, f"missing 8-bit carry-bit constant:\n{out}"
+
+
+def test_alu_sub_16bit_uses_carry_bit_10000():
+    out = _join(_emit_alu(Alu(op=AluOp.SUB, lhs=_v(1), rhs=_v(2),
+                              width=2, out=_v(3))))
+    assert "0x10000" in out, f"missing 16-bit carry-bit constant:\n{out}"
+    assert "& 0xFFFF" in out, f"missing 16-bit operand mask:\n{out}"
+
+
+# ── Shift width masks ───────────────────────────────────────────────────
+
+def test_shift_lsr_8bit_masks_src():
+    out = _join(_emit_shift(Shift(op=ShiftOp.LSR, src=_v(1),
+                                  width=1, out=_v(2))))
+    assert "& 0xFF" in out, f"missing 8-bit mask on LSR src:\n{out}"
+
+
+def test_shift_asl_16bit_masks_src_for_carry():
+    out = _join(_emit_shift(Shift(op=ShiftOp.ASL, src=_v(1),
+                                  width=2, out=_v(2))))
+    # ASL-16 carry must read bit-15 of the masked 16-bit value.
+    assert "& 0xFFFF" in out, f"missing 16-bit mask on ASL src:\n{out}"
+    assert "0x8000" in out, f"missing 16-bit sign-bit:\n{out}"
+
+
+def test_shift_ror_8bit_uses_8bit_mask():
+    out = _join(_emit_shift(Shift(op=ShiftOp.ROR, src=_v(1),
+                                  width=1, out=_v(2))))
+    assert "& 0xFF" in out, f"missing 8-bit mask on ROR src:\n{out}"
+
+
+# ── BIT width masks (latent bug fixed by widths layer) ─────────────────
+
+def test_bit_8bit_masks_a_register():
+    out = _join(_emit_bittest(BitTest(operand=_v(1), width=1)))
+    # Pre-DRY: cpu->A & operand was un-masked, leaking B in m=1. The
+    # DRY layer routes through widths.masked so cpu->A is now masked
+    # to width=1.
+    assert "& 0xFF" in out, f"missing 8-bit mask on BIT operand:\n{out}"
+    assert "cpu->A" in out
+    # The cpu->A reference must be inside a width-masked expression,
+    # not a bare reference for the AND.
+    assert "cpu->A & " not in out.replace("cpu->A & 0xFF", ""), (
+        f"BIT must mask cpu->A through widths.masked, not bare AND:\n{out}")
+
+
+def test_bit_16bit_uses_overflow_4000():
+    out = _join(_emit_bittest(BitTest(operand=_v(1), width=2)))
+    assert "0x4000" in out, f"missing 16-bit V-flag bit on BIT-16:\n{out}"
+
+
+# ── SetNZ + Transfer + WriteReg ────────────────────────────────────────
+
+def test_setnz_8bit_masks_src():
+    out = _join(_emit_setnz(SetNZ(src=_v(1), width=1)))
+    assert "& 0xFF" in out, f"missing 8-bit mask on SetNZ-8:\n{out}"
+
+
+def test_setnz_emits_p_update():
+    """The DRY layer routes set_nz through cpu->P update, fixing the
+    asymmetry where some emitters skipped P sync."""
+    out = _join(_emit_setnz(SetNZ(src=_v(1), width=1)))
+    assert "cpu->P" in out, f"SetNZ must update cpu->P:\n{out}"
+
+
+def test_writereg_a_m1_preserves_high_via_helper():
+    """Verify A m=1 path uses preserve_high pattern (keep B, replace low)."""
+    out = _join(_emit_writereg(WriteReg(reg=Reg.A, src=_v(1))))
+    # Expected: when m_flag=1, ORs (cpu->A & 0xFF00) | (src & 0xFF)
+    assert "& 0xFF00" in out, f"A m=1 must preserve high byte:\n{out}"
+    assert "& 0xFF" in out, f"A m=1 must mask new low byte:\n{out}"
+
+
+def test_writereg_x_x1_zero_extends():
+    """Verify X x=1 zeros high byte (hw contract — fix b39e99b)."""
+    out = _join(_emit_writereg(WriteReg(reg=Reg.X, src=_v(1))))
+    # Should NOT preserve cpu->X high in the x=1 branch.
+    if "x_flag" in out:
+        x_branch = out.split("if (cpu->x_flag)")[1].split("else")[0]
+        assert "& 0xFF00" not in x_branch, (
+            f"X x=1 must zero-extend, not preserve high byte:\n{out}")
+        assert "& 0xFF" in x_branch, f"X x=1 must mask low byte:\n{out}"
+
+
+def test_increg_x_8bit_zero_extends():
+    """INX/DEX in x=1 mode: result must be zero-extended."""
+    out = _join(_emit_increg(IncReg(reg=Reg.X, delta=1)))
+    if "x_flag" in out:
+        x_branch = out.split("if (cpu->x_flag)")[1].split("} else")[0]
+        # x=1 branch should NOT preserve high byte.
+        assert "& 0xFF00" not in x_branch, (
+            f"INX x=1 must not preserve high — hw zeros it:\n{out}")
+
+
+def test_pullreg_a_m1_preserves_high():
+    out = _join(_emit_pullreg(PullReg(reg=Reg.A)))
+    if "m_flag" in out:
+        m_branch = out.split("if (cpu->m_flag)")[1].split("} else")[0]
+        assert "& 0xFF00" in m_branch, (
+            f"PLA m=1 must preserve A high (B):\n{out}")
+
+
+def test_pullreg_x_x1_zero_extends():
+    out = _join(_emit_pullreg(PullReg(reg=Reg.X)))
+    if "x_flag" in out:
+        x_branch = out.split("if (cpu->x_flag)")[1].split("} else")[0]
+        assert "& 0xFF00" not in x_branch, (
+            f"PLX x=1 must zero-extend high:\n{out}")
+
+
+def test_transfer_to_x_x1_zero_extends():
+    out = _join(_emit_transfer(Transfer(src=Reg.A, dst=Reg.X)))
+    if "x_flag" in out:
+        x_branch = out.split("if (cpu->x_flag)")[1].split("} else")[0]
+        assert "& 0xFF00" not in x_branch, (
+            f"TAX x=1 must zero-extend X.high:\n{out}")
+
+
+def test_pushreg_a_m1_pushes_low_byte_only():
+    out = _join(_emit_pushreg(PushReg(reg=Reg.A)))
+    if "m_flag" in out:
+        m_branch = out.split("if (cpu->m_flag)")[1].split("} else")[0]
+        # m=1 branch must use cpu_write8 + low-byte mask.
+        assert "cpu_write8" in m_branch, f"PHA m=1 must push 1 byte:\n{out}"
+        assert "& 0xFF" in m_branch, f"PHA m=1 must mask low byte:\n{out}"
