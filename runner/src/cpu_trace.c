@@ -7,10 +7,43 @@
 #include <stdio.h>
 #include <string.h>
 
-CpuTraceEvent g_cpu_trace_ring[CPU_TRACE_RING_LEN];
+#include <stdlib.h>
+
+CpuTraceEvent *g_cpu_trace_ring = (CpuTraceEvent *)0;
+uint64_t      g_cpu_trace_capacity = 0;   /* set by cpu_trace_init; pow2 */
 uint64_t      g_cpu_trace_idx = 0;
 CpuDbpbEvent  g_cpu_dbpb_ring[CPU_DBPB_RING_LEN];
 uint64_t      g_cpu_dbpb_idx = 0;
+
+/* Round v down to the nearest power of 2 (>= 1<<16). */
+static uint64_t round_pow2_down(uint64_t v) {
+    if (v == 0) return 0;
+    uint64_t p = 1;
+    while ((p << 1) && (p << 1) <= v) p <<= 1;
+    return p;
+}
+
+uint64_t cpu_trace_init(void) {
+    uint64_t cap = CPU_TRACE_RING_DEFAULT_ENTRIES;
+    const char *env = getenv("SNESRECOMP_CPU_TRACE_RING_ENTRIES");
+    if (env && *env) {
+        unsigned long long v = strtoull(env, NULL, 0);
+        if (v >= (1ULL << 16) && v <= (1ULL << 28)) cap = (uint64_t)v;
+    }
+    /* Ensure power-of-2 (so `& (cap - 1)` slot math is correct). */
+    cap = round_pow2_down(cap);
+    if (cap < (1ULL << 16)) cap = (1ULL << 16);
+    if (g_cpu_trace_ring) free(g_cpu_trace_ring);
+    g_cpu_trace_ring = (CpuTraceEvent *)calloc((size_t)cap, sizeof(CpuTraceEvent));
+    g_cpu_trace_capacity = g_cpu_trace_ring ? cap : 0;
+    g_cpu_trace_idx = 0;
+    fprintf(stderr,
+            "[cpu_trace] ring allocated: %llu entries (~%llu MB)%s\n",
+            (unsigned long long)g_cpu_trace_capacity,
+            (unsigned long long)((g_cpu_trace_capacity * sizeof(CpuTraceEvent)) >> 20),
+            g_cpu_trace_ring ? "" : " — ALLOC FAILED");
+    return g_cpu_trace_capacity;
+}
 uint8_t       g_db_watch_set = 0;
 uint32_t      g_db_watch_bits[8] = {0};
 ScopedTripwire g_scoped_tripwire = {0};
@@ -207,7 +240,7 @@ static void scoped_tripwire_collect_recent_context(uint64_t before_idx) {
     for (int i = 1; i <= scan && (got_block == 0 || got_func == 0); i++) {
         if ((uint64_t)i > before_idx) break;
         uint64_t abs_idx = before_idx - i;
-        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        int slot = (int)(abs_idx & (g_cpu_trace_capacity - 1));
         CpuTraceEvent *e = &g_cpu_trace_ring[slot];
         if (!got_block && e->event_type == CPU_TR_BLOCK) {
             g_scoped_tripwire.recent_block_pc24 = e->pc24;
@@ -300,7 +333,7 @@ static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
 
 static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                     uint8_t extra0, uint16_t extra1) {
-    int slot = (int)(g_cpu_trace_idx++ & (CPU_TRACE_RING_LEN - 1));
+    int slot = (int)(g_cpu_trace_idx++ & (g_cpu_trace_capacity - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
     e->native_func_id_or_hash = 0;  /* set separately by func_entry */
@@ -348,7 +381,7 @@ static uint32_t fnv1a(const char *s) {
 }
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
-    int slot = (int)(g_cpu_trace_idx++ & (CPU_TRACE_RING_LEN - 1));
+    int slot = (int)(g_cpu_trace_idx++ & (g_cpu_trace_capacity - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
     uint32_t h = name ? fnv1a(name) : 0;
@@ -765,7 +798,9 @@ void cpu_trace_arm_default_watches(void) {
 }
 
 void cpu_trace_clear(void) {
-    memset(g_cpu_trace_ring, 0, sizeof(g_cpu_trace_ring));
+    if (g_cpu_trace_ring && g_cpu_trace_capacity)
+        memset(g_cpu_trace_ring, 0,
+               (size_t)g_cpu_trace_capacity * sizeof(CpuTraceEvent));
     memset(g_cpu_dbpb_ring, 0, sizeof(g_cpu_dbpb_ring));
     g_cpu_trace_idx = 0;
     g_cpu_dbpb_idx = 0;
@@ -793,13 +828,13 @@ static const char *event_name(uint8_t et) {
 }
 
 void cpu_trace_dump_recent(const char *tag, int n) {
-    if (n > CPU_TRACE_RING_LEN) n = CPU_TRACE_RING_LEN;
+    if ((uint64_t)n > g_cpu_trace_capacity) n = (int)g_cpu_trace_capacity;
     if ((uint64_t)n > g_cpu_trace_idx) n = (int)g_cpu_trace_idx;
     fprintf(stderr, "=== %s — last %d trace events ===\n", tag ? tag : "trace", n);
     fprintf(stderr, "  (newest first)\n");
     for (int i = 0; i < n; i++) {
         uint64_t abs_idx = g_cpu_trace_idx - 1 - i;
-        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        int slot = (int)(abs_idx & (g_cpu_trace_capacity - 1));
         CpuTraceEvent *e = &g_cpu_trace_ring[slot];
         fprintf(stderr, "  [%-5s] PC=$%06X DB=%02X PB=%02X A=%04X X=%04X Y=%04X S=%04X "
                         "P=%02X m=%u x=%u",
@@ -836,8 +871,8 @@ void cpu_trace_dump_recent(const char *tag, int n) {
 }
 
 void cpu_trace_dump_wram(const char *tag, int scan_n) {
-    int total = (int)((g_cpu_trace_idx < CPU_TRACE_RING_LEN) ?
-                      g_cpu_trace_idx : CPU_TRACE_RING_LEN);
+    int total = (int)((g_cpu_trace_idx < g_cpu_trace_capacity) ?
+                      g_cpu_trace_idx : g_cpu_trace_capacity);
     if (scan_n <= 0 || scan_n > total) scan_n = total;
     fprintf(stderr, "=== %s — WRAM-WRITE events in last %d ring entries (newest first) ===\n",
             tag ? tag : "wram", scan_n);
@@ -847,7 +882,7 @@ void cpu_trace_dump_wram(const char *tag, int scan_n) {
     int wram_count = 0;
     for (int i = 0; i < scan_n && wram_count < 256; i++) {
         uint64_t abs_idx = g_cpu_trace_idx - 1 - (uint64_t)i;
-        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        int slot = (int)(abs_idx & (g_cpu_trace_capacity - 1));
         CpuTraceEvent *e = &g_cpu_trace_ring[slot];
         if (e->event_type != CPU_TR_WRAM_WRITE) continue;
         wram_count++;
@@ -866,7 +901,7 @@ void cpu_trace_dump_wram(const char *tag, int scan_n) {
         for (int j = 1; j <= 4096; j++) {
             uint64_t prev_abs = abs_idx - (uint64_t)j;
             if (prev_abs >= g_cpu_trace_idx) break;  /* underflow guard */
-            int prev_slot = (int)(prev_abs & (CPU_TRACE_RING_LEN - 1));
+            int prev_slot = (int)(prev_abs & (g_cpu_trace_capacity - 1));
             CpuTraceEvent *p = &g_cpu_trace_ring[prev_slot];
             if (p->event_type == CPU_TR_FUNC_ENTRY) {
                 fprintf(stderr, "  in func@$%06X hash=%08X",
@@ -878,7 +913,7 @@ void cpu_trace_dump_wram(const char *tag, int scan_n) {
         for (int j = 1; j <= 256; j++) {
             uint64_t prev_abs = abs_idx - (uint64_t)j;
             if (prev_abs >= g_cpu_trace_idx) break;
-            int prev_slot = (int)(prev_abs & (CPU_TRACE_RING_LEN - 1));
+            int prev_slot = (int)(prev_abs & (g_cpu_trace_capacity - 1));
             CpuTraceEvent *p = &g_cpu_trace_ring[prev_slot];
             if (p->event_type == CPU_TR_BLOCK) {
                 fprintf(stderr, "  block@$%06X", p->pc24);

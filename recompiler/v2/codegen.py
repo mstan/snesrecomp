@@ -496,15 +496,26 @@ def _emit_xce(op: XCE) -> List[str]:
 
 
 def _emit_xba(op: XBA) -> List[str]:
-    """XBA: exchange B and A. Always 8-bit byte swap regardless of m_flag.
-    Z/N are set from the new low byte (the value that was previously in B)."""
+    """XBA: exchange the high and low bytes of A. Always 8-bit byte swap
+    regardless of m_flag. Z/N are set from the new low byte (= old A.high).
+
+    Source the new low byte from cpu->A's CURRENT high byte directly.
+    The cpu->B shadow is NOT trustworthy here: every LDA-in-m=0 (and
+    other A-mutating ops) overwrites cpu->A's full 16 bits without
+    syncing cpu->B, so reading cpu->B as the new A.low produces a stale
+    byte. Real-world impact: the SMW stripe-image-count parse at
+    `LDA [_0],Y / XBA / AND #$3FFF / TAX` mis-derived the byte-count
+    when entering m=0 freshly, which corrupted the Layer-3 tilemap
+    upload (visible attract-demo border garbage).
+    """
     lines = [
         "{",
         f"  uint8 _lo = {widths.low_byte('cpu->A')};",
-        "  cpu->A = (uint16)((uint16)cpu->B | ((uint16)_lo << 8));",
-        f"  cpu->B = {widths.low_byte('(cpu->A >> 8)')};",  # B mirrors A high
+        f"  uint8 _hi = {widths.low_byte('(cpu->A >> 8)')};",
+        "  cpu->A = (uint16)((uint16)_hi | ((uint16)_lo << 8));",
+        "  cpu->B = _lo;",  # B mirrors NEW A.high (= old A.low)
     ]
-    # Z/N from new A.low (which is what was in B before the swap).
+    # Z/N from new A.low (which is what was in A.high before the swap).
     lines.extend(f"  {s}" for s in widths.set_nz_no_p(widths.masked("cpu->A", 1), 1))
     lines.append("}")
     return lines

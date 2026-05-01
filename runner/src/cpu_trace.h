@@ -84,19 +84,29 @@ typedef struct CpuDbpbEvent {
     uint16_t pad;
 } CpuDbpbEvent;
 
-/* Ring sizes: with always-on continuous capture there's no reason to
- * keep these tight. 1M main events @ ~32B/entry = ~32MB; fine on
- * modern hosts and big enough to hold the entire boot phase plus
- * many seconds of game state for backwards investigation, even at
- * high block rates. Keep DB/PB ring smaller because mutations are
- * rare. */
-#define CPU_TRACE_RING_LEN  (1024 * 1024)
+/* Ring sizes: with always-on continuous capture, "tight" sizing forces
+ * probes to attach quickly, which is the anti-pattern this project
+ * rejects. Default 16M main events (~512 MB at 32B/entry) holds
+ * ~16K frames at typical attract-demo block rates (~1000 events/frame)
+ * — covers ~4.5 minutes of continuous play. Override via
+ * SNESRECOMP_CPU_TRACE_RING_ENTRIES env (decimal, clamped to
+ * [1<<16, 1<<28]). Heap-allocated at cpu_trace_init() time so the BSS
+ * doesn't blow past the Windows PE 2 GB load ceiling. The DB/PB ring
+ * stays small (mutations are rare). */
+#define CPU_TRACE_RING_DEFAULT_ENTRIES (16ULL * 1024ULL * 1024ULL)
 #define CPU_DBPB_RING_LEN   1024
 
 #if SNESRECOMP_TRACE
 
-extern CpuTraceEvent g_cpu_trace_ring[CPU_TRACE_RING_LEN];
-extern uint64_t      g_cpu_trace_idx;     /* monotonic; modulo with LEN */
+/* Heap-allocated ring; pointer + capacity are mutable. The capacity is
+ * always a power of 2 (the modulo math relies on it) — alloc rounds
+ * down to the nearest power-of-2 if env asks for something non-pow2. */
+extern CpuTraceEvent *g_cpu_trace_ring;
+extern uint64_t       g_cpu_trace_capacity;  /* always pow2; mask = cap - 1 */
+extern uint64_t       g_cpu_trace_idx;       /* monotonic; modulo via mask */
+/* Initialise the ring (or re-allocate at a new capacity). Called once at
+ * startup from main; idempotent. Returns the chosen capacity. */
+uint64_t cpu_trace_init(void);
 extern CpuDbpbEvent  g_cpu_dbpb_ring[CPU_DBPB_RING_LEN];
 extern uint64_t      g_cpu_dbpb_idx;
 extern uint8_t       g_db_watch_set;       /* bitmask: bit N set => watch DB == N (256 bits packed in 32B) */

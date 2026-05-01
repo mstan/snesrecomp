@@ -284,11 +284,15 @@ extern "C" void s9x_write_hook_trampoline(uint32_t a, uint8_t b) {
  * dispatch. Fills the gap that recomp's symbolic tracker can only
  * provide A/X/Y/B — the hardware always knows the truth.
  *
- * Storage: ring of (frame, pc24, op, A, X, Y, S, D, DB, P_W, cycles)
- * = 24 bytes per entry × 1M = 24 MB. Suitable for ~10 seconds of
- * attract demo recording.
+ * Heap-allocated; capacity set by snes9x_bridge_insn_trace_alloc()
+ * from SNESRECOMP_EMU_INSN_RING_ENTRIES env (decimal, clamped
+ * [1<<16, 1<<28]). Default 64M entries × 24 bytes ≈ 1.5 GB, covering
+ * ~2000 frames at typical attract-demo rates. Static-arrayed at 1M
+ * (the previous default) covered ~100 frames, which forced "probe
+ * quickly" workflows after every relaunch — the anti-pattern this
+ * project rejects.
  */
-#define EMU_INSN_TRACE_SIZE (1u << 20)  /* 1M entries */
+#define EMU_INSN_TRACE_DEFAULT_ENTRIES (64u * 1024u * 1024u)
 
 struct emu_insn_entry {
     int32_t  frame;
@@ -307,7 +311,26 @@ struct emu_insn_entry {
 int               s_emu_insn_active = 0;
 uint64_t          s_emu_insn_write_idx = 0;
 uint64_t          s_emu_insn_count = 0;
-emu_insn_entry    s_emu_insn_trace[EMU_INSN_TRACE_SIZE];
+uint64_t          s_emu_insn_capacity = 0;
+emu_insn_entry   *s_emu_insn_trace = nullptr;
+
+/* Heap-allocate the oracle insn ring. Honors SNESRECOMP_EMU_INSN_RING_ENTRIES
+ * env override. Idempotent — second call frees + reallocs. Returns the
+ * chosen capacity so callers can log it. */
+extern "C" uint64_t snes9x_bridge_insn_trace_alloc(void) {
+    uint64_t cap = EMU_INSN_TRACE_DEFAULT_ENTRIES;
+    const char *env = getenv("SNESRECOMP_EMU_INSN_RING_ENTRIES");
+    if (env && *env) {
+        unsigned long long v = strtoull(env, NULL, 0);
+        if (v >= (1ULL << 16) && v <= (1ULL << 28)) cap = (uint64_t)v;
+    }
+    if (s_emu_insn_trace) free(s_emu_insn_trace);
+    s_emu_insn_trace = (emu_insn_entry *)calloc((size_t)cap, sizeof(emu_insn_entry));
+    s_emu_insn_capacity = s_emu_insn_trace ? cap : 0;
+    s_emu_insn_write_idx = 0;
+    s_emu_insn_count = 0;
+    return cap;
+}
 
 /* NMI counter — ticks every NMI dispatch. Useful for "how many NMIs
  * fired between block_idx X and Y" cadence comparisons. */
@@ -354,8 +377,9 @@ void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
             memcpy(s_emu_snap_ring[slot].wram_slice, Memory.RAM, EMU_SNAP_SLICE_LEN);
         }
     }
-    if (!s_emu_insn_active) return;
-    uint64_t idx = s_emu_insn_write_idx % EMU_INSN_TRACE_SIZE;
+    if (!s_emu_insn_active || !s_emu_insn_trace || s_emu_insn_capacity == 0)
+        return;
+    uint64_t idx = s_emu_insn_write_idx % s_emu_insn_capacity;
     auto &e = s_emu_insn_trace[idx];
     e.frame = (int32_t)s_watch_frame;
     e.pc24  = ((uint32_t)pb << 16) | pc;
@@ -369,7 +393,7 @@ void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
     e.p_w   = (uint16_t)Registers.P.W;
     e.cycles = CPU.Cycles;
     s_emu_insn_write_idx++;
-    if (s_emu_insn_count < EMU_INSN_TRACE_SIZE) s_emu_insn_count++;
+    if (s_emu_insn_count < s_emu_insn_capacity) s_emu_insn_count++;
 }
 
 void s9x_bridge_nmi_hook(void) {
@@ -430,6 +454,20 @@ int snes9x_bridge_init(const char *rom_path) {
     // record. emu_insn_trace_on / _off remain available for explicit
     // toggling, but the default is armed so any probe — including the
     // ring-driven differ — finds populated data the moment it attaches.
+    {
+        uint64_t cap = snes9x_bridge_insn_trace_alloc();
+        if (s_emu_insn_trace) {
+            fprintf(stderr,
+                "[snes9x] insn ring allocated: %llu entries (~%llu MB)\n",
+                (unsigned long long)cap,
+                (unsigned long long)((cap * sizeof(emu_insn_entry)) >> 20));
+        } else {
+            fprintf(stderr,
+                "[snes9x] WARNING: failed to allocate insn ring "
+                "(%llu entries); reduce SNESRECOMP_EMU_INSN_RING_ENTRIES\n",
+                (unsigned long long)cap);
+        }
+    }
     snes9x_bridge_insn_trace_on();
     fprintf(stderr, "[snes9x] always-on insn trace armed\n");
 
@@ -923,10 +961,11 @@ int snes9x_bridge_insn_trace_get(uint64_t i, int32_t *frame,
                                  uint8_t *db, uint16_t *a, uint16_t *x,
                                  uint16_t *y, uint16_t *s, uint16_t *d,
                                  uint16_t *p_w, int32_t *cycles) {
-    if (i >= s_emu_insn_count) return 0;
-    uint64_t start = (s_emu_insn_count < EMU_INSN_TRACE_SIZE) ? 0 :
-                     (s_emu_insn_write_idx - EMU_INSN_TRACE_SIZE);
-    uint64_t idx = (start + i) % EMU_INSN_TRACE_SIZE;
+    if (i >= s_emu_insn_count || !s_emu_insn_trace || s_emu_insn_capacity == 0)
+        return 0;
+    uint64_t start = (s_emu_insn_count < s_emu_insn_capacity) ? 0 :
+                     (s_emu_insn_write_idx - s_emu_insn_capacity);
+    uint64_t idx = (start + i) % s_emu_insn_capacity;
     auto &e = s_emu_insn_trace[idx];
     if (frame)  *frame  = e.frame;
     if (pc24)   *pc24   = e.pc24;

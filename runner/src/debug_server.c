@@ -709,11 +709,21 @@ uint16_t debug_wram_read_word(uint32_t addr) {
 // leaves it undefined; the ring and TCP commands are entirely absent
 // from the binary.
 #if SNESRECOMP_TIER4
-#define INSN_TRACE_LOG_SIZE 2097152
-static volatile int s_insn_trace_active = 0;
-static int s_insn_trace_write_idx = 0;
-static int s_insn_trace_count = 0;
-static struct {
+// Heap-allocated ring; capacity set at debug_server_init from
+// SNESRECOMP_INSN_RING_ENTRIES env (decimal, clamped [1<<16, 1<<28]).
+// Default 64M entries × 32 bytes ≈ 2 GB, covering ~2000 frames at
+// ~30K insns/frame typical attract-demo. Static-arrayed at 2M (the
+// previous default) hit the loader's 2 GB PE ceiling once the BSS
+// totals climbed past 1.85 GB; heap-allocate to stay below it.
+//
+// Always-on by default. Probes query backward in history; arming at
+// probe time loses any events that fired before the probe attached.
+// The trace_insn / trace_insn_reset commands remain available for
+// explicit pause/resume, but the default state is armed so
+// cmd_get_insn_trace finds populated data the moment a probe connects
+// (mirrors emu insn trace armed in snes9x_bridge_init).
+#define INSN_TRACE_DEFAULT_ENTRIES (64u * 1024u * 1024u)
+typedef struct {
     int      frame;
     uint64_t block_idx;
     uint32_t pc;
@@ -721,7 +731,32 @@ static struct {
     uint32_t a, x, y, b;     // RDB_REG_UNKNOWN (0xFFFFFFFF) when not pinned
     uint8_t  m_flag;         // 1 if 8-bit accumulator
     uint8_t  x_flag;         // 1 if 8-bit index
-} s_insn_trace[INSN_TRACE_LOG_SIZE];
+} InsnTraceEntry;
+
+static volatile int s_insn_trace_active = 1;
+static uint64_t s_insn_trace_write_idx = 0;
+static uint64_t s_insn_trace_count = 0;
+static uint64_t s_insn_trace_capacity = 0;
+static InsnTraceEntry *s_insn_trace = (InsnTraceEntry *)0;
+
+/* Heap-allocate the recomp insn ring. Honors SNESRECOMP_INSN_RING_ENTRIES
+ * env override (decimal entries; clamped to [1<<16, 1<<28]). Returns the
+ * chosen capacity so callers can log it. Idempotent — second call frees
+ * + reallocs. */
+static uint64_t insn_trace_alloc_ring(void) {
+    uint64_t cap = INSN_TRACE_DEFAULT_ENTRIES;
+    const char *env = getenv("SNESRECOMP_INSN_RING_ENTRIES");
+    if (env && *env) {
+        unsigned long long v = strtoull(env, NULL, 0);
+        if (v >= (1ULL << 16) && v <= (1ULL << 28)) cap = (uint64_t)v;
+    }
+    if (s_insn_trace) free(s_insn_trace);
+    s_insn_trace = (InsnTraceEntry *)calloc((size_t)cap, sizeof(InsnTraceEntry));
+    s_insn_trace_capacity = s_insn_trace ? cap : 0;
+    s_insn_trace_write_idx = 0;
+    s_insn_trace_count = 0;
+    return cap;
+}
 
 // Forward declaration: g_block_counter is defined below in the Tier 3
 // section but referenced here. Both live in this same TU so the
@@ -731,8 +766,9 @@ extern volatile uint64_t g_block_counter;
 void debug_on_insn_enter(uint32_t pc, uint32_t mnem_id,
                          uint32_t a, uint32_t x, uint32_t y, uint32_t b,
                          uint32_t mx_flags) {
-    if (!s_insn_trace_active) return;
-    int idx = s_insn_trace_write_idx % INSN_TRACE_LOG_SIZE;
+    if (!s_insn_trace_active || !s_insn_trace || s_insn_trace_capacity == 0)
+        return;
+    uint64_t idx = s_insn_trace_write_idx % s_insn_trace_capacity;
     s_insn_trace[idx].frame = snes_frame_counter;
     s_insn_trace[idx].block_idx = g_block_counter;
     s_insn_trace[idx].pc = pc;
@@ -744,7 +780,7 @@ void debug_on_insn_enter(uint32_t pc, uint32_t mnem_id,
     s_insn_trace[idx].m_flag = (uint8_t)((mx_flags >> 0) & 1);
     s_insn_trace[idx].x_flag = (uint8_t)((mx_flags >> 1) & 1);
     s_insn_trace_write_idx++;
-    if (s_insn_trace_count < INSN_TRACE_LOG_SIZE) s_insn_trace_count++;
+    if (s_insn_trace_count < s_insn_trace_capacity) s_insn_trace_count++;
 }
 #endif /* SNESRECOMP_TIER4 */
 
@@ -2574,7 +2610,8 @@ static void cmd_get_wram_read_trace(const char *args) {
 static void cmd_trace_insn(const char *args) {
     (void)args;
     s_insn_trace_active = 1;
-    send_fmt("{\"ok\":true,\"max_entries\":%d}", INSN_TRACE_LOG_SIZE);
+    send_fmt("{\"ok\":true,\"max_entries\":%llu}",
+             (unsigned long long)s_insn_trace_capacity);
 }
 
 static void cmd_trace_insn_reset(const char *args) {
@@ -2600,16 +2637,24 @@ static void cmd_get_insn_trace(const char *args) {
     if (max_emit < 1) max_emit = 1;
     if (max_emit > 4096) max_emit = 4096;
 
+    if (!s_insn_trace || s_insn_trace_capacity == 0) {
+        send_fmt("{\"ok\":true,\"total\":0,\"log\":[],\"emitted\":0,"
+                 "\"error\":\"insn ring not allocated\"}");
+        return;
+    }
     static char buf[262144];
-    int pos = snprintf(buf, sizeof(buf), "{\"ok\":true,\"total\":%d,\"log\":[",
-                       s_insn_trace_count);
-    int start = s_insn_trace_count < INSN_TRACE_LOG_SIZE ? 0 :
-                s_insn_trace_write_idx - INSN_TRACE_LOG_SIZE;
+    int pos = snprintf(buf, sizeof(buf),
+                       "{\"ok\":true,\"total\":%llu,\"capacity\":%llu,\"log\":[",
+                       (unsigned long long)s_insn_trace_count,
+                       (unsigned long long)s_insn_trace_capacity);
+    uint64_t start = (s_insn_trace_count < s_insn_trace_capacity)
+                         ? 0
+                         : (s_insn_trace_write_idx - s_insn_trace_capacity);
     int budget = (int)sizeof(buf) - 256;
     int emitted = 0;
     int first = 1;
-    for (int i = 0; i < s_insn_trace_count && pos < budget && emitted < max_emit; i++) {
-        int idx = (start + i) % INSN_TRACE_LOG_SIZE;
+    for (uint64_t i = 0; i < s_insn_trace_count && pos < budget && emitted < max_emit; i++) {
+        uint64_t idx = (start + i) % s_insn_trace_capacity;
         uint64_t bi = s_insn_trace[idx].block_idx;
         uint32_t pc = s_insn_trace[idx].pc;
         if (bi < from_bi || bi > to_bi) continue;
@@ -3898,11 +3943,11 @@ static void cmd_trace_get_v2(const char *args) {
     int emitted = 0;
     int seen_matching = 0;
     /* Bound scan distance to avoid crawling the whole 1M ring on bad filter. */
-    int max_scan = CPU_TRACE_RING_LEN;
+    int max_scan = g_cpu_trace_capacity;
     for (int i = 1; i <= max_scan && emitted < count; i++) {
         if ((uint64_t)i > end_idx) break;
         uint64_t abs_idx = end_idx - i;
-        int slot = (int)(abs_idx & (CPU_TRACE_RING_LEN - 1));
+        int slot = (int)(abs_idx & (g_cpu_trace_capacity - 1));
         CpuTraceEvent *e = &g_cpu_trace_ring[slot];
         /* Skip if filter mismatches. */
         if (event_filter >= 0 && e->event_type != (uint8_t)event_filter) continue;
@@ -4653,6 +4698,28 @@ int debug_server_init(int port) {
             fprintf(stderr,
                 "[debug_server] WARNING: failed to allocate VRAM rings "
                 "(%llu entries); reduce SNESRECOMP_VRAM_RING_ENTRIES.\n",
+                (unsigned long long)cap);
+        }
+    }
+#endif
+
+#if SNESRECOMP_TIER4
+    // Heap-allocate the recomp insn ring. Default 64M entries
+    // (~2 GB at 32 bytes each) covers ~2000 frames of attract demo at
+    // typical ~30K insns/frame. Override via SNESRECOMP_INSN_RING_ENTRIES
+    // (decimal entries, clamped [1<<16, 1<<28]).
+    {
+        uint64_t cap = insn_trace_alloc_ring();
+        if (s_insn_trace) {
+            fprintf(stderr,
+                "[debug_server] insn ring allocated: %llu entries "
+                "(~%llu MB)\n",
+                (unsigned long long)cap,
+                (unsigned long long)((cap * sizeof(InsnTraceEntry)) >> 20));
+        } else {
+            fprintf(stderr,
+                "[debug_server] WARNING: failed to allocate insn ring "
+                "(%llu entries); reduce SNESRECOMP_INSN_RING_ENTRIES.\n",
                 (unsigned long long)cap);
         }
     }
