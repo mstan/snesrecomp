@@ -238,9 +238,21 @@ def _emit_alu(op: Alu) -> List[str]:
         tname = f"_tc{op.lhs.vid}_{op.rhs.vid}"  # CMP: no out
 
     lines = []
+    # Operand mask. ReadReg always emits a uint16 read of cpu->A/X/Y,
+    # so when m_flag=1 (or x_flag=1) the LHS carries the stale HIGH
+    # byte from a prior 16-bit context. ADC/SBC/CMP compute carry/borrow
+    # from bit width*8, which only behaves correctly when the inputs
+    # are masked to the operation width. Without this mask, e.g. CMP
+    # with A=$FF25 vs $0A in 8-bit mode returns C=1 (because 0xff25 >=
+    # 0x0a), so BCC never takes and the dec-by-10 loop in HexToDec runs
+    # forever. AND/OR/XOR get the cast-to-_ctype masking via the OUT
+    # type so they don't need this. Fixed 2026-04-30.
+    op_mask = "0xFF" if op.width == 1 else "0xFFFF"
+    lhs_m = f"({_v(op.lhs)} & {op_mask})"
+    rhs_m = f"({_v(op.rhs)} & {op_mask})"
     if op.op == AluOp.ADD:
         lines.append(
-            f"uint32 {tname} = (uint32){_v(op.lhs)} + (uint32){_v(op.rhs)} + cpu->_flag_C;"
+            f"uint32 {tname} = (uint32){lhs_m} + (uint32){rhs_m} + cpu->_flag_C;"
         )
         if op.out is not None:
             lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)}){tname};")
@@ -251,12 +263,12 @@ def _emit_alu(op: Alu) -> List[str]:
         # operands (i.e., (lhs ^ result) & (rhs ^ result) & sign_bit).
         if op.out is not None:
             lines.append(
-                f"cpu->_flag_V = ((({_v(op.lhs)} ^ {_v(op.out)}) & "
-                f"({_v(op.rhs)} ^ {_v(op.out)}) & {sign}) != 0) ? 1 : 0;"
+                f"cpu->_flag_V = ((({lhs_m} ^ {_v(op.out)}) & "
+                f"({rhs_m} ^ {_v(op.out)}) & {sign}) != 0) ? 1 : 0;"
             )
     elif op.op == AluOp.SUB:
         lines.append(
-            f"uint32 {tname} = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)} - (1 - cpu->_flag_C);"
+            f"uint32 {tname} = (uint32){lhs_m} - (uint32){rhs_m} - (1 - cpu->_flag_C);"
         )
         if op.out is not None:
             lines.append(f"{_ctype(op.width)} {_v(op.out)} = ({_ctype(op.width)}){tname};")
@@ -267,8 +279,8 @@ def _emit_alu(op: Alu) -> List[str]:
         # result differs from sign of lhs (overflow into sign bit).
         if op.out is not None:
             lines.append(
-                f"cpu->_flag_V = ((({_v(op.lhs)} ^ {_v(op.rhs)}) & "
-                f"({_v(op.lhs)} ^ {_v(op.out)}) & {sign}) != 0) ? 1 : 0;"
+                f"cpu->_flag_V = ((({lhs_m} ^ {rhs_m}) & "
+                f"({lhs_m} ^ {_v(op.out)}) & {sign}) != 0) ? 1 : 0;"
             )
     elif op.op == AluOp.AND:
         lines.append(
@@ -287,10 +299,10 @@ def _emit_alu(op: Alu) -> List[str]:
         )
     elif op.op == AluOp.CMP:
         lines.append(
-            f"uint32 {tname} = (uint32){_v(op.lhs)} - (uint32){_v(op.rhs)};"
+            f"uint32 {tname} = (uint32){lhs_m} - (uint32){rhs_m};"
         )
         sign = "0x80" if op.width == 1 else "0x8000"
-        lines.append(f"cpu->_flag_C = ({_v(op.lhs)} >= {_v(op.rhs)}) ? 1 : 0;")
+        lines.append(f"cpu->_flag_C = ({lhs_m} >= {rhs_m}) ? 1 : 0;")
         lines.append(f"cpu->_flag_Z = (({_ctype(op.width)}){tname} == 0) ? 1 : 0;")
         lines.append(f"cpu->_flag_N = (({tname} & {sign}) != 0) ? 1 : 0;")
         return lines
