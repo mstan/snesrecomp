@@ -264,3 +264,70 @@ def test_call_with_pb_save_returns_six_statements():
     assert "MyFn_M1X1(cpu);" == env[3], f"stmt 4 must be the callee:\n{env[3]}"
     assert "CPU_TR_RTL" in env[4], f"stmt 5 must be RTL trace:\n{env[4]}"
     assert "cpu->PB = _saved_pb" in env[5], f"stmt 6 must restore PB:\n{env[5]}"
+
+
+# ── Stack helpers (Follow-up C) ─────────────────────────────────────────
+
+def test_push_byte_writes_then_decrements():
+    from v2.emitter_helpers import push_byte
+    env = push_byte("(uint8)cpu->A")
+    assert len(env) == 2
+    assert "cpu_write8" in env[0] and "cpu->S" in env[0]
+    assert "cpu->S - 1" in env[1]
+
+
+def test_push_word_decrements_writes_decrements():
+    from v2.emitter_helpers import push_word
+    env = push_word("cpu->A")
+    assert len(env) == 3
+    assert "cpu->S - 1" in env[0]
+    assert "cpu_write16" in env[1]
+    assert "cpu->S - 1" in env[2]
+
+
+def test_pop_byte_increments_then_reads():
+    from v2.emitter_helpers import pop_byte_assign
+    env = pop_byte_assign("uint8 _v")
+    assert len(env) == 2
+    assert "cpu->S + 1" in env[0]
+    assert "cpu_read8" in env[1] and "uint8 _v =" in env[1]
+
+
+def test_pop_word_increments_reads_increments():
+    from v2.emitter_helpers import pop_word_assign
+    env = pop_word_assign("cpu->A")
+    assert len(env) == 3
+    assert "cpu->S + 1" in env[0]
+    assert "cpu_read16" in env[1]
+    assert "cpu->S + 1" in env[2]
+
+
+# ── REP/SEP P-mirror sync (Follow-up D) ─────────────────────────────────
+
+def test_rep_modify_p_via_mirrors_clears_bits():
+    from v2.emitter_helpers import modify_p_via_mirrors
+    env = modify_p_via_mirrors(0x30, "rep")
+    assert len(env) == 5
+    text = "\n".join(env)
+    assert "_old_p = cpu->P" in env[0]
+    assert "cpu_mirrors_to_p" in env[1]
+    assert "& ~0x30" in env[2]                   # AND-NOT mask
+    assert "cpu_p_to_mirrors" in env[3]
+    assert "/*REP*/" in env[4] and "cpu_trace_px_record" in env[4]
+
+
+def test_sep_modify_p_via_mirrors_sets_bits():
+    from v2.emitter_helpers import modify_p_via_mirrors
+    env = modify_p_via_mirrors(0x20, "sep")
+    text = "\n".join(env)
+    assert "| 0x20" in env[2]                    # OR mask
+    assert "/*SEP*/" in env[4]
+
+
+def test_modify_p_via_mirrors_rejects_bad_kind():
+    from v2.emitter_helpers import modify_p_via_mirrors
+    try:
+        modify_p_via_mirrors(0x10, "xor")
+    except ValueError:
+        return
+    assert False, "modify_p_via_mirrors must reject non-rep/sep kinds"

@@ -69,6 +69,13 @@ PATTERNS = [
     # emitter_helpers.call_with_pb_save should write that.
     (r'_saved_pb\s*=\s*cpu->PB',
      "ad-hoc JSL bank save/restore — use emitter_helpers.call_with_pb_save"),
+    # Note on Follow-up D: the canonical REP/SEP P-mirror envelope
+    # lives in emitter_helpers.modify_p_via_mirrors. We do NOT lint
+    # for the `cpu->P = (uint8)(cpu->P [&|]` shape because
+    # _emit_setflag legitimately uses the same single-flag-update
+    # form without the mirror sync. The shape test in
+    # tests/test_emitter_mask_shape.py validates the helper's output
+    # directly; that's the gate.
 ]
 
 

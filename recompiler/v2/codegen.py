@@ -472,31 +472,14 @@ def _emit_setnz(op) -> List[str]:
 
 
 def _emit_repflags(op: RepFlags) -> List[str]:
-    # IMPORTANT: sync mirrors → P BEFORE modifying P. Many ALU ops update
-    # _flag_Z/N/V/C without resyncing cpu->P, so cpu->P can be stale at
-    # this point. If we modify P directly and then call cpu_p_to_mirrors,
-    # the stale P-bits clobber freshly-set mirrors. Concrete bug:
-    # DEC.W $8D updates _flag_Z=1; the trailing SEP #$20 then ran
-    # cpu_p_to_mirrors which read P-bit 1 (still 0) and overwrote
-    # _flag_Z back to 0, making BNE always loop. Fixed 2026-04-30.
-    return [
-        "{ uint8 _old_p = cpu->P;",
-        "  cpu_mirrors_to_p(cpu);",
-        f"  cpu->P = (uint8)(cpu->P & ~{op.mask:#04x});",
-        "  cpu_p_to_mirrors(cpu);",
-        "  cpu_trace_px_record(cpu, 0, 0 /*REP*/, _old_p, cpu->P); }",
-    ]
+    # mirrors_to_p BEFORE modifying P (44c96a7) — see emitter_helpers.
+    return ["{"] + [f"  {s}" for s in
+                    emitter_helpers.modify_p_via_mirrors(op.mask, "rep")] + ["}"]
 
 
 def _emit_sepflags(op: SepFlags) -> List[str]:
-    # See _emit_repflags for rationale on the pre-sync.
-    return [
-        "{ uint8 _old_p = cpu->P;",
-        "  cpu_mirrors_to_p(cpu);",
-        f"  cpu->P = (uint8)(cpu->P | {op.mask:#04x});",
-        "  cpu_p_to_mirrors(cpu);",
-        "  cpu_trace_px_record(cpu, 0, 1 /*SEP*/, _old_p, cpu->P); }",
-    ]
+    return ["{"] + [f"  {s}" for s in
+                    emitter_helpers.modify_p_via_mirrors(op.mask, "sep")] + ["}"]
 
 
 def _emit_xce(op: XCE) -> List[str]:
@@ -529,134 +512,94 @@ def _emit_xba(op: XBA) -> List[str]:
 
 def _emit_pushreg(op: PushReg) -> List[str]:
     field = _reg(op.reg)
-    # Push is 1 or 2 bytes depending on register; for now treat A/B/X/Y/D as
-    # following m/x widths and S/DB/PB as 1-byte. P is 1 byte. D is 16-bit.
+    # Push width: A/X/Y follow m/x_flag at runtime; D is always 16-bit;
+    # P/DB/PB are always 1 byte.
     if op.reg == Reg.P:
-        # PHP itself doesn't change P, but record it so the snapshot's
-        # P-mutation ring shows context (what P was pushed).
+        # PHP also records the P-mutation ring snapshot.
         return [
             "cpu_mirrors_to_p(cpu);",
-            f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
-            "cpu->S = (uint16)(cpu->S - 1);",
-            f"cpu_trace_event(cpu, 0, CPU_TR_PHP, cpu->P, 0);",
-            f"cpu_trace_px_record(cpu, 0, 4 /*PHP*/, cpu->P, cpu->P);",
+            *emitter_helpers.push_byte(f"(uint8)({field})"),
+            "cpu_trace_event(cpu, 0, CPU_TR_PHP, cpu->P, 0);",
+            "cpu_trace_px_record(cpu, 0, 4 /*PHP*/, cpu->P, cpu->P);",
         ]
     if op.reg == Reg.DB:
-        return [
-            f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
-            "cpu->S = (uint16)(cpu->S - 1);",
-            f"cpu_trace_event(cpu, 0, CPU_TR_PHB, cpu->DB, cpu->DB);",
+        return emitter_helpers.push_byte(f"(uint8)({field})") + [
+            "cpu_trace_event(cpu, 0, CPU_TR_PHB, cpu->DB, cpu->DB);",
         ]
     if op.reg == Reg.PB:
-        # PHK pushes the program-bank K. Critical hook: a stale PB here
-        # is the suspected root cause of bogus DB after PLB.
-        return [
-            f"cpu_write8(cpu, 0x00, cpu->S, (uint8)({field}));",
-            "cpu->S = (uint16)(cpu->S - 1);",
-            f"cpu_trace_event(cpu, 0, CPU_TR_PHK, cpu->PB, cpu->PB);",
+        # PHK pushes the program-bank K. Stale PB here is the suspected
+        # root cause of bogus DB after PLB.
+        return emitter_helpers.push_byte(f"(uint8)({field})") + [
+            "cpu_trace_event(cpu, 0, CPU_TR_PHK, cpu->PB, cpu->PB);",
         ]
     if op.reg == Reg.D:
-        return [
-            f"cpu->S = (uint16)(cpu->S - 1);",
-            f"cpu_write16(cpu, 0x00, cpu->S, {field});",
-            f"cpu->S = (uint16)(cpu->S - 1);",
-        ]
-    # A/B/X/Y: width depends on M/X flag at runtime.
+        return emitter_helpers.push_word(field)
+    # A/X/Y: width depends on M/X flag at runtime.
     if op.reg == Reg.A:
-        return [
-            "if (cpu->m_flag) {",
-            f"  cpu_write8(cpu, 0x00, cpu->S, {widths.low_byte(field)});",
-            "  cpu->S = (uint16)(cpu->S - 1);",
-            "} else {",
-            "  cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write16(cpu, 0x00, cpu->S, {field});",
-            "  cpu->S = (uint16)(cpu->S - 1);",
-            "}",
-        ]
+        return ["if (cpu->m_flag) {",
+                *(f"  {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
+                "} else {",
+                *(f"  {s}" for s in emitter_helpers.push_word(field)),
+                "}"]
     if op.reg in (Reg.X, Reg.Y):
-        return [
-            "if (cpu->x_flag) {",
-            f"  cpu_write8(cpu, 0x00, cpu->S, {widths.low_byte(field)});",
-            "  cpu->S = (uint16)(cpu->S - 1);",
-            "} else {",
-            "  cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write16(cpu, 0x00, cpu->S, {field});",
-            "  cpu->S = (uint16)(cpu->S - 1);",
-            "}",
-        ]
+        return ["if (cpu->x_flag) {",
+                *(f"  {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
+                "} else {",
+                *(f"  {s}" for s in emitter_helpers.push_word(field)),
+                "}"]
     return [f"/* TODO PushReg({op.reg}) */"]
 
 
 def _emit_pullreg(op: PullReg) -> List[str]:
     field = _reg(op.reg)
     if op.reg == Reg.P:
-        return [
-            "{ uint8 _old_p = cpu->P;",
-            "  cpu->S = (uint16)(cpu->S + 1);",
-            f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
-            "  cpu_p_to_mirrors(cpu);",
-            f"  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P);",
-            "  cpu_trace_px_record(cpu, 0, 2 /*PLP*/, _old_p, cpu->P); }",
-        ]
+        return ["{ uint8 _old_p = cpu->P;",
+                *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
+                "  cpu_p_to_mirrors(cpu);",
+                "  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P);",
+                "  cpu_trace_px_record(cpu, 0, 2 /*PLP*/, _old_p, cpu->P); }"]
     if op.reg == Reg.DB:
         # PLB sets N/Z from popped value.
-        return ([
-            "{ uint8 _old_db = cpu->DB;",
-            "  cpu->S = (uint16)(cpu->S + 1);",
-            f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
-        ] + [f"  {s}" for s in widths.set_nz(field, 1)] + [
-            f"  cpu_trace_db_change(cpu, 0, _old_db, cpu->DB, CPU_TR_PLB); }}",
-        ])
+        return ["{ uint8 _old_db = cpu->DB;",
+                *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
+                *(f"  {s}" for s in widths.set_nz(field, 1)),
+                "  cpu_trace_db_change(cpu, 0, _old_db, cpu->DB, CPU_TR_PLB); }"]
     if op.reg == Reg.PB:
-        # PLK doesn't exist on the 65816, but the IR currently routes
-        # any PullReg(PB) here. Emit symmetric tracing for safety.
-        return ([
-            "{ uint8 _old_pb = cpu->PB;",
-            "  cpu->S = (uint16)(cpu->S + 1);",
-            f"  {field} = cpu_read8(cpu, 0x00, cpu->S);",
-        ] + [f"  {s}" for s in widths.set_nz(field, 1)] + [
-            f"  cpu_trace_pb_change(cpu, 0, _old_pb, cpu->PB, CPU_TR_PB_WRITE); }}",
-        ])
+        # PLK doesn't exist on the 65816 but IR routes any PullReg(PB) here.
+        return ["{ uint8 _old_pb = cpu->PB;",
+                *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
+                *(f"  {s}" for s in widths.set_nz(field, 1)),
+                "  cpu_trace_pb_change(cpu, 0, _old_pb, cpu->PB, CPU_TR_PB_WRITE); }"]
     if op.reg == Reg.D:
         # PLD: 16-bit, sets N/Z from popped 16-bit value.
-        return [
-            "cpu->S = (uint16)(cpu->S + 1);",
-            f"{field} = cpu_read16(cpu, 0x00, cpu->S);",
-            "cpu->S = (uint16)(cpu->S + 1);",
-        ] + widths.set_nz(field, 2)
+        return emitter_helpers.pop_word_assign(field) + widths.set_nz(field, 2)
+    # Final cpu->P sync line — both A and X/Y end with the same packed-flag update.
+    p_sync = ("cpu->P = (uint8)((cpu->P & ~0x82) | "
+              "(cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));")
     if op.reg == Reg.A:
         # PLA: width follows M. Preserve B (high byte) in m=1.
         lines = ["if (cpu->m_flag) {",
-                 "  cpu->S = (uint16)(cpu->S + 1);",
-                 "  uint8 _v = cpu_read8(cpu, 0x00, cpu->S);",
-                 f"  {field} = {widths.preserve_high(field, '_v')};"]
-        lines.extend(f"  {s}" for s in widths.set_nz_no_p("_v", 1))
-        lines.append("} else {")
-        lines.append("  cpu->S = (uint16)(cpu->S + 1);")
-        lines.append(f"  {field} = cpu_read16(cpu, 0x00, cpu->S);")
-        lines.append("  cpu->S = (uint16)(cpu->S + 1);")
-        lines.extend(f"  {s}" for s in widths.set_nz_no_p(field, 2))
-        lines.append("}")
-        # Final cpu->P sync covers both branches.
-        lines.append("cpu->P = (uint8)((cpu->P & ~0x82) | "
-                     "(cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));")
+                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
+                 f"  {field} = {widths.preserve_high(field, '_v')};",
+                 *(f"  {s}" for s in widths.set_nz_no_p("_v", 1)),
+                 "} else {",
+                 *(f"  {s}" for s in emitter_helpers.pop_word_assign(field)),
+                 *(f"  {s}" for s in widths.set_nz_no_p(field, 2)),
+                 "}",
+                 p_sync]
         return lines
     if op.reg in (Reg.X, Reg.Y):
         # PLX/PLY: x=1 zero-extends (hw contract).
         lines = ["if (cpu->x_flag) {",
-                 "  cpu->S = (uint16)(cpu->S + 1);",
-                 "  uint8 _v = cpu_read8(cpu, 0x00, cpu->S);",
+                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
                  f"  {field} = {widths.zero_extend_lo('_v')};"
-                 f"  /* x=1 zeros high byte (hw contract) */"]
-        lines.extend(f"  {s}" for s in widths.set_nz_no_p("_v", 1))
-        lines.append("} else {")
-        lines.append("  cpu->S = (uint16)(cpu->S + 1);")
-        lines.append(f"  {field} = cpu_read16(cpu, 0x00, cpu->S);")
-        lines.append("  cpu->S = (uint16)(cpu->S + 1);")
-        lines.extend(f"  {s}" for s in widths.set_nz_no_p(field, 2))
-        lines.append("}")
-        lines.append("cpu->P = (uint8)((cpu->P & ~0x82) | "
-                     "(cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));")
+                 f"  /* x=1 zeros high byte (hw contract) */",
+                 *(f"  {s}" for s in widths.set_nz_no_p("_v", 1)),
+                 "} else {",
+                 *(f"  {s}" for s in emitter_helpers.pop_word_assign(field)),
+                 *(f"  {s}" for s in widths.set_nz_no_p(field, 2)),
+                 "}",
+                 p_sync]
         return lines
     return [f"/* TODO PullReg({op.reg}) */"]
 
@@ -883,28 +826,14 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
 
 def _emit_push(op: Push) -> List[str]:
     if op.width == 1:
-        return [
-            f"cpu_write8(cpu, 0x00, cpu->S, (uint8){_v(op.src)});",
-            "cpu->S = (uint16)(cpu->S - 1);",
-        ]
-    return [
-        "cpu->S = (uint16)(cpu->S - 1);",
-        f"cpu_write16(cpu, 0x00, cpu->S, {_v(op.src)});",
-        "cpu->S = (uint16)(cpu->S - 1);",
-    ]
+        return emitter_helpers.push_byte(f"(uint8){_v(op.src)}")
+    return emitter_helpers.push_word(_v(op.src))
 
 
 def _emit_pull(op: Pull) -> List[str]:
     if op.width == 1:
-        return [
-            "cpu->S = (uint16)(cpu->S + 1);",
-            f"uint8 {_v(op.out)} = cpu_read8(cpu, 0x00, cpu->S);",
-        ]
-    return [
-        "cpu->S = (uint16)(cpu->S + 1);",
-        f"uint16 {_v(op.out)} = cpu_read16(cpu, 0x00, cpu->S);",
-        "cpu->S = (uint16)(cpu->S + 1);",
-    ]
+        return emitter_helpers.pop_byte_assign(f"uint8 {_v(op.out)}")
+    return emitter_helpers.pop_word_assign(f"uint16 {_v(op.out)}")
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
