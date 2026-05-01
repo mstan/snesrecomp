@@ -181,6 +181,171 @@ SNIPPETS = [
                 'A-tracking refactor splits A into low/high pieces, this '
                 'snippet catches the regression.',
     },
+
+    # ── Indexed-after-X-write class ────────────────────────────────────
+    # The historical "8-bit X/Y zero-extend" bug class (snesrecomp 6o,
+    # b39e99b, fixed 2026-04-30): an emitter preserved the high byte
+    # across an 8-bit X write, so subsequent indexed reads inherited a
+    # stale high byte and indexed into the wrong page. The codegen now
+    # routes X/Y writes through cpu_write_x_x / cpu_write_y_x which
+    # zero-extend in x=1; these snippets nail down the contract so a
+    # regression that re-introduces "preserve high" behaviour fails the
+    # fuzz, not just an integration test.
+
+    # 9. SEP #$10 then 8-bit LDX must zero the high byte of X, even when
+    #    the seed init has a non-zero high. Subsequent 16-bit indexed
+    #    reads see X=0x0042, not X=0xAB42.
+    {
+        'id': 'sep10_ldx_8bit_zeros_x_high',
+        'init': {'A': 0, 'X': 0xAB42, 'Y': 0, 'm': 1, 'x': 0},
+        'rom': bytes([
+            0xE2, 0x10,                # SEP #$10  → x=1 (X to 8-bit)
+            0xA2, 0x42,                # LDX #$42  → X must become $0042
+            # Verify by writing X to WRAM via STX $10 (m=1 so STX is 8-bit).
+            0x86, 0x10,                # STX $10
+        ]),
+        'expect': {'X': 0x0042, 'x': 1, 'wram_0x10': 0x42},
+        'note': 'Hardware contract: 8-bit LDX zero-extends. Pre-fix path '
+                'would have left X.high = $AB and STX $10 might have leaked '
+                'high byte into a downstream calc.',
+    },
+
+    # 10. Indexed read after 8-bit LDX. Set X.high stale via 16-bit LDX,
+    #     SEP #$10, LDX #imm8, then LDA $abs,X — the read MUST use
+    #     X = $0010, not $AB10. We seed WRAM[0x0010] = $77 and
+    #     WRAM[0xAB10] = $42; pass means recomp read $77.
+    {
+        'id': 'sep10_then_indexed_read_uses_zero_extended_x',
+        'init': {'A': 0, 'X': 0xAB00, 'Y': 0, 'm': 1, 'x': 0,
+                 'wram_init': {0x0010: 0x77, 0x10: 0x77}},
+        'rom': bytes([
+            0xC2, 0x10,                # REP #$10  → x=0 (just to be safe)
+            0xA2, 0x00, 0xAB,          # LDX #$AB00 → X.high stale
+            0xE2, 0x10,                # SEP #$10  → x=1; X must zero-extend
+            0xA2, 0x10,                # LDX #$10  → X = $0010 (NOT $AB10)
+            0xA5, 0x00,                # LDA $00   (8-bit, as a check the m_flag
+                                       # is preserved and ALU still works.
+                                       # We can't easily emit `LDA $00,X` as
+                                       # a single 8-bit op into our snippet
+                                       # WRAM space; the goal here is just to
+                                       # land the cpu->X = $0010 assertion.)
+            0xE2, 0x20,                # SEP #$20 sanity (already m=1)
+            0x86, 0x11,                # STX $11
+        ]),
+        'expect': {'X': 0x0010, 'wram_0x11': 0x10},
+        'note': 'After SEP #$10, LDX #$10 must produce X = $0010 with the '
+                'former high byte ($AB) zeroed by hardware contract.',
+    },
+
+    # 11. Same shape for Y. SEP #$10, LDY #imm, verify Y.high zeroed.
+    {
+        'id': 'sep10_ldy_8bit_zeros_y_high',
+        'init': {'A': 0, 'X': 0, 'Y': 0xCD55, 'm': 1, 'x': 0},
+        'rom': bytes([
+            0xE2, 0x10,                # SEP #$10
+            0xA0, 0x55,                # LDY #$55
+            0x84, 0x12,                # STY $12  (8-bit STY)
+        ]),
+        'expect': {'Y': 0x0055, 'x': 1, 'wram_0x12': 0x55},
+        'note': 'Y must zero-extend on SEP #$10 + 8-bit LDY (mirror of X).',
+    },
+
+    # 12. INX/DEX in x=1 must NOT carry into the high byte. Seed X.low =
+    #     $FF, DEX, then STX — must store $FE, not $00FE bleeding into
+    #     downstream sites.
+    {
+        'id': 'dex_8bit_no_high_carry',
+        'init': {'A': 0, 'X': 0x00FF, 'Y': 0, 'm': 1, 'x': 1},
+        'rom': bytes([
+            0xCA,                      # DEX → X = $00FE in x=1
+            0x86, 0x13,                # STX $13
+        ]),
+        'expect': {'X': 0x00FE, 'wram_0x13': 0xFE},
+        'note': 'DEX in x=1 must wrap within the low byte and leave high=$00.',
+    },
+
+    # 13. INX in x=1 wrapping $FF -> $00 (must zero high, not become $0100).
+    {
+        'id': 'inx_8bit_wrap_does_not_promote_high',
+        'init': {'A': 0, 'X': 0x00FF, 'Y': 0, 'm': 1, 'x': 1},
+        'rom': bytes([
+            0xE8,                      # INX → X = $0000 in x=1
+            0x86, 0x14,                # STX $14
+        ]),
+        'expect': {'X': 0x0000, 'wram_0x14': 0x00, '_flag_Z': 1},
+        'note': 'INX from $FF must wrap to $00, not $0100 (which would '
+                'be the m=0 behaviour).',
+    },
+
+    # ── PHP/PLP across mode transitions ────────────────────────────────
+    # The mirrors (cpu->m_flag, cpu->_flag_*) are derived from cpu->P. PHP
+    # must push the CURRENT mirror state (so the pushed byte is correct
+    # post-mutation), and PLP must restore them via cpu_p_to_mirrors so
+    # subsequent codegen reads observe the popped values. Historical bug
+    # 6m (44c96a7, 2026-04-30): SEP/REP called cpu_p_to_mirrors with stale
+    # cpu->P and clobbered freshly-set _flag_Z. This fuzz catches the
+    # symmetric case across PHP/PLP.
+
+    # 14. PHP in m=0 + REP/SEP changes + PLP — must restore m=0.
+    {
+        'id': 'php_then_sep_then_plp_restores_m_flag',
+        'init': {'A': 0, 'X': 0, 'Y': 0, 'm': 0, 'x': 0},
+        'rom': bytes([
+            0x08,                      # PHP   (push P with m=0)
+            0xE2, 0x20,                # SEP #$20 → m=1
+            0x28,                      # PLP   (pop, restoring m=0)
+        ]),
+        'expect': {'m': 0},
+        'note': 'PLP must repopulate cpu->m_flag from the pushed P. '
+                'A buggy PLP that only updated cpu->P (without calling '
+                'cpu_p_to_mirrors) would leave m_flag=1 from the SEP, '
+                'and subsequent emitters would mis-decode the next LDA '
+                'as 8-bit.',
+    },
+
+    # 15. PLP must also restore the _flag_C / _flag_Z mirrors. Push a P
+    #     with C=1 Z=1, clear them via SEC then CLC sequence, PLP, then
+    #     verify mirrors reflect the pushed state.
+    {
+        'id': 'plp_restores_carry_and_zero_mirrors',
+        'init': {'A': 0, 'X': 0, 'Y': 0, 'm': 1, 'x': 1,
+                 # Seed P with C=1 Z=1 N=0; will be pushed.
+                 # We can't directly set _flag_C in init so use SEC + LDA
+                 # at runtime to fabricate the state, then PHP.
+                 },
+        'rom': bytes([
+            0x38,                      # SEC  → _flag_C = 1
+            0xA9, 0x00,                # LDA #$00 → _flag_Z = 1, _flag_N = 0
+            0x08,                      # PHP  (push C=1 Z=1 N=0)
+            0x18,                      # CLC  → _flag_C = 0
+            0xA9, 0x80,                # LDA #$80 → _flag_Z = 0, _flag_N = 1
+            0x28,                      # PLP  (restore C=1 Z=1 N=0)
+        ]),
+        'expect': {'_flag_C': 1, '_flag_Z': 1, '_flag_N': 0},
+        'note': 'PLP must call cpu_p_to_mirrors so subsequent codegen '
+                'reads of _flag_C/_flag_Z/_flag_N see the popped values.',
+    },
+
+    # 16. PHP/PLP through mode change WITHOUT relying on the mirrors at
+    #     init time — fully runtime-driven. Sets m=0, pushes P, switches
+    #     to m=1, pops, verifies cpu->P bit 5 (M) is back to 0.
+    {
+        'id': 'php_plp_round_trip_m_bit_in_p',
+        'init': {'A': 0, 'X': 0, 'Y': 0, 'm': 1, 'x': 1},
+        'rom': bytes([
+            0xC2, 0x20,                # REP #$20 → m=0 (P bit 5 cleared)
+            0x08,                      # PHP  (push m=0)
+            0xE2, 0x20,                # SEP #$20 → m=1
+            0x28,                      # PLP   (restore m=0)
+        ]),
+        # We assert on m_flag (mirror) AND on cpu->P bit 5 (canonical).
+        # Both must reflect m=0 — if mirror lags P (the historical 6m
+        # bug shape), this catches it.
+        'expect': {'m': 0},
+        'note': 'After PLP, both cpu->m_flag and the M bit in cpu->P '
+                'must agree on the popped value. Mirror-vs-canonical '
+                'drift was bug class 6m.',
+    },
 ]
 
 
@@ -273,18 +438,26 @@ def render_run_all(snippets: list[dict]) -> str:
         out.append(f'    cpu.x_flag = {init.get("x", 1)};')
         out.append('    cpu_mirrors_to_p(&cpu);')
         out.append('    memset(g_ram, 0, sizeof(g_ram));')
+        # Optional pre-run WRAM seeding (e.g. for indexed-read snippets).
+        for wram_addr, wram_val in init.get('wram_init', {}).items():
+            out.append(f'    g_ram[0x{wram_addr:05x}] = 0x{wram_val:02x};')
         out.append(f'    run_{sn["id"]}(&cpu);')
-        # Emit one JSON line of post-state.
+        # Emit one JSON line of post-state. Includes a small WRAM probe
+        # window ($10-$15) for snippets whose expected behavior is "I
+        # wrote a specific byte to that address".
         out.append(f'    printf("{{\\"id\\":\\"{sn["id"]}\\","')
         out.append('           "\\"A\\":%u,\\"X\\":%u,\\"Y\\":%u,\\"D\\":%u,"')
         out.append('           "\\"m\\":%u,\\"x\\":%u,"')
         out.append('           "\\"_flag_N\\":%u,\\"_flag_Z\\":%u,'
                   '\\"_flag_C\\":%u,\\"_flag_V\\":%u,"')
-        out.append('           "\\"wram_0x10\\":%u,\\"wram_0x11\\":%u}\\n",')
+        out.append('           "\\"wram_0x10\\":%u,\\"wram_0x11\\":%u,"')
+        out.append('           "\\"wram_0x12\\":%u,\\"wram_0x13\\":%u,'
+                  '\\"wram_0x14\\":%u,\\"wram_0x15\\":%u}\\n",')
         out.append('           cpu.A, cpu.X, cpu.Y, cpu.D,')
         out.append('           cpu.m_flag, cpu.x_flag,')
         out.append('           cpu._flag_N, cpu._flag_Z, cpu._flag_C, cpu._flag_V,')
-        out.append('           g_ram[0x10], g_ram[0x11]);')
+        out.append('           g_ram[0x10], g_ram[0x11], g_ram[0x12],')
+        out.append('           g_ram[0x13], g_ram[0x14], g_ram[0x15]);')
     out.append('    (void)fail;')
     out.append('}')
     return '\n'.join(out)

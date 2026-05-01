@@ -74,11 +74,18 @@ def compile_c_to_exe(src: str, *,
     exe_path = work_dir / exe_name
     src_path.write_text(src, encoding='utf-8')
 
+    # vcvars64 invokes vswhere.exe; ensure its location is on PATH even
+    # when cmd.exe is launched from environments (e.g. Git Bash) that
+    # strip the default Windows PATH entries.
     bat_path = work_dir / 'build.bat'
     bat_path.write_text(
         f'@echo off\n'
+        f'set "PATH=C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer;'
+        f'C:\\Windows\\System32;C:\\Windows;%PATH%"\n'
         f'call "{_vcvars_path()}" >NUL\n'
-        f'cl {extra_cl_flags} /Fe:"{exe_path}" "{src_path}" >NUL\n'
+        # cl outputs object/exe info to stdout; we want stderr too for
+        # diagnostics on failure. Don't suppress.
+        f'cl {extra_cl_flags} /Fe:"{exe_path}" "{src_path}"\n'
         f'exit /b %ERRORLEVEL%\n',
         encoding='utf-8',
     )

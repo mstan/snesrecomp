@@ -216,4 +216,12 @@ static void cpu_trace_event(CpuState *cpu, uint32 a, uint8 b, uint8 c, uint16 d)
 static void cpu_trace_px_record(CpuState *cpu, uint32 a, uint8 b, uint8 c, uint8 d) {
     (void)cpu; (void)a; (void)b; (void)c; (void)d;
 }
+
+/* CPU_TR_* enum values referenced by some emits (PHP/PLP/PHB/PHK
+ * push/pull tracking). Mirrored from cpu_trace.h; values must match. */
+#define CPU_TR_BLOCK      0
+#define CPU_TR_PHB        1
+#define CPU_TR_PHK        3
+#define CPU_TR_PLP        4
+#define CPU_TR_PHP        5
 """
