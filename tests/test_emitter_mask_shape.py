@@ -131,22 +131,23 @@ def test_setnz_emits_p_update():
 
 
 def test_writereg_a_m1_preserves_high_via_helper():
-    """Verify A m=1 path uses preserve_high pattern (keep B, replace low)."""
+    """A writes route through cpu_write_a_m, which encapsulates the
+    M-flag-driven dispatch (preserve high in m=1, full replace in m=0).
+    The shape was previously open-coded as `if (cpu->m_flag) { cpu->A
+    = (cpu->A & 0xFF00) | (src & 0xFF); } else ...`; commit 1162626
+    moved that into the helper. Now the contract is the helper name."""
     out = _join(_emit_writereg(WriteReg(reg=Reg.A, src=_v(1))))
-    # Expected: when m_flag=1, ORs (cpu->A & 0xFF00) | (src & 0xFF)
-    assert "& 0xFF00" in out, f"A m=1 must preserve high byte:\n{out}"
-    assert "& 0xFF" in out, f"A m=1 must mask new low byte:\n{out}"
+    assert "cpu_write_a_m" in out, (
+        f"A writes must go through cpu_write_a_m helper:\n{out}")
 
 
 def test_writereg_x_x1_zero_extends():
-    """Verify X x=1 zeros high byte (hw contract — fix b39e99b)."""
+    """X writes route through cpu_write_x_x — the helper handles the
+    x=1 zero-extend hw contract (fix b39e99b) without each emit site
+    having to remember it."""
     out = _join(_emit_writereg(WriteReg(reg=Reg.X, src=_v(1))))
-    # Should NOT preserve cpu->X high in the x=1 branch.
-    if "x_flag" in out:
-        x_branch = out.split("if (cpu->x_flag)")[1].split("else")[0]
-        assert "& 0xFF00" not in x_branch, (
-            f"X x=1 must zero-extend, not preserve high byte:\n{out}")
-        assert "& 0xFF" in x_branch, f"X x=1 must mask low byte:\n{out}"
+    assert "cpu_write_x_x" in out, (
+        f"X writes must go through cpu_write_x_x helper:\n{out}")
 
 
 def test_increg_x_8bit_zero_extends():
