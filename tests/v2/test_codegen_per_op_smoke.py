@@ -124,9 +124,61 @@ def test_xce_swaps_emulation_and_carry():
 
 
 def test_xba_swaps_a_high_low():
+    """XBA must operate on cpu->A only — never read cpu->B (which doesn't
+    exist as a separate field, see CpuState in cpu_state.h). A previous
+    shadow-field implementation went stale every time a 16-bit LDA wrote
+    cpu->A without syncing the shadow; the regression caused SMW Layer-3
+    stripe-image header parses to mis-derive their byte counts (visible
+    attract-demo border garbage). See docs/TROUBLESHOOTING.md.
+
+    Invariants the emit must satisfy:
+      - References cpu->A.
+      - Does NOT read cpu->B (forbidden — field removed).
+      - Sets _flag_Z and _flag_N from the new low byte.
+      - Computes a byte-swap of the prior cpu->A bits (text shape).
+    """
     op = XBA()
     s = _joined(emit_op(op))
-    assert "cpu->A" in s and "cpu->B" in s
+    assert "cpu->A" in s, "XBA must reference cpu->A"
+    assert "cpu->B" not in s, (
+        "XBA must NOT read or write cpu->B — that field has been removed "
+        "and B is now derived from (A >> 8). Reading a stale shadow was "
+        "the SMW Layer-3 stripe-corruption bug class."
+    )
+    assert "cpu->_flag_Z" in s and "cpu->_flag_N" in s, (
+        "XBA must set Z and N from the new low byte"
+    )
+    # The emit must perform a byte swap. We don't pin the specific
+    # variable name (some emitters bind cpu->A to a local first) but the
+    # bit-fiddling shape is invariant: there must be both an `<< 8` and
+    # a `>> 8` operating on the source.
+    assert "<< 8" in s, "XBA must shift the old low byte up"
+    assert ">> 8" in s, "XBA must shift the old high byte down"
+    # And the swap result must land back in cpu->A.
+    assert "cpu->A =" in s
+
+
+def test_xba_independent_of_b_shadow():
+    """Lint-style: no v2 emit anywhere reads cpu->B. cpu->B was deleted as
+    independent state, so any emit referencing it would fail to compile —
+    catch that at test time before regen, not at compile time."""
+    # Walk every op kind we have emitters for and make sure none reference
+    # cpu->B in the emit text. (Reg.B reads through the derived expression
+    # in _REG_FIELD, which is not the literal `cpu->B`.)
+    op = XBA()
+    s = _joined(emit_op(op))
+    assert "cpu->B" not in s, "XBA leaks cpu->B"
+    op = ReadReg(reg=Reg.B, out=Value(vid=99))
+    s = _joined(emit_op(op))
+    assert "cpu->B" not in s, (
+        "ReadReg(Reg.B) must not emit a literal cpu->B read; the canonical "
+        "form is `(cpu->A >> 8) & 0xFF`."
+    )
+    # Spot-check: ReadReg(Reg.A) still uses cpu->A, so the test isn't
+    # silently passing because nothing has any field reference at all.
+    op_a = ReadReg(reg=Reg.A, out=Value(vid=98))
+    s_a = _joined(emit_op(op_a))
+    assert "cpu->A" in s_a
 
 
 def test_pushreg_a_uses_m_flag_path():

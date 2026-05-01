@@ -33,10 +33,17 @@ extern "C" {
 typedef struct CpuState {
     /* Accumulator and index registers. Stored as 16-bit always; the
      * M / X flags govern semantic width when codegen reads/writes them.
-     * (M=1 -> only the low byte of A is "live"; the high byte lives in
-     * the B field below.) */
+     * In M=1 mode only the low byte is semantically live, but the high
+     * byte is preserved verbatim across 8-bit ops — it's still part of
+     * the 16-bit accumulator and surfaces under XBA / TDC / PHA-16.
+     *
+     * NOTE: there is no separate `B` field. The byte the 65816 calls B
+     * is by definition `(A >> 8) & 0xFF`. A previous shadow `B` field
+     * went stale on every 16-bit LDA and produced silent XBA bugs
+     * (Layer-3 stripe corruption — see TROUBLESHOOTING.md). Reads of
+     * "B" route through the cpu_read_b() helper below or `(A >> 8)`
+     * inline; nothing ever writes B as separate state. */
     uint16 A;
-    uint8  B;       /* B half of the 16-bit accumulator pair (XBA-swappable). */
     uint16 X;
     uint16 Y;
 
@@ -73,6 +80,15 @@ typedef struct CpuState {
      * / PB-relative addressing all resolve through the cpu_ helpers. */
     uint8 *ram;
 } CpuState;
+
+/* Read the B byte of the 16-bit accumulator. Always equals the high
+ * byte of A; provided as a helper so call sites read intent rather
+ * than reaching into A bits directly. There is no `cpu_write_b` — the
+ * way to "write B" on real hardware is XBA (or TCD/TDC), and those
+ * route through full-A arithmetic. */
+static inline uint8 cpu_read_b(const CpuState *cpu) {
+    return (uint8)((cpu->A >> 8) & 0xFF);
+}
 
 /* P-bit positions (matches 65816 hardware). */
 #define CPU_P_C  0x01u  /* Carry */

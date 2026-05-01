@@ -3644,7 +3644,7 @@ static void cmd_get_v2_cpu(const char *args) {
              "\"main_cycles\":%llu,\"catchup_calls\":%llu,\"catchup_cycles\":%llu,"
              "\"spc_pc\":\"0x%04x\",\"timer0_ticks\":%llu,"
              "\"timer0_target\":%d,\"timer0_div\":%d,\"timer0_cnt\":%d,\"timer0_en\":%d}",
-             g_cpu.A, g_cpu.B, g_cpu.X, g_cpu.Y,
+             g_cpu.A, cpu_read_b(&g_cpu), g_cpu.X, g_cpu.Y,
              g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB,
              g_cpu.P, g_cpu.m_flag, g_cpu.x_flag, g_cpu.emulation,
              g_cpu._flag_N, g_cpu._flag_V, g_cpu._flag_Z, g_cpu._flag_C,

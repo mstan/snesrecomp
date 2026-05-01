@@ -152,7 +152,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
 
 void cpu_state_init(CpuState *cpu, uint8 *ram) {
     cpu->A = 0;
-    cpu->B = 0;
+    /* No cpu->B init — B is derived from (A >> 8) and has no separate state. */
     cpu->X = 0;
     cpu->Y = 0;
     cpu->S = 0x01FF;

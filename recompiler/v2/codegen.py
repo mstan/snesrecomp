@@ -115,8 +115,16 @@ def _ctype(width: int) -> str:
 
 
 # Reg → CpuState field expression.
+#
+# Reg.B is intentionally a DERIVED expression, not a struct field. The 65816
+# B register is the high byte of the 16-bit accumulator and ALWAYS equals
+# `(A >> 8) & 0xFF`. Earlier versions had a `cpu->B` shadow field; that
+# field went stale every time a 16-bit LDA wrote `cpu->A` without syncing
+# the shadow, and XBA-after-LDA-in-m=0 swapped in stale bytes (SMW
+# Layer-3 stripe corruption, fixed in commit 6c04c94, then removed
+# entirely in this commit).
 _REG_FIELD = {
-    Reg.A: "cpu->A", Reg.B: "cpu->B",
+    Reg.A: "cpu->A", Reg.B: "((uint8)((cpu->A >> 8) & 0xFF))",
     Reg.X: "cpu->X", Reg.Y: "cpu->Y",
     Reg.S: "cpu->S", Reg.D: "cpu->D",
     Reg.DB: "cpu->DB", Reg.PB: "cpu->PB",
@@ -496,29 +504,30 @@ def _emit_xce(op: XCE) -> List[str]:
 
 
 def _emit_xba(op: XBA) -> List[str]:
-    """XBA: exchange the high and low bytes of A. Always 8-bit byte swap
-    regardless of m_flag. Z/N are set from the new low byte (= old A.high).
+    """XBA: exchange the high and low bytes of the 16-bit accumulator.
+    Always 8-bit byte swap regardless of m_flag.
 
-    Source the new low byte from cpu->A's CURRENT high byte directly.
-    The cpu->B shadow is NOT trustworthy here: every LDA-in-m=0 (and
-    other A-mutating ops) overwrites cpu->A's full 16 bits without
-    syncing cpu->B, so reading cpu->B as the new A.low produces a stale
-    byte. Real-world impact: the SMW stripe-image-count parse at
-    `LDA [_0],Y / XBA / AND #$3FFF / TAX` mis-derived the byte-count
-    when entering m=0 freshly, which corrupted the Layer-3 tilemap
-    upload (visible attract-demo border garbage).
+    Operates ENTIRELY on cpu->A — there is no separate B shadow field
+    to keep in sync. The byte the 65816 calls "B" is just the high byte
+    of A; it changes whenever any operation mutates A's high half (LDA
+    in m=0, TCD/TDC pair manipulation, etc.). A separate `cpu->B` shadow
+    invited stale-read bugs (the SMW stripe-image header parse used
+    `LDA [_0],Y / XBA / AND #$3FFF / TAX`, and a stale shadow made it
+    mis-derive the byte-count — visible as Layer-3 attract-demo
+    scramble). The shadow has been removed; XBA must not reintroduce
+    a dependency on it.
+
+    Z/N flags are set from the new A.low byte (= old A.high), per the
+    65816 manual.
     """
-    lines = [
+    return [
         "{",
-        f"  uint8 _lo = {widths.low_byte('cpu->A')};",
-        f"  uint8 _hi = {widths.low_byte('(cpu->A >> 8)')};",
-        "  cpu->A = (uint16)((uint16)_hi | ((uint16)_lo << 8));",
-        "  cpu->B = _lo;",  # B mirrors NEW A.high (= old A.low)
+        "  uint16 _old = cpu->A;",
+        "  cpu->A = (uint16)(((_old & 0xFF) << 8) | ((_old >> 8) & 0xFF));",
+        "  cpu->_flag_Z = ((cpu->A & 0xFF) == 0) ? 1 : 0;",
+        "  cpu->_flag_N = ((cpu->A & 0x80) != 0) ? 1 : 0;",
+        "}",
     ]
-    # Z/N from new A.low (which is what was in A.high before the swap).
-    lines.extend(f"  {s}" for s in widths.set_nz_no_p(widths.masked("cpu->A", 1), 1))
-    lines.append("}")
-    return lines
 
 
 def _emit_pushreg(op: PushReg) -> List[str]:
