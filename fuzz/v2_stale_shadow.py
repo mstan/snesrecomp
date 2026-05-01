@@ -15,15 +15,15 @@ and the test stays self-contained (no snes9x oracle dependency).
 
 Workflow:
 
-    1. For each snippet, decode its rom_hex with v2.decoder, lower with
-       v2.lowering, emit C body via v2.codegen.emit_op.
-    2. Wrap the emitted body in a tiny C harness that:
-         - allocates a CpuState,
-         - seeds A/X/Y/M/X-flag/D from snippet['init'],
-         - calls the emitted body,
-         - prints the final CpuState as JSON to stdout.
-    3. Compile with cl.exe / link in cpu_state.c.
-    4. Run, capture JSON, diff against snippet['expect'].
+    1. For each snippet, lower its rom bytes via v2.lowering and emit
+       a C body via v2.codegen.emit_op.
+    2. Wrap the emitted body in the V2 fuzz harness (CpuState struct +
+       cpu_read/cpu_write helpers from fuzz._harness_c.V2_PROLOGUE).
+    3. Compile via fuzz._msvc.compile_c_to_exe (vcvars64 + cl.exe).
+    4. Run via fuzz._msvc.run_capturing_jsonl, diff against
+       snippet['expect'].
+
+Shared with future v2 fuzz targets via fuzz._msvc and fuzz._harness_c.
 
 Run:
     python snesrecomp/fuzz/v2_stale_shadow.py
@@ -31,20 +31,19 @@ exits 0 if all snippets pass; non-zero with a per-snippet diff otherwise.
 """
 from __future__ import annotations
 
-import json
-import os
 import pathlib
-import subprocess
 import sys
-import tempfile
 
 FUZZ = pathlib.Path(__file__).resolve().parent
 REPO = FUZZ.parent
 sys.path.insert(0, str(REPO / 'recompiler'))
+sys.path.insert(0, str(FUZZ))
 
-import snes65816 as s65   # noqa: E402  -- v1 decoder, used to verify rom_hex parses
-from v2 import decoder, lowering, codegen, cfg as v2cfg  # noqa: E402
-from v2.ir import Reg, IRBlock  # noqa: E402
+import snes65816 as s65   # noqa: E402
+from v2 import lowering, codegen  # noqa: E402
+
+from _harness_c import V2_PROLOGUE  # noqa: E402
+from _msvc import compile_c_to_exe, run_capturing_jsonl, BuildError  # noqa: E402
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -233,127 +232,17 @@ def emit_snippet_body(rom: bytes) -> list[str]:
 # Build a self-contained C harness that runs all snippets and prints JSON.
 # ────────────────────────────────────────────────────────────────────────────
 
-C_HARNESS_PROLOGUE = r'''
-/* v2 stale-shadow fuzz harness. Auto-generated. */
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
+C_HARNESS_PROLOGUE = V2_PROLOGUE + r"""
+/* === v2 stale-shadow fuzz — per-target wrapper === */
+"""
 
-typedef uint8_t  uint8;
-typedef uint16_t uint16;
-typedef uint32_t uint32;
-
-/* Subset of CpuState matching cpu_state.h (no separate B field after
- * commit 84b359e). Stays in sync by structural correspondence; if the
- * real struct grows fields, harness still works because it only sets/
- * reads the named members. */
-typedef struct CpuState {
-    uint16 A;
-    uint16 X;
-    uint16 Y;
-    uint16 S;
-    uint16 D;
-    uint8  DB;
-    uint8  PB;
-    uint8  P;
-    uint8  m_flag;
-    uint8  x_flag;
-    uint8  emulation;
-    uint8  _flag_N;
-    uint8  _flag_V;
-    uint8  _flag_Z;
-    uint8  _flag_C;
-    uint8  _flag_I;
-    uint8  _flag_D;
-    uint8 *ram;
-} CpuState;
-
-#define CPU_P_C 0x01u
-#define CPU_P_Z 0x02u
-#define CPU_P_I 0x04u
-#define CPU_P_D 0x08u
-#define CPU_P_X 0x10u
-#define CPU_P_M 0x20u
-#define CPU_P_V 0x40u
-#define CPU_P_N 0x80u
-
-static inline void cpu_p_to_mirrors(CpuState *cpu) {
-    cpu->m_flag  = (cpu->P & CPU_P_M) ? 1 : 0;
-    cpu->x_flag  = (cpu->P & CPU_P_X) ? 1 : 0;
-    cpu->_flag_C = (cpu->P & CPU_P_C) ? 1 : 0;
-    cpu->_flag_Z = (cpu->P & CPU_P_Z) ? 1 : 0;
-    cpu->_flag_I = (cpu->P & CPU_P_I) ? 1 : 0;
-    cpu->_flag_D = (cpu->P & CPU_P_D) ? 1 : 0;
-    cpu->_flag_V = (cpu->P & CPU_P_V) ? 1 : 0;
-    cpu->_flag_N = (cpu->P & CPU_P_N) ? 1 : 0;
-}
-static inline void cpu_mirrors_to_p(CpuState *cpu) {
-    cpu->P = (uint8)(
-        (cpu->m_flag  ? CPU_P_M : 0) |
-        (cpu->x_flag  ? CPU_P_X : 0) |
-        (cpu->_flag_C ? CPU_P_C : 0) |
-        (cpu->_flag_Z ? CPU_P_Z : 0) |
-        (cpu->_flag_I ? CPU_P_I : 0) |
-        (cpu->_flag_D ? CPU_P_D : 0) |
-        (cpu->_flag_V ? CPU_P_V : 0) |
-        (cpu->_flag_N ? CPU_P_N : 0)
-    );
-}
-static inline uint8 cpu_read_b(const CpuState *cpu) {
-    return (uint8)((cpu->A >> 8) & 0xFF);
-}
-
-/* 128 KB WRAM. */
-static uint8_t g_ram[0x20000];
-
-/* cpu_read/cpu_write — same map as cpu_state.c. */
-static int cpu_ram_offset(uint8 bank, uint16 addr) {
-    if (bank == 0x7E) return (int)addr;
-    if (bank == 0x7F) return 0x10000 + (int)addr;
-    if (addr < 0x2000 && (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)))
-        return (int)addr;
-    return -1;
-}
-static uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
-    int off = cpu_ram_offset(bank, addr);
-    return (off >= 0) ? cpu->ram[off] : 0xFF;
-}
-static uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
-    int off = cpu_ram_offset(bank, addr);
-    if (off >= 0 && off + 1 < 0x20000)
-        return (uint16)cpu->ram[off] | ((uint16)cpu->ram[off+1] << 8);
-    return 0xFFFF;
-}
-static void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
-    int off = cpu_ram_offset(bank, addr);
-    if (off >= 0) cpu->ram[off] = v;
-}
-static void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
-    int off = cpu_ram_offset(bank, addr);
-    if (off >= 0 && off + 1 < 0x20000) {
-        cpu->ram[off]   = (uint8)(v & 0xFF);
-        cpu->ram[off+1] = (uint8)(v >> 8);
-    }
-}
-
-/* Stubs the v2 codegen sometimes emits even for fragment snippets. */
-static void cpu_trace_event(CpuState *cpu, uint32 a, uint8 b, uint8 c, uint16 d) {
-    (void)cpu; (void)a; (void)b; (void)c; (void)d;
-}
-static void cpu_trace_px_record(CpuState *cpu, uint32 a, uint8 b, uint8 c, uint8 d) {
-    (void)cpu; (void)a; (void)b; (void)c; (void)d;
-}
-static void WatchdogCheck(void) {}
-
-'''
-
-C_HARNESS_EPILOGUE = r'''
+C_HARNESS_EPILOGUE = r"""
 int main(void) {
     int fail = 0;
     run_all(&fail);
     return fail;
 }
-'''
+"""
 
 
 def render_run_all(snippets: list[dict]) -> str:
@@ -403,47 +292,24 @@ def render_run_all(snippets: list[dict]) -> str:
 
 def main() -> int:
     src = C_HARNESS_PROLOGUE + render_run_all(SNIPPETS) + C_HARNESS_EPILOGUE
-    work = pathlib.Path(tempfile.mkdtemp(prefix='v2_stale_shadow_'))
-    src_path = work / 'fuzz.c'
-    exe_path = work / 'fuzz.exe'
-    src_path.write_text(src, encoding='utf-8')
-
-    # Locate cl.exe via vswhere or PATH; fall back to just trying.
-    cl_candidates = [
-        'cl.exe',
-        r'C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC',
-    ]
-    # Easiest: invoke a vcvars batch, then compile.
-    bat = work / 'build.bat'
-    bat.write_text(f'''@echo off
-call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat" >NUL
-cl /nologo /O2 /Fe:"{exe_path}" "{src_path}" >NUL
-exit /b %ERRORLEVEL%
-''', encoding='utf-8')
-    rc = subprocess.run(['cmd', '/c', str(bat)], capture_output=True, text=True)
-    if rc.returncode != 0:
+    try:
+        exe = compile_c_to_exe(src)
+    except BuildError as e:
         print('build failed:', file=sys.stderr)
-        print(rc.stdout, file=sys.stderr)
-        print(rc.stderr, file=sys.stderr)
-        print(f'(source preserved at {src_path})', file=sys.stderr)
+        print(e.stdout, file=sys.stderr)
+        print(e.stderr, file=sys.stderr)
+        print(f'(source preserved at {e.src_path})', file=sys.stderr)
         return 2
 
-    rc = subprocess.run([str(exe_path)], capture_output=True, text=True)
-    if rc.returncode != 0:
-        print(f'run failed (rc={rc.returncode}):', file=sys.stderr)
-        print(rc.stdout, file=sys.stderr)
-        print(rc.stderr, file=sys.stderr)
+    results_list, rc = run_capturing_jsonl(exe)
+    if rc != 0:
+        print(f'run failed (rc={rc})', file=sys.stderr)
         return 3
 
     results = {}
-    for line in rc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            print(f'bad output line: {line!r}', file=sys.stderr)
+    for d in results_list:
+        if '_parse_error' in d:
+            print(f'bad output line: {d["_parse_error"]!r}', file=sys.stderr)
             return 4
         results[d['id']] = d
 
@@ -462,7 +328,7 @@ exit /b %ERRORLEVEL%
     for sid, msg in fails:
         print(f'  FAIL  {sid}: {msg}')
     if fails:
-        print(f'\n(harness preserved at {work} for inspection)')
+        print(f'\n(harness preserved at {exe.parent} for inspection)')
         return 1
     print('all snippets pass')
     return 0
