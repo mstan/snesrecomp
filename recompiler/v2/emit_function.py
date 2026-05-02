@@ -295,12 +295,25 @@ def emit_function(rom: bytes, bank: int, start: int,
         if key in nlr_skip_by_block:
             skip = nlr_skip_by_block[key]
             ops_here = block_ir.get(key, [])
+            block_pc24 = (bank << 16) | (key.pc & 0xFFFF)
+            site_label = f"{func_name}/{_label_for(key)}"
+            # Non-rotating site-exec counter (survives ring rotation).
+            lines.append(
+                f"cpu_trace_nlr_site_exec(cpu, 0x{block_pc24:06X}, "
+                f"\"{site_label}\");"
+            )
             lines.append(
                 f"cpu_trace_event(cpu, 0, CPU_TR_NLR_DETECT, "
                 f"(uint8){skip}, 0); /* PLA*N + RTS = "
                 f"return-to-grandparent via SKIP_{skip} */"
             )
             lines.append(f"cpu->pending_skip = (uint8)RECOMP_RETURN_SKIP_{skip};")
+            # Non-rotating pending_skip-write counter + first-writer
+            # forensics (frame, PC, function name).
+            lines.append(
+                f"cpu_trace_pending_skip_write(cpu, 0x{block_pc24:06X}, "
+                f"(uint8)RECOMP_RETURN_SKIP_{skip}, \"{func_name}\");"
+            )
             if ops_here and isinstance(ops_here[-1], Return):
                 # Sub-case (a): block ends in its own Return — emit it
                 # inline so pending_skip is consumed immediately.

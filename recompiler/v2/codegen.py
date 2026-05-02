@@ -847,6 +847,11 @@ def _emit_return(op: Return) -> List[str]:
     an upstream NLR-pattern block on the same path) and returns its
     value. NORMAL paths get pending_skip == 0 == RECOMP_RETURN_NORMAL.
 
+    cpu_trace_pending_skip_consume is a non-rotating counter (separate
+    from the cpu_trace ring, which rotates) so probes can answer "did
+    any Return on this run read non-zero pending_skip ever" — even
+    after the ring has rotated past boot.
+
     The `return ...;` line stays at the start of its line so the
     per-line scanner in emit_function.py auto-injects RecompStackPop()
     before it. Wrapped in {} so `_ps` is local-scoped."""
@@ -854,11 +859,13 @@ def _emit_return(op: Return) -> List[str]:
         return [
             "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);",
             "{ uint8 _ps = cpu->pending_skip; cpu->pending_skip = 0;",
+            "  cpu_trace_pending_skip_consume(cpu, 0, _ps, g_last_recomp_func);",
             "  return (RecompReturn)_ps; /* RTI */ }",
         ]
     label = "/* RTL */" if op.long else "/* RTS */"
     return [
         "{ uint8 _ps = cpu->pending_skip; cpu->pending_skip = 0;",
+        "  cpu_trace_pending_skip_consume(cpu, 0, _ps, g_last_recomp_func);",
         f"  return (RecompReturn)_ps; {label} }}",
     ]
 

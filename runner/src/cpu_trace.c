@@ -942,6 +942,73 @@ static struct {
 } s_offrails_seen[OFFRAILS_TAG_MAX];
 static int s_offrails_used = 0;
 
+/* ── NLR diagnostic counters (non-rotating) ────────────────────────── */
+NlrDiag g_nlr_diag = {0};
+
+static int nlr_diag_find_or_add_site(const char *name) {
+    uint32_t h = name ? fnv1a(name) : 0;
+    for (int i = 0; i < g_nlr_diag.per_site_used; i++) {
+        if (g_nlr_diag.per_site_hash[i] == h) return i;
+    }
+    if (g_nlr_diag.per_site_used >= NLR_DIAG_PER_SITE_MAX) return -1;
+    int slot = g_nlr_diag.per_site_used++;
+    g_nlr_diag.per_site_hash[slot] = h;
+    g_nlr_diag.per_site_count[slot] = 0;
+    if (name) {
+        strncpy(g_nlr_diag.per_site_label[slot], name, NLR_DIAG_FIRST_FUNC_LEN - 1);
+        g_nlr_diag.per_site_label[slot][NLR_DIAG_FIRST_FUNC_LEN - 1] = 0;
+    } else {
+        g_nlr_diag.per_site_label[slot][0] = 0;
+    }
+    return slot;
+}
+
+void cpu_trace_nlr_site_exec(CpuState *cpu, uint32_t pc24, const char *name) {
+    (void)cpu; (void)pc24;
+    g_nlr_diag.site_exec_count++;
+    int slot = nlr_diag_find_or_add_site(name);
+    if (slot >= 0) g_nlr_diag.per_site_count[slot]++;
+}
+
+void cpu_trace_pending_skip_write(CpuState *cpu, uint32_t pc24,
+                                  uint8_t new_value, const char *func) {
+    (void)cpu;
+    g_nlr_diag.pending_skip_writes++;
+    if (!g_nlr_diag.first_writer_captured && new_value != 0) {
+        extern int snes_frame_counter;
+        g_nlr_diag.first_writer_captured = 1;
+        g_nlr_diag.first_writer_pc24 = pc24;
+        g_nlr_diag.first_writer_frame = snes_frame_counter;
+        g_nlr_diag.first_writer_value = new_value;
+        if (func) {
+            strncpy(g_nlr_diag.first_writer_func, func, NLR_DIAG_FIRST_FUNC_LEN - 1);
+            g_nlr_diag.first_writer_func[NLR_DIAG_FIRST_FUNC_LEN - 1] = 0;
+        }
+    }
+}
+
+void cpu_trace_pending_skip_consume(CpuState *cpu, uint32_t pc24,
+                                    uint8_t value, const char *func) {
+    (void)cpu;
+    if (value == 0) {
+        g_nlr_diag.pending_skip_reads_zero++;
+    } else {
+        g_nlr_diag.pending_skip_reads_nonzero++;
+        if (!g_nlr_diag.first_consumer_captured) {
+            extern int snes_frame_counter;
+            g_nlr_diag.first_consumer_captured = 1;
+            g_nlr_diag.first_consumer_pc24 = pc24;
+            g_nlr_diag.first_consumer_frame = snes_frame_counter;
+            g_nlr_diag.first_consumer_value = value;
+            if (func) {
+                strncpy(g_nlr_diag.first_consumer_func, func,
+                        NLR_DIAG_FIRST_FUNC_LEN - 1);
+                g_nlr_diag.first_consumer_func[NLR_DIAG_FIRST_FUNC_LEN - 1] = 0;
+            }
+        }
+    }
+}
+
 void cpu_trace_offrails(const char *tag, uint32_t hint) {
     /* Cheap key — collision-tolerant, just needs to dedupe spam. */
     uint64_t k = fnv1a(tag ? tag : "");
