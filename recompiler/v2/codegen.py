@@ -59,6 +59,19 @@ _NAME_RESOLVER: Dict[int, str] = {}
 # multiple C bodies.
 _UNRESOLVED_CALL_TARGETS: set = set()
 
+# NOTE (2026-05-02): the `_UNRESOLVED_GOTO_TARGETS` machinery has been
+# RETIRED. Auto-promoting arbitrary jump targets into separate C
+# functions split asm routines across C scopes and stranded their
+# PHB/PLB (and other stack-lifetime) invariants — root cause of DB=$C0
+# at dispatcher entry, manifest as the title-screen-loop regression.
+#
+# Replacement: the decoder imports BRA/BRL/JMP-ABS/cond-branch targets
+# that lie past cfg `end:` directly into the SAME function's CFG (see
+# `_labeled_successors` + the end:-applies-to-fall-through-only rule
+# in decoder.py). Auto-promote remains for genuine subroutine targets
+# (JSR/JSL) only. See `record_unresolved_goto_target` placeholder
+# below for the contract enforcement.
+
 
 def _variant_suffix(m: int, x: int) -> str:
     """Return the `_M{m}X{x}` suffix used for per-variant function names.
@@ -86,6 +99,19 @@ def take_unresolved_call_targets() -> set:
     out = _UNRESOLVED_CALL_TARGETS
     _UNRESOLVED_CALL_TARGETS = set()
     return out
+
+
+def take_unresolved_goto_targets() -> set:
+    """Compatibility shim. The auto-promote-goto-targets pass has been
+    retired (2026-05-02) in favor of the inline-cross-fn-blocks model.
+    Returns an empty set so v2_regen's drain loop terminates immediately
+    on the first pass.
+
+    Old callers of `record_unresolved_goto_target` are gone — emit_function
+    now emits a LOUD `return; /* unresolvable cross-fn goto */` for the
+    handful of jumps that can't be imported (cross-bank, out-of-range),
+    without recording for promotion."""
+    return set()
 
 
 from v2 import widths  # noqa: E402

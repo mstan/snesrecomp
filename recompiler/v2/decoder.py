@@ -121,16 +121,41 @@ def post_mx(insn: Insn, in_m: int, in_x: int) -> Tuple[int, int]:
 def _successors(insn: Insn, key: DecodeKey, bank: int) -> List[DecodeKey]:
     """Compute successor DecodeKeys for one decoded instruction.
 
-    Successor mode = post-instruction (m, x) per `post_mx`. Successor PC
-    depends on insn semantics:
-        terminator      -> []
-        BRA / BRL       -> [target]
-        cond branch     -> [fall-through, target]
-        JMP ABS         -> [target]
-        JMP INDIR/(X)   -> []  (table-driven; caller's job)
-        JMP LONG        -> []  (cross-bank; caller's job)
-        JSR / JSL       -> [fall-through]  (callee opaque)
-        default         -> [fall-through]
+    Returns plain DecodeKey list (kind-agnostic) for callers that only
+    need successors. See `_labeled_successors` for the (key, kind)
+    variant used by `decode_function`'s end: gating logic.
+    """
+    return [k for (k, _kind) in _labeled_successors(insn, key, bank)]
+
+
+def _labeled_successors(insn: Insn, key: DecodeKey, bank: int):
+    """Compute (DecodeKey, edge_kind) tuples for one decoded instruction.
+
+    `edge_kind` is one of:
+        'jump'        — control-flow edge whose TARGET is named explicitly
+                        in the insn (BRA/BRL/cond-branch-taken/JMP-ABS).
+                        These edges may cross the cfg-declared end:
+                        boundary because the asm explicitly transfers
+                        there — the original routine's lifetime extends
+                        across them, even though `end:` says the next
+                        cfg function starts at that PC.
+        'fall'        — natural fall-through to the next instruction
+                        (linear, JSR/JSL-after-call, cond-branch-not-
+                        taken). These edges respect end:; falling
+                        through past end: would pull the next function's
+                        body into this one and is forbidden.
+        terminator    -> [] (no successors)
+        JMP INDIR/(X) -> [] (table-driven; caller's job)
+        JMP LONG/JML  -> [] (cross-bank; caller's job)
+
+    The distinction matters for the inline-cross-fn-blocks model
+    (control-flow correctness fix, 2026-05-02): a BRA into a label past
+    end: must IMPORT that label's blocks into the current function so
+    PHB/PLB pairs and other stack-lifetime invariants stay matched
+    within one C function scope. Treating arbitrary jump targets as new
+    C functions (the prior auto-promote behavior) split asm routines
+    across multiple C bodies and stranded their PHBs without their
+    matching PLBs — root cause of DB=$C0 at dispatch entry.
     """
     post_m, post_x = post_mx(insn, key.m, key.x)
     pc = insn.addr & 0xFFFF
@@ -142,27 +167,29 @@ def _successors(insn: Insn, key: DecodeKey, bank: int) -> List[DecodeKey]:
         return []
 
     if mnem in ('BRA', 'BRL'):
-        return [DecodeKey(addr24(bank, insn.operand), post_m, post_x)]
+        return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x), 'jump')]
 
     if mnem in _COND_BRANCHES:
         return [
-            DecodeKey(addr24(bank, next_pc), post_m, post_x),
-            DecodeKey(addr24(bank, insn.operand), post_m, post_x),
+            (DecodeKey(addr24(bank, next_pc), post_m, post_x), 'fall'),
+            (DecodeKey(addr24(bank, insn.operand), post_m, post_x), 'jump'),
         ]
 
     if mnem == 'JMP':
         if insn.mode == ABS:
-            return [DecodeKey(addr24(bank, insn.operand), post_m, post_x)]
+            return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x), 'jump')]
         # INDIR / INDIR_X (table-dispatch) and LONG (cross-bank) — no
         # static successors at this layer.
         return []
 
     # Long-jump (JML) is decoded as JMP+LONG above; JSL is its own mnem.
+    # Both are cross-routine calls; only the fall-through (return site)
+    # is decoded into THIS function. The callee is a separate cfg entry.
     if mnem in ('JSR', 'JSL'):
-        return [DecodeKey(addr24(bank, next_pc), post_m, post_x)]
+        return [(DecodeKey(addr24(bank, next_pc), post_m, post_x), 'fall')]
 
     # Default: linear fall-through with post-instruction mode.
-    return [DecodeKey(addr24(bank, next_pc), post_m, post_x)]
+    return [(DecodeKey(addr24(bank, next_pc), post_m, post_x), 'fall')]
 
 
 def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
@@ -266,7 +293,19 @@ def decode_function(rom: bytes, bank: int, start: int,
     entry_key = DecodeKey(addr24(bank, start), entry_m, entry_x)
     graph = FunctionDecodeGraph(entry=entry_key)
 
-    worklist: List[DecodeKey] = [entry_key]
+    # Worklist holds (key, edge_kind, pred_pc). edge_kind is
+    # 'entry' for the initial seed, 'jump' for BRA/BRL/JMP-ABS/cond-
+    # branch-target, 'fall' for linear next-PC after non-control or
+    # JSR/JSL. pred_pc is the predecessor PC (-1 for entry seed).
+    #
+    # end: gates the boundary CROSSING, not the imported territory:
+    # we reject a fall-through edge whose SOURCE is inside [start,end)
+    # and whose TARGET is past end:. That stops natural drift of the
+    # entry's body into the NEXT cfg function. Inside imported
+    # territory (source.pc >= end, reached via prior 'jump'), all
+    # successors are decoded — fall-through within an imported routine
+    # is part of that routine's lifetime, not a boundary crossing.
+    worklist: List = [(entry_key, 'entry', -1)]
 
     while worklist:
         if len(graph.insns) >= max_insns:
@@ -274,12 +313,22 @@ def decode_function(rom: bytes, bank: int, start: int,
                 f"v2 decoder exceeded max_insns={max_insns} at "
                 f"function ${addr24(bank, start):06X}"
             )
-        key = worklist.pop()
+        key, edge_kind, pred_pc = worklist.pop()
         if key in graph.insns:
             continue
 
         pc = key.pc & 0xFFFF
-        if end is not None and pc >= end:
+        # Boundary-crossing fall-through: predecessor was inside the
+        # nominal range, and this fall-through would land past end: in
+        # the next function's body. Reject — that's exactly what end:
+        # was put in cfg to prevent. (Jump targets past end: were
+        # already accepted by the same predecessor; this only blocks
+        # the unintended drift.)
+        if (end is not None
+                and pc >= end
+                and edge_kind == 'fall'
+                and pred_pc >= 0
+                and pred_pc < end):
             continue
         if not (0x8000 <= pc <= 0xFFFF):
             # Out-of-bank reference; surface upstream by skipping here.
@@ -367,11 +416,12 @@ def decode_function(rom: bytes, bank: int, start: int,
                 graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
                 continue
 
-        succ = _successors(insn, key, bank)
+        labeled_succ = _labeled_successors(insn, key, bank)
+        succ = [k for (k, _) in labeled_succ]
         graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)
 
-        for s in succ:
+        for s, sk in labeled_succ:
             if s not in graph.insns:
-                worklist.append(s)
+                worklist.append((s, sk, pc))
 
     return graph

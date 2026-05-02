@@ -15,6 +15,12 @@ uint64_t      g_cpu_trace_idx = 0;
 CpuDbpbEvent  g_cpu_dbpb_ring[CPU_DBPB_RING_LEN];
 uint64_t      g_cpu_dbpb_idx = 0;
 
+/* Forward decls — used by boundary auditor below, defined later in this TU. */
+static uint32_t fnv1a(const char *s);
+extern const char *g_last_recomp_func;
+extern const char *g_recomp_stack[];
+extern int         g_recomp_stack_top;
+
 /* Round v down to the nearest power of 2 (>= 1<<16). */
 static uint64_t round_pow2_down(uint64_t v) {
     if (v == 0) return 0;
@@ -42,12 +48,236 @@ uint64_t cpu_trace_init(void) {
             (unsigned long long)g_cpu_trace_capacity,
             (unsigned long long)((g_cpu_trace_capacity * sizeof(CpuTraceEvent)) >> 20),
             g_cpu_trace_ring ? "" : " — ALLOC FAILED");
+    /* Allocate the boundary auditor ring alongside cpu_trace. Same
+     * heap-alloc / pow2 / env-tunable shape; sized independently. */
+    boundary_audit_init();
     return g_cpu_trace_capacity;
 }
 uint8_t       g_db_watch_set = 0;
 uint32_t      g_db_watch_bits[8] = {0};
 ScopedTripwire g_scoped_tripwire = {0};
 PxTripwire     g_px_tripwire = {0};
+
+/* ── Boundary auditor ────────────────────────────────────────────────────
+ *
+ * Per generated-function entry/exit ring. Hooked into RecompStackPush /
+ * RecompStackPop so coverage is automatic for every recompiled function.
+ * Pairing across entry/exit is kept in the parallel `s_active_seq` stack
+ * (one entry per active call). Sized to match RECOMP_STACK_DEPTH.
+ */
+BoundaryEvent *g_boundary_ring = (BoundaryEvent *)0;
+uint64_t       g_boundary_capacity = 0;
+uint64_t       g_boundary_idx = 0;
+/* When set non-zero, all subsequent boundary events are dropped. Used
+ * by tripwires to FREEZE the ring at fire time so the captured window
+ * survives post-trip activity and can be walked from seq=0 to find
+ * the first runtime imbalance. */
+uint8_t        g_boundary_frozen = 0;
+
+#define BOUNDARY_ACTIVE_DEPTH 64  /* matches RECOMP_STACK_DEPTH */
+static uint64_t s_active_entry_seq[BOUNDARY_ACTIVE_DEPTH];
+static int      s_active_top = 0;
+
+uint64_t boundary_audit_init(void) {
+    uint64_t cap = BOUNDARY_RING_DEFAULT_ENTRIES;
+    const char *env = getenv("SNESRECOMP_BOUNDARY_RING_ENTRIES");
+    if (env && *env) {
+        unsigned long long v = strtoull(env, NULL, 0);
+        if (v >= (1ULL << 14) && v <= (1ULL << 24)) cap = (uint64_t)v;
+    }
+    cap = round_pow2_down(cap);
+    if (cap < (1ULL << 14)) cap = (1ULL << 14);
+    if (g_boundary_ring) free(g_boundary_ring);
+    g_boundary_ring = (BoundaryEvent *)calloc((size_t)cap, sizeof(BoundaryEvent));
+    g_boundary_capacity = g_boundary_ring ? cap : 0;
+    g_boundary_idx = 0;
+    s_active_top = 0;
+    fprintf(stderr,
+            "[boundary_audit] ring allocated: %llu entries (~%llu MB)%s\n",
+            (unsigned long long)g_boundary_capacity,
+            (unsigned long long)((g_boundary_capacity * sizeof(BoundaryEvent)) >> 20),
+            g_boundary_ring ? "" : " — ALLOC FAILED");
+    return g_boundary_capacity;
+}
+
+/* Capture register state from g_cpu into a BoundaryEvent. */
+static void boundary_fill_state(BoundaryEvent *be) {
+    extern CpuState g_cpu;  /* defined in common_rtl.c */
+    be->A = g_cpu.A; be->X = g_cpu.X; be->Y = g_cpu.Y;
+    be->S = g_cpu.S; be->D = g_cpu.D;
+    be->DB = g_cpu.DB; be->PB = g_cpu.PB; be->P = g_cpu.P;
+    be->m_flag = g_cpu.m_flag; be->x_flag = g_cpu.x_flag;
+}
+
+void boundary_audit_record_entry(const char *name) {
+    if (!g_boundary_ring || !g_boundary_capacity) return;
+    if (g_boundary_frozen) return;  /* tripwire froze the ring */
+    extern int snes_frame_counter;
+    uint64_t seq = g_boundary_idx++;
+    int slot = (int)(seq & (g_boundary_capacity - 1));
+    BoundaryEvent *be = &g_boundary_ring[slot];
+    be->seq = seq;
+    be->entry_seq = 0;
+    be->frame = snes_frame_counter;
+    be->name_hash = name ? fnv1a(name) : 0;
+    boundary_fill_state(be);
+    be->kind = BD_ENTRY;
+    be->stack_depth = (uint8_t)(g_recomp_stack_top > 255 ? 255 : g_recomp_stack_top);
+    be->pad[0] = be->pad[1] = be->pad[2] = 0;
+    if (name) {
+        strncpy(be->name, name, BOUNDARY_NAME_LEN - 1);
+        be->name[BOUNDARY_NAME_LEN - 1] = 0;
+    } else {
+        be->name[0] = 0;
+    }
+    /* Track entry seq on the parallel call-stack so the matching EXIT
+     * can reference it. Saturate at BOUNDARY_ACTIVE_DEPTH; if the call
+     * stack runs deeper than expected, EXIT events still get written —
+     * they just carry entry_seq=0 (unpaired). */
+    if (s_active_top < BOUNDARY_ACTIVE_DEPTH) {
+        s_active_entry_seq[s_active_top++] = seq;
+    }
+}
+
+void boundary_audit_record_exit(const char *name) {
+    if (!g_boundary_ring || !g_boundary_capacity) return;
+    if (g_boundary_frozen) return;  /* tripwire froze the ring */
+    extern int snes_frame_counter;
+    uint64_t seq = g_boundary_idx++;
+    int slot = (int)(seq & (g_boundary_capacity - 1));
+    BoundaryEvent *be = &g_boundary_ring[slot];
+    be->seq = seq;
+    /* Pop the matching entry seq off the parallel stack. If empty (over-
+     * popped) leave entry_seq=0 — that itself is signal: an unbalanced
+     * exit. */
+    if (s_active_top > 0) {
+        be->entry_seq = s_active_entry_seq[--s_active_top];
+    } else {
+        be->entry_seq = 0;
+    }
+    be->frame = snes_frame_counter;
+    be->name_hash = name ? fnv1a(name) : 0;
+    boundary_fill_state(be);
+    be->kind = BD_EXIT;
+    be->stack_depth = (uint8_t)(g_recomp_stack_top > 255 ? 255 : g_recomp_stack_top);
+    be->pad[0] = be->pad[1] = be->pad[2] = 0;
+    if (name) {
+        strncpy(be->name, name, BOUNDARY_NAME_LEN - 1);
+        be->name[BOUNDARY_NAME_LEN - 1] = 0;
+    } else {
+        be->name[0] = 0;
+    }
+}
+
+/* ── DB→<value> one-shot tripwire ──────────────────────────────────────
+ *
+ * Captures full state + last 256 boundary events + last 64 dbpb events
+ * the FIRST time cpu->DB transitions FROM != target_db TO target_db.
+ * Auto-arms target_db=$C0 in cpu_trace_arm_default_watches.
+ */
+DbTripwire g_db_tripwire = {0};
+
+void cpu_trace_arm_db_tripwire(uint8_t target_db) {
+    memset(&g_db_tripwire, 0, sizeof(g_db_tripwire));
+    g_db_tripwire.armed = 1;
+    g_db_tripwire.target_db = target_db;
+}
+
+void cpu_trace_disarm_db_tripwire(void) {
+    g_db_tripwire.armed = 0;
+}
+
+/* Snapshot the last `want` boundary events into the tripwire. Walks
+ * backward from g_boundary_idx (which is the next-to-write slot). */
+static void db_tripwire_snapshot_boundary(int want) {
+    if (want > DB_TRIP_BOUNDARY_HISTORY) want = DB_TRIP_BOUNDARY_HISTORY;
+    int avail = (int)(g_boundary_idx < (uint64_t)want ? g_boundary_idx : (uint64_t)want);
+    if (avail > (int)g_boundary_capacity) avail = (int)g_boundary_capacity;
+    g_db_tripwire.bd_count = avail;
+    /* Newest-first: bd_history[0] = most-recent boundary event. */
+    for (int i = 0; i < avail; i++) {
+        uint64_t abs = g_boundary_idx - 1 - (uint64_t)i;
+        int slot = (int)(abs & (g_boundary_capacity - 1));
+        g_db_tripwire.bd_history[i] = g_boundary_ring[slot];
+    }
+}
+
+/* Snapshot the last `want` dbpb events into the tripwire. */
+static void db_tripwire_snapshot_dbpb(int want) {
+    if (want > DB_TRIP_DBPB_HISTORY) want = DB_TRIP_DBPB_HISTORY;
+    int avail = (int)(g_cpu_dbpb_idx < (uint64_t)want ? g_cpu_dbpb_idx : (uint64_t)want);
+    if (avail > CPU_DBPB_RING_LEN) avail = CPU_DBPB_RING_LEN;
+    g_db_tripwire.dbpb_count = avail;
+    for (int i = 0; i < avail; i++) {
+        uint64_t abs = g_cpu_dbpb_idx - 1 - (uint64_t)i;
+        int slot = (int)(abs & (CPU_DBPB_RING_LEN - 1));
+        g_db_tripwire.dbpb_history[i] = g_cpu_dbpb_ring[slot];
+    }
+}
+
+void cpu_trace_db_tripwire_check(CpuState *cpu, uint32_t pc24,
+                                 uint8_t old_db, uint8_t new_db,
+                                 uint8_t event_type) {
+    DbTripwire *t = &g_db_tripwire;
+    if (!t->armed || t->triggered) return;
+    if (new_db != t->target_db) return;
+    if (old_db == t->target_db) return;  /* already at target — not a transition */
+
+    extern int snes_frame_counter;
+    t->triggered = 1;
+    t->frame = snes_frame_counter;
+    t->trip_pc24 = pc24;
+    t->old_db = old_db;
+    t->new_db = new_db;
+    t->trip_event_type = event_type;
+    t->trip_boundary_seq = g_boundary_idx;
+    t->trip_trace_idx = g_cpu_trace_idx;
+
+    if (cpu) {
+        t->A = cpu->A; t->X = cpu->X; t->Y = cpu->Y;
+        t->S = cpu->S; t->D = cpu->D;
+        t->DB = cpu->DB; t->PB = cpu->PB; t->P = cpu->P;
+        t->m_flag = cpu->m_flag; t->x_flag = cpu->x_flag;
+        t->e_flag = cpu->emulation;
+    }
+
+    if (g_last_recomp_func) {
+        strncpy(t->last_func, g_last_recomp_func, DB_TRIP_FUNC_LEN - 1);
+        t->last_func[DB_TRIP_FUNC_LEN - 1] = 0;
+    }
+
+    int depth = g_recomp_stack_top;
+    if (depth > DB_TRIP_STACK_DEPTH) depth = DB_TRIP_STACK_DEPTH;
+    t->stack_depth = depth;
+    int skip = g_recomp_stack_top - depth;
+    for (int i = 0; i < depth; i++) {
+        const char *p = g_recomp_stack[skip + i];
+        if (p) {
+            strncpy(t->stack[i], p, DB_TRIP_FUNC_LEN - 1);
+            t->stack[i][DB_TRIP_FUNC_LEN - 1] = 0;
+        } else {
+            t->stack[i][0] = 0;
+        }
+    }
+
+    db_tripwire_snapshot_boundary(DB_TRIP_BOUNDARY_HISTORY);
+    db_tripwire_snapshot_dbpb(DB_TRIP_DBPB_HISTORY);
+    /* Freeze the boundary ring so post-trip activity can't overwrite
+     * the seq=0..trip_seq window. Probes that walk forward from seq=0
+     * looking for the first runtime imbalance need this — without it,
+     * a 1M-event ring fills in seconds and the trip context is gone. */
+    g_boundary_frozen = 1;
+
+    fprintf(stderr,
+            "[db_tripwire] FIRED frame=%d DB %02X -> %02X at pc=$%06X "
+            "func=%s S=$%04X bd_seq=%llu (boundary history captured: %d events)\n",
+            t->frame, old_db, new_db, pc24,
+            t->last_func[0] ? t->last_func : "(none)",
+            (unsigned)t->S,
+            (unsigned long long)t->trip_boundary_seq,
+            (int)t->bd_count);
+    fflush(stderr);
+}
 
 /* Externs used by px tripwire + scoped tripwire bodies. Defined in
  * common_cpu_infra.c / debug_server.c. Hoisted to file scope so the
@@ -375,6 +605,22 @@ void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
         cpu_trace_dump_dbpb(tag);
         cpu_trace_dump_recent(tag, 128);
     }
+    /* DB tripwire poll — gen code does `cpu->DB = cpu_read8(...)` at PLB
+     * sites directly (bypassing cpu_trace_db_change). Poll at block
+     * granularity so a sane→target transition that happened since the
+     * last block fires the tripwire. We carry a per-process "last seen
+     * DB" so the trip fires on transition rather than steady-state.
+     * pc24 here is the BLOCK pc, an upper bound on the mutation site. */
+    if (g_db_tripwire.armed && !g_db_tripwire.triggered) {
+        static uint8_t s_last_seen_db = 0;
+        static uint8_t s_last_init = 0;
+        if (!s_last_init) { s_last_seen_db = cpu->DB; s_last_init = 1; }
+        if (cpu->DB != s_last_seen_db) {
+            cpu_trace_db_tripwire_check(cpu, pc24, s_last_seen_db, cpu->DB,
+                                        CPU_TR_BLOCK);
+            s_last_seen_db = cpu->DB;
+        }
+    }
 }
 
 /* Tiny FNV-1a over a NUL-terminated function name. */
@@ -447,6 +693,10 @@ void cpu_trace_db_change(CpuState *cpu, uint32_t pc24, uint8_t old_db,
         cpu_trace_dump_dbpb(tag);
         cpu_trace_dump_recent(tag, 256);
     }
+    /* One-shot DB tripwire — captures structured snapshot for TCP query
+     * on first transition to target_db. Cheap when not armed (single
+     * load+branch on g_db_tripwire.armed). */
+    cpu_trace_db_tripwire_check(cpu, pc24, old_db, new_db, event_type);
 }
 
 void cpu_trace_pb_change(CpuState *cpu, uint32_t pc24, uint8_t old_pb,
@@ -768,6 +1018,12 @@ void cpu_trace_arm_default_watches(void) {
      * even before TCP attaches. The snapshot doesn't rotate. */
     cpu_trace_arm_px_tripwire();
     fprintf(stderr, "[cpu_trace] P.X tripwire armed (first 1→0 transition caught)\n");
+    /* Auto-arm DB→$C0 tripwire — investigation 2026-05-02: cpu->DB
+     * corrupts to $C0 at every ProcessGameMode entry (DBPB ring shows
+     * the steady-state but not the first transition). This catches the
+     * FIRST sane→$C0 transition with full boundary-event history. */
+    cpu_trace_arm_db_tripwire(0xC0);
+    fprintf(stderr, "[cpu_trace] DB tripwire armed (first transition to $C0)\n");
     /* Auto-arm scoped WRAM tripwire on the BG palette buffer
      * $7E:0700-$070F, the first 16 colors of MainPalette/BackgroundColor.
      *

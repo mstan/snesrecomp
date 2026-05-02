@@ -26,7 +26,7 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from typing import Dict, List, Optional  # noqa: E402
+from typing import Dict, List, Optional, Tuple  # noqa: E402
 
 from v2.decoder import (  # noqa: E402
     DecodeKey, DecodedInsn, FunctionDecodeGraph, decode_function, addr24,
@@ -60,7 +60,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                   entry_m: int, entry_x: int,
                   *, end: Optional[int] = None,
                   func_name: Optional[str] = None,
-                  dispatch_helpers=None) -> str:
+                  dispatch_helpers=None,
+                  exclude_ranges: Optional[List[Tuple[int, int]]] = None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
     Pipeline:
@@ -114,14 +115,66 @@ def emit_function(rom: bytes, bank: int, start: int,
 
     # Set of labels that actually correspond to blocks in this function.
     # Successors that don't resolve to a local block (cross-bank, past `end:`,
-    # indirect dispatch with unknown table) become a `return; /* unresolved */`.
+    # indirect dispatch with unknown table) get tail-called as a separate
+    # function. The auto-promote loop in v2_regen ensures that callable
+    # function exists in the same emit pass (or a later iteration).
     local_labels = {_label_for(k) for k in block_order}
+
+    # Bank where THIS function's body lives. Used to compute the 24-bit
+    # address of cross-function targets (which always lie within the same
+    # bank — cross-BANK jumps go through Call/JSL machinery, not Goto).
+    _SAME_BANK = bank & 0xFF
 
     def _goto_or_return(target: DecodeKey, prefix: str = "") -> str:
         label = _label_for(target)
         if label in local_labels:
             return f"{prefix}goto {label};"
-        return f"{prefix}return; /* {label} unresolved (cross-fn / cross-bank / past end:) */"
+        # HLE-replacement check: cfg `exclude_range S E` carves out a
+        # data region — by convention, asm whose lifted form is replaced
+        # by host-side HLE (e.g. the SMW asm main loop at $00:806B-$8078,
+        # which the runner replaces with SmwRunOneFrameOfGame).
+        # A cross-fn jump TARGETING such a range can never reach asm
+        # code: there isn't any. The runner owns control-flow at that
+        # address. The right shape is `return to host` — let the
+        # outer-frame's HLE mechanism take over.
+        # Skip auto-promote recording so the target doesn't get
+        # synthesized as an empty BankEntry next pass.
+        if exclude_ranges:
+            tpc = target.pc & 0xFFFF
+            for (lo, hi) in exclude_ranges:
+                if lo <= tpc < hi:
+                    return (
+                        f"{prefix}return; "
+                        f"/* {label} HLE-replaced "
+                        f"(cfg exclude_range {lo:04X}-{hi:04X}) */"
+                    )
+        # Unresolvable cross-function jump.
+        #
+        # With the inline-cross-fn-blocks model (2026-05-02), the decoder
+        # imports BRA/BRL/JMP-ABS/cond-branch targets that lie past the
+        # cfg `end:` boundary directly into THIS function's CFG, so the
+        # vast majority of intra-bank cross-fn jumps resolve as local
+        # labels above. Anything that reaches HERE is one of:
+        #   - a cross-BANK jump (JML/long-JMP — the decoder doesn't decode
+        #     other banks; out of scope for in-bank inlining),
+        #   - a target outside [0x8000, 0xFFFF] (data/header region),
+        #   - a pathological cfg setup we couldn't import.
+        #
+        # We do NOT auto-promote the target into a separate C function:
+        # that was the prior policy and it stranded PHB/PLB pairs across
+        # C scopes (caused DB=$C0 at dispatch entry — the title-screen
+        # regression). Auto-promote only synthesizes for true subroutine
+        # entries (JSR/JSL targets), not for arbitrary jump destinations.
+        #
+        # Emit a LOUD return so the fallback is observable both at
+        # gen-source review (clear comment) and in any future lint pass
+        # that scans for `unresolvable cross-fn`. Auto-promote is NOT
+        # invoked.
+        return (
+            f"{prefix}return; "
+            f"/* {label} unresolvable cross-fn goto — "
+            f"target outside this bank's import range */"
+        )
 
     for key in block_order:
         block = cfg.blocks[key]

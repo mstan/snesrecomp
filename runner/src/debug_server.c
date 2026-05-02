@@ -4091,6 +4091,188 @@ static void cmd_tripwire_disarm(const char *args) {
 #endif
 }
 
+/* ── Boundary auditor TCP commands ──────────────────────────────────────
+ *
+ * boundary_get count=N [skip=N] [kind=ENTRY|EXIT|ANY] [func=substr]
+ *   Walk the boundary ring backward from g_boundary_idx and emit JSON.
+ *   `kind` filter: 0=ENTRY, 1=EXIT, default ANY.
+ *   `func` filter: substring match against event name (case-sensitive).
+ *
+ * db_trip_arm target=C0   one-shot arm the DB tripwire on target_db.
+ * db_trip_get             return the snapshot if triggered.
+ * db_trip_disarm          disarm without re-init.
+ */
+static void cmd_boundary_get(const char *args) {
+#if SNESRECOMP_TRACE
+    int count = 64;
+    int skip = 0;
+    int kind_filter = -1;       /* -1 = any */
+    char func_filter[BOUNDARY_NAME_LEN] = {0};
+    if (args) {
+        const char *p;
+        if ((p = strstr(args, "count=")) != NULL) sscanf(p + 6, "%d", &count);
+        if ((p = strstr(args, "skip=")) != NULL) sscanf(p + 5, "%d", &skip);
+        if ((p = strstr(args, "kind=")) != NULL) {
+            const char *k = p + 5;
+            if (!strncmp(k, "ENTRY", 5)) kind_filter = BD_ENTRY;
+            else if (!strncmp(k, "EXIT", 4)) kind_filter = BD_EXIT;
+            else if (!strncmp(k, "ANY", 3)) kind_filter = -1;
+        }
+        if ((p = strstr(args, "func=")) != NULL) {
+            p += 5;
+            int i = 0;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && i < BOUNDARY_NAME_LEN - 1) {
+                func_filter[i++] = *p++;
+            }
+        }
+    }
+    if (count > 4096) count = 4096;
+    if (count < 1) count = 1;
+
+    extern uint64_t g_boundary_idx;
+    extern uint64_t g_boundary_capacity;
+    extern BoundaryEvent *g_boundary_ring;
+    if (!g_boundary_ring || !g_boundary_capacity) {
+        send_fmt("{\"error\":\"boundary ring not allocated\"}");
+        return;
+    }
+
+    static char buf[1048576];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"end_idx\":%llu,\"events\":[",
+        (unsigned long long)g_boundary_idx);
+    int emitted = 0;
+    int seen_matching = 0;
+    int max_scan = (int)g_boundary_capacity;
+    for (int i = 1; i <= max_scan && emitted < count; i++) {
+        if ((uint64_t)i > g_boundary_idx) break;
+        uint64_t abs_idx = g_boundary_idx - (uint64_t)i;
+        int slot = (int)(abs_idx & (g_boundary_capacity - 1));
+        BoundaryEvent *e = &g_boundary_ring[slot];
+        if (kind_filter >= 0 && e->kind != (uint8_t)kind_filter) continue;
+        if (func_filter[0] && !strstr(e->name, func_filter)) continue;
+        if (skip > 0 && seen_matching < skip) { seen_matching++; continue; }
+        seen_matching++;
+
+        if (pos > (int)sizeof(buf) - 512) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"entry_seq\":%llu,\"frame\":%d,"
+            "\"kind\":%u,\"name\":\"%s\","
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,\"depth\":%u}",
+            emitted ? "," : "",
+            (unsigned long long)e->seq,
+            (unsigned long long)e->entry_seq,
+            e->frame, (unsigned)e->kind, e->name,
+            e->A, e->X, e->Y, e->S, e->D,
+            e->DB, e->PB, e->P, e->m_flag, e->x_flag,
+            (unsigned)e->stack_depth);
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
+    send_line(buf);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_db_trip_arm(const char *args) {
+#if SNESRECOMP_TRACE
+    unsigned int target = 0xC0;
+    if (args) {
+        const char *p = strstr(args, "target=");
+        if (p) sscanf(p + 7, "%x", &target);
+    }
+    cpu_trace_arm_db_tripwire((uint8_t)(target & 0xFF));
+    send_fmt("{\"ok\":true,\"target_db\":\"0x%02x\"}", target & 0xFF);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_db_trip_disarm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_disarm_db_tripwire();
+    send_fmt("{\"ok\":true}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_db_trip_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    DbTripwire *t = &g_db_tripwire;
+    static char buf[262144];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"triggered\":%u,\"target_db\":\"0x%02x\"",
+        t->armed, t->triggered, t->target_db);
+    if (t->triggered) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"trip_pc24\":\"0x%06x\","
+            "\"old_db\":\"0x%02x\",\"new_db\":\"0x%02x\","
+            "\"trip_event_type\":%u,"
+            "\"trip_boundary_seq\":%llu,\"trip_trace_idx\":%llu,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,\"e\":%u,"
+            "\"last_func\":\"%s\",\"stack\":[",
+            t->frame, t->trip_pc24, t->old_db, t->new_db,
+            t->trip_event_type,
+            (unsigned long long)t->trip_boundary_seq,
+            (unsigned long long)t->trip_trace_idx,
+            t->A, t->X, t->Y, t->S, t->D,
+            t->DB, t->PB, t->P, t->m_flag, t->x_flag, t->e_flag,
+            t->last_func);
+        for (int i = 0; i < t->stack_depth; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", t->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"boundary_history\":[");
+        for (int i = 0; i < t->bd_count; i++) {
+            BoundaryEvent *e = &t->bd_history[i];
+            if (pos > (int)sizeof(buf) - 512) break;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"seq\":%llu,\"entry_seq\":%llu,\"frame\":%d,"
+                "\"kind\":%u,\"name\":\"%s\","
+                "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+                "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+                "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\","
+                "\"depth\":%u}",
+                i ? "," : "",
+                (unsigned long long)e->seq,
+                (unsigned long long)e->entry_seq,
+                e->frame, (unsigned)e->kind, e->name,
+                e->A, e->X, e->Y, e->S, e->D,
+                e->DB, e->PB,
+                (unsigned)e->stack_depth);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"dbpb_history\":[");
+        for (int i = 0; i < t->dbpb_count; i++) {
+            CpuDbpbEvent *d = &t->dbpb_history[i];
+            if (pos > (int)sizeof(buf) - 256) break;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"pc24\":\"0x%06x\",\"event_type\":%u,\"reg_id\":%u,"
+                "\"old_val\":\"0x%02x\",\"new_val\":\"0x%02x\",\"S\":\"0x%04x\"}",
+                i ? "," : "",
+                d->pc24, d->event_type, d->reg_id,
+                d->old_val, d->new_val, d->S);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* DMA tripwire — fires on the FIRST $420B write where any active
  * channel has VRAM destination in $7000-$8FFF AND source bank $05.
  * Captures rich snapshot for offline analysis. */
@@ -4453,6 +4635,10 @@ static const CmdEntry s_commands[] = {
     {"tripwire_arm",   cmd_tripwire_arm},
     {"tripwire_get",   cmd_tripwire_get},
     {"tripwire_disarm", cmd_tripwire_disarm},
+    {"boundary_get",   cmd_boundary_get},
+    {"db_trip_arm",    cmd_db_trip_arm},
+    {"db_trip_get",    cmd_db_trip_get},
+    {"db_trip_disarm", cmd_db_trip_disarm},
     {"dma_trip_get",   cmd_dma_trip_get},
     {"pxwatch_arm",    cmd_pxwatch_arm},
     {"pxwatch_disarm", cmd_pxwatch_disarm},

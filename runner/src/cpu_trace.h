@@ -54,6 +54,12 @@ enum {
     CPU_TR_PB_WRITE = 12,  /* any direct cpu->PB mutation */
     CPU_TR_FUNC_ENTRY = 13,  /* generated function entry */
     CPU_TR_WRAM_WRITE = 14,  /* watched WRAM byte/word write */
+    /* Non-local return signaling (see cpu_state.h::RecompReturn).
+     * extra0 carries the SKIP_N count, extra1 carries the recomp
+     * stack depth at the event. */
+    CPU_TR_NLR_DETECT  = 15,  /* a non-local-return idiom block fired */
+    CPU_TR_NLR_PROPAGATE = 16,  /* a callsite forwarded a SKIP_N up the stack */
+    CPU_TR_NLR_CONSUMED = 17,  /* a callsite received SKIP_N and decremented */
 };
 
 typedef struct CpuTraceEvent {
@@ -395,6 +401,148 @@ void cpu_trace_px_record(CpuState *cpu, uint32_t pc24, uint8_t source_kind,
  * non-rotating breadcrumb array. Use these around suspect call sites in
  * I_RESET / smw_rtl. Cheap (memcpy of CpuState fields). */
 void cpu_trace_px_breadcrumb(CpuState *cpu, uint32_t marker, const char *label);
+
+/* ── Boundary auditor (per-function entry/exit ring) ─────────────────────
+ *
+ * Distinct from g_cpu_trace_ring (which is a single linear stream of
+ * mixed BLOCK / FUNC_ENTRY / WRAM_WRITE / DB_WRITE / ... events). The
+ * boundary ring captures EVERY generated-function entry and exit with
+ * full register state at the boundary. Pairing is kept by `entry_seq`
+ * on EXIT events pointing back to the originating ENTRY's `seq`.
+ *
+ * Hooked into RecompStackPush (entry) and RecompStackPop (exit) in
+ * common_cpu_infra.c, so it fires automatically for every generated
+ * function — no codegen change needed.
+ *
+ * Use case (2026-05-02): static push/pop audit found 131 imbalanced
+ * functions but path-insensitive. Dynamic boundary auditor + DB→$C0
+ * tripwire pinpoint the FIRST runtime corruption on the attract path,
+ * which the static list cannot.
+ */
+
+#define BOUNDARY_NAME_LEN 40
+
+enum {
+    BD_ENTRY = 0,
+    BD_EXIT  = 1,
+};
+
+typedef struct BoundaryEvent {
+    uint64_t seq;            /* monotonic event id (matches g_boundary_idx) */
+    uint64_t entry_seq;      /* for BD_EXIT: seq of paired BD_ENTRY; 0 for BD_ENTRY */
+    int32_t  frame;          /* snes_frame_counter at boundary */
+    uint32_t name_hash;      /* fnv-1a of name */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P;
+    uint8_t  m_flag, x_flag;
+    uint8_t  kind;           /* BD_ENTRY | BD_EXIT */
+    uint8_t  stack_depth;    /* g_recomp_stack_top AFTER push (entry) or BEFORE pop (exit) */
+    uint8_t  pad[3];
+    char     name[BOUNDARY_NAME_LEN];
+} BoundaryEvent;
+
+/* Default ring: 1M events × 80B = ~80 MB. Holds ~250-1000 frames at
+ * typical attract-demo call rates. Override via
+ * SNESRECOMP_BOUNDARY_RING_ENTRIES (decimal, clamped to [1<<14, 1<<24]).
+ */
+#define BOUNDARY_RING_DEFAULT_ENTRIES (1ULL << 20)
+
+#if SNESRECOMP_TRACE
+extern BoundaryEvent *g_boundary_ring;
+extern uint64_t       g_boundary_capacity;  /* always pow2; mask = cap - 1 */
+extern uint64_t       g_boundary_idx;       /* monotonic; modulo via mask */
+
+uint64_t boundary_audit_init(void);
+/* Record an entry. `name` is the function name about to begin; the
+ * recomp stack has ALREADY been pushed (so g_recomp_stack_top is the
+ * post-push depth). Cheap — single atomic-ish increment + memcpy. */
+void boundary_audit_record_entry(const char *name);
+/* Record an exit. `name` is the function name about to end; the recomp
+ * stack has NOT YET been popped (so g_recomp_stack_top is the pre-pop
+ * depth). Pairs with the matching entry via the per-call entry_seq
+ * stack maintained inline. */
+void boundary_audit_record_exit(const char *name);
+#endif
+
+/* ── DB→<value> one-shot tripwire ──────────────────────────────────────
+ *
+ * Fires the FIRST time cpu->DB transitions from a non-target value to
+ * `target_db`. Captures full state, the most recent N boundary events
+ * (entries+exits), and the last 64 dbpb events into a structured
+ * snapshot. Distinct from `cpu_trace_set_db_watch(b, 1)` which dumps to
+ * stderr; this captures structured data for TCP readback and pairs the
+ * trip event to the boundary-audit ring index for surrounding-context
+ * queries.
+ *
+ * Dominant SMW symptom 2026-05-02: cpu->DB = $C0 at every
+ * ProcessGameMode entry. This tripwire pinpoints the first such
+ * corruption on the attract path, with full call-history context.
+ */
+#define DB_TRIP_BOUNDARY_HISTORY 256
+#define DB_TRIP_DBPB_HISTORY      64
+#define DB_TRIP_FUNC_LEN          BOUNDARY_NAME_LEN
+#define DB_TRIP_STACK_DEPTH       16
+
+typedef struct DbTripwire {
+    uint8_t  armed;
+    uint8_t  triggered;
+    uint8_t  target_db;          /* the DB value that fires the trip */
+    uint8_t  pad0;
+
+    /* Trigger metadata */
+    int32_t  frame;
+    uint32_t trip_pc24;          /* pc24 of the DB-write event */
+    uint8_t  old_db;
+    uint8_t  new_db;
+    uint8_t  trip_event_type;    /* PLB / PLP / RTI / DB_WRITE / ... */
+    uint8_t  pad1;
+    uint64_t trip_boundary_seq;  /* g_boundary_idx at trip */
+    uint64_t trip_trace_idx;     /* g_cpu_trace_idx at trip */
+
+    /* Full CpuState at trip */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+    uint8_t  pad2[2];
+
+    /* Most-recent function context */
+    char     last_func[DB_TRIP_FUNC_LEN];
+
+    /* Recomp stack at trip (deepest at [stack_depth-1]) */
+    int32_t  stack_depth;
+    char     stack[DB_TRIP_STACK_DEPTH][DB_TRIP_FUNC_LEN];
+
+    /* Captured history (frozen at trip; not affected by post-trip
+     * boundary/dbpb activity). */
+    int32_t  bd_count;           /* up to DB_TRIP_BOUNDARY_HISTORY */
+    BoundaryEvent bd_history[DB_TRIP_BOUNDARY_HISTORY];
+
+    int32_t  dbpb_count;         /* up to DB_TRIP_DBPB_HISTORY */
+    CpuDbpbEvent dbpb_history[DB_TRIP_DBPB_HISTORY];
+} DbTripwire;
+
+#if SNESRECOMP_TRACE
+extern DbTripwire g_db_tripwire;
+
+void cpu_trace_arm_db_tripwire(uint8_t target_db);
+void cpu_trace_disarm_db_tripwire(void);
+/* Internal — fires from cpu_trace_db_change when the trip condition is
+ * met. Called unconditionally on every DB change; the armed/triggered
+ * gate is checked inline. */
+void cpu_trace_db_tripwire_check(CpuState *cpu, uint32_t pc24,
+                                 uint8_t old_db, uint8_t new_db,
+                                 uint8_t event_type);
+#else
+static inline void cpu_trace_arm_db_tripwire(uint8_t b) { (void)b; }
+static inline void cpu_trace_disarm_db_tripwire(void) { }
+static inline void cpu_trace_db_tripwire_check(CpuState *c, uint32_t p,
+                                               uint8_t o, uint8_t n,
+                                               uint8_t e) {
+    (void)c; (void)p; (void)o; (void)n; (void)e;
+}
+static inline uint64_t boundary_audit_init(void) { return 0; }
+static inline void boundary_audit_record_entry(const char *n) { (void)n; }
+static inline void boundary_audit_record_exit(const char *n) { (void)n; }
+#endif
 
 /* Dump the last `n` events of the main ring to stderr, prefixed by `tag`. */
 void cpu_trace_dump_recent(const char *tag, int n);

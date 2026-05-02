@@ -21,42 +21,14 @@ TESTS_DIR = pathlib.Path(__file__).parent
 REPO_ROOT = TESTS_DIR.parent
 
 TEST_MODULES = [
-    'test_decompress',
-    'test_framework_fixes',
-    'test_function_boundaries',
-    'test_livein_inference',
-    'test_sig_augment',
-    'test_sync_funcs_h',
-    'test_smwdisx_compare',
-    'test_dispatch_extents',
-    'test_regen_idempotent',
-    'test_sig_completeness',
+    # v2-applicable tests that survived the v1 trim. v1-specific tests
+    # (recomp.py / src/gen/*_gen.c paths) were removed; their structural
+    # cousins for v2 live under tests/v2/ and run via tests/v2/run_tests.py.
     'test_attract_demo_regression',
-    'test_mflag_width',
-    'test_emit_order_fallthrough',
-    'test_dp_indirect_uses_db',
-    'test_dp_alias_after_register_mutation',
-    'test_side_effecting_lda_branch',
-    'test_sta_indir_wide',
-    'test_fallthrough_gap',
-    'test_promote_rety_loop_thread',
-    'test_reverse_debug_hook_coverage',
-    'test_block_hook_emits_regs',
-    'test_insn_hook_emits',
-    'test_wram_read_trace',
-    'test_mx_inference_from_callers',
-    'test_tail_call_x_restore',
-    'test_phi_merge_x_param',
-    'test_phi_merge_jmp_back_edge',
-    'test_diagonal_ledge_jmp_phi',
-    'test_accumulator_shift_width',
-    'test_memory_shift_rotate_width',
-    'test_tsb_trb_width',
-    'test_bit_v_flag_width',
-    'test_wram_addr_wrap',
-    'test_flag_tracking',
-    'test_rmw_hw_register_dispatch',
+    'test_dispatch_extents',
     'test_emitter_mask_shape',
+    'test_smwdisx_compare',
+    'test_sync_funcs_h',
 ]
 
 

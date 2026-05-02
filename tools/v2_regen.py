@@ -30,7 +30,11 @@ sys.path.insert(0, str(REPO / 'recompiler'))
 
 from snes65816 import load_rom  # noqa: E402
 from v2.cfg_loader import load_bank_cfg  # noqa: E402
-from v2.codegen import set_name_resolver, take_unresolved_call_targets  # noqa: E402
+from v2.codegen import (  # noqa: E402
+    set_name_resolver,
+    take_unresolved_call_targets,
+    take_unresolved_goto_targets,
+)
 from v2.decoder import classify_dispatch_helper, decode_function  # noqa: E402
 from v2.emit_bank import emit_bank  # noqa: E402
 
@@ -315,60 +319,33 @@ def main() -> int:
     # post-emit, then re-emits affected banks.
     from v2.emit_bank import BankEntry  # local import again (already done above; harmless)
 
-    max_passes = 8
-    last_unresolved: set = set()
-    for pass_idx in range(max_passes):
-        # Clear any leftovers from prior session/process.
-        take_unresolved_call_targets()
-        succeeded = 0
-        failed = []
+    def _autopromote_targets(parsed_repo, demands: set, *, source_kind: str) -> int:
+        """Add BankEntry records for any (addr, m, x) demand tuple not
+        already represented in the bank's cfg. Shared between Call-target
+        and Goto-target auto-promotion. Returns the count of newly-added
+        entries.
 
-        for bank, cfg_path, cfg in parsed:
-            out_path = out_dir / f'smw_{bank:02x}_v2.c'
-            try:
-                if cfg.bank != bank:
-                    print(f"  {cfg_path.name}: bank field ${cfg.bank:02X} doesn't match filename ${bank:02X}; using filename")
-                src = emit_bank(rom, bank=bank, entries=cfg.entries,
-                                dispatch_helpers=dispatch_helpers)
-                out_path.write_text(src, encoding='utf-8')
-                if pass_idx == 0:
-                    print(f"  OK    bank ${bank:02X}: {len(cfg.entries)} entries -> {out_path}")
-                succeeded += 1
-            except Exception as e:
-                print(f"  FAIL  bank ${bank:02X}: {type(e).__name__}: {e}")
-                traceback.print_exc()
-                failed.append((bank, str(e)))
-
-        unresolved = take_unresolved_call_targets()
-        last_unresolved = unresolved
-        if not unresolved:
-            break
-
-        added = 0
-        # Bucket Call-demand (addr, m, x) tuples by owning bank.
-        # Codegen now records ALL Call demands (resolved + synthetic),
-        # so this includes cfg-named targets whose new (m, x) variant
-        # hasn't been emitted yet.
+        `source_kind` is "call" or "goto" — only used for logging context;
+        promotion logic is identical (same bucket-and-merge shape).
+        """
+        if not demands:
+            return 0
         by_bank: dict[int, list[tuple[int, int, int]]] = {}
-        for addr, em, ex in unresolved:
+        for addr, em, ex in demands:
             by_bank.setdefault((addr >> 16) & 0xFF, []).append(
                 (addr & 0xFFFF, em, ex)
             )
-
-        bank_index = {b: cfg for (b, _p, cfg) in parsed}
+        bank_index = {b: cfg for (b, _p, cfg) in parsed_repo}
+        added_local = 0
         for bank, items in by_bank.items():
             cfg = bank_index.get(bank)
             if cfg is None:
                 # Cross-bank target whose owning bank has no cfg in this
-                # repo; nothing to auto-promote, the symbol stays
-                # unresolved (later passes will keep flagging it but the
-                # set is per-pass so we exit).
+                # repo. For Calls: stays unresolved (final-pass stubs).
+                # For Gotos: the tail-call site references a
+                # bank_BB_AAAA_M*X* symbol that won't be defined here;
+                # the same final-pass stub machinery covers it.
                 continue
-            # Existing-entry index by start PC so we can clone an
-            # already-named cfg entry at a new (m, x). Without this,
-            # cfg-named targets would only ever emit at their cfg-
-            # default (m, x) and gen would reference unresolved
-            # variants like UpdateEntirePalette_M0X0.
             existing_keys: set = {
                 (e.start & 0xFFFF, e.entry_m & 1, e.entry_x & 1)
                 for e in cfg.entries
@@ -380,9 +357,6 @@ def main() -> int:
                 key = (pc, em, ex)
                 if key in existing_keys:
                     continue
-                # If there's an existing entry at this PC (any (m, x)),
-                # clone its name + end so the new variant emits as
-                # `<name>_M{em}X{ex}`. Otherwise synthesize.
                 base_entry = entries_by_pc.get(pc)
                 if base_entry is not None:
                     cfg.entries.append(BankEntry(
@@ -401,11 +375,56 @@ def main() -> int:
                     cfg.entries.append(new_entry)
                     entries_by_pc[pc] = new_entry
                 existing_keys.add(key)
-                added += 1
+                added_local += 1
+        return added_local
+
+    max_passes = 8
+    last_unresolved: set = set()
+    for pass_idx in range(max_passes):
+        # Clear any leftovers from prior session/process.
+        take_unresolved_call_targets()
+        # take_unresolved_goto_targets() retired 2026-05-02 — goto
+        # targets are now inlined into source functions by the decoder
+        # (see decoder._labeled_successors), not auto-promoted.
+        succeeded = 0
+        failed = []
+
+        for bank, cfg_path, cfg in parsed:
+            out_path = out_dir / f'smw_{bank:02x}_v2.c'
+            try:
+                if cfg.bank != bank:
+                    print(f"  {cfg_path.name}: bank field ${cfg.bank:02X} doesn't match filename ${bank:02X}; using filename")
+                src = emit_bank(rom, bank=bank, entries=cfg.entries,
+                                dispatch_helpers=dispatch_helpers,
+                                exclude_ranges=cfg.exclude_ranges or None)
+                out_path.write_text(src, encoding='utf-8')
+                if pass_idx == 0:
+                    print(f"  OK    bank ${bank:02X}: {len(cfg.entries)} entries -> {out_path}")
+                succeeded += 1
+            except Exception as e:
+                print(f"  FAIL  bank ${bank:02X}: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                failed.append((bank, str(e)))
+
+        # Drain Call-target demands only. Goto targets are no longer
+        # auto-promoted (would split asm routines and strand PHB/PLB —
+        # the title-screen-loop regression). The decoder imports them
+        # into the source function's CFG instead.
+        unresolved_calls = take_unresolved_call_targets()
+        last_unresolved = unresolved_calls
+        if not unresolved_calls:
+            break
+
+        added = _autopromote_targets(parsed, unresolved_calls, source_kind="call")
 
         if added == 0:
             break
-        print(f"  auto-promote pass {pass_idx + 1}: added {added} entries; re-emitting")
+        print(
+            f"  auto-promote pass {pass_idx + 1}: "
+            f"added {added} entries "
+            f"(calls={len(unresolved_calls)}); "
+            f"re-emitting"
+        )
 
     # Final pass: any still-unresolved Call targets after the last emit
     # belong to ROM banks not in the cfg set (e.g. data decoded as code

@@ -55,7 +55,8 @@ def emit_bank(rom: bytes, bank: int,
               entries: List[BankEntry],
               *,
               file_header: Optional[str] = None,
-              dispatch_helpers=None) -> str:
+              dispatch_helpers=None,
+              exclude_ranges: Optional[List[Tuple[int, int]]] = None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -93,6 +94,7 @@ def emit_bank(rom: bytes, bank: int,
             end=entry.end,
             func_name=entry.name,
             dispatch_helpers=dispatch_helpers,
+            exclude_ranges=exclude_ranges,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

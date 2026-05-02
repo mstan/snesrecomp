@@ -6,6 +6,7 @@
 #include "snes/cpu.h"
 #include "snes/snes.h"
 #include "util.h"
+#include "cpu_trace.h"
 #include <setjmp.h>
 #include <string.h>
 #include <time.h>
@@ -99,6 +100,9 @@ void RecompStackPush(const char *name) {
     g_recomp_stack[g_recomp_stack_top++] = name;
   g_last_recomp_func = name;
   debug_server_profile_push(name);
+  // Boundary auditor (always-on; no-op when SNESRECOMP_TRACE=0).
+  // Recorded AFTER the stack push so stack_depth reflects post-push state.
+  boundary_audit_record_entry(name);
   // Function-boundary snapshot: if a client set a target function
   // name, and this push matches it, capture WRAM. Frame execution
   // continues afterward — no longjmp. Compare the snapshot at
@@ -132,8 +136,13 @@ void RecompStackDump(void) {
 }
 
 void RecompStackPop(void) {
-  if (g_recomp_stack_top > 0)
+  // Record exit BEFORE the pop so stack_depth reflects pre-pop state and
+  // the function name is still the topmost entry. Defensive against
+  // empty stack: the auditor must NOT consume an entry_seq it didn't push.
+  if (g_recomp_stack_top > 0) {
+    boundary_audit_record_exit(g_recomp_stack[g_recomp_stack_top - 1]);
     g_recomp_stack_top--;
+  }
   g_last_recomp_func = g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)";
 }
 
