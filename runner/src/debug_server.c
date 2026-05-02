@@ -3952,20 +3952,11 @@ static void cmd_trace_get_v2(const char *args) {
         /* Skip if filter mismatches. */
         if (event_filter >= 0 && e->event_type != (uint8_t)event_filter) continue;
         if (e->event_type == CPU_TR_WRAM_WRITE) {
-            uint8_t b = (uint8_t)(e->extra1 >> 8);
-            uint16_t a = (uint16_t)(e->pc24 & 0xFFFF);  /* extra1 hit-byte; pc24 has bank, not addr */
-            /* WRAM_WRITE pc24 is (PB<<16); the actual write address isn't
-             * preserved per-event. The cpu_trace path stores hit_byte_in_word
-             * in extra1's low byte but not the addr. For range filtering on
-             * WRAM_WRITE, use the most recent BLOCK event's PC as
-             * approximation OR rely on event_type filter only.
-             *
-             * For now: bank filter applies; addr range filter skipped on
-             * WRAM_WRITE because the addr isn't stored. Clients should use
-             * the scoped tripwire (trip_get) for write-localized capture. */
-            (void)a;
-            if (bank_filter >= 0 && b != (uint8_t)bank_filter) continue;
-            (void)addr_lo; (void)addr_hi;
+            /* B2 (2026-05-01): explicit bank + addr16 fields land
+             * directly on the event. addr_lo/addr_hi range filter
+             * now works for WRAM_WRITE. */
+            if (bank_filter >= 0 && e->bank != (uint8_t)bank_filter) continue;
+            if (e->addr16 < addr_lo || e->addr16 > addr_hi) continue;
         }
         if (skip > 0 && seen_matching < skip) { seen_matching++; continue; }
         seen_matching++;
@@ -3978,6 +3969,8 @@ static void cmd_trace_get_v2(const char *args) {
             "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
             "\"m\":%u,\"x\":%u,"
             "\"extra0\":\"0x%02x\",\"extra1\":\"0x%04x\","
+            "\"bank\":\"0x%02x\",\"addr16\":\"0x%04x\",\"width\":%u,"
+            "\"old_value\":\"0x%04x\",\"new_value\":\"0x%04x\","
             "\"hash\":\"0x%08x\"}",
             emitted ? "," : "",
             (unsigned long long)abs_idx,
@@ -3985,6 +3978,8 @@ static void cmd_trace_get_v2(const char *args) {
             e->A, e->X, e->Y, e->S, e->D,
             e->DB, e->PB, e->P, e->M, e->XF,
             e->extra0, e->extra1,
+            e->bank, e->addr16, e->width,
+            e->old_value, e->new_value,
             e->native_func_id_or_hash);
         emitted++;
     }
