@@ -72,6 +72,16 @@ typedef struct CpuTraceEvent {
     uint8_t  event_type;             /* one of CPU_TR_* */
     uint8_t  extra0;                 /* event-specific (e.g. old DB) */
     uint16_t extra1;                 /* event-specific (e.g. old PB | new) */
+    /* B2 (2026-05-01): explicit named fields for WRAM_WRITE events.
+     * For non-WRAM events these stay zero. Old extra0/extra1 keep
+     * their existing back-compat semantics. Filled directly on the
+     * captured event after capture() returns (separate from the
+     * generic capture() entry path). */
+    uint8_t  bank;                   /* writer's bank ($00, $7E, ...) */
+    uint8_t  width;                  /* WRAM_WRITE: 1 or 2 */
+    uint16_t addr16;                 /* WRAM_WRITE: original 16-bit addr */
+    uint16_t old_value;              /* WRAM_WRITE: pre-store value */
+    uint16_t new_value;              /* WRAM_WRITE: post-store value */
 } CpuTraceEvent;
 
 typedef struct CpuDbpbEvent {
@@ -168,9 +178,12 @@ void cpu_trace_clear_wram_watches(void);
  * so we don't recompute the bank/addr → offset map here. `width` is 1
  * or 2 (the call site decides). For 16-bit writes the helper checks
  * each watched offset against off and off+1 separately so a watch on
- * the high byte still fires when STZ touches both bytes. */
+ * the high byte still fires when STZ touches both bytes. The caller
+ * captures `old_val` before the store and passes it through so the
+ * trace event preserves the pre-write byte (B2, 2026-05-01). */
 void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
-                                int32_t ram_off, uint16_t new_val, int width);
+                                int32_t ram_off, uint16_t old_val,
+                                uint16_t new_val, int width);
 /* If `name` matches a function entry, fire a one-shot trace dump and
  * disarm. Useful for "did the empty fallback stub get called?" probes
  * (e.g. arm on "GameMode14_InLevel_0086DF" to catch the next miss). */
@@ -409,7 +422,7 @@ static inline void cpu_trace_set_pb_watch(uint8_t b, int e)                 { (v
 static inline void cpu_trace_set_s_range_watch(uint16_t l, uint16_t h, int e){ (void)l; (void)h; (void)e; }
 static inline void cpu_trace_set_wram_watch(uint8_t b, uint16_t a, int w, int mv, uint8_t v, int e) { (void)b; (void)a; (void)w; (void)mv; (void)v; (void)e; }
 static inline void cpu_trace_clear_wram_watches(void) { }
-static inline void cpu_trace_wram_write_check(CpuState *c, uint8_t b, uint16_t a, int32_t off, uint16_t nv, int w) { (void)c; (void)b; (void)a; (void)off; (void)nv; (void)w; }
+static inline void cpu_trace_wram_write_check(CpuState *c, uint8_t b, uint16_t a, int32_t off, uint16_t ov, uint16_t nv, int w) { (void)c; (void)b; (void)a; (void)off; (void)ov; (void)nv; (void)w; }
 static inline void cpu_trace_set_func_watch(const char *n)                  { (void)n; }
 static inline void cpu_trace_arm_default_watches(void)                       { }
 static inline void cpu_trace_offrails(const char *t, uint32_t h)            { (void)t; (void)h; }

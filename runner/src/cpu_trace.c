@@ -350,6 +350,13 @@ static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
     e->event_type = event_type;
     e->extra0 = extra0;
     e->extra1 = extra1;
+    /* B2: zero-default the WRAM_WRITE-specific fields. WRAM_WRITE call
+     * sites overwrite these immediately after capture() returns. */
+    e->bank = 0;
+    e->width = 0;
+    e->addr16 = 0;
+    e->old_value = 0;
+    e->new_value = 0;
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
@@ -596,7 +603,8 @@ void cpu_trace_clear_wram_watches(void) {
 }
 
 void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
-                                int32_t ram_off, uint16_t new_val, int width) {
+                                int32_t ram_off, uint16_t old_val,
+                                uint16_t new_val, int width) {
     /* Scoped tripwire fires regardless of g_wram_watch_any — it has its
      * own armed/triggered gate. Check it here BEFORE the early-out so a
      * client can arm a tripwire without needing a parallel cpu_trace
@@ -636,10 +644,24 @@ void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
         else if (width == 2 && w->ram_offset == ram_off + 1) hit_byte = 1;
         if (hit_byte < 0) continue;
         uint8_t hit_val = (hit_byte == 0) ? b0 : b1;
-        /* Always record. extra0 = new value, extra1 = (bank<<8) | hit_byte. */
+        /* Always record. extra0 = new value, extra1 = (bank<<8) | hit_byte
+         * (legacy back-compat). New B2 fields land directly on the
+         * captured event after capture() returns: explicit
+         * bank/width/addr16/old_value/new_value eliminate the
+         * "arm one byte at a time" workaround. */
         uint32_t pc24 = ((uint32_t)cpu->PB << 16); /* low 16 unknown at write site */
         capture(cpu, pc24, CPU_TR_WRAM_WRITE, hit_val,
                 (uint16_t)(((uint16_t)bank << 8) | (uint16_t)hit_byte));
+        /* The just-captured event is at index (g_cpu_trace_idx - 1). */
+        {
+            uint64_t just_idx = g_cpu_trace_idx - 1;
+            CpuTraceEvent *just = &g_cpu_trace_ring[just_idx & (g_cpu_trace_capacity - 1)];
+            just->bank = bank;
+            just->width = (uint8_t)width;
+            just->addr16 = (uint16_t)(addr + (uint16_t)hit_byte);
+            just->old_value = old_val;
+            just->new_value = new_val;
+        }
         /* Tripwire branch: only if match_value is set AND the value matches.
          * The tripwire is one-shot to avoid stderr spam on tight write
          * loops; recording continues regardless. */
