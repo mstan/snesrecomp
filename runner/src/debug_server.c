@@ -4273,6 +4273,56 @@ static void cmd_db_trip_get(const char *args) {
 #endif
 }
 
+/* NLR diagnostic — non-rotating counters that survive cpu_trace ring
+ * rotation. Answers "did any NLR-pattern block ever execute?" and
+ * "did any Return ever consume a non-zero pending_skip?" — questions
+ * the rotating ring can't answer once it's wrapped. */
+static void cmd_nlr_diag(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    NlrDiag *d = &g_nlr_diag;
+    static char buf[16384];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"site_exec_count\":%llu,"
+        "\"pending_skip_writes\":%llu,"
+        "\"pending_skip_reads_zero\":%llu,"
+        "\"pending_skip_reads_nonzero\":%llu,"
+        "\"first_writer\":{\"captured\":%u",
+        (unsigned long long)d->site_exec_count,
+        (unsigned long long)d->pending_skip_writes,
+        (unsigned long long)d->pending_skip_reads_zero,
+        (unsigned long long)d->pending_skip_reads_nonzero,
+        d->first_writer_captured);
+    if (d->first_writer_captured) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"pc24\":\"0x%06x\",\"value\":%u,\"func\":\"%s\"",
+            d->first_writer_frame, d->first_writer_pc24,
+            d->first_writer_value, d->first_writer_func);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "},\"first_consumer\":{\"captured\":%u",
+        d->first_consumer_captured);
+    if (d->first_consumer_captured) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"pc24\":\"0x%06x\",\"value\":%u,\"func\":\"%s\"",
+            d->first_consumer_frame, d->first_consumer_pc24,
+            d->first_consumer_value, d->first_consumer_func);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "},\"per_site\":[");
+    for (int i = 0; i < d->per_site_used; i++) {
+        if (pos > (int)sizeof(buf) - 256) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"label\":\"%s\",\"count\":%llu}",
+            i ? "," : "", d->per_site_label[i],
+            (unsigned long long)d->per_site_count[i]);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* DMA tripwire — fires on the FIRST $420B write where any active
  * channel has VRAM destination in $7000-$8FFF AND source bank $05.
  * Captures rich snapshot for offline analysis. */
@@ -4638,6 +4688,7 @@ static const CmdEntry s_commands[] = {
     {"boundary_get",   cmd_boundary_get},
     {"db_trip_arm",    cmd_db_trip_arm},
     {"db_trip_get",    cmd_db_trip_get},
+    {"nlr_diag",       cmd_nlr_diag},
     {"db_trip_disarm", cmd_db_trip_disarm},
     {"dma_trip_get",   cmd_dma_trip_get},
     {"pxwatch_arm",    cmd_pxwatch_arm},

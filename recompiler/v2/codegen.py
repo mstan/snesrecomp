@@ -843,23 +843,37 @@ def _emit_call(op: Call) -> List[str]:
 
 
 def _emit_return(op: Return) -> List[str]:
-    """RTS / RTL / RTI emit. Reads + clears cpu->pending_skip (set by
-    an upstream NLR-pattern block on the same path) and returns its
-    value. NORMAL paths get pending_skip == 0 == RECOMP_RETURN_NORMAL.
+    """RTS / RTL / RTI emit. Reads + clears the function-LOCAL
+    `_pending_skip` (set by an upstream NLR-pattern block on the same
+    path) and returns its value. NORMAL paths get _pending_skip == 0
+    == RECOMP_RETURN_NORMAL.
+
+    `_pending_skip` is declared at the top of every emitted function
+    by emit_function.py — see the prologue there for design rationale.
+    NOT cpu->pending_skip: NLR signaling is C control-flow state, not
+    65816 hardware state, and storing it on CpuState invited
+    optimizer/aliasing weirdness around the cpu pointer.
+
+    cpu_trace_pending_skip_consume is a non-rotating counter (separate
+    from the cpu_trace ring, which rotates) so probes can answer "did
+    any Return on this run read non-zero _pending_skip ever" — even
+    after the ring has rotated past boot.
 
     The `return ...;` line stays at the start of its line so the
     per-line scanner in emit_function.py auto-injects RecompStackPop()
-    before it. Wrapped in {} so `_ps` is local-scoped."""
+    before it."""
     if op.interrupt:
         return [
             "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);",
-            "{ uint8 _ps = cpu->pending_skip; cpu->pending_skip = 0;",
-            "  return (RecompReturn)_ps; /* RTI */ }",
+            "{ RecompReturn _ps = _pending_skip; _pending_skip = RECOMP_RETURN_NORMAL;",
+            "  cpu_trace_pending_skip_consume(cpu, 0, (uint8)_ps, g_last_recomp_func);",
+            "  return _ps; /* RTI */ }",
         ]
     label = "/* RTL */" if op.long else "/* RTS */"
     return [
-        "{ uint8 _ps = cpu->pending_skip; cpu->pending_skip = 0;",
-        f"  return (RecompReturn)_ps; {label} }}",
+        "{ RecompReturn _ps = _pending_skip; _pending_skip = RECOMP_RETURN_NORMAL;",
+        "  cpu_trace_pending_skip_consume(cpu, 0, (uint8)_ps, g_last_recomp_func);",
+        f"  return _ps; {label} }}",
     ]
 
 

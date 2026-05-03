@@ -79,24 +79,20 @@ typedef struct CpuState {
      * issue cpu_readN / cpu_writeN against this pointer so DB / D / S
      * / PB-relative addressing all resolve through the cpu_ helpers. */
     uint8 *ram;
-
-    /* Pending non-local-return skip count. Set by NLR-pattern blocks
-     * (the asm "PLA*N before fall-through to RTS" idiom — see
-     * RecompReturn enum above) and consumed by the next RTS/RTL emit
-     * site, which returns it instead of RECOMP_RETURN_NORMAL.
-     *
-     * The NLR block must NOT do the literal PLAs (those would consume
-     * ancestor data on the simulated SNES stack since v2 doesn't push
-     * return-PC bytes). Instead the block stores the skip count here
-     * and falls through to the successor block, which runs its real
-     * work normally and reaches the RTS — where pending_skip is read
-     * and reset.
-     *
-     * Stored as uint8 (cast to RecompReturn) so the field placement
-     * doesn't depend on enum-type layout. Init to 0 (NORMAL) by
-     * cpu_state_init. */
-    uint8 pending_skip;
 } CpuState;
+
+/* NB: NLR pending-skip state is intentionally NOT a CpuState field.
+ * It's declared as a function-local `RecompReturn _pending_skip` at
+ * the top of every emitted v2 function — see emit_function.py. NLR
+ * skip is C control-flow state, not 65816 hardware state, and a
+ * prior `cpu->pending_skip` field on CpuState produced layout/
+ * aliasing weirdness around the cpu pointer that masked the bug
+ * the dynamic auditor was supposed to characterize. The local
+ * variable is invisible to unrelated runtime helpers, can be kept
+ * in a register by the optimizer, and matches the actual lifetime
+ * of the signal (only meaningful within the currently executing
+ * generated function).
+ */
 
 /* Read the B byte of the 16-bit accumulator. Always equals the high
  * byte of A; provided as a helper so call sites read intent rather

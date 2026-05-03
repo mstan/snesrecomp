@@ -64,16 +64,12 @@ HIDDEN_REGS = {
     'emulation',
 }
 
-# Recompiler-only state: not part of the 65816 architecture but used by
-# the v2 C ABI. `pending_skip` threads non-local-return signaling
-# across call frames — set by NLR-pattern blocks (PLA*N + RTS idiom),
-# consumed by the next Return op. See RecompReturn enum in cpu_state.h
-# and project_first_db_corruption_root_2026_05_02 in memory.
-ABI_STATE = {
-    'pending_skip',
-}
+# NB: NLR pending-skip is intentionally NOT a CpuState field. It's a
+# function-local `RecompReturn _pending_skip` declared per emitted v2
+# function — see emit_function.py prologue + cpu_state.h header. So
+# no `cpu->pending_skip` reference should appear in v2 emit output.
 
-ALLOWED = CANONICAL | SHADOWS_FROM_P | HIDDEN_REGS | ABI_STATE
+ALLOWED = CANONICAL | SHADOWS_FROM_P | HIDDEN_REGS
 
 
 # Fields that were once present and have since been deleted as

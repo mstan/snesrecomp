@@ -29,6 +29,7 @@ TEST_MODULES = [
     'test_emit_bank_smoke',
     'test_cfg_loader',
     'test_v2_emit_lint',
+    'test_nlr_idiom',
 ]
 
 

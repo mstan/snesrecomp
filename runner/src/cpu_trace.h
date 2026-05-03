@@ -544,6 +544,89 @@ static inline void boundary_audit_record_entry(const char *n) { (void)n; }
 static inline void boundary_audit_record_exit(const char *n) { (void)n; }
 #endif
 
+/* ── NLR diagnostic counters (non-rotating) ────────────────────────────
+ *
+ * Phase 2 of the non-local-return work (2026-05-02) introduced a
+ * regression that the rotating cpu_trace ring couldn't characterize
+ * — by the time TCP probes attached and queried, NLR_DETECT trace
+ * events had already rotated out of the 16M-entry ring (~12 rotations
+ * in the first 10 seconds at typical event rates).
+ *
+ * These monotonic counters survive ring rotation: they answer
+ * "did this event ever happen, ever, even once" rather than "did it
+ * happen in the last 16M events." Critical for proving whether the
+ * NLR-modified blocks actually execute or not — a non-zero
+ * site_exec_count is proof of execution; a zero count after Mario
+ * has run for many seconds is proof of non-execution.
+ */
+#define NLR_DIAG_FIRST_FUNC_LEN 64
+#define NLR_DIAG_PER_SITE_MAX  16
+
+typedef struct NlrDiag {
+    uint64_t site_exec_count;          /* total NLR block executions */
+    uint64_t pending_skip_writes;      /* count of cpu->pending_skip = nonzero */
+    uint64_t pending_skip_reads_zero;  /* Returns that read pending_skip == 0 */
+    uint64_t pending_skip_reads_nonzero; /* Returns that read pending_skip != 0 */
+
+    /* First time pending_skip went from 0 → nonzero, where? */
+    uint8_t  first_writer_captured;
+    uint8_t  pad[3];
+    uint32_t first_writer_pc24;
+    int32_t  first_writer_frame;
+    uint8_t  first_writer_value;
+    uint8_t  pad2[3];
+    char     first_writer_func[NLR_DIAG_FIRST_FUNC_LEN];
+
+    /* First time a Return read pending_skip != 0, where? */
+    uint8_t  first_consumer_captured;
+    uint8_t  pad3[3];
+    uint32_t first_consumer_pc24;
+    int32_t  first_consumer_frame;
+    uint8_t  first_consumer_value;
+    uint8_t  pad4[3];
+    char     first_consumer_func[NLR_DIAG_FIRST_FUNC_LEN];
+
+    /* Per-site exec counts, keyed by FNV-1a hash of "func/label". */
+    int32_t  per_site_used;
+    int32_t  pad5;
+    uint32_t per_site_hash[NLR_DIAG_PER_SITE_MAX];
+    uint64_t per_site_count[NLR_DIAG_PER_SITE_MAX];
+    char     per_site_label[NLR_DIAG_PER_SITE_MAX][NLR_DIAG_FIRST_FUNC_LEN];
+} NlrDiag;
+
+#if SNESRECOMP_TRACE
+extern NlrDiag g_nlr_diag;
+
+/* Record execution of a specific NLR pattern site. Called from the
+ * generated NLR-block emit BEFORE the pending_skip store. `name` is
+ * a "FuncName/L_BLOCK_M1X1" style label so different NLR sites in the
+ * same function are distinguishable. */
+void cpu_trace_nlr_site_exec(CpuState *cpu, uint32_t pc24, const char *name);
+
+/* Record a write to cpu->pending_skip that transitions it from 0 to
+ * non-zero. Called from the NLR-block emit AFTER setting pending_skip. */
+void cpu_trace_pending_skip_write(CpuState *cpu, uint32_t pc24,
+                                  uint8_t new_value, const char *func);
+
+/* Record a Return that READ pending_skip. Called from _emit_return.
+ * Both zero and non-zero reads counted (separately) so the ratio
+ * tells us how often skip-propagation actually happens. */
+void cpu_trace_pending_skip_consume(CpuState *cpu, uint32_t pc24,
+                                    uint8_t value, const char *func);
+#else
+static inline void cpu_trace_nlr_site_exec(CpuState *c, uint32_t p, const char *n) {
+    (void)c; (void)p; (void)n;
+}
+static inline void cpu_trace_pending_skip_write(CpuState *c, uint32_t p,
+                                                uint8_t v, const char *f) {
+    (void)c; (void)p; (void)v; (void)f;
+}
+static inline void cpu_trace_pending_skip_consume(CpuState *c, uint32_t p,
+                                                  uint8_t v, const char *f) {
+    (void)c; (void)p; (void)v; (void)f;
+}
+#endif
+
 /* Dump the last `n` events of the main ring to stderr, prefixed by `tag`. */
 void cpu_trace_dump_recent(const char *tag, int n);
 /* Dump the entire dbpb ring (newest first). */
