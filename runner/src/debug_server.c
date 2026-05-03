@@ -1071,6 +1071,14 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
         if (s_block_trace.count < BLOCK_TRACE_LOG_SIZE) s_block_trace.count++;
     }
     // Hot-path pause check. Almost always not taken.
+    // Plain `pause` cmd via cmd_pause sets s_paused=1; honor it here so
+    // the main thread parks at the next block boundary. Without this,
+    // setting s_paused=1 from TCP had no effect (the wait was only
+    // entered on breakpoint hit). 2026-05-03.
+    if (s_paused) {
+        debug_server_wait_if_paused();
+        return;
+    }
     if (!s_rdb_break_armed && !s_rdb_step_pending) return;
     int hit = s_rdb_step_pending;
     if (!hit) {
@@ -4331,6 +4339,161 @@ static void cmd_stack_drift_get(const char *args) {
 #endif
 }
 
+/* Function-name entry watch: arm by name, then query for the first-hit
+ * snapshot (frame, pc, registers, full recomp call stack). The watch is
+ * one-shot — re-arming via func_watch_arm clears the prior snapshot.
+ *
+ *   func_watch_arm <function_name>     — arm with name (FNV-1a hashed)
+ *   func_watch_get                     — return captured snapshot or empty
+ */
+static void cmd_func_watch_arm(const char *args) {
+#if SNESRECOMP_TRACE
+    if (!args || !*args) {
+        send_fmt("{\"error\":\"func_watch_arm needs <name>\"}");
+        return;
+    }
+    /* Copy into static storage so the cstr lives past this fn's stack. */
+    static char watched_name[80];
+    int i = 0;
+    while (args[i] && args[i] != ' ' && args[i] != '\n' && i < (int)sizeof(watched_name) - 1) {
+        watched_name[i] = args[i]; i++;
+    }
+    watched_name[i] = 0;
+    cpu_trace_set_func_watch(watched_name);
+    send_fmt("{\"ok\":1,\"watching\":\"%s\"}", watched_name);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_func_watch_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    FuncWatchHit *h = &g_func_watch_hit;
+    static char buf[16384];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"captured\":%u", h->captured);
+    if (h->captured) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"pc24\":\"0x%06x\",\"name\":\"%s\","
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,\"e\":%u,\"stack\":[",
+            h->frame, h->pc24, h->name,
+            h->A, h->X, h->Y, h->S, h->D,
+            h->DB, h->PB, h->P, h->m_flag, h->x_flag, h->e_flag);
+        for (int i = 0; i < h->stack_depth; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", h->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+/* Per-instruction stack-op trace: enable / disable / status. Off by default
+ * because it produces ~5-10x more events than block trace at typical play
+ * rates. Turn on for short windows (e.g. arm just before frame 800, query
+ * the resulting CPU_TR_STACK_OP events around frame 822 trip). */
+static void cmd_stack_op_enable(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    g_stack_op_trace_enabled = 1;
+    send_fmt("{\"ok\":1,\"enabled\":1}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+static void cmd_stack_op_disable(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    g_stack_op_trace_enabled = 0;
+    send_fmt("{\"ok\":1,\"enabled\":0}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+static void cmd_stack_op_status(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    send_fmt("{\"ok\":1,\"enabled\":%u}", g_stack_op_trace_enabled);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+/* Stack-drift control: arm / clear / disarm. The auditor auto-arms at
+ * boot with frame_min=400 to skip boot prolog noise. After a trip, the
+ * boundary ring is FROZEN to preserve the seq window for inspection.
+ * To investigate later events (e.g. a death scene many frames after a
+ * benign earlier imbalance), call stack_drift_clear [frame_min] — that
+ * resets the trip flag AND unfreezes the boundary ring, so subsequent
+ * imbalances and the full ongoing call boundary stream are captured
+ * again.
+ *
+ * Args:
+ *   stack_drift_arm <frame_min>           — full arm: clear+set frame_min+arm
+ *   stack_drift_clear [frame_min]         — clear trip; keep armed; optional
+ *                                           new frame_min (default: keep)
+ *   stack_drift_disarm                    — disarm; ring stays unfrozen
+ */
+static void cmd_stack_drift_arm(const char *args) {
+#if SNESRECOMP_TRACE
+    extern uint8_t g_boundary_frozen;
+    int frame_min = 0;
+    if (args && *args) frame_min = (int)strtol(args, NULL, 0);
+    cpu_trace_arm_stack_drift_tripwire((int32_t)frame_min);
+    g_boundary_frozen = 0;
+    send_fmt("{\"ok\":1,\"armed\":1,\"frame_min\":%d}", frame_min);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_stack_drift_clear(const char *args) {
+#if SNESRECOMP_TRACE
+    extern uint8_t g_boundary_frozen;
+    StackDriftTripwire *t = &g_stack_drift_tripwire;
+    int new_min = t->frame_min;
+    if (args && *args) new_min = (int)strtol(args, NULL, 0);
+    /* Clear trip + boundary-history snapshot, keep armed flag. */
+    uint8_t was_armed = t->armed ? 1 : 0;
+    memset(t, 0, sizeof(*t));
+    t->armed = was_armed;
+    t->frame_min = (int32_t)new_min;
+    /* Unfreeze the live boundary ring so post-clear events resume. The
+     * DB tripwire shares the same g_boundary_frozen flag — only unfreeze
+     * if THAT tripwire isn't holding a snapshot we'd lose. Conservative:
+     * unfreeze unconditionally — DB trip can be re-armed/cleared similarly
+     * via db_trip_arm. */
+    g_boundary_frozen = 0;
+    send_fmt("{\"ok\":1,\"armed\":%u,\"frame_min\":%d,\"triggered\":0}",
+             t->armed, new_min);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_stack_drift_disarm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    extern uint8_t g_boundary_frozen;
+    cpu_trace_disarm_stack_drift_tripwire();
+    g_boundary_frozen = 0;
+    send_fmt("{\"ok\":1,\"armed\":0}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* NLR diagnostic — non-rotating counters that survive cpu_trace ring
  * rotation. Answers "did any NLR-pattern block ever execute?" and
  * "did any Return ever consume a non-zero pending_skip?" — questions
@@ -4748,6 +4911,14 @@ static const CmdEntry s_commands[] = {
     {"db_trip_get",    cmd_db_trip_get},
     {"nlr_diag",       cmd_nlr_diag},
     {"stack_drift_get", cmd_stack_drift_get},
+    {"stack_drift_arm", cmd_stack_drift_arm},
+    {"stack_drift_clear", cmd_stack_drift_clear},
+    {"stack_drift_disarm", cmd_stack_drift_disarm},
+    {"func_watch_arm", cmd_func_watch_arm},
+    {"func_watch_get", cmd_func_watch_get},
+    {"stack_op_enable",  cmd_stack_op_enable},
+    {"stack_op_disable", cmd_stack_op_disable},
+    {"stack_op_status",  cmd_stack_op_status},
     {"db_trip_disarm", cmd_db_trip_disarm},
     {"dma_trip_get",   cmd_dma_trip_get},
     {"pxwatch_arm",    cmd_pxwatch_arm},

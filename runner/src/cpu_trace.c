@@ -781,6 +781,35 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
         snprintf(tag, sizeof(tag), "FUNC-WATCH HIT %s at PC $%06X",
                  g_func_watch_name ? g_func_watch_name : "?", pc24);
         g_func_watch_hash = 0;  /* one-shot */
+        /* Capture full stack snapshot so probes can answer "what called
+         * this function?" without ring reconstruction. Defensive: works
+         * even if g_recomp_stack overflowed. */
+        FuncWatchHit *fwh = &g_func_watch_hit;
+        memset(fwh, 0, sizeof(*fwh));
+        fwh->captured = 1;
+        extern int snes_frame_counter;
+        fwh->frame = snes_frame_counter;
+        fwh->pc24 = pc24;
+        if (cpu) {
+            fwh->A = cpu->A; fwh->X = cpu->X; fwh->Y = cpu->Y;
+            fwh->S = cpu->S; fwh->D = cpu->D;
+            fwh->DB = cpu->DB; fwh->PB = cpu->PB; fwh->P = cpu->P;
+            fwh->m_flag = cpu->m_flag; fwh->x_flag = cpu->x_flag;
+            fwh->e_flag = cpu->emulation;
+        }
+        if (g_func_watch_name) {
+            strncpy(fwh->name, g_func_watch_name, sizeof(fwh->name) - 1);
+        }
+        int depth = g_recomp_stack_top;
+        if (depth > 64) depth = 64;
+        fwh->stack_depth = depth;
+        int skip = g_recomp_stack_top - depth;
+        for (int i = 0; i < depth; i++) {
+            const char *p = g_recomp_stack[skip + i];
+            if (p) {
+                strncpy(fwh->stack[i], p, sizeof(fwh->stack[i]) - 1);
+            }
+        }
         cpu_trace_dump_dbpb(tag);
         cpu_trace_dump_recent(tag, 128);
     }
@@ -789,6 +818,25 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
 void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                      uint8_t extra0, uint16_t extra1) {
     capture(cpu, pc24, event_type, extra0, extra1);
+}
+
+uint8_t g_stack_op_trace_enabled = 0;
+
+void cpu_trace_stack_op(CpuState *cpu, uint32_t pc24, uint8_t op_id,
+                        uint16_t old_S, int8_t delta) {
+    if (!g_stack_op_trace_enabled) return;
+    /* extra0 = op_id, extra1 = (uint16)((uint8)delta << 8) — sign-extended at
+     * read time. Old S goes in addr16; new S in new_value (these are unused
+     * for non-WRAM events, free to repurpose). */
+    capture(cpu, pc24, CPU_TR_STACK_OP, op_id,
+            (uint16_t)((uint16_t)(uint8_t)delta << 8));
+    uint64_t just_idx = g_cpu_trace_idx - 1;
+    CpuTraceEvent *just = &g_cpu_trace_ring[just_idx & (g_cpu_trace_capacity - 1)];
+    just->addr16 = old_S;
+    just->new_value = cpu->S;
+    just->old_value = old_S;
+    just->width = 0;
+    just->bank = 0;
 }
 
 static int db_watch_hit(uint8_t db) {
@@ -877,10 +925,15 @@ void cpu_trace_set_s_range_watch(uint16_t s_lo, uint16_t s_hi, int enabled) {
 /* Function-name watch (matched by FNV-1a hash inside cpu_trace_func_entry). */
 uint32_t g_func_watch_hash = 0;
 const char *g_func_watch_name = NULL;
+/* FuncWatchHit struct definition is in cpu_trace.h so debug_server.c
+ * can read fields directly via the extern declaration. */
+FuncWatchHit g_func_watch_hit = {0};
 void cpu_trace_set_func_watch(const char *name) {
     extern uint32_t fnv1a_extern(const char *s);
     g_func_watch_name = name;
     g_func_watch_hash = name ? fnv1a_extern(name) : 0;
+    /* Reset captured state so the next hit takes a fresh snapshot. */
+    memset(&g_func_watch_hit, 0, sizeof(g_func_watch_hit));
 }
 
 /* WRAM-address watches.

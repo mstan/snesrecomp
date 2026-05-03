@@ -60,6 +60,37 @@ enum {
     CPU_TR_NLR_DETECT  = 15,  /* a non-local-return idiom block fired */
     CPU_TR_NLR_PROPAGATE = 16,  /* a callsite forwarded a SKIP_N up the stack */
     CPU_TR_NLR_CONSUMED = 17,  /* a callsite received SKIP_N and decremented */
+    /* Per-instruction stack-op trace. Captures every PHA/PHX/PHY/PHP/PHB/PHD/PHK,
+     * PEA/PEI/PER, PLA/PLX/PLY/PLP/PLB/PLD, and RTS/RTL/RTI as they execute.
+     * extra0 = stack-op mnemonic id (see CPU_STACK_OP_*).
+     * extra1 = (high byte = bytes pushed/popped, signed: +N = pushed, -N = popped;
+     *          low byte = unused). Use addr16 for old S, new_value for new S
+     *          (reusing the WRAM_WRITE field slots; non-WRAM events leave them
+     *          zero today, so the field is free). */
+    CPU_TR_STACK_OP    = 18,
+};
+
+/* Stack-op mnemonic IDs. Encoded in extra0 of CPU_TR_STACK_OP events. */
+enum {
+    CPU_STACK_OP_PHA = 1,
+    CPU_STACK_OP_PHX = 2,
+    CPU_STACK_OP_PHY = 3,
+    CPU_STACK_OP_PHP = 4,
+    CPU_STACK_OP_PHB = 5,
+    CPU_STACK_OP_PHD = 6,
+    CPU_STACK_OP_PHK = 7,
+    CPU_STACK_OP_PEA = 8,
+    CPU_STACK_OP_PEI = 9,
+    CPU_STACK_OP_PER = 10,
+    CPU_STACK_OP_PLA = 11,
+    CPU_STACK_OP_PLX = 12,
+    CPU_STACK_OP_PLY = 13,
+    CPU_STACK_OP_PLP = 14,
+    CPU_STACK_OP_PLB = 15,
+    CPU_STACK_OP_PLD = 16,
+    CPU_STACK_OP_RTS = 17,
+    CPU_STACK_OP_RTL = 18,
+    CPU_STACK_OP_RTI = 19,
 };
 
 typedef struct CpuTraceEvent {
@@ -133,6 +164,15 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name);
 void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                      uint8_t extra0, uint16_t extra1);
 
+/* Per-instruction stack-op trace. Gen code (or a hand-body) calls this
+ * AFTER the push/pull mutates cpu->S. We capture old_S = new_S +/- delta
+ * and record into the main ring as CPU_TR_STACK_OP. Off by default —
+ * enable by setting g_stack_op_trace_enabled = 1 (controllable via TCP).
+ * `delta` is +N for pulls (S increased), -N for pushes (S decreased). */
+extern uint8_t g_stack_op_trace_enabled;
+void cpu_trace_stack_op(CpuState *cpu, uint32_t pc24, uint8_t op_id,
+                        uint16_t old_S, int8_t delta);
+
 /* Specialised helpers — record the PRE/POST values of DB/PB mutations and
  * mirror them into the small DB/PB ring. PC24 is the source-line PC of
  * the instruction performing the mutation. Calls cpu_trace_event() for
@@ -194,6 +234,21 @@ void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
  * disarm. Useful for "did the empty fallback stub get called?" probes
  * (e.g. arm on "GameMode14_InLevel_0086DF" to catch the next miss). */
 void cpu_trace_set_func_watch(const char *name);
+
+/* Snapshot captured at the FIRST entry to the func_watch'd function.
+ * Includes registers and a copy of g_recomp_stack[] — answers "what
+ * called this function?" without ring reconstruction. */
+typedef struct FuncWatchHit {
+    uint8_t  captured;
+    int      frame;
+    uint32_t pc24;
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+    char     name[64];
+    int      stack_depth;
+    char     stack[64][64];
+} FuncWatchHit;
+extern FuncWatchHit g_func_watch_hit;
 
 /* Arm the standard SMW v2-boot watch set: high-bank DBs ($A0-$FF), any
  * PB != 0, S outside $0100-$1FFF, and known fallback stub names.
@@ -768,6 +823,10 @@ static inline void cpu_trace_disarm_px_tripwire(void) { }
 static inline void cpu_trace_clear_px_tripwire(void) { }
 static inline void cpu_trace_px_record(CpuState *c, uint32_t p, uint8_t k, uint8_t o, uint8_t n) { (void)c; (void)p; (void)k; (void)o; (void)n; }
 static inline void cpu_trace_px_breadcrumb(CpuState *c, uint32_t m, const char *l) { (void)c; (void)m; (void)l; }
+static inline void cpu_trace_stack_op(CpuState *c, uint32_t p, uint8_t op,
+                                      uint16_t s, int8_t d) {
+    (void)c; (void)p; (void)op; (void)s; (void)d;
+}
 
 #endif
 

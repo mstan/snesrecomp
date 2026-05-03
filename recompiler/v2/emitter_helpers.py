@@ -70,6 +70,26 @@ def pop_word_assign(target_decl: str) -> List[str]:
     ]
 
 
+# ── Stack-op trace wrapper ──────────────────────────────────────────────
+#
+# Wraps an existing push/pull C-line sequence with a "save old S → emit ops
+# → emit cpu_trace_stack_op" envelope. The trace call is gated at runtime by
+# g_stack_op_trace_enabled, so when disabled it's a single load+branch.
+#
+# `op_id` is one of CPU_STACK_OP_* (see cpu_trace.h enum). `delta` is +N for
+# pulls (S grows), -N for pushes (S shrinks). The wrapper opens its own
+# `{ uint16 _old_s = cpu->S; ... }` scope so the temporary doesn't leak.
+def stack_op_traced(op_id: str, delta: int, body: List[str]) -> List[str]:
+    """Wrap `body` (push/pull lines) with old-S capture + post-trace call."""
+    return [
+        "{",
+        "  uint16 _old_s = cpu->S;",
+        *(f"  {ln}" for ln in body),
+        f"  cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, {delta});",
+        "}",
+    ]
+
+
 # ── REP/SEP P-mirror sync envelope (DRY_REFACTOR follow-up D) ──────────
 #
 # REP and SEP modify the packed `cpu->P` byte. To stay correct, the

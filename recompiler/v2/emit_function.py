@@ -146,83 +146,141 @@ def emit_function(rom: bytes, bank: int, start: int,
 
     # ── Non-local-return idiom detection ────────────────────────────────
     # A basic block is an NLR-block if its IR has the shape
-    #   [PullReg(A) × N] + (Goto-only-terminator | Return-terminator)
+    #   [<setup ops>] + [PullReg(A) × N] + (Goto | Return)
     # where N is a multiple of the return-PC byte count (2 for RTS, 3
-    # for RTL). Two sub-cases:
+    # for RTL). Setup ops are anything OTHER than Push/Pull/Call (those
+    # would interfere with stack accounting). Three sub-cases:
     #   (a) Block ends in its own Return — single-block PLA*N RTS,
     #       e.g. a leaf "SkipCaller" function. Skip = N / unit.
-    #   (b) Block has only PullRegs and exactly one successor whose
-    #       body ends in Return without further stack manipulation —
-    #       multi-block "BNE NLRBlock; ... NLRBlock: PLA*N + (BRA-
-    #       target or fall-through); tail: real-work + RTS".
-    # In either case we set cpu->pending_skip = SKIP_N and skip the
-    # literal PLA emit. The eventual Return op consumes pending_skip.
-    # See RecompReturn enum in cpu_state.h.
-    def _detect_nlr(key: DecodeKey) -> int:
+    #   (b) Block ends in a Goto whose successor block ends in Return
+    #       (no further stack manipulation in successor) — multi-block
+    #       BNE NLRBlock; NLRBlock: PLA*N + BRA tail; tail: work + RTS.
+    #   (c) Block has setup work + PLA*N + JMP cross-fn. The JMP target
+    #       is decoded INTO this function's CFG (v2 inlines cross-fn
+    #       branch targets), and that target eventually RTSes. The
+    #       setup ops are real game-state changes — they MUST be
+    #       emitted; only the PLAs and the SKIP emit are special.
+    #       Yoshi-block 2026-05-02: $00:F005 has this pattern with
+    #       JMP $EE35 — Mario-on-Yoshi-vs-koopa-slope death root.
+    # Returns a dict {skip:int, pla_start_ir_idx:int, pla_count:int}
+    # so the emit loop can preserve setup ops, skip just the PLAs, and
+    # set _pending_skip before the terminator.
+    import os, sys as _sys
+    _NLR_DEBUG = os.environ.get('SNESRECOMP_NLR_DEBUG') == '1'
+    def _detect_nlr(key: DecodeKey):
+        def _dbg(msg):
+            if _NLR_DEBUG:
+                print(f'[nlr_dbg] {func_name} {_label_for(key)}: {msg}',
+                      file=_sys.stderr, flush=True)
         ops = block_ir.get(key, [])
         if not ops:
-            return 0
-        pull_count = 0
-        rest_start = 0
-        for i, op in enumerate(ops):
-            if isinstance(op, PullReg) and op.reg == Reg.A:
-                pull_count += 1
-            else:
-                rest_start = i
-                break
+            _dbg('REJECT: no ops')
+            return None
+        # Three terminator shapes:
+        #   - Block ends in Return — the RTS picks up _pending_skip.
+        #   - Block ends in Goto — the goto's successor must be a
+        #     Return-terminated block.
+        #   - Block ends in something else (e.g. PullReg, Read, Write) —
+        #     the block has NO terminator IR, just an implicit
+        #     fall-through to its single CFG successor. Same NLR
+        #     handling as the Goto case (chase successor).
+        last_op = ops[-1]
+        if isinstance(last_op, (Goto, Return)):
+            terminator = last_op
+            scan_end_excl = len(ops) - 1
         else:
-            rest_start = len(ops)
+            terminator = None
+            scan_end_excl = len(ops)
+        # Walk backward from scan_end_excl, counting PullReg(A)s.
+        i = scan_end_excl - 1
+        pla_end_excl = scan_end_excl
+        while i >= 0 and isinstance(ops[i], PullReg) and ops[i].reg == Reg.A:
+            i -= 1
+        pla_start = i + 1
+        pull_count = pla_end_excl - pla_start
+        _dbg(f'pull_count={pull_count} pla_start={pla_start} '
+             f'terminator={type(terminator).__name__ if terminator else "fall-through"}')
         if pull_count < 2:
-            return 0
-        rest = ops[rest_start:]
+            return None
+        # Setup region (before PLAs) must not contain Push/Pull/Call/
+        # IndirectGoto — those would interfere with stack accounting.
+        # Goto/CondBranch in the middle would mean the block isn't
+        # straight-line, which isn't possible at this stage of v2
+        # (each basic block has exactly one terminator), but check
+        # defensively.
+        for op in ops[:pla_start]:
+            if isinstance(op, (PushReg, PullReg, Push, Pull)):
+                _dbg(f'REJECT: setup region has {type(op).__name__}')
+                return None
+            if isinstance(op, (Call, IndirectGoto)):
+                _dbg(f'REJECT: setup region has {type(op).__name__}')
+                return None
+            if isinstance(op, (Goto, Return, CondBranch)):
+                _dbg(f'REJECT: setup region has {type(op).__name__}')
+                return None
+        # Determine return-PC byte count: 2 for RTS, 3 for RTL.
         long_return = None
-        return_ops = [op for op in rest if isinstance(op, Return)]
-        if return_ops:
-            # Sub-case (a): rest contains a Return. Reject if any other
-            # state-touching op is in `rest` (Goto / CondBranch tolerated
-            # only as control-flow, not as work).
-            for op in rest:
-                if isinstance(op, (PushReg, PullReg, Push, Pull)):
-                    return 0
-                if isinstance(op, (Call, IndirectGoto)):
-                    return 0
-            long_return = return_ops[-1].long
+        if isinstance(terminator, Return):
+            long_return = terminator.long
         else:
-            # Sub-case (b): no Return in rest; only Goto allowed.
-            for op in rest:
-                if isinstance(op, Goto):
-                    continue
-                return 0
+            # Goto OR implicit fall-through: chase the lone successor.
+            # Must be a local block ending in Return (no further stack
+            # manipulation in successor — its RTS will pick up the
+            # _pending_skip we set here).
             block = cfg.blocks[key]
             succs = block.successors
+            _dbg(f'no Return; successors={[_label_for(s) for s in succs]}')
             if len(succs) != 1:
-                return 0
+                _dbg(f'REJECT: succ_count={len(succs)} (not exactly 1)')
+                return None
             succ_key = succs[0]
             if succ_key not in block_ir:
-                return 0
+                _dbg(f'REJECT: succ {_label_for(succ_key)} not in block_ir')
+                return None
             succ_ops = block_ir[succ_key]
             if not succ_ops:
-                return 0
+                _dbg(f'REJECT: succ has no ops')
+                return None
             last = succ_ops[-1]
             if not isinstance(last, Return):
-                return 0
+                _dbg(f'REJECT: succ last op = {type(last).__name__} (not Return)')
+                return None
+            # Successor must not contain Push/Pull (they'd interfere with
+            # stack accounting). Call/IndirectGoto are tolerated — the
+            # callee is balanced and doesn't affect THIS function's stack
+            # frame relative to entry. Old detector pre-2026-05-02 only
+            # rejected Push/Pull/Call but not IndirectGoto; my prior
+            # tightening to also reject Call regressed the A3CB pattern
+            # (its successor block has ALU/load/store ops only, no Call,
+            # but the over-tightening in earlier draft erroneously also
+            # required absence of Call which DOES match real NLR shapes
+            # like the koopa-shell fix — keep loose like the original).
             for sop in succ_ops:
                 if isinstance(sop, (PushReg, PullReg, Push, Pull)):
-                    return 0
+                    _dbg(f'REJECT: succ has {type(sop).__name__}')
+                    return None
             long_return = last.long
         unit = 3 if long_return else 2
         if pull_count % unit != 0:
-            return 0
+            _dbg(f'REJECT: pull_count={pull_count} not multiple of unit={unit}')
+            return None
         skip = pull_count // unit
         if skip < 1 or skip > 3:
-            return 0
-        return skip
+            _dbg(f'REJECT: skip={skip} out of [1,3]')
+            return None
+        _dbg(f'ACCEPT: skip={skip} pla_start={pla_start} pla_count={pull_count}')
+        return {
+            'skip': skip,
+            'pla_start_ir_idx': pla_start,
+            'pla_count': pull_count,
+        }
 
-    nlr_skip_by_block: Dict[DecodeKey, int] = {}
+    # Map key -> {skip, pla_start_ir_idx, pla_count}
+    nlr_skip_by_block: Dict[DecodeKey, dict] = {}
     for key in block_order:
-        s = _detect_nlr(key)
-        if s > 0:
-            nlr_skip_by_block[key] = s
+        info = _detect_nlr(key)
+        if info is not None:
+            nlr_skip_by_block[key] = info
 
     # Bank where THIS function's body lives. Used to compute the 24-bit
     # address of cross-function targets (which always lie within the same
@@ -285,60 +343,11 @@ def emit_function(rom: bytes, bank: int, start: int,
         lines: List[str] = []
         block_terminated = False  # True if last op was branch/goto/return/call
 
-        # NLR shortcut: if this block matches the PLA*N+RTS idiom
-        # (single-block) or PLA*N+fall-through-to-RTS-block (multi-
-        # block), set pending_skip and either emit the block's own
-        # Return inline (sub-case a) or fall through to the lone
-        # Return-terminated successor (sub-case b). Skip the literal
-        # PLAs — they would consume ancestor stack data since v2
-        # doesn't push return-PC bytes onto the simulated SNES stack.
-        if key in nlr_skip_by_block:
-            skip = nlr_skip_by_block[key]
-            ops_here = block_ir.get(key, [])
-            block_pc24 = (bank << 16) | (key.pc & 0xFFFF)
-            site_label = f"{func_name}/{_label_for(key)}"
-            # Non-rotating site-exec counter (survives ring rotation).
-            lines.append(
-                f"cpu_trace_nlr_site_exec(cpu, 0x{block_pc24:06X}, "
-                f"\"{site_label}\");"
-            )
-            lines.append(
-                f"cpu_trace_event(cpu, 0, CPU_TR_NLR_DETECT, "
-                f"(uint8){skip}, 0); /* PLA*N + RTS = "
-                f"return-to-grandparent via SKIP_{skip} */"
-            )
-            # Function-local — NOT cpu->pending_skip. See declaration
-            # in the function prologue for design rationale.
-            lines.append(f"_pending_skip = RECOMP_RETURN_SKIP_{skip};")
-            # Non-rotating pending_skip-write counter + first-writer
-            # forensics (frame, PC, function name).
-            lines.append(
-                f"cpu_trace_pending_skip_write(cpu, 0x{block_pc24:06X}, "
-                f"(uint8)RECOMP_RETURN_SKIP_{skip}, \"{func_name}\");"
-            )
-            if ops_here and isinstance(ops_here[-1], Return):
-                # Sub-case (a): block ends in its own Return — emit it
-                # inline so pending_skip is consumed immediately.
-                for ln in emit_op(ops_here[-1]):
-                    lines.append(ln)
-            else:
-                # Sub-case (b): fall through to the Return-terminated
-                # successor whose RTS will consume pending_skip.
-                succs = block.successors
-                if len(succs) >= 1:
-                    lines.append(_goto_or_return(succs[0]) + " /* NLR fall-through */")
-                else:
-                    # Defensive — _detect_nlr requires exactly one successor.
-                    lines.append("return RECOMP_RETURN_NORMAL; /* NLR but no succ */")
-            block_terminated = True
-            block_lines[key] = lines
-            continue
-
         # Iterate the pre-lowered (Insn, [IROp]) pairs. Calling lower()
         # again here would mint fresh Value-ids and break codegen's
         # vid → C-var mapping (GameMode00↔01 oscillation 2026-05-02).
         #
-        # Pre-scan: identify JML-with-dispatch_entries (PHK+PER+JML or
+        # Pre-scan #1: identify JML-with-dispatch_entries (PHK+PER+JML or
         # PHK+PEA+JML inline-dispatch trampoline; e.g. GenerateTile_Dispatch
         # at $00:BFBC). The PHK / PEA / PER immediately preceding such a JML
         # are TRAMPOLINE SETUP that the runtime dispatcher (ExecutePtr /
@@ -346,6 +355,15 @@ def emit_function(rom: bytes, bank: int, start: int,
         # we inline the dispatch directly, so those pushes would leak 3
         # garbage bytes onto the simulated SNES stack. Skip emit for them.
         # Yoshi-block freeze ROOT 2026-05-02 — see project memory.
+        #
+        # Pre-scan #2: NLR PLA idiom. If this block was detected as NLR
+        # (PLA*N at the END of the block before a Goto/Return), figure
+        # out the INSN-LEVEL indices of the PLA insns so we can skip
+        # their literal-pop emit. The setup ops BEFORE the PLAs MUST
+        # still emit — they're real game-state changes (e.g. STA $1DFC
+        # in $00:F005's L_F024 block sets the Yoshi-knockoff sound).
+        # The SKIP_N _pending_skip set is injected before the terminator
+        # insn so the eventual RTS picks it up.
         pairs = block_per_insn_ir.get(key, [])
         skip_emit_idx = set()
         for ji, (jdi, _jops) in enumerate(pairs):
@@ -360,12 +378,102 @@ def emit_function(rom: bytes, bank: int, start: int,
                     else:
                         break
 
+        # NLR pre-scan: map the IR-level pla_start to insn-level indices.
+        # Each PLA insn lowers to exactly one PullReg(A) IR op. The
+        # PLA insns are the LAST `pla_count` insns of the IR's PLA run.
+        # Three terminator shapes (matching detector):
+        #   - Block ends in Return-IR (RTS/RTL): last insn is RTS/RTL,
+        #     PLAs are insns [last - pla_count, last).
+        #   - Block ends in Goto-IR (JMP/BRA): same as above.
+        #   - Block ends WITHOUT terminator IR (implicit fall-through):
+        #     last insn IS one of the PLAs; PLAs are insns [last - pla_count + 1, last + 1).
+        # We use the IR's `terminator` flag (None vs Goto/Return) plus
+        # mnemonic spot-check.
+        nlr_info = nlr_skip_by_block.get(key)
+        nlr_pla_insn_indices = set()
+        nlr_inject_before_idx = None  # insn index BEFORE which to inject SKIP setter
+        nlr_inject_after_loop = False  # if True, emit SKIP after the per-insn loop
+        if nlr_info is not None:
+            pla_count = nlr_info['pla_count']
+            ir_ops_flat = block_ir.get(key, [])
+            has_terminator_ir = (
+                len(ir_ops_flat) > 0
+                and isinstance(ir_ops_flat[-1], (Goto, Return))
+            )
+            if has_terminator_ir:
+                term_insn_idx = len(pairs) - 1
+                pla_first_insn = term_insn_idx - pla_count
+                pla_last_excl = term_insn_idx
+                inject_at = term_insn_idx  # before the terminator insn
+            else:
+                pla_first_insn = len(pairs) - pla_count
+                pla_last_excl = len(pairs)
+                inject_at = None  # no terminator insn → emit after loop
+            if pla_first_insn < 0:
+                nlr_info = None
+            else:
+                ok = True
+                for ix in range(pla_first_insn, pla_last_excl):
+                    if pairs[ix][0].mnem != 'PLA':
+                        if _NLR_DEBUG:
+                            print(f'[nlr_dbg] {func_name} {_label_for(key)}: '
+                                  f'mnem-check FAIL at insn {ix}: '
+                                  f'{pairs[ix][0].mnem!r} (expected PLA); '
+                                  f'pla_first={pla_first_insn} pla_last_excl={pla_last_excl} '
+                                  f'has_term={has_terminator_ir} pla_count={pla_count}',
+                                  file=_sys.stderr, flush=True)
+                        ok = False
+                        break
+                if not ok:
+                    nlr_info = None
+                else:
+                    for ix in range(pla_first_insn, pla_last_excl):
+                        nlr_pla_insn_indices.add(ix)
+                        skip_emit_idx.add(ix)
+                    nlr_inject_before_idx = inject_at
+                    nlr_inject_after_loop = (inject_at is None)
+
+        if _NLR_DEBUG and key in nlr_skip_by_block:
+            print(f'[nlr_dbg] EMIT-LOOP {func_name} {_label_for(key)}: '
+                  f'nlr_info={nlr_info!r} pla_indices={sorted(nlr_pla_insn_indices)} '
+                  f'inject_before={nlr_inject_before_idx} after_loop={nlr_inject_after_loop} '
+                  f'skip_emit_idx={sorted(skip_emit_idx)}',
+                  file=_sys.stderr, flush=True)
         for ii, (di_insn, ir_ops) in enumerate(pairs):
-            if ii in skip_emit_idx:
+            # NLR: inject _pending_skip setter + diagnostics RIGHT BEFORE
+            # the terminator insn. This ensures any preceding setup ops
+            # have already emitted, and the upcoming Goto/Return picks up
+            # the SKIP value.
+            if nlr_info is not None and ii == nlr_inject_before_idx:
+                skip = nlr_info['skip']
+                block_pc24 = (bank << 16) | (key.pc & 0xFFFF)
+                site_label = f"{func_name}/{_label_for(key)}"
                 lines.append(
-                    f"/* trampoline setup {di_insn.mnem} skipped — "
-                    f"inlined into synthesized dispatch below */"
+                    f"cpu_trace_nlr_site_exec(cpu, 0x{block_pc24:06X}, "
+                    f"\"{site_label}\");"
                 )
+                lines.append(
+                    f"cpu_trace_event(cpu, 0, CPU_TR_NLR_DETECT, "
+                    f"(uint8){skip}, 0); /* PLA*N + (Goto|RTS) = "
+                    f"return-to-grandparent via SKIP_{skip} */"
+                )
+                lines.append(f"_pending_skip = RECOMP_RETURN_SKIP_{skip};")
+                lines.append(
+                    f"cpu_trace_pending_skip_write(cpu, 0x{block_pc24:06X}, "
+                    f"(uint8)RECOMP_RETURN_SKIP_{skip}, \"{func_name}\");"
+                )
+
+            if ii in skip_emit_idx:
+                if ii in nlr_pla_insn_indices:
+                    lines.append(
+                        f"/* PLA skipped — NLR idiom; SKIP_{nlr_info['skip']} "
+                        f"set on _pending_skip above */"
+                    )
+                else:
+                    lines.append(
+                        f"/* trampoline setup {di_insn.mnem} skipped — "
+                        f"inlined into synthesized dispatch below */"
+                    )
                 continue
             for op in ir_ops:
                 if isinstance(op, CondBranch):
@@ -430,6 +538,30 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # ReadReg, ALU, Read/Write, etc. — non-terminating.
                     for ln in emit_op(op):
                         lines.append(ln)
+        # NLR with no terminator IR (block IR was pure-PullReg, like
+        # $01:A3CB's [PLA, PLA, fall-through]). The SKIP setter wasn't
+        # injected during the per-insn loop because there was no
+        # terminator insn to anchor on. Inject it here, BEFORE the
+        # implicit fall-through emission below.
+        if nlr_info is not None and nlr_inject_after_loop and not block_terminated:
+            skip = nlr_info['skip']
+            block_pc24 = (bank << 16) | (key.pc & 0xFFFF)
+            site_label = f"{func_name}/{_label_for(key)}"
+            lines.append(
+                f"cpu_trace_nlr_site_exec(cpu, 0x{block_pc24:06X}, "
+                f"\"{site_label}\");"
+            )
+            lines.append(
+                f"cpu_trace_event(cpu, 0, CPU_TR_NLR_DETECT, "
+                f"(uint8){skip}, 0); /* PLA*N + fall-through = "
+                f"return-to-grandparent via SKIP_{skip} */"
+            )
+            lines.append(f"_pending_skip = RECOMP_RETURN_SKIP_{skip};")
+            lines.append(
+                f"cpu_trace_pending_skip_write(cpu, 0x{block_pc24:06X}, "
+                f"(uint8)RECOMP_RETURN_SKIP_{skip}, \"{func_name}\");"
+            )
+
         # Block didn't end with a control-flow op. Emit the explicit edge
         # to its lone CFG successor (linear fall-through) — never rely on
         # textual fall-through into whatever block_order put next, which

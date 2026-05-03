@@ -578,88 +578,120 @@ def _emit_pushreg(op: PushReg) -> List[str]:
         # PHP also records the P-mutation ring snapshot.
         return [
             "cpu_mirrors_to_p(cpu);",
-            *emitter_helpers.push_byte(f"(uint8)({field})"),
+            *emitter_helpers.stack_op_traced(
+                "CPU_STACK_OP_PHP", -1,
+                emitter_helpers.push_byte(f"(uint8)({field})")),
             "cpu_trace_event(cpu, 0, CPU_TR_PHP, cpu->P, 0);",
             "cpu_trace_px_record(cpu, 0, 4 /*PHP*/, cpu->P, cpu->P);",
         ]
     if op.reg == Reg.DB:
-        return emitter_helpers.push_byte(f"(uint8)({field})") + [
+        return emitter_helpers.stack_op_traced(
+            "CPU_STACK_OP_PHB", -1,
+            emitter_helpers.push_byte(f"(uint8)({field})")
+        ) + [
             "cpu_trace_event(cpu, 0, CPU_TR_PHB, cpu->DB, cpu->DB);",
         ]
     if op.reg == Reg.PB:
         # PHK pushes the program-bank K. Stale PB here is the suspected
         # root cause of bogus DB after PLB.
-        return emitter_helpers.push_byte(f"(uint8)({field})") + [
+        return emitter_helpers.stack_op_traced(
+            "CPU_STACK_OP_PHK", -1,
+            emitter_helpers.push_byte(f"(uint8)({field})")
+        ) + [
             "cpu_trace_event(cpu, 0, CPU_TR_PHK, cpu->PB, cpu->PB);",
         ]
     if op.reg == Reg.D:
-        return emitter_helpers.push_word(field)
+        return emitter_helpers.stack_op_traced(
+            "CPU_STACK_OP_PHD", -2, emitter_helpers.push_word(field))
     # A/X/Y: width depends on M/X flag at runtime.
     if op.reg == Reg.A:
-        return ["if (cpu->m_flag) {",
-                *(f"  {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
-                "} else {",
-                *(f"  {s}" for s in emitter_helpers.push_word(field)),
-                "}"]
+        return [
+            "{ uint16 _old_s = cpu->S;",
+            "  if (cpu->m_flag) {",
+            *(f"    {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
+            "    cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PHA, _old_s, -1);",
+            "  } else {",
+            *(f"    {s}" for s in emitter_helpers.push_word(field)),
+            "    cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PHA, _old_s, -2);",
+            "  } }",
+        ]
     if op.reg in (Reg.X, Reg.Y):
-        return ["if (cpu->x_flag) {",
-                *(f"  {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
-                "} else {",
-                *(f"  {s}" for s in emitter_helpers.push_word(field)),
-                "}"]
+        op_id = "CPU_STACK_OP_PHX" if op.reg == Reg.X else "CPU_STACK_OP_PHY"
+        return [
+            "{ uint16 _old_s = cpu->S;",
+            "  if (cpu->x_flag) {",
+            *(f"    {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
+            f"    cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, -1);",
+            "  } else {",
+            *(f"    {s}" for s in emitter_helpers.push_word(field)),
+            f"    cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, -2);",
+            "  } }",
+        ]
     return [f"/* TODO PushReg({op.reg}) */"]
 
 
 def _emit_pullreg(op: PullReg) -> List[str]:
     field = _reg(op.reg)
     if op.reg == Reg.P:
-        return ["{ uint8 _old_p = cpu->P;",
+        return ["{ uint8 _old_p = cpu->P; uint16 _old_s = cpu->S;",
                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
                 "  cpu_p_to_mirrors(cpu);",
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLP, _old_s, +1);",
                 "  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P);",
                 "  cpu_trace_px_record(cpu, 0, 2 /*PLP*/, _old_p, cpu->P); }"]
     if op.reg == Reg.DB:
         # PLB sets N/Z from popped value.
-        return ["{ uint8 _old_db = cpu->DB;",
+        return ["{ uint8 _old_db = cpu->DB; uint16 _old_s = cpu->S;",
                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
                 *(f"  {s}" for s in widths.set_nz(field, 1)),
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLB, _old_s, +1);",
                 "  cpu_trace_db_change(cpu, 0, _old_db, cpu->DB, CPU_TR_PLB); }"]
     if op.reg == Reg.PB:
         # PLK doesn't exist on the 65816 but IR routes any PullReg(PB) here.
-        return ["{ uint8 _old_pb = cpu->PB;",
+        return ["{ uint8 _old_pb = cpu->PB; uint16 _old_s = cpu->S;",
                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
                 *(f"  {s}" for s in widths.set_nz(field, 1)),
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLB, _old_s, +1);",
                 "  cpu_trace_pb_change(cpu, 0, _old_pb, cpu->PB, CPU_TR_PB_WRITE); }"]
     if op.reg == Reg.D:
         # PLD: 16-bit, sets N/Z from popped 16-bit value.
-        return emitter_helpers.pop_word_assign(field) + widths.set_nz(field, 2)
+        return emitter_helpers.stack_op_traced(
+            "CPU_STACK_OP_PLD", +2,
+            emitter_helpers.pop_word_assign(field) + widths.set_nz(field, 2))
     # Final cpu->P sync line — both A and X/Y end with the same packed-flag update.
     p_sync = ("cpu->P = (uint8)((cpu->P & ~0x82) | "
               "(cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));")
     if op.reg == Reg.A:
         # PLA: width follows M. Preserve B (high byte) in m=1.
-        lines = ["if (cpu->m_flag) {",
-                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
-                 f"  {field} = {widths.preserve_high(field, '_v')};",
-                 *(f"  {s}" for s in widths.set_nz_no_p("_v", 1)),
-                 "} else {",
-                 *(f"  {s}" for s in emitter_helpers.pop_word_assign(field)),
-                 *(f"  {s}" for s in widths.set_nz_no_p(field, 2)),
-                 "}",
-                 p_sync]
+        lines = ["{ uint16 _old_s = cpu->S;",
+                 "  if (cpu->m_flag) {",
+                 *(f"    {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
+                 f"    {field} = {widths.preserve_high(field, '_v')};",
+                 *(f"    {s}" for s in widths.set_nz_no_p("_v", 1)),
+                 "    cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLA, _old_s, +1);",
+                 "  } else {",
+                 *(f"    {s}" for s in emitter_helpers.pop_word_assign(field)),
+                 *(f"    {s}" for s in widths.set_nz_no_p(field, 2)),
+                 "    cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLA, _old_s, +2);",
+                 "  }",
+                 f"  {p_sync} }}"]
         return lines
     if op.reg in (Reg.X, Reg.Y):
+        op_id = "CPU_STACK_OP_PLX" if op.reg == Reg.X else "CPU_STACK_OP_PLY"
         # PLX/PLY: x=1 zero-extends (hw contract).
-        lines = ["if (cpu->x_flag) {",
-                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
-                 f"  {field} = {widths.zero_extend_lo('_v')};"
+        lines = ["{ uint16 _old_s = cpu->S;",
+                 "  if (cpu->x_flag) {",
+                 *(f"    {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
+                 f"    {field} = {widths.zero_extend_lo('_v')};"
                  f"  /* x=1 zeros high byte (hw contract) */",
-                 *(f"  {s}" for s in widths.set_nz_no_p("_v", 1)),
-                 "} else {",
-                 *(f"  {s}" for s in emitter_helpers.pop_word_assign(field)),
-                 *(f"  {s}" for s in widths.set_nz_no_p(field, 2)),
-                 "}",
-                 p_sync]
+                 *(f"    {s}" for s in widths.set_nz_no_p("_v", 1)),
+                 f"    cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, +1);",
+                 "  } else {",
+                 *(f"    {s}" for s in emitter_helpers.pop_word_assign(field)),
+                 *(f"    {s}" for s in widths.set_nz_no_p(field, 2)),
+                 f"    cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, +2);",
+                 "  }",
+                 f"  {p_sync} }}"]
         return lines
     return [f"/* TODO PullReg({op.reg}) */"]
 
@@ -906,20 +938,24 @@ def _emit_nop(op: Nop) -> List[str]:
 
 
 def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
+    # PEA/PER/PEI all push 16-bit immediates. Trace as PEA for now (kind
+    # discrimination doesn't matter for stack-delta accounting).
     if op.seg.kind == SegKind.ABS_BANK:
         return [
-            "cpu->S = (uint16)(cpu->S - 1);",
-            f"cpu_write16(cpu, 0x00, cpu->S, (uint16){op.seg.offset:#06x});",
-            "cpu->S = (uint16)(cpu->S - 1);",
+            "{ uint16 _old_s = cpu->S;",
+            "  cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write16(cpu, 0x00, cpu->S, (uint16){op.seg.offset:#06x});",
+            "  cpu->S = (uint16)(cpu->S - 1);",
+            "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PEA, _old_s, -2); }",
         ]
     if op.seg.kind == SegKind.DP_INDIRECT:
         return [
-            "{",
+            "{ uint16 _old_s = cpu->S;",
             f"  uint16 _peival = cpu_read16(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
             "  cpu->S = (uint16)(cpu->S - 1);",
             "  cpu_write16(cpu, 0x00, cpu->S, _peival);",
             "  cpu->S = (uint16)(cpu->S - 1);",
-            "}",
+            "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PEI, _old_s, -2); }",
         ]
     return ["/* TODO PushEffectiveAddress unsupported kind */"]
 
@@ -947,15 +983,25 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
 
 
 def _emit_push(op: Push) -> List[str]:
+    # Generic Push IR (used for synthetic / non-register pushes). Trace as
+    # PHA for accounting; the IR doesn't carry the original mnemonic.
     if op.width == 1:
-        return emitter_helpers.push_byte(f"(uint8){_v(op.src)}")
-    return emitter_helpers.push_word(_v(op.src))
+        return emitter_helpers.stack_op_traced(
+            "CPU_STACK_OP_PHA", -1,
+            emitter_helpers.push_byte(f"(uint8){_v(op.src)}"))
+    return emitter_helpers.stack_op_traced(
+        "CPU_STACK_OP_PHA", -2,
+        emitter_helpers.push_word(_v(op.src)))
 
 
 def _emit_pull(op: Pull) -> List[str]:
     if op.width == 1:
-        return emitter_helpers.pop_byte_assign(f"uint8 {_v(op.out)}")
-    return emitter_helpers.pop_word_assign(f"uint16 {_v(op.out)}")
+        return emitter_helpers.stack_op_traced(
+            "CPU_STACK_OP_PLA", +1,
+            emitter_helpers.pop_byte_assign(f"uint8 {_v(op.out)}"))
+    return emitter_helpers.stack_op_traced(
+        "CPU_STACK_OP_PLA", +2,
+        emitter_helpers.pop_word_assign(f"uint16 {_v(op.out)}"))
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
