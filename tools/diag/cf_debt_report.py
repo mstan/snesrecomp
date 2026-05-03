@@ -94,9 +94,13 @@ UNRESOLVABLE_GOTO_SUBSTR = 'unresolvable cross-fn goto'
 # audit found 42 instances at one point; current v2 might have 0.
 UNRESOLVED_PASTEND_SUBSTR = 'unresolved (cross-fn / cross-bank / past end:)'
 
-# Stub-definition shape inside unresolved_stubs_v2.c.
+# Stub-definition shape inside unresolved_stubs_v2.c. Matches both the
+# legacy silent body `(void)cpu; return RECOMP_RETURN_NORMAL;` and the
+# loud-trap variant `return cpu_trace_unresolved_stub_trap(...);`.
 RE_STUB_DEF = re.compile(
-    r'^RecompReturn\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(\s*CpuState\s*\*\s*cpu\s*\)\s*\{\s*\(void\)cpu;\s*return\s+RECOMP_RETURN_NORMAL\s*;'
+    r'^RecompReturn\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(\s*CpuState\s*\*\s*cpu\s*\)\s*\{\s*'
+    r'(?:\(void\)cpu;\s*return\s+RECOMP_RETURN_NORMAL'
+    r'|return\s+cpu_trace_unresolved_stub_trap)'
 )
 
 

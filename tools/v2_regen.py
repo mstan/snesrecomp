@@ -455,19 +455,25 @@ def main() -> int:
             ' * Stub bodies for Call targets that resolved to a ROM bank not',
             ' * in the cfg set. These are typically data decoded as code',
             ' * (garbled JSL operands). Real execution paths should never',
-            ' * reach them; the stubs exist solely so the linker resolves.',
+            ' * reach them; each stub chains into cpu_trace_unresolved_stub_trap',
+            ' * so a runtime fire is captured (loud stderr line + TCP-queryable',
+            ' * snapshot via unresolved_stub_get) instead of silently returning.',
             ' * One stub per (target, m, x) variant requested by the gen.',
             ' */',
             '',
             '#include "cpu_state.h"',
+            '#include "cpu_trace.h"',
             '',
         ]
         total_stubs = 0
         for bank in sorted(by_bank):
             for pc, em, ex in sorted(by_bank[bank]):
+                name = f'bank_{bank:02X}_{pc:04X}_M{em}X{ex}'
+                target_pc24 = (bank << 16) | (pc & 0xFFFF)
                 lines.append(
-                    f'RecompReturn bank_{bank:02X}_{pc:04X}_M{em}X{ex}(CpuState *cpu) '
-                    f'{{ (void)cpu; return RECOMP_RETURN_NORMAL; }}'
+                    f'RecompReturn {name}(CpuState *cpu) {{ '
+                    f'return cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}"); '
+                    f'}}'
                 )
                 total_stubs += 1
         stub_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')

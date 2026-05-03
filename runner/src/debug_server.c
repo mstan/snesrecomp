@@ -4534,6 +4534,51 @@ static void cmd_unresolved_goto_get(const char *args) {
 #endif
 }
 
+/* unresolved_stub_get — JSON dump of the unresolved-stub trap ring.
+ * Each slot is a unique stub function name that actually got called
+ * at runtime (every fire is a sign of a phantom variant or a real
+ * cross-bank call into a non-cfg ROM bank). */
+static void cmd_unresolved_stub_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    static char buf[65536];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"hit_count\":%d,\"hits\":[",
+        g_unresolved_stub_hit_count);
+    for (int i = 0; i < g_unresolved_stub_hit_count; i++) {
+        UnresolvedStubHit *h = &g_unresolved_stub_hits[i];
+        if (!h->captured) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"target_pc24\":\"0x%06x\",\"func\":\"%s\","
+            "\"first_frame\":%d,\"first_block_idx\":%llu,"
+            "\"repeat_count\":%d,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,\"e\":%u,\"stack\":[",
+            i ? "," : "", h->target_pc24, h->func_name,
+            h->first_frame, (unsigned long long)h->first_block_idx,
+            h->repeat_count,
+            h->A, h->X, h->Y, h->S, h->D, h->DB, h->PB, h->P,
+            h->m_flag, h->x_flag, h->e_flag);
+        for (int j = 0; j < h->stack_depth; j++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", j ? "," : "", h->stack[j]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"block_history\":[");
+        for (int j = 0; j < h->block_history_depth; j++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"0x%06x\"", j ? "," : "", h->block_history[j]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* phantom_trap_arm_smc — re-arm the canonical SMC-phantom set. Useful
  * after a phantom_trap_clear during a single run. */
 static void cmd_phantom_trap_arm_smc(const char *args) {
@@ -5041,6 +5086,7 @@ static const CmdEntry s_commands[] = {
     {"phantom_trap_clear",   cmd_phantom_trap_clear},
     {"phantom_trap_arm_smc", cmd_phantom_trap_arm_smc},
     {"unresolved_goto_get",  cmd_unresolved_goto_get},
+    {"unresolved_stub_get",  cmd_unresolved_stub_get},
     {"db_trip_disarm", cmd_db_trip_disarm},
     {"dma_trip_get",   cmd_dma_trip_get},
     {"pxwatch_arm",    cmd_pxwatch_arm},

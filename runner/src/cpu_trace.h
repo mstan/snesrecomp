@@ -389,6 +389,49 @@ RecompReturn cpu_trace_unresolved_goto_trap(
     CpuState *cpu, uint32_t source_pc24, uint32_t target_pc24,
     const char *func_name, const char *target_label);
 
+/* ── Unresolved-stub runtime trap ─────────────────────────────────────
+ *
+ * Replaces the historical silent stub body
+ *   `(void)cpu; return RECOMP_RETURN_NORMAL;`
+ * emitted into src/gen_v2/unresolved_stubs_v2.c for Call targets that
+ * resolve to a ROM bank not in the cfg set. These targets are
+ * typically data decoded as code (garbled JSL operands from a phantom
+ * function) — but a silent normal-return hides any case where one
+ * actually fires at runtime.
+ *
+ * Keying: stub function name (e.g. "bank_24_222F_M1X1"). One slot
+ * per unique stub; repeats bump .repeat_count.
+ *
+ * On hit: register snapshot + recomp stack + 64-deep block-PC
+ * history + loud stderr line. Returns RECOMP_RETURN_NORMAL so the
+ * program keeps running (matches historical silent behaviour). */
+#define UNRESOLVED_STUB_TRAP_MAX 32
+
+typedef struct UnresolvedStubHit {
+    uint8_t  captured;
+    uint32_t target_pc24;       /* bank<<16 | addr — encoded from name */
+    char     func_name[64];
+    int      first_frame;
+    uint64_t first_block_idx;
+    int      repeat_count;
+    /* Snapshot at first hit: */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+    int      stack_depth;
+    char     stack[16][64];
+    int      block_history_depth;
+    uint32_t block_history[64];
+} UnresolvedStubHit;
+
+extern UnresolvedStubHit g_unresolved_stub_hits[UNRESOLVED_STUB_TRAP_MAX];
+extern int g_unresolved_stub_hit_count;
+
+/* Called from generated stub bodies in unresolved_stubs_v2.c. Returns
+ * RECOMP_RETURN_NORMAL after recording the hit so caller continues.
+ * `func_name` MUST be a string literal or globally stable (strncpy'd). */
+RecompReturn cpu_trace_unresolved_stub_trap(
+    CpuState *cpu, uint32_t target_pc24, const char *func_name);
+
 /* Called by RomPtr-invalid + cart_readLorom-out-of-range + any other
  * "off-the-rails" softfail to dump the trace ONCE per N events. Avoids
  * burying the trace under repeats of the same fail. */
@@ -967,6 +1010,11 @@ static inline void cpu_trace_phantom_arm_unresolvable_goto_set(void)        { }
 static inline RecompReturn cpu_trace_unresolved_goto_trap(
     CpuState *c, uint32_t s, uint32_t t, const char *fn, const char *lbl) {
     (void)c; (void)s; (void)t; (void)fn; (void)lbl;
+    return RECOMP_RETURN_NORMAL;
+}
+static inline RecompReturn cpu_trace_unresolved_stub_trap(
+    CpuState *c, uint32_t t, const char *fn) {
+    (void)c; (void)t; (void)fn;
     return RECOMP_RETURN_NORMAL;
 }
 

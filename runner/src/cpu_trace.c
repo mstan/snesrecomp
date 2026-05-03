@@ -1087,6 +1087,75 @@ RecompReturn cpu_trace_unresolved_goto_trap(
     return RECOMP_RETURN_NORMAL;
 }
 
+/* ── Unresolved-stub trap ────────────────────────────────────────────
+ *
+ * Stub bodies in src/gen_v2/unresolved_stubs_v2.c chain into this. A
+ * fire means a generated function actually called a target whose
+ * bank wasn't in the cfg set — i.e. either real code reaches data
+ * decoded as code (recompiler bug) or a phantom variant got executed.
+ */
+UnresolvedStubHit g_unresolved_stub_hits[UNRESOLVED_STUB_TRAP_MAX] = {0};
+int g_unresolved_stub_hit_count = 0;
+
+RecompReturn cpu_trace_unresolved_stub_trap(
+    CpuState *cpu, uint32_t target_pc24, const char *func_name)
+{
+    int hit_idx = -1;
+    for (int i = 0; i < g_unresolved_stub_hit_count; i++) {
+        UnresolvedStubHit *h = &g_unresolved_stub_hits[i];
+        if (!h->captured) continue;
+        if (h->target_pc24 == target_pc24
+            && strncmp(h->func_name, func_name ? func_name : "",
+                       sizeof(h->func_name)) == 0)
+        {
+            h->repeat_count++;
+            return RECOMP_RETURN_NORMAL;
+        }
+    }
+    if (g_unresolved_stub_hit_count < UNRESOLVED_STUB_TRAP_MAX) {
+        hit_idx = g_unresolved_stub_hit_count++;
+    } else {
+        fprintf(stderr,
+                "[UNRESOLVED-STUB TRAP - slots full] target=$%06X func='%s'\n",
+                target_pc24, func_name ? func_name : "?");
+        return RECOMP_RETURN_NORMAL;
+    }
+    UnresolvedStubHit *h = &g_unresolved_stub_hits[hit_idx];
+    memset(h, 0, sizeof(*h));
+    h->captured = 1;
+    h->target_pc24 = target_pc24;
+    h->repeat_count = 1;
+    if (func_name) {
+        strncpy(h->func_name, func_name, sizeof(h->func_name) - 1);
+    }
+    extern int snes_frame_counter;
+    h->first_frame = snes_frame_counter;
+    h->first_block_idx = g_cpu_trace_idx;
+    if (cpu) {
+        h->A = cpu->A; h->X = cpu->X; h->Y = cpu->Y;
+        h->S = cpu->S; h->D = cpu->D;
+        h->DB = cpu->DB; h->PB = cpu->PB; h->P = cpu->P;
+        h->m_flag = cpu->m_flag; h->x_flag = cpu->x_flag;
+        h->e_flag = cpu->emulation;
+    }
+    int depth = g_recomp_stack_top;
+    if (depth > 16) depth = 16;
+    int skip = g_recomp_stack_top - depth;
+    h->stack_depth = depth;
+    for (int i = 0; i < depth; i++) {
+        const char *p = g_recomp_stack[skip + i];
+        if (p) strncpy(h->stack[i], p, sizeof(h->stack[i]) - 1);
+    }
+    h->block_history_depth = phantom_collect_block_history(h->block_history, 64);
+    fprintf(stderr,
+            "[UNRESOLVED-STUB TRAP HIT] func='%s' target=$%06X "
+            "frame=%d S=$%04X PB=$%02X DB=$%02X m=%d x=%d stack_top=%s\n",
+            h->func_name, target_pc24, h->first_frame, h->S,
+            h->PB, h->DB, h->m_flag, h->x_flag,
+            depth > 0 ? h->stack[depth - 1] : "<empty>");
+    return RECOMP_RETURN_NORMAL;
+}
+
 void cpu_trace_phantom_arm_unresolvable_goto_set(void) {
     /* Unresolvable-cross-fn-goto block-entry PCs cf_debt_report
      * 2026-05-03 found. Each is the BLOCK PC whose codegen currently
