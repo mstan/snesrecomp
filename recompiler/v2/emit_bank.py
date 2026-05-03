@@ -43,12 +43,22 @@ class BankEntry:
             terminators.
         entry_m, entry_x: entry mode-state. Default (1, 1) — 65816 reset
             state, which is what most SMW functions are entered with.
+        tail_call_pc16: optional 16-bit local PC of a SIBLING fn declared
+            elsewhere in this bank that this fn deliberately falls
+            through into. cfg directive `tail_call:<hex>` on a func line
+            sets this. The boundary edge — formerly an unresolvable
+            cross-fn goto — gets emitted as
+                `return Sibling_M{m}X{x}(cpu);`
+            in the calling fn's C body. Encodes a real ROM idiom (two
+            asm entry points sharing a body) the recompiler can't
+            otherwise prove from bytes alone.
     """
     name: Optional[str]
     start: int
     end: Optional[int] = None
     entry_m: int = 1
     entry_x: int = 1
+    tail_call_pc16: Optional[int] = None
 
 
 def emit_bank(rom: bytes, bank: int,
@@ -87,7 +97,27 @@ def emit_bank(rom: bytes, bank: int,
         parts.append(f"RecompReturn {base}{suffix}(CpuState *cpu);")
     parts.append("")
 
+    # Build a (start_pc16 -> base_name) lookup so a `tail_call:<addr>`
+    # directive on one entry can be resolved to the sibling entry's C
+    # base name for emission. Mirrors variant_suffix at emit_function
+    # call time so the suffix matches the boundary's (m, x).
+    by_start: dict = {}
+    for e in entries:
+        b = e.name or _default_func_name_local(bank, e.start)
+        by_start[e.start & 0xFFFF] = b
+
     for entry in entries:
+        tail_call_target_name = None
+        if entry.tail_call_pc16 is not None:
+            tgt = entry.tail_call_pc16 & 0xFFFF
+            if tgt not in by_start:
+                raise ValueError(
+                    f"bank ${bank:02X}: func '{entry.name}' at "
+                    f"${entry.start:04X} declares tail_call:${tgt:04X} "
+                    f"but no sibling func entry exists at that PC. "
+                    f"Add the sibling as its own `func` line."
+                )
+            tail_call_target_name = by_start[tgt]
         src = emit_function(
             rom=rom,
             bank=bank,
@@ -101,6 +131,8 @@ def emit_bank(rom: bytes, bank: int,
             suppressed_collector=suppressed_collector,
             const_z_fold_collector=const_z_fold_collector,
             exclude_ranges=exclude_ranges,
+            tail_call_pc16=entry.tail_call_pc16,
+            tail_call_target_name=tail_call_target_name,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

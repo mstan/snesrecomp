@@ -65,7 +65,9 @@ def emit_function(rom: bytes, bank: int, start: int,
                   indirect_call_tables=None,
                   suppressed_collector=None,
                   const_z_fold_collector=None,
-                  exclude_ranges: Optional[List[Tuple[int, int]]] = None) -> str:
+                  exclude_ranges: Optional[List[Tuple[int, int]]] = None,
+                  tail_call_pc16: Optional[int] = None,
+                  tail_call_target_name: Optional[str] = None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
     Pipeline:
@@ -323,6 +325,26 @@ def emit_function(rom: bytes, bank: int, start: int,
                         f"/* {label} HLE-replaced "
                         f"(cfg exclude_range {lo:04X}-{hi:04X}) */"
                     )
+        # cfg `tail_call:<addr>` directive — declared sibling fall-through.
+        # When the decoder's `end:` boundary cuts a routine that
+        # deliberately falls into a separately-named adjacent fn (real
+        # ROM idiom: two callable entry points sharing a body), cfg
+        # encodes the fact via `tail_call:`. The boundary edge becomes
+        # an explicit tail call to the sibling fn instead of an
+        # unresolvable goto. (m, x) come from the boundary DecodeKey
+        # so the right variant suffix is used.
+        if (tail_call_pc16 is not None
+                and tail_call_target_name is not None
+                and (target.pc & 0xFFFF) == (tail_call_pc16 & 0xFFFF)):
+            sib_suffix = _variant_suffix(target.m, target.x)
+            return (
+                f"{prefix}{{ "
+                f"RecompReturn _tc = {tail_call_target_name}{sib_suffix}(cpu); "
+                f"return _tc; "
+                f"}}  /* tail_call into sibling fn at ${target.pc & 0xFFFF:04X} "
+                f"(cfg tail_call: directive) */"
+            )
+
         # Unresolvable cross-function jump.
         #
         # With the inline-cross-fn-blocks model (2026-05-02), the decoder

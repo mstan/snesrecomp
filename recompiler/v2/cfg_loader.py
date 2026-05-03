@@ -134,20 +134,33 @@ def load_bank_cfg(path: str) -> BankCfg:
             if head == 'comment' and '=' in stripped:
                 continue
 
-            # func <name> <hex_pc> [end:<hex_end>] [sig:...] [...]
+            # func <name> <hex_pc> [end:<hex_end>] [tail_call:<hex>] [sig:...] [...]
             if head == 'func':
                 if len(tokens) < 3:
                     continue
                 name = tokens[1]
                 start = _parse_hex(tokens[2])
                 end: Optional[int] = None
+                tail_call_pc16: Optional[int] = None
                 for t in tokens[3:]:
                     if t.startswith('end:'):
                         try:
                             end = _parse_hex(t[len('end:'):])
                         except ValueError:
                             pass
-                cfg.entries.append(BankEntry(name=name, start=start, end=end))
+                    elif t.startswith('tail_call:'):
+                        # Local 16-bit PC of a sibling fn whose body
+                        # this one falls into. The sibling MUST be
+                        # declared as its own `func` entry elsewhere in
+                        # this same bank cfg; emit_bank validates that
+                        # at resolve time.
+                        try:
+                            tail_call_pc16 = _parse_hex(t[len('tail_call:'):])
+                        except ValueError:
+                            pass
+                cfg.entries.append(BankEntry(
+                    name=name, start=start, end=end,
+                    tail_call_pc16=tail_call_pc16))
                 continue
 
             # name <hex_addr> <friendly_name> [sig:...]
