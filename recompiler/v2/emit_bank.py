@@ -58,6 +58,7 @@ def emit_bank(rom: bytes, bank: int,
               dispatch_helpers=None,
               indirect_call_tables=None,
               suppressed_collector=None,
+              const_z_fold_collector=None,
               exclude_ranges: Optional[List[Tuple[int, int]]] = None) -> str:
     """Emit one bank's C source.
 
@@ -98,6 +99,7 @@ def emit_bank(rom: bytes, bank: int,
             dispatch_helpers=dispatch_helpers,
             indirect_call_tables=indirect_call_tables,
             suppressed_collector=suppressed_collector,
+            const_z_fold_collector=const_z_fold_collector,
             exclude_ranges=exclude_ranges,
         )
         parts.append(src)

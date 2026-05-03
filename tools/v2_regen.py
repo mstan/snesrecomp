@@ -393,20 +393,26 @@ def main() -> int:
         # the cfg-required-dispatch-or-kill report. Each emit_bank call
         # appends the bank's suppressions to this list.
         all_suppressed: list = []
+        # Aggregate constant-Z folds (BEQ/BNE rewritten to unconditional
+        # Goto by the decoder post-pass). Build report at end of pass.
+        all_const_z_folds: list = []
         for bank, cfg_path, cfg in parsed:
             out_path = out_dir / f'smw_{bank:02x}_v2.c'
             try:
                 if cfg.bank != bank:
                     print(f"  {cfg_path.name}: bank field ${cfg.bank:02X} doesn't match filename ${bank:02X}; using filename")
                 bank_suppressed: list = []
+                bank_const_z_folds: list = []
                 src = emit_bank(rom, bank=bank, entries=cfg.entries,
                                 dispatch_helpers=dispatch_helpers,
                                 indirect_call_tables=getattr(
                                     cfg, 'indirect_call_tables', None),
                                 suppressed_collector=bank_suppressed,
+                                const_z_fold_collector=bank_const_z_folds,
                                 exclude_ranges=cfg.exclude_ranges or None)
                 out_path.write_text(src, encoding='utf-8')
                 all_suppressed.extend(bank_suppressed)
+                all_const_z_folds.extend(bank_const_z_folds)
                 if pass_idx == 0:
                     print(f"  OK    bank ${bank:02X}: {len(cfg.entries)} entries -> {out_path}")
                 succeeded += 1
@@ -512,6 +518,32 @@ def main() -> int:
                   f"variants[{mx_str}]  in {funcs_str}")
         print(f"Add `indirect_call_table SITE_PC BASE COUNT` to the "
               f"containing function's cfg to authorise.")
+
+    # Constant-Z branch-fold report. Each entry is one BEQ/BNE the
+    # decoder rewrote to an unconditional Goto because the same-block
+    # predecessor (LDA/LDX/LDY #imm) made Z statically known. The dead
+    # edge was pruned along with any insns reachable only through it.
+    # Listed here so every fold is visible/auditable rather than silent.
+    if all_const_z_folds:
+        # Collapse by (branch_pc24, entry_m, entry_x) so the same fold
+        # in two (m,x) variants of one function appears twice (each
+        # variant has its own decoded body).
+        print()
+        print(f"=== CONSTANT-Z BRANCH FOLDS ===")
+        print(f"{len(all_const_z_folds)} BEQ/BNE rewritten to "
+              f"unconditional Goto (decoder post-pass)")
+        # Sort by branch PC then by func entry / mode for stable output.
+        for f in sorted(all_const_z_folds,
+                        key=lambda r: (r.branch_pc24, r.func_entry_pc24,
+                                       r.entry_m, r.entry_x)):
+            wfmt = f.width_bits // 4   # hex digits
+            imm_str = f"#${f.prev_imm:0{wfmt}X}"
+            taken_str = 'TAKEN' if f.taken_kind == 'jump' else 'FALL'
+            print(f"  ${f.branch_pc24:06X}  "
+                  f"{f.prev_mnem} {imm_str} (Z={f.z_value}) ; "
+                  f"{f.branch_mnem} -> {taken_str} -> ${f.live_pc24:06X}  "
+                  f"[dead -> ${f.dead_pc24:06X}]  "
+                  f"in ${f.func_entry_pc24:06X} M{f.entry_m}X{f.entry_x}")
 
     print()
     print(f"v2_regen: {succeeded}/{total} banks emitted")

@@ -41,7 +41,7 @@ if str(_RECOMPILER_DIR) not in sys.path:
 
 from snes65816 import (  # noqa: E402
     decode_insn, lorom_offset, Insn,
-    ABS, INDIR, INDIR_X, LONG,
+    ABS, INDIR, INDIR_X, LONG, IMM,
 )
 
 
@@ -97,6 +97,28 @@ class SuppressedIndirectCall:
 
 
 @dataclass
+class ConstZFold:
+    """Bookkeeping entry for a BEQ/BNE rewritten to an unconditional Goto
+    by `_apply_constant_z_fold`. Recorded for the build report so each
+    fold is visible/auditable rather than silently absorbed.
+    """
+    branch_pc24: int          # PC of the BEQ/BNE
+    prev_pc24: int            # PC of the preceding LDA/LDX/LDY #imm
+    branch_mnem: str          # 'BEQ' | 'BNE'
+    prev_mnem: str            # 'LDA' | 'LDX' | 'LDY'
+    prev_imm: int             # masked immediate value used for Z
+    width_bits: int           # 8 or 16 (op width at the load)
+    z_value: int              # 0 or 1
+    taken_kind: str           # 'jump' (live edge is the explicit target)
+                              # or 'fall' (live edge is fall-through PC)
+    live_pc24: int            # surviving successor's 24-bit PC
+    dead_pc24: int            # pruned successor's 24-bit PC
+    func_entry_pc24: int      # decode_function's entry PC for context
+    entry_m: int
+    entry_x: int
+
+
+@dataclass
 class FunctionDecodeGraph:
     """Output of `decode_function` for one function entry.
 
@@ -110,10 +132,14 @@ class FunctionDecodeGraph:
             fall-through edge was severed because cfg has no
             `indirect_call_table` authorisation. See class
             SuppressedIndirectCall above.
+        const_z_folds: list of BEQ/BNE rewrites by the constant-Z fold
+            post-pass. Each entry records the original branch + the
+            statically-proven Z + the surviving and pruned edges.
     """
     entry: DecodeKey
     insns: Dict[DecodeKey, DecodedInsn] = field(default_factory=dict)
     suppressed_indirect_calls: List[SuppressedIndirectCall] = field(default_factory=list)
+    const_z_folds: List[ConstZFold] = field(default_factory=list)
 
     def keys_at_pc(self, pc24: int) -> List[DecodeKey]:
         """Return all DecodeKeys with this 24-bit PC (across entry mode states)."""
@@ -534,4 +560,138 @@ def decode_function(rom: bytes, bank: int, start: int,
             if s not in graph.insns:
                 worklist.append((s, sk, pc))
 
+    # Constant-Z branch fold + reachability prune. Runs once after the
+    # worklist drains so predecessor counts are stable. See
+    # `_apply_constant_z_fold` for the narrow scope.
+    _apply_constant_z_fold(graph)
+
     return graph
+
+
+def _apply_constant_z_fold(graph: FunctionDecodeGraph) -> None:
+    """Decoder post-pass: rewrite BEQ/BNE successors to a single live
+    edge when the same-block predecessor is an immediate LDA/LDX/LDY
+    that makes Z statically known.
+
+    Narrow scope (deliberate — see project_constant_z_fold spec):
+        * Predecessor must be LDA/LDX/LDY in IMM addressing mode.
+        * Predecessor's only successor must be this branch (no other
+          edge can land on the load between it and the branch).
+        * Branch must have exactly ONE predecessor (the load) and
+          exactly TWO successors (fall + jump from _labeled_successors).
+        * Op width follows m for LDA, x for LDX/LDY (entry mode of
+          the load, which is what the decoder used to read its bytes).
+        * Only Z-flag branches (BEQ/BNE). N/V/C are explicitly out of
+          scope for this initial fold; SEP/REP/PLP/ALU are out too.
+
+    On match:
+        * graph.insns[branch_key].successors becomes [live_edge_only].
+        * insn.const_z_fold_unconditional is set so lowering emits a
+          `Goto` IR op (single successor) rather than a `CondBranch`
+          (two-successor flag test).
+        * insn.const_z_fold_dead_pc24 records the pruned target for
+          the build report.
+        * Reachability is recomputed from graph.entry; insns reachable
+          ONLY through the pruned edge are removed from graph.insns
+          (and therefore from cfg block construction + codegen). Their
+          unresolvable-goto markers, if any, vanish along with them —
+          that is the point of the fold.
+        * graph.const_z_folds gets a record for the build report.
+    """
+    if not graph.insns:
+        return
+
+    # Build predecessors map.
+    preds: Dict[DecodeKey, set] = {}
+    for k, di in graph.insns.items():
+        for s in di.successors:
+            preds.setdefault(s, set()).add(k)
+
+    # Apply folds. Iterate over a snapshot of keys because we mutate
+    # graph.insns mid-loop.
+    for k in list(graph.insns.keys()):
+        di = graph.insns.get(k)
+        if di is None:
+            continue
+        insn = di.insn
+        if insn.mnem not in ('BEQ', 'BNE'):
+            continue
+        my_preds = preds.get(k, set())
+        if len(my_preds) != 1:
+            continue
+        pred_key = next(iter(my_preds))
+        pred_di = graph.insns.get(pred_key)
+        if pred_di is None:
+            continue
+        pred_insn = pred_di.insn
+        if pred_insn.mnem not in ('LDA', 'LDX', 'LDY'):
+            continue
+        if pred_insn.mode != IMM:
+            continue
+        if len(pred_di.successors) != 1 or pred_di.successors[0] != k:
+            continue
+        if len(di.successors) != 2:
+            # Already pruned (defensive — shouldn't reach this branch).
+            continue
+
+        # Compute Z from the masked immediate. LDA uses m-width;
+        # LDX/LDY use x-width. Use the LOAD's entry flags (the mode
+        # under which decode_insn read its operand bytes).
+        if pred_insn.mnem == 'LDA':
+            width_bits = 8 if pred_insn.m_flag == 1 else 16
+        else:
+            width_bits = 8 if pred_insn.x_flag == 1 else 16
+        mask = (1 << width_bits) - 1
+        masked = pred_insn.operand & mask
+        z = 1 if masked == 0 else 0
+
+        # successors order from _labeled_successors for cond branch:
+        # [(fall, 'fall'), (jump, 'jump')].
+        fall_succ, jump_succ = di.successors[0], di.successors[1]
+        if insn.mnem == 'BEQ':
+            taken = (z == 1)
+        else:  # BNE
+            taken = (z == 0)
+        live = jump_succ if taken else fall_succ
+        dead = fall_succ if taken else jump_succ
+
+        # Rewrite successors to single live edge.
+        graph.insns[k] = DecodedInsn(key=k, insn=insn, successors=[live])
+        insn.const_z_fold_unconditional = True
+        insn.const_z_fold_dead_pc24 = dead.pc & 0xFFFFFF
+
+        # Build a context-rich record for the report.
+        graph.const_z_folds.append(ConstZFold(
+            branch_pc24=insn.addr & 0xFFFFFF,
+            prev_pc24=pred_insn.addr & 0xFFFFFF,
+            branch_mnem=insn.mnem,
+            prev_mnem=pred_insn.mnem,
+            prev_imm=masked,
+            width_bits=width_bits,
+            z_value=z,
+            taken_kind='jump' if taken else 'fall',
+            live_pc24=live.pc & 0xFFFFFF,
+            dead_pc24=dead.pc & 0xFFFFFF,
+            func_entry_pc24=graph.entry.pc & 0xFFFFFF,
+            entry_m=graph.entry.m & 1,
+            entry_x=graph.entry.x & 1,
+        ))
+
+    # Reachability prune. Walk from entry; drop any insn no longer
+    # reachable. Without this the dead-path insns linger in graph.insns
+    # and cfg.build picks them up as orphan blocks (carrying any
+    # unresolvable-goto markers they accumulated).
+    reachable: set = set()
+    work = [graph.entry]
+    while work:
+        cur = work.pop()
+        if cur in reachable:
+            continue
+        if cur not in graph.insns:
+            continue
+        reachable.add(cur)
+        for s in graph.insns[cur].successors:
+            work.append(s)
+    for k in list(graph.insns.keys()):
+        if k not in reachable:
+            del graph.insns[k]

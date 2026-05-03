@@ -46,7 +46,9 @@ MODE_STR = {
 
 class Insn:
     __slots__ = ('addr', 'opcode', 'mnem', 'mode', 'operand', 'length',
-                 'dispatch_entries', 'dispatch_kind', 'm_flag', 'x_flag', 'dispatch_terminal')
+                 'dispatch_entries', 'dispatch_kind', 'm_flag', 'x_flag',
+                 'dispatch_terminal',
+                 'const_z_fold_unconditional', 'const_z_fold_dead_pc24')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
         self.addr = addr
@@ -60,6 +62,13 @@ class Insn:
         self.dispatch_terminal = False
         self.m_flag = 1
         self.x_flag = 1
+        # Constant-Z branch fold: when set on a BEQ/BNE, the preceding
+        # same-block immediate-LD* made Z statically known and the
+        # branch was rewritten to an unconditional Goto with a single
+        # live successor. dead_pc24 records the pruned edge for the
+        # build report.
+        self.const_z_fold_unconditional = False
+        self.const_z_fold_dead_pc24 = None
 
     def __repr__(self):
         bank = (self.addr >> 16) & 0xFF

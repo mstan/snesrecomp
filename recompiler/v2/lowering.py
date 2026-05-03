@@ -323,7 +323,14 @@ def _pull_reg(reg):
 
 # Branches
 def _cond_branch(flag, take_if):
-    def h(insn, vf): return [CondBranch(flag=flag, take_if=take_if)]
+    def h(insn, vf):
+        # Constant-Z fold: decoder's post-pass proved this branch is
+        # unconditional and rewrote graph.insns[key].successors to a
+        # single live edge. Emit a plain Goto so emit_function picks
+        # successors[0] without testing the flag bit at runtime.
+        if getattr(insn, 'const_z_fold_unconditional', False):
+            return [Goto()]
+        return [CondBranch(flag=flag, take_if=take_if)]
     return h
 
 

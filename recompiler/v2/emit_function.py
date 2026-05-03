@@ -64,6 +64,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                   dispatch_helpers=None,
                   indirect_call_tables=None,
                   suppressed_collector=None,
+                  const_z_fold_collector=None,
                   exclude_ranges: Optional[List[Tuple[int, int]]] = None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
@@ -82,6 +83,10 @@ def emit_function(rom: bytes, bank: int, start: int,
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:
         suppressed_collector.extend(graph.suppressed_indirect_calls)
+    # Same plumbing for the constant-Z fold log: each rewritten BEQ/BNE
+    # is recorded once per (function entry, branch site).
+    if const_z_fold_collector is not None:
+        const_z_fold_collector.extend(graph.const_z_folds)
     cfg = build_cfg(graph)
 
     if func_name is None:
