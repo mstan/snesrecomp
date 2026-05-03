@@ -4273,6 +4273,64 @@ static void cmd_db_trip_get(const char *args) {
 #endif
 }
 
+/* Stack-drift tripwire — fires on the FIRST function exit (post-frame
+ * frame_min) where exit_S != entry_S AND exit_kind == NORMAL. Distinct
+ * from the DB tripwire (which catches DB→<value> transitions): this
+ * catches structural-invariant violations regardless of register state.
+ * Auto-arms at boot via cpu_trace_arm_default_watches with frame_min=400. */
+static void cmd_stack_drift_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    StackDriftTripwire *t = &g_stack_drift_tripwire;
+    static char buf[262144];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"triggered\":%u,\"frame_min\":%d",
+        t->armed, t->triggered, t->frame_min);
+    if (t->triggered) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"func\":\"%s\","
+            "\"entry_S\":\"0x%04x\",\"exit_S\":\"0x%04x\",\"s_delta\":%d,"
+            "\"entry_seq\":%llu,\"exit_seq\":%llu,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"m\":%u,\"x\":%u,\"e\":%u,\"stack\":[",
+            t->frame, t->func_name,
+            t->entry_S, t->exit_S, t->s_delta,
+            (unsigned long long)t->entry_seq,
+            (unsigned long long)t->exit_seq,
+            t->A, t->X, t->Y, t->S, t->D,
+            t->DB, t->PB, t->P, t->m_flag, t->x_flag, t->e_flag);
+        for (int i = 0; i < t->stack_depth; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", t->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"boundary_history\":[");
+        for (int i = 0; i < t->bd_count; i++) {
+            BoundaryEvent *e = &t->bd_history[i];
+            if (pos > (int)sizeof(buf) - 512) break;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"seq\":%llu,\"entry_seq\":%llu,\"frame\":%d,"
+                "\"kind\":%u,\"exit_kind\":%u,\"name\":\"%s\","
+                "\"S\":\"0x%04x\",\"DB\":\"0x%02x\",\"PB\":\"0x%02x\","
+                "\"depth\":%u}",
+                i ? "," : "",
+                (unsigned long long)e->seq,
+                (unsigned long long)e->entry_seq,
+                e->frame, (unsigned)e->kind, (unsigned)e->exit_kind,
+                e->name,
+                e->S, e->DB, e->PB,
+                (unsigned)e->stack_depth);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* NLR diagnostic — non-rotating counters that survive cpu_trace ring
  * rotation. Answers "did any NLR-pattern block ever execute?" and
  * "did any Return ever consume a non-zero pending_skip?" — questions
@@ -4689,6 +4747,7 @@ static const CmdEntry s_commands[] = {
     {"db_trip_arm",    cmd_db_trip_arm},
     {"db_trip_get",    cmd_db_trip_get},
     {"nlr_diag",       cmd_nlr_diag},
+    {"stack_drift_get", cmd_stack_drift_get},
     {"db_trip_disarm", cmd_db_trip_disarm},
     {"dma_trip_get",   cmd_dma_trip_get},
     {"pxwatch_arm",    cmd_pxwatch_arm},

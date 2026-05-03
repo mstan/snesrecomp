@@ -141,6 +141,10 @@ def call_with_pb_save(target_bank: int, callee_name: str) -> List[str]:
         "cpu->PB = _saved_pb;",
         "if (_r != RECOMP_RETURN_NORMAL) {",
         "  cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
+        # Mark this exit as SKIP-PROPAGATION so the stack-drift
+        # tripwire ignores the LEGITIMATE imbalance from skipping
+        # this function's post-JSL cleanup.
+        "  cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
         "  return (RecompReturn)((int)_r - 1);",
         "}",
     ]

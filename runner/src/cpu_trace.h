@@ -427,6 +427,25 @@ enum {
     BD_EXIT  = 1,
 };
 
+/* Exit kinds — set on BD_EXIT events so post-hoc analysis can ignore
+ * SKIP-cascade imbalances (which are intentional under the NLR ABI).
+ * NORMAL = the function returned normally (RTS read pending_skip == 0).
+ * NLR_PRIMARY = an NLR-pattern block in this function set pending_skip
+ *               and the RTS returned the SKIP_N value. The function's
+ *               S balance is preserved (literal PLAs were skipped).
+ * SKIP_PROPAGATION = a JSR/JSL callsite in this function received
+ *                    SKIP_N from its callee and emitted an early
+ *                    return (without running its own post-call
+ *                    cleanup). The function's S balance is
+ *                    LEGITIMATELY broken — its prologue PHB/PHK
+ *                    weren't matched by epilogue PLB. This mirrors
+ *                    the asm "skip caller" semantic. */
+enum {
+    BD_EXIT_KIND_NORMAL = 0,
+    BD_EXIT_KIND_NLR_PRIMARY = 1,
+    BD_EXIT_KIND_SKIP_PROPAGATION = 2,
+};
+
 typedef struct BoundaryEvent {
     uint64_t seq;            /* monotonic event id (matches g_boundary_idx) */
     uint64_t entry_seq;      /* for BD_EXIT: seq of paired BD_ENTRY; 0 for BD_ENTRY */
@@ -437,7 +456,8 @@ typedef struct BoundaryEvent {
     uint8_t  m_flag, x_flag;
     uint8_t  kind;           /* BD_ENTRY | BD_EXIT */
     uint8_t  stack_depth;    /* g_recomp_stack_top AFTER push (entry) or BEFORE pop (exit) */
-    uint8_t  pad[3];
+    uint8_t  exit_kind;      /* one of BD_EXIT_KIND_*; only meaningful when kind == BD_EXIT */
+    uint8_t  pad[2];
     char     name[BOUNDARY_NAME_LEN];
 } BoundaryEvent;
 
@@ -462,6 +482,13 @@ void boundary_audit_record_entry(const char *name);
  * depth). Pairs with the matching entry via the per-call entry_seq
  * stack maintained inline. */
 void boundary_audit_record_exit(const char *name);
+/* Tag the NEXT boundary EXIT with a non-NORMAL kind. Codegen emits
+ * `cpu_trace_mark_nlr_exit(BD_EXIT_KIND_NLR_PRIMARY)` from the Return
+ * op when pending_skip != 0, and `cpu_trace_mark_nlr_exit(
+ * BD_EXIT_KIND_SKIP_PROPAGATION)` from JSR/JSL callsites that
+ * propagate SKIP_N upward. The flag is consumed (and reset to
+ * NORMAL) by the next boundary_audit_record_exit. */
+void cpu_trace_mark_nlr_exit(uint8_t kind);
 #endif
 
 /* ── DB→<value> one-shot tripwire ──────────────────────────────────────
@@ -520,8 +547,60 @@ typedef struct DbTripwire {
     CpuDbpbEvent dbpb_history[DB_TRIP_DBPB_HISTORY];
 } DbTripwire;
 
+/* ── Stack-drift tripwire (post-frame-N) ──────────────────────────────
+ *
+ * Fires on the FIRST function exit where:
+ *   - frame >= frame_min (gate; default 400 to skip boot prolog)
+ *   - exit_kind == BD_EXIT_KIND_NORMAL (ignore intentional NLR cascade)
+ *   - S_exit != S_entry (paired via boundary auditor's entry_seq stack)
+ *
+ * Auto-arms at boot via cpu_trace_arm_default_watches. Freezes the
+ * boundary ring on fire so post-trip activity can't overwrite the
+ * imbalance window — same pattern as DB→$C0 tripwire.
+ *
+ * Captures full state at trip + last 256 boundary events + recomp
+ * stack at trip time. Distinct from DB tripwire (which fires on a DB
+ * value), this fires on a STRUCTURAL invariant violation (function
+ * entry-S != exit-S), catching the next-class-of-NLR-or-stack bug
+ * that may surface at the Yoshi-block freeze.
+ */
+#define STACK_DRIFT_TRIP_BD_HISTORY 256
+#define STACK_DRIFT_TRIP_FUNC_LEN BOUNDARY_NAME_LEN
+#define STACK_DRIFT_TRIP_STACK_DEPTH 16
+
+typedef struct StackDriftTripwire {
+    uint8_t  armed;
+    uint8_t  triggered;
+    uint8_t  pad[2];
+    int32_t  frame_min;        /* trigger only on frame >= this */
+
+    /* Captured at trip */
+    int32_t  frame;
+    int32_t  s_delta;          /* exit_S - entry_S (signed) */
+    uint16_t entry_S;
+    uint16_t exit_S;
+    uint64_t entry_seq;
+    uint64_t exit_seq;
+    char     func_name[STACK_DRIFT_TRIP_FUNC_LEN];
+
+    /* Full CpuState at trip */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+    uint8_t  pad2[2];
+
+    /* Recomp stack snapshot */
+    int32_t  stack_depth;
+    char     stack[STACK_DRIFT_TRIP_STACK_DEPTH][STACK_DRIFT_TRIP_FUNC_LEN];
+
+    /* Frozen boundary history at trip */
+    int32_t  bd_count;
+    int32_t  pad3;
+    BoundaryEvent bd_history[STACK_DRIFT_TRIP_BD_HISTORY];
+} StackDriftTripwire;
+
 #if SNESRECOMP_TRACE
 extern DbTripwire g_db_tripwire;
+extern StackDriftTripwire g_stack_drift_tripwire;
 
 void cpu_trace_arm_db_tripwire(uint8_t target_db);
 void cpu_trace_disarm_db_tripwire(void);
@@ -531,6 +610,19 @@ void cpu_trace_disarm_db_tripwire(void);
 void cpu_trace_db_tripwire_check(CpuState *cpu, uint32_t pc24,
                                  uint8_t old_db, uint8_t new_db,
                                  uint8_t event_type);
+
+/* Arm the stack-drift tripwire. `frame_min` skips imbalances earlier
+ * than this frame number (lets the boot prolog complete without
+ * spurious trips). */
+void cpu_trace_arm_stack_drift_tripwire(int32_t frame_min);
+void cpu_trace_disarm_stack_drift_tripwire(void);
+/* Internal — called from boundary_audit_record_exit AFTER the EXIT
+ * event has been written, with paired entry_S looked up from the
+ * active-call stack. */
+void cpu_trace_stack_drift_check(uint16_t entry_S, uint16_t exit_S,
+                                 uint64_t entry_seq, uint64_t exit_seq,
+                                 const char *func_name,
+                                 uint8_t exit_kind);
 #else
 static inline void cpu_trace_arm_db_tripwire(uint8_t b) { (void)b; }
 static inline void cpu_trace_disarm_db_tripwire(void) { }
@@ -539,9 +631,17 @@ static inline void cpu_trace_db_tripwire_check(CpuState *c, uint32_t p,
                                                uint8_t e) {
     (void)c; (void)p; (void)o; (void)n; (void)e;
 }
+static inline void cpu_trace_arm_stack_drift_tripwire(int32_t f) { (void)f; }
+static inline void cpu_trace_disarm_stack_drift_tripwire(void) { }
+static inline void cpu_trace_stack_drift_check(uint16_t es, uint16_t xs,
+                                               uint64_t a, uint64_t b,
+                                               const char *n, uint8_t k) {
+    (void)es; (void)xs; (void)a; (void)b; (void)n; (void)k;
+}
 static inline uint64_t boundary_audit_init(void) { return 0; }
 static inline void boundary_audit_record_entry(const char *n) { (void)n; }
 static inline void boundary_audit_record_exit(const char *n) { (void)n; }
+static inline void cpu_trace_mark_nlr_exit(uint8_t k) { (void)k; }
 #endif
 
 /* ── NLR diagnostic counters (non-rotating) ────────────────────────────

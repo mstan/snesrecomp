@@ -836,6 +836,12 @@ def _emit_call(op: Call) -> List[str]:
         f"  RecompReturn _r = {name}(cpu);",
         "  if (_r != RECOMP_RETURN_NORMAL) {",
         "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
+        # Mark this exit as SKIP-PROPAGATION so the stack-drift
+        # tripwire ignores the LEGITIMATE imbalance: this function's
+        # post-JSR cleanup (e.g. PLB) won't execute, leaving its
+        # prologue PHB unmatched. That mirrors the asm "skip caller"
+        # semantic and is by design under the NLR ABI.
+        "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
         "    return (RecompReturn)((int)_r - 1);",
         "  }",
         "}",
@@ -862,17 +868,25 @@ def _emit_return(op: Return) -> List[str]:
     The `return ...;` line stays at the start of its line so the
     per-line scanner in emit_function.py auto-injects RecompStackPop()
     before it."""
+    # Mark this exit as NLR-PRIMARY when _ps != NORMAL so the
+    # boundary auditor's stack-drift tripwire ignores the
+    # legitimate-imbalance case (an NLR-pattern block fired in this
+    # function and the literal PLAs were skipped — entry_S == exit_S
+    # in this codegen, but cpu_trace_mark_nlr_exit kept for
+    # completeness / future-proofing for sub-classes of NLR).
     if op.interrupt:
         return [
             "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);",
             "{ RecompReturn _ps = _pending_skip; _pending_skip = RECOMP_RETURN_NORMAL;",
             "  cpu_trace_pending_skip_consume(cpu, 0, (uint8)_ps, g_last_recomp_func);",
+            "  if (_ps != RECOMP_RETURN_NORMAL) cpu_trace_mark_nlr_exit(BD_EXIT_KIND_NLR_PRIMARY);",
             "  return _ps; /* RTI */ }",
         ]
     label = "/* RTL */" if op.long else "/* RTS */"
     return [
         "{ RecompReturn _ps = _pending_skip; _pending_skip = RECOMP_RETURN_NORMAL;",
         "  cpu_trace_pending_skip_consume(cpu, 0, (uint8)_ps, g_last_recomp_func);",
+        "  if (_ps != RECOMP_RETURN_NORMAL) cpu_trace_mark_nlr_exit(BD_EXIT_KIND_NLR_PRIMARY);",
         f"  return _ps; {label} }}",
     ]
 

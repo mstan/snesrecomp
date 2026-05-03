@@ -75,8 +75,22 @@ uint64_t       g_boundary_idx = 0;
 uint8_t        g_boundary_frozen = 0;
 
 #define BOUNDARY_ACTIVE_DEPTH 64  /* matches RECOMP_STACK_DEPTH */
-static uint64_t s_active_entry_seq[BOUNDARY_ACTIVE_DEPTH];
-static int      s_active_top = 0;
+typedef struct ActiveCall {
+    uint64_t entry_seq;
+    uint16_t entry_S;
+} ActiveCall;
+static ActiveCall s_active[BOUNDARY_ACTIVE_DEPTH];
+static int        s_active_top = 0;
+
+/* Pending NLR exit-kind flag — set by codegen via
+ * cpu_trace_mark_nlr_exit() right before a SKIP-propagation return,
+ * consumed (and reset) by boundary_audit_record_exit. Lets the
+ * stack-drift tripwire ignore intentional NLR-cascade imbalances. */
+static uint8_t s_pending_exit_kind = BD_EXIT_KIND_NORMAL;
+
+void cpu_trace_mark_nlr_exit(uint8_t kind) {
+    s_pending_exit_kind = kind;
+}
 
 uint64_t boundary_audit_init(void) {
     uint64_t cap = BOUNDARY_RING_DEFAULT_ENTRIES;
@@ -123,19 +137,23 @@ void boundary_audit_record_entry(const char *name) {
     boundary_fill_state(be);
     be->kind = BD_ENTRY;
     be->stack_depth = (uint8_t)(g_recomp_stack_top > 255 ? 255 : g_recomp_stack_top);
-    be->pad[0] = be->pad[1] = be->pad[2] = 0;
+    be->exit_kind = BD_EXIT_KIND_NORMAL;  /* unused on ENTRY */
+    be->pad[0] = be->pad[1] = 0;
     if (name) {
         strncpy(be->name, name, BOUNDARY_NAME_LEN - 1);
         be->name[BOUNDARY_NAME_LEN - 1] = 0;
     } else {
         be->name[0] = 0;
     }
-    /* Track entry seq on the parallel call-stack so the matching EXIT
-     * can reference it. Saturate at BOUNDARY_ACTIVE_DEPTH; if the call
-     * stack runs deeper than expected, EXIT events still get written —
-     * they just carry entry_seq=0 (unpaired). */
+    /* Track entry seq + entry_S on the parallel call-stack so the
+     * matching EXIT can reference both. Saturate at
+     * BOUNDARY_ACTIVE_DEPTH; if the call stack runs deeper, EXIT
+     * events still get written — they just carry entry_seq=0
+     * (unpaired). */
     if (s_active_top < BOUNDARY_ACTIVE_DEPTH) {
-        s_active_entry_seq[s_active_top++] = seq;
+        s_active[s_active_top].entry_seq = seq;
+        s_active[s_active_top].entry_S = be->S;
+        s_active_top++;
     }
 }
 
@@ -147,11 +165,16 @@ void boundary_audit_record_exit(const char *name) {
     int slot = (int)(seq & (g_boundary_capacity - 1));
     BoundaryEvent *be = &g_boundary_ring[slot];
     be->seq = seq;
-    /* Pop the matching entry seq off the parallel stack. If empty (over-
-     * popped) leave entry_seq=0 — that itself is signal: an unbalanced
-     * exit. */
+    /* Pop the matching entry seq + entry_S off the parallel stack.
+     * If empty (over-popped) leave entry_seq=0 — that itself is
+     * signal: an unbalanced exit. */
+    uint16_t entry_S = 0;
+    int paired = 0;
     if (s_active_top > 0) {
-        be->entry_seq = s_active_entry_seq[--s_active_top];
+        s_active_top--;
+        be->entry_seq = s_active[s_active_top].entry_seq;
+        entry_S = s_active[s_active_top].entry_S;
+        paired = 1;
     } else {
         be->entry_seq = 0;
     }
@@ -160,12 +183,24 @@ void boundary_audit_record_exit(const char *name) {
     boundary_fill_state(be);
     be->kind = BD_EXIT;
     be->stack_depth = (uint8_t)(g_recomp_stack_top > 255 ? 255 : g_recomp_stack_top);
-    be->pad[0] = be->pad[1] = be->pad[2] = 0;
+    /* Consume + reset the pending NLR exit-kind flag. */
+    be->exit_kind = s_pending_exit_kind;
+    s_pending_exit_kind = BD_EXIT_KIND_NORMAL;
+    be->pad[0] = be->pad[1] = 0;
     if (name) {
         strncpy(be->name, name, BOUNDARY_NAME_LEN - 1);
         be->name[BOUNDARY_NAME_LEN - 1] = 0;
     } else {
         be->name[0] = 0;
+    }
+    /* Stack-drift tripwire — fires on the FIRST function exit after
+     * frame_min where exit_S != entry_S AND exit_kind == NORMAL.
+     * SKIP-propagation and NLR-primary exits are LEGITIMATELY
+     * unbalanced under the asm "skip caller" semantic and must be
+     * ignored; only NORMAL exits with mismatched S indicate a bug. */
+    if (paired) {
+        cpu_trace_stack_drift_check(entry_S, be->S, be->entry_seq, seq,
+                                    be->name, be->exit_kind);
     }
 }
 
@@ -275,6 +310,92 @@ void cpu_trace_db_tripwire_check(CpuState *cpu, uint32_t pc24,
             t->last_func[0] ? t->last_func : "(none)",
             (unsigned)t->S,
             (unsigned long long)t->trip_boundary_seq,
+            (int)t->bd_count);
+    fflush(stderr);
+}
+
+/* ── Stack-drift tripwire ──────────────────────────────────────────── */
+StackDriftTripwire g_stack_drift_tripwire = {0};
+
+void cpu_trace_arm_stack_drift_tripwire(int32_t frame_min) {
+    memset(&g_stack_drift_tripwire, 0, sizeof(g_stack_drift_tripwire));
+    g_stack_drift_tripwire.armed = 1;
+    g_stack_drift_tripwire.frame_min = frame_min;
+}
+
+void cpu_trace_disarm_stack_drift_tripwire(void) {
+    g_stack_drift_tripwire.armed = 0;
+}
+
+static void stack_drift_tripwire_snapshot_boundary(int want) {
+    if (want > STACK_DRIFT_TRIP_BD_HISTORY) want = STACK_DRIFT_TRIP_BD_HISTORY;
+    int avail = (int)(g_boundary_idx < (uint64_t)want ? g_boundary_idx : (uint64_t)want);
+    if (avail > (int)g_boundary_capacity) avail = (int)g_boundary_capacity;
+    g_stack_drift_tripwire.bd_count = avail;
+    /* Newest-first. */
+    for (int i = 0; i < avail; i++) {
+        uint64_t abs = g_boundary_idx - 1 - (uint64_t)i;
+        int slot = (int)(abs & (g_boundary_capacity - 1));
+        g_stack_drift_tripwire.bd_history[i] = g_boundary_ring[slot];
+    }
+}
+
+void cpu_trace_stack_drift_check(uint16_t entry_S, uint16_t exit_S,
+                                 uint64_t entry_seq, uint64_t exit_seq,
+                                 const char *func_name,
+                                 uint8_t exit_kind) {
+    StackDriftTripwire *t = &g_stack_drift_tripwire;
+    if (!t->armed || t->triggered) return;
+    /* Only NORMAL exits matter — SKIP-propagation cascades are
+     * legitimately unbalanced under the asm "skip caller" semantic. */
+    if (exit_kind != BD_EXIT_KIND_NORMAL) return;
+    /* Frame gate so boot prolog doesn't trigger spurious imbalances. */
+    extern int snes_frame_counter;
+    if (snes_frame_counter < t->frame_min) return;
+    /* The actual invariant: function exit must preserve S. */
+    if (entry_S == exit_S) return;
+
+    t->triggered = 1;
+    t->frame = snes_frame_counter;
+    t->s_delta = (int32_t)exit_S - (int32_t)entry_S;
+    t->entry_S = entry_S;
+    t->exit_S = exit_S;
+    t->entry_seq = entry_seq;
+    t->exit_seq = exit_seq;
+    if (func_name) {
+        strncpy(t->func_name, func_name, STACK_DRIFT_TRIP_FUNC_LEN - 1);
+        t->func_name[STACK_DRIFT_TRIP_FUNC_LEN - 1] = 0;
+    }
+
+    extern CpuState g_cpu;
+    t->A = g_cpu.A; t->X = g_cpu.X; t->Y = g_cpu.Y;
+    t->S = g_cpu.S; t->D = g_cpu.D;
+    t->DB = g_cpu.DB; t->PB = g_cpu.PB; t->P = g_cpu.P;
+    t->m_flag = g_cpu.m_flag; t->x_flag = g_cpu.x_flag;
+    t->e_flag = g_cpu.emulation;
+
+    int depth = g_recomp_stack_top;
+    if (depth > STACK_DRIFT_TRIP_STACK_DEPTH) depth = STACK_DRIFT_TRIP_STACK_DEPTH;
+    t->stack_depth = depth;
+    int skip = g_recomp_stack_top - depth;
+    for (int i = 0; i < depth; i++) {
+        const char *p = g_recomp_stack[skip + i];
+        if (p) {
+            strncpy(t->stack[i], p, STACK_DRIFT_TRIP_FUNC_LEN - 1);
+            t->stack[i][STACK_DRIFT_TRIP_FUNC_LEN - 1] = 0;
+        } else {
+            t->stack[i][0] = 0;
+        }
+    }
+
+    stack_drift_tripwire_snapshot_boundary(STACK_DRIFT_TRIP_BD_HISTORY);
+    g_boundary_frozen = 1;
+
+    fprintf(stderr,
+            "[stack_drift] FIRED frame=%d func=%s S_delta=%+d "
+            "(entry=$%04X exit=$%04X) bd_count=%d\n",
+            t->frame, t->func_name, t->s_delta,
+            (unsigned)t->entry_S, (unsigned)t->exit_S,
             (int)t->bd_count);
     fflush(stderr);
 }
@@ -1091,6 +1212,14 @@ void cpu_trace_arm_default_watches(void) {
      * FIRST sane→$C0 transition with full boundary-event history. */
     cpu_trace_arm_db_tripwire(0xC0);
     fprintf(stderr, "[cpu_trace] DB tripwire armed (first transition to $C0)\n");
+    /* Auto-arm stack-drift tripwire — fires on FIRST function exit
+     * after frame >= 400 where exit_S != entry_S AND exit_kind ==
+     * NORMAL. Frame gate of 400 skips the boot prolog; the original
+     * koopa-shell freeze hit at frame 380 with the now-fixed NLR
+     * site, so 400 is just past the known-good window. The Yoshi-
+     * block freeze (downstream bug) likely surfaces here. */
+    cpu_trace_arm_stack_drift_tripwire(400);
+    fprintf(stderr, "[cpu_trace] stack-drift tripwire armed (frame >= 400)\n");
     /* Auto-arm scoped WRAM tripwire on the BG palette buffer
      * $7E:0700-$070F, the first 16 colors of MainPalette/BackgroundColor.
      *
