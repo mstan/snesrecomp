@@ -1000,6 +1000,30 @@ void cpu_trace_phantom_arm_smc_set(void) {
             g_phantom_trap_armed_count);
 }
 
+void cpu_trace_phantom_arm_unresolvable_goto_set(void) {
+    /* Unresolvable-cross-fn-goto block-entry PCs cf_debt_report
+     * 2026-05-03 found. Each is the BLOCK PC whose codegen currently
+     * emits `return RECOMP_RETURN_NORMAL; /\* ... unresolvable cross-fn
+     * goto ... *\/` — a silent normalisation of unknown control
+     * transfer. The trap captures whether any of these PCs actually
+     * runs; if 0 hits across attract + gameplay, flipping the emit
+     * to a loud abort is safe. If hits, the silent-return is
+     * masking a real bug. */
+    cpu_trace_phantom_arm(0x009D38, "BufferFileSelectText_unres");
+    cpu_trace_phantom_arm(0x00EE2D, "RunPlayerBlockCode_00EE1D_unres");
+    cpu_trace_phantom_arm(0x018B06, "SprXXX_Generic_018B03_unres");
+    cpu_trace_phantom_arm(0x038839, "Spr0BF_MegaMole_038820_unres");
+    cpu_trace_phantom_arm(0x03FE00, "bank_03_FE00_unres");
+    cpu_trace_phantom_arm(0x059C60, "auto_059C60_unres");
+    cpu_trace_phantom_arm(0x05C32B, "UnusedScrollSprite_unres");
+    cpu_trace_phantom_arm(0x0DB583, "ExtObj8E_YellowSwitchBlock_unres");
+    cpu_trace_phantom_arm(0x0DB916, "RopeObj33_BlueSwitchBlocks_unres");
+    fprintf(stderr,
+            "[cpu_trace] phantom-PC trap now covers %d total sites "
+            "(SMC + unresolvable-goto)\n",
+            g_phantom_trap_armed_count);
+}
+
 uint8_t g_stack_op_trace_enabled = 0;
 
 void cpu_trace_stack_op(CpuState *cpu, uint32_t pc24, uint8_t op_id,
@@ -1451,6 +1475,13 @@ void cpu_trace_arm_default_watches(void) {
      * sequences). This trap catches any of those PCs actually firing
      * as block entries — proves the classification empirically. */
     cpu_trace_phantom_arm_smc_set();
+    /* Auto-arm unresolvable-cross-fn-goto trap — investigation
+     * 2026-05-03: 9 unique block PCs whose codegen currently emits
+     * `return RECOMP_RETURN_NORMAL` for a goto whose target lies
+     * outside cfg's import range. Trap proves whether the silent
+     * normalisation is actually exercised before we change emit to
+     * a loud abort. */
+    cpu_trace_phantom_arm_unresolvable_goto_set();
     /* Auto-arm stack-drift tripwire — fires on FIRST function exit
      * after frame >= 400 where exit_S != entry_S AND exit_kind ==
      * NORMAL. Frame gate of 400 skips the boot prolog; the original

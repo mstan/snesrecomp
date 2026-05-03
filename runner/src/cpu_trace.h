@@ -314,6 +314,15 @@ void cpu_trace_phantom_disarm_all(void);
  * cpu_trace_arm_default_watches at process start. */
 void cpu_trace_phantom_arm_smc_set(void);
 
+/* Arm the unresolvable-cross-fn-goto block-entry set. These are the
+ * BLOCK PCs whose codegen currently emits `return RECOMP_RETURN_NORMAL`
+ * with an "unresolvable cross-fn goto" comment — silently normalising
+ * an unknown control transfer into a normal return. The trap fires
+ * when any such block executes so we can see whether the silent
+ * fall-through is actually exercised at runtime, before flipping the
+ * emit to a loud abort. */
+void cpu_trace_phantom_arm_unresolvable_goto_set(void);
+
 /* Called by RomPtr-invalid + cart_readLorom-out-of-range + any other
  * "off-the-rails" softfail to dump the trace ONCE per N events. Avoids
  * burying the trace under repeats of the same fail. */
@@ -888,6 +897,7 @@ static inline void cpu_trace_stack_op(CpuState *c, uint32_t p, uint8_t op,
 static inline void cpu_trace_phantom_arm(uint32_t p, const char *l)         { (void)p; (void)l; }
 static inline void cpu_trace_phantom_disarm_all(void)                       { }
 static inline void cpu_trace_phantom_arm_smc_set(void)                      { }
+static inline void cpu_trace_phantom_arm_unresolvable_goto_set(void)        { }
 
 #endif
 
