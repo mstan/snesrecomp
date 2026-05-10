@@ -95,6 +95,7 @@ enum {
 
 typedef struct CpuTraceEvent {
     uint32_t pc24;                   /* SNES PC at event time (bank<<16 | local) */
+    int32_t  frame;                  /* snes_frame_counter at event time */
     uint32_t native_func_id_or_hash; /* fnv-1a of function name, optional */
     uint16_t A;
     uint16_t X;
@@ -1039,6 +1040,76 @@ static inline void cpu_trace_gm14_clear(void) { }
 static inline void cpu_trace_gm14_maybe_record(const char *n, uint8_t k) {
     (void)n; (void)k;
 }
+#endif
+
+/* ── Block-keyed sampler ───────────────────────────────────────────────
+ *
+ * Captures register state + a user-specified set of WRAM byte values on
+ * every entry to a chosen block PC, into a non-rotating per-slot ring.
+ * Distinct from cpu_trace_block (which records every block entry into
+ * the rotating main ring). Use this when you need to inspect state INSIDE
+ * a function on every visit to a specific block — without polluting the
+ * main ring or pausing execution.
+ *
+ * Why this exists: func_watch / boundary_audit only capture at function
+ * entry/exit. cpu_trace_block fires every block but writes to the
+ * rotating ring (oldest events evict). For probing "what's $1FE2+X
+ * read at this block?" across many visits, this dedicated sampler keeps
+ * the slot's hits non-rotating until cleared.
+ */
+#define BLOCK_WATCH_MAX           16
+#define BLOCK_WATCH_ADDRS_MAX     8
+#define BLOCK_WATCH_HITS_MAX      32
+#define BLOCK_WATCH_STACK_DEPTH   8
+#define BLOCK_WATCH_FUNC_LEN      40
+
+typedef struct BlockWatchHit {
+    int32_t  frame;
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, m_flag, x_flag, e_flag;
+    uint8_t  pad[2];
+    uint8_t  vals[BLOCK_WATCH_ADDRS_MAX];   /* WRAM byte at each watched addr */
+    int32_t  stack_depth;
+    char     stack[BLOCK_WATCH_STACK_DEPTH][BLOCK_WATCH_FUNC_LEN];
+} BlockWatchHit;
+
+typedef struct BlockWatch {
+    uint8_t  enabled;
+    uint8_t  pad[3];
+    uint32_t pc24;                                  /* watched block PC */
+    int32_t  n_addrs;                               /* 0..BLOCK_WATCH_ADDRS_MAX */
+    int32_t  ram_offsets[BLOCK_WATCH_ADDRS_MAX];   /* g_ram offsets; -1 = unused */
+    int32_t  max_hits;                              /* stop capturing after this many */
+    int32_t  hit_count;                             /* number captured */
+    BlockWatchHit hits[BLOCK_WATCH_HITS_MAX];
+} BlockWatch;
+
+#if SNESRECOMP_TRACE
+extern BlockWatch g_block_watches[BLOCK_WATCH_MAX];
+extern uint8_t    g_block_watch_any;
+
+/* Arm a block-watch slot. If a slot already exists for `pc24`, that slot
+ * is reset and reused. `ram_offsets` is an array of `n_addrs` g_ram
+ * offsets in [0, 0x20000); -1 means "unused" but normally callers pass
+ * exactly n_addrs valid offsets. `max_hits` clamped to BLOCK_WATCH_HITS_MAX. */
+void cpu_trace_block_watch_arm(uint32_t pc24,
+                                const int32_t *ram_offsets,
+                                int n_addrs,
+                                int max_hits);
+/* Clear all block-watches. */
+void cpu_trace_block_watch_clear_all(void);
+/* Clear one slot. */
+void cpu_trace_block_watch_clear_one(int slot);
+/* Internal: called from cpu_trace_block on every block entry. Cheap when
+ * no watch is armed (one bool check). */
+void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24);
+#else
+static inline void cpu_trace_block_watch_arm(uint32_t p, const int32_t *o, int n, int m) {
+    (void)p; (void)o; (void)n; (void)m;
+}
+static inline void cpu_trace_block_watch_clear_all(void) { }
+static inline void cpu_trace_block_watch_clear_one(int s) { (void)s; }
+static inline void cpu_trace_block_watch_check(CpuState *c, uint32_t p) { (void)c; (void)p; }
 #endif
 
 /* Dump the last `n` events of the main ring to stderr, prefixed by `tag`. */

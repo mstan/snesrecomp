@@ -39,6 +39,12 @@ void debug_server_wait_if_paused(void);
 // Consumes the request (only returns it once).
 int debug_server_consume_loadstate(void);
 
+// TCP controller override. The returned input mask uses the runner's
+// controller layout: player 1 in bits 0..11, player 2 in bits 12..23.
+// The active mask is already shifted into the high controller-present bits.
+uint32_t debug_server_get_controller_inputs(void);
+uint32_t debug_server_get_controller_active_mask(void);
+
 // Snapshot the current frame's state (CPU/PPU/DMA/WRAM/VRAM/CGRAM/OAM)
 // into the history ring buffer. Called once per frame from common_cpu_infra.
 // Cross-runtime divergence comparison is done by an external tool that

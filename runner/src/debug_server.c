@@ -76,6 +76,8 @@ static uint32_t s_ram_size = 0;
 static volatile int s_paused = 0;
 static volatile int s_step_remaining = 0;  // frames remaining before auto-re-pause
 static volatile int s_pending_loadstate = -1;  // -1 = none, 0-9 = slot to load
+static volatile uint32_t s_controller_inputs = 0;  // p1 bits 0..11, p2 bits 12..23
+static volatile uint32_t s_controller_active = 0;  // bit0=p1 present, bit1=p2 present
 
 // Threading state
 #ifdef _WIN32
@@ -1783,6 +1785,177 @@ static void cmd_run_to_frame(const char *args) {
     // The poll function will re-pause when we reach the target
 }
 
+typedef struct ControllerName {
+    const char *name;
+    uint32_t mask;
+} ControllerName;
+
+static const ControllerName k_controller_names[] = {
+    {"b",      0x0001u},
+    {"y",      0x0002u},
+    {"select", 0x0004u},
+    {"start",  0x0008u},
+    {"up",     0x0010u},
+    {"down",   0x0020u},
+    {"left",   0x0040u},
+    {"right",  0x0080u},
+    {"a",      0x0100u},
+    {"x",      0x0200u},
+    {"l",      0x0400u},
+    {"r",      0x0800u},
+    {NULL, 0}
+};
+
+static void lower_ascii_in_place(char *s) {
+    for (; *s; s++) {
+        if (*s >= 'A' && *s <= 'Z')
+            *s = (char)(*s - 'A' + 'a');
+    }
+}
+
+static int parse_controller_mask(const char *text, uint32_t *out_mask,
+                                 char *err, size_t err_size) {
+    char buf[160];
+    uint32_t mask = 0;
+    if (!text || !*text) {
+        snprintf(err, err_size, "empty controller mask");
+        return 0;
+    }
+    snprintf(buf, sizeof(buf), "%s", text);
+    lower_ascii_in_place(buf);
+
+    if (strcmp(buf, "none") == 0 || strcmp(buf, "release") == 0 ||
+        strcmp(buf, "released") == 0 || strcmp(buf, "off") == 0 ||
+        strcmp(buf, "0") == 0) {
+        *out_mask = 0;
+        return 1;
+    }
+
+    if (buf[0] == '0' && buf[1] == 'x') {
+        char *end = NULL;
+        unsigned long v = strtoul(buf, &end, 16);
+        if (!end || *end) {
+            snprintf(err, err_size, "bad hex controller mask '%s'", text);
+            return 0;
+        }
+        *out_mask = (uint32_t)(v & 0x0FFFu);
+        return 1;
+    }
+
+    char *p = buf;
+    while (*p) {
+        char *tok = p;
+        while (*p && *p != '+' && *p != ',' && *p != '|') p++;
+        if (*p) *p++ = 0;
+
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char *end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        if (*tok) {
+            int found = 0;
+            for (const ControllerName *n = k_controller_names; n->name; n++) {
+                if (strcmp(tok, n->name) == 0) {
+                    mask |= n->mask;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                snprintf(err, err_size, "unknown controller button '%s'", tok);
+                return 0;
+            }
+        }
+    }
+
+    *out_mask = mask;
+    return 1;
+}
+
+static void emit_controller_state(void) {
+    uint32_t p1 = s_controller_inputs & 0x0FFFu;
+    uint32_t p2 = (s_controller_inputs >> 12) & 0x0FFFu;
+    uint32_t active = s_controller_active & 0x3u;
+    send_fmt("{\"ok\":true,\"p1\":\"0x%03x\",\"p2\":\"0x%03x\","
+             "\"p1_active\":%s,\"p2_active\":%s}",
+             p1, p2,
+             (active & 1u) ? "true" : "false",
+             (active & 2u) ? "true" : "false");
+}
+
+static void cmd_set_controller(const char *args) {
+    if (!args || !*args) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: set_controller "
+                 "<p1_buttons|0xmask> [p2_buttons|0xmask]\"}");
+        return;
+    }
+
+    char buf[256];
+    char err[128] = {0};
+    uint32_t p1 = 0, p2 = 0;
+    int p1_set = 0, p2_set = 0;
+    int positional = 0;
+    snprintf(buf, sizeof(buf), "%s", args);
+
+    char *tok = strtok(buf, " \t\r\n");
+    while (tok) {
+        const char *value = tok;
+        if (strncmp(tok, "p1=", 3) == 0 || strncmp(tok, "P1=", 3) == 0) {
+            value = tok + 3;
+            if (!parse_controller_mask(value, &p1, err, sizeof(err))) {
+                send_fmt("{\"ok\":false,\"error\":\"%s\"}", err);
+                return;
+            }
+            p1_set = 1;
+        } else if (strncmp(tok, "p2=", 3) == 0 || strncmp(tok, "P2=", 3) == 0) {
+            value = tok + 3;
+            if (!parse_controller_mask(value, &p2, err, sizeof(err))) {
+                send_fmt("{\"ok\":false,\"error\":\"%s\"}", err);
+                return;
+            }
+            p2_set = 1;
+        } else if (positional == 0) {
+            if (!parse_controller_mask(value, &p1, err, sizeof(err))) {
+                send_fmt("{\"ok\":false,\"error\":\"%s\"}", err);
+                return;
+            }
+            p1_set = 1;
+            positional++;
+        } else if (positional == 1) {
+            if (!parse_controller_mask(value, &p2, err, sizeof(err))) {
+                send_fmt("{\"ok\":false,\"error\":\"%s\"}", err);
+                return;
+            }
+            p2_set = 1;
+            positional++;
+        } else {
+            send_fmt("{\"ok\":false,\"error\":\"too many controller args\"}");
+            return;
+        }
+        tok = strtok(NULL, " \t\r\n");
+    }
+
+    if (!p1_set && !p2_set) {
+        send_fmt("{\"ok\":false,\"error\":\"no controller mask supplied\"}");
+        return;
+    }
+
+    s_controller_inputs = (p1 & 0x0FFFu) | ((p2 & 0x0FFFu) << 12);
+    s_controller_active = (p1_set ? 1u : 0u) | (p2_set ? 2u : 0u);
+    emit_controller_state();
+}
+
+static void cmd_get_controller(const char *args) {
+    (void)args;
+    emit_controller_state();
+}
+
+static void cmd_clear_controller(const char *args) {
+    (void)args;
+    s_controller_inputs = 0;
+    s_controller_active = 0;
+    emit_controller_state();
+}
+
 static void cmd_trace_addr(const char *args) {
     unsigned int addr = 0;
     sscanf(args, "%x", &addr);
@@ -3338,6 +3511,117 @@ static void cmd_history_status(const char *args) {
              s_history_count, FRAME_HISTORY_SIZE, oldest, newest);
 }
 
+static uint8_t sprite_field(const uint8_t *wram, int base, int slot) {
+    return wram[base + slot];
+}
+
+static int sprite_timeseries_append(char *buf, int pos, int cap,
+                                    const uint8_t *wram, int frame, int slot,
+                                    int first) {
+    int x = sprite_field(wram, 0x00e4, slot)
+          | (sprite_field(wram, 0x14e0, slot) << 8);
+    int y = sprite_field(wram, 0x00d8, slot)
+          | (sprite_field(wram, 0x14d4, slot) << 8);
+    return pos + snprintf(buf + pos, cap - pos,
+        "%s{\"f\":%d,\"st\":\"%02x\",\"n\":\"%02x\","
+        "\"x\":\"%04x\",\"y\":\"%04x\",\"xs\":\"%02x\",\"ys\":\"%02x\","
+        "\"bl\":\"%02x\",\"sl\":\"%02x\",\"dir\":\"%02x\","
+        "\"t1540\":\"%02x\",\"t1558\":\"%02x\",\"m1fe2\":\"%02x\","
+        "\"noobj\":\"%02x\"}",
+        first ? "" : ",",
+        frame,
+        sprite_field(wram, 0x14c8, slot),
+        sprite_field(wram, 0x009e, slot),
+        x & 0xffff,
+        y & 0xffff,
+        sprite_field(wram, 0x00b6, slot),
+        sprite_field(wram, 0x00aa, slot),
+        sprite_field(wram, 0x1588, slot),
+        sprite_field(wram, 0x15b8, slot),
+        sprite_field(wram, 0x157c, slot),
+        sprite_field(wram, 0x1540, slot),
+        sprite_field(wram, 0x1558, slot),
+        sprite_field(wram, 0x1fe2, slot),
+        sprite_field(wram, 0x15dc, slot));
+}
+
+static int sprite_timeseries_same(const uint8_t *a, const uint8_t *b, int slot) {
+    static const int bases[] = {
+        0x14c8, 0x009e, 0x00e4, 0x14e0, 0x00d8, 0x14d4, 0x00b6,
+        0x00aa, 0x1588, 0x15b8, 0x157c, 0x1540, 0x1558, 0x1fe2,
+        0x15dc
+    };
+    for (int i = 0; i < (int)(sizeof(bases) / sizeof(bases[0])); i++) {
+        int off = bases[i] + slot;
+        if (a[off] != b[off]) return 0;
+    }
+    return 1;
+}
+
+static void cmd_sprite_timeseries(const char *args) {
+    int slot = 9;
+    int from_frame = INT_MIN;
+    int to_frame = INT_MIN;
+    int changes_only = 1;
+    int limit = 512;
+    if (args && *args) {
+        int n = sscanf(args, "%d %d %d %d %d",
+                       &slot, &from_frame, &to_frame, &changes_only, &limit);
+        if (n < 1) slot = 9;
+    }
+    if (slot < 0 || slot >= 12) {
+        send_fmt("{\"ok\":false,\"error\":\"slot out of range\",\"slot\":%d}", slot);
+        return;
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 4096) limit = 4096;
+
+    lock_mutex();
+    int oldest = s_history_count > 0
+        ? s_frame_history[(s_history_write_idx - s_history_count + FRAME_HISTORY_SIZE) % FRAME_HISTORY_SIZE].frame_number
+        : -1;
+    int newest = s_history_count > 0
+        ? s_frame_history[(s_history_write_idx - 1 + FRAME_HISTORY_SIZE) % FRAME_HISTORY_SIZE].frame_number
+        : -1;
+    if (from_frame == INT_MIN) from_frame = oldest;
+    if (to_frame == INT_MIN) to_frame = newest;
+    if (from_frame < oldest) from_frame = oldest;
+    if (to_frame > newest) to_frame = newest;
+
+    static char buf[1048576];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"slot\":%d,\"from\":%d,\"to\":%d,"
+        "\"changes_only\":%s,\"entries\":[",
+        slot, from_frame, to_frame, changes_only ? "true" : "false");
+    uint8_t last[0x2000];
+    int have_last = 0;
+    int emitted = 0;
+    int considered = 0;
+    int truncated = 0;
+    for (int f = from_frame; f <= to_frame; f++) {
+        FrameRecord *r = find_frame(f);
+        if (!r) continue;
+        considered++;
+        int same = have_last && sprite_timeseries_same(last, r->wram, slot);
+        if (!changes_only || !same) {
+            if (emitted >= limit || pos > (int)sizeof(buf) - 1024) {
+                truncated = 1;
+                break;
+            }
+            pos = sprite_timeseries_append(buf, pos, (int)sizeof(buf),
+                                           r->wram, f, slot, emitted == 0);
+            emitted++;
+        }
+        memcpy(last, r->wram, sizeof(last));
+        have_last = 1;
+    }
+    unlock_mutex();
+    snprintf(buf + pos, sizeof(buf) - pos,
+             "],\"emitted\":%d,\"considered\":%d,\"truncated\":%s}",
+             emitted, considered, truncated ? "true" : "false");
+    send_line(buf);
+}
+
 static void cmd_profile_on(const char *args) {
     s_profile_enabled = 1;
     s_profile_count = 0;
@@ -3913,9 +4197,11 @@ static void cmd_trace_dump(const char *args) {
  *     bank=XX             — for WRAM_WRITE: extra1>>8 must equal bank
  *     addr_lo=XXXX        — for WRAM_WRITE: addr (low 16 of pc24) >= lo
  *     addr_hi=XXXX        — for WRAM_WRITE: addr <= hi
+ *     frame_lo=N          — only events at/after this host frame
+ *     frame_hi=N          — only events at/before this host frame
  *     before_idx=N        — start scan from absolute idx N-1 (default = g_cpu_trace_idx)
  *
- * Each emitted event is JSON: idx, event, pc24, A,X,Y,S,D, DB,PB,P,m,x,
+ * Each emitted event is JSON: idx, event, frame, pc24, A,X,Y,S,D, DB,PB,P,m,x,
  * extra0, extra1.
  */
 static void cmd_trace_get_v2(const char *args) {
@@ -3925,6 +4211,8 @@ static void cmd_trace_get_v2(const char *args) {
     int event_filter = -1;
     int bank_filter = -1;
     unsigned int addr_lo = 0, addr_hi = 0xFFFF;
+    int frame_lo = INT_MIN;
+    int frame_hi = INT_MAX;
     long long before_idx_arg = -1;
     if (args) {
         const char *p;
@@ -3934,6 +4222,8 @@ static void cmd_trace_get_v2(const char *args) {
         if ((p = strstr(args, "bank=")) != NULL) { unsigned int b = 0; if (sscanf(p + 5, "%x", &b) == 1) bank_filter = (int)b; }
         if ((p = strstr(args, "addr_lo=")) != NULL) sscanf(p + 8, "%x", &addr_lo);
         if ((p = strstr(args, "addr_hi=")) != NULL) sscanf(p + 8, "%x", &addr_hi);
+        if ((p = strstr(args, "frame_lo=")) != NULL) sscanf(p + 9, "%d", &frame_lo);
+        if ((p = strstr(args, "frame_hi=")) != NULL) sscanf(p + 9, "%d", &frame_hi);
         if ((p = strstr(args, "before_idx=")) != NULL) sscanf(p + 11, "%lld", &before_idx_arg);
     }
     if (count > 4096) count = 4096;
@@ -3959,6 +4249,7 @@ static void cmd_trace_get_v2(const char *args) {
         CpuTraceEvent *e = &g_cpu_trace_ring[slot];
         /* Skip if filter mismatches. */
         if (event_filter >= 0 && e->event_type != (uint8_t)event_filter) continue;
+        if (e->frame < frame_lo || e->frame > frame_hi) continue;
         if (e->event_type == CPU_TR_WRAM_WRITE) {
             /* B2 (2026-05-01): explicit bank + addr16 fields land
              * directly on the event. addr_lo/addr_hi range filter
@@ -3971,7 +4262,7 @@ static void cmd_trace_get_v2(const char *args) {
 
         if (pos > (int)sizeof(buf) - 512) break;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"idx\":%llu,\"event\":%u,\"pc24\":\"0x%06x\","
+            "%s{\"idx\":%llu,\"event\":%u,\"frame\":%d,\"pc24\":\"0x%06x\","
             "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
             "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
             "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
@@ -3982,7 +4273,7 @@ static void cmd_trace_get_v2(const char *args) {
             "\"hash\":\"0x%08x\"}",
             emitted ? "," : "",
             (unsigned long long)abs_idx,
-            (unsigned)e->event_type, e->pc24,
+            (unsigned)e->event_type, e->frame, e->pc24,
             e->A, e->X, e->Y, e->S, e->D,
             e->DB, e->PB, e->P, e->M, e->XF,
             e->extra0, e->extra1,
@@ -5026,6 +5317,123 @@ static void cmd_clear_wram_watches(const char *args) {
     send_fmt("{\"ok\":true,\"cleared\":true}");
 }
 
+/* block_watch_arm <pc24_hex> <ram_off1>[,<ram_off2>,...] [max_hits=8]
+ *
+ * Arms a block-keyed sampler at `pc24`. On every entry to that block,
+ * captures registers + the byte at each listed g_ram offset + recomp
+ * call stack (up to 8 frames). Stops capturing after `max_hits`. Use
+ * `block_watch_get [slot]` to read back captured hits.
+ *
+ * Example — capture state at $01:9081 (the SpriteDisableObjInt gate
+ * inside SubUpdateSprPos), reading $1FE2+9 ($1FEB), $1540+9 ($1549),
+ * $1558+9 ($1561), $15B8+9 ($15C1):
+ *   block_watch_arm 019081 1FEB,1549,1561,15C1 12
+ */
+static void cmd_block_watch_arm(const char *args) {
+#if SNESRECOMP_TRACE
+    if (!args || !*args) {
+        send_fmt("{\"error\":\"usage: block_watch_arm <pc24_hex> "
+                 "<ram_off1>[,<ram_off2>,...] [max_hits=8]\"}");
+        return;
+    }
+    unsigned int pc = 0;
+    char addrs_str[256] = {0};
+    int max_hits = 8;
+    int n = sscanf(args, "%x %255s %d", &pc, addrs_str, &max_hits);
+    if (n < 2) {
+        send_fmt("{\"error\":\"need pc24 and at least one addr\"}");
+        return;
+    }
+    int32_t addrs[BLOCK_WATCH_ADDRS_MAX];
+    for (int i = 0; i < BLOCK_WATCH_ADDRS_MAX; i++) addrs[i] = -1;
+    int n_addrs = 0;
+    char *tok = strtok(addrs_str, ",");
+    while (tok && n_addrs < BLOCK_WATCH_ADDRS_MAX) {
+        addrs[n_addrs++] = (int32_t)strtoul(tok, NULL, 16);
+        tok = strtok(NULL, ",");
+    }
+    cpu_trace_block_watch_arm((uint32_t)pc, addrs, n_addrs, max_hits);
+    send_fmt("{\"ok\":1,\"pc24\":\"0x%06x\",\"n_addrs\":%d,\"max_hits\":%d}",
+             pc, n_addrs, max_hits);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+/* block_watch_get [slot]
+ * Dumps captured hits as JSON. Without slot arg, dumps all enabled slots.
+ */
+static void cmd_block_watch_get(const char *args) {
+#if SNESRECOMP_TRACE
+    int slot_filter = -1;
+    if (args && *args) sscanf(args, "%d", &slot_filter);
+    static char buf[1 << 17];   /* 128KB */
+    int pos = snprintf(buf, sizeof(buf), "{\"slots\":[");
+    int emitted = 0;
+    for (int i = 0; i < BLOCK_WATCH_MAX; i++) {
+        if (slot_filter >= 0 && i != slot_filter) continue;
+        BlockWatch *w = &g_block_watches[i];
+        if (!w->enabled) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"slot\":%d,\"pc24\":\"0x%06x\",\"hit_count\":%d,"
+            "\"max_hits\":%d,\"n_addrs\":%d,\"addrs\":[",
+            emitted ? "," : "", i, w->pc24, w->hit_count,
+            w->max_hits, w->n_addrs);
+        for (int j = 0; j < w->n_addrs; j++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"0x%05x\"", j ? "," : "", (uint32_t)w->ram_offsets[j]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"events\":[");
+        for (int h = 0; h < w->hit_count && pos < (int)sizeof(buf) - 2048; h++) {
+            BlockWatchHit *e = &w->hits[h];
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"hit\":%d,\"frame\":%d,"
+                "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+                "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+                "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+                "\"m\":%u,\"x\":%u,\"e\":%u,\"vals\":[",
+                h ? "," : "", h, e->frame,
+                e->A, e->X, e->Y, e->S, e->D,
+                e->DB, e->PB, e->P,
+                e->m_flag, e->x_flag, e->e_flag);
+            for (int v = 0; v < w->n_addrs; v++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%s\"0x%02x\"", v ? "," : "", e->vals[v]);
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"stack\":[");
+            for (int s = 0; s < e->stack_depth; s++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%s\"%s\"", s ? "," : "", e->stack[s]);
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+/* block_watch_clear [slot]
+ * Without slot arg, clears all slots. With slot, clears just that one. */
+static void cmd_block_watch_clear(const char *args) {
+#if SNESRECOMP_TRACE
+    int slot = -1;
+    if (args && *args) sscanf(args, "%d", &slot);
+    if (slot < 0) cpu_trace_block_watch_clear_all();
+    else cpu_trace_block_watch_clear_one(slot);
+    send_fmt("{\"ok\":1,\"cleared\":\"%s\"}", slot < 0 ? "all" : "one");
+#else
+    (void)args;
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* Dump only WRAM_WRITE events from the trace ring. Each event includes
  * the most-recent function + block context preceding it, so you can
  * attribute the write without dumping the whole ring. Output goes to
@@ -5192,6 +5600,9 @@ static const CmdEntry s_commands[] = {
     {"arm_watches",    cmd_arm_watches},
     {"set_wram_watch", cmd_set_wram_watch},
     {"clear_wram_watches", cmd_clear_wram_watches},
+    {"block_watch_arm",   cmd_block_watch_arm},
+    {"block_watch_get",   cmd_block_watch_get},
+    {"block_watch_clear", cmd_block_watch_clear},
     {"trace_dump_wram", cmd_trace_dump_wram},
     {"get_spc_writes", cmd_get_spc_writes},
     {"get_spc_pc_hist", cmd_get_spc_pc_hist},
@@ -5205,6 +5616,9 @@ static const CmdEntry s_commands[] = {
     {"pause",         cmd_pause},
     {"continue",      cmd_continue},
     {"step",          cmd_step},
+    {"set_controller",   cmd_set_controller},
+    {"get_controller",   cmd_get_controller},
+    {"clear_controller", cmd_clear_controller},
     {"func_snap_set",   cmd_func_snap_set},
     {"func_snap_count", cmd_func_snap_count},
     {"func_snap_get_n", cmd_func_snap_get_n},
@@ -5269,6 +5683,7 @@ static const CmdEntry s_commands[] = {
     {"get_frame",     cmd_get_frame},
     {"frame_range",   cmd_frame_range},
     {"history",       cmd_history_status},
+    {"sprite_timeseries", cmd_sprite_timeseries},
     {"profile",       cmd_profile_query},
     {"profile_on",    cmd_profile_on},
     {"profile_off",   cmd_profile_off},
@@ -5610,6 +6025,14 @@ int debug_server_consume_loadstate(void) {
     if (slot >= 0)
         s_pending_loadstate = -1;
     return slot;
+}
+
+uint32_t debug_server_get_controller_inputs(void) {
+    return s_controller_inputs;
+}
+
+uint32_t debug_server_get_controller_active_mask(void) {
+    return (s_controller_active & 0x3u) << 30;
 }
 
 // Legacy poll — now a no-op since the background thread handles networking.

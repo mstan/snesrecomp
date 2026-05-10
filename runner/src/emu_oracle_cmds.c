@@ -542,6 +542,163 @@ static void h_emu_wram_at_frame(const char *args) {
                           "\"val\":\"0x%02x\"}", frame, addr, v);
 }
 
+/* emu_dump_frame_wram <frame> [addr_hex] [len]: historical low-WRAM range
+ * dump from snes9x's per-frame history ring. Mirrors recomp's
+ * dump_frame_wram, but the oracle history currently stores bank-7E
+ * $0000-$1FFF only. */
+static void h_emu_dump_frame_wram(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    unsigned int frame = 0, addr = 0, len = 0x2000;
+    if (!args || sscanf(args, "%u %x %u", &frame, &addr, &len) < 1) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"usage: emu_dump_frame_wram <frame> [hex_addr] [len]\"}");
+        return;
+    }
+    if (len == 0 || len > 0x2000 || addr >= 0x2000 || addr + len > 0x2000) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"out of range\","
+                              "\"addr\":\"0x%05x\",\"len\":%u,\"max_len\":8192}",
+                              addr, len);
+        return;
+    }
+    extern int snes9x_bridge_history_copy_range(uint32_t, uint32_t, uint32_t,
+                                                uint8_t *);
+    static uint8_t tmp[0x2000];
+    if (!snes9x_bridge_history_copy_range((uint32_t)frame, (uint32_t)addr,
+                                          (uint32_t)len, tmp)) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"frame not in history\","
+                              "\"frame\":%u,\"addr\":\"0x%05x\",\"len\":%u}",
+                              frame, addr, len);
+        return;
+    }
+    static char buf[0x5000];
+    int pos = snprintf(buf, sizeof(buf),
+                       "{\"ok\":true,\"frame\":%u,\"addr\":\"0x%05x\","
+                       "\"len\":%u,\"hex\":\"",
+                       frame, addr, len);
+    for (unsigned int i = 0; i < len && pos < (int)sizeof(buf) - 4; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x", tmp[i]);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "\"}");
+    debug_server_send_line(buf);
+}
+
+static uint8_t emu_sprite_field(const uint8_t *wram, int base, int slot) {
+    return wram[base + slot];
+}
+
+static int emu_sprite_timeseries_append(char *buf, int pos, int cap,
+                                        const uint8_t *wram, int frame,
+                                        int slot, int first) {
+    int x = emu_sprite_field(wram, 0x00e4, slot)
+          | (emu_sprite_field(wram, 0x14e0, slot) << 8);
+    int y = emu_sprite_field(wram, 0x00d8, slot)
+          | (emu_sprite_field(wram, 0x14d4, slot) << 8);
+    return pos + snprintf(buf + pos, cap - pos,
+        "%s{\"f\":%d,\"st\":\"%02x\",\"n\":\"%02x\","
+        "\"x\":\"%04x\",\"y\":\"%04x\",\"xs\":\"%02x\",\"ys\":\"%02x\","
+        "\"bl\":\"%02x\",\"sl\":\"%02x\",\"dir\":\"%02x\","
+        "\"t1540\":\"%02x\",\"t1558\":\"%02x\",\"m1fe2\":\"%02x\","
+        "\"noobj\":\"%02x\"}",
+        first ? "" : ",",
+        frame,
+        emu_sprite_field(wram, 0x14c8, slot),
+        emu_sprite_field(wram, 0x009e, slot),
+        x & 0xffff,
+        y & 0xffff,
+        emu_sprite_field(wram, 0x00b6, slot),
+        emu_sprite_field(wram, 0x00aa, slot),
+        emu_sprite_field(wram, 0x1588, slot),
+        emu_sprite_field(wram, 0x15b8, slot),
+        emu_sprite_field(wram, 0x157c, slot),
+        emu_sprite_field(wram, 0x1540, slot),
+        emu_sprite_field(wram, 0x1558, slot),
+        emu_sprite_field(wram, 0x1fe2, slot),
+        emu_sprite_field(wram, 0x15dc, slot));
+}
+
+static int emu_sprite_timeseries_same(const uint8_t *a, const uint8_t *b,
+                                      int slot) {
+    static const int bases[] = {
+        0x14c8, 0x009e, 0x00e4, 0x14e0, 0x00d8, 0x14d4, 0x00b6,
+        0x00aa, 0x1588, 0x15b8, 0x157c, 0x1540, 0x1558, 0x1fe2,
+        0x15dc
+    };
+    for (int i = 0; i < (int)(sizeof(bases) / sizeof(bases[0])); i++) {
+        int off = bases[i] + slot;
+        if (a[off] != b[off]) return 0;
+    }
+    return 1;
+}
+
+static void h_emu_sprite_timeseries(const char *args) {
+    if (!g_active_backend || strcmp(g_active_backend->name, "snes9x") != 0) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"requires snes9x backend\"}");
+        return;
+    }
+    int slot = 9;
+    int from_frame = INT_MIN;
+    int to_frame = INT_MIN;
+    int changes_only = 1;
+    int limit = 512;
+    if (args && *args) {
+        int n = sscanf(args, "%d %d %d %d %d",
+                       &slot, &from_frame, &to_frame, &changes_only, &limit);
+        if (n < 1) slot = 9;
+    }
+    if (slot < 0 || slot >= 12) {
+        debug_server_send_fmt("{\"ok\":false,\"error\":\"slot out of range\",\"slot\":%d}", slot);
+        return;
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 4096) limit = 4096;
+
+    extern int snes9x_bridge_history_oldest_frame(void);
+    extern int snes9x_bridge_history_newest_frame(void);
+    extern int snes9x_bridge_history_copy_range(uint32_t, uint32_t, uint32_t,
+                                                uint8_t *);
+    int oldest = snes9x_bridge_history_oldest_frame();
+    int newest = snes9x_bridge_history_newest_frame();
+    if (from_frame == INT_MIN) from_frame = oldest;
+    if (to_frame == INT_MIN) to_frame = newest;
+    if (from_frame < oldest) from_frame = oldest;
+    if (to_frame > newest) to_frame = newest;
+
+    static char buf[1048576];
+    static uint8_t cur[0x2000];
+    static uint8_t last[0x2000];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"slot\":%d,\"from\":%d,\"to\":%d,"
+        "\"changes_only\":%s,\"entries\":[",
+        slot, from_frame, to_frame, changes_only ? "true" : "false");
+    int have_last = 0;
+    int emitted = 0;
+    int considered = 0;
+    int truncated = 0;
+    for (int f = from_frame; f <= to_frame; f++) {
+        if (!snes9x_bridge_history_copy_range((uint32_t)f, 0, sizeof(cur), cur))
+            continue;
+        considered++;
+        int same = have_last && emu_sprite_timeseries_same(last, cur, slot);
+        if (!changes_only || !same) {
+            if (emitted >= limit || pos > (int)sizeof(buf) - 1024) {
+                truncated = 1;
+                break;
+            }
+            pos = emu_sprite_timeseries_append(buf, pos, (int)sizeof(buf),
+                                               cur, f, slot, emitted == 0);
+            emitted++;
+        }
+        memcpy(last, cur, sizeof(last));
+        have_last = 1;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos,
+             "],\"emitted\":%d,\"considered\":%d,\"truncated\":%s}",
+             emitted, considered, truncated ? "true" : "false");
+    debug_server_send_line(buf);
+}
+
 /* emu_history_find <addr> <hex_val>: returns the most recent
  * frame in history where wram[addr] == val, or -1. Useful for
  * waypoint queries. */
@@ -1118,6 +1275,118 @@ static void h_emu_gm14_player_trace_clear(const char *args) {
     debug_server_send_fmt("{\"ok\":1}");
 }
 
+/* emu_block_watch_arm <pc24_hex> <ram_off1>[,<ram_off2>,...] [max_hits=8]
+ *
+ * Mirrors the recomp-side block_watch_arm. Captures registers + WRAM
+ * bytes on every entry to PB:PC == pc24 in the snes9x oracle. Same
+ * wire format as recomp's `block_watch_get` so a single Python diff
+ * tool can compare both sides at the same code point. */
+extern void snes9x_bridge_block_watch_arm(uint32_t pc24, const int32_t *offs,
+                                           int n_addrs, int max_hits);
+extern void snes9x_bridge_block_watch_clear_all(void);
+extern void snes9x_bridge_block_watch_clear_one(int slot);
+extern int  snes9x_bridge_block_watch_count(void);
+extern int  snes9x_bridge_block_watch_get_meta(int slot, uint32_t *pc24,
+                                                 int *n_addrs, int *max_hits,
+                                                 int *hit_count,
+                                                 int32_t out_addrs[8]);
+extern int  snes9x_bridge_block_watch_get_hit(int slot, int hit,
+                                                int32_t *frame,
+                                                uint16_t out_regs[8],
+                                                uint8_t out_vals[8]);
+
+#define EMU_BW_ADDRS_MAX 8
+
+static void h_emu_block_watch_arm(const char *args) {
+    if (!args || !*args) {
+        debug_server_send_fmt(
+            "{\"error\":\"usage: emu_block_watch_arm <pc24_hex> "
+            "<ram_off1>[,<ram_off2>,...] [max_hits=8]\"}");
+        return;
+    }
+    unsigned int pc = 0;
+    char addrs_str[256] = {0};
+    int max_hits = 8;
+    int n = sscanf(args, "%x %255s %d", &pc, addrs_str, &max_hits);
+    if (n < 2) {
+        debug_server_send_fmt("{\"error\":\"need pc24 and at least one addr\"}");
+        return;
+    }
+    int32_t addrs[EMU_BW_ADDRS_MAX];
+    for (int i = 0; i < EMU_BW_ADDRS_MAX; i++) addrs[i] = -1;
+    int n_addrs = 0;
+    char *tok = strtok(addrs_str, ",");
+    while (tok && n_addrs < EMU_BW_ADDRS_MAX) {
+        addrs[n_addrs++] = (int32_t)strtoul(tok, NULL, 16);
+        tok = strtok(NULL, ",");
+    }
+    snes9x_bridge_block_watch_arm((uint32_t)pc, addrs, n_addrs, max_hits);
+    debug_server_send_fmt(
+        "{\"ok\":1,\"pc24\":\"0x%06x\",\"n_addrs\":%d,\"max_hits\":%d}",
+        pc, n_addrs, max_hits);
+}
+
+static void h_emu_block_watch_get(const char *args) {
+    int slot_filter = -1;
+    if (args && *args) sscanf(args, "%d", &slot_filter);
+    static char buf[1 << 17];
+    int pos = snprintf(buf, sizeof(buf), "{\"slots\":[");
+    int emitted = 0;
+    for (int i = 0; i < 16; i++) {
+        if (slot_filter >= 0 && i != slot_filter) continue;
+        uint32_t pc24 = 0;
+        int n_addrs = 0, max_hits = 0, hit_count = 0;
+        int32_t addrs[EMU_BW_ADDRS_MAX];
+        for (int k = 0; k < EMU_BW_ADDRS_MAX; k++) addrs[k] = -1;
+        if (!snes9x_bridge_block_watch_get_meta(i, &pc24, &n_addrs,
+                                                  &max_hits, &hit_count,
+                                                  addrs)) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"slot\":%d,\"pc24\":\"0x%06x\",\"hit_count\":%d,"
+            "\"max_hits\":%d,\"n_addrs\":%d,\"addrs\":[",
+            emitted ? "," : "", i, pc24, hit_count, max_hits, n_addrs);
+        for (int j = 0; j < n_addrs; j++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"0x%05x\"", j ? "," : "", (uint32_t)addrs[j]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"events\":[");
+        for (int h = 0; h < hit_count && pos < (int)sizeof(buf) - 1024; h++) {
+            int32_t frame = 0;
+            uint16_t regs[8] = {0};
+            uint8_t vals[EMU_BW_ADDRS_MAX] = {0};
+            if (!snes9x_bridge_block_watch_get_hit(i, h, &frame, regs, vals))
+                continue;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"hit\":%d,\"frame\":%d,"
+                "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+                "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+                "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%04x\","
+                "\"vals\":[",
+                h ? "," : "", h, (int)frame,
+                regs[0], regs[1], regs[2], regs[3], regs[4],
+                (unsigned)regs[5], (unsigned)regs[6], regs[7]);
+            for (int v = 0; v < n_addrs; v++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%s\"0x%02x\"", v ? "," : "", vals[v]);
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
+static void h_emu_block_watch_clear(const char *args) {
+    int slot = -1;
+    if (args && *args) sscanf(args, "%d", &slot);
+    if (slot < 0) snes9x_bridge_block_watch_clear_all();
+    else snes9x_bridge_block_watch_clear_one(slot);
+    debug_server_send_fmt("{\"ok\":1,\"cleared\":\"%s\"}",
+                          slot < 0 ? "all" : "one");
+}
+
 /* Dispatcher. Returns 1 if the command was one of ours and was
  * handled, 0 to let the standard s_commands[] scan continue. */
 int emu_oracle_handle_cmd(const char *cmd, const char *args) {
@@ -1141,6 +1410,8 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "emu_write_wram") == 0){ h_emu_write_wram(args); return 1; }
     if (strcmp(cmd, "emu_history") == 0)   { h_emu_history(args);   return 1; }
     if (strcmp(cmd, "emu_wram_at_frame") == 0) { h_emu_wram_at_frame(args); return 1; }
+    if (strcmp(cmd, "emu_dump_frame_wram") == 0) { h_emu_dump_frame_wram(args); return 1; }
+    if (strcmp(cmd, "emu_sprite_timeseries") == 0) { h_emu_sprite_timeseries(args); return 1; }
     if (strcmp(cmd, "emu_history_find") == 0) { h_emu_history_find(args); return 1; }
     if (strcmp(cmd, "emu_history_find_word") == 0) { h_emu_history_find_word(args); return 1; }
     if (strcmp(cmd, "emu_wram_delta") == 0){ h_emu_wram_delta(args); return 1; }
@@ -1157,6 +1428,9 @@ int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (strcmp(cmd, "find_first_divergence") == 0){ h_find_first_divergence(args); return 1; }
     if (strcmp(cmd, "emu_gm14_player_trace_get") == 0)   { h_emu_gm14_player_trace_get(args);   return 1; }
     if (strcmp(cmd, "emu_gm14_player_trace_clear") == 0) { h_emu_gm14_player_trace_clear(args); return 1; }
+    if (strcmp(cmd, "emu_block_watch_arm") == 0)   { h_emu_block_watch_arm(args);   return 1; }
+    if (strcmp(cmd, "emu_block_watch_get") == 0)   { h_emu_block_watch_get(args);   return 1; }
+    if (strcmp(cmd, "emu_block_watch_clear") == 0) { h_emu_block_watch_clear(args); return 1; }
     return 0;
 }
 

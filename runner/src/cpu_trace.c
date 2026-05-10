@@ -798,6 +798,7 @@ static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
     int slot = (int)(g_cpu_trace_idx++ & (g_cpu_trace_capacity - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
+    e->frame = snes_frame_counter;
     e->native_func_id_or_hash = 0;  /* set separately by func_entry */
     e->A = cpu->A;
     e->X = cpu->X;
@@ -824,9 +825,108 @@ static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
 /* Forward decl — phantom-PC trap check defined later in the file. */
 static inline void phantom_check(CpuState *cpu, uint32_t pc24);
 
+/* ── Block-keyed sampler ────────────────────────────────────────────── */
+BlockWatch g_block_watches[BLOCK_WATCH_MAX] = {0};
+uint8_t    g_block_watch_any = 0;
+
+void cpu_trace_block_watch_arm(uint32_t pc24,
+                                const int32_t *ram_offsets,
+                                int n_addrs,
+                                int max_hits) {
+    if (n_addrs < 0) n_addrs = 0;
+    if (n_addrs > BLOCK_WATCH_ADDRS_MAX) n_addrs = BLOCK_WATCH_ADDRS_MAX;
+    if (max_hits < 1) max_hits = 1;
+    if (max_hits > BLOCK_WATCH_HITS_MAX) max_hits = BLOCK_WATCH_HITS_MAX;
+    int slot = -1;
+    /* Reuse if same pc24 already armed (re-arm clears previous hits). */
+    for (int i = 0; i < BLOCK_WATCH_MAX; i++) {
+        if (g_block_watches[i].enabled && g_block_watches[i].pc24 == pc24) {
+            slot = i; break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < BLOCK_WATCH_MAX; i++) {
+            if (!g_block_watches[i].enabled) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "[cpu_trace] block_watch table FULL (max=%d)\n", BLOCK_WATCH_MAX);
+        fflush(stderr);
+        return;
+    }
+    BlockWatch *w = &g_block_watches[slot];
+    memset(w, 0, sizeof(*w));
+    w->enabled = 1;
+    w->pc24 = pc24;
+    w->n_addrs = n_addrs;
+    for (int i = 0; i < BLOCK_WATCH_ADDRS_MAX; i++) {
+        w->ram_offsets[i] = (i < n_addrs) ? ram_offsets[i] : -1;
+    }
+    w->max_hits = max_hits;
+    w->hit_count = 0;
+    g_block_watch_any = 1;
+    fprintf(stderr,
+        "[cpu_trace] block_watch ARMED slot=%d pc=%06X n_addrs=%d max_hits=%d\n",
+        slot, pc24, n_addrs, max_hits);
+    for (int i = 0; i < n_addrs; i++) {
+        fprintf(stderr, "  addr[%d] = ram_off $%05X\n", i, (uint32_t)ram_offsets[i]);
+    }
+    fflush(stderr);
+}
+
+void cpu_trace_block_watch_clear_all(void) {
+    memset(g_block_watches, 0, sizeof(g_block_watches));
+    g_block_watch_any = 0;
+}
+
+void cpu_trace_block_watch_clear_one(int slot) {
+    if (slot < 0 || slot >= BLOCK_WATCH_MAX) return;
+    memset(&g_block_watches[slot], 0, sizeof(BlockWatch));
+    int any = 0;
+    for (int i = 0; i < BLOCK_WATCH_MAX; i++) {
+        if (g_block_watches[i].enabled) { any = 1; break; }
+    }
+    g_block_watch_any = any ? 1 : 0;
+}
+
+void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
+    if (!g_block_watch_any) return;
+    extern int snes_frame_counter;
+    for (int i = 0; i < BLOCK_WATCH_MAX; i++) {
+        BlockWatch *w = &g_block_watches[i];
+        if (!w->enabled || w->pc24 != pc24) continue;
+        if (w->hit_count >= w->max_hits) continue;
+        BlockWatchHit *h = &w->hits[w->hit_count];
+        h->frame = snes_frame_counter;
+        h->A = cpu->A; h->X = cpu->X; h->Y = cpu->Y;
+        h->S = cpu->S; h->D = cpu->D;
+        h->DB = cpu->DB; h->PB = cpu->PB; h->P = cpu->P;
+        h->m_flag = cpu->m_flag; h->x_flag = cpu->x_flag; h->e_flag = cpu->emulation;
+        for (int j = 0; j < w->n_addrs; j++) {
+            int32_t off = w->ram_offsets[j];
+            h->vals[j] = (off >= 0 && off < 0x20000) ? g_ram[off] : 0;
+        }
+        int depth = g_recomp_stack_top;
+        if (depth > BLOCK_WATCH_STACK_DEPTH) depth = BLOCK_WATCH_STACK_DEPTH;
+        h->stack_depth = depth;
+        for (int j = 0; j < depth; j++) {
+            const char *fn = g_recomp_stack[g_recomp_stack_top - depth + j];
+            if (fn) {
+                strncpy(h->stack[j], fn, BLOCK_WATCH_FUNC_LEN - 1);
+                h->stack[j][BLOCK_WATCH_FUNC_LEN - 1] = 0;
+            } else {
+                h->stack[j][0] = 0;
+            }
+        }
+        w->hit_count++;
+        return;  /* one slot per pc24 */
+    }
+}
+
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
     capture(cpu, pc24, CPU_TR_BLOCK, 0, 0);
     phantom_check(cpu, pc24);
+    cpu_trace_block_watch_check(cpu, pc24);
     /* Stack-range tripwire — fires once when S first leaves the
      * configured range. Disarms after firing to avoid spam. */
     extern uint8_t  g_s_watch_set;

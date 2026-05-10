@@ -459,6 +459,136 @@ extern "C" int snes9x_bridge_gm14_get_row(uint64_t abs_idx, void *out_row) {
     return 1;
 }
 
+/* ── Oracle-side block-keyed sampler ──────────────────────────────────
+ * Same shape as recomp's BlockWatch (cpu_trace.h). Captures registers +
+ * specified WRAM bytes on every entry to the configured PB:PC. */
+#define EMU_BLOCK_WATCH_MAX        16
+#define EMU_BLOCK_WATCH_ADDRS_MAX  8
+#define EMU_BLOCK_WATCH_HITS_MAX   32
+
+struct emu_block_watch_hit {
+    int32_t  frame;
+    uint16_t r_A, r_X, r_Y, r_S, r_D;
+    uint8_t  r_DB, r_PB;
+    uint16_t r_P;
+    uint8_t  vals[EMU_BLOCK_WATCH_ADDRS_MAX];
+};
+
+struct emu_block_watch {
+    uint8_t  enabled;
+    uint32_t pc24;
+    int      n_addrs;
+    int32_t  ram_offsets[EMU_BLOCK_WATCH_ADDRS_MAX];
+    int      max_hits;
+    int      hit_count;
+    emu_block_watch_hit hits[EMU_BLOCK_WATCH_HITS_MAX];
+};
+
+static emu_block_watch s_emu_block_watches[EMU_BLOCK_WATCH_MAX] = {};
+static uint8_t         s_emu_block_watch_any = 0;
+
+extern "C" void snes9x_bridge_block_watch_arm(uint32_t pc24,
+                                                const int32_t *offs,
+                                                int n_addrs,
+                                                int max_hits) {
+    if (n_addrs < 0) n_addrs = 0;
+    if (n_addrs > EMU_BLOCK_WATCH_ADDRS_MAX) n_addrs = EMU_BLOCK_WATCH_ADDRS_MAX;
+    if (max_hits < 1) max_hits = 1;
+    if (max_hits > EMU_BLOCK_WATCH_HITS_MAX) max_hits = EMU_BLOCK_WATCH_HITS_MAX;
+    int slot = -1;
+    for (int i = 0; i < EMU_BLOCK_WATCH_MAX; i++) {
+        if (s_emu_block_watches[i].enabled &&
+            s_emu_block_watches[i].pc24 == pc24) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < EMU_BLOCK_WATCH_MAX; i++) {
+            if (!s_emu_block_watches[i].enabled) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "[snes9x] emu_block_watch table FULL (max=%d)\n",
+                EMU_BLOCK_WATCH_MAX);
+        return;
+    }
+    emu_block_watch *w = &s_emu_block_watches[slot];
+    memset(w, 0, sizeof(*w));
+    w->enabled = 1;
+    w->pc24 = pc24;
+    w->n_addrs = n_addrs;
+    for (int i = 0; i < EMU_BLOCK_WATCH_ADDRS_MAX; i++) {
+        w->ram_offsets[i] = (i < n_addrs) ? offs[i] : -1;
+    }
+    w->max_hits = max_hits;
+    w->hit_count = 0;
+    s_emu_block_watch_any = 1;
+}
+
+extern "C" void snes9x_bridge_block_watch_clear_all(void) {
+    memset(s_emu_block_watches, 0, sizeof(s_emu_block_watches));
+    s_emu_block_watch_any = 0;
+}
+
+extern "C" void snes9x_bridge_block_watch_clear_one(int slot) {
+    if (slot < 0 || slot >= EMU_BLOCK_WATCH_MAX) return;
+    memset(&s_emu_block_watches[slot], 0, sizeof(emu_block_watch));
+    int any = 0;
+    for (int i = 0; i < EMU_BLOCK_WATCH_MAX; i++) {
+        if (s_emu_block_watches[i].enabled) { any = 1; break; }
+    }
+    s_emu_block_watch_any = any ? 1 : 0;
+}
+
+extern "C" int snes9x_bridge_block_watch_count(void) {
+    int n = 0;
+    for (int i = 0; i < EMU_BLOCK_WATCH_MAX; i++) {
+        if (s_emu_block_watches[i].enabled) n++;
+    }
+    return n;
+}
+
+/* Slot accessor — returns 0 if `slot` is empty/disabled, 1 otherwise.
+ * Caller's pointers are populated only on success. */
+extern "C" int snes9x_bridge_block_watch_get_meta(int slot,
+                                                    uint32_t *out_pc24,
+                                                    int *out_n_addrs,
+                                                    int *out_max_hits,
+                                                    int *out_hit_count,
+                                                    int32_t out_addrs[EMU_BLOCK_WATCH_ADDRS_MAX]) {
+    if (slot < 0 || slot >= EMU_BLOCK_WATCH_MAX) return 0;
+    emu_block_watch *w = &s_emu_block_watches[slot];
+    if (!w->enabled) return 0;
+    if (out_pc24)      *out_pc24      = w->pc24;
+    if (out_n_addrs)   *out_n_addrs   = w->n_addrs;
+    if (out_max_hits)  *out_max_hits  = w->max_hits;
+    if (out_hit_count) *out_hit_count = w->hit_count;
+    if (out_addrs) {
+        for (int i = 0; i < EMU_BLOCK_WATCH_ADDRS_MAX; i++) out_addrs[i] = w->ram_offsets[i];
+    }
+    return 1;
+}
+
+extern "C" int snes9x_bridge_block_watch_get_hit(int slot, int hit,
+                                                   int32_t *out_frame,
+                                                   uint16_t out_regs[8],
+                                                   uint8_t  out_vals[EMU_BLOCK_WATCH_ADDRS_MAX]) {
+    if (slot < 0 || slot >= EMU_BLOCK_WATCH_MAX) return 0;
+    emu_block_watch *w = &s_emu_block_watches[slot];
+    if (!w->enabled || hit < 0 || hit >= w->hit_count) return 0;
+    emu_block_watch_hit *h = &w->hits[hit];
+    if (out_frame) *out_frame = h->frame;
+    if (out_regs) {
+        out_regs[0] = h->r_A; out_regs[1] = h->r_X; out_regs[2] = h->r_Y;
+        out_regs[3] = h->r_S; out_regs[4] = h->r_D;
+        out_regs[5] = (uint16_t)h->r_DB;
+        out_regs[6] = (uint16_t)h->r_PB;
+        out_regs[7] = h->r_P;
+    }
+    if (out_vals) {
+        for (int i = 0; i < EMU_BLOCK_WATCH_ADDRS_MAX; i++) out_vals[i] = h->vals[i];
+    }
+    return 1;
+}
+
 void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
     /* Oracle GM14 entry-only trace. Fires every time PB:PC == $00:C47E.
      * No call-depth/return tracking needed for entry-only first pass. */
@@ -503,6 +633,36 @@ void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
         r->r_PB         = Registers.PB;
         r->r_P          = (uint16_t)Registers.P.W;
         s_emu_gm14_idx++;
+    }
+
+    /* ── Oracle-side block-keyed sampler ──────────────────────────────
+     *
+     * Mirrors the recomp-side cpu_trace_block_watch_check. Lets a single
+     * Python differ ask the same question on both sides: at PB:PC, what
+     * are the WRAM bytes at these offsets? */
+    if (s_emu_block_watch_any) {
+        uint32_t cur_pc24 = ((uint32_t)pb << 16) | pc;
+        for (int i = 0; i < EMU_BLOCK_WATCH_MAX; i++) {
+            emu_block_watch *w = &s_emu_block_watches[i];
+            if (!w->enabled || w->pc24 != cur_pc24) continue;
+            if (w->hit_count >= w->max_hits) continue;
+            emu_block_watch_hit *h = &w->hits[w->hit_count];
+            h->frame = (int32_t)s_watch_frame;
+            h->r_A   = Registers.A.W;
+            h->r_X   = Registers.X.W;
+            h->r_Y   = Registers.Y.W;
+            h->r_S   = Registers.S.W;
+            h->r_D   = Registers.D.W;
+            h->r_DB  = Registers.DB;
+            h->r_PB  = Registers.PB;
+            h->r_P   = (uint16_t)Registers.P.W;
+            for (int j = 0; j < w->n_addrs; j++) {
+                int32_t off = w->ram_offsets[j];
+                h->vals[j] = (off >= 0 && off < 0x20000) ? Memory.RAM[off] : 0;
+            }
+            w->hit_count++;
+            break;
+        }
     }
 
     /* Function-boundary snapshot fires regardless of insn-trace state. */
@@ -753,6 +913,25 @@ extern "C" int snes9x_bridge_history_byte_at(uint32_t frame, uint32_t addr,
     }
     return 0;
 }
+
+extern "C" int snes9x_bridge_history_copy_range(uint32_t frame, uint32_t addr,
+                                                 uint32_t len,
+                                                 uint8_t *out) {
+    if (!out || len == 0) return 0;
+    if (addr >= EMU_FRAME_HIST_SLICE || addr + len > EMU_FRAME_HIST_SLICE) return 0;
+    if (s_emu_frame_hist_count == 0) return 0;
+    int start = (s_emu_frame_hist_write_idx - s_emu_frame_hist_count
+                 + EMU_FRAME_HIST_SIZE) % EMU_FRAME_HIST_SIZE;
+    for (int i = 0; i < s_emu_frame_hist_count; i++) {
+        int idx = (start + i) % EMU_FRAME_HIST_SIZE;
+        if (s_emu_frame_hist[idx].frame == frame) {
+            memcpy(out, s_emu_frame_hist[idx].wram + addr, len);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Find the latest frame in history where wram[addr] matches val.
  * Returns the frame number, or -1 if not found. Useful for
  * waypoint queries: "what was the most recent frame where
