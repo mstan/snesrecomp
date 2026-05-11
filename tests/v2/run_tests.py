@@ -37,6 +37,7 @@ TEST_MODULES = [
     'test_nlr_idiom',
     'test_dispatcher_phk_per_jml',
     'test_wrapper_autoroute',
+    'test_tail_call_autoroute',
 ]
 
 

@@ -40,6 +40,10 @@ from v2.decoder import (  # noqa: E402
 )
 from v2.emit_bank import emit_bank  # noqa: E402
 from v2.wrapper_autoroute import detect_and_route as autoroute_wrappers, format_fix_summary  # noqa: E402
+from v2.tail_call_autoroute import (  # noqa: E402
+    detect_and_route as autoroute_tail_calls,
+    format_fix_summary as format_tail_call_summary,
+)
 
 
 _BANK_CFG_RE = re.compile(r'bank([0-9a-fA-F]+)\.cfg$')
@@ -103,6 +107,16 @@ def main() -> int:
     print("Auto-routing SMW DB-transition wrappers...")
     wrapper_fixes = autoroute_wrappers(parsed, name_map, cross_bank_names, rom)
     print(format_fix_summary(wrapper_fixes))
+
+    # Auto-detect tail-call fallthrough cfg sites. Pattern: cfg `func A
+    # end:<pc>` whose <pc> is also the start of cfg `func B`, AND A's
+    # last decoded instruction is a non-terminal that falls through to
+    # exactly <pc>. emit_function would otherwise emit an unresolvable
+    # goto at the boundary. See `recompiler/v2/tail_call_autoroute.py`.
+    print()
+    print("Auto-detecting tail-call fallthrough sites...")
+    tail_call_fixes = autoroute_tail_calls(parsed, rom)
+    print(format_tail_call_summary(tail_call_fixes))
 
     # Promote cross-bank `name` decls into target bank's emit entries.
     # Skip when the bank already has either (a) an entry at the same PC,
