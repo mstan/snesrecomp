@@ -25,6 +25,23 @@ risk from intermediate state. The trade-off: non-leaf functions whose
 exits depend on their callees (like F461/F465 themselves, which call
 into deeper routines) are still opt-in via cfg directive.
 
+Detection has two passes per cfg `func`:
+
+1. **cfg-declared entry mutates** — decode with the cfg-declared (M, X);
+   if exit != entry, commit that exit. Original behavior since
+   `14c8eea`.
+
+2. **Multi-variant convergent (added 2026-05-14)** — when the
+   cfg-declared entry's exit == entry (would skip under pass 1), scan
+   the other three (M, X) combos. If every successful decode is a leaf
+   and ALL decoded exits agree on a single (M, X) tuple AND at least
+   one entry mutates, commit that exit. Closes the FileSelectColorMath-
+   shape class: leafs whose SEP/REP forces (m, x) into a fixed value
+   regardless of entry, but whose cfg-declared entry happens to land
+   on the post-SEP/REP state. Per the audit in
+   `tools/audit_leaf_exit_mx_variants.py`, 31 SMW sites fall in this
+   class before the extension.
+
 Mutates each `BankCfg.exit_mx_at` list in place with the inferred
 tuples, so the existing builder at `v2_regen.py:342+` picks them up
 when constructing `callee_exit_mx`.
@@ -73,35 +90,57 @@ def _graph_has_call(graph) -> bool:
     return False
 
 
+_MX_COMBOS: List[Tuple[int, int]] = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+
+def _decode_leaf_exit(rom: bytes, bank: int, addr16: int,
+                      em: int, ex: int, end):
+    """Decode (bank, addr16) with entry (em, ex). Returns
+    (exit_m, exit_x) if the body decoded cleanly AND is a leaf with a
+    determinable exit, else None."""
+    try:
+        graph = decode_function(rom, bank, addr16,
+                                entry_m=em, entry_x=ex, end=end)
+    except Exception:
+        return None
+    if not graph.insns:
+        return None
+    if _graph_has_call(graph):
+        return None
+    exit_m, exit_x = analyze_function_exit_mx(graph)
+    if exit_m is None or exit_x is None:
+        return None
+    return (exit_m & 1, exit_x & 1)
+
+
 def detect_and_route(parsed, rom: bytes) -> List[FixRecord]:
     """Auto-detect leaf-function exit-(M, X) state mutations.
 
-    For each cfg `func` entry F:
-      1. Decode F with its declared (entry_m, entry_x).
-      2. Skip if the decoded body contains any JSR or JSL (non-leaf).
-      3. Compute exit (M, X) via `analyze_function_exit_mx`.
-      4. Skip if either component is ambiguous (None) or matches the
-         entry state (no inference needed).
-      5. Skip if a cfg `exit_mx_at` directive already exists at F's PC.
-      6. Otherwise, append `(bank, F.start & 0xFFFF, exit_m, exit_x)`
-         to F's owning BankCfg's `exit_mx_at` list.
+    Two-pass per cfg `func` entry F:
 
-    Returns the list of applied fixes.
+    **Pass 1** — cfg-declared entry mutates:
+      1. Decode F with its declared (entry_m, entry_x).
+      2. Skip if non-leaf or exit is ambiguous.
+      3. If exit != entry, commit that exit.
+
+    **Pass 2** — multi-variant convergent (pass 1 skipped):
+      4. Decode F under all four (M, X) combos. Skip if ANY decode is
+         non-leaf, fails, or is ambiguous (conservative).
+      5. If all four entries produce the same exit (M, X) AND at least
+         one entry mutates, commit that exit.
+
+    Sites already covered by a cfg `exit_mx_at` directive are skipped.
+    Mutates the owning `BankCfg.exit_mx_at` list and returns the
+    applied fixes.
     """
     fixes: List[FixRecord] = []
 
-    # Index of (bank, addr16) → BankCfg, used so we can mutate the
-    # owning cfg's exit_mx_at list. Also collect already-declared sites
-    # to skip them.
-    by_bank = {bank: cfg for (bank, _path, cfg) in parsed}
     declared: Set[Tuple[int, int]] = set()
     for bank, _cfg_path, cfg in parsed:
         for (b_id, addr16, _m, _x) in cfg.exit_mx_at:
             declared.add((b_id & 0xFF, addr16 & 0xFFFF))
 
-    # Avoid double-detecting the same function via multiple cfg entries
-    # at the same PC (defensive — shouldn't happen but cheap to guard).
-    seen_keys: Set[Tuple[int, int, int, int]] = set()
+    seen_keys: Set[Tuple[int, int]] = set()
 
     for bank, _cfg_path, cfg in parsed:
         for entry in cfg.entries:
@@ -110,43 +149,60 @@ def detect_and_route(parsed, rom: bytes) -> List[FixRecord]:
             addr16 = entry.start & 0xFFFF
             if (bank, addr16) in declared:
                 continue  # cfg-declared wins
+            if (bank, addr16) in seen_keys:
+                continue
+
             em_in = entry.entry_m & 1
             ex_in = entry.entry_x & 1
-            key = (bank, addr16, em_in, ex_in)
-            if key in seen_keys:
-                continue
 
-            try:
-                graph = decode_function(
-                    rom, bank, addr16,
-                    entry_m=em_in, entry_x=ex_in,
-                    end=entry.end,
-                )
-            except Exception:
-                continue
-            if not graph.insns:
-                continue
+            cfg_exit = _decode_leaf_exit(rom, bank, addr16,
+                                         em_in, ex_in, entry.end)
 
-            # Leaf restriction: any JSR/JSL means the function's exit
-            # state depends on a callee's exit state. Skip — the
-            # fixpoint that would resolve it is exactly what regressed
-            # the prior attempt.
-            if _graph_has_call(graph):
-                continue
+            # Pass 1: cfg-declared entry mutates.
+            if cfg_exit is not None:
+                exit_m, exit_x = cfg_exit
+                if exit_m != em_in or exit_x != ex_in:
+                    seen_keys.add((bank, addr16))
+                    cfg.exit_mx_at.append(
+                        (bank, addr16, exit_m, exit_x))
+                    fixes.append(FixRecord(
+                        bank=bank, addr16=addr16, fn_name=entry.name,
+                        entry_m=em_in, entry_x=ex_in,
+                        exit_m=exit_m, exit_x=exit_x,
+                    ))
+                    continue
 
-            exit_m, exit_x = analyze_function_exit_mx(graph)
-            if exit_m is None or exit_x is None:
+            # Pass 2: multi-variant convergent. The cfg-declared entry
+            # either didn't mutate or didn't decode. Scan all four
+            # combos — if every entry decodes as a leaf with a known
+            # exit AND all four exits agree AND ≥1 entry mutates,
+            # commit that exit.
+            entry_exits: List[Tuple[int, int, int, int]] = []
+            ok = True
+            for em, ex in _MX_COMBOS:
+                e = _decode_leaf_exit(rom, bank, addr16, em, ex,
+                                      entry.end)
+                if e is None:
+                    ok = False
+                    break
+                entry_exits.append((em, ex, e[0], e[1]))
+            if not ok:
                 continue
-            if exit_m == em_in and exit_x == ex_in:
-                continue
+            unique_exits = set((m, x) for (_, _, m, x) in entry_exits)
+            if len(unique_exits) != 1:
+                continue  # divergent — needs per-variant directive
+            exit_m, exit_x = next(iter(unique_exits))
+            any_mutates = any((em != m or ex != x)
+                              for (em, ex, m, x) in entry_exits)
+            if not any_mutates:
+                continue  # all four entries are pass-through
 
-            seen_keys.add(key)
-            # Mutate the owning cfg so the existing builder picks it up.
-            cfg.exit_mx_at.append((bank, addr16, exit_m & 1, exit_x & 1))
+            seen_keys.add((bank, addr16))
+            cfg.exit_mx_at.append((bank, addr16, exit_m, exit_x))
             fixes.append(FixRecord(
                 bank=bank, addr16=addr16, fn_name=entry.name,
                 entry_m=em_in, entry_x=ex_in,
-                exit_m=exit_m & 1, exit_x=exit_x & 1,
+                exit_m=exit_m, exit_x=exit_x,
             ))
 
     return fixes
