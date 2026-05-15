@@ -3816,13 +3816,23 @@ static void cmd_dump_oam(const char *args) {
 static void cmd_screenshot(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
 
-    // Render current PPU state into a temp buffer
+    // Render current PPU state into a temp buffer. PpuBeginDrawing rebinds
+    // ppu->renderBuffer + renderPitch; if we don't restore them, the next
+    // SmwDrawPpuFrame from the main loop renders into scr_pixels instead of
+    // g_my_pixels, and the on-screen window freezes on whatever was in
+    // g_my_pixels at the moment of the first screenshot.
     static uint8_t scr_pixels[256 * 4 * 240];
+    uint8_t *saved_render_buffer = g_ppu->renderBuffer;
+    uint32_t saved_render_pitch  = g_ppu->renderPitch;
     PpuBeginDrawing(g_ppu, scr_pixels, 256 * 4, 0);
 
     // Run HDMA + scanlines like SmwDrawPpuFrame but without IRQ
     for (int i = 0; i <= 224; i++)
         ppu_runLine(g_ppu, i);
+
+    // Restore the main loop's binding so the visible window keeps updating.
+    g_ppu->renderBuffer = saved_render_buffer;
+    g_ppu->renderPitch  = saved_render_pitch;
 
     // Determine output path
     const char *path = args[0] ? args : "debug_screenshot.bmp";
