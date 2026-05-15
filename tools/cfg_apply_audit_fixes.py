@@ -156,7 +156,7 @@ def apply_fixes_to_cfg(cfg_path: pathlib.Path, fixes_for_bank: Dict[int, int],
         # Synthesize a cfg line. Use the auto_BB_AAAA naming convention
         # so the gen-C symbol stays the same.
         name = f'auto_{bank:02x}_{addr:04X}'
-        out_lines.append(f'func {name} {addr:x} end:{fix_end:x} sig:void()  # AUDIT_FIX: created from RECOMP_WARN audit')
+        out_lines.append(f'func {name} {addr:x} end:{fix_end:x}  # AUDIT_FIX: created from RECOMP_WARN audit')
         added += 1
 
     if not dry_run:
