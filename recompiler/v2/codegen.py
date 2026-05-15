@@ -651,8 +651,29 @@ def _emit_pushreg(op: PushReg) -> List[str]:
     if op.reg == Reg.D:
         return emitter_helpers.stack_op_traced(
             "CPU_STACK_OP_PHD", -2, emitter_helpers.push_word(field))
-    # A/X/Y: width depends on M/X flag at runtime.
+    # A/X/Y: width depends on M/X flag.
+    #
+    # Prefer the decoder's per-instruction static M/X (`op.static_m` /
+    # `op.static_x`) over runtime `cpu->m_flag` / `cpu->x_flag`. When
+    # static is known the decoder has already proven the width at this
+    # PC; emitting a runtime branch would let caller-side flag
+    # corruption desync this push from a later pull bracketed by REP/
+    # SEP. See `_push_reg` in lowering.py for the Iggy-platform repro
+    # that motivates this. Static `None` (legacy callers, manual
+    # construction in tests) falls back to the runtime branch.
     if op.reg == Reg.A:
+        if op.static_m == 1:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PHA, _old_s, -1); }",
+            ]
+        if op.static_m == 0:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.push_word(field)),
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PHA, _old_s, -2); }",
+            ]
         return [
             "{ uint16 _old_s = cpu->S;",
             "  if (cpu->m_flag) {",
@@ -665,6 +686,18 @@ def _emit_pushreg(op: PushReg) -> List[str]:
         ]
     if op.reg in (Reg.X, Reg.Y):
         op_id = "CPU_STACK_OP_PHX" if op.reg == Reg.X else "CPU_STACK_OP_PHY"
+        if op.static_x == 1:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.push_byte(widths.low_byte(field))),
+                f"  cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, -1); }}",
+            ]
+        if op.static_x == 0:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.push_word(field)),
+                f"  cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, -2); }}",
+            ]
         return [
             "{ uint16 _old_s = cpu->S;",
             "  if (cpu->x_flag) {",
@@ -711,6 +744,26 @@ def _emit_pullreg(op: PullReg) -> List[str]:
               "(cpu->_flag_Z ? 0x02 : 0) | (cpu->_flag_N ? 0x80 : 0));")
     if op.reg == Reg.A:
         # PLA: width follows M. Preserve B (high byte) in m=1.
+        # Prefer decoder static `op.static_m` over runtime cpu->m_flag
+        # for the same reason as PushReg — keeps PHA/PLA brackets
+        # balanced against caller-side flag drift.
+        if op.static_m == 1:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
+                f"  {field} = {widths.preserve_high(field, '_v')};",
+                *(f"  {s}" for s in widths.set_nz_no_p("_v", 1)),
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLA, _old_s, +1);",
+                f"  {p_sync} }}",
+            ]
+        if op.static_m == 0:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.pop_word_assign(field)),
+                *(f"  {s}" for s in widths.set_nz_no_p(field, 2)),
+                "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLA, _old_s, +2);",
+                f"  {p_sync} }}",
+            ]
         lines = ["{ uint16 _old_s = cpu->S;",
                  "  if (cpu->m_flag) {",
                  *(f"    {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
@@ -726,7 +779,28 @@ def _emit_pullreg(op: PullReg) -> List[str]:
         return lines
     if op.reg in (Reg.X, Reg.Y):
         op_id = "CPU_STACK_OP_PLX" if op.reg == Reg.X else "CPU_STACK_OP_PLY"
-        # PLX/PLY: x=1 zero-extends (hw contract).
+        # PLX/PLY: x=1 zero-extends (hw contract). Prefer decoder static
+        # `op.static_x` over runtime cpu->x_flag for the same reason as
+        # PushReg — keeps PH?/PL? brackets balanced when ROM bodies
+        # bracket them with internal REP/SEP idioms.
+        if op.static_x == 1:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),
+                f"  {field} = {widths.zero_extend_lo('_v')};"
+                f"  /* x=1 zeros high byte (hw contract) */",
+                *(f"  {s}" for s in widths.set_nz_no_p("_v", 1)),
+                f"  cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, +1);",
+                f"  {p_sync} }}",
+            ]
+        if op.static_x == 0:
+            return [
+                "{ uint16 _old_s = cpu->S;",
+                *(f"  {s}" for s in emitter_helpers.pop_word_assign(field)),
+                *(f"  {s}" for s in widths.set_nz_no_p(field, 2)),
+                f"  cpu_trace_stack_op(cpu, 0, {op_id}, _old_s, +2);",
+                f"  {p_sync} }}",
+            ]
         lines = ["{ uint16 _old_s = cpu->S;",
                  "  if (cpu->x_flag) {",
                  *(f"    {s}" for s in emitter_helpers.pop_byte_assign("uint8 _v")),

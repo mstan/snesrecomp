@@ -117,15 +117,17 @@ def test_xce_emits_xce():
 
 
 def test_pha_emits_pushreg_a():
+    # Lowering stamps decoder's per-instruction static (m, x) so codegen
+    # can emit fixed-width push/pull; `_decode` defaults to m=1,x=1.
     insn = _decode(bytes([0x48]))
     ops = lowering.lower(insn, value_factory=_vf())
-    assert ops == [PushReg(reg=Reg.A)]
+    assert ops == [PushReg(reg=Reg.A, static_m=1, static_x=1)]
 
 
 def test_plx_emits_pullreg_x():
     insn = _decode(bytes([0xFA]))
     ops = lowering.lower(insn, value_factory=_vf())
-    assert ops == [PullReg(reg=Reg.X)]
+    assert ops == [PullReg(reg=Reg.X, static_m=1, static_x=1)]
 
 
 def test_beq_emits_condbranch_zf_1():
