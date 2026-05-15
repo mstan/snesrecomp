@@ -903,18 +903,41 @@ def _emit_dispatch(insn) -> List[str]:
     entries = insn.dispatch_entries
     kind = getattr(insn, 'dispatch_kind', 'short')
     n = len(entries)
-    # The dispatched handlers are entered with the dispatcher's (m, x)
-    # at the JSL site — same rule as _emit_call. The dispatch helper
-    # itself doesn't touch M/X before transferring control. Take the
-    # JSL insn's m_flag/x_flag (set by the decoder under whichever
-    # entry-state reached this body).
-    em = getattr(insn, 'm_flag', 1) & 1
-    ex = getattr(insn, 'x_flag', 1) & 1
+    # The recomp bypasses the dispatch trampoline body (ExecutePtr /
+    # ExecutePtrLong at $00:847 / $00:864 in SMW) and calls the handler
+    # directly. The asm trampolines END with `SEP #$30` before JMLing
+    # to the dispatched handler — by ROM contract, every handler is
+    # entered with (m=1, x=1) regardless of caller-side runtime state.
+    # Synthesize the same contract here:
+    #  (1) Force the variant suffix to _M1X1 (matches what the handler
+    #      sees on real hardware).
+    #  (2) Emit a SEP-equivalent runtime reset of m_flag/x_flag/P so
+    #      width-sensitive ops inside the handler observe (m=1, x=1)
+    #      instead of inheriting the caller's (possibly drifted) flags.
+    #
+    # Iggy boss-platform freeze (2026-05-15) was rooted here:
+    # CallSpriteMain's `JSL ExecutePtr` reached the IggyLarry handler
+    # with runtime (m=1, x=0) inherited from caller, because the
+    # synthesized dispatch skipped the trampoline's SEP. PHX/PLX
+    # codegen (now static-width, see PushReg/PullReg) is one mitigation
+    # but only fixes stack — it doesn't restore wrong X-width memory
+    # reads further inside the handler. This reset closes that gap.
+    em = 1
+    ex = 1
     suffix = _variant_suffix(em, ex)
     lines = ["{ /* JSL dispatch — short=2B / long=3B table */"]
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append(f"  uint16 _idx = (uint16){widths.masked('cpu->A', 1)};")
     lines.append("  if (_idx >= _disp_n) { return RECOMP_RETURN_NORMAL; /* dispatch OOB */ }")
+    # Trampoline contract: dispatched handler observes (m=1, x=1). Mirror
+    # the SEP #$30 the asm trampoline does before its JML.
+    lines.append("  {")
+    lines.append("    uint8 _old_p = cpu->P;")
+    lines.append("    cpu_mirrors_to_p(cpu);")
+    lines.append("    cpu->P = (uint8)(cpu->P | 0x30);")
+    lines.append("    cpu_p_to_mirrors(cpu);")
+    lines.append("    cpu_trace_px_record(cpu, 0, 1 /*SEP*/, _old_p, cpu->P);")
+    lines.append("  }")
     lines.append("  switch (_idx) {")
     for i, e in enumerate(entries):
         if e == 0:
