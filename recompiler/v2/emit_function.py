@@ -298,10 +298,161 @@ def emit_function(rom: bytes, bank: int, start: int,
             'pla_count': pull_count,
         }
 
+    # ── Extended NLR detector: PLA*N at block START + branching tail ──
+    #
+    # Sub-case (d), 2026-05-14: PLA*N at the START of a block followed
+    # by intermediate stateless logic and a conditional or
+    # unconditional terminator whose every forward-reachable path
+    # eventually reaches an RTS/RTL without any intervening
+    # Push/Pull/Call/IndirectGoto. The PLAs eat the parent's return
+    # address; the subsequent logic runs; the eventual RTS uses the
+    # grandparent's return address.
+    #
+    # Canonical case: $00:9AEA HandleSelectionCursor.CheckMovement —
+    #   PLA PLA              ; eat parent return
+    #   LDA $15 / AND / LSR  ; cursor-direction logic
+    #   BEQ .Return          ; branch to RTS
+    #   ... cursor-move logic ...
+    # .Return: RTS
+    #
+    # The existing detector (cases a/b/c) misses this because the
+    # PLAs aren't immediately adjacent to a Return/Goto terminator —
+    # they're at the start of the block, with stateless logic + a
+    # CondBranch between them and the function's RTS.
+    #
+    # Detection is conservative: rejects if ANY reachable block has
+    # a Push/Pull/Call/IndirectGoto, or if any path is dead-ended
+    # (no terminator, no Return).
+    def _detect_nlr_at_start(key: DecodeKey):
+        def _dbg(msg):
+            if _NLR_DEBUG:
+                print(f'[nlr_dbg_d] {func_name} {_label_for(key)}: {msg}',
+                      file=_sys.stderr, flush=True)
+        ops = block_ir.get(key, [])
+        if not ops:
+            return None
+        # Count PLA*N at the START.
+        pla_end = 0
+        while pla_end < len(ops) and isinstance(ops[pla_end], PullReg) \
+                and ops[pla_end].reg == Reg.A:
+            pla_end += 1
+        pull_count = pla_end
+        if pull_count < 2:
+            return None
+        # Determine terminator presence and trailing scan boundary.
+        last_op = ops[-1]
+        if isinstance(last_op, (Goto, Return, CondBranch)):
+            scan_end_excl = len(ops) - 1
+            terminator = last_op
+        else:
+            scan_end_excl = len(ops)
+            terminator = None
+        # Middle region (between PLAs and terminator): no stack ops, no
+        # call, no nested goto/return/condbranch (each block has exactly
+        # one terminator at end — defensive).
+        for op in ops[pla_end:scan_end_excl]:
+            if isinstance(op, (PushReg, PullReg, Push, Pull)):
+                _dbg(f'REJECT: middle has {type(op).__name__}')
+                return None
+            if isinstance(op, (Call, IndirectGoto)):
+                _dbg(f'REJECT: middle has {type(op).__name__}')
+                return None
+            if isinstance(op, (Goto, Return, CondBranch)):
+                _dbg(f'REJECT: middle has {type(op).__name__}')
+                return None
+        # If the block ends in its own Return, skip = pull_count / unit
+        # and we're done — but that's case (a) which the primary
+        # detector already caught. Bail to avoid double-detection.
+        if isinstance(terminator, Return):
+            return None
+        # All forward-reachable paths from this block's successors
+        # must end in Return with no Push/Pull/Call along the way.
+        # DFS the successor graph; memoise.
+        unit_seen: List[int] = []  # collected return widths
+
+        def _forward_clean(start_key: DecodeKey) -> bool:
+            stack = [start_key]
+            visited: set = set()
+            while stack:
+                k = stack.pop()
+                if k in visited:
+                    continue
+                visited.add(k)
+                if k not in block_ir:
+                    _dbg(f'REJECT: succ {_label_for(k)} not in block_ir')
+                    return False
+                k_ops = block_ir[k]
+                if not k_ops:
+                    _dbg(f'REJECT: succ {_label_for(k)} empty')
+                    return False
+                k_last = k_ops[-1]
+                # Scan ops up to but not including the terminator.
+                if isinstance(k_last, (Goto, Return, CondBranch)):
+                    scan_n = len(k_ops) - 1
+                else:
+                    scan_n = len(k_ops)
+                for op in k_ops[:scan_n]:
+                    if isinstance(op, (PushReg, PullReg, Push, Pull,
+                                       Call, IndirectGoto)):
+                        _dbg(f'REJECT: succ {_label_for(k)} has '
+                             f'{type(op).__name__}')
+                        return False
+                if isinstance(k_last, Return):
+                    unit_seen.append(3 if k_last.long else 2)
+                    continue
+                # Goto / CondBranch / fall-through: walk successors.
+                k_succs = cfg.blocks[k].successors
+                if not k_succs:
+                    _dbg(f'REJECT: succ {_label_for(k)} no successors '
+                         f'and no Return')
+                    return False
+                for s in k_succs:
+                    stack.append(s)
+            return True
+
+        block = cfg.blocks[key]
+        succs = block.successors
+        if not succs:
+            _dbg('REJECT: no successors and no own Return')
+            return None
+        for s in succs:
+            if not _forward_clean(s):
+                return None
+        if not unit_seen:
+            _dbg('REJECT: no Return reached')
+            return None
+        # All reached Returns must use the same width (mixing RTS and
+        # RTL in one function's NLR pattern would be exotic — bail).
+        if len(set(unit_seen)) != 1:
+            _dbg(f'REJECT: mixed return widths {unit_seen}')
+            return None
+        unit = unit_seen[0]
+        if pull_count % unit != 0:
+            _dbg(f'REJECT: pull_count={pull_count} not multiple of '
+                 f'unit={unit}')
+            return None
+        skip = pull_count // unit
+        if skip < 1 or skip > 3:
+            _dbg(f'REJECT: skip={skip} out of [1,3]')
+            return None
+        _dbg(f'ACCEPT (case d): skip={skip} pla_count={pull_count}')
+        return {
+            'skip': skip,
+            'pla_start_ir_idx': 0,
+            'pla_count': pull_count,
+            # case-d marker: PLAs are at the START of the block, not
+            # the end. The emit code uses this to pick the right insn
+            # indices when the terminator is a CondBranch (not handled
+            # by the case-a/b/c "has_terminator_ir" path).
+            'pla_at_start': True,
+        }
+
     # Map key -> {skip, pla_start_ir_idx, pla_count}
     nlr_skip_by_block: Dict[DecodeKey, dict] = {}
     for key in block_order:
         info = _detect_nlr(key)
+        if info is None:
+            info = _detect_nlr_at_start(key)
         if info is not None:
             nlr_skip_by_block[key] = info
 
@@ -448,19 +599,35 @@ def emit_function(rom: bytes, bank: int, start: int,
         if nlr_info is not None:
             pla_count = nlr_info['pla_count']
             ir_ops_flat = block_ir.get(key, [])
-            has_terminator_ir = (
-                len(ir_ops_flat) > 0
-                and isinstance(ir_ops_flat[-1], (Goto, Return))
-            )
-            if has_terminator_ir:
-                term_insn_idx = len(pairs) - 1
-                pla_first_insn = term_insn_idx - pla_count
-                pla_last_excl = term_insn_idx
-                inject_at = term_insn_idx  # before the terminator insn
+            if nlr_info.get('pla_at_start'):
+                # Case-d: PLAs are the FIRST `pla_count` insns of the
+                # block; terminator can be Goto, Return, or CondBranch
+                # (any). Inject the SKIP setter BEFORE the terminator
+                # insn so its eventual RTS picks it up — works for
+                # CondBranch too since both legs reach a clean Return.
+                pla_first_insn = 0
+                pla_last_excl = pla_count
+                last_ir = ir_ops_flat[-1] if ir_ops_flat else None
+                has_terminator_ir = isinstance(
+                    last_ir, (Goto, Return, CondBranch))
+                if has_terminator_ir:
+                    inject_at = len(pairs) - 1
+                else:
+                    inject_at = None
             else:
-                pla_first_insn = len(pairs) - pla_count
-                pla_last_excl = len(pairs)
-                inject_at = None  # no terminator insn → emit after loop
+                has_terminator_ir = (
+                    len(ir_ops_flat) > 0
+                    and isinstance(ir_ops_flat[-1], (Goto, Return))
+                )
+                if has_terminator_ir:
+                    term_insn_idx = len(pairs) - 1
+                    pla_first_insn = term_insn_idx - pla_count
+                    pla_last_excl = term_insn_idx
+                    inject_at = term_insn_idx  # before the terminator insn
+                else:
+                    pla_first_insn = len(pairs) - pla_count
+                    pla_last_excl = len(pairs)
+                    inject_at = None  # no terminator insn → emit after loop
             if pla_first_insn < 0:
                 nlr_info = None
             else:
