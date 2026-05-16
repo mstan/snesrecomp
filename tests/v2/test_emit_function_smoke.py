@@ -9,14 +9,14 @@ from v2.emit_function import emit_function  # noqa: E402
 def test_linear_function_signature_and_return():
     """A trivial LDA #$05; STA $00; RTS function.
 
-    Expected shape (current emit — post static-width-WriteReg 2026-05-15):
+    Expected shape (current emit — post-width-aware-A-helper 2026-04):
         RecompReturn bank_00_8000_M1X1(CpuState *cpu) {
           L_8000_M1X1:
             cpu_trace_block(cpu, 0x008000);
             uint8 _v1 = 0x5;
-            cpu_write_a8(cpu, (uint8)((_v1) & 0xFF));   /* static m=1 → fixed 8-bit write */
+            cpu_write_a_m(cpu, (uint16)(_v1));   /* width-aware A write */
             ...
-            uint16 _v2 = cpu_read_a16(cpu);             /* read is always 16-bit; consumers mask */
+            uint16 _v2 = cpu_read_a16(cpu);      /* width-aware A read */
             cpu_write8(cpu, 0x7E, ..., _v2);
             { RecompReturn _ps = _pending_skip; ...
               return _ps; /* RTS */ }
@@ -30,9 +30,8 @@ def test_linear_function_signature_and_return():
 
     assert "RecompReturn bank_00_8000_M1X1(CpuState *cpu)" in src
     assert "L_8000_M1X1:" in src
-    # A-register touched: static-width write (m=1 → cpu_write_a8) since
-    # the function is decoded with entry m=1.
-    assert "cpu_write_a8" in src
+    # A-register touched (via width-aware helper, not a literal cpu->A=).
+    assert "cpu_write_a_m" in src
     assert "cpu_read_a16" in src
     assert "cpu_write8" in src
     # Function returns RecompReturn — Return ops consume pending_skip;

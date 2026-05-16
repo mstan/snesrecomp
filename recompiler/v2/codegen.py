@@ -323,30 +323,11 @@ def _emit_writereg(op: WriteReg) -> List[str]:
     they have a single canonical width.
     """
     src = _v(op.src)
-    # Prefer decoder's per-instruction static M/X over runtime cpu->m_flag
-    # / cpu->x_flag when known. Same rationale as PushReg/PullReg static
-    # widths (Bug B): a runtime branch lets upstream flag drift desync
-    # what should be a deterministic register-width op. Iggy boss-arena
-    # `LoadPalette` (REP #$30 at entry; 16-bit-A throughout) lost m=0
-    # state upstream and wrote half-bytes through `cpu_write_a_m`,
-    # producing the 6-of-16-colors palette corruption (2026-05-15).
     if op.reg == Reg.A:
-        if op.static_m == 1:
-            return [f"cpu_write_a8(cpu, (uint8)(({src}) & 0xFF));"]
-        if op.static_m == 0:
-            return [f"cpu_write_a16(cpu, (uint16)({src}));"]
         return [f"cpu_write_a_m(cpu, (uint16)({src}));"]
     if op.reg == Reg.X:
-        if op.static_x == 1:
-            return [f"cpu_write_x8(cpu, (uint8)(({src}) & 0xFF));"]
-        if op.static_x == 0:
-            return [f"cpu_write_x16(cpu, (uint16)({src}));"]
         return [f"cpu_write_x_x(cpu, (uint16)({src}));"]
     if op.reg == Reg.Y:
-        if op.static_x == 1:
-            return [f"cpu_write_y8(cpu, (uint8)(({src}) & 0xFF));"]
-        if op.static_x == 0:
-            return [f"cpu_write_y16(cpu, (uint16)({src}));"]
         return [f"cpu_write_y_x(cpu, (uint16)({src}));"]
     return [f"{_reg(op.reg)} = {src};"]
 

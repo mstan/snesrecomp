@@ -134,22 +134,8 @@ class ReadReg(IROp):
 
 @dataclass(frozen=True)
 class WriteReg(IROp):
-    """Width-respecting write into A / X / Y / etc.
-
-    `static_m` / `static_x` carry the decoder's per-instruction M/X
-    state when known (0 or 1). When the relevant flag is set, codegen
-    emits a fixed-width write (cpu_write_a8/16, cpu_write_x8/16) tied
-    to the decoder's static model — guarantees that LDA $7FDD followed
-    by STA $X in a known-m=0 region writes 2 correct bytes, even if
-    upstream runtime m_flag has drifted. None = legacy runtime-branch
-    via cpu_write_a_m / cpu_write_x_x / cpu_write_y_x. Same class as
-    PushReg/PullReg static_m/static_x (Iggy boss-platform palette bug,
-    2026-05-15).
-    """
     reg: Reg
     src: Value
-    static_m: Optional[int] = None
-    static_x: Optional[int] = None
 
 
 # Constants

@@ -139,52 +139,44 @@ def lower(insn: Insn, *, value_factory: ValueFactory) -> List[IROp]:
 # ── Per-mnemonic handlers ───────────────────────────────────────────────────
 
 def _h_lda(insn, vf):
-    # Stamp decoder's per-instruction (m, x) on WriteReg so codegen
-    # emits fixed-width A-write — see ir.py WriteReg docstring.
-    sm = getattr(insn, 'm_flag', None)
-    sx = getattr(insn, 'x_flag', None)
     w = _width_a(insn)
     if insn.mode == IMM:
         v = vf()
         return [ConstI(value=insn.operand, width=w, out=v),
-                WriteReg(reg=Reg.A, src=v, static_m=sm, static_x=sx),
+                WriteReg(reg=Reg.A, src=v),
                 SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
     v = vf()
     return [Read(seg=seg, width=w, out=v),
-            WriteReg(reg=Reg.A, src=v, static_m=sm, static_x=sx),
+            WriteReg(reg=Reg.A, src=v),
             SetNZ(src=v, width=w)]
 
 
 def _h_ldx(insn, vf):
-    sm = getattr(insn, 'm_flag', None)
-    sx = getattr(insn, 'x_flag', None)
     w = _width_x(insn)
     if insn.mode == IMM:
         v = vf()
         return [ConstI(value=insn.operand, width=w, out=v),
-                WriteReg(reg=Reg.X, src=v, static_m=sm, static_x=sx),
+                WriteReg(reg=Reg.X, src=v),
                 SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
     v = vf()
     return [Read(seg=seg, width=w, out=v),
-            WriteReg(reg=Reg.X, src=v, static_m=sm, static_x=sx),
+            WriteReg(reg=Reg.X, src=v),
             SetNZ(src=v, width=w)]
 
 
 def _h_ldy(insn, vf):
-    sm = getattr(insn, 'm_flag', None)
-    sx = getattr(insn, 'x_flag', None)
     w = _width_x(insn)
     if insn.mode == IMM:
         v = vf()
         return [ConstI(value=insn.operand, width=w, out=v),
-                WriteReg(reg=Reg.Y, src=v, static_m=sm, static_x=sx),
+                WriteReg(reg=Reg.Y, src=v),
                 SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
     v = vf()
     return [Read(seg=seg, width=w, out=v),
-            WriteReg(reg=Reg.Y, src=v, static_m=sm, static_x=sx),
+            WriteReg(reg=Reg.Y, src=v),
             SetNZ(src=v, width=w)]
 
 
@@ -222,10 +214,6 @@ def _alu_handler(op: AluOp, lhs_reg: Reg, width_fn):
 
     def h(insn, vf):
         width = width_fn(insn)
-        # Stamp decoder static (m, x) on the WriteReg back into the
-        # accumulator-like register (Iggy palette bug class fix).
-        sm = getattr(insn, 'm_flag', None)
-        sx = getattr(insn, 'x_flag', None)
         # Acquire RHS
         if insn.mode == IMM:
             rhs = vf()
@@ -240,7 +228,7 @@ def _alu_handler(op: AluOp, lhs_reg: Reg, width_fn):
         ops.append(ReadReg(reg=lhs_reg, out=lhs))
         ops.append(Alu(op=op, lhs=lhs, rhs=rhs, width=width, out=out))
         if out is not None:
-            ops.append(WriteReg(reg=lhs_reg, src=out, static_m=sm, static_x=sx))
+            ops.append(WriteReg(reg=lhs_reg, src=out))
         return ops
 
     return h
@@ -250,14 +238,12 @@ def _alu_handler(op: AluOp, lhs_reg: Reg, width_fn):
 def _shift_handler(op: ShiftOp):
     def h(insn, vf):
         width = _width_a(insn)
-        sm = getattr(insn, 'm_flag', None)
-        sx = getattr(insn, 'x_flag', None)
         if insn.mode == ACC:
             src = vf()
             out = vf()
             return [ReadReg(reg=Reg.A, out=src),
                     Shift(op=op, src=src, width=width, out=out),
-                    WriteReg(reg=Reg.A, src=out, static_m=sm, static_x=sx)]
+                    WriteReg(reg=Reg.A, src=out)]
         seg = _segref_for(insn)
         src = vf()
         out = vf()
