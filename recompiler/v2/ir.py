@@ -271,30 +271,14 @@ class Pull(IROp):
 
 @dataclass(frozen=True)
 class PushReg(IROp):
-    """PHA / PHX / PHY / PHB / PHD / PHK / PHP.
-
-    `static_m` / `static_x` carry the decoder's per-instruction M/X state
-    when known (0 or 1). When set, codegen emits a fixed-width push
-    instead of a runtime `cpu->m_flag` / `cpu->x_flag` branch — this
-    pins the width to the static decoder model so that REP/SEP-bracketed
-    push/pull idioms (e.g. `PHX ; REP #$30 ; ... ; SEP #$30 ; PLX`)
-    remain stack-balanced even when runtime flags diverge from the
-    decoder's per-instruction state. None = legacy runtime-branch emit.
-    """
+    """PHA / PHX / PHY / PHB / PHD / PHK / PHP."""
     reg: Reg
-    static_m: Optional[int] = None
-    static_x: Optional[int] = None
 
 
 @dataclass(frozen=True)
 class PullReg(IROp):
-    """PLA / PLX / PLY / PLB / PLD / PLP.
-
-    See `PushReg` for the meaning of `static_m` / `static_x`.
-    """
+    """PLA / PLX / PLY / PLB / PLD / PLP."""
     reg: Reg
-    static_m: Optional[int] = None
-    static_x: Optional[int] = None
 
 
 # Block move

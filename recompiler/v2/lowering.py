@@ -311,35 +311,13 @@ def _h_xba(insn, vf): return [XBA()]
 
 
 # Stack
-#
-# Stamp the decoder's per-instruction M/X on PHA/PHX/PHY/PLA/PLX/PLY so
-# codegen can emit fixed-width push/pull when the decoder's state is
-# definite. Without this, codegen falls back to runtime
-# `cpu->m_flag`/`cpu->x_flag` checks; when a ROM idiom does
-# `PH? ; REP #$30 ; ... ; SEP #$30 ; PL?` and a caller's runtime flag
-# disagrees with the decoder's entry assumption, runtime branches push
-# and pull different widths and the stack drifts. Stamping `static_m` /
-# `static_x` lets codegen pin both ends to the decoder model, so the
-# bracket stays balanced regardless of caller-side flag corruption.
-#
-# Iggy boss platform freeze (2026-05-15) is the canonical instance:
-# `GetSineAndCosineOfTiltingPlatform_M1X1` at $01:CB20 — PHX at decoder
-# x=1 entry, SEP #$30 forces x=1 before PLX, but runtime entered with
-# x_flag=0 (upstream bug elsewhere) so PHX pushed 2 bytes and PLX popped
-# 1, leaving stack -1 and corrupting the return chain.
 def _push_reg(reg):
-    def h(insn, vf):
-        sm = getattr(insn, 'm_flag', None)
-        sx = getattr(insn, 'x_flag', None)
-        return [PushReg(reg=reg, static_m=sm, static_x=sx)]
+    def h(insn, vf): return [PushReg(reg=reg)]
     return h
 
 
 def _pull_reg(reg):
-    def h(insn, vf):
-        sm = getattr(insn, 'm_flag', None)
-        sx = getattr(insn, 'x_flag', None)
-        return [PullReg(reg=reg, static_m=sm, static_x=sx)]
+    def h(insn, vf): return [PullReg(reg=reg)]
     return h
 
 

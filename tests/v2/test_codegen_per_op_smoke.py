@@ -204,52 +204,6 @@ def test_pushreg_x_uses_x_flag_path():
     assert "cpu->x_flag" in s
 
 
-# Static-width PHA/PHX/PHY/PLA/PLX/PLY emit — decoder's per-instruction
-# (m, x) pins the push/pull width to the static model. This is the fix
-# for the Iggy boss platform freeze (2026-05-15): without it,
-# `PHX ; REP #$30 ; ... ; SEP #$30 ; PLX` brackets can desync when
-# caller-side runtime x_flag drifts from the decoder's entry assumption.
-
-def test_pushreg_x_static_x1_emits_unconditional_byte():
-    op = PushReg(reg=Reg.X, static_x=1)
-    s = _joined(emit_op(op))
-    assert "cpu->x_flag" not in s   # no runtime branch
-    assert "cpu_write8" in s        # fixed 1-byte push
-    assert "cpu_write16" not in s
-
-
-def test_pushreg_x_static_x0_emits_unconditional_word():
-    op = PushReg(reg=Reg.X, static_x=0)
-    s = _joined(emit_op(op))
-    assert "cpu->x_flag" not in s
-    assert "cpu_write16" in s
-    assert "cpu_write8" not in s
-
-
-def test_pullreg_x_static_x1_emits_unconditional_byte():
-    op = PullReg(reg=Reg.X, static_x=1)
-    s = _joined(emit_op(op))
-    assert "cpu->x_flag" not in s
-    assert "cpu_read8" in s
-    assert "cpu_read16" not in s
-
-
-def test_pushreg_a_static_m0_emits_unconditional_word():
-    op = PushReg(reg=Reg.A, static_m=0)
-    s = _joined(emit_op(op))
-    assert "cpu->m_flag" not in s
-    assert "cpu_write16" in s
-    assert "cpu_write8" not in s
-
-
-def test_pullreg_a_static_m1_emits_unconditional_byte():
-    op = PullReg(reg=Reg.A, static_m=1)
-    s = _joined(emit_op(op))
-    assert "cpu->m_flag" not in s
-    assert "cpu_read8" in s
-    assert "cpu_read16" not in s
-
-
 def test_pullreg_p_calls_mirrors_sync():
     op = PullReg(reg=Reg.P)
     s = _joined(emit_op(op))
