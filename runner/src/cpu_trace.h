@@ -830,9 +830,63 @@ typedef struct StackDriftTripwire {
     BoundaryEvent bd_history[STACK_DRIFT_TRIP_BD_HISTORY];
 } StackDriftTripwire;
 
+/* ── Static M/X claim verifier ─────────────────────────────────────────
+ *
+ * Catches decoder-soundness gaps at the moment of mismatch, BEFORE they
+ * cascade into stack drift / OAM corruption / mosaic-stuck / etc.
+ *
+ * Mechanism: every generated function ends its name with a variant
+ * suffix `_M{m}X{x}` reflecting the decoder's static (M, X) at the
+ * function's entry PC. cpu_trace_func_entry fires at every function
+ * entry with that name + the runtime CpuState. We parse the suffix
+ * and compare:
+ *
+ *     decoder_static_m  vs  cpu->m_flag
+ *     decoder_static_x  vs  cpu->x_flag
+ *
+ * If they disagree, the decoder's abstract interpretation is unsound
+ * at this PC for this entry variant. Any downstream consumer that
+ * trusts the static (m, x) (push/pull width pinning, WriteReg width,
+ * etc.) emits wrong code at the mismatch site.
+ *
+ * Trips on FIRST mismatch (one-shot). Captures full state + recomp
+ * stack snapshot for triage. The companion stack-drift tripwire
+ * catches the downstream cost; this catches the cause.
+ *
+ * See docs/ABSTRACT_INTERPRETATION_GAPS.md for the underlying soundness
+ * model.
+ */
+#define MX_CLAIM_TRIP_FUNC_LEN 64
+#define MX_CLAIM_TRIP_STACK_DEPTH 16
+
+typedef struct MxClaimViolation {
+    uint8_t  armed;
+    uint8_t  triggered;
+    uint8_t  pad[2];
+
+    /* Captured at trip */
+    int32_t  frame;
+    uint32_t pc24;
+    uint8_t  claimed_m;       /* decoder's static M from name suffix */
+    uint8_t  claimed_x;       /* decoder's static X from name suffix */
+    uint8_t  runtime_m;       /* cpu->m_flag at the func entry */
+    uint8_t  runtime_x;       /* cpu->x_flag at the func entry */
+    char     func_name[MX_CLAIM_TRIP_FUNC_LEN];
+
+    /* Full CpuState at trip */
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P, e_flag;
+
+    /* Recomp stack snapshot (caller chain — most useful for "which
+     * caller violated the claim?") */
+    int32_t  stack_depth;
+    char     stack[MX_CLAIM_TRIP_STACK_DEPTH][MX_CLAIM_TRIP_FUNC_LEN];
+} MxClaimViolation;
+
 #if SNESRECOMP_TRACE
 extern DbTripwire g_db_tripwire;
 extern StackDriftTripwire g_stack_drift_tripwire;
+extern MxClaimViolation g_mx_claim_violation;
 
 void cpu_trace_arm_db_tripwire(uint8_t target_db);
 void cpu_trace_disarm_db_tripwire(void);
@@ -855,6 +909,18 @@ void cpu_trace_stack_drift_check(uint16_t entry_S, uint16_t exit_S,
                                  uint64_t entry_seq, uint64_t exit_seq,
                                  const char *func_name,
                                  uint8_t exit_kind);
+
+/* Arm the static-M/X claim verifier. When armed, every
+ * cpu_trace_func_entry parses the trailing `_M{m}X{x}` from the
+ * function name and compares against runtime cpu->m_flag/x_flag.
+ * First mismatch trips one-shot with a full snapshot. */
+void cpu_trace_arm_mx_claim_check(void);
+void cpu_trace_disarm_mx_claim_check(void);
+/* Internal — called from cpu_trace_func_entry's hot path when armed.
+ * Returns 1 if the claim matched (or could not be parsed), 0 if a
+ * mismatch was just recorded. The caller continues regardless; this is
+ * observability only. */
+int cpu_trace_mx_claim_check(CpuState *cpu, uint32_t pc24, const char *name);
 #else
 static inline void cpu_trace_arm_db_tripwire(uint8_t b) { (void)b; }
 static inline void cpu_trace_disarm_db_tripwire(void) { }
@@ -869,6 +935,11 @@ static inline void cpu_trace_stack_drift_check(uint16_t es, uint16_t xs,
                                                uint64_t a, uint64_t b,
                                                const char *n, uint8_t k) {
     (void)es; (void)xs; (void)a; (void)b; (void)n; (void)k;
+}
+static inline void cpu_trace_arm_mx_claim_check(void) { }
+static inline void cpu_trace_disarm_mx_claim_check(void) { }
+static inline int cpu_trace_mx_claim_check(CpuState *c, uint32_t p, const char *n) {
+    (void)c; (void)p; (void)n; return 1;
 }
 static inline uint64_t boundary_audit_init(void) { return 0; }
 static inline void boundary_audit_record_entry(const char *n) { (void)n; }

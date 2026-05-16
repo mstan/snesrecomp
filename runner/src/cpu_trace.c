@@ -505,6 +505,95 @@ void cpu_trace_stack_drift_check(uint16_t entry_S, uint16_t exit_S,
     fflush(stderr);
 }
 
+/* ── Static M/X claim verifier ──────────────────────────────────────── */
+MxClaimViolation g_mx_claim_violation = {0};
+
+void cpu_trace_arm_mx_claim_check(void) {
+    memset(&g_mx_claim_violation, 0, sizeof(g_mx_claim_violation));
+    g_mx_claim_violation.armed = 1;
+}
+
+void cpu_trace_disarm_mx_claim_check(void) {
+    g_mx_claim_violation.armed = 0;
+}
+
+/* Parse trailing `_M{0|1}X{0|1}` (exactly 5 chars at end of name).
+ * Returns 1 if parsed; *out_m and *out_x set accordingly. Returns 0
+ * if the suffix is absent (e.g., hand-written entry-point shims, or
+ * names from older variants). */
+static int _parse_variant_suffix(const char *name, uint8_t *out_m,
+                                 uint8_t *out_x) {
+    if (!name) return 0;
+    size_t len = strlen(name);
+    if (len < 5) return 0;
+    const char *s = name + len - 5;
+    if (s[0] != '_' || s[1] != 'M' || s[3] != 'X') return 0;
+    if (s[2] != '0' && s[2] != '1') return 0;
+    if (s[4] != '0' && s[4] != '1') return 0;
+    *out_m = (uint8_t)(s[2] == '1' ? 1 : 0);
+    *out_x = (uint8_t)(s[4] == '1' ? 1 : 0);
+    return 1;
+}
+
+int cpu_trace_mx_claim_check(CpuState *cpu, uint32_t pc24, const char *name) {
+    MxClaimViolation *t = &g_mx_claim_violation;
+    if (!t->armed || t->triggered) return 1;
+
+    uint8_t claimed_m = 0, claimed_x = 0;
+    if (!_parse_variant_suffix(name, &claimed_m, &claimed_x)) {
+        /* No suffix to compare against — neither a pass nor a fail. */
+        return 1;
+    }
+
+    uint8_t runtime_m = (uint8_t)(cpu->m_flag & 1);
+    uint8_t runtime_x = (uint8_t)(cpu->x_flag & 1);
+    if (runtime_m == claimed_m && runtime_x == claimed_x) {
+        return 1;  /* claim matches reality */
+    }
+
+    /* Mismatch — trip one-shot. */
+    t->triggered = 1;
+    extern int snes_frame_counter;
+    t->frame = snes_frame_counter;
+    t->pc24 = pc24;
+    t->claimed_m = claimed_m;
+    t->claimed_x = claimed_x;
+    t->runtime_m = runtime_m;
+    t->runtime_x = runtime_x;
+    if (name) {
+        strncpy(t->func_name, name, MX_CLAIM_TRIP_FUNC_LEN - 1);
+        t->func_name[MX_CLAIM_TRIP_FUNC_LEN - 1] = 0;
+    }
+
+    t->A = cpu->A; t->X = cpu->X; t->Y = cpu->Y;
+    t->S = cpu->S; t->D = cpu->D;
+    t->DB = cpu->DB; t->PB = cpu->PB; t->P = cpu->P;
+    t->e_flag = cpu->emulation;
+
+    int depth = g_recomp_stack_top;
+    if (depth > MX_CLAIM_TRIP_STACK_DEPTH) depth = MX_CLAIM_TRIP_STACK_DEPTH;
+    t->stack_depth = depth;
+    int skip = g_recomp_stack_top - depth;
+    for (int i = 0; i < depth; i++) {
+        const char *p = g_recomp_stack[skip + i];
+        if (p) {
+            strncpy(t->stack[i], p, MX_CLAIM_TRIP_FUNC_LEN - 1);
+            t->stack[i][MX_CLAIM_TRIP_FUNC_LEN - 1] = 0;
+        } else {
+            t->stack[i][0] = 0;
+        }
+    }
+
+    fprintf(stderr,
+            "[mx_claim] FIRED frame=%d func=%s pc=$%06X "
+            "claimed=(M%uX%u) runtime=(M%uX%u)\n",
+            t->frame, t->func_name, (unsigned)t->pc24,
+            (unsigned)t->claimed_m, (unsigned)t->claimed_x,
+            (unsigned)t->runtime_m, (unsigned)t->runtime_x);
+    fflush(stderr);
+    return 0;
+}
+
 /* Externs used by px tripwire + scoped tripwire bodies. Defined in
  * common_cpu_infra.c / debug_server.c. Hoisted to file scope so the
  * px tripwire functions (which appear above the existing scoped
@@ -970,6 +1059,13 @@ static uint32_t fnv1a(const char *s) {
 }
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
+    /* Soundness check (one-shot, gated by armed flag). Compares the
+     * decoder's static (M, X) claim — encoded in the function name's
+     * trailing `_M{m}X{x}` suffix — against the runtime cpu->m_flag /
+     * x_flag. Mismatch trips with a full snapshot and stops further
+     * checks. See docs/ABSTRACT_INTERPRETATION_GAPS.md. */
+    cpu_trace_mx_claim_check(cpu, pc24, name);
+
     int slot = (int)(g_cpu_trace_idx++ & (g_cpu_trace_capacity - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
@@ -1862,6 +1958,12 @@ void cpu_trace_arm_default_watches(void) {
      * block freeze (downstream bug) likely surfaces here. */
     cpu_trace_arm_stack_drift_tripwire(400);
     fprintf(stderr, "[cpu_trace] stack-drift tripwire armed (frame >= 400)\n");
+    /* Auto-arm static M/X claim verifier — catches decoder-soundness
+     * gaps at function entry, BEFORE stack drift cascades into visible
+     * symptoms. Trips on first variant-suffix mismatch. See
+     * docs/ABSTRACT_INTERPRETATION_GAPS.md for the model. */
+    cpu_trace_arm_mx_claim_check();
+    fprintf(stderr, "[cpu_trace] static M/X claim verifier armed\n");
     /* Auto-arm scoped WRAM tripwire on the BG palette buffer
      * $7E:0700-$070F, the first 16 colors of MainPalette/BackgroundColor.
      *

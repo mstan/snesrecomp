@@ -5051,6 +5051,75 @@ static void cmd_stack_drift_disarm(const char *args) {
 #endif
 }
 
+/* ── Static M/X claim verifier TCP commands ────────────────────────────
+ *
+ * Companion to docs/ABSTRACT_INTERPRETATION_GAPS.md. Surfaces decoder-
+ * soundness mismatches at the moment they happen, before they cascade
+ * into visible symptoms.
+ *
+ *   mx_claim_check_arm                    — arm verifier (clear trip)
+ *   mx_claim_check_get                    — return current trip snapshot
+ *   mx_claim_check_disarm                 — disarm verifier
+ */
+static void cmd_mx_claim_check_arm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_arm_mx_claim_check();
+    send_fmt("{\"ok\":1,\"armed\":1}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_mx_claim_check_disarm(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    cpu_trace_disarm_mx_claim_check();
+    send_fmt("{\"ok\":1,\"armed\":0}");
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_mx_claim_check_get(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    MxClaimViolation *t = &g_mx_claim_violation;
+    static char buf[8192];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"triggered\":%u",
+        (unsigned)t->armed, (unsigned)t->triggered);
+    if (t->triggered) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"frame\":%d,\"pc24\":\"0x%06x\","
+            "\"claimed_m\":%u,\"claimed_x\":%u,"
+            "\"runtime_m\":%u,\"runtime_x\":%u,"
+            "\"func\":\"%s\","
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
+            "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
+            "\"e\":%u,"
+            "\"stack\":[",
+            t->frame, t->pc24,
+            (unsigned)t->claimed_m, (unsigned)t->claimed_x,
+            (unsigned)t->runtime_m, (unsigned)t->runtime_x,
+            t->func_name,
+            t->A, t->X, t->Y, t->S, t->D,
+            t->DB, t->PB, t->P,
+            (unsigned)t->e_flag);
+        for (int i = 0; i < t->stack_depth && pos < (int)sizeof(buf) - 256; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s\"%s\"", i ? "," : "", t->stack[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* NLR diagnostic — non-rotating counters that survive cpu_trace ring
  * rotation. Answers "did any NLR-pattern block ever execute?" and
  * "did any Return ever consume a non-zero pending_skip?" — questions
@@ -5586,6 +5655,9 @@ static const CmdEntry s_commands[] = {
     {"nlr_diag",       cmd_nlr_diag},
     {"stack_drift_get", cmd_stack_drift_get},
     {"stack_drift_arm", cmd_stack_drift_arm},
+    {"mx_claim_check_arm", cmd_mx_claim_check_arm},
+    {"mx_claim_check_disarm", cmd_mx_claim_check_disarm},
+    {"mx_claim_check_get", cmd_mx_claim_check_get},
     {"stack_drift_clear", cmd_stack_drift_clear},
     {"stack_drift_disarm", cmd_stack_drift_disarm},
     {"func_watch_arm", cmd_func_watch_arm},
