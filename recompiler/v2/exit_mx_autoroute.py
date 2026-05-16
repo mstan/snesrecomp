@@ -25,35 +25,26 @@ risk from intermediate state. The trade-off: non-leaf functions whose
 exits depend on their callees (like F461/F465 themselves, which call
 into deeper routines) are still opt-in via cfg directive.
 
-**Per-variant detection (2026-05-15).** Original implementation
-committed ONE exit per function (the cfg-declared entry's exit, or
-the convergent exit when all four variants agreed). v2_regen then
-broadcast that single tuple to all four entry variants when building
-`callee_exit_mx`. That broadcast corrupts post-JSR state for any
-entry variant whose actual exit differs from the broadcast — typical
-when a leaf does `REP #$20` (only touches M) or `SEP #$10` (only
-touches X). Example: `ManipulateMode7Image_008B2B` (SineAndScale, the
-Mode-7 multiplier helper) does REP #$20: entry (0,0) → exit (0,0) but
-entry (1,1) → exit (0,1). Broadcast applied (0,1) everywhere, so the
-M0X0 caller after `JSR SineAndScale` was told the callee returns with
-x=1; the decoder then emitted only `L_8B01_M0X1` for the fall-through
-PC, the `CPY #$0004` got mis-decoded as `CPY #$04` + phantom BRK, and
-`CalculateMode7Values` early-returned without writing
-`Mode7ParamA/B/C/D`. The Mode-7 BG matrix never updated and the Iggy
-boss-arena tilting platform rendered invisible (Bug C, 2026-05-15).
+Detection has two passes per cfg `func`:
 
-Fix: decode all four (M, X) combos for every cfg `func` entry; for
-each variant where exit ≠ entry, emit a per-variant record in
-`BankCfg.exit_mx_at_per_variant` (6-tuple: bank, addr16, entry_m,
-entry_x, exit_m, exit_x). v2_regen prefers per-variant entries over
-the legacy 4-tuple broadcast when populating callee_exit_mx, so each
-JSR fall-through resolves to the correct exit for its specific entry
-variant.
+1. **cfg-declared entry mutates** — decode with the cfg-declared (M, X);
+   if exit != entry, commit that exit. Original behavior since
+   `14c8eea`.
 
-The legacy 4-tuple `cfg.exit_mx_at` list still receives the
-cfg-declared variant's exit (when it mutates) for backward compat
-with any consumers expecting one-tuple-per-fn semantics; per-variant
-takes precedence at lookup time.
+2. **Multi-variant convergent (added 2026-05-14)** — when the
+   cfg-declared entry's exit == entry (would skip under pass 1), scan
+   the other three (M, X) combos. If every successful decode is a leaf
+   and ALL decoded exits agree on a single (M, X) tuple AND at least
+   one entry mutates, commit that exit. Closes the FileSelectColorMath-
+   shape class: leafs whose SEP/REP forces (m, x) into a fixed value
+   regardless of entry, but whose cfg-declared entry happens to land
+   on the post-SEP/REP state. Per the audit in
+   `tools/audit_leaf_exit_mx_variants.py`, 31 SMW sites fall in this
+   class before the extension.
+
+Mutates each `BankCfg.exit_mx_at` list in place with the inferred
+tuples, so the existing builder at `v2_regen.py:342+` picks them up
+when constructing `callee_exit_mx`.
 
 Public API:
     detect_and_route(parsed, rom) -> List[FixRecord]
@@ -77,9 +68,7 @@ from v2.decoder import decode_function, analyze_function_exit_mx  # noqa: E402
 
 @dataclass(frozen=True)
 class FixRecord:
-    """One leaf function variant whose exit (M, X) state differs from
-    entry. Per-variant since 2026-05-15: a single function may emit
-    multiple FixRecords (one per mutating entry variant)."""
+    """One leaf function whose exit (M, X) state differs from entry."""
     bank: int
     addr16: int             # 16-bit local PC of the leaf function
     fn_name: str
@@ -125,38 +114,24 @@ def _decode_leaf_exit(rom: bytes, bank: int, addr16: int,
 
 
 def detect_and_route(parsed, rom: bytes) -> List[FixRecord]:
-    """Auto-detect per-variant leaf-function exit-(M, X) mutations.
+    """Auto-detect leaf-function exit-(M, X) state mutations.
 
-    For every cfg `func` entry F that has no cfg-declared `exit_mx_at`:
+    Two-pass per cfg `func` entry F:
 
-      1. Decode F under all four entry combos: (0,0), (0,1), (1,0),
-         (1,1). For each combo: skip if decode fails, the body has any
-         JSR/JSL (non-leaf), or analyze_function_exit_mx returns
-         ambiguous (None) for either component.
-      2. For each variant where exit ≠ entry, append a per-variant
-         entry to `cfg.exit_mx_at_per_variant`:
-             (bank, addr16, entry_m, entry_x, exit_m, exit_x).
-      3. Additionally, if the cfg-declared entry variant mutates, also
-         append its exit to the legacy `cfg.exit_mx_at` 4-tuple list
-         for any consumers that still rely on it. v2_regen prefers
-         per-variant over the broadcast.
+    **Pass 1** — cfg-declared entry mutates:
+      1. Decode F with its declared (entry_m, entry_x).
+      2. Skip if non-leaf or exit is ambiguous.
+      3. If exit != entry, commit that exit.
 
-    Per-variant records preserve variant-specific state for leafs that
-    only touch one of M/X — e.g. SineAndScale at $00:8B2B does
-    `REP #$20` (forces m=0, leaves x at entry value):
+    **Pass 2** — multi-variant convergent (pass 1 skipped):
+      4. Decode F under all four (M, X) combos. Skip if ANY decode is
+         non-leaf, fails, or is ambiguous (conservative).
+      5. If all four entries produce the same exit (M, X) AND at least
+         one entry mutates, commit that exit.
 
-        entry (0,0) -> exit (0,0)  ← no mutation, no record
-        entry (0,1) -> exit (0,1)  ← no mutation, no record
-        entry (1,0) -> exit (0,0)  ← M mutates: record
-        entry (1,1) -> exit (0,1)  ← M mutates: record
-
-    Without per-variant records, the legacy broadcast would smear the
-    cfg-default's (1,1)→(0,1) exit across ALL four entries, including
-    (0,0)'s post-JSR fall-through state — the Bug C class.
-
-    Sites already covered by a cfg-written `exit_mx_at` directive are
-    skipped (cfg-declared wins; per-variant auto-detection respects
-    explicit cfg facts).
+    Sites already covered by a cfg `exit_mx_at` directive are skipped.
+    Mutates the owning `BankCfg.exit_mx_at` list and returns the
+    applied fixes.
     """
     fixes: List[FixRecord] = []
 
@@ -180,11 +155,28 @@ def detect_and_route(parsed, rom: bytes) -> List[FixRecord]:
             em_in = entry.entry_m & 1
             ex_in = entry.entry_x & 1
 
-            # Decode every (M, X) combo. Skip the function entirely if
-            # ANY variant fails to decode cleanly, has a JSR/JSL (non-
-            # leaf), or has an ambiguous exit. Conservative: avoids
-            # committing partial information that could mislead the
-            # decoder for the variant that succeeded.
+            cfg_exit = _decode_leaf_exit(rom, bank, addr16,
+                                         em_in, ex_in, entry.end)
+
+            # Pass 1: cfg-declared entry mutates.
+            if cfg_exit is not None:
+                exit_m, exit_x = cfg_exit
+                if exit_m != em_in or exit_x != ex_in:
+                    seen_keys.add((bank, addr16))
+                    cfg.exit_mx_at.append(
+                        (bank, addr16, exit_m, exit_x))
+                    fixes.append(FixRecord(
+                        bank=bank, addr16=addr16, fn_name=entry.name,
+                        entry_m=em_in, entry_x=ex_in,
+                        exit_m=exit_m, exit_x=exit_x,
+                    ))
+                    continue
+
+            # Pass 2: multi-variant convergent. The cfg-declared entry
+            # either didn't mutate or didn't decode. Scan all four
+            # combos — if every entry decodes as a leaf with a known
+            # exit AND all four exits agree AND ≥1 entry mutates,
+            # commit that exit.
             entry_exits: List[Tuple[int, int, int, int]] = []
             ok = True
             for em, ex in _MX_COMBOS:
@@ -196,34 +188,22 @@ def detect_and_route(parsed, rom: bytes) -> List[FixRecord]:
                 entry_exits.append((em, ex, e[0], e[1]))
             if not ok:
                 continue
+            unique_exits = set((m, x) for (_, _, m, x) in entry_exits)
+            if len(unique_exits) != 1:
+                continue  # divergent — needs per-variant directive
+            exit_m, exit_x = next(iter(unique_exits))
+            any_mutates = any((em != m or ex != x)
+                              for (em, ex, m, x) in entry_exits)
+            if not any_mutates:
+                continue  # all four entries are pass-through
 
             seen_keys.add((bank, addr16))
-
-            # Emit one per-variant record for each variant that mutates.
-            # The non-mutating variants don't need a record — the
-            # decoder's default `ret_m, ret_x = post_m, post_x` after
-            # JSR/JSL already gives the correct fall-through state for
-            # them (callee preserves the caller's M/X).
-            #
-            # Deliberately NOT also appending to the legacy 4-tuple
-            # `cfg.exit_mx_at`. That list broadcasts ONE exit to ALL
-            # entry variants of a target, which corrupts the very
-            # variants we're trying to preserve. The original Bug C
-            # symptom is exactly this: cfg-default M1X1→M0X1 was
-            # broadcast to the M0X0 caller, poisoning the post-JSR
-            # fall-through key. Per-variant alone is sufficient —
-            # mutating entries get explicit records, non-mutating
-            # entries rely on the decoder default.
-            for em, ex, exit_m, exit_x in entry_exits:
-                if em == exit_m and ex == exit_x:
-                    continue
-                cfg.exit_mx_at_per_variant.append(
-                    (bank, addr16, em, ex, exit_m, exit_x))
-                fixes.append(FixRecord(
-                    bank=bank, addr16=addr16, fn_name=entry.name,
-                    entry_m=em, entry_x=ex,
-                    exit_m=exit_m, exit_x=exit_x,
-                ))
+            cfg.exit_mx_at.append((bank, addr16, exit_m, exit_x))
+            fixes.append(FixRecord(
+                bank=bank, addr16=addr16, fn_name=entry.name,
+                entry_m=em_in, entry_x=ex_in,
+                exit_m=exit_m, exit_x=exit_x,
+            ))
 
     return fixes
 

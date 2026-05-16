@@ -372,9 +372,6 @@ def main() -> int:
             declared_exit_mx[(b_id & 0xFF, addr16 & 0xFFFF)] = (m_val, x_val)
     # Broadcast each declared exit_mx to ALL (m, x) variants at the
     # target address. Variants are the discovered set in `variants`.
-    # NOTE: this is the legacy "one tuple per fn" mode. Per-variant
-    # entries (added 2026-05-15, see below) override the broadcast
-    # for individual (target, entry_m, entry_x) keys.
     for (b_id, addr16), (ex_m, ex_xf) in declared_exit_mx.items():
         target_pc24 = (b_id << 16) | addr16
         mx_set = variants.get(target_pc24)
@@ -386,29 +383,10 @@ def main() -> int:
             # No discovered variants — apply to cfg-default (1, 1).
             callee_exit_mx[(target_pc24, 1, 1)] = (ex_m, ex_xf)
             cfg_exit_mx_count += 1
-
-    # Per-variant exit_mx — exit_mx_autoroute populates these for
-    # functions whose exit (M, X) depends on the entry variant (e.g.
-    # SineAndScale at $00:8B2B does REP #$20: entry (0,0) → exit (0,0),
-    # but entry (1,1) → exit (0,1)). Per-variant entries OVERRIDE the
-    # legacy broadcast for the specific (target, entry_m, entry_x)
-    # tuples they cover. Other variants of the same address still get
-    # the broadcast value (typically a no-op for variants whose
-    # entry == exit).
-    per_variant_count = 0
-    for bank, _cfg_path, cfg in parsed:
-        for (b_id, addr16, em_in, ex_in, ex_m, ex_xf) in \
-                cfg.exit_mx_at_per_variant:
-            target_pc24 = ((b_id & 0xFF) << 16) | (addr16 & 0xFFFF)
-            callee_exit_mx[(target_pc24, em_in & 1, ex_in & 1)] = (
-                ex_m & 1, ex_xf & 1)
-            per_variant_count += 1
-
-    if cfg_exit_mx_count or per_variant_count:
+    if cfg_exit_mx_count:
         print()
-        print(f"Loaded {cfg_exit_mx_count} cfg `exit_mx_at` broadcast "
-              f"annotations ({len(declared_exit_mx)} unique targets); "
-              f"{per_variant_count} per-variant overrides")
+        print(f"Loaded {cfg_exit_mx_count} cfg `exit_mx_at` annotations "
+              f"({len(declared_exit_mx)} unique target addresses)")
 
     # Apply per-(m,x) variants to existing cfg entries: for each cfg
     # entry whose target address has more than its declared (m, x)

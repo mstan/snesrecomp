@@ -65,16 +65,6 @@ class BankCfg:
     # resume callers after JSR/JSL with the correct (m, x) instead of
     # assuming the callee preserves the caller's state.
     exit_mx_at: List[Tuple[int, int, int, int]] = field(default_factory=list)
-    # Per-entry-variant exit (m, x). Tuple = (bank, addr16, entry_m,
-    # entry_x, exit_m, exit_x). Populated by exit_mx_autoroute when a
-    # function's exit (m, x) depends on the entry variant — typical for
-    # SEP/REP patterns that only touch ONE of M/X (e.g. SineAndScale at
-    # $00:8B2B does REP #$20 → forces m=0, leaves x at entry value;
-    # entry (0,0) exits (0,0) but entry (1,1) exits (0,1)). The legacy
-    # 4-tuple `exit_mx_at` above broadcasts ONE exit to all variants
-    # and corrupts non-default ones in that case; per-variant overrides
-    # take precedence in v2_regen's callee_exit_mx builder.
-    exit_mx_at_per_variant: List[Tuple[int, int, int, int, int, int]] = field(default_factory=list)
 
 
 # Token regex helpers
