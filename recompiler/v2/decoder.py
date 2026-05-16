@@ -119,15 +119,32 @@ def _addr_in_data_regions(data_regions, bank: int, pc16: int) -> bool:
 
 @dataclass(frozen=True)
 class DecodeKey:
-    """Identifies a decoded instruction by 24-bit address + entry M/X.
+    """Identifies a decoded instruction by 24-bit address + entry M/X +
+    PHP/PLP stack history.
 
-    Two DecodeKeys are equal iff (pc, m, x) all match. Same `pc` with
-    different `m` or `x` is two distinct keys → two distinct decoded
-    instances in the graph.
+    Two DecodeKeys are equal iff (pc, m, x, p_stack) all match. Same `pc`
+    with different (m, x, p_stack) is multiple distinct keys → multiple
+    distinct decoded instances in the graph.
+
+    `p_stack` tracks the LIFO (m, x) snapshots PHP'd within the current
+    function body but not yet PLP'd. Each PHP pushes the current (m, x)
+    onto this stack; each PLP pops the top entry and RESTORES (m, x) to
+    that popped value. Without this tracking, the canonical SMW idiom
+    `PHX ; PHY ; PHP ; SEP #$30 ; … ; PLP ; PLY ; PLX ; RTS` (used by
+    UpdateSaveBuffer, NMI handlers, and many SEP-bracketed helpers)
+    de-syncs static-width pinning at the PLP-restored PLX/PLY: the
+    decoder otherwise stays at the post-SEP (m=1, x=1) state through
+    PLP, producing 1-byte pops where the runtime expects 2-byte (entry)
+    width. PHP/PLP tracking lets the decoder revert to the saved state
+    at PLP so push and pull widths match across the bracket.
+
+    Bounded at depth 8; deeper PHP nesting is treated as an unmodeled
+    runtime-only state (PHP becomes a no-op for p_stack growth).
     """
     pc: int   # 24-bit ((bank << 16) | local_pc)
     m: int    # entry M flag, 0 or 1
     x: int    # entry X flag, 0 or 1
+    p_stack: Tuple[Tuple[int, int], ...] = ()  # PHP-pushed (m, x) LIFO
 
 
 @dataclass
@@ -239,22 +256,67 @@ _TERMINATORS = frozenset({'RTS', 'RTL', 'RTI', 'STP', 'WAI', 'BRK'})
 _COND_BRANCHES = frozenset({'BPL', 'BMI', 'BVC', 'BVS', 'BCC', 'BCS', 'BNE', 'BEQ'})
 
 
-def post_mx(insn: Insn, in_m: int, in_x: int) -> Tuple[int, int]:
-    """Compute (m, x) AFTER executing `insn`, given entry (in_m, in_x).
+# Maximum PHP nesting depth tracked by p_stack. Bounded to keep the
+# state space finite — beyond this depth, additional PHPs are no-ops for
+# decoder state (any PLP at that depth conservatively keeps the current
+# (m, x)). SMW typical code uses depth 0–1, sometimes 2; 8 is safe.
+_PHP_STACK_MAX_DEPTH = 8
 
-    REP/SEP clear/set M and X bits independently per the operand bitmask.
-    Other instructions don't touch M/X (XCE, PLP, RTI are unmodeled at
-    this layer — they keep the entry mode; later phases may refine).
+
+def post_state(insn: Insn, in_m: int, in_x: int,
+               in_p_stack: Tuple[Tuple[int, int], ...] = ()
+               ) -> Tuple[int, int, Tuple[Tuple[int, int], ...]]:
+    """Compute (m, x, p_stack) AFTER executing `insn`, given entry state.
+
+    REP/SEP clear/set M and X bits independently per the operand bitmask;
+    p_stack is unchanged (REP/SEP don't push P).
+
+    PHP pushes the current (m, x) onto p_stack; (m, x) themselves are
+    unchanged (PHP only pushes P, doesn't modify the flag bits). At PLP
+    later, this snapshot is restored.
+
+    PLP pops the top of p_stack and restores (m, x) to that snapshot. If
+    p_stack is empty (unbalanced PLP — caller pushed P, or a coding
+    error), keep (m, x) at the current state (conservative).
+
+    XCE, RTI, and other M/X-affecting ops not modeled here — they keep
+    the current state. PLP via this path correctly handles the
+    PHP/PLP-balanced common case.
     """
-    if insn.mnem == 'REP':
+    mnem = insn.mnem
+    if mnem == 'REP':
         m = 0 if (insn.operand & 0x20) else in_m
         x = 0 if (insn.operand & 0x10) else in_x
-        return m, x
-    if insn.mnem == 'SEP':
+        return m, x, in_p_stack
+    if mnem == 'SEP':
         m = 1 if (insn.operand & 0x20) else in_m
         x = 1 if (insn.operand & 0x10) else in_x
-        return m, x
-    return in_m, in_x
+        return m, x, in_p_stack
+    if mnem == 'PHP':
+        if len(in_p_stack) < _PHP_STACK_MAX_DEPTH:
+            return in_m, in_x, in_p_stack + ((in_m, in_x),)
+        # Stack overflow — keep current state, drop the push silently.
+        # Beyond depth 8 we lose tracking but don't pollute state.
+        return in_m, in_x, in_p_stack
+    if mnem == 'PLP':
+        if in_p_stack:
+            popped_m, popped_x = in_p_stack[-1]
+            return popped_m, popped_x, in_p_stack[:-1]
+        # PLP with empty p_stack — caller pushed P before JSR, or
+        # unbalanced. Keep current state.
+        return in_m, in_x, in_p_stack
+    return in_m, in_x, in_p_stack
+
+
+def post_mx(insn: Insn, in_m: int, in_x: int) -> Tuple[int, int]:
+    """Back-compat shim: returns just (m, x) without p_stack tracking.
+
+    Callers that don't thread p_stack will lose PHP/PLP-bracketed
+    correctness. New code should use post_state() directly. Kept for
+    any external/test code that imports post_mx.
+    """
+    m, x, _ = post_state(insn, in_m, in_x, ())
+    return m, x
 
 
 def _successors(insn: Insn, key: DecodeKey, bank: int,
@@ -300,7 +362,7 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
     across multiple C bodies and stranded their PHBs without their
     matching PLBs — root cause of DB=$C0 at dispatch entry.
     """
-    post_m, post_x = post_mx(insn, key.m, key.x)
+    post_m, post_x, post_p_stack = post_state(insn, key.m, key.x, key.p_stack)
     pc = insn.addr & 0xFFFF
     next_pc = (pc + insn.length) & 0xFFFF
 
@@ -310,17 +372,17 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
         return []
 
     if mnem in ('BRA', 'BRL'):
-        return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x), 'jump')]
+        return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x, post_p_stack), 'jump')]
 
     if mnem in _COND_BRANCHES:
         return [
-            (DecodeKey(addr24(bank, next_pc), post_m, post_x), 'fall'),
-            (DecodeKey(addr24(bank, insn.operand), post_m, post_x), 'jump'),
+            (DecodeKey(addr24(bank, next_pc), post_m, post_x, post_p_stack), 'fall'),
+            (DecodeKey(addr24(bank, insn.operand), post_m, post_x, post_p_stack), 'jump'),
         ]
 
     if mnem == 'JMP':
         if insn.mode == ABS:
-            return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x), 'jump')]
+            return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x, post_p_stack), 'jump')]
         # INDIR / INDIR_X (table-dispatch) and LONG (cross-bank) — no
         # static successors at this layer.
         return []
@@ -339,6 +401,10 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
     # subsequent operand widths and synthesise phantom branch targets
     # at mid-instruction bytes (root cause of the RunPlayerBlockCode
     # -1 stack drift / "Mario dies on slope" bug, 2026-05-03).
+    #
+    # p_stack is preserved across JSR/JSL: the callee's own PHP/PLP is
+    # internal to its body. A well-balanced callee leaves the caller's
+    # PHP/PLP stack untouched.
     if mnem in ('JSR', 'JSL'):
         ret_m, ret_x = post_m, post_x
         if callee_exit_mx is not None:
@@ -357,10 +423,10 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                     em, ex = hit
                     if em is not None and ex is not None:
                         ret_m, ret_x = em & 1, ex & 1
-        return [(DecodeKey(addr24(bank, next_pc), ret_m, ret_x), 'fall')]
+        return [(DecodeKey(addr24(bank, next_pc), ret_m, ret_x, post_p_stack), 'fall')]
 
     # Default: linear fall-through with post-instruction mode.
-    return [(DecodeKey(addr24(bank, next_pc), post_m, post_x), 'fall')]
+    return [(DecodeKey(addr24(bank, next_pc), post_m, post_x, post_p_stack), 'fall')]
 
 
 def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
@@ -441,7 +507,7 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
 def decode_function(rom: bytes, bank: int, start: int,
                     entry_m: int, entry_x: int,
                     *, end: Optional[int] = None,
-                    max_insns: int = 4000,
+                    max_insns: int = 12000,
                     dispatch_helpers: Optional[Dict[int, str]] = None,
                     indirect_call_tables: Optional[Dict[int, dict]] = None,
                     data_regions: Optional[List[Tuple[int, int, int]]] = None,
@@ -671,13 +737,15 @@ def decode_function(rom: bytes, bank: int, start: int,
                 # edges) so handlers get auto-promoted.
                 labeled_succ = _labeled_successors(insn, key, bank,
                                            callee_exit_mx=callee_exit_mx)
-                # Append jump-kind edges to the in-bank handlers.
+                # Append jump-kind edges to the in-bank handlers. Each
+                # dispatch target enters as its own function — empty
+                # p_stack, not the caller's.
                 for e in entries:
                     e16 = e & 0xFFFF
                     eb = (e >> 16) & 0xFF if kind == 'long' else bank
                     if eb == bank and 0x8000 <= e16 <= 0xFFFF:
                         labeled_succ.append(
-                            (DecodeKey(addr24(eb, e16), key.m, key.x), 'jump')
+                            (DecodeKey(addr24(eb, e16), key.m, key.x, ()), 'jump')
                         )
                 succ = [k for (k, _) in labeled_succ]
                 graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)
@@ -707,12 +775,92 @@ def decode_function(rom: bytes, bank: int, start: int,
             if s not in graph.insns:
                 worklist.append((s, sk, pc))
 
+    # PHP/PLP tracking causes the decoder to produce multiple DecodeKey
+    # variants at the same (pc, m, x) when different p_stack histories
+    # reach the same PC. The downstream IR + codegen identify blocks by
+    # (pc, m, x) only (see emit_function._label_for), so multiple keys
+    # at the same (pc, m, x) collide at C-label emission. Merge those
+    # duplicates here: keep ONE representative DecodedInsn per (pc, m,
+    # x), with the union of successors. Successor keys themselves are
+    # remapped to the canonical key at each (pc, m, x).
+    #
+    # The merge preserves PHP/PLP correctness for the common case (one
+    # bracket → one p_stack value reaches each PC) and degrades
+    # gracefully for nested PHP/PLP (multiple variants at PLP produce
+    # multiple successor (m, x) — the codegen emits each as a separate
+    # downstream block).
+    _dedupe_by_pcmx(graph)
+
     # Constant-Z branch fold + reachability prune. Runs once after the
     # worklist drains so predecessor counts are stable. See
     # `_apply_constant_z_fold` for the narrow scope.
     _apply_constant_z_fold(graph)
 
     return graph
+
+
+def _dedupe_by_pcmx(graph: 'FunctionDecodeGraph') -> None:
+    """Collapse DecodeKeys at the same (pc, m, x) — different p_stack —
+    into one canonical key. Used by `decode_function` post-pass.
+
+    Without dedupe, the gen-time _label_for(key) — which only uses
+    (pc, m, x) — produces duplicate C labels when multiple p_stack
+    histories reach the same PC + (m, x). The C compiler rejects with
+    `error C2045: 'L_xxxx_MyXz': label redefined`.
+
+    The merge keeps ONE DecodedInsn per (pc, m, x). Successors from
+    all merged variants are unioned and themselves remapped to canonical
+    keys.
+    """
+    canonical: Dict[Tuple[int, int, int], DecodeKey] = {}
+    remap: Dict[DecodeKey, DecodeKey] = {}
+
+    # Pass 1: pick canonical key per (pc, m, x). First-encountered wins.
+    for key in graph.insns:
+        pcmx = (key.pc, key.m, key.x)
+        if pcmx not in canonical:
+            canonical[pcmx] = key
+        remap[key] = canonical[pcmx]
+
+    # Pass 2: rebuild graph.insns with canonical keys + merged successors.
+    #
+    # IMPORTANT: deduplicate successors only ACROSS different DecodedInsn
+    # variants at the same (pc, m, x), NOT within a single variant's
+    # successors list. _labeled_successors emits (fall, jump) pairs for
+    # conditional branches; when fall and jump point at the same target
+    # (e.g. BRA offset 0), the duplicate must be preserved so that
+    # downstream passes seeing `len(successors) == 2` (like the
+    # constant-Z fold) still recognise the conditional shape.
+    merged: Dict[DecodeKey, DecodedInsn] = {}
+    seen_succ_per_canonical: Dict[DecodeKey, set] = {}
+    for key, di in graph.insns.items():
+        ck = remap[key]
+        if ck not in merged:
+            # First variant we see for this canonical key: take its
+            # successors verbatim (duplicates intact), starting fresh.
+            remapped_first = [remap.get(s, s) for s in di.successors]
+            merged[ck] = DecodedInsn(key=ck, insn=di.insn,
+                                     successors=remapped_first)
+            seen_succ_per_canonical[ck] = set(remapped_first)
+            continue
+        # Subsequent variants at the same canonical (pc, m, x): append
+        # only successors not already present in the merged successor
+        # set. (We only see additional successors from variants reaching
+        # this PC under a different p_stack — the per-variant successor
+        # set was constructed by _labeled_successors already with the
+        # right (fall, jump) duplication rules.)
+        for s in di.successors:
+            ms = remap.get(s, s)
+            if ms not in seen_succ_per_canonical[ck]:
+                merged[ck].successors.append(ms)
+                seen_succ_per_canonical[ck].add(ms)
+
+    graph.insns = merged
+
+    # Remap the entry key in case the entry itself had a non-canonical
+    # variant (unusual but possible if the entry has nonempty p_stack).
+    if graph.entry in remap:
+        graph.entry = remap[graph.entry]
 
 
 def analyze_function_exit_mx(graph: 'FunctionDecodeGraph'
