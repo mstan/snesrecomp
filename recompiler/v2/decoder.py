@@ -88,6 +88,294 @@ def _dispatch_target_is_padding(rom: bytes, bank: int, pc16: int,
     return False
 
 
+def _autorecover_indirect_dp(rom: bytes, bank: int, func_start: int,
+                             site_pc: int, dp_addr: int,
+                             insn_length: int,
+                             data_regions=None,
+                             max_scan_insns: int = 256
+                             ) -> Optional[Tuple[Tuple[int, ...], str]]:
+    """For a `JMP ($<dp>)` (length 3, 16-bit indirect) or `JML [<dp>]`
+    (length 3, opcode DC, 24-bit indirect at abs <dp>) at `site_pc`:
+    walk the function from `func_start` to `site_pc-1`, accumulating
+    `LDA <ABS_X table>,X / STA $<dp>`-style pair sequences that write
+    the DP pointer immediately before the dispatch. Returns
+    `(table_bases, idx_reg)` if a pattern matched, else None.
+
+    Pattern shapes recognised:
+      A. JMP indirect, M=1 split-byte form:
+           LDA <tbl_lo>,X ; STA $<dp>
+           LDA <tbl_hi>,X ; STA $<dp+1>
+         → return ((tbl_lo, tbl_hi), 'X')
+      B. JML indirect, M=1 split-byte form:
+           LDA <tbl_lo>,X ; STA $<dp>
+           LDA <tbl_hi>,X ; STA $<dp+1>
+           LDA <tbl_bk>,X ; STA $<dp+2>
+         → return ((tbl_lo, tbl_hi, tbl_bk), 'X')
+      C. M=0 single-word form:
+           LDA <tbl>,X ; STA $<dp>   (16-bit LDA/STA covers both bytes)
+         → return ((tbl,), 'X')
+
+    Index register: derived from the LDA's addressing mode (`,X` or `,Y`).
+    Both must use the same index. Mixed forms are rejected.
+
+    The walk is linear from func_start. Branches and intervening writes
+    to the DP slots are tolerated as long as the LDA/STA pair that
+    "wins" is the most recent one before the dispatch. SEP/REP state is
+    tracked so M is known when the JMP fires.
+    """
+    from snes65816 import (decode_insn, lorom_offset, ABS_X, LONG_X,
+                            ABS_Y, DP)
+    # Most-recent winners per DP slot (offset 0, 1, 2 from dp_addr base).
+    # Each is (table_base, table_mode, idx_reg).
+    winners: dict = {}
+    pc = func_start & 0xFFFF
+    m_state = 1
+    x_state = 1
+    last_lda_table: Optional[Tuple[int, int, str]] = None
+    scanned = 0
+    while pc < site_pc and scanned < max_scan_insns:
+        try:
+            off = lorom_offset(bank, pc)
+        except AssertionError:
+            return None
+        if off >= len(rom):
+            return None
+        try:
+            insn = decode_insn(rom, off, pc=pc, bank=bank,
+                               m=m_state, x=x_state)
+        except Exception:
+            return None
+        if insn is None:
+            return None
+        mnem = insn.mnem
+        # Track M/X state across REP/SEP — table-base recovery is the
+        # same regardless of M, but instruction LENGTHS depend on it.
+        if mnem == 'REP':
+            if insn.operand & 0x20:
+                m_state = 0
+            if insn.operand & 0x10:
+                x_state = 0
+        elif mnem == 'SEP':
+            if insn.operand & 0x20:
+                m_state = 1
+            if insn.operand & 0x10:
+                x_state = 1
+        # Capture the most-recent LDA <ABS/LONG, X/Y> — these are the
+        # candidate sources for the next STA to a DP slot.
+        if mnem == 'LDA' and insn.mode in (ABS_X, LONG_X):
+            last_lda_table = (insn.operand & 0xFFFF, insn.mode, 'X')
+        elif mnem == 'LDA' and insn.mode == ABS_Y:
+            last_lda_table = (insn.operand & 0xFFFF, insn.mode, 'Y')
+        elif mnem == 'STA' and insn.mode == DP:
+            slot = (insn.operand & 0xFFFF) - (dp_addr & 0xFFFF)
+            if 0 <= slot <= 2 and last_lda_table is not None:
+                # Pair the LDA we just saw with this STA — it
+                # writes one byte of the dispatch pointer.
+                winners[slot] = last_lda_table
+                # Don't reuse the same LDA for another slot.
+                last_lda_table = None
+        # Any other write to one of the DP slots WITHOUT a preceding
+        # paired LDA invalidates the pattern (someone else clobbers it).
+        elif mnem == 'STA' or mnem == 'STZ':
+            slot = (insn.operand & 0xFFFF) - (dp_addr & 0xFFFF)
+            if 0 <= slot <= 2:
+                # Allow STZ + STA without LDA pairing only if it's
+                # writing zero (defensive). Drop the slot.
+                winners.pop(slot, None)
+        # Any LDA to a non-table mode — clear the candidate.
+        elif mnem == 'LDA':
+            last_lda_table = None
+        scanned += 1
+        pc = (pc + insn.length) & 0xFFFF
+
+    if not winners:
+        return None
+
+    # Validate winners: same idx_reg across all collected slots.
+    idx_regs = set(w[2] for w in winners.values())
+    if len(idx_regs) != 1:
+        return None
+    idx_reg = next(iter(idx_regs))
+
+    # Resolve to ordered tuple of table bases. Need consecutive slots
+    # starting at slot 0. For JML (insn_length == 3, opcode DC → 24-bit
+    # indirect) expect 3 slots; for JMP (16-bit indirect) expect 1 or 2.
+    needed_slots = 3 if (insn_length == 3 and m_state == 1
+                          # Heuristic: JML form needs 3 (opcode DC).
+                          # Caller will sanity-check via opcode anyway.
+                          and 2 in winners) else (2 if 1 in winners else 1)
+    table_bases: List[int] = []
+    for s in range(needed_slots):
+        if s not in winners:
+            return None
+        table_bases.append(winners[s][0])
+    return (tuple(table_bases), idx_reg)
+
+
+def _autorecover_dp_table_count(rom: bytes, bank: int,
+                                table_bases: Tuple[int, ...],
+                                data_regions=None,
+                                max_entries: int = 256) -> Optional[int]:
+    """Walk the parallel byte-tables for a DP-pointer dispatch and
+    return the count of valid entries before the first invalid one.
+
+    table_bases: 1, 2 or 3 16-bit table bases in the dispatching insn's
+    bank. Each table holds one byte per dispatch index. The composed
+    target is:
+        len==1: pointer = (bank << 16) | (rom[base[0]+i] but how is
+                  this a 16-bit ptr from 1 byte? Skipped — len==1 is
+                  not a valid composition; returns 0 in that case.)
+        len==2: pointer = (bank << 16) | (hi << 8) | lo
+        len==3: pointer = (bank << 16) | (hi << 8) | lo  — wait, with
+                  bank table: pointer = (bk << 16) | (hi << 8) | lo
+
+    For each i in 0..max-1, check the composed pointer is valid:
+      - target's bank in [00..FF] (always true, defensive)
+      - target's 16-bit pc in [$8000..$FFFF]
+      - target bytes don't look like padding
+      - target not in any data_region
+    Stop at first invalid; return how many were valid.
+    """
+    if not table_bases:
+        return None
+    if len(table_bases) == 1:
+        # M=0 single-word form: each table entry is a 2-byte ptr at
+        # `base + 2*i` in the dispatcher's bank. Treat the table as
+        # a contiguous 16-bit-entry array; walk until invalid.
+        base = table_bases[0] & 0xFFFF
+        count = 0
+        for i in range(max_entries):
+            tbl_pc = (base + 2 * i) & 0xFFFF
+            if tbl_pc + 1 > 0xFFFF:
+                break
+            try:
+                off = lorom_offset(bank, tbl_pc)
+            except AssertionError:
+                break
+            if off + 1 >= len(rom):
+                break
+            addr16 = rom[off] | (rom[off + 1] << 8)
+            if addr16 == 0:
+                break
+            if addr16 < 0x8000:
+                break
+            if _addr_in_data_regions(data_regions, bank, addr16):
+                break
+            if _dispatch_target_is_padding(rom, bank, addr16):
+                break
+            count += 1
+        return count if count > 0 else None
+    lo_base = table_bases[0] & 0xFFFF
+    hi_base = table_bases[1] & 0xFFFF
+    bk_base = table_bases[2] & 0xFFFF if len(table_bases) >= 3 else None
+    count = 0
+    for i in range(max_entries):
+        try:
+            lo_off = lorom_offset(bank, (lo_base + i) & 0xFFFF)
+            hi_off = lorom_offset(bank, (hi_base + i) & 0xFFFF)
+        except AssertionError:
+            break
+        if max(lo_off, hi_off) >= len(rom):
+            break
+        lo = rom[lo_off]
+        hi = rom[hi_off]
+        if bk_base is not None:
+            try:
+                bk_off = lorom_offset(bank, (bk_base + i) & 0xFFFF)
+            except AssertionError:
+                break
+            if bk_off >= len(rom):
+                break
+            eb = rom[bk_off]
+        else:
+            eb = bank
+        addr16 = (hi << 8) | lo
+        if addr16 == 0:
+            # Single null tolerated; two consecutive = stop.
+            # Simpler: stop on first null. Real handlers don't sit at $0000.
+            break
+        if addr16 < 0x8000:
+            break
+        if _addr_in_data_regions(data_regions, eb, addr16):
+            break
+        if _dispatch_target_is_padding(rom, eb, addr16):
+            break
+        count += 1
+    return count if count > 0 else None
+
+
+def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
+                                 data_regions=None,
+                                 max_entries: int = 256) -> Optional[List[int]]:
+    """Walk the dispatch table for a `JMP (abs,X)` / `JML (abs,X)` at
+    `insn`. Returns a list of 24-bit target PCs, or None if the very
+    first entry already looks invalid (no table at this site).
+
+    Termination rules (in order):
+      1. table address would cross the bank boundary ($FFFF)
+      2. ROM-offset goes off the image
+      3. raw target value is null ($0000) AND the next entry is also
+         null — pad detected. Single $0000 is preserved as a null-entry
+         (some jump tables intentionally have a no-op slot)
+      4. raw target value is < $8000 (not LoROM code space)
+      5. target points into a cfg `data_region` for the resolved bank
+      6. target bytes look like padding ($FF / $00 fill) per
+         `_dispatch_target_is_padding`
+      7. max_entries hit (defensive)
+
+    Entry size: 2 for JMP (length 3) — INDIR_X target stays in current
+    bank. 3 for JML (length 4) — INDIR_X target is a 24-bit pointer.
+    """
+    base = insn.operand & 0xFFFF
+    entry_size = 3 if getattr(insn, 'length', 3) == 4 else 2
+    entries: List[int] = []
+    tbl_pc = base
+    nulls_in_a_row = 0
+    while len(entries) < max_entries:
+        if tbl_pc + entry_size - 1 > 0xFFFF:
+            break
+        try:
+            off = lorom_offset(bank, tbl_pc & 0xFFFF)
+        except AssertionError:
+            break
+        if off + entry_size - 1 >= len(rom):
+            break
+        addr16 = rom[off] | (rom[off + 1] << 8)
+        if entry_size == 3:
+            eb = rom[off + 2]
+            full = (eb << 16) | addr16
+        else:
+            eb = bank
+            full = (bank << 16) | addr16
+        if addr16 == 0 and (entry_size == 2 or eb == 0):
+            # Null entry. Tolerate one in a row (some tables leave a
+            # slot blank intentionally); two consecutive nulls = pad.
+            nulls_in_a_row += 1
+            if nulls_in_a_row >= 2:
+                # Drop the trailing null we already appended (one too
+                # many).
+                if entries and entries[-1] == 0:
+                    entries.pop()
+                break
+            entries.append(0)
+            tbl_pc += entry_size
+            continue
+        nulls_in_a_row = 0
+        if addr16 < 0x8000:
+            break
+        if entry_size == 3 and (eb < 0x00 or eb > 0xFF):  # defensive
+            break
+        if entry_size == 3 and addr16 < 0x8000:
+            break
+        if _addr_in_data_regions(data_regions, eb, addr16):
+            break
+        if _dispatch_target_is_padding(rom, eb, addr16):
+            break
+        entries.append(full)
+        tbl_pc += entry_size
+    return entries if entries else None
+
+
 def _addr_in_data_regions(data_regions, bank: int, pc16: int) -> bool:
     """Return True iff (bank, pc16) is inside any cfg-declared
     `data_region <bank> <start> <end>` range.
@@ -196,6 +484,26 @@ class DispatchTargetSuppressed:
 
 
 @dataclass
+class UnresolvedIndirect:
+    """Bookkeeping entry for an indirect JMP/JML/JSR whose static target
+    list the decoder could not recover. Either:
+      - auto-recovery didn't match a known idiom at the site, AND
+      - no cfg `indirect_dispatch` directive authorised the site.
+    v2_regen hard-fails on any non-empty list — there is no stub
+    fallback. Authoring an `indirect_dispatch <site> <count> idx:<reg>
+    [tables:...]` line in the cfg is the resolution path; recompiler-
+    level auto-recovery extensions are the more-complete path.
+    """
+    site_pc24: int
+    mnem: str                # 'JMP' | 'JML' | 'JSR'
+    mode: int                # raw addressing mode (snes65816 module)
+    operand: int             # raw operand from the insn
+    function_entry_pc24: int
+    entry_m: int
+    entry_x: int
+
+
+@dataclass
 class ConstZFold:
     """Bookkeeping entry for a BEQ/BNE rewritten to an unconditional Goto
     by `_apply_constant_z_fold`. Recorded for the build report so each
@@ -240,6 +548,11 @@ class FunctionDecodeGraph:
     suppressed_indirect_calls: List[SuppressedIndirectCall] = field(default_factory=list)
     const_z_folds: List[ConstZFold] = field(default_factory=list)
     dispatch_targets_suppressed: List[DispatchTargetSuppressed] = field(default_factory=list)
+    # Indirect JMP / JML / JSR sites that the decoder COULD NOT resolve
+    # statically: no auto-recovery pattern matched AND no cfg
+    # `indirect_dispatch` directive authorised them. v2_regen treats any
+    # non-empty list as a hard build failure (no-stub policy).
+    unresolved_indirects: List['UnresolvedIndirect'] = field(default_factory=list)
 
     def keys_at_pc(self, pc24: int) -> List[DecodeKey]:
         """Return all DecodeKeys with this 24-bit PC (across entry mode states)."""
@@ -254,6 +567,94 @@ _TERMINATORS = frozenset({'RTS', 'RTL', 'RTI', 'STP', 'WAI', 'BRK'})
 
 # Mnemonics with two successors: fall-through AND taken-branch target.
 _COND_BRANCHES = frozenset({'BPL', 'BMI', 'BVC', 'BVS', 'BCC', 'BCS', 'BNE', 'BEQ'})
+
+
+def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
+                                       auth: dict) -> Optional[List[int]]:
+    """Read N dispatch targets from ROM per the cfg `indirect_dispatch`
+    directive. Returns a list of 24-bit PC targets, or None if the
+    table-base layout doesn't fit the addressing mode of `insn`.
+
+    auth shape: {
+      'count':       int N,
+      'idx_reg':     'X' | 'Y',
+      'table_bases': tuple of 0..3 16-bit bases.
+    }
+
+    Resolution rules:
+      ()         — table base is `insn.operand` (JSR/JMP/JML (abs,X) form,
+                   or JMP (abs)/JML [abs] with operand as table addr).
+                   Entry size = 3 if `insn.length == 4` (JML) else 2.
+      (lo,)      — single static table at `lo`. Entry size from `insn`.
+      (lo, hi)   — 2 parallel byte-tables forming a 16-bit pointer per
+                   index. Target = (bank << 16) | (rom[hi+i] << 8) | rom[lo+i].
+      (lo, hi, bk) — 3 parallel byte-tables forming a 24-bit pointer per
+                   index. Target = (rom[bk+i] << 16) | (rom[hi+i] << 8) | rom[lo+i].
+                   This is the Module_MainRouting / JML [DP] form.
+
+    All table reads are in the dispatching insn's bank (`bank`). LoROM
+    range check + ROM-length check applied per entry; out-of-range
+    returns None (cfg/ROM mismatch).
+    """
+    count = int(auth['count'])
+    bases = auth.get('table_bases') or ()
+
+    if len(bases) >= 2:
+        # Parallel byte-tables. Walk i = 0..count-1, read one byte from
+        # each table, compose the target.
+        lo_base = bases[0] & 0xFFFF
+        hi_base = bases[1] & 0xFFFF
+        bk_base = bases[2] & 0xFFFF if len(bases) == 3 else None
+        entries: List[int] = []
+        for i in range(count):
+            try:
+                lo_off = lorom_offset(bank, (lo_base + i) & 0xFFFF)
+                hi_off = lorom_offset(bank, (hi_base + i) & 0xFFFF)
+            except AssertionError:
+                return None
+            if max(lo_off, hi_off) >= len(rom):
+                return None
+            lo = rom[lo_off]
+            hi = rom[hi_off]
+            if bk_base is not None:
+                try:
+                    bk_off = lorom_offset(bank, (bk_base + i) & 0xFFFF)
+                except AssertionError:
+                    return None
+                if bk_off >= len(rom):
+                    return None
+                eb = rom[bk_off]
+                entries.append((eb << 16) | (hi << 8) | lo)
+            else:
+                entries.append((bank << 16) | (hi << 8) | lo)
+        return entries
+
+    # Single-table form. Base is operand (bases=()) or bases[0] (bases=(lo,)).
+    if bases:
+        base = bases[0] & 0xFFFF
+    else:
+        base = insn.operand & 0xFFFF
+    # Entry size: 3 for JML (4-byte insn) and JSL; 2 for JMP/JSR (3 bytes).
+    entry_size = 3 if getattr(insn, 'length', 3) == 4 else 2
+    entries: List[int] = []
+    tbl_pc = base
+    for _i in range(count):
+        if tbl_pc + entry_size - 1 > 0xFFFF:
+            return None
+        try:
+            off = lorom_offset(bank, tbl_pc & 0xFFFF)
+        except AssertionError:
+            return None
+        if off + entry_size - 1 >= len(rom):
+            return None
+        addr16 = rom[off] | (rom[off + 1] << 8)
+        if entry_size == 3:
+            eb = rom[off + 2]
+            entries.append((eb << 16) | addr16)
+        else:
+            entries.append((bank << 16) | addr16)
+        tbl_pc += entry_size
+    return entries
 
 
 # Maximum PHP nesting depth tracked by p_stack. Bounded to keep the
@@ -510,6 +911,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     max_insns: int = 12000,
                     dispatch_helpers: Optional[Dict[int, str]] = None,
                     indirect_call_tables: Optional[Dict[int, dict]] = None,
+                    indirect_dispatch: Optional[Dict[int, dict]] = None,
                     data_regions: Optional[List[Tuple[int, int, int]]] = None,
                     callee_exit_mx: Optional[Dict] = None,
                     ) -> FunctionDecodeGraph:
@@ -697,11 +1099,192 @@ def decode_function(rom: bytes, bank: int, start: int,
                 graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
                 continue
 
+        # cfg `indirect_dispatch` for JMP / JML indirect — recovers the
+        # static target list of an IndirectGoto. Class fix for the
+        # "IndirectGoto: dispatch table" stub class (Zelda Module_MainRouting
+        # boot blocker + ~50 other sites; SMW 2 sites).
+        #
+        # Form-handling:
+        #   - JMP (abs,X) / JML (abs,X)  — single table at insn.operand,
+        #     entry size from JMP/JML width (16 or 24 bit). AUTO-RECOVERED
+        #     when no cfg directive exists: walk entries at insn.operand
+        #     until one falls outside the bank, points into data_region,
+        #     or looks like padding. cfg can override.
+        #   - JMP (abs) [opcode 6C]      — single fixed-target indirect
+        #     (16-bit). Static recovery needs cfg (no table to walk).
+        #   - JML [abs]  [opcode DC]     — single fixed-target indirect
+        #     (24-bit). Same caveat as JMP (abs).
+        #   - JMP/JML [DP] — DP-built pointer (Module_MainRouting form).
+        #     cfg supplies tables: <lo>[,<hi>[,<bank>]] — 1, 2 or 3
+        #     parallel byte-tables forming a 16/24-bit pointer per
+        #     dispatch index.
+        if (insn.mnem in ('JMP', 'JML')
+                and insn.mode in (INDIR, INDIR_X)):
+            site_pc24 = (bank << 16) | pc
+            auth = (indirect_dispatch or {}).get(site_pc24)
+            # Auto-recovery for (abs,X) form: walk the table at the
+            # operand until invalid. Skipped when cfg already authorised
+            # the site (cfg overrides — same count, but explicit beats
+            # heuristic).
+            if auth is None and insn.mode == INDIR_X:
+                entries = _autorecover_indirect_xtable(rom, bank, insn,
+                                                       data_regions)
+                if entries:
+                    auth = {
+                        'count': len(entries),
+                        'idx_reg': 'X',
+                        'table_bases': (),
+                        '_autorecovered': True,
+                    }
+            # Auto-recovery for (abs) / [abs] DP-built-pointer form:
+            # walk back from func start to find LDA <tbl>,<idx> /
+            # STA $<dp+k> pairs that compose the dispatch pointer
+            # immediately before the JMP/JML. count comes from a
+            # walk-until-invalid pass over the recovered tables.
+            if auth is None and insn.mode == INDIR:
+                # Operand is the abs addr the JMP/JML indirects through.
+                # For DP-resident pointer (most common in zelda3), op
+                # is < $0100 and we can walk-back to find tables.
+                dp_op = insn.operand & 0xFFFF
+                if 0x0000 <= dp_op <= 0x00FF:
+                    rec = _autorecover_indirect_dp(
+                        rom, bank, start, pc, dp_op,
+                        insn.length, data_regions=data_regions)
+                    if rec is not None:
+                        table_bases, idx_reg = rec
+                        # Count from walk-until-invalid over the
+                        # recovered tables.
+                        count = _autorecover_dp_table_count(
+                            rom, bank, table_bases, data_regions)
+                        if count:
+                            auth = {
+                                'count': count,
+                                'idx_reg': idx_reg,
+                                'table_bases': table_bases,
+                                '_autorecovered': True,
+                            }
+            # Static single-target form: `JMP ($<abs>)` / `JML [$<abs>]`
+            # where <abs> is in ROM range ($8000+). The pointer lives
+            # directly in ROM at (bank, abs) — read it once at decode
+            # time and treat the site as a 1-entry dispatch. Equivalent
+            # to a plain JMP to the read target, but produced as a
+            # dispatch so the same emit path applies.
+            if (auth is None and insn.mode == INDIR
+                    and (insn.operand & 0xFFFF) >= 0x8000):
+                tbl_pc = insn.operand & 0xFFFF
+                try:
+                    tbl_off = lorom_offset(bank, tbl_pc)
+                    rom_ok = tbl_off + (3 if insn.length == 4 else 2) - 1 < len(rom)
+                except AssertionError:
+                    rom_ok = False
+                if rom_ok:
+                    tgt_lo = rom[tbl_off]
+                    tgt_hi = rom[tbl_off + 1]
+                    tgt16 = tgt_lo | (tgt_hi << 8)
+                    if (tgt16 >= 0x8000
+                            and not _addr_in_data_regions(
+                                data_regions, bank, tgt16)
+                            and not _dispatch_target_is_padding(
+                                rom, bank, tgt16)):
+                        auth = {
+                            'count': 1,
+                            # Index isn't really used (count=1), but the
+                            # emit path requires X or Y. X is harmless;
+                            # the runtime branch is `if (idx >= 1) trap;
+                            # switch (0)`, which collapses to the call.
+                            'idx_reg': 'X',
+                            'table_bases': (tbl_pc,),
+                            '_autorecovered': True,
+                            '_single_target': True,
+                        }
+            if auth is not None:
+                entries = _resolve_indirect_dispatch_targets(
+                    rom, bank, insn, auth)
+                if entries is not None:
+                    insn.dispatch_entries = entries
+                    insn.dispatch_kind = ('long' if (insn.length == 4
+                                                    or len(auth.get('table_bases', ())) == 3)
+                                          else 'short')
+                    insn.dispatch_idx_reg = auth['idx_reg']
+                    # Register each in-bank target as a decode successor
+                    # so reach-analysis + auto-promote pick up the handlers.
+                    extra_succs = []
+                    for e in entries:
+                        if e is None or e == 0:
+                            continue
+                        eb = (e >> 16) & 0xFF
+                        e16 = e & 0xFFFF
+                        if eb == bank and 0x8000 <= e16 <= 0xFFFF:
+                            extra_succs.append(
+                                (DecodeKey(addr24(eb, e16), key.m, key.x, ()),
+                                 'jump'))
+                    # JMP/JML indirect is a TERMINATOR (no fall-through).
+                    # All decoded successors come from the resolved table.
+                    succ = [k for (k, _) in extra_succs]
+                    graph.insns[key] = DecodedInsn(key=key, insn=insn,
+                                                   successors=succ)
+                    for s, sk in extra_succs:
+                        if s not in graph.insns:
+                            worklist.append((s, sk, pc))
+                    continue
+
+        # Indirect JMP / JML reached here ⇒ no cfg authorisation. Record
+        # as unresolved (v2_regen hard-fails on any). The insn stays in
+        # the graph with no successors so predecessors' edges still
+        # resolve — same shape as suppressed JSR (abs,X).
+        if (insn.mnem in ('JMP', 'JML')
+                and insn.mode in (INDIR, INDIR_X)):
+            graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
+            graph.unresolved_indirects.append(UnresolvedIndirect(
+                site_pc24=(bank << 16) | pc,
+                mnem=insn.mnem,
+                mode=insn.mode,
+                operand=insn.operand & 0xFFFFFF,
+                function_entry_pc24=addr24(bank, start),
+                entry_m=key.m,
+                entry_x=key.x,
+            ))
+            continue
+
         # cfg-required-dispatch-or-kill for JSR (abs,X). See class
         # SuppressedIndirectCall above and the regression test at
         # tests/v2/test_decoder_smc_phantom_suppression.py.
         if insn.mnem == 'JSR' and insn.mode == INDIR_X:
             site_pc24 = (bank << 16) | pc
+            # Prefer the unified `indirect_dispatch` directive (new path,
+            # 2026-05-17 class fix). Fall back to the legacy
+            # `indirect_call_table` map for compat. If the unified
+            # directive matches, recover targets through the same helper
+            # the JMP path uses — keeps semantics symmetric.
+            ud_auth = (indirect_dispatch or {}).get(site_pc24)
+            if ud_auth is not None:
+                entries = _resolve_indirect_dispatch_targets(
+                    rom, bank, insn, ud_auth)
+                if entries is not None:
+                    kind = ('long' if (insn.length == 4
+                                       or len(ud_auth.get('table_bases', ())) == 3)
+                            else 'short')
+                    insn.dispatch_entries = entries
+                    insn.dispatch_kind = kind
+                    insn.dispatch_idx_reg = ud_auth['idx_reg']
+                    labeled_succ = _labeled_successors(insn, key, bank,
+                                               callee_exit_mx=callee_exit_mx)
+                    for e in entries:
+                        if e is None or e == 0:
+                            continue
+                        eb = (e >> 16) & 0xFF
+                        e16 = e & 0xFFFF
+                        if eb == bank and 0x8000 <= e16 <= 0xFFFF:
+                            labeled_succ.append(
+                                (DecodeKey(addr24(eb, e16), key.m, key.x, ()),
+                                 'jump'))
+                    succ = [k for (k, _) in labeled_succ]
+                    graph.insns[key] = DecodedInsn(key=key, insn=insn,
+                                                   successors=succ)
+                    for s, sk in labeled_succ:
+                        if s not in graph.insns:
+                            worklist.append((s, sk, pc))
+                    continue
             auth = (indirect_call_tables or {}).get(site_pc24)
             if auth is not None:
                 # AUTHORISED: read the static dispatch table from

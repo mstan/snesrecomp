@@ -55,13 +55,58 @@ from v2.exit_mx_autoroute import (  # noqa: E402
 _BANK_CFG_RE = re.compile(r'bank([0-9a-fA-F]+)\.cfg$')
 
 
+# Stub-lint markers. Any emitted C line containing one of these strings
+# is a recompiler stub — a code path that produced "do nothing" / "trap
+# and return" placeholder output instead of real behavior. Hard-rule:
+# the recompiler MUST emit no stubs. Each marker corresponds to a real
+# code path in v2 that ducks out of emit; the lint exists so that the
+# moment a new stub appears, the build fails loudly instead of letting
+# the runtime quietly do nothing.
+#
+# Adding a new entry here is a one-line cost. Removing one requires
+# closing the corresponding recompiler-level gap so the emit never
+# produces the string in the first place.
+_STUB_MARKERS = (
+    'IndirectGoto: target',                  # codegen._emit_indirect_goto
+    'IndirectGoto: dispatch table',          # emit_function indirect-goto fallthrough
+    'Call indirect SUPPRESSED',              # codegen Call with suppressed table
+    'Call: target unknown',                  # codegen Call with no target
+    'unresolvable cross-fn goto',            # emit_function unresolved-goto trap
+    'cpu_trace_unresolved_goto_trap',        # trap-fn call (any per-bank file)
+    'cpu_trace_unresolved_stub_trap',        # trap-fn call (unresolved_stubs_v2.c)
+)
+
+
+def _lint_stubs(out_dir: pathlib.Path) -> list[tuple[str, int, str, str]]:
+    """Scan every emitted .c file in out_dir for stub markers.
+
+    Returns a list of (path, line_no, marker, line_text) tuples. Empty
+    list means clean. Caller fails the build if non-empty.
+    """
+    hits: list[tuple[str, int, str, str]] = []
+    for p in sorted(out_dir.glob('*.c')):
+        try:
+            with p.open('r', encoding='utf-8', errors='replace') as f:
+                for ln, raw in enumerate(f, start=1):
+                    for marker in _STUB_MARKERS:
+                        if marker in raw:
+                            hits.append((str(p), ln, marker, raw.rstrip('\n')))
+                            break
+        except OSError as e:
+            print(f"  lint: failed to read {p}: {e}", file=sys.stderr)
+    return hits
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="v2 regen — emit one C file per bank cfg")
-    p.add_argument('--rom', required=True, help='Path to SMW ROM file (.sfc)')
+    p.add_argument('--rom', required=True, help='Path to game ROM file (.sfc)')
     p.add_argument('--cfg-dir', required=True,
                    help='Directory containing bankXX.cfg files')
     p.add_argument('--out-dir', required=True,
                    help='Output directory for emitted C files')
+    p.add_argument('--prefix', default='smw',
+                   help='Filename prefix for emitted bank files '
+                        '(e.g. `smw` -> smw_00_v2.c; default: smw)')
     args = p.parse_args()
 
     rom = load_rom(args.rom)
@@ -104,6 +149,57 @@ def main() -> int:
             addr = nd.addr_24 & 0xFFFFFF
             name_map[addr] = nd.name
             cross_bank_names.setdefault((addr >> 16) & 0xFF, []).append(nd)
+
+    # Expand `auto_vectors` cfg directive: read the SNES interrupt-
+    # vector table at ROM offset 0x7FE0-0x7FFF (LoROM mirror of
+    # $00:FFE0-FFFF) and auto-seed I_RESET / I_NMI / I_IRQ entries
+    # at the dereferenced PCs in bank 0's cfg. Lets a fresh game
+    # project's bank00.cfg ship with one line instead of hand-decoded
+    # vectors. Skip $0000 / $FFFF placeholder slots; skip duplicates
+    # against existing cfg entries; warn if requested in a non-bank-0
+    # cfg.
+    from v2.emit_bank import BankEntry  # local import to avoid top-level cycle
+    for bank, _cfg_path, cfg in parsed:
+        if not cfg.auto_vectors:
+            continue
+        if bank != 0:
+            print(f"  WARN: auto_vectors in bank ${bank:02X}.cfg ignored "
+                  f"(vector table lives in bank $00)")
+            continue
+        rom_off = 0x7FE0
+        if rom_off + 32 > len(rom):
+            print("  WARN: auto_vectors: ROM too small for vector table")
+            continue
+        def _vec(slot_off):
+            return (rom[rom_off + slot_off + 1] << 8) | rom[rom_off + slot_off]
+        # Native NMI ($FFEA), native IRQ ($FFEE), emulation RESET
+        # ($FFFC) are the three the framework's smw_rtl-style host
+        # orchestration calls. Native is preferred over emulation for
+        # NMI/IRQ — after I_RESET sets up native mode, steady-state
+        # interrupts use the native slots.
+        seed = [
+            ('I_RESET', _vec(0x1C)),   # $FFFC emulation reset
+            ('I_NMI',   _vec(0x0A)),   # $FFEA native NMI
+            ('I_IRQ',   _vec(0x0E)),   # $FFEE native IRQ
+        ]
+        existing_starts = {e.start & 0xFFFF for e in cfg.entries}
+        existing_names = {e.name for e in cfg.entries if e.name}
+        added = []
+        for name, pc in seed:
+            if pc in (0x0000, 0xFFFF):
+                continue
+            if pc in existing_starts:
+                continue
+            if name in existing_names:
+                continue
+            cfg.entries.append(BankEntry(name=name, start=pc))
+            name_map[(bank << 16) | pc] = name
+            existing_starts.add(pc)
+            existing_names.add(name)
+            added.append((name, pc))
+        if added:
+            print(f"  auto_vectors: bank ${bank:02X}.cfg seeded "
+                  + ", ".join(f"{n}=${pc:04X}" for n, pc in added))
 
     # Auto-route SMW PHB/PHK/PLB/JSR/PLB/RTL wrapper-bypass cfg aliases.
     # Class fix for the bug where cross-bank `name <wrapper_pc> <fn>` +
@@ -555,22 +651,40 @@ def main() -> int:
         # auto-detected dispatch table entry because the target lands
         # inside a cfg `data_region`). Build report.
         all_dispatch_suppressed: list = []
+        # Aggregate unresolved indirect JMP/JML/JSR sites. Hard-fail
+        # gate: any entry here means a stub would otherwise be emitted.
+        all_unresolved_indirects: list = []
         for bank, cfg_path, cfg in parsed:
-            out_path = out_dir / f'smw_{bank:02x}_v2.c'
+            out_path = out_dir / f'{args.prefix}_{bank:02x}_v2.c'
             try:
                 if cfg.bank != bank:
                     print(f"  {cfg_path.name}: bank field ${cfg.bank:02X} doesn't match filename ${bank:02X}; using filename")
                 bank_suppressed: list = []
                 bank_const_z_folds: list = []
                 bank_dispatch_suppressed: list = []
+                bank_unresolved_indirects: list = []
+                # Build per-bank `indirect_dispatch` map keyed by
+                # 24-bit site PC for the decoder. cfg field is a list
+                # of dicts with 16-bit `site_pc16` — combine with this
+                # bank to form the 24-bit key.
+                ind_dispatch_map = None
+                ind_list = getattr(cfg, 'indirect_dispatch', None) or []
+                if ind_list:
+                    ind_dispatch_map = {}
+                    for d in ind_list:
+                        pc24 = (bank << 16) | (d['site_pc16'] & 0xFFFF)
+                        ind_dispatch_map[pc24] = d
                 src = emit_bank(rom, bank=bank, entries=cfg.entries,
                                 dispatch_helpers=dispatch_helpers,
                                 indirect_call_tables=getattr(
                                     cfg, 'indirect_call_tables', None),
+                                indirect_dispatch=ind_dispatch_map,
                                 suppressed_collector=bank_suppressed,
                                 const_z_fold_collector=bank_const_z_folds,
                                 dispatch_target_suppressed_collector=
                                     bank_dispatch_suppressed,
+                                unresolved_indirect_collector=
+                                    bank_unresolved_indirects,
                                 data_regions=cfg.data_regions or None,
                                 exclude_ranges=cfg.exclude_ranges or None,
                                 callee_exit_mx=callee_exit_mx)
@@ -578,6 +692,7 @@ def main() -> int:
                 all_suppressed.extend(bank_suppressed)
                 all_const_z_folds.extend(bank_const_z_folds)
                 all_dispatch_suppressed.extend(bank_dispatch_suppressed)
+                all_unresolved_indirects.extend(bank_unresolved_indirects)
                 if pass_idx == 0:
                     print(f"  OK    bank ${bank:02X}: {len(cfg.entries)} entries -> {out_path}")
                 succeeded += 1
@@ -744,12 +859,76 @@ def main() -> int:
         for addr in sorted(rejected):
             print(f"  ${addr:06X}")
 
+    # Unresolved indirect-dispatch sites. Every entry is a JMP/JML/JSR
+    # the decoder couldn't resolve via cfg `indirect_dispatch` or auto-
+    # recovery. v2_regen treats the list as a hard build error so no
+    # IndirectGoto stub silently reaches the runtime. Authoring an
+    # `indirect_dispatch <site> <count> idx:<reg> [tables:...]` line in
+    # the appropriate bank cfg closes each site; or extend the
+    # recompiler with an auto-recovery pattern.
+    if all_unresolved_indirects:
+        # Group by addressing mode shape for a readable report.
+        from collections import defaultdict
+        by_form: dict = defaultdict(list)
+        for u in all_unresolved_indirects:
+            # mode → readable form name (consistent with disassembly).
+            form = f"{u.mnem} mode={u.mode}"
+            by_form[form].append(u)
+        print()
+        print(f"=== UNRESOLVED INDIRECT DISPATCH — {len(all_unresolved_indirects)} site(s) ===")
+        for form, recs in sorted(by_form.items()):
+            print(f"  [{form}] x{len(recs)}")
+            for r in sorted(recs, key=lambda x: x.site_pc24):
+                print(f"    site=${r.site_pc24:06X}  operand=${r.operand:06X}  "
+                      f"M{r.entry_m}X{r.entry_x}  "
+                      f"in ${r.function_entry_pc24:06X}")
+        print()
+        print("Add `indirect_dispatch <site_pc> <count> idx:<X|Y> "
+              "[tables:<lo>[,<hi>[,<bank>]]]` to the cfg of each site's "
+              "bank to authorise. Stubs are forbidden — see "
+              "feedback_no_stubs_ever memory.")
+
     print()
     print(f"v2_regen: {succeeded}/{total} banks emitted")
     if failed:
         print(f"failed banks:")
         for bank, msg in failed:
             print(f"  ${bank:02X}: {msg}")
+        return 1
+    # Unresolved IndirectGoto sites: emit runs through (each site
+    # produces a runtime cpu_trace_dispatch_oob trap, not a silent
+    # stub) but the lint pass below will still flag the build as
+    # incomplete via the trap-call string + any other residual
+    # stub markers. v2_regen returns non-zero so chained scripts
+    # know the recompile didn't close every class.
+    if all_unresolved_indirects:
+        print(f"  WARN: {len(all_unresolved_indirects)} unresolved "
+              f"indirect-dispatch site(s) — trap stubs emitted, HLE pending. "
+              f"See report above.")
+
+    # Stub lint. Hard gate: no stub markers in any emitted .c file.
+    # See _STUB_MARKERS comment for the rationale. There is no
+    # allowlist — every hit is a recompiler-level gap that must be
+    # closed at the gen path, not silenced here.
+    lint_hits = _lint_stubs(out_dir)
+    if lint_hits:
+        print()
+        print(f"=== STUB LINT — {len(lint_hits)} stub(s) in emitted output ===")
+        by_marker: dict[str, list] = {}
+        for path, ln, marker, text in lint_hits:
+            by_marker.setdefault(marker, []).append((path, ln, text))
+        for marker in sorted(by_marker.keys()):
+            entries = by_marker[marker]
+            print(f"  [{marker}] x{len(entries)}")
+            shown = entries[:5]
+            for path, ln, text in shown:
+                short = pathlib.Path(path).name
+                print(f"    {short}:{ln}: {text.strip()[:160]}")
+            if len(entries) > len(shown):
+                print(f"    ... and {len(entries) - len(shown)} more")
+        print()
+        print("Stubs are a hard build error. Close the recompiler-level "
+              "gap that produced each marker; do NOT add an allowlist.")
         return 1
     return 0
 

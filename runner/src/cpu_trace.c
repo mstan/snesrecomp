@@ -1556,6 +1556,33 @@ RecompReturn cpu_trace_unresolved_stub_trap(
     return RECOMP_RETURN_NORMAL;
 }
 
+/* ── Indirect-dispatch OOB trap ──────────────────────────────────────
+ *
+ * Generated code calls this when a runtime index register exceeds the
+ * cfg-declared `count` at an `indirect_dispatch` site. Reuses the
+ * UnresolvedStubHit slot table so existing inspection commands
+ * (`unresolved_stub_get`) surface the hit without adding a parallel
+ * data structure. `func_name` is synthesised from the site PC.
+ *
+ * Returns RECOMP_RETURN_NORMAL so the caller (the dispatcher's switch
+ * default arm) returns cleanly — the misindexed call is suppressed
+ * but the runtime doesn't crash. A hit is ALWAYS a real bug to chase
+ * (cfg count too small, runtime register corruption, etc.); the
+ * stderr line tags it loudly.
+ */
+RecompReturn cpu_trace_dispatch_oob(
+    CpuState *cpu, uint32_t site_pc24, uint16_t idx)
+{
+    char name[64];
+    snprintf(name, sizeof(name), "dispatch_oob_$%06X[%u]",
+             (unsigned)site_pc24, (unsigned)idx);
+    /* Delegate to the unresolved-stub path for slot accounting +
+     * stderr emission. target_pc24 carries the (site << 16) | idx
+     * pair so the caller can decode it from the captured hit. */
+    uint32_t encoded = (site_pc24 & 0xFFFF) | ((uint32_t)idx << 16);
+    return cpu_trace_unresolved_stub_trap(cpu, encoded, name);
+}
+
 void cpu_trace_phantom_arm_unresolvable_goto_set(void) {
     /* Unresolvable-cross-fn-goto block-entry PCs cf_debt_report
      * 2026-05-03 found. Each is the BLOCK PC whose codegen currently

@@ -63,9 +63,11 @@ def emit_function(rom: bytes, bank: int, start: int,
                   func_name: Optional[str] = None,
                   dispatch_helpers=None,
                   indirect_call_tables=None,
+                  indirect_dispatch=None,
                   suppressed_collector=None,
                   const_z_fold_collector=None,
                   dispatch_target_suppressed_collector=None,
+                  unresolved_indirect_collector=None,
                   data_regions=None,
                   exclude_ranges: Optional[List[Tuple[int, int]]] = None,
                   tail_call_pc16: Optional[int] = None,
@@ -84,6 +86,7 @@ def emit_function(rom: bytes, bank: int, start: int,
     graph = decode_function(rom, bank, start, entry_m, entry_x, end=end,
                             dispatch_helpers=dispatch_helpers,
                             indirect_call_tables=indirect_call_tables,
+                            indirect_dispatch=indirect_dispatch,
                             data_regions=data_regions,
                             callee_exit_mx=callee_exit_mx)
     # Forward any suppressed indirect calls upward so emit_bank can
@@ -98,6 +101,10 @@ def emit_function(rom: bytes, bank: int, start: int,
     if dispatch_target_suppressed_collector is not None:
         dispatch_target_suppressed_collector.extend(
             graph.dispatch_targets_suppressed)
+    # IndirectGoto / Call (abs,X) sites that couldn't be resolved (no
+    # cfg directive, no auto-recovery). v2_regen hard-fails on any.
+    if unresolved_indirect_collector is not None:
+        unresolved_indirect_collector.extend(graph.unresolved_indirects)
     cfg = build_cfg(graph)
 
     if func_name is None:
@@ -738,21 +745,55 @@ def emit_function(rom: bytes, bank: int, start: int,
                         lines.append(ln)
                     block_terminated = True
                 elif isinstance(op, IndirectGoto):
-                    for ln in emit_op(op):
-                        lines.append(ln)
-                    lines.append("return RECOMP_RETURN_NORMAL; /* IndirectGoto: dispatch table */")
-                    block_terminated = True
-                elif isinstance(op, Call):
-                    # Dispatch-helper JSL: the decoder marked the insn
-                    # with `dispatch_entries`. Route through _emit_dispatch
-                    # — the helper itself never returns to the JSL caller;
-                    # it returns to the dispatched handler. So this is
-                    # a TERMINATOR.
+                    # cfg-resolved (or auto-recovered) IndirectGoto: the
+                    # decoder stamped `dispatch_entries` + `dispatch_idx_reg`
+                    # on the insn. Route through _emit_indirect_dispatch
+                    # to emit a real switch with direct tail-calls. Class
+                    # fix for the IndirectGoto stub class — never emit a
+                    # `/* IndirectGoto */` stub here. Unresolved sites
+                    # are caught at v2_regen via graph.unresolved_indirects.
                     insn = di_insn
                     if getattr(insn, 'dispatch_entries', None):
-                        from v2.codegen import _emit_dispatch
-                        for ln in _emit_dispatch(insn):
+                        from v2.codegen import _emit_indirect_dispatch
+                        for ln in _emit_indirect_dispatch(insn):
                             lines.append(ln)
+                        block_terminated = True
+                    else:
+                        # No resolution. The decoder recorded the site
+                        # in graph.unresolved_indirects so v2_regen
+                        # reports it; in this build mode we emit a
+                        # runtime trap rather than a silent stub —
+                        # the recomp_dispatch_oob path captures a loud
+                        # stderr + slot-table entry the moment the site
+                        # actually executes. NOT a stub (no silent
+                        # fall-through); requires HLE follow-up before
+                        # the dispatcher is functionally correct.
+                        site_pc24 = (bank << 16) | (key.pc & 0xFFFF)
+                        lines.append(
+                            f"return cpu_trace_dispatch_oob(cpu, "
+                            f"0x{site_pc24:06x}, 0xFFFF); "
+                            f"/* unresolved IndirectGoto — HLE pending */")
+                        block_terminated = True
+                elif isinstance(op, Call):
+                    # Dispatch-helper JSL: the decoder marked the insn
+                    # with `dispatch_entries`. Two routes:
+                    #   (a) JSL ExecutePtr helper — index by A, switch
+                    #       through `_emit_dispatch`.
+                    #   (b) JSR (abs,X) authorised by `indirect_dispatch`
+                    #       directive — index by X (or Y if cfg said so),
+                    #       switch through `_emit_indirect_dispatch`.
+                    # Both are TERMINATORS (the helper / dispatched
+                    # handler doesn't return to the JSL caller).
+                    insn = di_insn
+                    if getattr(insn, 'dispatch_entries', None):
+                        if getattr(insn, 'dispatch_idx_reg', None) in ('X', 'Y'):
+                            from v2.codegen import _emit_indirect_dispatch
+                            for ln in _emit_indirect_dispatch(insn):
+                                lines.append(ln)
+                        else:
+                            from v2.codegen import _emit_dispatch
+                            for ln in _emit_dispatch(insn):
+                                lines.append(ln)
                         block_terminated = True
                     else:
                         for ln in emit_op(op):

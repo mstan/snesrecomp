@@ -79,6 +79,29 @@ class BankCfg:
     # is wrong for those (Bug C class, see
     # docs/ABSTRACT_INTERPRETATION_GAPS.md).
     exit_mx_at_per_variant: List[Tuple[int, int, int, int, int, int]] = field(default_factory=list)
+    # `auto_vectors` directive — when true and this cfg is bank 00,
+    # v2_regen reads the SNES interrupt-vector table at ROM offset
+    # 0x7FE0-0x7FFF (LoROM mirror of $00:FFE0-FFFF) and auto-seeds
+    # `func I_RESET / I_NMI / I_IRQ` entries at the dereferenced PCs.
+    # Lets a fresh game project ship a minimal bank00.cfg with just
+    # the one directive instead of hand-decoding the vector table.
+    auto_vectors: bool = False
+    # `indirect_dispatch` directives — authorise the decoder to recover
+    # the static target list of an indirect JMP/JML/JSR. Each entry is
+    # a dict with keys:
+    #   site_pc16: int       — local 16-bit PC of the dispatch insn
+    #   count: int           — N (number of dispatch targets)
+    #   idx_reg: 'X' or 'Y'  — which CPU index register selects the case
+    #   table_bases: tuple   — table addr(s):
+    #       ()           : table base taken from insn.operand (JSR/JMP/JML (abs,X))
+    #       (lo,)        : single static table at given addr
+    #       (lo, hi)     : two parallel byte-tables forming a 16-bit pointer
+    #       (lo, hi, bk) : three parallel byte-tables forming a 24-bit pointer
+    #                      (assembled into DP then JML [DP], e.g. Module_MainRouting)
+    # Decoder reads ROM via the resolved table layout, registers each
+    # entry as a decode successor (for auto-promote / reachability), and
+    # stamps `insn.dispatch_entries` so codegen emits a real switch.
+    indirect_dispatch: List[dict] = field(default_factory=list)
 
 
 # Token regex helpers
@@ -132,6 +155,76 @@ def load_bank_cfg(path: str) -> BankCfg:
 
             # comment = ... (v2 ignores)
             if head == 'comment' and '=' in stripped:
+                continue
+
+            # auto_vectors — request that v2_regen.py read the SNES
+            # interrupt-vector table at ROM offset 0x7FE0-0x7FFF
+            # (LoROM mirror of $00:FFE0-FFFF) and auto-seed
+            # `func I_RESET / I_NMI / I_IRQ` entries. Bank 00 only
+            # (vectors live in bank 0); v2_regen warns and skips for
+            # other banks.
+            if head == 'auto_vectors':
+                cfg.auto_vectors = True
+                continue
+
+            # indirect_dispatch <site_pc> <count> idx:<X|Y> [tables:<lo>[,<hi>[,<bank>]]]
+            #
+            # Authorises the decoder to recover the static target list
+            # of an indirect JMP/JML/JSR at the named site. See
+            # BankCfg.indirect_dispatch for the field shape + table-base
+            # interpretation. Class fix for IndirectGoto / Call indirect
+            # SUPPRESSED stubs — see _STUB_MARKERS in tools/v2_regen.py
+            # and feedback_no_stubs_ever memory.
+            if head == 'indirect_dispatch':
+                if len(tokens) < 4:
+                    raise ValueError(
+                        f"{path}: indirect_dispatch needs at least "
+                        f"<site_pc> <count> idx:<reg> — got: {stripped!r}")
+                try:
+                    site_pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: indirect_dispatch bad site_pc {tokens[1]!r}: {e}")
+                try:
+                    count = int(tokens[2], 0)
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: indirect_dispatch bad count {tokens[2]!r}: {e}")
+                if count <= 0 or count > 4096:
+                    raise ValueError(
+                        f"{path}: indirect_dispatch count {count} out of range (1..4096)")
+                idx_reg: Optional[str] = None
+                table_bases: Tuple[int, ...] = ()
+                for t in tokens[3:]:
+                    if t.startswith('idx:'):
+                        v = t[len('idx:'):].upper()
+                        if v not in ('X', 'Y'):
+                            raise ValueError(
+                                f"{path}: indirect_dispatch idx: must be X or Y, got {v!r}")
+                        idx_reg = v
+                    elif t.startswith('tables:'):
+                        raw_bases = t[len('tables:'):].split(',')
+                        if len(raw_bases) < 1 or len(raw_bases) > 3:
+                            raise ValueError(
+                                f"{path}: indirect_dispatch tables: needs 1-3 "
+                                f"comma-separated hex addresses, got {t!r}")
+                        try:
+                            table_bases = tuple(_parse_hex(b) & 0xFFFF for b in raw_bases)
+                        except ValueError as e:
+                            raise ValueError(
+                                f"{path}: indirect_dispatch tables: bad hex {t!r}: {e}")
+                    else:
+                        raise ValueError(
+                            f"{path}: indirect_dispatch unknown option {t!r}")
+                if idx_reg is None:
+                    raise ValueError(
+                        f"{path}: indirect_dispatch needs idx:X or idx:Y — got: {stripped!r}")
+                cfg.indirect_dispatch.append({
+                    'site_pc16': site_pc16,
+                    'count': count,
+                    'idx_reg': idx_reg,
+                    'table_bases': table_bases,
+                })
                 continue
 
             # func <name> <hex_pc> [end:<hex_end>] [tail_call:<hex>] [exit_mx:M,X] [sig:...] [...]

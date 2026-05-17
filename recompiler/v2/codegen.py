@@ -882,8 +882,103 @@ def _emit_goto(op: Goto) -> List[str]:
 
 
 def _emit_indirect_goto(op: IndirectGoto) -> List[str]:
+    """Standalone IndirectGoto codegen (no dispatch_entries resolved).
+
+    Used to emit a `/* IndirectGoto: ... */` stub when the decoder
+    couldn't resolve targets — but the no-stub policy means this stub
+    must never reach src/gen/. Callers in emit_function.py route
+    dispatch_entries-resolved sites through `_emit_indirect_dispatch`
+    instead, and v2_regen hard-fails on any unresolved site BEFORE
+    src/gen/ is consumed. This emit stays as a defensive guard so the
+    function signature is preserved.
+    """
     bank, addr = _segref_addr_expr(op.seg)
     return [f"/* IndirectGoto: target = ({bank}, {addr}) — caller dispatches */"]
+
+
+def _emit_indirect_dispatch(insn) -> List[str]:
+    """Emit a real switch for an indirect JMP/JML/JSR whose static
+    target list the decoder recovered (via cfg `indirect_dispatch` or
+    auto-recovery). Switches on the index register declared by the
+    cfg directive (X or Y); each case tail-calls the corresponding
+    handler.
+
+    The dispatching JMP/JML is a TERMINATOR (control transfers to the
+    handler; the handler's own RTL/RTS returns to the dispatcher's
+    caller, not back into the dispatcher). So each case emits a `return
+    <handler>(cpu);` rather than a fall-through-after-call. This
+    matches the asm idiom where `JSR Module_MainRouting` pushes a 16-bit
+    return; Module_MainRouting's `JML [DP]` transfers to the handler;
+    the handler `RTL`s and pops PB+PC — meaning the handler must have
+    been entered via JSL (or the dispatch's `JML` effectively converts
+    a 24-bit-target call into a tail-call from the JSL caller's POV).
+
+    Empty `case 0:` ⇒ null entry (table padding); emits `default: break`-
+    style fall-through that returns NORMAL.
+
+    OOB index ⇒ runtime trap. No silent stub.
+    """
+    bank = (insn.addr >> 16) & 0xFF
+    entries = insn.dispatch_entries
+    idx_reg = getattr(insn, 'dispatch_idx_reg', 'X')
+    if idx_reg not in ('X', 'Y'):
+        idx_reg = 'X'
+    n = len(entries)
+    site_pc24 = insn.addr & 0xFFFFFF
+
+    # Variant suffix for the dispatched handlers: we route to each
+    # handler at its DEFAULT cfg entry (m, x). The handler's own cfg
+    # entry knows what mode it expects; the recomp pipeline mints the
+    # corresponding _MxXy variant. For dispatchers where every entry
+    # is reached in (m=1, x=1) — the SNES asm default — _M1X1 is right.
+    # Per-target variant resolution beyond this needs another cfg
+    # directive (out of scope for this class fix).
+    em, ex = 1, 1
+    suffix = _variant_suffix(em, ex)
+
+    lines = ["{ /* indirect dispatch — cfg-resolved target list */"]
+    # Index source: low byte (x=1 / m=1) of X or Y, conservatively
+    # masked to 8 bits since dispatch tables are at most 256 entries
+    # anyway and most are far smaller.
+    idx_field = 'X' if idx_reg == 'X' else 'Y'
+    lines.append(
+        f"  uint16 _idx = (uint16)(cpu->{idx_field} & 0xFFFF);")
+    lines.append(f"  static const uint16 _disp_n = {n};")
+    lines.append("  if (_idx >= _disp_n) {")
+    lines.append(
+        f"    return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    lines.append("  }")
+    lines.append("  switch (_idx) {")
+    for i, e in enumerate(entries):
+        if e is None or e == 0:
+            lines.append(f"    case {i}: return RECOMP_RETURN_NORMAL; /* null entry */")
+            continue
+        target_bank = (e >> 16) & 0xFF
+        local_pc = e & 0xFFFF
+        tgt_addr = e & 0xFFFFFF
+        base_name = _NAME_RESOLVER.get(tgt_addr)
+        if base_name is None:
+            base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
+        _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+        name = f"{base_name}{suffix}"
+        # Tail-call: the dispatched handler's return value propagates
+        # straight back to OUR caller. PB save/restore happens around
+        # the call so PHK inside the handler pushes the target bank.
+        env = emitter_helpers.call_with_pb_save(target_bank, name)
+        lines.append(f"    case {i}: {{")
+        for stmt in env:
+            lines.append(f"      {stmt}")
+        # After call_with_pb_save returns (NORMAL path), the dispatcher
+        # itself returns NORMAL: it was a JMP-style terminator. The
+        # SKIP-N propagation is already handled by call_with_pb_save.
+        lines.append("      return RECOMP_RETURN_NORMAL;")
+        lines.append("    }")
+    lines.append("    default: break; /* unreachable: gated above */")
+    lines.append("  }")
+    lines.append(
+        f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    lines.append("}")
+    return lines
 
 
 def _emit_dispatch(insn) -> List[str]:
