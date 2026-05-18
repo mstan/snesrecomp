@@ -789,7 +789,80 @@ def emit_function(rom: bytes, bank: int, start: int,
                             lines.append(_goto_or_return(succs[0],
                                                           source_pc24=blk_pc24))
                         else:
-                            lines.append(f"return RECOMP_RETURN_NORMAL; /* Goto with no successor */")
+                            # Cross-bank JML / out-of-import-range goto.
+                            # 2026-05-18 class fix: if the JML operand
+                            # resolves to a registered named function in
+                            # ANY bank, emit a tail-call to its
+                            # M{m}X{x} variant (using the current block's
+                            # (m, x) — JML doesn't touch the status
+                            # register's M/X bits). This is the cross-
+                            # bank analogue of the same-bank tail-call-
+                            # past-end: case handled in _goto_or_return.
+                            # Closes the zelda Intro_FadeInBg →
+                            # Palette_FadeIntro2 JML $00:ED8F gap that
+                            # was producing a `return RECOMP_RETURN_NORMAL;
+                            # /* Goto with no successor */` stub (block
+                            # silently bailed instead of decrementing
+                            # palette_filter_countdown — title screen
+                            # never advanced to attract demo).
+                            target_pc24 = None
+                            if (getattr(insn, 'mnem', '') == 'JMP'
+                                    and getattr(insn, 'mode', None) is not None):
+                                from v2.lowering import LONG as _LONG_MODE
+                                if insn.mode == _LONG_MODE:
+                                    target_pc24 = insn.operand & 0xFFFFFF
+                            if target_pc24 is not None:
+                                from v2.codegen import (get_name_for_pc,
+                                                          register_call_demand)
+                                tgt_name = get_name_for_pc(target_pc24)
+                                if tgt_name is not None:
+                                    sib_suffix = _variant_suffix(key.m, key.x)
+                                    register_call_demand(target_pc24,
+                                                          key.m, key.x)
+                                    tgt_bank = (target_pc24 >> 16) & 0xFF
+                                    # JML changes PB on real hardware
+                                    # (the destination bank byte becomes
+                                    # the new PB). A same-bank tail-call
+                                    # past end: doesn't need this — BRA
+                                    # / BRL / JMP-abs leave PB
+                                    # unchanged. For cross-bank we MUST
+                                    # set cpu->PB so the callee's PB-
+                                    # relative addressing (PC-rel
+                                    # branches, K-byte reads) computes
+                                    # against the right bank. We do NOT
+                                    # save/restore: this is a tail-call,
+                                    # the callee's RTL returns out to
+                                    # the caller's caller (just like the
+                                    # asm did) — that caller's JSL
+                                    # wrapper restores PB itself.
+                                    lines.append(
+                                        f"cpu->PB = 0x{tgt_bank:02X}; /* JML "
+                                        f"into bank ${tgt_bank:02X} */"
+                                    )
+                                    lines.append(
+                                        f"{{ RecompReturn _tc = "
+                                        f"{tgt_name}{sib_suffix}(cpu); "
+                                        f"RecompStackPop(); return _tc; }}"
+                                        f"  /* tail-call cross-bank into "
+                                        f"{tgt_name}{sib_suffix} at "
+                                        f"${target_pc24:06X} (JML "
+                                        f"unresolved successor) */"
+                                    )
+                                    block_terminated = True
+                                    break  # exit `for op in ir_ops`
+                            # No name resolved — fall back to the trap so
+                            # the runtime captures the unresolved site.
+                            src_pc24 = blk_pc24
+                            tgt_str = (f"0x{target_pc24:06X}"
+                                       if target_pc24 is not None else "0x000000")
+                            lines.append(
+                                f"return cpu_trace_unresolved_goto_trap(cpu, "
+                                f"0x{src_pc24:06X}, {tgt_str}, "
+                                f"\"{func_name}\", \"L_{key.pc & 0xFFFF:04X}_"
+                                f"M{key.m}X{key.x}\");"
+                                f"  /* unresolvable cross-bank goto — "
+                                f"no named function at target */"
+                            )
                         block_terminated = True
                 elif isinstance(op, Return):
                     for ln in emit_op(op):

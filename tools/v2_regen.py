@@ -74,6 +74,8 @@ _STUB_MARKERS = (
     'unresolvable cross-fn goto',            # emit_function unresolved-goto trap
     'cpu_trace_unresolved_goto_trap',        # trap-fn call (any per-bank file)
     'cpu_trace_unresolved_stub_trap',        # trap-fn call (unresolved_stubs_v2.c)
+    'Goto with no successor',                # emit_function cross-bank-goto bail (2026-05-18)
+    'unresolvable cross-bank goto',          # emit_function cross-bank trap fallback (2026-05-18)
 )
 
 
