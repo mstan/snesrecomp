@@ -720,6 +720,21 @@ def main() -> int:
             f"(calls={len(unresolved_calls)}); "
             f"re-emitting"
         )
+        # Refresh the codegen name resolver with the newly-synthesized
+        # entries (e.g. JSR/JSL targets that auto-promote turned into
+        # `bank_BB_AAAA` BankEntries). emit_function's tail-call resolver
+        # consults _NAME_RESOLVER when a jump past end: lands on a known
+        # entry; without this refresh, JMP-targets that the variant
+        # discovery raised as siblings AFTER the initial name_map was
+        # built would fall through to the unresolved-goto trap instead
+        # of emitting a tail-call. (Zelda intro fix follow-up 2026-05-17:
+        # the decoder's sibling-entry rejection turns JMPs into dangling
+        # successors that emit_function MUST resolve to a name.)
+        for bank2, _cfg_path2, cfg2 in parsed:
+            for entry in cfg2.entries:
+                if entry.name:
+                    name_map[(bank2 << 16) | (entry.start & 0xFFFF)] = entry.name
+        set_name_resolver(name_map)
 
     # Final pass: any still-unresolved Call targets after the last emit
     # belong to ROM banks not in the cfg set (e.g. data decoded as code

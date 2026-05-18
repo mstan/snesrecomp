@@ -162,6 +162,32 @@ def take_unresolved_goto_targets() -> set:
     return set()
 
 
+def get_name_for_pc(pc24: int):
+    """Look up the friendly C function name registered for a 24-bit address.
+    Returns None if no cfg/ingester directive named the address.
+
+    Used by emit_function's tail-call resolver: when a goto target lies
+    past the current function's `end:` boundary AND lands on a known
+    function entry in the same bank, emit a tail call to that function
+    rather than the unresolvable-goto trap. The asm idiom (a function
+    falling through into its declared successor sibling) becomes a real
+    C tail call, preserving both the function-boundary semantics the
+    name-map declared AND the asm's fall-through semantic."""
+    return _NAME_RESOLVER.get(pc24 & 0xFFFFFF)
+
+
+def register_call_demand(pc24: int, m: int, x: int) -> None:
+    """Register that some emitted gen code needs a callable
+    `<name><variant_suffix>(cpu)` at the given (pc24, m, x). v2_regen's
+    auto-promote pass diffs this set against the variants actually
+    emitted and clones the cfg entry to cover any missing one.
+
+    Used by emit_function's tail-call resolver — the synthesized tail
+    call to a sibling function at the fall-through-past-end: site must
+    have its (m, x) variant emitted or the C linker will fail."""
+    _UNRESOLVED_CALL_TARGETS.add((pc24 & 0xFFFFFF, m & 1, x & 1))
+
+
 from v2 import widths  # noqa: E402
 from v2 import emitter_helpers  # noqa: E402
 from v2.ir import (  # noqa: E402
@@ -232,10 +258,31 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
     if k == SegKind.DIRECT:
         return ("0x7E", f"(uint16)(cpu->D + {seg.offset:#06x}{idx})")
     if k == SegKind.ABS_BANK:
-        return ("cpu->DB", f"(uint16)({seg.offset:#06x}{idx})")
+        if seg.index is None:
+            return ("cpu->DB", f"(uint16)({seg.offset:#06x})")
+        # Indexed Absolute (ABS_X / ABS_Y): hardware computes a 24-bit
+        # effective address `DB:offset + index`, with the carry from
+        # `offset + index` propagating INTO THE BANK. Truncating to
+        # uint16 (the old emit) silently lost the bank carry — root
+        # cause of the Zelda intro submodule-reset bug 2026-05-17:
+        # `STA $7E2000,X` with X=0xFF10 should land at $7F:1F10, but
+        # the old emit stored at $7E:1F10, clobbering $7E:1F11 which
+        # holds submodule_index. Compute the 24-bit effective inline
+        # and let the C compiler CSE the duplicate sub-expression
+        # between bank_expr and addr_expr.
+        idx_reg = "cpu->X" if seg.index == Reg.X else "cpu->Y"
+        eff24 = (f"(((uint32)cpu->DB << 16) + (uint32){seg.offset:#06x}"
+                 f" + (uint32){idx_reg})")
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.LONG:
         bank = seg.bank if seg.bank is not None else 0
-        return (f"{bank:#04x}", f"(uint16)({seg.offset:#06x}{idx})")
+        if seg.index is None:
+            return (f"{bank:#04x}", f"(uint16)({seg.offset:#06x})")
+        # Indexed Absolute Long (LONG_X / LONG_Y): same bank-carry rule.
+        base24 = (bank << 16) | (seg.offset & 0xFFFF)
+        idx_reg = "cpu->X" if seg.index == Reg.X else "cpu->Y"
+        eff24 = f"((uint32){base24:#08x} + (uint32){idx_reg})"
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.STACK:
         return ("0x00", f"(uint16)(cpu->S + {seg.offset:#06x})")
     if k == SegKind.DP_INDIRECT:

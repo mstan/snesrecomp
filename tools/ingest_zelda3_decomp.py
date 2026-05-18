@@ -1,16 +1,29 @@
 """Harvest function-definition PC comments from the snesrev/zelda3 decomp
-and emit them as `name <pc6> <FunctionName>` cfg lines per bank.
+and emit them as `func <Name> <hex_pc> end:<hex_next>` cfg lines per bank.
 
 The decomp at https://github.com/snesrev/zelda3 annotates every function
 definition with its original SNES PC in a trailing comment, e.g.:
 
     void Interrupt_NMI(uint16 joypad_input) {  // 8080c9
 
-This script extracts those (name, pc) pairs and emits them into the
-per-bank cfg files of a snesrecomp-based project. Cfg `name` lines that
-land in the matching bank are auto-promoted to function entries by the
-v2 cfg loader (`cfg_loader.py:280`), giving static reachability a much
-larger set of seeds to crawl.
+This script extracts those (name, pc) pairs and emits them as v2 cfg
+`func` entries with `end:` boundaries computed from the per-bank
+sorted order — each entry's `end:` is the next entry's PC, so the
+decoder treats the function as ending exactly where the next zelda3
+function begins.
+
+The recompiler handles asm fall-through past an `end:` into the next
+sibling function via the tail-call codegen in emit_function.py — a
+fall-through across the boundary emits `return <Next>_M{m}X{x}(cpu);`
+rather than inlining the next function's body or trapping. That keeps
+both the zelda3 function-boundary semantics AND the asm's literal
+fall-through behaviour. Before that fix, `end:`-driven boundaries
+caused the Intro_Init / Intro_Init_Continue intro-loop bug (2026-05-17)
+because the boundary edge fell into the unresolvable-cross-fn-goto
+trap; previously the ingester emitted `name` aliases instead, which
+let v2 inline the whole sibling chain into the leading function and
+produce its own correctness gaps. The `func`-with-`end:` form is the
+canonical shape.
 
 Idempotent: each cfg file's auto-ingested section is delimited and
 replaced wholesale on every run.
@@ -101,6 +114,13 @@ def emit_per_bank(
         re.escape(INGEST_BEGIN) + r".*?" + re.escape(INGEST_END) + r"\n?",
         flags=re.DOTALL,
     )
+    # Hand-written `func <name> <pc>` lines outside the auto-section
+    # always win — auto-ingested entries at the same PC are skipped to
+    # avoid duplicate C function definitions (the cfg loader appends
+    # both, and emit_bank would synthesize two bodies with the same
+    # name). The regex is intentionally permissive on trailing flags
+    # (end:, tail_call:, exit_mx:, sig:, etc.).
+    func_decl_re = re.compile(r'^\s*func\s+(\S+)\s+([0-9a-fA-F]+)\b')
 
     for bank in sorted(by_bank):
         items = sorted(by_bank[bank])
@@ -114,22 +134,56 @@ def emit_per_bank(
             seen.add(addr)
             dedup.append((addr, name))
 
+        cfg_path = output_dir / f"bank{bank:02x}.cfg"
+        # Pre-read hand-declared func PCs from this bank's cfg (everything
+        # OUTSIDE the auto-ingested section). Auto-emit skips these PCs so
+        # the hand-written entry's attributes (end:, exit_mx, etc.) are
+        # the only declaration the loader sees.
+        hand_pcs: set = set()
+        hand_block = ""
+        if cfg_path.exists():
+            existing = cfg_path.read_text(encoding="utf-8")
+            hand_block = ingest_section_re.sub("", existing)
+            for ln in hand_block.splitlines():
+                m = func_decl_re.match(ln)
+                if not m:
+                    continue
+                try:
+                    hand_pcs.add(int(m.group(2), 16) & 0xFFFF)
+                except ValueError:
+                    pass
+
+        # Drop auto entries whose PC was already declared by hand. Keep
+        # the surviving list; recompute `end:` boundaries on it so the
+        # next sibling is the next auto-emitted entry — gaps where a
+        # hand-declared func sits are bridged correctly because the
+        # auto entry above the gap will end: at the next auto PC past
+        # the hand-declared region, and the decoder will stop on the
+        # natural terminator of the hand-declared function's body.
+        filtered = [(addr, name) for (addr, name) in dedup
+                    if addr not in hand_pcs]
+
         section_lines = [
             INGEST_BEGIN,
             "# Source: zelda3 decomp PC comments.",
             "# Regenerate via: python tools/ingest_zelda3_decomp.py",
-            f"# {len(dedup)} entries.",
+            f"# {len(filtered)} entries "
+            f"({len(dedup) - len(filtered)} suppressed by hand-declared func).",
         ]
-        for addr, name in dedup:
-            section_lines.append(f"name {bank:02x}{addr:04x} {name}")
+        # Emit `func` entries with end: = next entry's PC. The last
+        # entry in the bank caps at 0x10000 — there's no next sibling,
+        # and the decoder will stop on RTS/RTL/RTI like a normal function.
+        # Fall-through past `end:` into the next entry routes through the
+        # tail-call codegen in emit_function.py.
+        for i, (addr, name) in enumerate(filtered):
+            next_addr = filtered[i + 1][0] if i + 1 < len(filtered) else 0x10000
+            section_lines.append(
+                f"func {name} {addr:04x} end:{next_addr:04x}")
         section_lines.append(INGEST_END)
         new_section = "\n".join(section_lines) + "\n"
 
-        cfg_path = output_dir / f"bank{bank:02x}.cfg"
         if cfg_path.exists():
-            existing = cfg_path.read_text(encoding="utf-8")
-            existing = ingest_section_re.sub("", existing)
-            existing = existing.rstrip() + "\n\n"
+            existing = hand_block.rstrip() + "\n\n"
             new_content = existing + new_section
         else:
             # NOTE: cfg loader parses `bank = NN` via _parse_hex, so emit
@@ -143,10 +197,12 @@ def emit_per_bank(
             )
 
         if dry_run:
-            print(f"[dry-run] {cfg_path}: {len(dedup)} entries")
+            print(f"[dry-run] {cfg_path}: {len(filtered)} entries "
+                  f"({len(dedup) - len(filtered)} suppressed)")
         else:
             cfg_path.write_text(new_content, encoding="utf-8")
-            print(f"wrote {cfg_path}: {len(dedup)} entries")
+            print(f"wrote {cfg_path}: {len(filtered)} entries "
+                  f"({len(dedup) - len(filtered)} suppressed by hand-declared)")
 
 
 def main() -> int:

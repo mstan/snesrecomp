@@ -72,7 +72,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                   exclude_ranges: Optional[List[Tuple[int, int]]] = None,
                   tail_call_pc16: Optional[int] = None,
                   tail_call_target_name: Optional[str] = None,
-                  callee_exit_mx=None) -> str:
+                  callee_exit_mx=None,
+                  sibling_entry_pcs: Optional[set] = None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
     Pipeline:
@@ -88,7 +89,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                             indirect_call_tables=indirect_call_tables,
                             indirect_dispatch=indirect_dispatch,
                             data_regions=data_regions,
-                            callee_exit_mx=callee_exit_mx)
+                            callee_exit_mx=callee_exit_mx,
+                            sibling_entry_pcs=sibling_entry_pcs)
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:
@@ -504,12 +506,63 @@ def emit_function(rom: bytes, bank: int, start: int,
                 and tail_call_target_name is not None
                 and (target.pc & 0xFFFF) == (tail_call_pc16 & 0xFFFF)):
             sib_suffix = _variant_suffix(target.m, target.x)
+            # Register cross-variant Call demand so v2_regen's auto-
+            # promote synthesizes the (m, x) body when it differs from
+            # the sibling's cfg-declared default. Without this, the
+            # C linker fails with "unresolved external _M{m}X{x}" when
+            # the boundary's (m, x) doesn't match the cfg-default of
+            # the sibling — exactly what tripped the zelda3 cross-
+            # variant externals (NMI_RunTileMapUpdateDMA_M0X1,
+            # SpotlightInternal_M1X0, etc.) on the 2026-05-17
+            # tail-call-past-end class fix.
+            from v2.codegen import register_call_demand
+            tail_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
+            register_call_demand(tail_pc24, target.m, target.x)
             return (
                 f"{prefix}{{ "
                 f"RecompReturn _tc = {tail_call_target_name}{sib_suffix}(cpu); "
+                f"RecompStackPop(); "
                 f"return _tc; "
                 f"}}  /* tail_call into sibling fn at ${target.pc & 0xFFFF:04X} "
                 f"(cfg tail_call: directive) */"
+            )
+
+        # Tail-call past `end:` boundary into a declared sibling
+        # function. 2026-05-17 class fix for the inline-cross-fn-blocks
+        # gap: zelda3 (and SMW's adjacent-entrypoint idiom) has functions
+        # that fall through directly into the next sibling function with
+        # no RTS — the asm is balanced end-to-end, but the C boundary the
+        # cfg/ingester drew has to be honoured. Without this case the
+        # decoder would either (a) inline the whole sibling body and any
+        # transitive fall-throughs into the current C function (the bug
+        # behind the Zelda intro-loop submodule reset 2026-05-17), or
+        # (b) emit cpu_trace_unresolved_goto_trap.
+        #
+        # Detection: the goto target's 24-bit PC resolves to a known
+        # function entry in _NAME_RESOLVER (populated by v2_regen from
+        # every `func` + `name` declaration across all bank cfgs). Same-
+        # bank emits a direct call; cross-bank would also work but
+        # cross-bank gotos don't reach this code path (they're emitted
+        # via Call/JML machinery upstream).
+        #
+        # Variant: tail-call to the (m, x) of the target DecodeKey — the
+        # decode state at the boundary. register_call_demand records the
+        # demand so v2_regen's auto-promote synthesizes the variant if
+        # it isn't already in cfg.
+        target_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
+        src_pc24 = source_pc24 if source_pc24 is not None else 0
+        from v2.codegen import get_name_for_pc, register_call_demand
+        sibling_name = get_name_for_pc(target_pc24)
+        if sibling_name is not None:
+            sib_suffix = _variant_suffix(target.m, target.x)
+            register_call_demand(target_pc24, target.m, target.x)
+            return (
+                f"{prefix}{{ "
+                f"RecompReturn _tc = {sibling_name}{sib_suffix}(cpu); "
+                f"RecompStackPop(); "
+                f"return _tc; "
+                f"}}  /* tail-call past end: into {sibling_name}{sib_suffix} "
+                f"at ${target.pc & 0xFFFF:04X} */"
             )
 
         # Unresolvable cross-function jump.
@@ -538,8 +591,6 @@ def emit_function(rom: bytes, bank: int, start: int,
         # happen to share source PCs. The trap returns NORMAL after
         # capture (Release path) or aborts (Oracle/debug); see
         # runner/src/cpu_trace.c.
-        src_pc24 = source_pc24 if source_pc24 is not None else 0
-        target_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
         return (
             f"{prefix}return cpu_trace_unresolved_goto_trap(cpu, "
             f"0x{src_pc24:06X}, 0x{target_pc24:06X}, "

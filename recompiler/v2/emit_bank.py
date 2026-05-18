@@ -111,6 +111,17 @@ def emit_bank(rom: bytes, bank: int,
         b = e.name or _default_func_name_local(bank, e.start)
         by_start[e.start & 0xFFFF] = b
 
+    # Set of named function entry PCs in THIS bank — passed to the
+    # decoder so a cross-end: JUMP that lands on a sibling entry is
+    # NOT inline-imported. Without this gate, the decoder pulls the
+    # sibling's entire body into the source function's CFG; that's
+    # what produced the Zelda intro-loop oscillation (Intro_Init_
+    # Continue's BCS to Intro_InitializeMemory_darken inlined darken
+    # into Intro_Init_Continue and ran darken's submodule_index++ on
+    # the wrong dispatch path). Each entry sees the set minus its own
+    # start so back-edges to self stay local.
+    all_entry_pcs = {e.start & 0xFFFF for e in entries}
+
     for entry in entries:
         tail_call_target_name = None
         if entry.tail_call_pc16 is not None:
@@ -123,6 +134,7 @@ def emit_bank(rom: bytes, bank: int,
                     f"Add the sibling as its own `func` line."
                 )
             tail_call_target_name = by_start[tgt]
+        sibling_pcs = all_entry_pcs - {entry.start & 0xFFFF}
         src = emit_function(
             rom=rom,
             bank=bank,
@@ -144,6 +156,7 @@ def emit_bank(rom: bytes, bank: int,
             tail_call_pc16=entry.tail_call_pc16,
             tail_call_target_name=tail_call_target_name,
             callee_exit_mx=callee_exit_mx,
+            sibling_entry_pcs=sibling_pcs,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

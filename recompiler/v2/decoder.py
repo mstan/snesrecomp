@@ -914,6 +914,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     indirect_dispatch: Optional[Dict[int, dict]] = None,
                     data_regions: Optional[List[Tuple[int, int, int]]] = None,
                     callee_exit_mx: Optional[Dict] = None,
+                    sibling_entry_pcs: Optional[set] = None,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
 
@@ -942,6 +943,22 @@ def decode_function(rom: bytes, bank: int, start: int,
     graph.suppressed_indirect_calls for the build report. See the
     cfg-required-dispatch-or-kill rule documented on
     SuppressedIndirectCall.
+
+    `sibling_entry_pcs`: optional set of 16-bit PCs in THIS bank that
+    are named function entries OTHER than `start`. When a `jump` edge
+    crosses end: and lands on a sibling entry, the decoder refuses the
+    inline-import — the boundary becomes a tail-call handled by
+    emit_function's `_goto_or_return`. Without this gate, the inline-
+    cross-fn-blocks model would import the sibling's entire body into
+    THIS function's CFG (the Zelda intro-loop root cause 2026-05-17:
+    Intro_Init_Continue's BCS to Intro_InitializeMemory_darken at
+    $0C:C1F5 inlined darken into Intro_Init_Continue's body, so darken's
+    `submodule_index++` ran on a wrong path and submodule oscillated
+    0→1→2→0 instead of progressing).
+
+    The PHB/PLB-balanced cross-fn-jump case is preserved because those
+    targets are NOT named function entries — the inline-import path
+    still applies. Only cfg-named entries get the tail-call routing.
     """
     entry_m &= 1
     entry_x &= 1
@@ -984,6 +1001,25 @@ def decode_function(rom: bytes, bank: int, start: int,
                 and edge_kind == 'fall'
                 and pred_pc >= 0
                 and pred_pc < end):
+            continue
+        # Boundary-crossing JUMP that lands on a named sibling function
+        # entry: refuse the inline-import. emit_function's
+        # `_goto_or_return` then emits a tail-call to the sibling
+        # (recompiler-level fix 2026-05-17). Without this, the inline-
+        # cross-fn-blocks model would pull the sibling's entire body
+        # into THIS function's CFG — root cause of the Zelda intro
+        # submodule oscillation, because Intro_Init_Continue's BCS to
+        # Intro_InitializeMemory_darken inlined darken into Intro_
+        # Init_Continue, running darken's `submodule_index++` on the
+        # wrong dispatch path. The PHB/PLB-balanced cross-fn-jump case
+        # is unaffected — those targets aren't in `sibling_entry_pcs`.
+        if (sibling_entry_pcs is not None
+                and end is not None
+                and pc >= end
+                and edge_kind == 'jump'
+                and pred_pc >= 0
+                and pred_pc < end
+                and pc in sibling_entry_pcs):
             continue
         if not (0x8000 <= pc <= 0xFFFF):
             # Out-of-bank reference; surface upstream by skipping here.
@@ -1036,7 +1072,25 @@ def decode_function(rom: bytes, bank: int, start: int,
                         entries.append(0)
                         tbl_pc += entry_size
                         continue
-                    if addr16 < 0x8000 or eb != bank:
+                    # Long-format dispatch tables can target ANY bank —
+                    # the whole point of 24-bit entries is cross-bank
+                    # dispatch. The earlier `eb != bank` reject was too
+                    # strict; it truncated zelda3's Intro_Init_Continue
+                    # dispatch table at 8 entries instead of 11
+                    # (Intro_LoadTextPointersAndPalettes at $02:8116,
+                    # LoadItemGFXIntoWRAM4BPPBuffer at $00:D231,
+                    # LoadFollowerGraphics at $00:D423 all rejected).
+                    # The intro pipeline would skip these init handlers
+                    # — root cause of the Nintendo-jingle endless-loop
+                    # (subsubmodule 8/9/10 dispatched to nothing).
+                    # Replacement check: accept any valid LoROM bank
+                    # ($00-$3F or $80-$FF) with addr16 >= 0x8000. The
+                    # `_dispatch_target_is_padding` gate below catches
+                    # genuine table-end junk.
+                    if addr16 < 0x8000:
+                        break
+                    is_valid_lorom_bank = (eb < 0x40) or (eb >= 0x80)
+                    if not is_valid_lorom_bank:
                         break
                     # Validity gate: stop the table if the entry points
                     # into all-FF or all-00 bytes. See
