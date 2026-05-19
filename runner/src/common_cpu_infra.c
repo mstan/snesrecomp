@@ -169,6 +169,19 @@ void WatchdogCheck(void) {
   if (++g_watchdog_counter < 10000) return;
   g_watchdog_counter = 0;
   double elapsed = (double)(clock() - g_frame_start_clock) / CLOCKS_PER_SEC;
+  /* Boot has no watchdog. I_RESET runs once and uploads the SPC
+   * engine + samples through the IPL handshake, which is real-time
+   * paced by the audio thread (the SPC bootROM can only echo bytes
+   * at ~1 MHz). For SMW the upload is ~12 KB and naturally takes
+   * tens of seconds wall time; that's expected, not a hang. After
+   * I_RESET returns the runtime falls into the normal per-frame
+   * cadence (I_NMI + Internal) which completes comfortably under 5 s.
+   *
+   * Detecting "still in boot" via snes_frame_counter == 0 is robust:
+   * the recompiled NMI handler increments snes_frame_counter, and
+   * the very first NMI only fires after I_RESET returns and frame 1
+   * starts. */
+  if (snes_frame_counter == 0) return;
   if (elapsed > 5.0) {
     fprintf(stderr,
       "\n=== WATCHDOG: Frame %d exceeded %.1fs ===\n"

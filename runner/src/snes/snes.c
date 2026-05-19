@@ -92,11 +92,27 @@ static uint64_t s_catchup_calls = 0;
 static uint64_t s_catchup_cycles_total = 0;
 uint64_t g_apu_timer0_total_ticks = 0;
 void snes_catchupApu(Snes* snes) {
+  /* Upper cap is a guard against accumulator runaway after a long
+   * stall; SPC runs at ~1 MHz so 10000 cycles is about 10 ms of real
+   * SPC time per catchup, plenty to absorb any spike. */
   if (snes->apuCatchupCycles > 10000)
     snes->apuCatchupCycles = 10000;
 
+  /* No artificial minimum. Earlier code floored to 1024 SPC cycles
+   * per call, which was needed to brute-force progress while the
+   * g_apu_autoack stub short-circuited polls. With autoack ripped,
+   * the real SPC IPL handshake must run at hardware-realistic
+   * timing: ~3.5 SNES-CPU cycles per SPC cycle, which works out to
+   * ~73 SPC cycles per HW-reg touch (cpu_pace_cycles bumps 256 main
+   * cycles per touch -> 256 * 2/7 is about 73). Flooring to 1024 made each
+   * SMW upload byte take ~3000 SPC cycles instead of ~219, blowing
+   * past the 5-second per-frame watchdog before the ~10 KB SPC
+   * engine could finish uploading. The audio thread separately
+   * cycles the SPC in bulk via RtlRenderAudio (534 samples is about 17 k
+   * cycles per audio callback), so the SPC always gets enough
+   * time even when the CPU is busy elsewhere. */
   int catchupCycles = (int) snes->apuCatchupCycles;
-  if (catchupCycles < 1024) catchupCycles = 1024;
+  if (catchupCycles < 0) catchupCycles = 0;
 
   for(int i = 0; i < catchupCycles; i++) {
     apu_cycle(snes->apu);
@@ -401,5 +417,4 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
   // write to cart
   cart_write(snes->cart, bank, adr, val);
 }
-
 

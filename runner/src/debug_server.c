@@ -57,6 +57,8 @@ extern Snes *g_snes;
 // APU pacing counter; defined in common_rtl.c.
 extern uint64_t g_main_cpu_cycles_estimate;
 extern uint8 g_ram[0x20000];
+extern uint8 *g_sram;
+extern int g_sram_size;
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 
 // Note: g_snes->ram == g_ram (same pointer, see snes_init). The dual-WRAM
@@ -1612,6 +1614,30 @@ static void cmd_dump_ram(const char *args) {
         int pos = 0;
         for (; i < len && pos < 4000; i++)
             pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x", s_ram[addr + i]);
+        send(s_client_sock, chunk, pos, 0);
+    }
+    send(s_client_sock, "\"}\n", 3, 0);
+}
+
+static void cmd_read_sram(const char *args) {
+    unsigned int addr = 0, len = 16;
+    sscanf(args, "%x %u", &addr, &len);
+    if (len > 0x20000) len = 0x20000;
+    if (!g_sram || addr + len > (unsigned int)g_sram_size) {
+        send_fmt("{\"error\":\"out of range\",\"addr\":\"0x%x\",\"max\":\"0x%x\"}",
+                 addr, g_sram_size);
+        return;
+    }
+    if (s_client_sock == SOCKET_INVALID) return;
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "{\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"", addr, len);
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%s%02x",
+                            (i == 0) ? "" : " ", g_sram[addr + i]);
         send(s_client_sock, chunk, pos, 0);
     }
     send(s_client_sock, "\"}\n", 3, 0);
@@ -4170,24 +4196,6 @@ static void cmd_get_frame_range_extended(const char *args) {
     send_line(buf);
 }
 
-/* Persistent BBAA injection: every 16-bit read of $2140 returns
- * $BBAA when set. Helps isolate whether boot is hung on engine-not-
- * writing vs host-poll-broken. */
-extern int g_force_apu_bbaa;
-extern int g_apu_autoack;
-static void cmd_force_apu_bbaa(const char *args) {
-    int v = 1;
-    sscanf(args ? args : "", "%d", &v);
-    g_force_apu_bbaa = v;
-    send_fmt("{\"ok\":true,\"force\":%d}", g_force_apu_bbaa);
-}
-static void cmd_apu_autoack(const char *args) {
-    int v = 1;
-    sscanf(args ? args : "", "%d", &v);
-    g_apu_autoack = v;
-    send_fmt("{\"ok\":true,\"autoack\":%d}", g_apu_autoack);
-}
-
 /* v2 trace ring access via debug-server. */
 static void cmd_trace_dump(const char *args) {
     int n = 256;
@@ -5547,7 +5555,7 @@ static void cmd_block_watch_get(const char *args) {
 #if SNESRECOMP_TRACE
     int slot_filter = -1;
     if (args && *args) sscanf(args, "%d", &slot_filter);
-    static char buf[1 << 17];   /* 128KB */
+    static char buf[1 << 20];   /* 1MB */
     int pos = snprintf(buf, sizeof(buf), "{\"slots\":[");
     int emitted = 0;
     for (int i = 0; i < BLOCK_WATCH_MAX; i++) {
@@ -5740,8 +5748,6 @@ static const CmdEntry s_commands[] = {
     {"ping",          cmd_ping},
     {"post_mortem_dump", cmd_post_mortem_dump},
     {"get_v2_cpu",    cmd_get_v2_cpu},
-    {"force_apu_bbaa", cmd_force_apu_bbaa},
-    {"apu_autoack",    cmd_apu_autoack},
     {"trace_dump",     cmd_trace_dump},
     {"trace_dbpb",     cmd_trace_dbpb},
     {"trace_clear",    cmd_trace_clear},
@@ -5796,6 +5802,7 @@ static const CmdEntry s_commands[] = {
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
+    {"read_sram",     cmd_read_sram},
     {"call_stack",    cmd_call_stack},
     {"watch",         cmd_watch},
     {"unwatch",       cmd_unwatch},

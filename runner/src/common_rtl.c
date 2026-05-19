@@ -13,16 +13,6 @@
 #include "debug_server.h"
 
 uint8 g_ram[0x20000];
-/* Diag flag — set via debug_server `force_apu_bbaa <0|1>` cmd. When 1,
- * every 16-bit read of $2140 returns $BBAA. Useful for proving the
- * host-side compare logic is correct. */
-int g_force_apu_bbaa = 0;
-/* Brutal hack: when 1, ALL APU port reads return a value derived from
- * the v2 CpuState's A register so polls always succeed. Lets us see
- * how much of the rest of the recompiled boot path works when the SPC
- * handshake is short-circuited. TEMP default-on for visual boot test —
- * remove once real SPC engine handshake works. */
-int g_apu_autoack = 1;
 uint8 *g_sram;
 int g_sram_size;
 const uint8 *g_rom;
@@ -173,7 +163,10 @@ bool Unreachable(void) {
 }
 
 uint8 *RomPtr(uint32_t addr) {
-  if (!(addr & 0x8000) || addr >= 0x7e0000) {
+  uint8_t bank = (uint8_t)(addr >> 16);
+  uint16_t lo = (uint16_t)addr;
+  bool lorom_rom_window = (lo >= 0x8000) || ((bank & 0x7f) >= 0x40);
+  if (bank == 0x7e || bank == 0x7f || !lorom_rom_window) {
     if (!g_fail) g_fail = true;
     /* No printf — the ring buffer + cpu_trace_offrails is the
      * channel for backwards investigation. printf'ing every bad
@@ -232,16 +225,7 @@ uint8 ReadReg(uint16 reg) {
   if (reg >= 0x2100 && reg < 0x2140) {
     return ppu_read(g_ppu, reg & 0xff);
   } else if (reg >= 0x2140 && reg < 0x2180) {
-    if (g_apu_autoack) {
-      /* Auto-ack: return v2 CpuState's current A low byte for $2140
-       * (which is what L_80D3 / L_80AA / L_809A wait for), and BB/AA
-       * for $2141 to keep the BBAA poll satisfied. */
-      extern struct CpuState g_cpu;
-      if (reg == 0x2140) return (uint8)(g_cpu.A & 0xFF);
-      if (reg == 0x2141) return 0xBB;
-      return 0;
-    }
-    // APU read — need emulator for this since APU is emulated
+    // APU read — route through emulator (real SPC700 outPorts).
     return snes_read(g_snes, reg);
   } else if (reg == 0x2180) {
     return snes_readBBus(g_snes, reg & 0xff);
@@ -273,23 +257,12 @@ uint16 ReadRegWord(uint16 reg) {
     void RtlApuLock(void); void RtlApuUnlock(void);
     void snes_catchupApu(Snes* snes);
     extern Snes *g_snes;
-    extern int g_force_apu_bbaa;
-    extern int g_apu_autoack;
-    extern struct CpuState g_cpu;
-    if (g_apu_autoack && reg == 0x2140) {
-      /* Auto-ack 16-bit: return $BBAA always for the BBAA poll. */
-      return 0xBBAA;
-    }
     RtlApuLock();
     rtl_accumulate_apu_catchup();
     snes_catchupApu(g_snes);
     uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
     uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
     RtlApuUnlock();
-    if (g_force_apu_bbaa && reg == 0x2140) {
-      lo = 0xAA;
-      hi = 0xBB;
-    }
     return (uint16_t)lo | ((uint16_t)hi << 8);
   }
   uint16_t rv = ReadReg(reg);
@@ -346,7 +319,7 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 void rtl_accumulate_apu_catchup(void) {
   uint64_t delta = g_main_cpu_cycles_estimate - g_apu_last_sync_cycles;
   g_apu_last_sync_cycles = g_main_cpu_cycles_estimate;
-  // 2/7 ≈ 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
+  // 2/7 is about 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
   // (back-to-back APU touches with no block hooks between them) just don't
   // advance APU on this pass; cycles accumulate for the next touch.
   g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
@@ -355,7 +328,7 @@ void rtl_accumulate_apu_catchup(void) {
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
   // Catch the APU up to the current cycle and write the port value
-  // directly. Serialise with the audio thread via RtlApuLock — it
+  // directly. Serialise with the audio thread via RtlApuLock -- it
   // holds the same lock while cycling the APU in RtlRenderAudio.
   RtlApuLock();
   rtl_accumulate_apu_catchup();
@@ -364,15 +337,118 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   RtlApuUnlock();
 }
 
+static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_result) {
+  uint16_t dp = cpu->D;
+  uint16_t data_lo = (uint16_t)g_ram[(dp + 0) & 0xffff]
+                   | ((uint16_t)g_ram[(dp + 1) & 0xffff] << 8);
+  uint8_t data_bank = g_ram[(dp + 2) & 0xffff];
+  const uint8_t *p = RomPtr(((uint32_t)data_bank << 16) | data_lo);
+  uint16_t final_pc = 0;
+  int block_count = 0;
+
+  RtlApuLock();
+  for (;;) {
+    uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    uint16_t target = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+    p += 4;
+    if (n == 0) {
+      final_pc = target;
+      break;
+    }
+    for (uint16_t i = 0; i < n; i++)
+      g_snes->apu->ram[(uint16_t)(target + i)] = p[i];
+    p += n;
+    if (++block_count > 512) {
+      RtlApuUnlock();
+      fprintf(stderr, "[apu] bad SPC upload stream at %02X:%04X\n",
+              data_bank, data_lo);
+      return false;
+    }
+  }
+
+  /* First-upload vs subsequent-upload semantics differ. The very first
+   * upload from CPU after reset goes through the SNES SPC IPL bootROM,
+   * which ends with `JMP [$0000+X]` — i.e. the IPL jumps to the entry
+   * address provided in the terminator's target field. After that
+   * first upload, the IPL is mapped out (romReadable=false) and the
+   * loaded SPC engine handles all subsequent CPU upload requests via
+   * its own routine (SMW's StandardTransfer at SPC $12F2). That
+   * routine just RETs at the end — it does NOT jump to any entry
+   * point. The terminator's target field is benign on subsequent
+   * uploads.
+   *
+   * If we unconditionally re-jumped SPC PC to the terminator entry,
+   * every music-bank upload would restart APU_Start, zero-clearing
+   * the engine's music state ($00-$E7 + ARAM_0386-9) and the
+   * just-uploaded music data would never start playing. SFX would
+   * still work since they're triggered by inPort writes processed
+   * after the restart's re-init, but song state would never persist.
+   *
+   * Detect "first upload" via apu->romReadable: it's reset to true by
+   * apu_reset() and only flipped false here, so on the IPL-phase
+   * upload it's still true. */
+  bool ipl_phase = g_snes->apu->romReadable;
+  memset(g_snes->apu->inPorts, 0, sizeof(g_snes->apu->inPorts));
+  memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
+  if (ipl_phase) {
+    g_snes->apu->romReadable = false;
+    g_snes->apuCatchupCycles = 0;
+    g_snes->apu->cpuCyclesLeft = 0;
+    if (final_pc != 0) {
+      g_snes->apu->spc->a = 0;
+      g_snes->apu->spc->x = 0;
+      g_snes->apu->spc->y = 0;
+      if (g_snes->apu->spc->sp == 0)
+        g_snes->apu->spc->sp = 0xef;
+      g_snes->apu->spc->pc = final_pc;
+    }
+  }
+  g_apu_last_sync_cycles = g_main_cpu_cycles_estimate;
+  RtlApuUnlock();
+
+  if (update_cpu_result) {
+    cpu->A = (uint16_t)(cpu->A & 0xff00);
+    cpu->X = 0;
+    cpu->Y = 0;
+    cpu->_flag_Z = 1;
+    cpu->_flag_N = 0;
+    cpu->P = (uint8_t)((cpu->P & ~0x82) | 0x02);
+  }
+  return true;
+}
+
+bool RtlUploadSpcImageFromDp(CpuState *cpu) {
+  return RtlUploadSpcImageFromDpInternal(cpu, false);
+}
+
+bool RtlHandleSpcUpload(CpuState *cpu) {
+  return RtlUploadSpcImageFromDpInternal(cpu, true);
+}
+
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   assert(channels == 2);
+  /* Cycle the APU in small batches under the lock, releasing between
+   * each so the CPU thread (RtlApuWrite / snes_readBBus) can make
+   * progress. Earlier code held RtlApuLock for the entire 17 000-cycle
+   * loop, which took ~4 ms host time per audio callback. With audio
+   * callbacks at ~60 Hz that pinned the CPU thread out of the lock for
+   * ~27 % of wall time, and the SMW IPL upload (which touches APU
+   * ports thousands of times) ran an order of magnitude slower than
+   * the watchdog allowed.
+   *
+   * 256 SPC cycles per batch is about 64 us host work per acquire, short
+   * enough that the CPU thread's RtlApuLock call almost never has to
+   * wait through a full audio batch. apu_cycle is single-threaded
+   * regardless -- the lock just serialises access to inPorts/outPorts
+   * shared with the CPU thread. */
+  while (g_snes->apu->dsp->sampleOffset < 534) {
+    RtlApuLock();
+    int batch = 256;
+    while (batch-- > 0 && g_snes->apu->dsp->sampleOffset < 534)
+      apu_cycle(g_snes->apu);
+    RtlApuUnlock();
+  }
   RtlApuLock();
-  // Cycle the APU to fill the DSP sample buffer, then drain samples.
-  // RtlApuLock is held throughout — matches the lock acquired by
-  // RtlApuWrite / snes_readBBus on the CPU thread so both threads
-  // agree on APU state.
-  while (g_snes->apu->dsp->sampleOffset < 534)
-    apu_cycle(g_snes->apu);
   dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
   RtlApuUnlock();
 }

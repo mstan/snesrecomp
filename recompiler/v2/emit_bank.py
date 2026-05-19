@@ -67,12 +67,15 @@ def emit_bank(rom: bytes, bank: int,
               file_header: Optional[str] = None,
               dispatch_helpers=None,
               indirect_call_tables=None,
+              indirect_dispatch=None,
               suppressed_collector=None,
               const_z_fold_collector=None,
               dispatch_target_suppressed_collector=None,
+              unresolved_indirect_collector=None,
               data_regions=None,
               exclude_ranges: Optional[List[Tuple[int, int]]] = None,
-              callee_exit_mx=None) -> str:
+              callee_exit_mx=None,
+              hle_spc_upload=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -109,6 +112,17 @@ def emit_bank(rom: bytes, bank: int,
         b = e.name or _default_func_name_local(bank, e.start)
         by_start[e.start & 0xFFFF] = b
 
+    # Set of named function entry PCs in THIS bank — passed to the
+    # decoder so a cross-end: JUMP that lands on a sibling entry is
+    # NOT inline-imported. Without this gate, the decoder pulls the
+    # sibling's entire body into the source function's CFG; that's
+    # what produced the Zelda intro-loop oscillation (Intro_Init_
+    # Continue's BCS to Intro_InitializeMemory_darken inlined darken
+    # into Intro_Init_Continue and ran darken's submodule_index++ on
+    # the wrong dispatch path). Each entry sees the set minus its own
+    # start so back-edges to self stay local.
+    all_entry_pcs = {e.start & 0xFFFF for e in entries}
+
     for entry in entries:
         tail_call_target_name = None
         if entry.tail_call_pc16 is not None:
@@ -121,6 +135,7 @@ def emit_bank(rom: bytes, bank: int,
                     f"Add the sibling as its own `func` line."
                 )
             tail_call_target_name = by_start[tgt]
+        sibling_pcs = all_entry_pcs - {entry.start & 0xFFFF}
         src = emit_function(
             rom=rom,
             bank=bank,
@@ -131,15 +146,19 @@ def emit_bank(rom: bytes, bank: int,
             func_name=entry.name,
             dispatch_helpers=dispatch_helpers,
             indirect_call_tables=indirect_call_tables,
+            indirect_dispatch=indirect_dispatch,
             suppressed_collector=suppressed_collector,
             const_z_fold_collector=const_z_fold_collector,
             dispatch_target_suppressed_collector=
                 dispatch_target_suppressed_collector,
+            unresolved_indirect_collector=unresolved_indirect_collector,
             data_regions=data_regions,
             exclude_ranges=exclude_ranges,
             tail_call_pc16=entry.tail_call_pc16,
             tail_call_target_name=tail_call_target_name,
             callee_exit_mx=callee_exit_mx,
+            sibling_entry_pcs=sibling_pcs,
+            hle_spc_upload=hle_spc_upload,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

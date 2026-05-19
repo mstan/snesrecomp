@@ -162,6 +162,32 @@ def take_unresolved_goto_targets() -> set:
     return set()
 
 
+def get_name_for_pc(pc24: int):
+    """Look up the friendly C function name registered for a 24-bit address.
+    Returns None if no cfg/ingester directive named the address.
+
+    Used by emit_function's tail-call resolver: when a goto target lies
+    past the current function's `end:` boundary AND lands on a known
+    function entry in the same bank, emit a tail call to that function
+    rather than the unresolvable-goto trap. The asm idiom (a function
+    falling through into its declared successor sibling) becomes a real
+    C tail call, preserving both the function-boundary semantics the
+    name-map declared AND the asm's fall-through semantic."""
+    return _NAME_RESOLVER.get(pc24 & 0xFFFFFF)
+
+
+def register_call_demand(pc24: int, m: int, x: int) -> None:
+    """Register that some emitted gen code needs a callable
+    `<name><variant_suffix>(cpu)` at the given (pc24, m, x). v2_regen's
+    auto-promote pass diffs this set against the variants actually
+    emitted and clones the cfg entry to cover any missing one.
+
+    Used by emit_function's tail-call resolver — the synthesized tail
+    call to a sibling function at the fall-through-past-end: site must
+    have its (m, x) variant emitted or the C linker will fail."""
+    _UNRESOLVED_CALL_TARGETS.add((pc24 & 0xFFFFFF, m & 1, x & 1))
+
+
 from v2 import widths  # noqa: E402
 from v2 import emitter_helpers  # noqa: E402
 from v2.ir import (  # noqa: E402
@@ -232,10 +258,31 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
     if k == SegKind.DIRECT:
         return ("0x7E", f"(uint16)(cpu->D + {seg.offset:#06x}{idx})")
     if k == SegKind.ABS_BANK:
-        return ("cpu->DB", f"(uint16)({seg.offset:#06x}{idx})")
+        if seg.index is None:
+            return ("cpu->DB", f"(uint16)({seg.offset:#06x})")
+        # Indexed Absolute (ABS_X / ABS_Y): hardware computes a 24-bit
+        # effective address `DB:offset + index`, with the carry from
+        # `offset + index` propagating INTO THE BANK. Truncating to
+        # uint16 (the old emit) silently lost the bank carry — root
+        # cause of the Zelda intro submodule-reset bug 2026-05-17:
+        # `STA $7E2000,X` with X=0xFF10 should land at $7F:1F10, but
+        # the old emit stored at $7E:1F10, clobbering $7E:1F11 which
+        # holds submodule_index. Compute the 24-bit effective inline
+        # and let the C compiler CSE the duplicate sub-expression
+        # between bank_expr and addr_expr.
+        idx_reg = "cpu->X" if seg.index == Reg.X else "cpu->Y"
+        eff24 = (f"(((uint32)cpu->DB << 16) + (uint32){seg.offset:#06x}"
+                 f" + (uint32){idx_reg})")
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.LONG:
         bank = seg.bank if seg.bank is not None else 0
-        return (f"{bank:#04x}", f"(uint16)({seg.offset:#06x}{idx})")
+        if seg.index is None:
+            return (f"{bank:#04x}", f"(uint16)({seg.offset:#06x})")
+        # Indexed Absolute Long (LONG_X / LONG_Y): same bank-carry rule.
+        base24 = (bank << 16) | (seg.offset & 0xFFFF)
+        idx_reg = "cpu->X" if seg.index == Reg.X else "cpu->Y"
+        eff24 = f"((uint32){base24:#08x} + (uint32){idx_reg})"
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.STACK:
         return ("0x00", f"(uint16)(cpu->S + {seg.offset:#06x})")
     if k == SegKind.DP_INDIRECT:
@@ -882,8 +929,122 @@ def _emit_goto(op: Goto) -> List[str]:
 
 
 def _emit_indirect_goto(op: IndirectGoto) -> List[str]:
+    """Standalone IndirectGoto codegen (no dispatch_entries resolved).
+
+    Used to emit a `/* IndirectGoto: ... */` stub when the decoder
+    couldn't resolve targets — but the no-stub policy means this stub
+    must never reach src/gen/. Callers in emit_function.py route
+    dispatch_entries-resolved sites through `_emit_indirect_dispatch`
+    instead, and v2_regen hard-fails on any unresolved site BEFORE
+    src/gen/ is consumed. This emit stays as a defensive guard so the
+    function signature is preserved.
+    """
     bank, addr = _segref_addr_expr(op.seg)
     return [f"/* IndirectGoto: target = ({bank}, {addr}) — caller dispatches */"]
+
+
+def _emit_indirect_dispatch(insn) -> List[str]:
+    """Emit a real switch for an indirect JMP/JML/JSR whose static
+    target list the decoder recovered (via cfg `indirect_dispatch` or
+    auto-recovery). Switches on the index register declared by the
+    cfg directive (X or Y); each case tail-calls the corresponding
+    handler.
+
+    The dispatching JMP/JML is a TERMINATOR (control transfers to the
+    handler; the handler's own RTL/RTS returns to the dispatcher's
+    caller, not back into the dispatcher). So each case emits a `return
+    <handler>(cpu);` rather than a fall-through-after-call. This
+    matches the asm idiom where `JSR Module_MainRouting` pushes a 16-bit
+    return; Module_MainRouting's `JML [DP]` transfers to the handler;
+    the handler `RTL`s and pops PB+PC — meaning the handler must have
+    been entered via JSL (or the dispatch's `JML` effectively converts
+    a 24-bit-target call into a tail-call from the JSL caller's POV).
+
+    Empty `case 0:` ⇒ null entry (table padding); emits `default: break`-
+    style fall-through that returns NORMAL.
+
+    OOB index ⇒ runtime trap. No silent stub.
+    """
+    bank = (insn.addr >> 16) & 0xFF
+    entries = insn.dispatch_entries
+    idx_reg = getattr(insn, 'dispatch_idx_reg', 'X')
+    if idx_reg not in ('X', 'Y'):
+        idx_reg = 'X'
+    n = len(entries)
+    site_pc24 = insn.addr & 0xFFFFFF
+
+    # Variant suffix for the dispatched handlers: we route to each
+    # handler at its DEFAULT cfg entry (m, x). The handler's own cfg
+    # entry knows what mode it expects; the recomp pipeline mints the
+    # corresponding _MxXy variant. For dispatchers where every entry
+    # is reached in (m=1, x=1) — the SNES asm default — _M1X1 is right.
+    # Per-target variant resolution beyond this needs another cfg
+    # directive (out of scope for this class fix).
+    em, ex = 1, 1
+    suffix = _variant_suffix(em, ex)
+
+    lines = ["{ /* indirect dispatch — cfg-resolved target list */"]
+    # Index source: X or Y register. For JMP/JSR (abs,X)-style dispatch
+    # (table_bases empty — the dispatch consumes the operand directly as
+    # `(table, X)`), the asm shifts the entry index up by the entry size
+    # BEFORE the TAX: 16-bit pointer table = `ASL A; TAX` → X is a byte
+    # offset into the table; 24-bit pointer table = `ASL; ASL; ADC; TAX`
+    # → X is a 3-byte offset. The switch needs the LOGICAL entry index,
+    # so divide the register by the entry size before switching. The DP-
+    # built-pointer form (table_bases non-empty: parallel byte tables
+    # indexed directly) doesn't need the divide — the asm uses the index
+    # register as-is to load one byte per parallel table.
+    idx_field = 'X' if idx_reg == 'X' else 'Y'
+    kind = getattr(insn, 'dispatch_kind', 'short')
+    entry_size = 3 if kind == 'long' else 2
+    table_bases = tuple(getattr(insn, 'dispatch_table_bases', ()) or ())
+    if len(table_bases) >= 2:
+        lines.append(
+            f"  uint16 _idx = (uint16)(cpu->{idx_field} & 0xFFFF);"
+            "  /* parallel byte tables: register already holds logical index */"
+        )
+    else:
+        lines.append(
+            f"  uint16 _idx = (uint16)((cpu->{idx_field} & 0xFFFF) / {entry_size});"
+            f"  /* entry_size={entry_size} ({kind}); ASL[*N] + TAX in asm => "
+            f"{idx_field} is byte offset, divide back to logical index */"
+        )
+    lines.append(f"  static const uint16 _disp_n = {n};")
+    lines.append("  if (_idx >= _disp_n) {")
+    lines.append(
+        f"    return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    lines.append("  }")
+    lines.append("  switch (_idx) {")
+    for i, e in enumerate(entries):
+        if e is None or e == 0:
+            lines.append(f"    case {i}: return RECOMP_RETURN_NORMAL; /* null entry */")
+            continue
+        target_bank = (e >> 16) & 0xFF
+        local_pc = e & 0xFFFF
+        tgt_addr = e & 0xFFFFFF
+        base_name = _NAME_RESOLVER.get(tgt_addr)
+        if base_name is None:
+            base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
+        _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+        name = f"{base_name}{suffix}"
+        # Tail-call: the dispatched handler's return value propagates
+        # straight back to OUR caller. PB save/restore happens around
+        # the call so PHK inside the handler pushes the target bank.
+        env = emitter_helpers.call_with_pb_save(target_bank, name)
+        lines.append(f"    case {i}: {{")
+        for stmt in env:
+            lines.append(f"      {stmt}")
+        # After call_with_pb_save returns (NORMAL path), the dispatcher
+        # itself returns NORMAL: it was a JMP-style terminator. The
+        # SKIP-N propagation is already handled by call_with_pb_save.
+        lines.append("      return RECOMP_RETURN_NORMAL;")
+        lines.append("    }")
+    lines.append("    default: break; /* unreachable: gated above */")
+    lines.append("  }")
+    lines.append(
+        f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    lines.append("}")
+    return lines
 
 
 def _emit_dispatch(insn) -> List[str]:
