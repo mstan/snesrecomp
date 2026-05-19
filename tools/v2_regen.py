@@ -50,6 +50,10 @@ from v2.exit_mx_autoroute import (  # noqa: E402
     detect_and_route as autoroute_exit_mx,
     format_fix_summary as format_exit_mx_summary,
 )
+from v2.pha_rts_autoroute import (  # noqa: E402
+    detect_and_route as autoroute_pha_rts,
+    format_fix_summary as format_pha_rts_summary,
+)
 
 
 _BANK_CFG_RE = re.compile(r'bank([0-9a-fA-F]+)\.cfg$')
@@ -222,6 +226,22 @@ def main() -> int:
     print("Auto-detecting tail-call fallthrough sites...")
     tail_call_fixes = autoroute_tail_calls(parsed, rom)
     print(format_tail_call_summary(tail_call_fixes))
+
+    # Auto-detect PHA-RTS dispatch sites. Pattern (instruction-aligned
+    # inside any decoded function body):
+    #   LDA $abs,Y / DEC A / PHA / SEP #$30 / RTS
+    # The PHA leaves a (handler-1) on the stack; the trailing RTS pops
+    # and adds 1, dispatching into the loaded function pointer. Without
+    # an `indirect_dispatch` directive the recompiler emits the PHA as a
+    # literal stack push, which the next RTS in the caller chain pops
+    # as a bogus return address — DB/PB end up at random banks. Class
+    # fix synthesises the directive for every site the byte pattern
+    # matches inside cfg-declared function bodies. See
+    # `recompiler/v2/pha_rts_autoroute.py`.
+    print()
+    print("Auto-detecting PHA-RTS dispatch sites...")
+    pha_rts_fixes = autoroute_pha_rts(parsed, rom)
+    print(format_pha_rts_summary(pha_rts_fixes))
 
     # Auto-detect dispatch helpers BEFORE exit-(M, X) autoroute. The
     # autoroute decoder needs `dispatch_helpers` to recognise SMW's
