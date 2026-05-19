@@ -102,6 +102,19 @@ class BankCfg:
     # entry as a decode successor (for auto-promote / reachability), and
     # stamps `insn.dispatch_entries` so codegen emits a real switch.
     indirect_dispatch: List[dict] = field(default_factory=list)
+    # `hle_spc_upload <pc>` directives — replace the recompiled body of
+    # the function starting at <pc> with a single call to the runtime
+    # HLE helper RtlUploadSpcImageFromDp. The standard SNES SPC upload
+    # protocol is a length/target/data block stream pointed at by a
+    # 24-bit ROM pointer in direct page ($DP+0..2). The runtime reads
+    # the stream directly into apu->ram and jumps apu->spc->pc to the
+    # terminator's target, bypassing the per-byte IPL handshake (which
+    # only really works under hardware-realistic SPC pacing and pins
+    # the recompiler against the watchdog for many wall seconds).
+    # Per-game: declare the SPC upload entry PC here. Works for SMW
+    # (HandleSPCUploads_Inner / SPC700UploadLoop at $00:8079) and
+    # ALttP (LoadSongBank at $00:8888) — both use the same protocol.
+    hle_spc_upload: List[int] = field(default_factory=list)
 
 
 # Token regex helpers
@@ -165,6 +178,25 @@ def load_bank_cfg(path: str) -> BankCfg:
             # other banks.
             if head == 'auto_vectors':
                 cfg.auto_vectors = True
+                continue
+
+            # hle_spc_upload <hex_pc> — mark the function at <pc> as
+            # the project's SPC upload entry. emit_function replaces
+            # its decoded body with a single RtlUploadSpcImageFromDp
+            # call; the runtime walks the standard length/target/data
+            # block stream pointed to by DP+0..2 and writes directly
+            # into apu->ram. See BankCfg.hle_spc_upload comment.
+            if head == 'hle_spc_upload':
+                if len(tokens) != 2:
+                    raise ValueError(
+                        f"{path}: hle_spc_upload needs exactly one <pc> "
+                        f"argument, got: {stripped!r}")
+                try:
+                    pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: hle_spc_upload bad pc {tokens[1]!r}: {e}")
+                cfg.hle_spc_upload.append(pc16)
                 continue
 
             # indirect_dispatch <site_pc> <count> idx:<X|Y> [tables:<lo>[,<hi>[,<bank>]]]

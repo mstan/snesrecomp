@@ -366,18 +366,42 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
     }
   }
 
+  /* First-upload vs subsequent-upload semantics differ. The very first
+   * upload from CPU after reset goes through the SNES SPC IPL bootROM,
+   * which ends with `JMP [$0000+X]` — i.e. the IPL jumps to the entry
+   * address provided in the terminator's target field. After that
+   * first upload, the IPL is mapped out (romReadable=false) and the
+   * loaded SPC engine handles all subsequent CPU upload requests via
+   * its own routine (SMW's StandardTransfer at SPC $12F2). That
+   * routine just RETs at the end — it does NOT jump to any entry
+   * point. The terminator's target field is benign on subsequent
+   * uploads.
+   *
+   * If we unconditionally re-jumped SPC PC to the terminator entry,
+   * every music-bank upload would restart APU_Start, zero-clearing
+   * the engine's music state ($00-$E7 + ARAM_0386-9) and the
+   * just-uploaded music data would never start playing. SFX would
+   * still work since they're triggered by inPort writes processed
+   * after the restart's re-init, but song state would never persist.
+   *
+   * Detect "first upload" via apu->romReadable: it's reset to true by
+   * apu_reset() and only flipped false here, so on the IPL-phase
+   * upload it's still true. */
+  bool ipl_phase = g_snes->apu->romReadable;
   memset(g_snes->apu->inPorts, 0, sizeof(g_snes->apu->inPorts));
   memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
-  g_snes->apu->romReadable = false;
-  g_snes->apuCatchupCycles = 0;
-  g_snes->apu->cpuCyclesLeft = 0;
-  if (final_pc != 0) {
-    g_snes->apu->spc->a = 0;
-    g_snes->apu->spc->x = 0;
-    g_snes->apu->spc->y = 0;
-    if (g_snes->apu->spc->sp == 0)
-      g_snes->apu->spc->sp = 0xef;
-    g_snes->apu->spc->pc = final_pc;
+  if (ipl_phase) {
+    g_snes->apu->romReadable = false;
+    g_snes->apuCatchupCycles = 0;
+    g_snes->apu->cpuCyclesLeft = 0;
+    if (final_pc != 0) {
+      g_snes->apu->spc->a = 0;
+      g_snes->apu->spc->x = 0;
+      g_snes->apu->spc->y = 0;
+      if (g_snes->apu->spc->sp == 0)
+        g_snes->apu->spc->sp = 0xef;
+      g_snes->apu->spc->pc = final_pc;
+    }
   }
   g_apu_last_sync_cycles = g_main_cpu_cycles_estimate;
   RtlApuUnlock();

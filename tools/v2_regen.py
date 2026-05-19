@@ -689,7 +689,9 @@ def main() -> int:
                                     bank_unresolved_indirects,
                                 data_regions=cfg.data_regions or None,
                                 exclude_ranges=cfg.exclude_ranges or None,
-                                callee_exit_mx=callee_exit_mx)
+                                callee_exit_mx=callee_exit_mx,
+                                hle_spc_upload=getattr(
+                                    cfg, 'hle_spc_upload', None) or None)
                 out_path.write_text(src, encoding='utf-8', newline='\n')
                 all_suppressed.extend(bank_suppressed)
                 all_const_z_folds.extend(bank_const_z_folds)

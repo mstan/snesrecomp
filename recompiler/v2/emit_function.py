@@ -73,7 +73,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                   tail_call_pc16: Optional[int] = None,
                   tail_call_target_name: Optional[str] = None,
                   callee_exit_mx=None,
-                  sibling_entry_pcs: Optional[set] = None) -> str:
+                  sibling_entry_pcs: Optional[set] = None,
+                  hle_spc_upload=None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
     Pipeline:
@@ -84,6 +85,38 @@ def emit_function(rom: bytes, bank: int, start: int,
             emit_op(op)  → C lines
         block-end op → goto / fall-through wiring
     """
+    base_func_name = func_name if func_name is not None else _default_func_name(bank, start)
+    # HLE bypass: if cfg declared this function's PC as the SPC upload
+    # entry (`hle_spc_upload <pc>` in the bank cfg), replace the entire
+    # decoded body with a single RtlUploadSpcImageFromDp call. The
+    # standard SNES SPC upload protocol is a length/target/data block
+    # stream pointed to by a 24-bit ROM pointer in direct page; the
+    # runtime walks it directly and writes into apu->ram. Game-agnostic
+    # — works for any project that uses the standard protocol (verified
+    # on SMW's HandleSPCUploads_Inner $00:8079 and ALttP's LoadSongBank
+    # $00:8888).
+    if hle_spc_upload and (start & 0xFFFF) in set(hle_spc_upload):
+        variant_name = f"{base_func_name}{_variant_suffix(entry_m, entry_x)}"
+        pc24 = ((bank & 0xFF) << 16) | (start & 0xFFFF)
+        return "\n".join([
+            f"RecompReturn {variant_name}(CpuState *cpu) {{",
+            "  extern const char *g_last_recomp_func;",
+            "  extern bool RtlUploadSpcImageFromDp(CpuState *cpu);",
+            f"  g_last_recomp_func = \"{variant_name}\";",
+            f"  RecompStackPush(\"{variant_name}\");",
+            f"  cpu_dbg_funcname(\"{variant_name}\");",
+            f"  cpu_trace_func_entry(cpu, 0x{pc24:06X}, \"{variant_name}\");",
+            f"  cpu_trace_block(cpu, 0x{pc24:06X});",
+            "  WatchdogCheck();",
+            "  if (!RtlUploadSpcImageFromDp(cpu)) {",
+            f"    fprintf(stderr, \"[apu] {base_func_name} HLE upload failed\\n\");",
+            "  }",
+            "  RecompStackPop();",
+            "  return RECOMP_RETURN_NORMAL;",
+            "}",
+            "",
+        ])
+
     graph = decode_function(rom, bank, start, entry_m, entry_x, end=end,
                             dispatch_helpers=dispatch_helpers,
                             indirect_call_tables=indirect_call_tables,
@@ -898,6 +931,17 @@ def emit_function(rom: bytes, bank: int, start: int,
                             f"0x{site_pc24:06x}, 0xFFFF); "
                             f"/* unresolved IndirectGoto — HLE pending */")
                         block_terminated = True
+                elif isinstance(op, PushReg) and getattr(
+                        di_insn, 'dispatch_entries', None):
+                    # RTS-stack dispatch: the decoder marked the PHA
+                    # that would normally push target-1 for a following
+                    # RTS. Emit a switch instead of the literal stack
+                    # push, otherwise the synthesized return address
+                    # leaks onto the simulated SNES stack.
+                    from v2.codegen import _emit_indirect_dispatch
+                    for ln in _emit_indirect_dispatch(di_insn):
+                        lines.append(ln)
+                    block_terminated = True
                 elif isinstance(op, Call):
                     # Dispatch-helper JSL: the decoder marked the insn
                     # with `dispatch_entries`. Two routes:
@@ -906,19 +950,22 @@ def emit_function(rom: bytes, bank: int, start: int,
                     #   (b) JSR (abs,X) authorised by `indirect_dispatch`
                     #       directive — index by X (or Y if cfg said so),
                     #       switch through `_emit_indirect_dispatch`.
-                    # Both are TERMINATORS (the helper / dispatched
-                    # handler doesn't return to the JSL caller).
+                    # JSL ExecutePtr helpers are terminators. JSR
+                    # (abs,X) dispatches are ordinary calls: the selected
+                    # handler RTSes back to the next instruction.
                     insn = di_insn
                     if getattr(insn, 'dispatch_entries', None):
                         if getattr(insn, 'dispatch_idx_reg', None) in ('X', 'Y'):
                             from v2.codegen import _emit_indirect_dispatch
                             for ln in _emit_indirect_dispatch(insn):
                                 lines.append(ln)
+                            if getattr(insn, 'mnem', '') != 'JSR':
+                                block_terminated = True
                         else:
                             from v2.codegen import _emit_dispatch
                             for ln in _emit_dispatch(insn):
                                 lines.append(ln)
-                        block_terminated = True
+                            block_terminated = True
                     else:
                         for ln in emit_op(op):
                             lines.append(ln)

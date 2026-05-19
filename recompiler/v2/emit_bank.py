@@ -74,7 +74,8 @@ def emit_bank(rom: bytes, bank: int,
               unresolved_indirect_collector=None,
               data_regions=None,
               exclude_ranges: Optional[List[Tuple[int, int]]] = None,
-              callee_exit_mx=None) -> str:
+              callee_exit_mx=None,
+              hle_spc_upload=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -157,6 +158,7 @@ def emit_bank(rom: bytes, bank: int,
             tail_call_target_name=tail_call_target_name,
             callee_exit_mx=callee_exit_mx,
             sibling_entry_pcs=sibling_pcs,
+            hle_spc_upload=hle_spc_upload,
         )
         parts.append(src)
         parts.append("")  # blank line between functions
