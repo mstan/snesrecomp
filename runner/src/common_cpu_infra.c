@@ -95,51 +95,10 @@ const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
     return &g_recomp_snap_ring[slot];
 }
 
-/* Stack-imbalance hunt for the Zelda camera bug: snapshot 65816 S at every
- * recomp function entry; on exit, compare and yell if the delta is nonzero.
- * Filtered to the sword-damage chain to keep the log readable. Remove once
- * the recompiler decoder is fixed (see ISSUES.md). */
-#include "cpu_state.h"
-extern CpuState g_cpu;
-static uint16_t s_sbal_stack[256];
-static int      s_sbal_depth = 0;
-static int sbal_in_chain(const char *name) {
-  if (!name) return 0;
-  static const char *const chain[] = {
-    "Sprite_Main_M1X1", "Sprite_4B_GreenKnifeGuard_M1X1",
-    "Recruit_Draw_M1X1", "bank_05_FA50_M1X1", "Sprite_PrepOamCoord_M1X1",
-    "bank_06_E41A_M1X1", "Sprite_PrepOamCoordOrDoubleRet_M1X1",
-    "bank_06_DC54_M1X1", "SpriteDraw_Shadow_M1X1",
-    "bank_05_F94E_M1X1", "bank_05_F971_M1X1",
-    "Sprite_CheckDamageToAndFromLink_M1X1", "bank_06_F2AA_M1X1",
-    "Sprite_CheckDamageFromLink_M1X1", "Player_SetupActionHitBox_M1X1",
-    "Sprite_SetupHitBox_M1X1", "CheckIfHitBoxesOverlap_M1X1",
-    "Sprite_AttemptZapDamage_M1X1", "Sprite_ProjectSpeedTowardsLink_M1X1",
-    "Sprite_IsBelowLink_M1X1", "Sprite_IsRightOfLink_M1X1",
-    "Sprite_CalculateSwordDamage_M1X1", "Sprite_ApplyCalculatedDamage_M1X1",
-    "Sprite_GiveDamage_M1X1", "Sprite_CalculateSfxPan_M1X1",
-    "CalculateSfxPan_M1X1", "bank_06_F121_M1X1",
-    "Sprite_CheckDamageToLink_M1X1", "Sprite_CheckDamageToPlayer_1_M1X1",
-    "bank_05_F9ED_M1X1", "bank_05_F9F4_M1X1", "bank_05_FA00_M1X1",
-    "Sprite_CheckTileCollision_M1X1", "bank_06_E496_M1X1",
-    "Sprite_CheckTileCollision2_M1X1",
-    "Sprite_CheckTileCollisionSingleLayer_M1X1",
-    "Sprite_CheckForTileInDirection_vertical_M1X1",
-    "Sprite_CheckForTileInDirection_horizontal_M1X1",
-    "Sprite_CheckTileInDirection_M1X1", "Sprite_CheckTileProperty_M1X1",
-    "Sprite_GetTileAttribute_M1X1", "GreenKnifeGuard_Moving_M1X1",
-    NULL
-  };
-  for (int i = 0; chain[i]; i++)
-    if (name == chain[i] || strcmp(name, chain[i]) == 0) return 1;
-  return 0;
-}
-
 void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH)
     g_recomp_stack[g_recomp_stack_top++] = name;
   g_last_recomp_func = name;
-  if (s_sbal_depth < 256) s_sbal_stack[s_sbal_depth++] = g_cpu.S;
   debug_server_profile_push(name);
   // Boundary auditor (always-on; no-op when SNESRECOMP_TRACE=0).
   // Recorded AFTER the stack push so stack_depth reflects post-push state.
@@ -181,21 +140,7 @@ void RecompStackPop(void) {
   // the function name is still the topmost entry. Defensive against
   // empty stack: the auditor must NOT consume an entry_seq it didn't push.
   if (g_recomp_stack_top > 0) {
-    const char *exiting = g_recomp_stack[g_recomp_stack_top - 1];
-    boundary_audit_record_exit(exiting);
-    /* Stack-imbalance hunt: if any damage-chain function returns with a
-     * 65816 S that doesn't match its entry-time snapshot, log it. The
-     * culprit's name appears here. Remove once decoder is fixed. */
-    if (s_sbal_depth > 0) {
-      uint16_t S_at_entry = s_sbal_stack[--s_sbal_depth];
-      int16_t delta = (int16_t)(g_cpu.S - S_at_entry);
-      if (delta != 0 && sbal_in_chain(exiting)) {
-        extern int snes_frame_counter;
-        fprintf(stderr, "[sbal] f=%d %s entry_S=%04x exit_S=%04x delta=%+d\n",
-                snes_frame_counter, exiting, S_at_entry, g_cpu.S, delta);
-        fflush(stderr);
-      }
-    }
+    boundary_audit_record_exit(g_recomp_stack[g_recomp_stack_top - 1]);
     g_recomp_stack_top--;
   }
   g_last_recomp_func = g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)";

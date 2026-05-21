@@ -176,14 +176,6 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     if (off >= 0) {
         uint8 old = cpu->ram[off];
         cpu->ram[off] = v;
-        if (((off >= 0xE0 && off <= 0xE9) || off == 0x11 || off == 0x6C || (off >= 0x11A && off <= 0x124) || (off >= 0x420 && off <= 0x428)) && old != v) {
-            extern int snes_frame_counter;
-            extern const char *g_last_recomp_func;
-            fprintf(stderr, "[w8] f=%d off=%05x %02x->%02x bank=%02x addr=%04x D=%04x PC=%02x:???? func=%s\n",
-                snes_frame_counter, off, old, v, bank, addr, cpu->D, cpu->PB,
-                g_last_recomp_func ? g_last_recomp_func : "?");
-            fflush(stderr);
-        }
         cpu_trace_wram_write_check(cpu, bank, addr, off,
                                    (uint16)old, (uint16)v, 1);
         return;
@@ -201,14 +193,6 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
                    | ((uint16)cpu->ram[off + 1] << 8);
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
-        if (((off >= 0xE0 && off <= 0xE9) || off == 0x11 || off == 0x6C || (off >= 0x11A && off <= 0x124) || (off >= 0x420 && off <= 0x428)) && old != v) {
-            extern int snes_frame_counter;
-            extern const char *g_last_recomp_func;
-            fprintf(stderr, "[w16] f=%d off=%05x %04x->%04x bank=%02x addr=%04x D=%04x PC=%02x:???? func=%s\n",
-                snes_frame_counter, off, old, v, bank, addr, cpu->D, cpu->PB,
-                g_last_recomp_func ? g_last_recomp_func : "?");
-            fflush(stderr);
-        }
         cpu_trace_wram_write_check(cpu, bank, addr, off, old, v, 2);
         return;
     }
@@ -247,13 +231,4 @@ void cpu_state_init(CpuState *cpu, uint8 *ram) {
     cpu->ram = ram;
     /* NLR pending-skip is NOT on CpuState — it's a function-local in
      * each emitted v2 function. See cpu_state.h for design rationale. */
-    /* Always-on WRAM-write watches on scroll bytes. Per the
-     * ring-buffer-is-principal-observability rule, observability that
-     * matters at debug time is wired at boot, not armed at probe time. */
-    extern void cpu_trace_set_wram_watch(uint8_t bank, uint16_t addr, int width,
-                                         int match_value, uint8_t value, int enabled);
-    cpu_trace_set_wram_watch(0x7E, 0x00E2, 1, 0, 0, 1);  /* BG1 H scroll lo */
-    cpu_trace_set_wram_watch(0x7E, 0x00E3, 1, 0, 0, 1);  /* BG1 H scroll hi */
-    cpu_trace_set_wram_watch(0x7E, 0x00E8, 1, 0, 0, 1);  /* BG2 V scroll lo */
-    cpu_trace_set_wram_watch(0x7E, 0x00E9, 1, 0, 0, 1);  /* BG2 V scroll hi */
 }
