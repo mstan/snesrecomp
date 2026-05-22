@@ -9,6 +9,7 @@
  */
 #include "launcher.h"
 #include "crc32.h"
+#include "sha256.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +138,54 @@ static int verify_rom(const char *path, uint32_t expected_crc) {
     return 1;
 }
 
+/* ---- SHA-256 verification ---- */
+
+/* Returns 1 if the ROM at `path` matches expected_sha256 (or NULL).
+ * Same SMC-header-strip rule as CRC32. */
+static int verify_rom_sha256(const char *path, const uint8_t *expected_sha256) {
+    if (!expected_sha256) return 1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[Launcher] Cannot open '%s'\n", path);
+        return 0;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0) { fclose(f); return 0; }
+
+    uint8_t *data = (uint8_t *)malloc((size_t)sz);
+    if (!data) { fclose(f); return 0; }
+    size_t read = fread(data, 1, (size_t)sz, f);
+    fclose(f);
+    if (read != (size_t)sz) { free(data); return 0; }
+
+    size_t hdr = ((size_t)sz % 1024 == 512) ? 512 : 0;
+    uint8_t actual[32];
+    sha256_compute(data + hdr, (size_t)sz - hdr, actual);
+    free(data);
+
+    if (memcmp(actual, expected_sha256, 32) != 0) {
+        char exp_hex[65], act_hex[65];
+        for (int i = 0; i < 32; i++) {
+            snprintf(exp_hex + i*2, 3, "%02x", expected_sha256[i]);
+            snprintf(act_hex + i*2, 3, "%02x", actual[i]);
+        }
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "ROM SHA-256 mismatch.\n\nExpected:\n%s\n\nGot:\n%s\n\n"
+                 "Please select the correct ROM file.",
+                 exp_hex, act_hex);
+        fprintf(stderr, "[Launcher] %s\n", msg);
+#ifdef _WIN32
+        MessageBoxA(NULL, msg, "Wrong ROM", MB_ICONWARNING | MB_OK);
+#endif
+        return 0;
+    }
+    return 1;
+}
+
 /* ---- Public ---- */
 
 int snesrecomp_launcher_resolve_rom(int argc, char **argv,
@@ -169,6 +218,45 @@ int snesrecomp_launcher_resolve_rom(int argc, char **argv,
             }
         }
         if (verify_rom(out_path, expected_crc)) {
+            rom_cfg_write(out_path);
+            printf("[Launcher] ROM: %s\n", out_path);
+            return 1;
+        }
+        /* Wrong ROM — clear and re-prompt. */
+        out_path[0] = '\0';
+    }
+}
+
+int snesrecomp_launcher_resolve_rom_sha256(int argc, char **argv,
+                                           char *out_path, size_t max_len,
+                                           const uint8_t *expected_sha256) {
+    out_path[0] = '\0';
+
+    /* (1) argv[1] override (back-compat with command-line invocation). */
+    if (argc >= 2 && argv[1] && argv[1][0] != '-' && argv[1][0] != '\0') {
+        strncpy(out_path, argv[1], max_len - 1);
+        out_path[max_len - 1] = '\0';
+        if (expected_sha256 && !verify_rom_sha256(out_path, expected_sha256)) {
+            fprintf(stderr, "[Launcher] Warning: SHA-256 mismatch for '%s' — continuing anyway\n", out_path);
+        }
+        rom_cfg_write(out_path);
+        printf("[Launcher] ROM: %s\n", out_path);
+        return 1;
+    }
+
+    /* (2) Cached path from rom.cfg. */
+    rom_cfg_read(out_path, max_len);
+
+    /* (3) File picker loop until user provides a valid (or skip-hash) ROM. */
+    for (;;) {
+        if (out_path[0] == '\0') {
+            if (!pick_rom_file(out_path, max_len)) {
+                fprintf(stderr, "[Launcher] No ROM selected — exiting.\n");
+                out_path[0] = '\0';
+                return 0;
+            }
+        }
+        if (verify_rom_sha256(out_path, expected_sha256)) {
             rom_cfg_write(out_path);
             printf("[Launcher] ROM: %s\n", out_path);
             return 1;

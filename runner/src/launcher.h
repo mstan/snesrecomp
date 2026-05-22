@@ -39,6 +39,22 @@ int snesrecomp_launcher_resolve_rom(int argc, char **argv,
                                     char *out_path, size_t max_len,
                                     uint32_t expected_crc);
 
+/*
+ * snesrecomp_launcher_resolve_rom_sha256
+ *
+ * Same contract as snesrecomp_launcher_resolve_rom but verifies via SHA-256
+ * instead of CRC32. Use this when the canonical hash you want to pin against
+ * comes from a project that publishes SHA-256 (e.g. snesrev/zelda3).
+ *
+ * `expected_sha256` is a pointer to a 32-byte big-endian SHA-256 digest, or
+ * NULL to skip verification.
+ *
+ * Same SMC-copier-header handling as the CRC32 variant.
+ */
+int snesrecomp_launcher_resolve_rom_sha256(int argc, char **argv,
+                                           char *out_path, size_t max_len,
+                                           const uint8_t *expected_sha256);
+
 #ifdef __cplusplus
 }
 #endif
