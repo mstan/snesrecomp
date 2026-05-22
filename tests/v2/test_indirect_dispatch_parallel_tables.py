@@ -52,3 +52,94 @@ def test_parallel_byte_table_dispatch_uses_logical_index_register():
     assert 'cpu->Y & 0xFFFF) / 3' not in src
     assert 'case 7:' in src
     assert 'bank_00_9700_M1X1(cpu)' in src
+
+
+def test_plain_indirect_dispatch_uses_site_mx_variant():
+    """Plain JMP (abs,X) dispatch keeps the dispatch site's live M/X.
+
+    Unlike ExecutePtr-style trampolines, a direct indirect jump does not
+    force SEP #$30 before entering the selected handler.
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30  ; M0X0
+            0xA2, 0x00, 0x00,  # LDX #$0000
+            0x7C, 0x00, 0x81,  # JMP ($8100,X)
+        ]),
+        0x8100: bytes([
+            0x00, 0x90,        # -> $9000
+        ]),
+        0x9000: bytes([0x60]),  # RTS
+    })
+
+    src = emit_function(
+        rom=rom,
+        bank=0,
+        start=0x8000,
+        entry_m=1,
+        entry_x=1,
+        func_name='PlainIndirectDispatchSiteMx',
+        indirect_dispatch={
+            0x008005: {
+                'count': 1,
+                'idx_reg': 'X',
+            },
+        },
+    )
+
+    assert 'indirect dispatch terminator: cfg-resolved target list' in src
+    assert 'bank_00_9000_M0X0(cpu)' in src
+    assert 'bank_00_9000_M1X1(cpu)' not in src
+
+
+def test_absolute_indirect_dispatch_switches_on_loaded_pointer():
+    """JMP ($dp) dispatches by the pointer, even if X is reused.
+
+    Zelda room-object drawing loads the handler pointer into $0e, then
+    overwrites X with an object-data offset before `JMP ($000e)`. The
+    switch key must be the runtime pointer, not X.
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30  ; 16-bit A/X/Y
+            0xA2, 0x00, 0x00,  # LDX #$0000
+            0xBD, 0x00, 0x82,  # LDA $8200,X ; handler pointer
+            0x85, 0x0E,        # STA $0e
+            0xBD, 0x00, 0x81,  # LDA $8100,X ; object data offset
+            0xAA,              # TAX
+            0x6C, 0x0E, 0x00,  # JMP ($000e)
+        ]),
+        0x8100: bytes([
+            0xD8, 0x03,
+            0xE8, 0x02,
+        ]),
+        0x8200: bytes([
+            0x00, 0x90,
+            0x00, 0x91,
+        ]),
+        0x9000: bytes([0x60]),  # RTS
+        0x9100: bytes([0x60]),  # RTS
+    })
+
+    src = emit_function(
+        rom=rom,
+        bank=0,
+        start=0x8000,
+        entry_m=1,
+        entry_x=1,
+        func_name='AbsoluteIndirectPointerDispatch',
+        indirect_dispatch={
+            0x00800E: {
+                'count': 2,
+                'idx_reg': 'X',
+                'table_bases': (0x8200,),
+            },
+        },
+    )
+
+    assert 'absolute indirect dispatch: switch on the loaded pointer' in src
+    assert 'uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x000e)' in src
+    assert 'switch (_target)' in src
+    assert 'case 0x9000:' in src
+    assert 'case 0x9100:' in src
+    assert 'cpu->X & 0xFFFF) / 2' not in src

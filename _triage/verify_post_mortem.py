@@ -1,5 +1,5 @@
 import json, sys
-path = "F:/Projects/SuperMarioWorldRecomp/build/last_run_report.json"
+path = "F:/Projects/snesrecomp/SuperMarioWorldRecomp/build/last_run_report.json"
 with open(path, "r") as f:
     d = json.load(f)
 print("valid json:", list(d.keys()))

@@ -1329,7 +1329,7 @@ static void h_emu_block_watch_arm(const char *args) {
 static void h_emu_block_watch_get(const char *args) {
     int slot_filter = -1;
     if (args && *args) sscanf(args, "%d", &slot_filter);
-    static char buf[1 << 17];
+    static char buf[1 << 20];
     int pos = snprintf(buf, sizeof(buf), "{\"slots\":[");
     int emitted = 0;
     for (int i = 0; i < 16; i++) {

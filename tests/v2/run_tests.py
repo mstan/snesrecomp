@@ -38,6 +38,8 @@ TEST_MODULES = [
     'test_nlr_idiom',
     'test_dispatcher_phk_per_jml',
     'test_indirect_dispatch_parallel_tables',
+    'test_indirect_jsr_dispatch_continuation',
+    'test_rts_stack_dispatch',
     'test_wrapper_autoroute',
     'test_tail_call_autoroute',
     'test_emit_function_tail_call_past_end',

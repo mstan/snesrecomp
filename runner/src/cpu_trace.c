@@ -2207,43 +2207,59 @@ static const char *event_name(uint8_t et) {
 void cpu_trace_dump_recent(const char *tag, int n) {
     if ((uint64_t)n > g_cpu_trace_capacity) n = (int)g_cpu_trace_capacity;
     if ((uint64_t)n > g_cpu_trace_idx) n = (int)g_cpu_trace_idx;
-    fprintf(stderr, "=== %s — last %d trace events ===\n", tag ? tag : "trace", n);
-    fprintf(stderr, "  (newest first)\n");
-    for (int i = 0; i < n; i++) {
+    /* Single-buffer dump (see cpu_trace_dump_dbpb for the rationale).
+     * Up to ~160 bytes per line — a full event line with the longest
+     * decoration variant is ~140 chars. Bound the buffer at 64 KB so
+     * even a worst-case n=256 dump fits comfortably. Caller passes
+     * n <= 256 in practice (DB-WATCH path passes 256). */
+    static char buf[64 * 1024];
+    int cap = (int)sizeof(buf);
+    int pos = snprintf(buf, cap,
+                       "=== %s — last %d trace events ===\n"
+                       "  (newest first)\n",
+                       tag ? tag : "trace", n);
+    for (int i = 0; i < n && pos < cap - 192; i++) {
         uint64_t abs_idx = g_cpu_trace_idx - 1 - i;
         int slot = (int)(abs_idx & (g_cpu_trace_capacity - 1));
         CpuTraceEvent *e = &g_cpu_trace_ring[slot];
-        fprintf(stderr, "  [%-5s] PC=$%06X DB=%02X PB=%02X A=%04X X=%04X Y=%04X S=%04X "
+        pos += snprintf(buf + pos, cap - pos,
+                        "  [%-5s] PC=$%06X DB=%02X PB=%02X A=%04X X=%04X Y=%04X S=%04X "
                         "P=%02X m=%u x=%u",
-                event_name(e->event_type), e->pc24, e->DB, e->PB,
-                e->A, e->X, e->Y, e->S, e->P, e->M, e->XF);
+                        event_name(e->event_type), e->pc24, e->DB, e->PB,
+                        e->A, e->X, e->Y, e->S, e->P, e->M, e->XF);
         switch (e->event_type) {
             case CPU_TR_PLB:
             case CPU_TR_PHB:
             case CPU_TR_DB_WRITE:
-                fprintf(stderr, "  DB %02X→%02X", e->extra0, (uint8_t)e->extra1);
+                pos += snprintf(buf + pos, cap - pos,
+                                "  DB %02X→%02X", e->extra0, (uint8_t)e->extra1);
                 break;
             case CPU_TR_PHK:
             case CPU_TR_PB_WRITE:
             case CPU_TR_JSL:
             case CPU_TR_RTL:
-                fprintf(stderr, "  PB %02X→%02X", e->extra0, (uint8_t)e->extra1);
+                pos += snprintf(buf + pos, cap - pos,
+                                "  PB %02X→%02X", e->extra0, (uint8_t)e->extra1);
                 break;
             case CPU_TR_MVN:
             case CPU_TR_MVP:
-                fprintf(stderr, "  src=%02X dst=%02X", e->extra0, (uint8_t)e->extra1);
+                pos += snprintf(buf + pos, cap - pos,
+                                "  src=%02X dst=%02X", e->extra0, (uint8_t)e->extra1);
                 break;
             case CPU_TR_FUNC_ENTRY:
-                fprintf(stderr, "  hash=%08X", e->native_func_id_or_hash);
+                pos += snprintf(buf + pos, cap - pos,
+                                "  hash=%08X", e->native_func_id_or_hash);
                 break;
             case CPU_TR_WRAM_WRITE:
-                fprintf(stderr, "  bank=%02X byte=%u newval=$%02X",
-                        (uint8_t)(e->extra1 >> 8),
-                        (uint8_t)(e->extra1 & 0xFF), e->extra0);
+                pos += snprintf(buf + pos, cap - pos,
+                                "  bank=%02X byte=%u newval=$%02X",
+                                (uint8_t)(e->extra1 >> 8),
+                                (uint8_t)(e->extra1 & 0xFF), e->extra0);
                 break;
         }
-        fprintf(stderr, "\n");
+        pos += snprintf(buf + pos, cap - pos, "\n");
     }
+    fwrite(buf, 1, (size_t)pos, stderr);
     fflush(stderr);
 }
 
@@ -2306,16 +2322,28 @@ void cpu_trace_dump_wram(const char *tag, int scan_n) {
 
 void cpu_trace_dump_dbpb(const char *tag) {
     int n = (int)((g_cpu_dbpb_idx < CPU_DBPB_RING_LEN) ? g_cpu_dbpb_idx : CPU_DBPB_RING_LEN);
-    fprintf(stderr, "=== %s — last %d DB/PB mutations ===\n", tag ? tag : "dbpb", n);
-    for (int i = 0; i < n; i++) {
+    /* Build the whole dump in a single stack-local buffer and emit
+     * with one fwrite. Per-line fprintf to stderr on Windows console
+     * is a WriteConsole syscall + console formatting per call; 1024
+     * lines blocks the CPU thread for ~1 s of wall time. With one
+     * fwrite the same dump takes microseconds and the thread keeps
+     * running. ~80 bytes/line is plenty for the fixed layout below. */
+    static char buf[CPU_DBPB_RING_LEN * 80 + 256];
+    int cap = (int)sizeof(buf);
+    int pos = snprintf(buf, cap,
+                       "=== %s — last %d DB/PB mutations ===\n",
+                       tag ? tag : "dbpb", n);
+    for (int i = 0; i < n && pos < cap - 96; i++) {
         uint64_t abs_idx = g_cpu_dbpb_idx - 1 - i;
         int slot = (int)(abs_idx & (CPU_DBPB_RING_LEN - 1));
         CpuDbpbEvent *d = &g_cpu_dbpb_ring[slot];
-        fprintf(stderr, "  [%-5s] PC=$%06X %s %02X→%02X (S=$%04X)\n",
-                event_name(d->event_type), d->pc24,
-                d->reg_id == 0 ? "DB" : "PB",
-                d->old_val, d->new_val, d->S);
+        pos += snprintf(buf + pos, cap - pos,
+                        "  [%-5s] PC=$%06X %s %02X→%02X (S=$%04X)\n",
+                        event_name(d->event_type), d->pc24,
+                        d->reg_id == 0 ? "DB" : "PB",
+                        d->old_val, d->new_val, d->S);
     }
+    fwrite(buf, 1, (size_t)pos, stderr);
     fflush(stderr);
 }
 

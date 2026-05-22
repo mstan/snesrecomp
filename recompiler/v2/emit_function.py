@@ -74,7 +74,9 @@ def emit_function(rom: bytes, bank: int, start: int,
                   tail_call_target_name: Optional[str] = None,
                   callee_exit_mx=None,
                   sibling_entry_pcs: Optional[set] = None,
-                  hle_spc_upload=None) -> str:
+                  hle_spc_upload=None,
+                  hle_func=None,
+                  hle_dispatch=None) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
     Pipeline:
@@ -117,10 +119,35 @@ def emit_function(rom: bytes, bank: int, start: int,
             "",
         ])
 
+    # Generic HLE: cfg declared `hle_func <pc> <c_helper>`. Emit a
+    # forwarding stub that hands control to the named C function.
+    # The host runner provides the body (typically in gen_stubs.c).
+    if hle_func and (start & 0xFFFF) in hle_func:
+        c_helper = hle_func[start & 0xFFFF]
+        variant_name = f"{base_func_name}{_variant_suffix(entry_m, entry_x)}"
+        pc24 = ((bank & 0xFF) << 16) | (start & 0xFFFF)
+        return "\n".join([
+            f"RecompReturn {variant_name}(CpuState *cpu) {{",
+            "  extern const char *g_last_recomp_func;",
+            f"  extern RecompReturn {c_helper}(CpuState *cpu);",
+            f"  g_last_recomp_func = \"{variant_name}\";",
+            f"  RecompStackPush(\"{variant_name}\");",
+            f"  cpu_dbg_funcname(\"{variant_name}\");",
+            f"  cpu_trace_func_entry(cpu, 0x{pc24:06X}, \"{variant_name}\");",
+            f"  cpu_trace_block(cpu, 0x{pc24:06X});",
+            "  WatchdogCheck();",
+            f"  RecompReturn _r = {c_helper}(cpu);",
+            "  RecompStackPop();",
+            "  return _r;",
+            "}",
+            "",
+        ])
+
     graph = decode_function(rom, bank, start, entry_m, entry_x, end=end,
                             dispatch_helpers=dispatch_helpers,
                             indirect_call_tables=indirect_call_tables,
                             indirect_dispatch=indirect_dispatch,
+                            hle_dispatch=hle_dispatch,
                             data_regions=data_regions,
                             callee_exit_mx=callee_exit_mx,
                             sibling_entry_pcs=sibling_entry_pcs)
@@ -918,19 +945,62 @@ def emit_function(rom: bytes, bank: int, start: int,
                                     )
                                     block_terminated = True
                                     break  # exit `for op in ir_ops`
-                            # No name resolved — fall back to the trap so
-                            # the runtime captures the unresolved site.
+                            # No name resolved yet — for a CROSS-BANK
+                            # JML the target is unambiguously a tail-call
+                            # destination (PB changes; current function's
+                            # successor block is past `end:` or in another
+                            # bank). Register it as a Call demand so the
+                            # next auto-promote pass synthesizes a func
+                            # entry at the target. Then RE-EMIT this site
+                            # as a placeholder tail-call to the synthesized
+                            # `bank_BB_AAAA_MmXx` name — v2_regen will
+                            # have created the entry by the next pass.
+                            #
+                            # This is the cross-bank tail-call class fix:
+                            # we don't want to fall through to a trap and
+                            # block the build on first emit; we want the
+                            # demand pipeline to close the gap.
+                            # In-function (same-bank) Gotos are NOT
+                            # promoted (see the v2_regen.py "Goto targets
+                            # are no longer auto-promoted" comment) — that
+                            # would split asm routines. CROSS-bank is the
+                            # safe subset: the bank change implies a
+                            # function boundary.
                             src_pc24 = blk_pc24
                             tgt_str = (f"0x{target_pc24:06X}"
                                        if target_pc24 is not None else "0x000000")
-                            lines.append(
-                                f"return cpu_trace_unresolved_goto_trap(cpu, "
-                                f"0x{src_pc24:06X}, {tgt_str}, "
-                                f"\"{func_name}\", \"L_{key.pc & 0xFFFF:04X}_"
-                                f"M{key.m}X{key.x}\");"
-                                f"  /* unresolvable cross-bank goto — "
-                                f"no named function at target */"
-                            )
+                            if (target_pc24 is not None
+                                    and ((target_pc24 >> 16) & 0xFF) != bank):
+                                from v2.codegen import register_call_demand
+                                register_call_demand(target_pc24, key.m, key.x)
+                                sib_suffix = _variant_suffix(key.m, key.x)
+                                tgt_bank = (target_pc24 >> 16) & 0xFF
+                                tgt16 = target_pc24 & 0xFFFF
+                                synth_name = (
+                                    f"bank_{tgt_bank:02X}_{tgt16:04X}"
+                                )
+                                lines.append(
+                                    f"cpu->PB = 0x{tgt_bank:02X}; /* JML "
+                                    f"into bank ${tgt_bank:02X} */"
+                                )
+                                lines.append(
+                                    f"{{ RecompReturn _tc = "
+                                    f"{synth_name}{sib_suffix}(cpu); "
+                                    f"RecompStackPop(); return _tc; }}"
+                                    f"  /* tail-call cross-bank into "
+                                    f"{synth_name}{sib_suffix} at "
+                                    f"${target_pc24:06X} (auto-promoted "
+                                    f"via Call demand) */"
+                                )
+                            else:
+                                lines.append(
+                                    f"return cpu_trace_unresolved_goto_trap(cpu, "
+                                    f"0x{src_pc24:06X}, {tgt_str}, "
+                                    f"\"{func_name}\", \"L_{key.pc & 0xFFFF:04X}_"
+                                    f"M{key.m}X{key.x}\");"
+                                    f"  /* unresolvable cross-bank goto — "
+                                    f"no named function at target */"
+                                )
                         block_terminated = True
                 elif isinstance(op, Return):
                     for ln in emit_op(op):
@@ -951,20 +1021,31 @@ def emit_function(rom: bytes, bank: int, start: int,
                             lines.append(ln)
                         block_terminated = True
                     else:
-                        # No resolution. The decoder recorded the site
-                        # in graph.unresolved_indirects so v2_regen
-                        # reports it; in this build mode we emit a
-                        # runtime trap rather than a silent stub —
-                        # the recomp_dispatch_oob path captures a loud
-                        # stderr + slot-table entry the moment the site
-                        # actually executes. NOT a stub (no silent
-                        # fall-through); requires HLE follow-up before
-                        # the dispatcher is functionally correct.
-                        site_pc24 = (bank << 16) | (key.pc & 0xFFFF)
-                        lines.append(
-                            f"return cpu_trace_dispatch_oob(cpu, "
-                            f"0x{site_pc24:06x}, 0xFFFF); "
-                            f"/* unresolved IndirectGoto — HLE pending */")
+                        # No resolution. Two sub-cases:
+                        #   (a) cfg `hle_dispatch <pc16> <c_helper>` claims
+                        #       this site — emit a tail-call to the named
+                        #       C helper (host-side dispatcher).
+                        #   (b) Otherwise emit the runtime trap so the
+                        #       site is captured if execution ever reaches
+                        #       it. NOT a stub (no silent fall-through);
+                        #       requires HLE follow-up.
+                        site_pc24 = (insn.addr & 0xFFFFFF) if insn is not None else \
+                                    ((bank << 16) | (key.pc & 0xFFFF))
+                        site_pc16 = site_pc24 & 0xFFFF
+                        if hle_dispatch and site_pc16 in hle_dispatch:
+                            c_helper = hle_dispatch[site_pc16]
+                            lines.append(
+                                f"{{ extern RecompReturn {c_helper}(CpuState *cpu); "
+                                f"RecompReturn _r = {c_helper}(cpu); "
+                                f"RecompStackPop(); return _r; }} "
+                                f"/* hle_dispatch ${site_pc24:06X} — "
+                                f"host-side dispatcher */"
+                            )
+                        else:
+                            lines.append(
+                                f"return cpu_trace_dispatch_oob(cpu, "
+                                f"0x{site_pc24:06x}, 0xFFFF); "
+                                f"/* unresolved IndirectGoto — HLE pending */")
                         block_terminated = True
                 elif isinstance(op, PushReg) and getattr(
                         di_insn, 'dispatch_entries', None):

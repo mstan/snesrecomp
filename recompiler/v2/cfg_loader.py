@@ -115,6 +115,26 @@ class BankCfg:
     # (HandleSPCUploads_Inner / SPC700UploadLoop at $00:8079) and
     # ALttP (LoadSongBank at $00:8888) — both use the same protocol.
     hle_spc_upload: List[int] = field(default_factory=list)
+    # `hle_func <pc16> <c_function_name>` — replace the recompiled body
+    # of the function at <pc> with a single forwarding call to the named
+    # C function. Used for hand-written HLE bodies that need to run
+    # alongside cfg-declared (m,x) variants — the recompiler skips
+    # decoding the bytes for these PCs and emits a forwarding stub per
+    # requested variant: `RecompReturn NAME_MxXy(CpuState *cpu) {
+    #   return <c_function_name>(cpu); }`. The C helper must be
+    # provided by the per-game runner (typically in gen_stubs.c).
+    # Map: pc16 -> c_function_name. See emit_function.py for stub shape.
+    hle_func: dict = field(default_factory=dict)
+    # `hle_dispatch <site_pc16> <c_function_name>` — at the named indirect
+    # JMP/JML/JSR site, replace the unresolved-dispatch trap with a
+    # tail-call to the named C helper. Used when the asm dispatcher at
+    # <site_pc16> is replaced by a host-side scheduler / interpreter
+    # that decides the next PC itself (e.g. the MMX cooperative-task
+    # scheduler's `JMP ($0032,X)` at $00:80E6 — the C-host MmxSchedulerTick
+    # selects the task body to run). The site PC matches insn.addr,
+    # so the helper fires from every caller-body that inlined the
+    # dispatch as part of its decoded CFG. Map: pc16 -> c_function_name.
+    hle_dispatch: dict = field(default_factory=dict)
 
 
 # Token regex helpers
@@ -197,6 +217,56 @@ def load_bank_cfg(path: str) -> BankCfg:
                     raise ValueError(
                         f"{path}: hle_spc_upload bad pc {tokens[1]!r}: {e}")
                 cfg.hle_spc_upload.append(pc16)
+                continue
+
+            # hle_func <pc16> <c_function_name> — replace the decoded
+            # body of the function at <pc> with a forwarding stub:
+            #   RecompReturn NAME_MxXy(CpuState *cpu) {
+            #     return <c_function_name>(cpu);
+            #   }
+            # The C helper must be provided externally (typically
+            # gen_stubs.c). One stub per (m,x) variant the recompiler
+            # discovers as called from elsewhere. See BankCfg.hle_func
+            # comment.
+            if head == 'hle_func':
+                if len(tokens) != 3:
+                    raise ValueError(
+                        f"{path}: hle_func needs <pc> <c_function_name>, "
+                        f"got: {stripped!r}")
+                try:
+                    pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: hle_func bad pc {tokens[1]!r}: {e}")
+                c_name = tokens[2]
+                if not c_name.replace('_', '').isalnum() or c_name[0].isdigit():
+                    raise ValueError(
+                        f"{path}: hle_func c_function_name must be a valid "
+                        f"C identifier, got: {c_name!r}")
+                cfg.hle_func[pc16] = c_name
+                continue
+
+            # hle_dispatch <site_pc16> <c_function_name> — replace the
+            # unresolved-dispatch trap at the indirect JMP/JML/JSR site
+            # at <site_pc16> with a tail-call to the named C helper.
+            # The helper decides the next PC (host scheduler / interpreter).
+            # See BankCfg.hle_dispatch.
+            if head == 'hle_dispatch':
+                if len(tokens) != 3:
+                    raise ValueError(
+                        f"{path}: hle_dispatch needs <site_pc16> <c_function_name>, "
+                        f"got: {stripped!r}")
+                try:
+                    pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: hle_dispatch bad pc {tokens[1]!r}: {e}")
+                c_name = tokens[2]
+                if not c_name.replace('_', '').isalnum() or c_name[0].isdigit():
+                    raise ValueError(
+                        f"{path}: hle_dispatch c_function_name must be a valid "
+                        f"C identifier, got: {c_name!r}")
+                cfg.hle_dispatch[pc16] = c_name
                 continue
 
             # indirect_dispatch <site_pc> <count> idx:<X|Y> [tables:<lo>[,<hi>[,<bank>]]]

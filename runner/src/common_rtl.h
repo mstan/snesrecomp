@@ -19,6 +19,7 @@ typedef struct SimpleHdma {
 typedef struct Dma Dma;
 typedef struct DmaChannel DmaChannel;
 typedef struct Ppu Ppu;
+typedef struct CpuState CpuState;
 
 void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc);
 void SimpleHdma_DoLine(SimpleHdma *c);
@@ -231,6 +232,7 @@ void RtlSaveLoad(int cmd, int slot);
 void RtlApuLock();
 void RtlApuUnlock();
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
+bool RtlUploadSpcImageFromDp(CpuState *cpu);
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
 void RtlWriteSram();

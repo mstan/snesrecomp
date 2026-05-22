@@ -464,7 +464,7 @@ extern "C" int snes9x_bridge_gm14_get_row(uint64_t abs_idx, void *out_row) {
  * specified WRAM bytes on every entry to the configured PB:PC. */
 #define EMU_BLOCK_WATCH_MAX        16
 #define EMU_BLOCK_WATCH_ADDRS_MAX  8
-#define EMU_BLOCK_WATCH_HITS_MAX   32
+#define EMU_BLOCK_WATCH_HITS_MAX   256
 
 struct emu_block_watch_hit {
     int32_t  frame;

@@ -844,7 +844,15 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
     return (result >> (8 * (adr - 0x34))) & 0xff;
   }
     case 0x37: {
-      //assert(0);
+      /* Frame-level recomp runs do not model per-scanline PPU time, but
+       * games still use SLHV/OPVCT busy-waits to wait until late visible
+       * scanlines before touching HDMA/window tables. Latch a stable
+       * late-line value so those waits can complete. */
+      ppu->hCount = 0;
+      ppu->vCount = 0xc0;
+      ppu->hCountSecond = false;
+      ppu->vCountSecond = false;
+      ppu->countersLatched = true;
       return 0;
     }
     case 0x38: {

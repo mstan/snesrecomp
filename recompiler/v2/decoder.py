@@ -331,8 +331,24 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
     entries: List[int] = []
     tbl_pc = base
     nulls_in_a_row = 0
+    # In-bank handler PCs we've already accepted. Used as an upper bound
+    # on the table — once tbl_pc would meet or cross any accepted
+    # in-bank handler, we've walked into that handler's code and any
+    # further "entry" is mis-decoded handler bytes. Catches the class
+    # where the table sits immediately before its first handler (most
+    # common 65816 layout: `JSR ($base,X) ; JMP <after> ; <table bytes> ;
+    # <handler 0 code>`). Without this check, the walker reads the first
+    # 2-3 bytes of handler 0 as a bogus entry, which then gets auto-
+    # promoted to a phony function entry — manifests downstream as a
+    # cross-fn goto trap to garbage (MMX bank 01 $848E from the
+    # $01:D11B dispatch + bank 02 $8F20 from the $02:CFD4 dispatch).
+    inbank_handler_pcs: List[int] = []
     while len(entries) < max_entries:
         if tbl_pc + entry_size - 1 > 0xFFFF:
+            break
+        # Stop if the next entry's read range would overlap any already-
+        # accepted in-bank handler. Equivalent to: table_top >= min_handler_pc.
+        if any(tbl_pc >= h for h in inbank_handler_pcs):
             break
         try:
             off = lorom_offset(bank, tbl_pc & 0xFFFF)
@@ -372,6 +388,10 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
         if _dispatch_target_is_padding(rom, eb, addr16):
             break
         entries.append(full)
+        # Track in-bank handler PCs so the next iteration's overlap
+        # check can stop walking once tbl_pc would cross into one.
+        if eb == bank and 0x8000 <= addr16 <= 0xFFFF:
+            inbank_handler_pcs.append(addr16)
         tbl_pc += entry_size
     return entries if entries else None
 
@@ -912,6 +932,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     dispatch_helpers: Optional[Dict[int, str]] = None,
                     indirect_call_tables: Optional[Dict[int, dict]] = None,
                     indirect_dispatch: Optional[Dict[int, dict]] = None,
+                    hle_dispatch: Optional[Dict[int, str]] = None,
                     data_regions: Optional[List[Tuple[int, int, int]]] = None,
                     callee_exit_mx: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
@@ -1002,23 +1023,30 @@ def decode_function(rom: bytes, bank: int, start: int,
                 and pred_pc >= 0
                 and pred_pc < end):
             continue
-        # Boundary-crossing JUMP that lands on a named sibling function
-        # entry: refuse the inline-import. emit_function's
-        # `_goto_or_return` then emits a tail-call to the sibling
-        # (recompiler-level fix 2026-05-17). Without this, the inline-
-        # cross-fn-blocks model would pull the sibling's entire body
-        # into THIS function's CFG — root cause of the Zelda intro
-        # submodule oscillation, because Intro_Init_Continue's BCS to
-        # Intro_InitializeMemory_darken inlined darken into Intro_
-        # Init_Continue, running darken's `submodule_index++` on the
-        # wrong dispatch path. The PHB/PLB-balanced cross-fn-jump case
-        # is unaffected — those targets aren't in `sibling_entry_pcs`.
+        # JUMP edge that lands on a named sibling function entry:
+        # refuse the inline-import. emit_function's `_goto_or_return`
+        # then emits a tail-call to the sibling (recompiler-level fix
+        # 2026-05-17, generalised 2026-05-22). Without this, the
+        # inline-cross-fn-blocks model would pull the sibling's entire
+        # body into THIS function's CFG — root cause of the Zelda intro
+        # submodule oscillation (Intro_Init_Continue's BCS to Intro_
+        # InitializeMemory_darken inlined darken's submodule_index++),
+        # and root cause of MMX TaskDie ($00:80F8) being inlined into
+        # every task body's tail (the asm scheduler walk overwrote
+        # slot state on every yield).
+        #
+        # The earlier form gated this on `pc >= end` + `pred_pc < end`,
+        # which only matched siblings ABOVE the current function in PC
+        # space. MMX's TaskDie sits BELOW its callers ($80F8 < $852C,
+        # $B091, $B25B, ...) and slipped through. The address ordering
+        # is incidental — if the cfg declares pc as another function's
+        # entry, every cross-fn jump to that pc is by definition a
+        # tail-call. sibling_entry_pcs already excludes THIS function's
+        # own start, so back-edges to entry are unaffected. The PHB/
+        # PLB-balanced cross-fn-jump case is unaffected — those targets
+        # aren't in `sibling_entry_pcs`.
         if (sibling_entry_pcs is not None
-                and end is not None
-                and pc >= end
                 and edge_kind == 'jump'
-                and pred_pc >= 0
-                and pred_pc < end
                 and pc in sibling_entry_pcs):
             continue
         if not (0x8000 <= pc <= 0xFFFF):
@@ -1287,9 +1315,17 @@ def decode_function(rom: bytes, bank: int, start: int,
         # as unresolved (v2_regen hard-fails on any). The insn stays in
         # the graph with no successors so predecessors' edges still
         # resolve — same shape as suppressed JSR (abs,X).
+        #
+        # Exception: cfg `hle_dispatch <pc16> <c_helper>` claims the site
+        # for a host-side dispatcher. Treat as terminal (same shape, no
+        # successors) but DO NOT record as unresolved — emit_function
+        # will emit a tail-call to the helper from every caller-body
+        # that inlined this dispatch.
         if (insn.mnem in ('JMP', 'JML')
                 and insn.mode in (INDIR, INDIR_X)):
             graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
+            if hle_dispatch and (pc & 0xFFFF) in hle_dispatch:
+                continue
             graph.unresolved_indirects.append(UnresolvedIndirect(
                 site_pc24=(bank << 16) | pc,
                 mnem=insn.mnem,
@@ -1300,6 +1336,46 @@ def decode_function(rom: bytes, bank: int, start: int,
                 entry_x=key.x,
             ))
             continue
+
+        # cfg `indirect_dispatch` for RTS-stack dispatchers. Some 65816
+        # code computes an index, loads a 16-bit handler address from a
+        # ROM table, decrements it, PHA's it, then SEP #$30 + RTS. The
+        # RTS adds one to the pulled address, so this is a tail-call
+        # through the table rather than an ordinary stack push. When cfg
+        # authorises the PHA site, stamp the PHA as a terminal dispatch
+        # so emit_function replaces the literal push with a switch and
+        # does not leak the synthetic return address onto the simulated
+        # SNES stack.
+        if insn.mnem == 'PHA':
+            site_pc24 = (bank << 16) | pc
+            auth = (indirect_dispatch or {}).get(site_pc24)
+            if auth is not None:
+                entries = _resolve_indirect_dispatch_targets(
+                    rom, bank, insn, auth)
+                if entries is not None:
+                    insn.dispatch_entries = entries
+                    insn.dispatch_kind = ('long' if len(auth.get('table_bases', ())) == 3
+                                          else 'short')
+                    insn.dispatch_idx_reg = auth['idx_reg']
+                    insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
+                    insn.dispatch_terminal = True
+                    labeled_succ = []
+                    for e in entries:
+                        if e is None or e == 0:
+                            continue
+                        eb = (e >> 16) & 0xFF
+                        e16 = e & 0xFFFF
+                        if eb == bank and 0x8000 <= e16 <= 0xFFFF:
+                            labeled_succ.append(
+                                (DecodeKey(addr24(eb, e16), 1, 1, ()),
+                                 'jump'))
+                    succ = [k for (k, _) in labeled_succ]
+                    graph.insns[key] = DecodedInsn(key=key, insn=insn,
+                                                   successors=succ)
+                    for s, sk in labeled_succ:
+                        if s not in graph.insns:
+                            worklist.append((s, sk, pc))
+                    continue
 
         # cfg-required-dispatch-or-kill for JSR (abs,X). See class
         # SuppressedIndirectCall above and the regression test at
