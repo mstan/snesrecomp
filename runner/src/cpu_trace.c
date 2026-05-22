@@ -2171,6 +2171,22 @@ void cpu_trace_arm_default_watches(void) {
     for (int a = 0x1925; a <= 0x1930; a++) {
         cpu_trace_set_wram_watch(0x7E, (uint16_t)a, 1, 0, 0, 1);
     }
+    /* MMX cooperative-scheduler task-slot table: 7 slots × 16-byte
+     * stride starting at $7E:0030. Each slot's handler PC sits at
+     * offset $32-$33 (low-byte, high-byte). Investigation 2026-05-22:
+     * slot 0's $33 flips from $85 (Task0 $852C) to $00 around
+     * frame 8834, after which the scheduler tears down Task0's fiber
+     * and tries to dispatch invalid $002C. Per-byte recorder on every
+     * slot's handler-PC pair captures whichever store(s) overwrite
+     * $33 (and by symmetry the high byte of any other slot's PC), so
+     * any future scheduler-state corruption walks backward from the
+     * trip into the always-on ring. */
+    for (int slot = 0; slot < 7; slot++) {
+        uint16_t hi = (uint16_t)(0x0033 + slot * 0x10);
+        uint16_t lo = (uint16_t)(0x0032 + slot * 0x10);
+        cpu_trace_set_wram_watch(0x7E, lo, 1, 0, 0, 1);
+        cpu_trace_set_wram_watch(0x7E, hi, 1, 0, 0, 1);
+    }
     fflush(stderr);
 }
 
