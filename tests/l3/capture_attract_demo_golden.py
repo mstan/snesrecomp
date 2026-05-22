@@ -31,7 +31,7 @@ import sys
 import time
 
 
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE  = REPO / 'build/bin-x64-Oracle/smw.exe'
 FIXTURE_PATH = REPO / 'snesrecomp/tests/l3/fixtures/attract_demo_golden.json'
 

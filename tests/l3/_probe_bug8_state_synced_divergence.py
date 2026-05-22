@@ -15,7 +15,7 @@ import sys
 import time
 
 
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 TARGET_MODE = 0x07
 SCAN_LO = 0x0070

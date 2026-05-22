@@ -22,7 +22,7 @@ import sys
 from typing import List
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-PARENT = pathlib.Path('F:/Projects/SuperMarioWorldRecomp')
+PARENT = pathlib.Path('F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 CFG_DIR = PARENT / 'recomp'
 BANKS = (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x0c, 0x0d)
 

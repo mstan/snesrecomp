@@ -2,7 +2,7 @@
 at successive upstream PCs. The FIRST break that doesn't fire tells
 us where recomp's flow diverges from oracle's expected path."""
 import json, pathlib, socket, subprocess, sys, time
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 # PCs to test, in order of specificity (innermost first).

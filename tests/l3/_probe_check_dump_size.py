@@ -2,8 +2,8 @@
 import socket, json, subprocess, time
 subprocess.run(['taskkill','/F','/IM','smw.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(0.5)
-p = subprocess.Popen([r'F:/Projects/SuperMarioWorldRecomp/build/bin-x64-Oracle/smw.exe','--paused'],
-                    cwd=r'F:/Projects/SuperMarioWorldRecomp',
+p = subprocess.Popen([r'F:/Projects/snesrecomp/SuperMarioWorldRecomp/build/bin-x64-Oracle/smw.exe','--paused'],
+                    cwd=r'F:/Projects/snesrecomp/SuperMarioWorldRecomp',
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1.0)
 s = socket.socket(); s.connect(('127.0.0.1',4377)); f = s.makefile('r'); f.readline()

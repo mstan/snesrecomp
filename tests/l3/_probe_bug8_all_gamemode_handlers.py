@@ -4,7 +4,7 @@ even though $100 went 0x03 -> 0x04 -> 0x05."""
 from __future__ import annotations
 import json, pathlib, socket, subprocess, sys, time
 
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 

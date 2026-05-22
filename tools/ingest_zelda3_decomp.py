@@ -35,7 +35,7 @@ normalised to the `$00-$7F` physical-bank form (`0080c9` = `$00:80C9`).
 Usage:
     python tools/ingest_zelda3_decomp.py
         [--decomp F:/Projects/zelda3]
-        [--output F:/Projects/LegendofZeldaAlttpRecomp/recomp]
+        [--output F:/Projects/snesrecomp/LegendofZeldaAlttpRecomp/recomp]
         [--dry-run]
 """
 from __future__ import annotations
@@ -210,7 +210,7 @@ def main() -> int:
     ap.add_argument("--decomp", default="F:/Projects/zelda3",
                     help="path to zelda3 decomp repo root")
     ap.add_argument("--output",
-                    default="F:/Projects/LegendofZeldaAlttpRecomp/recomp",
+                    default="F:/Projects/snesrecomp/LegendofZeldaAlttpRecomp/recomp",
                     help="path to recomp/ dir containing bank cfg files")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()

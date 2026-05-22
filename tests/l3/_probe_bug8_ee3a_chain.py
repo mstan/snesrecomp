@@ -4,7 +4,7 @@ to $EE85 -> $EED1 -> $EEE1 -> $EF60 -> $EF6B. If EE3A doesn't fire on
 recomp, that's the break."""
 from __future__ import annotations
 import json, pathlib, socket, subprocess, sys, time
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 def cmd(s, f, l):
     s.sendall((l + '\n').encode()); return json.loads(f.readline())

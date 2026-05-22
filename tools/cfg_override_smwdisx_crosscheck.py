@@ -34,7 +34,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-PARENT = pathlib.Path('F:/Projects/SuperMarioWorldRecomp')
+PARENT = pathlib.Path('F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 SMWDISX_DIR = PARENT / 'SMWDisX'
 RESULTS_DIR = REPO / 'tools' / 'cfg_audit_results'
 

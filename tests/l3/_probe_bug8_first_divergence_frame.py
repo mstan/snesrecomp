@@ -23,7 +23,7 @@ import sys
 import time
 
 
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 RANGE_LO = 0x0000
 RANGE_HI = 0x01FF      # low-page zero-page + DP scratch; Bug #8 lives here

@@ -14,7 +14,7 @@ Plus the DP scratch vars it writes during upload ($00-$0F area).
 from __future__ import annotations
 import json, pathlib, socket, subprocess, time
 
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE  = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 def cmd(s, f, line):

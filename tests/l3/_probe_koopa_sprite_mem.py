@@ -1,7 +1,7 @@
 """Frozen koopa step 3: check SpriteMemorySetting ($1692) and key
 sprite-spawn registers at f94 on recomp vs oracle equivalent moment."""
 import json, pathlib, socket, subprocess, sys, time
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 def cmd(s, f, l):

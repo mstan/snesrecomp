@@ -22,7 +22,7 @@ import sys
 from typing import Dict, List, Tuple
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-PARENT = pathlib.Path('F:/Projects/SuperMarioWorldRecomp')
+PARENT = pathlib.Path('F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 CFG_DIR = PARENT / 'recomp'
 GEN_DIR = PARENT / 'src' / 'gen'
 

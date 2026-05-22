@@ -1,6 +1,6 @@
 """Count RunPlayerBlockCode_EB77 hits on recomp during boot."""
 import json, pathlib, socket, subprocess, sys, time
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 def cmd(s, f, l):
     s.sendall((l + '\n').encode()); return json.loads(f.readline())

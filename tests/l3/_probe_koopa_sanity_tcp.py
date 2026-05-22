@@ -1,6 +1,6 @@
 """Sanity-check emu_read_wram response format."""
 import json, pathlib, socket, subprocess, sys, time
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 def cmd(sock, f, line):

@@ -3,7 +3,7 @@ slot-finder loop on recomp. Capture A/X/Y at each PC in $02a8df-$02a960
 range during recomp's f95 spawn frame. Compare against oracle's
 emu_insn_trace at the equivalent oracle moment."""
 import json, pathlib, socket, subprocess, sys, time
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 def cmd(s, f, l):

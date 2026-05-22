@@ -7,7 +7,7 @@ This removes any frame-step-rate mismatch between the two emulators.
 from __future__ import annotations
 import json, pathlib, socket, subprocess, time
 
-REPO = pathlib.Path(r'F:/Projects/SuperMarioWorldRecomp')
+REPO = pathlib.Path(r'F:/Projects/snesrecomp/SuperMarioWorldRecomp')
 EXE  = REPO / 'build/bin-x64-Oracle/smw.exe'
 
 def cmd(s, f, line):
