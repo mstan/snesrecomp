@@ -999,6 +999,18 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         idx_reg = 'X'
     n = len(entries)
     site_pc24 = insn.addr & 0xFFFFFF
+    # JSR (abs,X) and JMP (abs,X) reach this same emitter, but their
+    # post-dispatch control flow differs: JMP is terminal (handler's
+    # RTS pops the JMP-CALLER's return, not the dispatcher's), so each
+    # case can `return` straight through. JSR is non-terminal — its
+    # own pushed return address sits below the handler's RTS, so the
+    # handler returns to the dispatcher and execution must fall
+    # through to the next block. emit_function.py mirrors this by
+    # leaving `block_terminated = False` for JSR, expecting the switch
+    # to break out and the post-call block trace to emit. So:
+    # JSR → emit `break;`, fall through to next block.
+    # JMP/JML → emit `return RECOMP_RETURN_NORMAL;` (terminal).
+    is_jsr = getattr(insn, 'mnem', '') == 'JSR'
 
     # Variant suffix for the dispatched handlers: we route to each
     # handler at its DEFAULT cfg entry (m, x). The handler's own cfg
@@ -1010,7 +1022,12 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     em, ex = 1, 1
     suffix = _variant_suffix(em, ex)
 
-    lines = ["{ /* indirect dispatch — cfg-resolved target list */"]
+    # Comment marker differentiates JSR (call, fall-through) from
+    # JMP/JML (terminator, tail-call) for downstream tooling and
+    # regression tests.
+    _comment = ("indirect dispatch call: cfg-resolved target list" if is_jsr
+                else "indirect dispatch terminator: cfg-resolved target list")
+    lines = [f"{{ /* {_comment} */"]
     # Index source: X or Y register. For JMP/JSR (abs,X)-style dispatch
     # (table_bases empty — the dispatch consumes the operand directly as
     # `(table, X)`), the asm shifts the entry index up by the entry size
@@ -1038,13 +1055,26 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         )
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append("  if (_idx >= _disp_n) {")
-    lines.append(
-        f"    return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    if is_jsr:
+        # Non-terminal: dispatch_oob is a function that returns NORMAL,
+        # but its return value is OUR caller's, not the dispatcher
+        # block's. For a JSR dispatcher we need to fall through to the
+        # post-JSR block — calling dispatch_oob and ignoring its return
+        # is the closest equivalent to "this case had no handler".
+        lines.append(
+            f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    else:
+        lines.append(
+            f"    return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
     lines.append("  }")
     lines.append("  switch (_idx) {")
     for i, e in enumerate(entries):
         if e is None or e == 0:
-            lines.append(f"    case {i}: return RECOMP_RETURN_NORMAL; /* null entry */")
+            if is_jsr:
+                lines.append(f"    case {i}: break; /* null entry */")
+            else:
+                lines.append(
+                    f"    case {i}: return RECOMP_RETURN_NORMAL; /* null entry */")
             continue
         target_bank = (e >> 16) & 0xFF
         local_pc = e & 0xFFFF
@@ -1054,22 +1084,32 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
         _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
         name = f"{base_name}{suffix}"
-        # Tail-call: the dispatched handler's return value propagates
-        # straight back to OUR caller. PB save/restore happens around
-        # the call so PHK inside the handler pushes the target bank.
+        # JMP/JML path: dispatched handler's return value propagates
+        # straight back to OUR caller (tail-call semantics — `return _r`).
+        # JSR path: handler returns to dispatcher; SKIP-N propagation
+        # still goes back through the caller chain via the standard
+        # NLR-propagation check, but on NORMAL the case breaks out of
+        # the switch so the post-JSR block continues. PB save/restore
+        # happens around the call so PHK inside the handler pushes
+        # the target bank.
         env = emitter_helpers.call_with_pb_save(target_bank, name)
         lines.append(f"    case {i}: {{")
         for stmt in env:
             lines.append(f"      {stmt}")
-        # After call_with_pb_save returns (NORMAL path), the dispatcher
-        # itself returns NORMAL: it was a JMP-style terminator. The
-        # SKIP-N propagation is already handled by call_with_pb_save.
-        lines.append("      return RECOMP_RETURN_NORMAL;")
+        if is_jsr:
+            lines.append("      break;")
+        else:
+            lines.append("      return RECOMP_RETURN_NORMAL;")
         lines.append("    }")
     lines.append("    default: break; /* unreachable: gated above */")
     lines.append("  }")
-    lines.append(
-        f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    if is_jsr:
+        # Switch ended; fall through into the next block emitted after
+        # this dispatcher (the post-JSR block in the original asm).
+        lines.append("  /* fall through to post-JSR block */")
+    else:
+        lines.append(
+            f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
     lines.append("}")
     return lines
 
