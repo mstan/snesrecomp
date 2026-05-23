@@ -2036,17 +2036,24 @@ void cpu_trace_offrails(const char *tag, uint32_t hint) {
 uint32_t fnv1a_extern(const char *s) { return fnv1a(s); }
 
 void cpu_trace_arm_default_watches(void) {
-    /* Watch every high bank that SMW should never use as DB at boot.
-     * SMW uses DB ∈ {$00, $01, $02, $03, $04, $05, $07, $0C, $0D, $7E,
-     * $7F}. Anything outside that — especially the high-ROM-bank
-     * mirrors $80-$FF — is poisoning. */
-    for (int b = 0x80; b <= 0xFF; b++) cpu_trace_set_db_watch((uint8_t)b, 1);
-    /* Also watch the specific garbage values seen in trace runs. */
-    for (int b = 0x10; b <= 0x7D; b++) {
-        /* Skip known-good DBs. */
-        if (b == 0x00 || b == 0x01 || b == 0x02 || b == 0x03 || b == 0x04 ||
-            b == 0x05 || b == 0x07 || b == 0x0C || b == 0x0D) continue;
-        cpu_trace_set_db_watch((uint8_t)b, 1);
+    /* DB-poison auto-watch — SMW-specific heuristic ("DB outside
+     * $00-$0D / $7E-$7F is poisoning"). For MMX and other games that
+     * legitimately use high DB banks, every novel bank transition
+     * dump-streams 256 trace events to stderr and stalls the runner.
+     * Opt in via SNESRECOMP_DB_POISON_WATCH=1; arm specific banks at
+     * runtime via the TCP `db_watch_add` command otherwise. */
+    {
+        const char *v = getenv("SNESRECOMP_DB_POISON_WATCH");
+        if (v && v[0] && v[0] != '0') {
+            for (int b = 0x80; b <= 0xFF; b++)
+                cpu_trace_set_db_watch((uint8_t)b, 1);
+            for (int b = 0x10; b <= 0x7D; b++) {
+                if (b == 0x00 || b == 0x01 || b == 0x02 || b == 0x03 ||
+                    b == 0x04 || b == 0x05 || b == 0x07 || b == 0x0C ||
+                    b == 0x0D) continue;
+                cpu_trace_set_db_watch((uint8_t)b, 1);
+            }
+        }
     }
     /* PB should always be $00 in v2 (we set PB explicitly via JSL emit;
      * it should restore on RTL). Watch every NON-zero PB. */
@@ -2077,8 +2084,9 @@ void cpu_trace_arm_default_watches(void) {
         cpu_trace_set_wram_watch(0x7E, (uint16_t)a, 1, 0, 0, 1);
     }
     fprintf(stderr, "[cpu_trace] default watches armed: "
-            "DB high banks + odd middle, PB!=0, S out-of-$01XX-$1FFF, "
-            "GameMode14_InLevel_0086DF, WRAM recorders on $7E:008A/8B/8C\n");
+            "PB!=0, S out-of-$01XX-$1FFF, "
+            "GameMode14_InLevel_0086DF, WRAM recorders on $7E:008A/8B/8C "
+            "(DB-poison auto-watch off; SNESRECOMP_DB_POISON_WATCH=1 to enable)\n");
     /* Arm P.X tripwire at startup so the first 1→0 transition is caught
      * even before TCP attaches. The snapshot doesn't rotate. */
     cpu_trace_arm_px_tripwire();
