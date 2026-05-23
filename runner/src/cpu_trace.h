@@ -144,6 +144,15 @@ typedef struct CpuDbpbEvent {
 #define CPU_TRACE_RING_DEFAULT_ENTRIES (16ULL * 1024ULL * 1024ULL)
 #define CPU_DBPB_RING_LEN   1024
 
+/* Boundary-event exit-kind tags. Recomp-emitted gen code passes these
+ * as the argument to cpu_trace_mark_nlr_exit(), so the symbols must be
+ * visible whether or not the boundary auditor is compiled in. */
+enum {
+    BD_EXIT_KIND_NORMAL = 0,
+    BD_EXIT_KIND_NLR_PRIMARY = 1,
+    BD_EXIT_KIND_SKIP_PROPAGATION = 2,
+};
+
 #if SNESRECOMP_TRACE
 
 /* Heap-allocated ring; pointer + capacity are mutable. The capacity is
@@ -702,11 +711,10 @@ enum {
  *                    LEGITIMATELY broken — its prologue PHB/PHK
  *                    weren't matched by epilogue PLB. This mirrors
  *                    the asm "skip caller" semantic. */
-enum {
-    BD_EXIT_KIND_NORMAL = 0,
-    BD_EXIT_KIND_NLR_PRIMARY = 1,
-    BD_EXIT_KIND_SKIP_PROPAGATION = 2,
-};
+/* (BD_EXIT_KIND_* moved out of the #if SNESRECOMP_TRACE block — gen
+ * code passes these as arguments to cpu_trace_mark_nlr_exit() which
+ * has an inline no-op stub in Production builds; the enum values
+ * still need to compile.) */
 
 typedef struct BoundaryEvent {
     uint64_t seq;            /* monotonic event id (matches g_boundary_idx) */
@@ -1329,6 +1337,30 @@ static inline RecompReturn cpu_trace_dispatch_oob(
     CpuState *c, uint32_t s, uint16_t i) {
     (void)c; (void)s; (void)i;
     return RECOMP_RETURN_NORMAL;
+}
+
+/* Init + boundary-audit stubs — direct callers in main.c and
+ * common_cpu_infra.c rely on these compiling away in Production. */
+static inline uint64_t cpu_trace_init(void) { return 0; }
+static inline uint64_t boundary_audit_init(void) { return 0; }
+static inline void boundary_audit_record_entry(const char *name) { (void)name; }
+static inline void boundary_audit_record_exit(const char *name) { (void)name; }
+static inline void cpu_trace_offrails_clear(void) { }
+static inline int  cpu_trace_offrails_count(void) { return 0; }
+
+/* NLR (non-local-return) hooks — gen code emits these unconditionally
+ * at function exits and JSR sites; need no-op stubs in Production. */
+static inline void cpu_trace_mark_nlr_exit(uint8_t kind) { (void)kind; }
+static inline void cpu_trace_nlr_site_exec(CpuState *c, uint32_t p, const char *n) {
+    (void)c; (void)p; (void)n;
+}
+static inline void cpu_trace_pending_skip_write(CpuState *c, uint32_t p,
+                                                uint8_t v, const char *f) {
+    (void)c; (void)p; (void)v; (void)f;
+}
+static inline void cpu_trace_pending_skip_consume(CpuState *c, uint32_t p,
+                                                  uint8_t v, const char *f) {
+    (void)c; (void)p; (void)v; (void)f;
 }
 
 #endif

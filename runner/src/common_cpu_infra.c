@@ -7,6 +7,7 @@
 #include "snes/snes.h"
 #include "util.h"
 #include "cpu_trace.h"
+#include "debug_server.h"
 #include <setjmp.h>
 #include <string.h>
 #include <time.h>
@@ -56,8 +57,6 @@ const char *g_last_recomp_func = "(none)";
 #define RECOMP_STACK_DEPTH 64
 const char *g_recomp_stack[RECOMP_STACK_DEPTH];
 int g_recomp_stack_top = 0;
-
-extern void debug_server_profile_push(const char *name);
 
 // Function-boundary WRAM snapshot history (Phase B koopa-stomp).
 // When a TCP client sets g_recomp_snap_on_func to a non-NULL name,
@@ -196,8 +195,7 @@ void WatchdogCheck(void) {
     fflush(stderr);
     g_watchdog_enabled = 0;
     g_watchdog_tripped = 1;
-    { extern void debug_server_profile_latch(int);
-      extern int snes_frame_counter;
+    { extern int snes_frame_counter;
       debug_server_profile_latch(snes_frame_counter); }
     longjmp(g_watchdog_jmp, 1);
   }

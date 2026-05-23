@@ -3,6 +3,16 @@
 
 #include <stdint.h>
 
+// SNESRECOMP_TRACE gates the debug-server runtime. When 0 (Production
+// builds), every public debug_server_* function declaration below is
+// replaced with a `static inline` no-op stub so call sites in main.c
+// and common_rtl.c compile to nothing. debug_server.c can then be
+// excluded from the build, dropping ~140 MB of static buffers + heavy
+// snprintf code from the link.
+#ifndef SNESRECOMP_TRACE
+#define SNESRECOMP_TRACE 0
+#endif
+
 // Reverse debugger build flag. See snesrecomp/REVERSE_DEBUGGER.md.
 // When 0: the generator emits raw `g_ram[x] = val` stores exactly as it
 // always has; no hooks are compiled; zero runtime cost. When 1: the
@@ -16,6 +26,8 @@
 #ifndef SNESRECOMP_REVERSE_DEBUG
 #define SNESRECOMP_REVERSE_DEBUG 1
 #endif
+
+#if SNESRECOMP_TRACE
 
 // Initialize the debug TCP server on the given port. Non-blocking.
 // Returns 0 on success, -1 on failure.
@@ -73,6 +85,32 @@ void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value);
 // walks the two rings forward in lockstep to identify the first
 // divergent (byte_addr, value) pair across the streams.
 void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value);
+
+// Per-function profiling — called from RecompStackPush and at the
+// watchdog trip point in common_cpu_infra.c. Records a histogram of
+// function names and the frame they were latched at.
+void debug_server_profile_push(const char *name);
+void debug_server_profile_latch(int frame_num);
+
+#else  /* SNESRECOMP_TRACE = 0 — Production: no-op every call. */
+
+static inline int debug_server_init(int port) { (void)port; return 0; }
+static inline void debug_server_poll(void) { }
+static inline void debug_server_shutdown(void) { }
+static inline void debug_server_start_paused(void) { }
+static inline void debug_server_wait_if_paused(void) { }
+static inline int debug_server_consume_loadstate(void) { return -1; }
+static inline uint32_t debug_server_get_controller_inputs(void) { return 0; }
+static inline uint32_t debug_server_get_controller_active_mask(void) { return 0; }
+static inline void debug_server_record_frame(int frame) { (void)frame; }
+static inline void debug_server_set_ram(uint8_t *ram, uint32_t ram_size) { (void)ram; (void)ram_size; }
+static inline void debug_server_on_reg_write(uint16_t adr, uint8_t val) { (void)adr; (void)val; }
+static inline void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) { (void)byte_addr; (void)value; }
+static inline void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value) { (void)byte_addr; (void)value; }
+static inline void debug_server_profile_push(const char *name) { (void)name; }
+static inline void debug_server_profile_latch(int frame_num) { (void)frame_num; }
+
+#endif  /* SNESRECOMP_TRACE */
 
 #if SNESRECOMP_REVERSE_DEBUG
 // Tier-1 reverse-debugger WRAM write hooks. Called from every WRAM store
