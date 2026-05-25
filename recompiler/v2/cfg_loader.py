@@ -135,6 +135,18 @@ class BankCfg:
     # so the helper fires from every caller-body that inlined the
     # dispatch as part of its decoded CFG. Map: pc16 -> c_function_name.
     hle_dispatch: dict = field(default_factory=dict)
+    # `force_variant_at <site_pc24> <m> <x>` — at the named direct
+    # JSR/JSL site, bypass the runtime 4-way (m, x) dispatch and emit a
+    # hardcoded call to the (m, x) variant of the target. Used for
+    # diagnostic VALIDATION of suspected m-flag tracking bugs: if forcing
+    # the expected variant at a specific site makes a freeze go away,
+    # the runtime cpu->m_flag at that site is wrong and the root cause
+    # is upstream. Once the upstream bug is fixed the hint should be
+    # REMOVED — this directive is intentionally narrow (one site, one
+    # (m, x)) and is NOT a long-term workaround. The 24-bit PC matches
+    # the JSR/JSL instruction's own address (the `insn.addr` of the
+    # call), NOT the target. Map: site_pc24 -> (m, x).
+    force_variant_at: dict = field(default_factory=dict)
 
 
 # Token regex helpers
@@ -244,6 +256,37 @@ def load_bank_cfg(path: str) -> BankCfg:
                         f"{path}: hle_func c_function_name must be a valid "
                         f"C identifier, got: {c_name!r}")
                 cfg.hle_func[pc16] = c_name
+                continue
+
+            # force_variant_at <site_pc24> <m> <x> — pin the variant
+            # called at the named direct JSR/JSL site. See BankCfg
+            # field doc for use as a diagnostic for suspected m-flag
+            # tracking bugs. Format: site_pc24 hex (with or without 0x),
+            # m and x each 0 or 1.
+            if head == 'force_variant_at':
+                if len(tokens) != 4:
+                    raise ValueError(
+                        f"{path}: force_variant_at needs <site_pc24> <m> <x>, "
+                        f"got: {stripped!r}")
+                try:
+                    site_pc24 = _parse_hex(tokens[1]) & 0xFFFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: force_variant_at bad site_pc24 {tokens[1]!r}: {e}")
+                try:
+                    m_val = int(tokens[2])
+                    x_val = int(tokens[3])
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: force_variant_at m and x must be 0 or 1: {e}")
+                if m_val not in (0, 1) or x_val not in (0, 1):
+                    raise ValueError(
+                        f"{path}: force_variant_at m and x must be 0 or 1, "
+                        f"got m={m_val} x={x_val}")
+                if site_pc24 in cfg.force_variant_at:
+                    raise ValueError(
+                        f"{path}: force_variant_at duplicate site ${site_pc24:06X}")
+                cfg.force_variant_at[site_pc24] = (m_val, x_val)
                 continue
 
             # hle_dispatch <site_pc16> <c_function_name> — replace the

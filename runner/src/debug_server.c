@@ -623,6 +623,22 @@ static struct {
     } log[WRAM_TRACE_LOG_SIZE];
 } s_wram_trace = {0};
 
+/* Arm the dedicated 1M-entry WRAM-write ring at boot for the
+ * DP queue/state pointers that have been investigation targets.
+ * This ring is SEPARATE from the main cpu_trace ring — it only
+ * fills on WRAM writes in the armed ranges, so it survives
+ * arbitrarily long BCS-self-loop block storms in the cpu_trace
+ * ring. Queryable via `get_wram_trace` from TCP. */
+void debug_server_arm_default_wram_trace(void) {
+    /* DMA queue tail pointers + neighbors. $7E:00A2 = $DB:0500
+     * stride-8 queue tail, $A5/$A6 = $7E:F000 variable-size queue
+     * tail, $A3/$A4 historical investigation targets. */
+    s_wram_trace.ranges[s_wram_trace.nranges].lo = 0x000A2;
+    s_wram_trace.ranges[s_wram_trace.nranges].hi = 0x000A6;
+    s_wram_trace.nranges++;
+    s_wram_trace.active = 1;
+}
+
 // ---- Tier-4 reads: WRAM read trace ----
 //
 // Symmetric counterpart of Tier 1's write trace. Every g_ram[X]
@@ -4573,6 +4589,65 @@ static void cmd_boundary_get(const char *args) {
 #endif
 }
 
+/* dispatch_log_get [count=N] [offset=N]
+ *   Dump cpu_dispatch_pc call log (PEI-trampoline diagnostic).
+ *   count=N (default 64, max 256): events to return, most recent first.
+ *   offset=N: skip N most-recent events.
+ *   Each event: pc24, mx_idx (0..3=M0X0/M0X1/M1X0/M1X1), found
+ *   (1=table hit, 0=miss), mirror (1=found via LoROM bank mirror),
+ *   frame.
+ */
+typedef struct DispatchLogEntry_ DispatchLogEntry_;
+struct DispatchLogEntry_ {
+    uint32_t pc24;
+    uint32_t source_pc24;
+    const char *func_name;
+    uint8_t  mx_idx, found, mirror, pad;
+    uint32_t frame;
+};
+unsigned cpu_dispatch_log_count(void);
+const DispatchLogEntry_ *cpu_dispatch_log_at(unsigned i);
+
+static void cmd_dispatch_log_get(const char *args) {
+    int count = 64;
+    int offset = 0;
+    if (args) {
+        const char *p = strstr(args, "count=");
+        if (p) sscanf(p + 6, "%d", &count);
+        p = strstr(args, "offset=");
+        if (p) sscanf(p + 7, "%d", &offset);
+    }
+    if (count < 1) count = 1;
+    if (count > 256) count = 256;
+    if (offset < 0) offset = 0;
+    unsigned total = cpu_dispatch_log_count();
+    static char buf[16384];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"total\":%u,\"events\":[", total);
+    int emitted = 0;
+    /* Walk backwards from most recent. */
+    unsigned start = total;
+    for (int k = 0; k < offset && start > 0; k++) start--;
+    for (int k = 0; k < count && start > 0; k++) {
+        start--;
+        const DispatchLogEntry_ *e = cpu_dispatch_log_at(start);
+        if (e == NULL) break;
+        if (pos > (int)sizeof(buf) - 256) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"frame\":%u,\"pc24\":\"0x%06x\",\"source_pc24\":\"0x%06x\","
+            "\"func\":\"%s\",\"mx\":%u,"
+            "\"found\":%u,\"mirror\":%u}",
+            emitted ? "," : "",
+            e->frame, e->pc24, e->source_pc24,
+            e->func_name ? e->func_name : "?",
+            (unsigned)e->mx_idx,
+            (unsigned)e->found, (unsigned)e->mirror);
+        emitted++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", emitted);
+    send_line(buf);
+}
+
 static void cmd_db_trip_arm(const char *args) {
 #if SNESRECOMP_TRACE
     unsigned int target = 0xC0;
@@ -5138,13 +5213,14 @@ static void cmd_stack_drift_disarm(const char *args) {
 
 /* ── Static M/X claim verifier TCP commands ────────────────────────────
  *
- * Companion to docs/ABSTRACT_INTERPRETATION_GAPS.md. Surfaces decoder-
- * soundness mismatches at the moment they happen, before they cascade
- * into visible symptoms.
+ * Companion to docs/ABSTRACT_INTERPRETATION_GAPS.md. Accumulating
+ * always-on observability surface for decoder-soundness mismatches.
+ * One record per (func_name, runtime_m, runtime_x). NOT a tripwire.
  *
- *   mx_claim_check_arm                    — arm verifier (clear trip)
- *   mx_claim_check_get                    — return current trip snapshot
- *   mx_claim_check_disarm                 — disarm verifier
+ *   mx_claim_check_arm                    — clear + arm the table
+ *   mx_claim_check_disarm                 — disarm
+ *   mx_claim_check_get                    — summary (counts only)
+ *   mx_claim_get_all                      — dump every record
  */
 static void cmd_mx_claim_check_arm(const char *args) {
     (void)args;
@@ -5169,36 +5245,65 @@ static void cmd_mx_claim_check_disarm(const char *args) {
 static void cmd_mx_claim_check_get(const char *args) {
     (void)args;
 #if SNESRECOMP_TRACE
-    MxClaimViolation *t = &g_mx_claim_violation;
-    static char buf[8192];
-    int pos = snprintf(buf, sizeof(buf),
-        "{\"armed\":%u,\"triggered\":%u",
-        (unsigned)t->armed, (unsigned)t->triggered);
-    if (t->triggered) {
+    MxClaimTable *t = &g_mx_claim_table;
+    static char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"armed\":%u,\"record_count\":%u,\"record_cap\":%u,"
+        "\"total_hits\":%llu,\"overflow_count\":%llu}",
+        (unsigned)t->armed,
+        (unsigned)t->record_count,
+        (unsigned)MX_CLAIM_RECORD_CAP,
+        (unsigned long long)t->total_hits,
+        (unsigned long long)t->overflow_count);
+    send_line(buf);
+#else
+    send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
+static void cmd_mx_claim_get_all(const char *args) {
+    (void)args;
+#if SNESRECOMP_TRACE
+    MxClaimTable *t = &g_mx_claim_table;
+    /* Each record can produce ~1200 chars (stack of 16 names × ~64 chars
+     * + scalar fields). 256 × 1300 = ~330 KiB upper bound. */
+    static char buf[400 * 1024];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "{\"armed\":%u,\"record_count\":%u,\"record_cap\":%u,"
+        "\"total_hits\":%llu,\"overflow_count\":%llu,\"records\":[",
+        (unsigned)t->armed,
+        (unsigned)t->record_count,
+        (unsigned)MX_CLAIM_RECORD_CAP,
+        (unsigned long long)t->total_hits,
+        (unsigned long long)t->overflow_count);
+    for (uint32_t i = 0; i < t->record_count && pos < (int)sizeof(buf) - 2048; i++) {
+        MxClaimRecord *r = &t->records[i];
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            ",\"frame\":%d,\"pc24\":\"0x%06x\","
+            "%s{\"func\":\"%s\","
             "\"claimed_m\":%u,\"claimed_x\":%u,"
             "\"runtime_m\":%u,\"runtime_x\":%u,"
-            "\"func\":\"%s\","
+            "\"hit_count\":%llu,"
+            "\"first_frame\":%d,\"first_pc24\":\"0x%06x\","
             "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
             "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
             "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
-            "\"e\":%u,"
-            "\"stack\":[",
-            t->frame, t->pc24,
-            (unsigned)t->claimed_m, (unsigned)t->claimed_x,
-            (unsigned)t->runtime_m, (unsigned)t->runtime_x,
-            t->func_name,
-            t->A, t->X, t->Y, t->S, t->D,
-            t->DB, t->PB, t->P,
-            (unsigned)t->e_flag);
-        for (int i = 0; i < t->stack_depth && pos < (int)sizeof(buf) - 256; i++) {
+            "\"e\":%u,\"stack\":[",
+            i ? "," : "",
+            r->func_name,
+            (unsigned)r->claimed_m, (unsigned)r->claimed_x,
+            (unsigned)r->runtime_m, (unsigned)r->runtime_x,
+            (unsigned long long)r->hit_count,
+            r->first_frame, r->first_pc24,
+            r->A, r->X, r->Y, r->S, r->D,
+            r->DB, r->PB, r->P, (unsigned)r->e_flag);
+        for (int s = 0; s < r->stack_depth && pos < (int)sizeof(buf) - 1024; s++) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s\"%s\"", i ? "," : "", t->stack[i]);
+                "%s\"%s\"", s ? "," : "", r->stack[s]);
         }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
-    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
 #else
     send_fmt("{\"error\":\"SNESRECOMP_TRACE not enabled\"}");
@@ -5835,12 +5940,14 @@ static const CmdEntry s_commands[] = {
     {"boundary_get",   cmd_boundary_get},
     {"db_trip_arm",    cmd_db_trip_arm},
     {"db_trip_get",    cmd_db_trip_get},
+    {"dispatch_log_get", cmd_dispatch_log_get},
     {"nlr_diag",       cmd_nlr_diag},
     {"stack_drift_get", cmd_stack_drift_get},
     {"stack_drift_arm", cmd_stack_drift_arm},
     {"mx_claim_check_arm", cmd_mx_claim_check_arm},
     {"mx_claim_check_disarm", cmd_mx_claim_check_disarm},
     {"mx_claim_check_get", cmd_mx_claim_check_get},
+    {"mx_claim_get_all", cmd_mx_claim_get_all},
     {"mx_async_check_arm", cmd_mx_async_check_arm},
     {"mx_async_check_disarm", cmd_mx_async_check_disarm},
     {"mx_async_check_get", cmd_mx_async_check_get},

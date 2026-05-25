@@ -180,19 +180,19 @@ def test_jsl_emits_call_long():
 def test_rts_emits_return_short():
     insn = _decode(bytes([0x60]))
     ops = lowering.lower(insn, value_factory=_vf())
-    assert ops == [Return(long=False)]
+    assert ops == [Return(long=False, source_pc24=0x008000)]
 
 
 def test_rtl_emits_return_long():
     insn = _decode(bytes([0x6B]))
     ops = lowering.lower(insn, value_factory=_vf())
-    assert ops == [Return(long=True)]
+    assert ops == [Return(long=True, source_pc24=0x008000)]
 
 
 def test_rti_emits_return_interrupt():
     insn = _decode(bytes([0x40]))
     ops = lowering.lower(insn, value_factory=_vf())
-    assert ops == [Return(long=True, interrupt=True)]
+    assert ops == [Return(long=True, interrupt=True, source_pc24=0x008000)]
 
 
 def test_tax_emits_transfer_a_x():

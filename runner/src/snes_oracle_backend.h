@@ -65,6 +65,28 @@ int snes_oracle_select(const char *name);
  * re-init. NULL until init succeeds. */
 const char *snes_oracle_rom_path(void);
 
+/* Per-game opt-out. Call from main.c BEFORE snes_oracle_init_default to
+ * declare that this game's investigation workflow makes oracle comparison
+ * meaningless (e.g., save-state-load-based repros that the from-boot
+ * oracle cannot follow). When set, every TCP emu_* / find_first_divergence
+ * / fuzz_run_snippet command returns a structured warning that names
+ * `reason` and refuses to silently no-op.
+ *
+ * The disabled state is INTENTIONAL guardrail, not a temporary feature
+ * flag — the warning explicitly tells callers (humans and agents) that
+ * re-enabling without fixing the underlying input/state-sync mismatch
+ * is NOT a solution. `reason` is stored by reference; pass a string
+ * literal or otherwise persistent storage.
+ *
+ * Pair with: skip the corresponding snes_oracle_init_default() call in
+ * the same main.c so g_active_backend stays NULL and emu_oracle_run_frame
+ * is a per-frame no-op. */
+void snes_oracle_set_disabled_by_game(const char *reason);
+
+/* Query whether the per-game opt-out is active. Used by emu_oracle_cmds
+ * dispatcher and may be used by main.c to gate per-frame work. */
+int snes_oracle_is_disabled_by_game(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -366,9 +366,21 @@ class Call(IROp):
 
 @dataclass(frozen=True)
 class Return(IROp):
-    """RTS / RTL / RTI."""
+    """RTS / RTL / RTI.
+
+    `source_pc24` is the 24-bit address of the source asm RTS/RTL/RTI
+    instruction. Lowering stamps it from `insn.addr` for every direct
+    Return so the post-lowering "PEI-trampoline" stack-delta analyser
+    (see decoder.analyze_function_trampoline_returns) can key its
+    decisions by pc24, and codegen.py can consult the populated
+    `_TRAMPOLINE_RETURNS` set to decide whether to emit the standard
+    `return _ps;` (balanced) or the unbalanced-frame dispatch path
+    (pop topmost bytes, tail-call cpu_dispatch_pc). None when the
+    Return was synthesized by an internal pass without a source insn.
+    """
     long: bool                 # True for RTL/RTI, False for RTS
     interrupt: bool = False    # True for RTI
+    source_pc24: Optional[int] = None
 
 
 # Misc

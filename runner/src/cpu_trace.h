@@ -151,6 +151,12 @@ enum {
     BD_EXIT_KIND_NORMAL = 0,
     BD_EXIT_KIND_NLR_PRIMARY = 1,
     BD_EXIT_KIND_SKIP_PROPAGATION = 2,
+    /* PEI-trampoline narrow detector (2026-05-24): _emit_return saw a
+     * cpu->S != _entry_s at RTS/RTL on a trampoline-flagged function,
+     * popped the topmost frame as (PB:PC+1), and tail-called
+     * cpu_dispatch_pc. Stack drift here is the intentional asm
+     * trampoline pattern (e.g. bank_04_9A02 path C in MMX). */
+    BD_EXIT_KIND_TRAMPOLINE = 3,
 };
 
 #if SNESRECOMP_TRACE
@@ -887,9 +893,13 @@ typedef struct StackDriftTripwire {
  * trusts the static (m, x) (push/pull width pinning, WriteReg width,
  * etc.) emits wrong code at the mismatch site.
  *
- * Trips on FIRST mismatch (one-shot). Captures full state + recomp
- * stack snapshot for triage. The companion stack-drift tripwire
- * catches the downstream cost; this catches the cause.
+ * Accumulating table — NOT a one-shot tripwire. Every mismatch is
+ * looked up by (func_name, runtime_m, runtime_x); a record's
+ * hit_count is incremented and total_hits goes up. The first hit per
+ * key captures the full CpuState + recomp stack snapshot. Subsequent
+ * hits update the counter only. This is the canonical observability
+ * surface for decoder M/X soundness gaps — query it any time with
+ * `mx_claim_get_all` and triage by hit count or first-seen frame.
  *
  * See docs/ABSTRACT_INTERPRETATION_GAPS.md for the underlying soundness
  * model.
@@ -897,34 +907,50 @@ typedef struct StackDriftTripwire {
 #define MX_CLAIM_TRIP_FUNC_LEN 64
 #define MX_CLAIM_TRIP_STACK_DEPTH 16
 
-typedef struct MxClaimViolation {
-    uint8_t  armed;
-    uint8_t  triggered;
-    uint8_t  pad[2];
+/* Accumulating table: one record per (func_name, runtime_m, runtime_x)
+ * key. First-seen state is captured; subsequent hits increment a
+ * counter only. This replaces the previous one-shot tripwire, per the
+ * always-on ring-buffer rule. */
+#define MX_CLAIM_RECORD_CAP   256
+#define MX_CLAIM_HASH_SIZE   1024   /* power of 2, >= 4x record cap */
+#define MX_CLAIM_HASH_EMPTY  0xFFFFu
 
-    /* Captured at trip */
-    int32_t  frame;
-    uint32_t pc24;
+typedef struct MxClaimRecord {
+    uint8_t  used;
     uint8_t  claimed_m;       /* decoder's static M from name suffix */
     uint8_t  claimed_x;       /* decoder's static X from name suffix */
-    uint8_t  runtime_m;       /* cpu->m_flag at the func entry */
-    uint8_t  runtime_x;       /* cpu->x_flag at the func entry */
-    char     func_name[MX_CLAIM_TRIP_FUNC_LEN];
+    uint8_t  runtime_m;       /* cpu->m_flag at the func entry (key) */
+    uint8_t  runtime_x;       /* cpu->x_flag at the func entry (key) */
+    uint8_t  pad[3];
 
-    /* Full CpuState at trip */
+    uint64_t hit_count;
+    int32_t  first_frame;
+    uint32_t first_pc24;
+    char     func_name[MX_CLAIM_TRIP_FUNC_LEN];   /* key */
+
+    /* First-seen CpuState */
     uint16_t A, X, Y, S, D;
     uint8_t  DB, PB, P, e_flag;
 
-    /* Recomp stack snapshot (caller chain — most useful for "which
-     * caller violated the claim?") */
+    /* First-seen recomp stack snapshot */
     int32_t  stack_depth;
     char     stack[MX_CLAIM_TRIP_STACK_DEPTH][MX_CLAIM_TRIP_FUNC_LEN];
-} MxClaimViolation;
+} MxClaimRecord;
+
+typedef struct MxClaimTable {
+    uint8_t  armed;
+    uint8_t  pad[3];
+    uint32_t record_count;       /* slots used (<= MX_CLAIM_RECORD_CAP) */
+    uint64_t total_hits;         /* sum of all mismatch hits */
+    uint64_t overflow_count;     /* mismatches we couldn't allocate a slot for */
+    uint16_t hash[MX_CLAIM_HASH_SIZE];
+    MxClaimRecord records[MX_CLAIM_RECORD_CAP];
+} MxClaimTable;
 
 #if SNESRECOMP_TRACE
 extern DbTripwire g_db_tripwire;
 extern StackDriftTripwire g_stack_drift_tripwire;
-extern MxClaimViolation g_mx_claim_violation;
+extern MxClaimTable g_mx_claim_table;
 
 void cpu_trace_arm_db_tripwire(uint8_t target_db);
 void cpu_trace_disarm_db_tripwire(void);

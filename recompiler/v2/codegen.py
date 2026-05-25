@@ -32,7 +32,7 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from typing import Dict, List  # noqa: E402
+from typing import Dict, List, Tuple  # noqa: E402
 
 # Resolver: 24-bit address (bank << 16 | pc) -> friendly C function name.
 # Populated by emit_bank before each bank emit (a process-wide map of every
@@ -74,6 +74,68 @@ def set_rom_size(size: int) -> None:
     """Set the ROM size used for JSR/JSL target validation."""
     global _ROM_SIZE
     _ROM_SIZE = int(size)
+
+
+# Per-call-site variant pin, populated from per-bank cfg
+# `force_variant_at` directives. Keyed by the JSR/JSL site PC24 (the
+# instruction's own address, NOT the target). When a Call site PC24 is
+# present here, `_emit_call` bypasses the runtime 4-way (m, x) dispatch
+# and hardcodes the single variant for the bound (m, x). Diagnostic
+# only; see cfg_loader.BankCfg.force_variant_at for use rationale.
+_FORCE_VARIANT_AT: Dict[int, Tuple[int, int]] = {}
+
+
+# Per-RTS/RTL-site flag: populated by the post-lowering stack-delta
+# analyser (see decoder.analyze_function_trampoline_returns). When a
+# Return op's source_pc24 is in this set, `_emit_return` emits the
+# PEI-trampoline dispatch path: pop the topmost frame from cpu->S,
+# compute (PB:PC+1), tail-call cpu_dispatch_pc. For Returns NOT in
+# the set, emit the standard `return _ps;`. The default — empty set —
+# means every Return is treated as balanced (matches pre-fix behavior).
+#
+# Trampoline classification is based on an in-function dataflow pass
+# that tracks `delta = sum(push_bytes - pop_bytes)` across the CFG.
+# A Return reaches with delta != 0 from at least one path → flagged.
+# Only the asm-instruction set is considered (PHP/PHA/PEI/.../PLA/PLP);
+# JSR/JSL/RTS/RTL are treated as 0-delta (the codegen does NOT push
+# their hardware frame onto cpu->S — see _emit_call / _emit_return).
+_TRAMPOLINE_RETURNS: set = set()
+
+
+def set_trampoline_returns(s: set) -> None:
+    """Replace the per-Return-site trampoline classification set.
+
+    Caller is responsible for populating with the union of all
+    Returns flagged across every emitted bank in this regen run.
+    Keys are the asm pc24 of the source RTS/RTL instruction (matches
+    Return.source_pc24 stamped by lowering).
+    """
+    global _TRAMPOLINE_RETURNS
+    _TRAMPOLINE_RETURNS = set(s) if s else set()
+
+
+def add_trampoline_returns(s: set) -> None:
+    """Union additional Return pc24s into the classification set.
+
+    Used during the per-bank emit loop: each emit_bank pass classifies
+    its own functions' Returns and contributes them to the global set.
+    The auto-promote loop may re-emit banks with the union from prior
+    passes — caller should snapshot before each pass and merge.
+    """
+    global _TRAMPOLINE_RETURNS
+    _TRAMPOLINE_RETURNS = _TRAMPOLINE_RETURNS | set(s)
+
+
+def set_force_variant_at(d: Dict[int, Tuple[int, int]]) -> None:
+    """Replace the per-site variant-pin map.
+
+    v2_regen calls this once after collecting every cfg's
+    force_variant_at entries. Pass an empty dict to clear. The
+    site-PC24 key matches `Call.source_pc24`, stamped by lowering for
+    BOTH direct JSR/JSL and indirect JSR (abs,X) sites.
+    """
+    global _FORCE_VARIANT_AT
+    _FORCE_VARIANT_AT = dict(d) if d else {}
 
 
 def take_rejected_call_targets() -> set:
@@ -132,6 +194,11 @@ def _variant_suffix(m: int, x: int) -> str:
     the cfg-default (m,x).
     """
     return f"_M{m & 1}X{x & 1}"
+
+
+# All four (m, x) variants — used by every site that demands the full
+# variant set (runtime dispatch emits one switch case per variant).
+_MX_VARIANTS = ((0, 0), (0, 1), (1, 0), (1, 1))
 
 
 def set_name_resolver(name_map: Dict[int, str]) -> None:
@@ -1078,12 +1145,46 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             base_name = _NAME_RESOLVER.get(tgt_addr)
             if base_name is None:
                 base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
-            _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
-            name = f"{base_name}{suffix}"
-            env = emitter_helpers.call_with_pb_save(target_bank, name)
             lines.append(f"    case 0x{case_value:04x}: {{")
-            for stmt in env:
-                lines.append(f"      {stmt}")
+            if is_rts_stack_dispatch:
+                # SEP #$30 forced m=x=1 immediately above; the M1X1
+                # variant is the only one ever entered. Keep the
+                # single-variant call.
+                _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+                name = f"{base_name}{suffix}"
+                env = emitter_helpers.call_with_pb_save(target_bank, name)
+                for stmt in env:
+                    lines.append(f"      {stmt}")
+            else:
+                # General indirect dispatch: runtime (m, x) dispatch
+                # inside one PB save/restore envelope so the wrong-
+                # variant class is eliminated for indirect calls too.
+                for em_v, ex_v in _MX_VARIANTS:
+                    _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
+                lines.append("      uint8 _saved_pb = cpu->PB;")
+                lines.append(
+                    f"      cpu_trace_pb_change(cpu, 0, _saved_pb,"
+                    f" {target_bank:#04x}, CPU_TR_JSL);")
+                lines.append(f"      cpu->PB = {target_bank:#04x};")
+                lines.append("      RecompReturn _r;")
+                lines.append(
+                    "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
+                for em_v, ex_v in _MX_VARIANTS:
+                    idx_v = (em_v << 1) | ex_v
+                    name_v = f"{base_name}{_variant_suffix(em_v, ex_v)}"
+                    lines.append(f"        case {idx_v}: _r = {name_v}(cpu); break;")
+                lines.append("        default: _r = RECOMP_RETURN_NORMAL; break;")
+                lines.append("      }")
+                lines.append(
+                    "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
+                lines.append("      cpu->PB = _saved_pb;")
+                lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
+                lines.append(
+                    "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
+                lines.append(
+                    "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
+                lines.append("        return (RecompReturn)((int)_r - 1);")
+                lines.append("      }")
             if is_jsr:
                 lines.append("      break;")
             else:
@@ -1143,8 +1244,6 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         base_name = _NAME_RESOLVER.get(tgt_addr)
         if base_name is None:
             base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
-        _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
-        name = f"{base_name}{suffix}"
         # JMP/JML path: dispatched handler's return value propagates
         # straight back to OUR caller (tail-call semantics — `return _r`).
         # JSR path: handler returns to dispatcher; SKIP-N propagation
@@ -1153,10 +1252,47 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         # the switch so the post-JSR block continues. PB save/restore
         # happens around the call so PHK inside the handler pushes
         # the target bank.
-        env = emitter_helpers.call_with_pb_save(target_bank, name)
         lines.append(f"    case {i}: {{")
-        for stmt in env:
-            lines.append(f"      {stmt}")
+        if is_rts_stack_dispatch:
+            # SEP #$30 forced m=x=1 immediately above; single-variant
+            # _M1X1 is the only one ever entered.
+            _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+            name = f"{base_name}{suffix}"
+            env = emitter_helpers.call_with_pb_save(target_bank, name)
+            for stmt in env:
+                lines.append(f"      {stmt}")
+        else:
+            # General indirect dispatch: runtime (m, x) dispatch inside
+            # one PB save/restore envelope. Eliminates the wrong-variant
+            # class for indirect calls (Dr. Light freeze 2026-05-23
+            # traced into a CC84_M1X1 entered at runtime M1X0 via this
+            # path).
+            for em_v, ex_v in _MX_VARIANTS:
+                _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
+            lines.append("      uint8 _saved_pb = cpu->PB;")
+            lines.append(
+                f"      cpu_trace_pb_change(cpu, 0, _saved_pb,"
+                f" {target_bank:#04x}, CPU_TR_JSL);")
+            lines.append(f"      cpu->PB = {target_bank:#04x};")
+            lines.append("      RecompReturn _r;")
+            lines.append(
+                "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
+            for em_v, ex_v in _MX_VARIANTS:
+                idx_v = (em_v << 1) | ex_v
+                name_v = f"{base_name}{_variant_suffix(em_v, ex_v)}"
+                lines.append(f"        case {idx_v}: _r = {name_v}(cpu); break;")
+            lines.append("        default: _r = RECOMP_RETURN_NORMAL; break;")
+            lines.append("      }")
+            lines.append(
+                "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
+            lines.append("      cpu->PB = _saved_pb;")
+            lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
+            lines.append(
+                "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
+            lines.append(
+                "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
+            lines.append("        return (RecompReturn)((int)_r - 1);")
+            lines.append("      }")
         if is_jsr:
             lines.append("      break;")
         else:
@@ -1305,47 +1441,128 @@ def _emit_call(op: Call) -> List[str]:
         return [f"/* Call: target ${addr:06X} not a valid LoROM code "
                 f"address and no cfg name — skipped (decoder followed "
                 f"garbage operand past an RTS) */"]
-    suffix = _variant_suffix(op.entry_m, op.entry_x)
     base_name = _NAME_RESOLVER.get(addr)
     if base_name is None:
         bank = (addr >> 16) & 0xFF
         pc = addr & 0xFFFF
         base_name = f"bank_{bank:02X}_{pc:04X}"
-    # Always record demand — cfg-named targets need their (m, x)
-    # variants discovered too, not just synthetic-named auto-promotes.
-    _UNRESOLVED_CALL_TARGETS.add((addr, op.entry_m & 1, op.entry_x & 1))
-    name = f"{base_name}{suffix}"
     target_bank = (addr >> 16) & 0xFF
-    # RecompReturn ABI: every callsite captures the callee's return
-    # status. NORMAL → continue. SKIP_N → emit `return SKIP_(N-1)` so
-    # the non-local-return propagates one C call frame upward (mirrors
-    # the asm idiom where extra PLA's discarded JSR return PCs and the
-    # following RTS skipped past one or more callers).
+    # Runtime (m, x) dispatch: emit a 4-way switch on cpu->m_flag,
+    # cpu->x_flag so the variant called matches the CPU's actual mode
+    # at the JSR/JSL site. The decoder's static (m, x) tracking can
+    # drift from runtime (PHP/PLP/RTI through unmodeled paths,
+    # ambiguous callee exit states, etc.); the wrong-variant class
+    # that surfaced via cpu_trace_mx_claim_check (Dr. Light capsule
+    # freeze 2026-05-23) is eliminated by the dispatch — runtime
+    # m/x ALWAYS picks the correct variant. Per-variant body emission
+    # gets the operand widths right per (m, x); the unused variants
+    # for a given runtime path are dead but compile cleanly. Demand
+    # all 4 variants so v2_regen's autopromote synthesizes whichever
+    # the static analysis missed.
+    for em, ex in _MX_VARIANTS:
+        _UNRESOLVED_CALL_TARGETS.add((addr, em, ex))
+    # cfg-pinned variant override. When the cfg names this call site
+    # via `force_variant_at <site_pc24> <m> <x>`, bypass the 4-way
+    # runtime switch and emit a hardcoded single-variant call. Used as
+    # a diagnostic to validate suspected m-flag tracking bugs — see
+    # cfg_loader.BankCfg.force_variant_at doc. Lookup keyed by the
+    # JSR/JSL instruction's own PC24 (op.source_pc24), set by lowering.
+    pinned = None
+    if op.source_pc24 is not None:
+        pinned = _FORCE_VARIANT_AT.get(op.source_pc24 & 0xFFFFFF)
+    if pinned is not None:
+        pm, px = pinned
+        pinned_name = f"{base_name}{_variant_suffix(pm, px)}"
+        if op.long:
+            # JSL: keep the PB save/restore so the callee runs in its
+            # target bank but the caller's PB is preserved on return.
+            return [
+                "{",
+                "  uint8 _saved_pb = cpu->PB;",
+                f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
+                f"  cpu->PB = {target_bank:#04x};",
+                f"  RecompReturn _r = {pinned_name}(cpu);  "
+                f"/* cfg force_variant_at ${op.source_pc24:06X} -> "
+                f"M{pm}X{px} */",
+                "  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
+                "  cpu->PB = _saved_pb;",
+                "  if (_r != RECOMP_RETURN_NORMAL) {",
+                "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
+                "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
+                "    return (RecompReturn)((int)_r - 1);",
+                "  }",
+                "}",
+            ]
+        # JSR: same-bank short call. No PB change.
+        return [
+            "{",
+            f"  RecompReturn _r = {pinned_name}(cpu);  "
+            f"/* cfg force_variant_at ${op.source_pc24:06X} -> "
+            f"M{pm}X{px} */",
+            "  if (_r != RECOMP_RETURN_NORMAL) {",
+            "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
+            "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
+            "    return (RecompReturn)((int)_r - 1);",
+            "  }",
+            "}",
+        ]
     if op.long:
-        # JSL: bank save+restore wraps the call. Propagation block goes
-        # AFTER the PB restore so the caller's PB is correct on the
-        # SKIP_N return path too.
-        env = emitter_helpers.call_with_pb_save(target_bank, name)
-        return ["{"] + [f"  {s}" for s in env] + ["}"]
+        # JSL: PB save/restore wraps the switch. The propagation
+        # block sits AFTER the PB restore so the caller's PB is
+        # correct on the SKIP_N return path.
+        lines = [
+            "{",
+            "  uint8 _saved_pb = cpu->PB;",
+            f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
+            f"  cpu->PB = {target_bank:#04x};",
+            "  RecompReturn _r;",
+            "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+        ]
+        for em, ex in _MX_VARIANTS:
+            idx = (em << 1) | ex
+            name = f"{base_name}{_variant_suffix(em, ex)}"
+            lines.append(f"    case {idx}: _r = {name}(cpu); break;")
+        lines.extend([
+            "    default: _r = RECOMP_RETURN_NORMAL; break;",
+            "  }",
+            "  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
+            "  cpu->PB = _saved_pb;",
+            "  if (_r != RECOMP_RETURN_NORMAL) {",
+            "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
+            "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
+            "    return (RecompReturn)((int)_r - 1);",
+            "  }",
+            "}",
+        ])
+        return lines
     # JSR: same-bank short call. PB doesn't change.
     # NB: emit_function.py's per-line scanner auto-injects a
     # RecompStackPop() before any line whose stripped text starts with
     # "return" — that includes the SKIP propagation `return` below.
-    return [
+    lines = [
         "{",
-        f"  RecompReturn _r = {name}(cpu);",
+        "  RecompReturn _r;",
+        "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+    ]
+    for em, ex in _MX_VARIANTS:
+        idx = (em << 1) | ex
+        name = f"{base_name}{_variant_suffix(em, ex)}"
+        lines.append(f"    case {idx}: _r = {name}(cpu); break;")
+    lines.extend([
+        "    default: _r = RECOMP_RETURN_NORMAL; break;",
+        "  }",
         "  if (_r != RECOMP_RETURN_NORMAL) {",
         "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
         # Mark this exit as SKIP-PROPAGATION so the stack-drift
-        # tripwire ignores the LEGITIMATE imbalance: this function's
-        # post-JSR cleanup (e.g. PLB) won't execute, leaving its
-        # prologue PHB unmatched. That mirrors the asm "skip caller"
-        # semantic and is by design under the NLR ABI.
+        # tripwire ignores the LEGITIMATE imbalance from skipping
+        # this function's post-JSR cleanup (e.g. PLB) — by design
+        # under the NLR ABI.
         "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
         "    return (RecompReturn)((int)_r - 1);",
         "  }",
         "}",
-    ]
+    ])
+    return lines
 
 
 def _emit_return(op: Return) -> List[str]:
@@ -1367,7 +1584,22 @@ def _emit_return(op: Return) -> List[str]:
 
     The `return ...;` line stays at the start of its line so the
     per-line scanner in emit_function.py auto-injects RecompStackPop()
-    before it."""
+    before it.
+
+    PEI-trampoline dispatch (2026-05-24, narrow variant). The post-
+    lowering stack-delta analyser flags Return sites that are
+    reachable with non-zero cpu->S delta from function entry (e.g.,
+    the bank_04_9A02 PEI-trampoline in MMX). For those sites, codegen
+    emits an extra branch: when `_pending_skip == NORMAL` AND the
+    delta is non-zero at runtime, pop `frame_size` bytes from cpu->S,
+    construct (PB:PC+1), tail-call cpu_dispatch_pc. The runtime check
+    against `_entry_s` keeps the standard `return _ps;` path on the
+    balanced subset of the function's paths (a single Return op may
+    be reachable from both balanced and trampoline paths through the
+    same join block — the static flag fires on either, but the
+    runtime branch picks the right behaviour per execution).
+    Reuses _entry_s captured in emit_function.py's prologue.
+    """
     # Mark this exit as NLR-PRIMARY when _ps != NORMAL so the
     # boundary auditor's stack-drift tripwire ignores the
     # legitimate-imbalance case (an NLR-pattern block fired in this
@@ -1383,12 +1615,54 @@ def _emit_return(op: Return) -> List[str]:
             "  return _ps; /* RTI */ }",
         ]
     label = "/* RTL */" if op.long else "/* RTS */"
-    return [
+    is_trampoline = (op.source_pc24 is not None
+                     and (op.source_pc24 & 0xFFFFFF) in _TRAMPOLINE_RETURNS)
+    if not is_trampoline:
+        # Standard emit — no balance check, no dispatch. Same as the
+        # pre-fix behaviour for the vast majority of functions.
+        return [
+            "{ RecompReturn _ps = _pending_skip; _pending_skip = RECOMP_RETURN_NORMAL;",
+            "  cpu_trace_pending_skip_consume(cpu, 0, (uint8)_ps, g_last_recomp_func);",
+            "  if (_ps != RECOMP_RETURN_NORMAL) cpu_trace_mark_nlr_exit(BD_EXIT_KIND_NLR_PRIMARY);",
+            f"  return _ps; {label} }}",
+        ]
+    # Trampoline-flagged Return. Emit the balance-check + dispatch
+    # branch. NLR path takes precedence (PLA*N + RTS NLR fires before
+    # any unbalanced-delta check). On the balanced path (cpu->S ==
+    # _entry_s at this Return — e.g., we reached the join through a
+    # balanced predecessor), emit the standard return. On the
+    # unbalanced path (cpu->S != _entry_s — the actual PEI-trampoline
+    # case), pop and dispatch.
+    label_inner = label.strip('/* ')  # "RTS" or "RTL"
+    lines = [
         "{ RecompReturn _ps = _pending_skip; _pending_skip = RECOMP_RETURN_NORMAL;",
         "  cpu_trace_pending_skip_consume(cpu, 0, (uint8)_ps, g_last_recomp_func);",
-        "  if (_ps != RECOMP_RETURN_NORMAL) cpu_trace_mark_nlr_exit(BD_EXIT_KIND_NLR_PRIMARY);",
-        f"  return _ps; {label} }}",
+        "  if (_ps != RECOMP_RETURN_NORMAL) {",
+        "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_NLR_PRIMARY);",
+        f"    return _ps;  /* {label_inner} NLR */ }}",
+        "  if (cpu->S != _entry_s) {  /* PEI-trampoline: dispatch on popped PC */",
+        # Byte-wise pop from cpu->S (matches 65816 RTS/RTL semantics):
+        # increment then read, low byte first.
+        "    cpu->S = (uint16)(cpu->S + 1);",
+        "    uint16 _tramp_pcl = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
+        "    cpu->S = (uint16)(cpu->S + 1);",
+        "    uint16 _tramp_pch = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
     ]
+    if op.long:
+        lines.append("    cpu->S = (uint16)(cpu->S + 1);")
+        lines.append("    uint8 _tramp_pb = cpu_read8(cpu, 0x00, cpu->S);")
+    else:
+        lines.append("    uint8 _tramp_pb = cpu->PB;")
+    lines.extend([
+        "    uint32 _tramp_pc = (uint32)(((_tramp_pch << 8) | _tramp_pcl) + 1) & 0xFFFFu;",
+        "    uint32 _tramp_pc24 = ((uint32)_tramp_pb << 16) | _tramp_pc;",
+        "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
+        f"    return cpu_dispatch_pc_from(cpu, _tramp_pc24, _entry_s, 0x{(op.source_pc24 or 0) & 0xFFFFFF:06x}u);  /* {label_inner} trampoline */ }}",
+        # Balanced path through a trampoline-flagged Return — just
+        # return NORMAL like a regular Return. cpu->S unchanged.
+        f"  return RECOMP_RETURN_NORMAL;  /* {label_inner} balanced */ }}",
+    ])
+    return lines
 
 
 def _emit_stop(op: Stop) -> List[str]:

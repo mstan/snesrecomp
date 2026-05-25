@@ -323,6 +323,50 @@ extern CpuState g_cpu;
 /* Diagnostic — generated functions can call this to log entry. */
 void cpu_dbg_funcname(const char *name);
 
+/* ── PEI-trampoline dispatch (2026-05-24, narrow detector) ─────────────
+ *
+ * Codegen emits a trampoline-aware RTS/RTL ONLY for functions flagged
+ * by the PEI/PEA/PER detector in emit_function.py. On those functions,
+ * when cpu->S != _entry_s at the Return site, _emit_return pops the
+ * topmost frame (2 bytes for RTS, 3 for RTL), computes (PB:PC+1), and
+ * tail-calls cpu_dispatch_pc(cpu, pc24). The helper binary-searches
+ * g_dispatch_table for an entry matching `pc24` and invokes the variant
+ * fnptr for the runtime (m,x) flags. If pc24 isn't a known function
+ * entry (typically a mid-function PC reached at the bottom of a
+ * trampoline chain), the helper returns RECOMP_RETURN_NORMAL and the
+ * host C call stack unwinds.
+ *
+ * The dispatch table is emitted by v2_regen.py at the end of each
+ * regen run into `<prefix>_dispatch_v2.c`. Entries are sorted by
+ * pc24 for binary search. Each row holds up to 4 fnptrs (one per
+ * (m,x) variant). */
+typedef struct DispatchEntry {
+    uint32 pc24;
+    /* Indexed by ((m_flag & 1) << 1) | (x_flag & 1):
+     *   0 = M0X0, 1 = M0X1, 2 = M1X0, 3 = M1X1.
+     * NULL = variant not emitted; cpu_dispatch_pc returns NORMAL. */
+    RecompReturn (*variant[4])(CpuState *);
+} DispatchEntry;
+
+extern const DispatchEntry g_dispatch_table[];
+extern const unsigned       g_dispatch_table_count;
+
+/* Dispatch on a popped trampoline target.
+ * `entry_s_for_miss_restore`: on lookup MISS, cpu->S is set to this
+ * value before returning RECOMP_RETURN_NORMAL. This prevents the
+ * trampoline pop's bytes-consumed effect from leaking cpu->S drift up
+ * to the caller. On lookup HIT, the dispatched function runs and its
+ * own cpu->S manipulations are preserved (no restore). The trampoline-
+ * emit caller in codegen._emit_return passes its function's _entry_s
+ * as the restore value, matching what real hw would leave cpu->S at
+ * once the trampoline chain bottomed out at the caller's continuation.
+ */
+RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24,
+                              uint16 entry_s_for_miss_restore);
+RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
+                                  uint16 entry_s_for_miss_restore,
+                                  uint32 source_pc24);
+
 #ifdef __cplusplus
 }
 #endif

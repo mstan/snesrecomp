@@ -505,16 +505,24 @@ void cpu_trace_stack_drift_check(uint16_t entry_S, uint16_t exit_S,
     fflush(stderr);
 }
 
-/* ── Static M/X claim verifier ──────────────────────────────────────── */
-MxClaimViolation g_mx_claim_violation = {0};
+/* ── Static M/X claim verifier ────────────────────────────────────────
+ *
+ * Accumulating table; one record per distinct (func_name, runtime_m,
+ * runtime_x) key. First-seen state is captured per key, subsequent
+ * hits only bump the counter. This is always-on observability — no
+ * "triggered" latch, no ring-buffer freeze. */
+MxClaimTable g_mx_claim_table = {0};
 
 void cpu_trace_arm_mx_claim_check(void) {
-    memset(&g_mx_claim_violation, 0, sizeof(g_mx_claim_violation));
-    g_mx_claim_violation.armed = 1;
+    memset(&g_mx_claim_table, 0, sizeof(g_mx_claim_table));
+    for (int i = 0; i < MX_CLAIM_HASH_SIZE; i++) {
+        g_mx_claim_table.hash[i] = MX_CLAIM_HASH_EMPTY;
+    }
+    g_mx_claim_table.armed = 1;
 }
 
 void cpu_trace_disarm_mx_claim_check(void) {
-    g_mx_claim_violation.armed = 0;
+    g_mx_claim_table.armed = 0;
 }
 
 /* Parse trailing `_M{0|1}X{0|1}` (exactly 5 chars at end of name).
@@ -535,9 +543,59 @@ static int _parse_variant_suffix(const char *name, uint8_t *out_m,
     return 1;
 }
 
+/* FNV-1a over (func_name || runtime_m || runtime_x). */
+static uint32_t _mx_claim_hash(const char *name,
+                               uint8_t runtime_m, uint8_t runtime_x) {
+    uint32_t h = 0x811c9dc5u;
+    if (name) {
+        for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+            h ^= *p;
+            h *= 0x01000193u;
+        }
+    }
+    h ^= (uint32_t)(((runtime_m & 1) << 1) | (runtime_x & 1));
+    h *= 0x01000193u;
+    return h;
+}
+
+/* Find existing record matching (name, runtime_m, runtime_x), or
+ * allocate a new one. Returns NULL on table overflow (>= 256 keys or
+ * full probe chain) — caller increments overflow_count. */
+static MxClaimRecord *_mx_claim_lookup_or_alloc(const char *name,
+                                                uint8_t runtime_m,
+                                                uint8_t runtime_x) {
+    MxClaimTable *t = &g_mx_claim_table;
+    uint32_t mask = MX_CLAIM_HASH_SIZE - 1;
+    uint32_t pos = _mx_claim_hash(name, runtime_m, runtime_x) & mask;
+    const char *key_name = name ? name : "";
+
+    for (uint32_t probe = 0; probe < MX_CLAIM_HASH_SIZE; probe++) {
+        uint16_t idx = t->hash[pos];
+        if (idx == MX_CLAIM_HASH_EMPTY) {
+            if (t->record_count >= MX_CLAIM_RECORD_CAP) return NULL;
+            uint32_t new_idx = t->record_count++;
+            t->hash[pos] = (uint16_t)new_idx;
+            MxClaimRecord *r = &t->records[new_idx];
+            r->used = 1;
+            r->runtime_m = runtime_m;
+            r->runtime_x = runtime_x;
+            strncpy(r->func_name, key_name, MX_CLAIM_TRIP_FUNC_LEN - 1);
+            r->func_name[MX_CLAIM_TRIP_FUNC_LEN - 1] = 0;
+            return r;
+        }
+        MxClaimRecord *r = &t->records[idx];
+        if (r->runtime_m == runtime_m && r->runtime_x == runtime_x &&
+            strncmp(r->func_name, key_name, MX_CLAIM_TRIP_FUNC_LEN) == 0) {
+            return r;
+        }
+        pos = (pos + 1) & mask;
+    }
+    return NULL;
+}
+
 int cpu_trace_mx_claim_check(CpuState *cpu, uint32_t pc24, const char *name) {
-    MxClaimViolation *t = &g_mx_claim_violation;
-    if (!t->armed || t->triggered) return 1;
+    MxClaimTable *t = &g_mx_claim_table;
+    if (!t->armed) return 1;
 
     uint8_t claimed_m = 0, claimed_x = 0;
     if (!_parse_variant_suffix(name, &claimed_m, &claimed_x)) {
@@ -551,46 +609,51 @@ int cpu_trace_mx_claim_check(CpuState *cpu, uint32_t pc24, const char *name) {
         return 1;  /* claim matches reality */
     }
 
-    /* Mismatch — trip one-shot. */
-    t->triggered = 1;
-    extern int snes_frame_counter;
-    t->frame = snes_frame_counter;
-    t->pc24 = pc24;
-    t->claimed_m = claimed_m;
-    t->claimed_x = claimed_x;
-    t->runtime_m = runtime_m;
-    t->runtime_x = runtime_x;
-    if (name) {
-        strncpy(t->func_name, name, MX_CLAIM_TRIP_FUNC_LEN - 1);
-        t->func_name[MX_CLAIM_TRIP_FUNC_LEN - 1] = 0;
+    /* Mismatch — accumulate. */
+    t->total_hits++;
+    MxClaimRecord *r = _mx_claim_lookup_or_alloc(name, runtime_m, runtime_x);
+    if (!r) {
+        t->overflow_count++;
+        return 0;
     }
 
-    t->A = cpu->A; t->X = cpu->X; t->Y = cpu->Y;
-    t->S = cpu->S; t->D = cpu->D;
-    t->DB = cpu->DB; t->PB = cpu->PB; t->P = cpu->P;
-    t->e_flag = cpu->emulation;
+    if (r->hit_count == 0) {
+        /* First-seen — capture full state + stack snapshot. */
+        extern int snes_frame_counter;
+        r->first_frame = snes_frame_counter;
+        r->first_pc24 = pc24;
+        r->claimed_m = claimed_m;
+        r->claimed_x = claimed_x;
 
-    int depth = g_recomp_stack_top;
-    if (depth > MX_CLAIM_TRIP_STACK_DEPTH) depth = MX_CLAIM_TRIP_STACK_DEPTH;
-    t->stack_depth = depth;
-    int skip = g_recomp_stack_top - depth;
-    for (int i = 0; i < depth; i++) {
-        const char *p = g_recomp_stack[skip + i];
-        if (p) {
-            strncpy(t->stack[i], p, MX_CLAIM_TRIP_FUNC_LEN - 1);
-            t->stack[i][MX_CLAIM_TRIP_FUNC_LEN - 1] = 0;
-        } else {
-            t->stack[i][0] = 0;
+        r->A = cpu->A; r->X = cpu->X; r->Y = cpu->Y;
+        r->S = cpu->S; r->D = cpu->D;
+        r->DB = cpu->DB; r->PB = cpu->PB; r->P = cpu->P;
+        r->e_flag = cpu->emulation;
+
+        int depth = g_recomp_stack_top;
+        if (depth > MX_CLAIM_TRIP_STACK_DEPTH) depth = MX_CLAIM_TRIP_STACK_DEPTH;
+        r->stack_depth = depth;
+        int skip = g_recomp_stack_top - depth;
+        for (int i = 0; i < depth; i++) {
+            const char *p = g_recomp_stack[skip + i];
+            if (p) {
+                strncpy(r->stack[i], p, MX_CLAIM_TRIP_FUNC_LEN - 1);
+                r->stack[i][MX_CLAIM_TRIP_FUNC_LEN - 1] = 0;
+            } else {
+                r->stack[i][0] = 0;
+            }
         }
-    }
 
-    fprintf(stderr,
-            "[mx_claim] FIRED frame=%d func=%s pc=$%06X "
-            "claimed=(M%uX%u) runtime=(M%uX%u)\n",
-            t->frame, t->func_name, (unsigned)t->pc24,
-            (unsigned)t->claimed_m, (unsigned)t->claimed_x,
-            (unsigned)t->runtime_m, (unsigned)t->runtime_x);
-    fflush(stderr);
+        fprintf(stderr,
+                "[mx_claim] FIRST-SEEN frame=%d func=%s pc=$%06X "
+                "claimed=(M%uX%u) runtime=(M%uX%u) (record %u/%u)\n",
+                r->first_frame, r->func_name, (unsigned)r->first_pc24,
+                (unsigned)claimed_m, (unsigned)claimed_x,
+                (unsigned)runtime_m, (unsigned)runtime_x,
+                (unsigned)t->record_count, (unsigned)MX_CLAIM_RECORD_CAP);
+        fflush(stderr);
+    }
+    r->hit_count++;
     return 0;
 }
 
@@ -975,7 +1038,12 @@ static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
 extern StackDriftTripwire g_stack_drift_tripwire;
 static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                     uint8_t extra0, uint16_t extra1) {
-    if (g_stack_drift_tripwire.triggered) return;
+    /* Ring is always-on. Tripwires snapshot via boundary_get / their own
+     * struct copies; freezing capture() here destroys observability for
+     * any investigation that runs *after* a tripwire fires (boundary
+     * ring + WRAM watches + STACK_OP events all stop), so we never want
+     * the live cpu_trace ring frozen. See CLAUDE.md global rules
+     * "always-on ring buffers". */
     int slot = (int)(g_cpu_trace_idx++ & (g_cpu_trace_capacity - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
@@ -2110,20 +2178,19 @@ void cpu_trace_arm_default_watches(void) {
      * normalisation is actually exercised before we change emit to
      * a loud abort. */
     cpu_trace_phantom_arm_unresolvable_goto_set();
-    /* Auto-arm stack-drift tripwire — fires on FIRST function exit
-     * after frame >= STACK_DRIFT_MIN where exit_S != entry_S AND
-     * exit_kind == NORMAL. The tripwire FREEZES the cpu_trace ring
-     * via the gate at capture():978, so the chosen frame_min must
-     * sit AFTER the windows currently being investigated.
-     *
-     * 2026-05-22: bumped 400 → 100000 because the MMX attract path
-     * has a known stack-drift -9 in NMI's $83D9 → $8458 PHB/PLB at
-     * frame ~402 (handoff priority #5) that froze the ring before
-     * the slot-0 handler-corruption window (frame ~2400-8800) became
-     * queryable. Re-arm via the `stack_drift_clear <frame_min>` TCP
-     * command if a tighter window is wanted during a specific hunt. */
-    cpu_trace_arm_stack_drift_tripwire(100000);
-    fprintf(stderr, "[cpu_trace] stack-drift tripwire armed (frame >= 100000)\n");
+    /* Stack-drift tripwire is NOT auto-armed. The boundary ring is
+     * already always-on and queryable via `boundary_get tail N` to
+     * find any function whose exit_S != entry_S. The tripwire's only
+     * value was an automated stderr printout + boundary-history
+     * struct snapshot, both of which were a net loss because firing
+     * it also froze the live cpu_trace + boundary rings (see
+     * capture() and boundary_audit_record_*) — destroying observation
+     * of every event after the trip. The handler `bank_00_84C3`
+     * (legitimate IRQ-exit: PLB/PLD/PLY/PLX/PLA + RTI) is a guaranteed
+     * +9 false positive against any naive S-balance check, and the
+     * MMX attract path has multiple other intentional S-imbalanced
+     * RTI handlers. Arm explicitly via TCP `stack_drift_arm` if a
+     * specific hunt wants the snapshot — but prefer ring queries. */
     /* Auto-arm static M/X claim verifier — catches decoder-soundness
      * gaps at function entry, BEFORE stack drift cascades into visible
      * symptoms. Trips on first variant-suffix mismatch. See
@@ -2174,9 +2241,11 @@ void cpu_trace_arm_default_watches(void) {
      * source bank $05). 2026-04-30. */
     extern void debug_server_arm_default_reg_trace(void);
     extern void debug_server_arm_default_dma_tripwire(void);
+    extern void debug_server_arm_default_wram_trace(void);
     debug_server_arm_default_reg_trace();
     debug_server_arm_default_dma_tripwire();
-    fprintf(stderr, "[cpu_trace] reg_trace + dma_tripwire armed at boot\n");
+    debug_server_arm_default_wram_trace();
+    fprintf(stderr, "[cpu_trace] reg_trace + dma_tripwire + wram_trace armed at boot\n");
     /* Per-byte recorder on the surrounding region $7E:1925-$1930 so the
      * WRM ring captures the COMPLETE timeline of writes around the
      * corruption site. Walk backward from the trip to see which
@@ -2200,6 +2269,25 @@ void cpu_trace_arm_default_watches(void) {
         uint16_t lo = (uint16_t)(0x0032 + slot * 0x10);
         cpu_trace_set_wram_watch(0x7E, lo, 1, 0, 0, 1);
         cpu_trace_set_wram_watch(0x7E, hi, 1, 0, 0, 1);
+    }
+    /* MMX DMA queue tail pointers. Two distinct queue uploaders exist
+     * in the NMI chain:
+     *   $7E:00A3 — fixed-stride-8 queue at $DB:0500. Walker is
+     *     bank_00_82C8's $00:8336-$8371 loop. `BCS $836C` trap fires
+     *     if the X-by-8 advance overflows past the value at $A3.
+     *   $7E:00A5 — variable-size queue at $7E:F000. Walker is the
+     *     $00:BA0A-$BA4D loop (reached via JSR from $82C8 / nearby).
+     *     Each entry is 4-byte header + size-byte data; loop ends
+     *     when X equals the word at $A5. `BCS $BA48` trap fires if
+     *     the ADC #$size advance overflows past $800. 2026-05-23: this
+     *     trap is the actual Dr. Light capsule freeze site — queue
+     *     contained two valid 4+$40 entries (total $88 bytes) but
+     *     $A5 was $80, so the walker overshot, read garbage entries,
+     *     and overflowed.
+     * Per-byte recorders cover both queue tail pointers and the
+     * $A6 high byte (for 16-bit STA at $A5). */
+    for (int a = 0x00A2; a <= 0x00A6; a++) {
+        cpu_trace_set_wram_watch(0x7E, (uint16_t)a, 1, 0, 0, 1);
     }
     fflush(stderr);
 }

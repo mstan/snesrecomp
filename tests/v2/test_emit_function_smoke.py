@@ -90,8 +90,10 @@ def test_function_body_is_brace_balanced():
 
 
 def test_jsr_emits_function_call():
-    """JSR $8010 -> emits RecompReturn _r = bank_00_8010_M1X1(cpu);
-    + skip-propagation block (RecompReturn ABI 2026-05-02)."""
+    """JSR $8010 -> emits a runtime (m, x) dispatch switch that calls
+    one of bank_00_8010_M{m}X{x}(cpu) per cpu->m_flag/x_flag, with the
+    skip-propagation block after the switch (RecompReturn ABI
+    2026-05-02; runtime dispatch 2026-05-23)."""
     rom = make_lorom_bank0({
         0x8000: bytes([
             0x20, 0x10, 0x80,   # JSR $8010
@@ -100,8 +102,13 @@ def test_jsr_emits_function_call():
         0x8010: bytes([0x60]),  # RTS at $8010 (callee body — discovered as part of decode? no: JSR doesn't follow into the callee in v2 decoder, target is opaque)
     })
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
-    assert "bank_00_8010_M1X1(cpu)" in src
-    assert "RecompReturn _r =" in src
+    # All four variants emitted as switch cases.
+    for sfx in ("_M0X0", "_M0X1", "_M1X0", "_M1X1"):
+        assert f"bank_00_8010{sfx}(cpu)" in src, (
+            f"variant bank_00_8010{sfx} missing from emit\n{src}"
+        )
+    assert "RecompReturn _r;" in src
+    assert "cpu->m_flag" in src and "cpu->x_flag" in src
     assert "RECOMP_RETURN_NORMAL" in src
 
 

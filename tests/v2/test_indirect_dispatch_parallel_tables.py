@@ -54,11 +54,12 @@ def test_parallel_byte_table_dispatch_uses_logical_index_register():
     assert 'bank_00_9700_M1X1(cpu)' in src
 
 
-def test_plain_indirect_dispatch_uses_site_mx_variant():
-    """Plain JMP (abs,X) dispatch keeps the dispatch site's live M/X.
+def test_plain_indirect_dispatch_switches_on_runtime_mx():
+    """Plain JMP (abs,X) dispatches to the runtime M/X variant.
 
     Unlike ExecutePtr-style trampolines, a direct indirect jump does not
-    force SEP #$30 before entering the selected handler.
+    force SEP #$30 before entering the selected handler. The generated
+    dispatcher therefore emits all variants and selects by cpu flags.
     """
     rom = make_lorom_bank0({
         0x8000: bytes([
@@ -88,8 +89,9 @@ def test_plain_indirect_dispatch_uses_site_mx_variant():
     )
 
     assert 'indirect dispatch terminator: cfg-resolved target list' in src
-    assert 'bank_00_9000_M0X0(cpu)' in src
-    assert 'bank_00_9000_M1X1(cpu)' not in src
+    assert 'switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1))' in src
+    for sfx in ("_M0X0", "_M0X1", "_M1X0", "_M1X1"):
+        assert f'bank_00_9000{sfx}(cpu)' in src
 
 
 def test_absolute_indirect_dispatch_switches_on_loaded_pointer():

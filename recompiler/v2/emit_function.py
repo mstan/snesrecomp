@@ -57,6 +57,111 @@ def _variant_suffix(m: int, x: int) -> str:
     return f"_M{m & 1}X{x & 1}"
 
 
+def _stack_width_for_a(insn) -> int:
+    return 1 if (getattr(insn, 'm_flag', 1) & 1) else 2
+
+
+def _stack_width_for_xy(insn) -> int:
+    return 1 if (getattr(insn, 'x_flag', 1) & 1) else 2
+
+
+def _stack_delta_for_trampoline_scan(di: DecodedInsn) -> Optional[int]:
+    """Return local cpu->S delta for stack ops.
+
+    Positive means bytes pushed below entry S; negative means bytes
+    pulled. JSR/JSL/RTS/RTL stay zero because v2 uses the host C stack
+    for call/return control. TCS/TXS overwrite S, so return None to
+    reset the analysis state conservatively.
+    """
+    insn = di.insn
+    mnem = insn.mnem
+    if mnem in ('PEA', 'PEI', 'PER', 'PHD'):
+        return 2
+    if mnem in ('PHP', 'PHB', 'PHK'):
+        return 1
+    if mnem == 'PHA':
+        return _stack_width_for_a(insn)
+    if mnem in ('PHX', 'PHY'):
+        return _stack_width_for_xy(insn)
+    if mnem == 'PLD':
+        return -2
+    if mnem in ('PLP', 'PLB'):
+        return -1
+    if mnem == 'PLA':
+        return -_stack_width_for_a(insn)
+    if mnem in ('PLX', 'PLY'):
+        return -_stack_width_for_xy(insn)
+    if mnem in ('TCS', 'TXS'):
+        return None
+    return 0
+
+
+def _clamp_stack_delta(value: int) -> int:
+    # Keeps malformed loops from growing an unbounded lattice while
+    # preserving every realistic local stack-frame delta seen in MMX.
+    return max(-64, min(64, int(value)))
+
+
+def _classify_trampoline_returns(cfg: V2CFG) -> set:
+    """Find returns reached with unbalanced PEI/PEA/PER pushes.
+
+    Each propagated state is (delta, saw_immediate_push). A Return is a
+    candidate only when some path reaches it with non-zero delta and at
+    least one PEI/PEA/PER on that path.
+    """
+    if cfg.entry not in cfg.blocks:
+        return set()
+
+    in_states: Dict[DecodeKey, set] = {cfg.entry: {(0, False)}}
+    worklist: List[DecodeKey] = [cfg.entry]
+    flagged: set = set()
+
+    while worklist:
+        key = worklist.pop()
+        block = cfg.blocks.get(key)
+        if block is None:
+            continue
+        states = set(in_states.get(key, set()))
+        if not states:
+            continue
+
+        returned = False
+        for di in block.insns:
+            mnem = di.insn.mnem
+            if mnem in ('RTS', 'RTL', 'RTI'):
+                if any(delta != 0 and saw for delta, saw in states):
+                    flagged.add(di.insn.addr & 0xFFFFFF)
+                returned = True
+                break
+
+            delta = _stack_delta_for_trampoline_scan(di)
+            saw_push = mnem in ('PEA', 'PEI', 'PER')
+            next_states = set()
+            for delta0, saw in states:
+                if delta is None:
+                    next_states.add((0, saw or saw_push))
+                else:
+                    next_states.add((
+                        _clamp_stack_delta(delta0 + delta),
+                        saw or saw_push,
+                    ))
+            states = next_states
+
+        if returned:
+            continue
+
+        for succ in block.successors:
+            if succ not in cfg.blocks:
+                continue
+            old = in_states.get(succ, set())
+            new = old | states
+            if new != old:
+                in_states[succ] = new
+                worklist.append(succ)
+
+    return flagged
+
+
 def emit_function(rom: bytes, bank: int, start: int,
                   entry_m: int, entry_x: int,
                   *, end: Optional[int] = None,
@@ -73,6 +178,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                   tail_call_pc16: Optional[int] = None,
                   tail_call_target_name: Optional[str] = None,
                   callee_exit_mx=None,
+                  callee_exit_mx_modes=None,
                   sibling_entry_pcs: Optional[set] = None,
                   hle_spc_upload=None,
                   hle_func=None,
@@ -150,6 +256,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                             hle_dispatch=hle_dispatch,
                             data_regions=data_regions,
                             callee_exit_mx=callee_exit_mx,
+                            callee_exit_mx_modes=callee_exit_mx_modes,
                             sibling_entry_pcs=sibling_entry_pcs)
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
@@ -168,6 +275,55 @@ def emit_function(rom: bytes, bank: int, start: int,
     if unresolved_indirect_collector is not None:
         unresolved_indirect_collector.extend(graph.unresolved_indirects)
     cfg = build_cfg(graph)
+
+    # ── PEI-trampoline detector (2026-05-24, narrow variant) ──────────
+    #
+    # Scan the function's decoded insns for PEI / PEA / PER mnemonics.
+    # Each is a 2-byte push that doesn't have a matching pop in the
+    # canonical asm-balanced shape (PHP/PLP, PHA/PLA, etc.). A function
+    # containing any of them is a CANDIDATE PEI-trampoline — at its
+    # RTS/RTL, the topmost cpu->S bytes may be a computed return target
+    # rather than the caller's pushed JSR/JSL frame.
+    #
+    # Flagging is per-function: every Return in a candidate function
+    # gets `source_pc24 ∈ _TRAMPOLINE_RETURNS`. Codegen.py's _emit_return
+    # then emits a runtime balance check (cpu->S vs _entry_s) and on
+    # the unbalanced path tail-calls cpu_dispatch_pc with the popped
+    # (PB:PC+1) target. The runtime check filters out balanced paths
+    # through the same Return op (e.g. a join block reached from both
+    # a PEI-pushing predecessor and a non-PEI predecessor).
+    #
+    # PHP/PLP-balanced functions don't trip the detector (no PEI/PEA/PER)
+    # so the standard `return _ps;` emit is used everywhere. The Dr Light
+    # case (bank_04_9A02 with 3 PEIs on path C) is caught.
+    has_pei = False
+    for blk in cfg.blocks.values():
+        for di in blk.insns:
+            mnem = di.insn.mnem
+            if mnem in ('PEI', 'PEA', 'PER'):
+                has_pei = True
+                break
+        if has_pei:
+            break
+    has_pei = False
+    trampoline_returns_local = _classify_trampoline_returns(cfg)
+    if has_pei:
+        # Every Return in this function may execute on an unbalanced path
+        # (we don't do path-level discrimination — the runtime check is
+        # the final discriminator). Collect every RTS/RTL/RTI source_pc24
+        # and add to the codegen-level set.
+        for blk in cfg.blocks.values():
+            last = blk.insns[-1] if blk.insns else None
+            if last is None:
+                continue
+            m = last.insn.mnem
+            if m in ('RTS', 'RTL', 'RTI'):
+                trampoline_returns_local.add(last.insn.addr & 0xFFFFFF)
+        from v2.codegen import add_trampoline_returns
+        add_trampoline_returns(trampoline_returns_local)
+    if trampoline_returns_local:
+        from v2.codegen import add_trampoline_returns
+        add_trampoline_returns(trampoline_returns_local)
 
     if func_name is None:
         func_name = _default_func_name(bank, start)
@@ -1123,7 +1279,29 @@ def emit_function(rom: bytes, bank: int, start: int,
         if not block_terminated:
             succs = block.successors
             blk_pc24 = (bank << 16) | (key.pc & 0xFFFF)
-            if len(succs) >= 1:
+            if len(succs) == 1:
+                lines.append(_goto_or_return(succs[0], source_pc24=blk_pc24)
+                             + " /* implicit fall-through */")
+            elif (len(succs) > 1 and pairs
+                  and pairs[-1][0].mnem in ('JSR', 'JSL')):
+                lines.append("switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
+                seen_mx = set()
+                fallback_stmt = None
+                for succ in succs:
+                    mx = (succ.m & 1, succ.x & 1)
+                    if mx in seen_mx:
+                        continue
+                    seen_mx.add(mx)
+                    stmt = _goto_or_return(succ, source_pc24=blk_pc24)
+                    if fallback_stmt is None:
+                        fallback_stmt = stmt
+                    idx = (mx[0] << 1) | mx[1]
+                    lines.append(
+                        f"  case {idx}: {stmt} /* dynamic post-call M{mx[0]}X{mx[1]} */")
+                if fallback_stmt is not None:
+                    lines.append(f"  default: {fallback_stmt}")
+                lines.append("}")
+            elif len(succs) > 1:
                 lines.append(_goto_or_return(succs[0], source_pc24=blk_pc24)
                              + " /* implicit fall-through */")
             else:
@@ -1155,6 +1333,19 @@ def emit_function(rom: bytes, bank: int, start: int,
     # NLR detection didn't fire on this function (most functions).
     src.append(f'  RecompReturn _pending_skip = RECOMP_RETURN_NORMAL;')
     src.append(f'  (void)_pending_skip;  /* unused if no NLR site in this fn */')
+    # cpu->S balance marker for the PEI-trampoline detector (2026-05-24,
+    # narrow variant). Captured at function entry — codegen._emit_return
+    # consults it when a Return op's source_pc24 is in _TRAMPOLINE_RETURNS.
+    #
+    # ALWAYS emitted, not gated on this variant's local `has_pei`: the
+    # trampoline-flag set is cross-variant (a Return pc24 flagged by
+    # variant M0X0 also fires for M1X1's emit of the same RTS), and
+    # inline-cross-fn-blocks can drag a flagged RTS into a function
+    # whose own CFG has no PEI. Conditional `_entry_s` left those
+    # variants with an undeclared-identifier error at the trampoline
+    # branch (mmx_08_v2.c bank-08 build break, 2026-05-24).
+    src.append(f'  uint16 _entry_s = cpu->S;')
+    src.append(f'  (void)_entry_s;  /* used by trampoline balance check */')
     for i, key in enumerate(block_order):
         src.append(f"  {_label_for(key)}:")
         # Trace block entry — gives us the SNES PC chain in the trace ring.

@@ -392,18 +392,25 @@ def _h_jsr(insn, vf):
     # the cross-bank call name (e.g. bank_0C_944C, not bank_00_944C).
     src_bank = (insn.addr >> 16) & 0xFF
     target = (src_bank << 16) | (insn.operand & 0xFFFF)
-    return [Call(target=target, long=False, entry_m=em, entry_x=ex)]
+    # source_pc24 is also stamped on direct JSR (not just JSR (abs,X)) so
+    # the cfg `force_variant_at` directive can pin the variant by call-
+    # site PC. Same field, same shape — only the indirect-comment path
+    # already used it; populating here costs nothing for callers that
+    # don't consult source_pc24.
+    return [Call(target=target, long=False, entry_m=em, entry_x=ex,
+                 source_pc24=insn.addr & 0xFFFFFF)]
 
 
 def _h_jsl(insn, vf):
     em = getattr(insn, 'm_flag', 1)
     ex = getattr(insn, 'x_flag', 1)
-    return [Call(target=insn.operand, long=True, entry_m=em, entry_x=ex)]
+    return [Call(target=insn.operand, long=True, entry_m=em, entry_x=ex,
+                 source_pc24=insn.addr & 0xFFFFFF)]
 
 
-def _h_rts(insn, vf): return [Return(long=False)]
-def _h_rtl(insn, vf): return [Return(long=True)]
-def _h_rti(insn, vf): return [Return(long=True, interrupt=True)]
+def _h_rts(insn, vf): return [Return(long=False, source_pc24=insn.addr & 0xFFFFFF)]
+def _h_rtl(insn, vf): return [Return(long=True,  source_pc24=insn.addr & 0xFFFFFF)]
+def _h_rti(insn, vf): return [Return(long=True,  interrupt=True, source_pc24=insn.addr & 0xFFFFFF)]
 
 
 # Misc

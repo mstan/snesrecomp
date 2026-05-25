@@ -28,7 +28,7 @@ Public API:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import sys
 import pathlib
@@ -741,7 +741,8 @@ def post_mx(insn: Insn, in_m: int, in_x: int) -> Tuple[int, int]:
 
 
 def _successors(insn: Insn, key: DecodeKey, bank: int,
-                callee_exit_mx: Optional[Dict] = None) -> List[DecodeKey]:
+                callee_exit_mx: Optional[Dict] = None,
+                callee_exit_mx_modes: Optional[Dict] = None) -> List[DecodeKey]:
     """Compute successor DecodeKeys for one decoded instruction.
 
     Returns plain DecodeKey list (kind-agnostic) for callers that only
@@ -750,11 +751,14 @@ def _successors(insn: Insn, key: DecodeKey, bank: int,
     """
     return [k for (k, _kind) in
             _labeled_successors(insn, key, bank,
-                                callee_exit_mx=callee_exit_mx)]
+                                callee_exit_mx=callee_exit_mx,
+                                callee_exit_mx_modes=callee_exit_mx_modes)]
 
 
 def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
-                        callee_exit_mx: Optional[Dict] = None):
+                        callee_exit_mx: Optional[Dict] = None,
+                        callee_exit_mx_modes: Optional[Dict] = None,
+                        rom: Optional[bytes] = None):
     """Compute (DecodeKey, edge_kind) tuples for one decoded instruction.
 
     `edge_kind` is one of:
@@ -828,6 +832,11 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
     # PHP/PLP stack untouched.
     if mnem in ('JSR', 'JSL'):
         ret_m, ret_x = post_m, post_x
+        target_pc24: Optional[int] = None
+        if mnem == 'JSR' and insn.length == 3:
+            target_pc24 = addr24(bank, insn.operand & 0xFFFF)
+        elif mnem == 'JSL':
+            target_pc24 = insn.operand & 0xFFFFFF
         if callee_exit_mx is not None:
             target_pc24: Optional[int] = None
             if mnem == 'JSR' and insn.length == 3:
@@ -850,6 +859,37 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                     em, ex = hit
                     if em is not None and ex is not None:
                         ret_m, ret_x = em & 1, ex & 1
+        if (target_pc24 is not None and callee_exit_mx_modes is not None
+                and (ret_m, ret_x) == (post_m, post_x)):
+            mode_set = callee_exit_mx_modes.get((target_pc24, post_m, post_x))
+            if mode_set is None:
+                tbank = (target_pc24 >> 16) & 0xFF
+                if tbank < 0x40 or 0x80 <= tbank < 0xC0:
+                    mode_set = callee_exit_mx_modes.get(
+                        (target_pc24 ^ 0x800000, post_m, post_x))
+            if mode_set and len(mode_set) > 2:
+                mode_set = None
+            if mode_set and rom is not None:
+                try:
+                    next_off = lorom_offset(bank, next_pc)
+                    next_ins = decode_insn(
+                        rom, next_off, next_pc, bank, m=post_m, x=post_x)
+                except Exception:
+                    next_ins = None
+                if next_ins is None or next_ins.mnem not in _COND_BRANCHES:
+                    mode_set = None
+            if mode_set:
+                seen = set()
+                succs = []
+                for em, ex in sorted((m & 1, x & 1) for (m, x) in mode_set):
+                    if (em, ex) in seen:
+                        continue
+                    seen.add((em, ex))
+                    succs.append(
+                        (DecodeKey(addr24(bank, next_pc), em, ex, post_p_stack),
+                         'fall'))
+                if succs:
+                    return succs
         return [(DecodeKey(addr24(bank, next_pc), ret_m, ret_x, post_p_stack), 'fall')]
 
     # Default: linear fall-through with post-instruction mode.
@@ -941,6 +981,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     hle_dispatch: Optional[Dict[int, str]] = None,
                     data_regions: Optional[List[Tuple[int, int, int]]] = None,
                     callee_exit_mx: Optional[Dict] = None,
+                    callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
@@ -1426,8 +1467,11 @@ def decode_function(rom: bytes, bank: int, start: int,
                     insn.dispatch_kind = kind
                     insn.dispatch_idx_reg = ud_auth['idx_reg']
                     insn.dispatch_table_bases = tuple(ud_auth.get('table_bases', ()) or ())
-                    labeled_succ = _labeled_successors(insn, key, bank,
-                                               callee_exit_mx=callee_exit_mx)
+                    labeled_succ = _labeled_successors(
+                        insn, key, bank,
+                        callee_exit_mx=callee_exit_mx,
+                        callee_exit_mx_modes=callee_exit_mx_modes,
+                        rom=rom)
                     site_m = insn.m_flag & 1
                     site_x = insn.x_flag & 1
                     for e in entries:
@@ -1479,8 +1523,11 @@ def decode_function(rom: bytes, bank: int, start: int,
                 # (the call returns to the next insn, like any JSR).
                 # Table entries are added as decode successors (jump
                 # edges) so handlers get auto-promoted.
-                labeled_succ = _labeled_successors(insn, key, bank,
-                                           callee_exit_mx=callee_exit_mx)
+                labeled_succ = _labeled_successors(
+                    insn, key, bank,
+                    callee_exit_mx=callee_exit_mx,
+                    callee_exit_mx_modes=callee_exit_mx_modes,
+                    rom=rom)
                 # Append jump-kind edges to the in-bank handlers. Each
                 # dispatch target enters as its own function — empty
                 # p_stack, not the caller's.
@@ -1512,8 +1559,11 @@ def decode_function(rom: bytes, bank: int, start: int,
             ))
             continue
 
-        labeled_succ = _labeled_successors(insn, key, bank,
-                                           callee_exit_mx=callee_exit_mx)
+        labeled_succ = _labeled_successors(
+            insn, key, bank,
+            callee_exit_mx=callee_exit_mx,
+            callee_exit_mx_modes=callee_exit_mx_modes,
+            rom=rom)
         succ = [k for (k, _) in labeled_succ]
         graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)
 
@@ -1607,6 +1657,53 @@ def _dedupe_by_pcmx(graph: 'FunctionDecodeGraph') -> None:
     # variant (unusual but possible if the entry has nonempty p_stack).
     if graph.entry in remap:
         graph.entry = remap[graph.entry]
+
+
+def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
+                                   callee_exit_mx: Optional[Dict] = None,
+                                   ) -> Optional[Set[Tuple[int, int]]]:
+    """Return the concrete set of (m, x) states at function exits.
+
+    Returns None when an exit goes through a dispatch terminator whose
+    handler exit state is not available yet. A set with more than one
+    element is intentionally preserved for callers that need to decode
+    post-call bytes under every possible width state.
+    """
+    modes: Set[Tuple[int, int]] = set()
+
+    for di in graph.insns.values():
+        ins = di.insn
+        if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            modes.add((ins.m_flag & 1, ins.x_flag & 1))
+            continue
+        is_dispatch_term = (
+            getattr(ins, 'dispatch_entries', None) is not None
+            and len(di.successors) == 0
+            and ins.mnem in ('JSL', 'JMP')
+        )
+        if is_dispatch_term:
+            if callee_exit_mx is None:
+                return None
+            site_m = ins.m_flag & 1
+            site_x = ins.x_flag & 1
+            dispatcher_bank = (ins.addr >> 16) & 0xFF
+            kind = getattr(ins, 'dispatch_kind', None)
+            for entry in (ins.dispatch_entries or ()):
+                if entry == 0:
+                    continue
+                if kind == 'long':
+                    tgt_pc24 = entry & 0xFFFFFF
+                else:
+                    tgt_pc24 = (dispatcher_bank << 16) | (entry & 0xFFFF)
+                handler_exit = callee_exit_mx.get((tgt_pc24, site_m, site_x))
+                if handler_exit is None:
+                    return None
+                hm, hx = handler_exit
+                if hm is None or hx is None:
+                    return None
+                modes.add((hm & 1, hx & 1))
+
+    return modes if modes else None
 
 
 def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',

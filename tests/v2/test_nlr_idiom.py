@@ -165,7 +165,9 @@ def test_unbalanced_pla_count_is_not_detected_as_nlr():
 
 def test_jsr_callsite_propagates_skip_n():
     """JSR callsite must check the callee's RecompReturn and propagate
-    SKIP_N upward by returning SKIP_(N-1)."""
+    SKIP_N upward by returning SKIP_(N-1). Emit now uses a runtime
+    (m, x) dispatch switch (2026-05-23) — propagation block sits after
+    the switch."""
     rom = make_lorom_bank0({
         0x8000: bytes([
             0x20, 0x10, 0x80,   # JSR $8010
@@ -175,10 +177,14 @@ def test_jsr_callsite_propagates_skip_n():
     })
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
 
-    assert "RecompReturn _r =" in src
+    assert "RecompReturn _r;" in src
     assert "RECOMP_RETURN_NORMAL" in src
     assert "(int)_r - 1" in src or "(int)_r-1" in src
-    assert "bank_00_8010_M1X1(cpu)" in src
+    # All four (m, x) variants emitted as switch cases.
+    for sfx in ("_M0X0", "_M0X1", "_M1X0", "_M1X1"):
+        assert f"bank_00_8010{sfx}(cpu)" in src, (
+            f"variant bank_00_8010{sfx} missing\n{src}"
+        )
 
 
 if __name__ == '__main__':

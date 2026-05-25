@@ -33,6 +33,7 @@ from v2.cfg_loader import load_bank_cfg  # noqa: E402
 from v2.codegen import (  # noqa: E402
     set_name_resolver,
     set_rom_size,
+    set_force_variant_at,
     take_rejected_call_targets,
     take_unresolved_call_targets,
     take_unresolved_goto_targets,
@@ -113,7 +114,23 @@ def main() -> int:
     p.add_argument('--prefix', default='smw',
                    help='Filename prefix for emitted bank files '
                         '(e.g. `smw` -> smw_00_v2.c; default: smw)')
+    p.add_argument('--banks', default=None,
+                   help='Comma-separated hex bank IDs to (re)emit. Other '
+                        'banks keep their existing .c files on disk. Use '
+                        'for fast iteration on codegen changes that only '
+                        'affect intra-bank emit (e.g. dispatch shape). '
+                        'Cross-bank demands still drive autopromote, but '
+                        'banks outside this filter are NOT written. '
+                        'Example: --banks 07 (only bank 7); --banks 00,07.')
     args = p.parse_args()
+    only_banks: set | None = None
+    if args.banks:
+        only_banks = set()
+        for tok in args.banks.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            only_banks.add(int(tok, 16))
 
     rom = load_rom(args.rom)
     set_rom_size(len(rom))
@@ -327,6 +344,30 @@ def main() -> int:
 
     set_name_resolver(name_map)
 
+    # Collect `force_variant_at` directives across every bank cfg and
+    # install them as a single keyed-by-site-PC24 map. Codegen consults
+    # this in _emit_call to pin a hardcoded variant at the named site
+    # (diagnostic for suspected m-flag tracking bugs). One global map
+    # keyed by 24-bit site PC; per-bank cfgs contribute non-overlapping
+    # entries (parser rejects duplicates within a single cfg).
+    force_variant_map: dict = {}
+    for _bank, _cfg_path, _cfg in parsed:
+        for site_pc24, (m_val, x_val) in _cfg.force_variant_at.items():
+            if site_pc24 in force_variant_map:
+                print(
+                    f"v2_regen: WARNING: force_variant_at duplicate "
+                    f"site ${site_pc24:06X} across cfgs (keeping first)",
+                    file=sys.stderr)
+                continue
+            force_variant_map[site_pc24] = (m_val, x_val)
+    set_force_variant_at(force_variant_map)
+    if force_variant_map:
+        print(
+            f"v2_regen: force_variant_at active at {len(force_variant_map)} "
+            f"site(s):")
+        for site_pc24, (m_val, x_val) in sorted(force_variant_map.items()):
+            print(f"  ${site_pc24:06X} -> M{m_val}X{x_val}")
+
     # NOTE: dispatch_helpers was discovered earlier (above
     # autoroute_exit_mx) so the M/X exit-state auto-router can see
     # dispatch terminators. Re-use the same map for variant discovery
@@ -358,6 +399,36 @@ def main() -> int:
     for _bank, _cfg_path, _cfg in parsed:
         if _cfg.data_regions:
             all_data_regions.extend(_cfg.data_regions)
+
+    def _build_callee_exit_mx_modes(callee_map: dict) -> dict:
+        """Collect multi-exit callee mode sets for dynamic post-call decode."""
+        from v2.decoder import (
+            analyze_function_exit_mx_modes,
+            decode_function as _decode_function,
+        )
+        mode_map: dict = {}
+        for b_id, _cfg_path2, cfg2 in parsed:
+            for entry2 in cfg2.entries:
+                target_pc24 = (b_id << 16) | (entry2.start & 0xFFFF)
+                key = (target_pc24, entry2.entry_m & 1, entry2.entry_x & 1)
+                try:
+                    graph2 = _decode_function(
+                        rom, b_id, entry2.start,
+                        entry_m=entry2.entry_m,
+                        entry_x=entry2.entry_x,
+                        end=entry2.end,
+                        dispatch_helpers=dispatch_helpers,
+                        data_regions=all_data_regions or None,
+                        callee_exit_mx=callee_map,
+                    )
+                except Exception:
+                    continue
+                modes = analyze_function_exit_mx_modes(graph2, callee_map)
+                if modes and len(modes) > 1:
+                    mode_map[key] = frozenset((m & 1, x & 1) for (m, x) in modes)
+        if mode_map:
+            print(f"  collected {len(mode_map)} ambiguous callee exit-mode sets")
+        return mode_map
 
     print()
     print("Discovering per-(m,x) variants (fixed-point)...")
@@ -565,6 +636,8 @@ def main() -> int:
                 ))
         cfg.entries = new_entries
 
+    callee_exit_mx_modes = _build_callee_exit_mx_modes(callee_exit_mx)
+
     total = len(parsed)
     succeeded = 0
     failed = []
@@ -689,6 +762,14 @@ def main() -> int:
         # gate: any entry here means a stub would otherwise be emitted.
         all_unresolved_indirects: list = []
         for bank, cfg_path, cfg in parsed:
+            if only_banks is not None and bank not in only_banks:
+                # Skip emit for filtered banks; keep their existing .c on
+                # disk. Cross-bank name resolution + autopromote still
+                # operate over all banks above; only the file write +
+                # per-bank decode are skipped.
+                if pass_idx == 0:
+                    print(f"  SKIP  bank ${bank:02X}: not in --banks filter (keeping existing .c)")
+                continue
             out_path = out_dir / f'{args.prefix}_{bank:02x}_v2.c'
             try:
                 if cfg.bank != bank:
@@ -722,6 +803,7 @@ def main() -> int:
                                 data_regions=cfg.data_regions or None,
                                 exclude_ranges=cfg.exclude_ranges or None,
                                 callee_exit_mx=callee_exit_mx,
+                                callee_exit_mx_modes=callee_exit_mx_modes,
                                 hle_spc_upload=getattr(
                                     cfg, 'hle_spc_upload', None) or None,
                                 hle_func=getattr(
@@ -788,6 +870,7 @@ def main() -> int:
                 callee_exit_mx[(target_pc24, em_in & 1, ex_in & 1)] = (
                     ex_m & 1, ex_xf & 1)
                 per_variant_count += 1
+        callee_exit_mx_modes = _build_callee_exit_mx_modes(callee_exit_mx)
         print(
             f"  auto-promote pass {pass_idx + 1}: "
             f"added {added} entries "
@@ -838,42 +921,146 @@ def main() -> int:
             if (addr & 0xFFFF) in mirror_pcs:
                 continue
         by_bank.setdefault(bank, set()).add((addr & 0xFFFF, em & 1, ex & 1))
-    # Always overwrite (or delete) the stub file so a previous run's
-    # stubs don't linger after the LoROM-mirror routing absorbs them.
+    # Always emit the stub file (even when no stubs are needed) so the
+    # vcxproj/CMake/Makefile can list it as a fixed compile unit
+    # unconditionally. An empty stub file compiles to an empty TU. The
+    # build system would otherwise need a conditional include for a
+    # sometimes-present file, and missing-source errors after a clean
+    # regen are confusing. (2026-05-23: runtime (m, x) dispatch raised
+    # cross-bank variant demand 4× in MMX, exposing this path.)
+    #
+    # With --banks filter active: the demand set collected here only
+    # reflects the filtered banks' emit, not the full ROM. The existing
+    # stub file from a previous full regen still covers the demands
+    # from skipped banks. Preserve it.
     stub_path = out_dir / 'unresolved_stubs_v2.c'
-    if not by_bank:
+    if only_banks is not None:
         if stub_path.exists():
-            stub_path.unlink()
-    if by_bank:
-        lines = [
-            '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',
-            ' *',
-            ' * Stub bodies for Call targets that resolved to a ROM bank not',
-            ' * in the cfg set. These are typically data decoded as code',
-            ' * (garbled JSL operands). Real execution paths should never',
-            ' * reach them; each stub chains into cpu_trace_unresolved_stub_trap',
-            ' * so a runtime fire is captured (loud stderr line + TCP-queryable',
-            ' * snapshot via unresolved_stub_get) instead of silently returning.',
-            ' * One stub per (target, m, x) variant requested by the gen.',
-            ' */',
-            '',
-            '#include "cpu_state.h"',
-            '#include "cpu_trace.h"',
-            '',
-        ]
-        total_stubs = 0
-        for bank in sorted(by_bank):
-            for pc, em, ex in sorted(by_bank[bank]):
-                name = f'bank_{bank:02X}_{pc:04X}_M{em}X{ex}'
-                target_pc24 = (bank << 16) | (pc & 0xFFFF)
-                lines.append(
-                    f'RecompReturn {name}(CpuState *cpu) {{ '
-                    f'return cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}"); '
-                    f'}}'
-                )
-                total_stubs += 1
-        stub_path.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+            print(f"  --banks filter active; preserving existing {stub_path}")
+        else:
+            print(f"  --banks filter active; no existing {stub_path} to preserve "
+                  f"(run a full regen first)")
+        # Skip the rewrite entirely.
+        return 0 if not failed else 1
+    lines = [
+        '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',
+        ' *',
+        ' * Stub bodies for Call targets that resolved to a ROM bank not',
+        ' * in the cfg set. These are typically data decoded as code',
+        ' * (garbled JSL operands). Real execution paths should never',
+        ' * reach them; each stub chains into cpu_trace_unresolved_stub_trap',
+        ' * so a runtime fire is captured (loud stderr line + TCP-queryable',
+        ' * snapshot via unresolved_stub_get) instead of silently returning.',
+        ' * One stub per (target, m, x) variant requested by the gen.',
+        ' *',
+        ' * Always emitted — file may be empty (no stubs needed) when',
+        ' * every (target, m, x) demand resolved within the cfg set.',
+        ' */',
+        '',
+        '#include "cpu_state.h"',
+        '#include "cpu_trace.h"',
+        '',
+    ]
+    total_stubs = 0
+    for bank in sorted(by_bank):
+        for pc, em, ex in sorted(by_bank[bank]):
+            name = f'bank_{bank:02X}_{pc:04X}_M{em}X{ex}'
+            target_pc24 = (bank << 16) | (pc & 0xFFFF)
+            lines.append(
+                f'RecompReturn {name}(CpuState *cpu) {{ '
+                f'return cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}"); '
+                f'}}'
+            )
+            total_stubs += 1
+    stub_path.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+    if total_stubs:
         print(f"  emitted stubs for {total_stubs} cross-ROM-bank (target, m, x) variants -> {stub_path}")
+    else:
+        print(f"  no cross-ROM-bank stubs needed; emitted empty {stub_path}")
+
+    # ── PEI-trampoline dispatch table emit (2026-05-24, narrow) ──────
+    #
+    # Runtime cpu_dispatch_pc (cpu_state.c) binary-searches this table
+    # when an RTS/RTL emit hits the trampoline branch (cpu->S !=
+    # _entry_s at a trampoline-flagged Return). Every emitted function
+    # entry contributes a row keyed by pc24 with up to 4 fnptrs
+    # (one per (m,x) variant; NULL when that variant wasn't emitted).
+    name_for_pc24: dict[int, str] = {}
+    for bank2, _cfg_path2, cfg2 in parsed:
+        for entry in cfg2.entries:
+            if entry.name:
+                name_for_pc24[(bank2 << 16) | (entry.start & 0xFFFF)] = entry.name
+    def _disp_name(pc24: int) -> str:
+        n = name_for_pc24.get(pc24)
+        if n is not None:
+            return n
+        bank = (pc24 >> 16) & 0xFF
+        pc = pc24 & 0xFFFF
+        return f"bank_{bank:02X}_{pc:04X}"
+    disp_variants: dict[int, set] = {}
+    for bank3, _cfg_path3, cfg3 in parsed:
+        for entry in cfg3.entries:
+            pc24 = (bank3 << 16) | (entry.start & 0xFFFF)
+            mx = (entry.entry_m & 1, entry.entry_x & 1)
+            disp_variants.setdefault(pc24, set()).add(mx)
+    for bank3, mx_set in by_bank.items():
+        for pc, em, ex in mx_set:
+            pc24 = (bank3 << 16) | (pc & 0xFFFF)
+            disp_variants.setdefault(pc24, set()).add((em, ex))
+    sorted_pc24s = sorted(disp_variants.keys())
+    disp_path = out_dir / f'{args.prefix}_dispatch_v2.c'
+    disp_lines = [
+        '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',
+        ' *',
+        ' * PEI-trampoline dispatch table — runtime cpu_dispatch_pc() looks',
+        ' * up function entries here when an RTS/RTL on a trampoline-flagged',
+        ' * function hits the unbalanced-cpu->S branch in _emit_return.',
+        ' *',
+        ' * Sorted by pc24 for binary search. variant[] holds fnptrs for',
+        ' * (M0X0, M0X1, M1X0, M1X1) — NULL when that variant wasn\'t emitted.',
+        ' */',
+        '',
+        '#include "cpu_state.h"',
+        '',
+    ]
+    fwd_seen: set[str] = set()
+    for pc24 in sorted_pc24s:
+        base = _disp_name(pc24)
+        for em in (0, 1):
+            for ex in (0, 1):
+                if (em, ex) in disp_variants[pc24]:
+                    name = f"{base}_M{em}X{ex}"
+                    if name in fwd_seen:
+                        continue
+                    fwd_seen.add(name)
+                    disp_lines.append(
+                        f"RecompReturn {name}(CpuState *cpu);")
+    disp_lines.append('')
+    disp_lines.append('const DispatchEntry g_dispatch_table[] = {')
+    if not sorted_pc24s:
+        disp_lines.append(
+            "    { 0xFFFFFFu, { NULL, NULL, NULL, NULL } },  /* sentinel — empty cfg */"
+        )
+    for pc24 in sorted_pc24s:
+        base = _disp_name(pc24)
+        slots = ['NULL', 'NULL', 'NULL', 'NULL']
+        for em, ex in disp_variants[pc24]:
+            idx = ((em & 1) << 1) | (ex & 1)
+            slots[idx] = f"{base}_M{em & 1}X{ex & 1}"
+        disp_lines.append(
+            f"    {{ 0x{pc24:06X}u, {{ {', '.join(slots)} }} }},  "
+            f"/* {base} */"
+        )
+    disp_lines.append('};')
+    disp_lines.append('')
+    disp_lines.append(
+        f"const unsigned g_dispatch_table_count = "
+        f"(unsigned)(sizeof(g_dispatch_table) / sizeof(g_dispatch_table[0]));"
+    )
+    disp_lines.append('')
+    disp_path.write_text('\n'.join(disp_lines) + '\n',
+                         encoding='utf-8', newline='\n')
+    print(f"  emitted dispatch table with {len(sorted_pc24s)} entries -> {disp_path}")
 
     # cfg-required-dispatch-or-kill report. Every JSR (abs,X) site
     # without a cfg `indirect_call_table` directive had its

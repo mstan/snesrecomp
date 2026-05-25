@@ -44,6 +44,24 @@ static const snes_oracle_backend_t *const s_backends[] = {
 const snes_oracle_backend_t *g_active_backend = (const snes_oracle_backend_t *)0;
 static char s_cached_rom_path[512] = {0};
 
+/* Per-game opt-out, set by snes_oracle_set_disabled_by_game from main.c.
+ * When non-zero, the dispatcher refuses every command it owns (emu_*,
+ * find_first_divergence, fuzz_run_snippet) with a structured warning
+ * that names the reason and explicitly tells callers re-enabling is NOT
+ * a fix. See snes_oracle_backend.h header doc for the rationale. */
+static int s_disabled_by_game = 0;
+static const char *s_disabled_reason =
+    "(no reason supplied — call snes_oracle_set_disabled_by_game with one)";
+
+void snes_oracle_set_disabled_by_game(const char *reason) {
+    s_disabled_by_game = 1;
+    if (reason && *reason) s_disabled_reason = reason;
+}
+
+int snes_oracle_is_disabled_by_game(void) {
+    return s_disabled_by_game;
+}
+
 const char *snes_oracle_rom_path(void) {
     return s_cached_rom_path[0] ? s_cached_rom_path : (const char *)0;
 }
@@ -1473,10 +1491,43 @@ static void h_emu_block_watch_clear(const char *args) {
                           slot < 0 ? "all" : "one");
 }
 
+/* When set, the entire dispatcher refuses to run. Recognise the same
+ * command set so an emu_* call surfaces the warning instead of returning
+ * a generic "unknown command" upstream. */
+static int s_dispatcher_owns_cmd(const char *cmd) {
+    if (!cmd) return 0;
+    if (strncmp(cmd, "emu_", 4) == 0) return 1;
+    if (strcmp(cmd, "find_first_divergence") == 0) return 1;
+    if (strcmp(cmd, "fuzz_run_snippet") == 0) return 1;
+    return 0;
+}
+
 /* Dispatcher. Returns 1 if the command was one of ours and was
  * handled, 0 to let the standard s_commands[] scan continue. */
 int emu_oracle_handle_cmd(const char *cmd, const char *args) {
     if (!cmd) return 0;
+    /* Per-game opt-out: when main.c has called
+     * snes_oracle_set_disabled_by_game, every command the oracle layer
+     * would otherwise handle is intercepted here. The warning JSON names
+     * the reason AND explicitly tells the caller re-enabling without
+     * fixing the underlying mismatch is NOT a solution — this is a
+     * guardrail against future agents flipping the flag back. */
+    if (s_disabled_by_game && s_dispatcher_owns_cmd(cmd)) {
+        debug_server_send_fmt(
+            "{\"ok\":false,\"error\":\"snes9x_oracle_disabled\","
+            "\"cmd\":\"%s\","
+            "\"reason\":\"%s\","
+            "\"do_not_re_enable\":\"Re-enabling this is NOT a fix. The "
+            "underlying input/state-sync mismatch must be addressed at "
+            "its root (e.g., save-state-aware oracle, or "
+            "input-record/replay parity) before this layer can produce "
+            "meaningful comparisons. A previous session wasted real time "
+            "chasing false divergences caused by exactly this gap.\","
+            "\"config\":\"controlled by [General] EnableSnes9xOracle in "
+            "the per-game .ini\"}",
+            cmd, s_disabled_reason);
+        return 1;
+    }
     if (strcmp(cmd, "emu_list") == 0)      { h_emu_list(args);      return 1; }
     if (strcmp(cmd, "emu_select") == 0)    { h_emu_select(args);    return 1; }
     if (strcmp(cmd, "emu_is_loaded") == 0) { h_emu_is_loaded(args); return 1; }

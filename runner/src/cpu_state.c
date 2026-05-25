@@ -178,6 +178,16 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
         cpu->ram[off] = v;
         cpu_trace_wram_write_check(cpu, bank, addr, off,
                                    (uint16)old, (uint16)v, 1);
+        /* Also route through the dedicated 1M-entry WRAM-only ring so
+         * writes survive when the main cpu_trace ring gets buried by
+         * unrelated events (e.g. a BCS-self-loop block firing millions
+         * of BLOCK events). IndirWriteByte/Word (common_rtl.h) already
+         * does this for indirect stores; mirror it here for the
+         * cpu_write8/16 path. */
+#if SNESRECOMP_REVERSE_DEBUG
+        extern void debug_on_wram_write_byte(uint32_t, uint8_t, uint8_t);
+        debug_on_wram_write_byte((uint32_t)off, old, v);
+#endif
         return;
     }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
@@ -194,6 +204,10 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
         cpu_trace_wram_write_check(cpu, bank, addr, off, old, v, 2);
+#if SNESRECOMP_REVERSE_DEBUG
+        extern void debug_on_wram_write_word(uint32_t, uint16_t, uint16_t);
+        debug_on_wram_write_word((uint32_t)off, old, v);
+#endif
         return;
     }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
@@ -206,6 +220,126 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
         return;
     }
     /* ROM / unmapped write: drop. */
+}
+
+/* ── PEI-trampoline dispatch helper (2026-05-24, narrow detector) ──────
+ *
+ * Called from _emit_return on trampoline-flagged Returns when the
+ * runtime balance check (cpu->S != _entry_s) fires. The caller has
+ * already popped the topmost frame from cpu->S and computed
+ * (PB, PC+1) as `pc24`. We binary-search g_dispatch_table for an
+ * entry matching `pc24` and, if found, call the variant fnptr for
+ * the runtime (m, x) flags.
+ *
+ * Not-found case: pc24 doesn't correspond to a known function entry.
+ * Returning NORMAL lets the host C call stack unwind back through the
+ * chain of `return cpu_dispatch_pc(...)` tail calls to the original
+ * site, which then resumes naturally.
+ */
+
+/* Diagnostic ring for dispatch events — instrumentation added during
+ * MMX Dr Light "sprite vanish" diagnosis (2026-05-24). Each entry
+ * records (pc24, mx_idx, found, frame) for one cpu_dispatch_pc call.
+ * Always-on (small fixed allocation, no perf concern). TCP cmd
+ * `dispatch_log_get` dumps the ring. */
+typedef struct DispatchLogEntry {
+    uint32_t pc24;
+    uint32_t source_pc24;
+    const char *func_name;
+    uint8_t  mx_idx;     /* (m<<1)|x */
+    uint8_t  found;      /* 1 if entry found in table, 0 if miss */
+    uint8_t  mirror;     /* 1 if found only via LoROM bank-mirror lookup */
+    uint8_t  pad;
+    uint32_t frame;
+} DispatchLogEntry;
+
+#define DISPATCH_LOG_CAP 1024
+static DispatchLogEntry g_dispatch_log[DISPATCH_LOG_CAP];
+static unsigned g_dispatch_log_idx;  /* monotonic; modulo via CAP for storage */
+
+extern int snes_frame_counter;  /* common_rtl.c — game frame number */
+extern const char *g_last_recomp_func;
+
+static void _dispatch_log_record(uint32 pc24, uint32 source_pc24,
+                                 unsigned mx_idx,
+                                 int found, int via_mirror) {
+    unsigned slot = g_dispatch_log_idx % DISPATCH_LOG_CAP;
+    g_dispatch_log[slot].pc24 = pc24;
+    g_dispatch_log[slot].source_pc24 = source_pc24;
+    g_dispatch_log[slot].func_name = g_last_recomp_func;
+    g_dispatch_log[slot].mx_idx = (uint8_t)mx_idx;
+    g_dispatch_log[slot].found = (uint8_t)(found ? 1 : 0);
+    g_dispatch_log[slot].mirror = (uint8_t)(via_mirror ? 1 : 0);
+    g_dispatch_log[slot].pad = 0;
+    g_dispatch_log[slot].frame = (uint32_t)snes_frame_counter;
+    g_dispatch_log_idx++;
+}
+
+unsigned cpu_dispatch_log_count(void) {
+    return g_dispatch_log_idx;
+}
+
+const DispatchLogEntry *cpu_dispatch_log_at(unsigned i) {
+    if (i >= g_dispatch_log_idx) return NULL;
+    if (g_dispatch_log_idx > DISPATCH_LOG_CAP &&
+        i < g_dispatch_log_idx - DISPATCH_LOG_CAP) return NULL;
+    return &g_dispatch_log[i % DISPATCH_LOG_CAP];
+}
+
+static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState *) {
+    unsigned lo = 0;
+    unsigned hi = g_dispatch_table_count;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        uint32 mid_pc = g_dispatch_table[mid].pc24;
+        if (mid_pc == pc24) {
+            unsigned idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+            return g_dispatch_table[mid].variant[idx];
+        }
+        if (mid_pc < pc24) lo = mid + 1;
+        else               hi = mid;
+    }
+    return NULL;
+}
+
+RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
+                                  uint16 entry_s_for_miss_restore,
+                                  uint32 source_pc24) {
+    pc24 &= 0xFFFFFFu;
+    source_pc24 &= 0xFFFFFFu;
+    unsigned mx_idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+    int via_mirror = 0;
+    RecompReturn (*fp)(CpuState *) = _cpu_dispatch_lookup(cpu, pc24);
+    if (fp == NULL) {
+        /* LoROM bank-mirror fallback: $00-$3F and $80-$BF share bytes.
+         * Cfg may declare a function in one bank while the trampoline
+         * popped (PB:PC) lands on the mirror. Try the other bank
+         * before giving up — matches set_name_resolver's alias. */
+        uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+        if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
+            fp = _cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u);
+            if (fp != NULL) via_mirror = 1;
+        }
+    }
+    _dispatch_log_record(pc24, source_pc24, mx_idx, fp != NULL, via_mirror);
+    if (fp == NULL) {
+        /* Not found. Restore cpu->S to the trampoline caller's _entry_s
+         * so the residual PEI'd bytes (which the would-be V's body
+         * would have consumed via PLAs) don't leak up as a phantom
+         * stack push. Without this restore, the caller's downstream
+         * stack ops would read garbage from the PEI'd region, causing
+         * subtle corruption (e.g. MMX Dr Light "sprite vanish" 2026-
+         * 05-24: 2 miss-dispatches × 3-byte leak = 6 bytes of cpu->S
+         * drift that corrupted sprite-engine state). */
+        cpu->S = entry_s_for_miss_restore;
+        return RECOMP_RETURN_NORMAL;
+    }
+    return fp(cpu);
+}
+
+RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24,
+                              uint16 entry_s_for_miss_restore) {
+    return cpu_dispatch_pc_from(cpu, pc24, entry_s_for_miss_restore, 0xFFFFFFu);
 }
 
 void cpu_state_init(CpuState *cpu, uint8 *ram) {
