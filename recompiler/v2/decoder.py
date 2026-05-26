@@ -971,7 +971,172 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     return None
 
 
+# ── decode_function memoization cache ───────────────────────────────
+#
+# decode_function is pure for fixed inputs: no module-level mutable
+# state is read, and grep verifies external callers never mutate the
+# returned FunctionDecodeGraph (only decoder.py itself writes to
+# graph.insns inside the worklist). Returned graphs are therefore safe
+# to share across callers via cache. Callers must not mutate; doing so
+# poisons the cached entry for every subsequent caller with the same
+# key.
+#
+# Key composition: hash(rom) + primitive args + id(kwarg_obj) for
+# every Optional dict/list/set.
+#
+# Why hash(rom): rom bytes are immutable; CPython caches the hash on
+# the bytes object after first compute (O(n) once, O(1) thereafter).
+# id(rom) would NOT be safe across multiple bytes objects in one
+# process — Python may reuse the address of a GC'd object.
+#
+# Why id() for dict/list/set kwargs (NOT _freeze): freezing big dicts
+# (callee_exit_mx in a late auto-promote pass has thousands of items)
+# is O(N) per decode call. With ~30k decode calls per pass × full
+# freeze of a 10k-item dict per call, the freeze dominates wall-clock
+# and makes A1 a regression vs the pre-cache pipeline. id() is O(1).
+# The id-reuse trap that affects rom (long-lived process, multiple
+# bytes objects) does NOT affect these kwargs:
+#   1. clear_decode_cache() runs at every phase boundary, so stale
+#      ids from a dropped kwarg cannot collide with a fresh kwarg's
+#      id in the SAME cache state.
+#   2. Within a phase, callers hold the kwarg dict alive (it's a
+#      local in v2_regen.main()), so its id is stable for the life
+#      of the phase.
+# Callers must not mutate a kwarg dict while passing it to
+# decode_function — that would poison the cache silently.
+#
+# **Memory bounding is the caller's responsibility.** Different
+# pipeline phases pass different kwarg combinations, so the same
+# (entry, m, x) tuple gets cached under N keys across N phases.
+# v2_regen.py calls clear_decode_cache() at every phase boundary.
+
+_DECODE_CACHE: Dict[tuple, "FunctionDecodeGraph"] = {}
+_DECODE_CACHE_HITS = 0
+_DECODE_CACHE_MISSES = 0
+_DECODE_CACHE_ENABLED = True
+
+
+def set_decode_cache_enabled(enabled: bool) -> None:
+    """Enable/disable decode_function memoization. Disabling clears."""
+    global _DECODE_CACHE_ENABLED
+    _DECODE_CACHE_ENABLED = bool(enabled)
+    if not _DECODE_CACHE_ENABLED:
+        clear_decode_cache()
+
+
+def clear_decode_cache() -> None:
+    """Drop every cached decode result and reset counters."""
+    global _DECODE_CACHE_HITS, _DECODE_CACHE_MISSES
+    _DECODE_CACHE.clear()
+    _DECODE_CACHE_HITS = 0
+    _DECODE_CACHE_MISSES = 0
+
+
+def decode_cache_stats() -> Dict[str, int]:
+    """Snapshot of {enabled, hits, misses, size}."""
+    return {
+        "enabled": 1 if _DECODE_CACHE_ENABLED else 0,
+        "hits": _DECODE_CACHE_HITS,
+        "misses": _DECODE_CACHE_MISSES,
+        "size": len(_DECODE_CACHE),
+    }
+
+
+def _freeze(obj):
+    """Recursively convert dict/list/set into a hashable, deterministic
+    representation for cache keys. dicts are sorted by repr(key) so two
+    dicts with the same content but different insertion order produce
+    the same frozen form. Handles tuple keys (callee_exit_mx uses
+    (pc24, m, x) keys) via repr-sort."""
+    if obj is None:
+        return None
+    if isinstance(obj, (int, str, bool, float, bytes)):
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(_freeze(x) for x in obj)
+    if isinstance(obj, frozenset):
+        return frozenset(_freeze(x) for x in obj)
+    if isinstance(obj, dict):
+        return tuple(sorted(
+            ((_freeze(k), _freeze(v)) for k, v in obj.items()),
+            key=lambda kv: repr(kv[0]),
+        ))
+    if isinstance(obj, list):
+        return tuple(_freeze(x) for x in obj)
+    if isinstance(obj, set):
+        return frozenset(_freeze(x) for x in obj)
+    return obj
+
+
 def decode_function(rom: bytes, bank: int, start: int,
+                    entry_m: int, entry_x: int,
+                    *, end: Optional[int] = None,
+                    max_insns: int = 12000,
+                    dispatch_helpers: Optional[Dict[int, str]] = None,
+                    indirect_call_tables: Optional[Dict[int, dict]] = None,
+                    indirect_dispatch: Optional[Dict[int, dict]] = None,
+                    hle_dispatch: Optional[Dict[int, str]] = None,
+                    data_regions: Optional[List[Tuple[int, int, int]]] = None,
+                    callee_exit_mx: Optional[Dict] = None,
+                    callee_exit_mx_modes: Optional[Dict] = None,
+                    sibling_entry_pcs: Optional[set] = None,
+                    ) -> "FunctionDecodeGraph":
+    """Public cached wrapper around `_decode_function_uncached`.
+
+    See `_decode_function_uncached` for decoder semantics. The cache is
+    process-local; callers must treat the returned graph as immutable
+    (it is shared across cache hits with the same key). v2_regen.py
+    calls clear_decode_cache() between phases to bound memory."""
+    if not _DECODE_CACHE_ENABLED:
+        return _decode_function_uncached(
+            rom, bank, start, entry_m, entry_x,
+            end=end, max_insns=max_insns,
+            dispatch_helpers=dispatch_helpers,
+            indirect_call_tables=indirect_call_tables,
+            indirect_dispatch=indirect_dispatch,
+            hle_dispatch=hle_dispatch,
+            data_regions=data_regions,
+            callee_exit_mx=callee_exit_mx,
+            callee_exit_mx_modes=callee_exit_mx_modes,
+            sibling_entry_pcs=sibling_entry_pcs,
+        )
+
+    cache_key = (
+        hash(rom), bank, start, entry_m & 1, entry_x & 1, end, max_insns,
+        id(dispatch_helpers) if dispatch_helpers is not None else 0,
+        id(indirect_call_tables) if indirect_call_tables is not None else 0,
+        id(indirect_dispatch) if indirect_dispatch is not None else 0,
+        id(hle_dispatch) if hle_dispatch is not None else 0,
+        id(data_regions) if data_regions is not None else 0,
+        id(callee_exit_mx) if callee_exit_mx is not None else 0,
+        id(callee_exit_mx_modes) if callee_exit_mx_modes is not None else 0,
+        id(sibling_entry_pcs) if sibling_entry_pcs is not None else 0,
+    )
+    cached = _DECODE_CACHE.get(cache_key)
+    if cached is not None:
+        global _DECODE_CACHE_HITS
+        _DECODE_CACHE_HITS += 1
+        return cached
+
+    global _DECODE_CACHE_MISSES
+    _DECODE_CACHE_MISSES += 1
+    graph = _decode_function_uncached(
+        rom, bank, start, entry_m, entry_x,
+        end=end, max_insns=max_insns,
+        dispatch_helpers=dispatch_helpers,
+        indirect_call_tables=indirect_call_tables,
+        indirect_dispatch=indirect_dispatch,
+        hle_dispatch=hle_dispatch,
+        data_regions=data_regions,
+        callee_exit_mx=callee_exit_mx,
+        callee_exit_mx_modes=callee_exit_mx_modes,
+        sibling_entry_pcs=sibling_entry_pcs,
+    )
+    _DECODE_CACHE[cache_key] = graph
+    return graph
+
+
+def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     entry_m: int, entry_x: int,
                     *, end: Optional[int] = None,
                     max_insns: int = 12000,

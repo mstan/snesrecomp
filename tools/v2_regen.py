@@ -20,9 +20,12 @@ the rest of the integration run.
 """
 
 import argparse
+import os
 import pathlib
 import re
 import sys
+import threading
+import time
 import traceback
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -40,6 +43,7 @@ from v2.codegen import (  # noqa: E402
 )
 from v2.decoder import (  # noqa: E402
     classify_dispatch_helper, decode_function, analyze_function_exit_mx,
+    set_decode_cache_enabled, clear_decode_cache, decode_cache_stats,
 )
 from v2.emit_bank import emit_bank  # noqa: E402
 from v2.wrapper_autoroute import detect_and_route as autoroute_wrappers, format_fix_summary  # noqa: E402
@@ -122,7 +126,54 @@ def main() -> int:
                         'Cross-bank demands still drive autopromote, but '
                         'banks outside this filter are NOT written. '
                         'Example: --banks 07 (only bank 7); --banks 00,07.')
+    p.add_argument('--no-decode-cache', action='store_true',
+                   help='Disable the decode_function memoization cache. '
+                        'Cache is on by default and cleared between each '
+                        'pipeline phase to bound memory. Use this flag '
+                        'to bisect output divergence the cache might '
+                        'introduce.')
+    p.add_argument('--timeout-seconds', type=int, default=1800,
+                   help='Hard wall-clock cap for the whole regen. '
+                        'Default 1800s (30 min). On timeout, prints '
+                        'phase + cache stats to stderr and exits 124. '
+                        'Set to 0 to disable.')
     args = p.parse_args()
+
+    # ── Phase-tracking + watchdog ───────────────────────────────────
+    regen_start_time = time.time()
+
+    def _phase(name: str) -> None:
+        """Mark a pipeline phase boundary: print elapsed time and
+        clear the decode cache to release the previous phase's memory.
+        Pre-emit phases pass different kwarg permutations to
+        decode_function, so the same (entry, m, x) gets cached under
+        N keys across N phases — unbounded memory if not cleared."""
+        elapsed = time.time() - regen_start_time
+        stats = decode_cache_stats()
+        print(f"[{elapsed:7.1f}s] {name} "
+              f"(cache before clear: {stats['size']} entries, "
+              f"{stats['hits']}h/{stats['misses']}m)",
+              flush=True)
+        clear_decode_cache()
+
+    if args.timeout_seconds > 0:
+        timeout_sec = args.timeout_seconds
+
+        def _on_timeout() -> None:
+            elapsed = time.time() - regen_start_time
+            stats = decode_cache_stats()
+            print(f"\n!!! v2_regen TIMEOUT after {elapsed:.0f}s "
+                  f"(limit {timeout_sec}s) !!!",
+                  file=sys.stderr, flush=True)
+            print(f"!!! last phase cache: {stats} !!!",
+                  file=sys.stderr, flush=True)
+            os._exit(124)
+
+        watchdog = threading.Timer(timeout_sec, _on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
+
+    set_decode_cache_enabled(not args.no_decode_cache)
     only_banks: set | None = None
     if args.banks:
         only_banks = set()
@@ -229,7 +280,7 @@ def main() -> int:
     # `name <body_pc> <fn>` (same `<fn>`) routes cross-bank JSL callers
     # past the wrapper, leaving DB at the caller's bank. See
     # `recompiler/v2/wrapper_autoroute.py` for the full diagnosis.
-    print()
+    _phase("autoroute_wrappers")
     print("Auto-routing SMW DB-transition wrappers...")
     wrapper_fixes = autoroute_wrappers(parsed, name_map, cross_bank_names, rom)
     print(format_fix_summary(wrapper_fixes))
@@ -239,7 +290,7 @@ def main() -> int:
     # last decoded instruction is a non-terminal that falls through to
     # exactly <pc>. emit_function would otherwise emit an unresolvable
     # goto at the boundary. See `recompiler/v2/tail_call_autoroute.py`.
-    print()
+    _phase("autoroute_tail_calls")
     print("Auto-detecting tail-call fallthrough sites...")
     tail_call_fixes = autoroute_tail_calls(parsed, rom)
     print(format_tail_call_summary(tail_call_fixes))
@@ -255,7 +306,7 @@ def main() -> int:
     # fix synthesises the directive for every site the byte pattern
     # matches inside cfg-declared function bodies. See
     # `recompiler/v2/pha_rts_autoroute.py`.
-    print()
+    _phase("autoroute_pha_rts")
     print("Auto-detecting PHA-RTS dispatch sites...")
     pha_rts_fixes = autoroute_pha_rts(parsed, rom)
     print(format_pha_rts_summary(pha_rts_fixes))
@@ -269,7 +320,7 @@ def main() -> int:
     # auto-router needs this signal to route exits for dispatch-
     # terminator functions like `BufferScrollingTiles_Layer1_Init`.
     # (Detection is identical to the existing block; it just moved up.)
-    print()
+    _phase("dispatch_helper_discovery")
     print("Auto-detecting JSL dispatch helpers...")
     dispatch_helpers: dict = {}
     jsl_targets: set = set()
@@ -308,7 +359,7 @@ def main() -> int:
     # operand widths. See `recompiler/v2/exit_mx_autoroute.py` for why
     # this is leaf-only (the unrestricted fixpoint version regressed
     # GraphicsDecompress on 2026-05-03 and was reverted to opt-in).
-    print()
+    _phase("autoroute_exit_mx")
     print("Auto-detecting leaf-function exit-(M, X) mutations...")
     exit_mx_fixes = autoroute_exit_mx(parsed, rom,
                                       dispatch_helpers=dispatch_helpers)
@@ -430,7 +481,7 @@ def main() -> int:
             print(f"  collected {len(mode_map)} ambiguous callee exit-mode sets")
         return mode_map
 
-    print()
+    _phase("variant_discovery")
     print("Discovering per-(m,x) variants (fixed-point)...")
     # variants: dict[addr_24 -> set[(m, x)]]
     #
@@ -636,6 +687,7 @@ def main() -> int:
                 ))
         cfg.entries = new_entries
 
+    _phase("callee_exit_mx_modes_initial")
     callee_exit_mx_modes = _build_callee_exit_mx_modes(callee_exit_mx)
 
     total = len(parsed)
@@ -739,6 +791,7 @@ def main() -> int:
     max_passes = 24
     last_unresolved: set = set()
     for pass_idx in range(max_passes):
+        _phase(f"emit_pass_{pass_idx}")
         # Clear any leftovers from prior session/process.
         take_unresolved_call_targets()
         # take_unresolved_goto_targets() retired 2026-05-02 — goto
@@ -1202,6 +1255,19 @@ def main() -> int:
         print(f"  WARN: {len(all_unresolved_indirects)} unresolved "
               f"indirect-dispatch site(s) — trap stubs emitted, HLE pending. "
               f"See report above.")
+
+    final_elapsed = time.time() - regen_start_time
+    cs = decode_cache_stats()
+    if cs["enabled"]:
+        total_lookups = cs["hits"] + cs["misses"]
+        hit_pct = (100.0 * cs["hits"] / total_lookups) if total_lookups else 0.0
+        print(f"\nv2_regen wall-clock: {final_elapsed:.1f}s; "
+              f"decode_function cache (last phase): {cs['hits']}h/"
+              f"{cs['misses']}m ({hit_pct:.1f}% hit rate); "
+              f"{cs['size']} unique keys at end")
+    else:
+        print(f"\nv2_regen wall-clock: {final_elapsed:.1f}s; "
+              f"decode cache: DISABLED (--no-decode-cache)")
 
     # Stub lint. Hard gate: no stub markers in any emitted .c file.
     # See _STUB_MARKERS comment for the rationale. There is no
