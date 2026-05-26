@@ -1707,7 +1707,7 @@ def _emit_return(op: Return) -> List[str]:
     label_inner = "RTL" if op.long else "RTS"
     src24 = (op.source_pc24 or 0) & 0xFFFFFF
     lines = [
-        f"{{ uint16 _ret_s = cpu->S;  {label} pop hardware return frame */",
+        f"{{ uint16 _ret_s = cpu->S;  /* {label_inner} pop hardware return frame */",
         "  cpu->S = (uint16)(cpu->S + 1);",
         "  uint16 _rpcl = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
         "  cpu->S = (uint16)(cpu->S + 1);",
