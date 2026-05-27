@@ -178,6 +178,28 @@ genuinely MULTI-LAYER: drift (fixed) → interrupt-frame (fixed) → per-functio
 NMI/IRQ/DMA stack idioms (remaining). Next: disassemble `83D9` (clearest, −9),
 understand the idiom, reconcile, regen/build/re-measure, repeat for IRQ chain.
 
+### Layer 3 characterized: the NMI DMA-processing chain (2026-05-26)
+`bank_00_83D9` (the −9 leaker) is an NMI-handler **indirect dispatcher**:
+`JMP ($83EB,X)` → `bank_00_83F1` (X=0) or `bank_00_8428` (X≠0), reached from
+`NmiHandler`. The −9 lives in that dispatched chain
+(`83F1`/`8428` → `81E3`/`82C8`) — the functions that build and walk the DMA
+queue. They use a stack protocol (PEI/PHA producer-consumer across the chain,
++ the `82C8` queue-tail walk) that Option-1's plain JSR-push/RTS-pop model does
+NOT capture. This is NOT a single-function fix — it's a cohesive sub-system
+whose cross-function stack contract must be modeled.
+
+Remaining layers after this: the IRQ chain (`I_IRQ`/`IrqHandler` −14,
+`84C3` +13) — almost certainly the same class (interrupt-driven DMA path).
+
+**Conclusion:** Option-1 is N-layer with N > one session. Layers fixed: drift,
+interrupt-frame. Layer remaining: the NMI/IRQ DMA-processing chains'
+cross-function stack protocol. Recommended approach for a dedicated session:
+trace the DMA-queue stack protocol across `83D9→83F1/8428→81E3→82C8` as a unit
+(what each pushes for the next to consume), then model it — likely needs the
+chain treated as a known producer/consumer group, or those specific PEI
+trampolines detected and emitted with `cpu_dispatch_pc`, rather than ad-hoc
+per-function deltas.
+
 ### Status
 Parked on `feat/cpu-s-stack-model`. Working game = Production v0.1.1 (untouched;
 its exe predates the Option-1 regen). To restore the Oracle dev build to
