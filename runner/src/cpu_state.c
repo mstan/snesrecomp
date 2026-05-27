@@ -349,6 +349,19 @@ RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24,
     return cpu_dispatch_pc_from(cpu, pc24, entry_s_for_miss_restore, 0xFFFFFFu);
 }
 
+/* Read-only probe: would a dispatch to pc24 find a function entry?
+ * Mirrors cpu_dispatch_pc_from's lookup + LoROM bank-mirror fallback so
+ * the RTS-decision trace can classify a popped PC as DISPATCH (entry
+ * exists) vs MISS_UNWIND (host-return continuation) without side effects. */
+int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24) {
+    pc24 &= 0xFFFFFFu;
+    if (_cpu_dispatch_lookup(cpu, pc24) != NULL) return 1;
+    uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+    if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0))
+        if (_cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u) != NULL) return 1;
+    return 0;
+}
+
 void cpu_state_init(CpuState *cpu, uint8 *ram) {
     cpu->A = 0;
     /* No cpu->B init — B is derived from (A >> 8) and has no separate state. */

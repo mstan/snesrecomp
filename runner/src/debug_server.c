@@ -864,6 +864,10 @@ static inline int rdb_range_hit(uint32_t adr, uint8_t width) {
 }
 
 static inline void rdb_record(uint32_t adr, uint16_t old_val, uint16_t new_val, uint8_t width) {
+    extern uint8_t g_boundary_frozen;
+    if (g_boundary_frozen) return;  /* same tripwire freezes the WRAM ring,
+                                       so the slice at the frozen frame survives
+                                       instead of evicting while the game runs on */
     if (!s_wram_trace.active) return;
     if (!rdb_range_hit(adr, width)) return;
     int idx = s_wram_trace.write_idx % WRAM_TRACE_LOG_SIZE;
@@ -952,6 +956,134 @@ static struct {
         char func[48];
     } log[BLOCK_TRACE_LOG_SIZE];
 } s_block_trace = {0};
+
+// ====================================================================
+// Focused OAM-overflow observability (task #7). Two always-on,
+// tripwire-frozen, PC-range-filtered traces used to pin the exact
+// RTS/return-resolution at the shared $D5CC OAM-finalize tail and the
+// block path around it. Both honor g_boundary_frozen (the [oamdrop]
+// detector trips it), so the window at the collapse survives while the
+// game keeps running. Range set via oamblk_range / rtstrace_range.
+// ====================================================================
+#define OAMBLK_TRACE_SIZE (1 << 16)
+static struct {
+    int active; unsigned write_idx; unsigned count;
+    struct {
+        int frame, depth;
+        uint32_t pc;
+        uint16_t a, x, y, s, d;
+        uint8_t  db, pb, p, mx;
+        uint8_t  e3, e4, e6, e8, ea, eb;
+        char func[40];
+        char parent[40];
+    } log[OAMBLK_TRACE_SIZE];
+} s_oamblk = {0};
+static uint32_t g_oamblk_lo = 1, g_oamblk_hi = 0;  /* lo>hi => off */
+
+#define RTS_TRACE_SIZE (1 << 15)
+/* decision codes */
+#define RTSDEC_HOST_RETURN   0   /* hrv && ret_s==entry_s -> RECOMP_RETURN_NORMAL  */
+#define RTSDEC_DISPATCH      1   /* popped PC is a known dispatch entry -> fp(cpu) */
+#define RTSDEC_MISS_UNWIND   2   /* popped PC not an entry -> restore S, NORMAL    */
+#define RTSDEC_ANCESTOR_SKIP 3   /* return-to-ancestor: SKIP_N to entry_s==ret_s   */
+static struct {
+    int active; unsigned write_idx; unsigned count;
+    struct {
+        int frame;
+        uint32_t src_pc;     /* the RTS/RTL instruction PC (block pc)            */
+        uint32_t popped_pc;  /* (PB:PC+1) popped return target                   */
+        uint16_t entry_s;    /* enclosing host fn's entry S                      */
+        uint16_t ret_s;      /* S before the pop                                 */
+        uint16_t s_after;    /* S after the pop                                  */
+        uint8_t  hrv;        /* host_return_valid at this RTS                    */
+        uint8_t  s_eq;       /* ret_s == entry_s                                 */
+        uint8_t  decision;   /* RTSDEC_*                                         */
+        uint8_t  found;      /* popped_pc is a known dispatch-table entry        */
+        uint8_t  e3, e4;     /* OAM park-boundary counters at the RTS            */
+        char func[40];       /* g_last_recomp_func (encodes entry PC)            */
+    } log[RTS_TRACE_SIZE];
+} s_rtst = {0};
+static uint32_t g_rtst_lo = 1, g_rtst_hi = 0;  /* lo>hi => off */
+
+// Block-path recorder. Called from cpu_trace_block (has full cpu).
+void dbg_oam_block_trace(CpuState *cpu, uint32_t pc24) {
+    extern uint8_t g_boundary_frozen;
+    if (g_boundary_frozen) return;
+    if (pc24 < g_oamblk_lo || pc24 > g_oamblk_hi) return;
+    unsigned i = s_oamblk.write_idx % OAMBLK_TRACE_SIZE;
+    s_oamblk.log[i].frame = snes_frame_counter;
+    s_oamblk.log[i].depth = g_recomp_stack_top;
+    s_oamblk.log[i].pc = pc24;
+    s_oamblk.log[i].a = (uint16_t)cpu->A;
+    s_oamblk.log[i].x = (uint16_t)cpu->X;
+    s_oamblk.log[i].y = (uint16_t)cpu->Y;
+    s_oamblk.log[i].s = (uint16_t)cpu->S;
+    s_oamblk.log[i].d = (uint16_t)cpu->D;
+    s_oamblk.log[i].db = cpu->DB;
+    s_oamblk.log[i].pb = cpu->PB;
+    s_oamblk.log[i].p = cpu->P;
+    s_oamblk.log[i].mx = (uint8_t)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+    s_oamblk.log[i].e3 = g_ram[0x0E3]; s_oamblk.log[i].e4 = g_ram[0x0E4];
+    s_oamblk.log[i].e6 = g_ram[0x0E6]; s_oamblk.log[i].e8 = g_ram[0x0E8];
+    s_oamblk.log[i].ea = g_ram[0x0EA]; s_oamblk.log[i].eb = g_ram[0x0EB];
+    if (g_last_recomp_func) { strncpy(s_oamblk.log[i].func, g_last_recomp_func, 39); s_oamblk.log[i].func[39] = 0; }
+    else s_oamblk.log[i].func[0] = 0;
+    s_oamblk.log[i].parent[0] = 0;
+    if (g_recomp_stack_top >= 2) {
+        const char *p = g_recomp_stack[g_recomp_stack_top - 2];
+        if (p) { strncpy(s_oamblk.log[i].parent, p, 39); s_oamblk.log[i].parent[39] = 0; }
+    }
+    s_oamblk.write_idx++;
+    if (s_oamblk.count < OAMBLK_TRACE_SIZE) s_oamblk.count++;
+}
+
+// RTS/return-decision recorder. Called from the emitted RTS/RTL lowering
+// AFTER the return frame is popped (so cpu->S == S-after-pop). The
+// host-return-vs-dispatch decision is fully determined by (hrv, ret_s,
+// entry_s) and a dispatch-table lookup of the popped PC, so we classify
+// it here exactly as cpu_dispatch_pc_from / _emit_return would.
+void dbg_rts_trace(CpuState *cpu, uint32_t src_pc, uint16_t entry_s,
+                   uint16_t ret_s, uint32_t popped_pc, uint8_t hrv) {
+    extern uint8_t g_boundary_frozen;
+    if (g_boundary_frozen) return;
+    if (src_pc < g_rtst_lo || src_pc > g_rtst_hi) return;
+    extern int cpu_dispatch_has_entry(CpuState *, uint32_t);
+    extern int cpu_resolve_ancestor_skip(uint16_t);
+    int found = cpu_dispatch_has_entry(cpu, popped_pc);
+    int s_eq = (ret_s == entry_s);
+    int decision;
+    if (hrv && s_eq)        decision = RTSDEC_HOST_RETURN;
+    else if (found)         decision = RTSDEC_DISPATCH;
+    else if (!s_eq && cpu_resolve_ancestor_skip(ret_s) >= 0)
+                            decision = RTSDEC_ANCESTOR_SKIP;
+    else                    decision = RTSDEC_MISS_UNWIND;
+    unsigned i = s_rtst.write_idx % RTS_TRACE_SIZE;
+    s_rtst.log[i].frame = snes_frame_counter;
+    s_rtst.log[i].src_pc = src_pc;
+    s_rtst.log[i].popped_pc = popped_pc;
+    s_rtst.log[i].entry_s = entry_s;
+    s_rtst.log[i].ret_s = ret_s;
+    s_rtst.log[i].s_after = (uint16_t)cpu->S;
+    s_rtst.log[i].hrv = hrv;
+    s_rtst.log[i].s_eq = (uint8_t)s_eq;
+    s_rtst.log[i].decision = (uint8_t)decision;
+    s_rtst.log[i].found = (uint8_t)found;
+    s_rtst.log[i].e3 = g_ram[0x0E3];
+    s_rtst.log[i].e4 = g_ram[0x0E4];
+    if (g_last_recomp_func) { strncpy(s_rtst.log[i].func, g_last_recomp_func, 39); s_rtst.log[i].func[39] = 0; }
+    else s_rtst.log[i].func[0] = 0;
+    s_rtst.write_idx++;
+    if (s_rtst.count < RTS_TRACE_SIZE) s_rtst.count++;
+    /* Validation tripwire (task #7 fix): freeze all rings the instant the
+     * return-to-ancestor fix path fires, so a heavy fish-explosion overflow
+     * is captured at the exact ANCESTOR_SKIP event (whether or not it would
+     * have wiped). This is the decisive proof the overflow now unwinds
+     * correctly instead of running the 128-slot park. */
+    if (decision == RTSDEC_ANCESTOR_SKIP) {
+        extern uint8_t g_boundary_frozen;
+        g_boundary_frozen = 1;
+    }
+}
 
 // ---- Tier 2.5: pause-on-block (breakpoints + single-stepping) ----
 // Mirrors the Sonic-recomp design (rdb_on_block_slow / step / continue),
@@ -5925,9 +6057,91 @@ static void cmd_post_mortem_dump(const char *args) {
     send_line("{\"ok\":true,\"path\":\"build/last_run_report.json\"}");
 }
 
+// ---- task #7 focused OAM-overflow trace commands ----
+static void cmd_oamblk_range(const char *args) {
+    unsigned int lo = 0, hi = 0;
+    if (sscanf(args, "%x %x", &lo, &hi) < 2 || hi < lo) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: oamblk_range <lo> <hi>\"}"); return;
+    }
+    g_oamblk_lo = lo; g_oamblk_hi = hi;
+    s_oamblk.write_idx = 0; s_oamblk.count = 0;
+    send_fmt("{\"ok\":true,\"lo\":\"0x%06x\",\"hi\":\"0x%06x\"}", lo, hi);
+}
+static void cmd_rtstrace_range(const char *args) {
+    unsigned int lo = 0, hi = 0;
+    if (sscanf(args, "%x %x", &lo, &hi) < 2 || hi < lo) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: rtstrace_range <lo> <hi>\"}"); return;
+    }
+    g_rtst_lo = lo; g_rtst_hi = hi;
+    s_rtst.write_idx = 0; s_rtst.count = 0;
+    send_fmt("{\"ok\":true,\"lo\":\"0x%06x\",\"hi\":\"0x%06x\"}", lo, hi);
+}
+static void cmd_get_oamblk(const char *args) {
+    int from_frame = 0, to_frame = INT_MAX, limit = 512;
+    sscanf(args, "%d %d %d", &from_frame, &to_frame, &limit);
+    if (limit > 4000) limit = 4000;
+    int start = s_oamblk.count < OAMBLK_TRACE_SIZE ? 0 :
+                (int)(s_oamblk.write_idx - OAMBLK_TRACE_SIZE);
+    static char buf[1048576];
+    int pos = snprintf(buf, sizeof(buf), "{\"ok\":true,\"count\":%u,\"log\":[", s_oamblk.count);
+    int n = 0;
+    for (unsigned k = 0; k < s_oamblk.count && n < limit; k++) {
+        int idx = (start + (int)k) % OAMBLK_TRACE_SIZE;
+        int f = s_oamblk.log[idx].frame;
+        if (f < from_frame || f > to_frame) continue;
+        if (pos > (int)sizeof(buf) - 400) break;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"pc\":\"0x%06x\",\"fn\":\"%s\",\"par\":\"%s\",\"dep\":%d,"
+            "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\",\"S\":\"0x%04x\",\"D\":\"0x%04x\","
+            "\"DB\":\"0x%02x\",\"P\":\"0x%02x\",\"mx\":%d,"
+            "\"E3\":\"0x%02x\",\"E4\":\"0x%02x\",\"E6\":\"0x%02x\",\"E8\":\"0x%02x\",\"EA\":\"0x%02x\",\"EB\":\"0x%02x\"}",
+            n ? "," : "", f, s_oamblk.log[idx].pc, s_oamblk.log[idx].func, s_oamblk.log[idx].parent,
+            s_oamblk.log[idx].depth, s_oamblk.log[idx].a, s_oamblk.log[idx].x, s_oamblk.log[idx].y,
+            s_oamblk.log[idx].s, s_oamblk.log[idx].d, s_oamblk.log[idx].db, s_oamblk.log[idx].p,
+            s_oamblk.log[idx].mx, s_oamblk.log[idx].e3, s_oamblk.log[idx].e4, s_oamblk.log[idx].e6,
+            s_oamblk.log[idx].e8, s_oamblk.log[idx].ea, s_oamblk.log[idx].eb);
+        n++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", n);
+    send_line(buf);
+}
+static void cmd_get_rtstrace(const char *args) {
+    int from_frame = 0, to_frame = INT_MAX, limit = 512;
+    sscanf(args, "%d %d %d", &from_frame, &to_frame, &limit);
+    if (limit > 4000) limit = 4000;
+    static const char *dec[] = { "HOST_RETURN", "DISPATCH", "MISS_UNWIND", "ANCESTOR_SKIP" };
+    int start = s_rtst.count < RTS_TRACE_SIZE ? 0 :
+                (int)(s_rtst.write_idx - RTS_TRACE_SIZE);
+    static char buf[1048576];
+    int pos = snprintf(buf, sizeof(buf), "{\"ok\":true,\"count\":%u,\"log\":[", s_rtst.count);
+    int n = 0;
+    for (unsigned k = 0; k < s_rtst.count && n < limit; k++) {
+        int idx = (start + (int)k) % RTS_TRACE_SIZE;
+        int f = s_rtst.log[idx].frame;
+        if (f < from_frame || f > to_frame) continue;
+        if (pos > (int)sizeof(buf) - 400) break;
+        int d = s_rtst.log[idx].decision; if (d < 0 || d > 3) d = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"src\":\"0x%06x\",\"fn\":\"%s\",\"entry_s\":\"0x%04x\","
+            "\"ret_s\":\"0x%04x\",\"s_after\":\"0x%04x\",\"popped\":\"0x%06x\","
+            "\"hrv\":%d,\"s_eq\":%d,\"found\":%d,\"decision\":\"%s\",\"E3\":\"0x%02x\",\"E4\":\"0x%02x\"}",
+            n ? "," : "", f, s_rtst.log[idx].src_pc, s_rtst.log[idx].func, s_rtst.log[idx].entry_s,
+            s_rtst.log[idx].ret_s, s_rtst.log[idx].s_after, s_rtst.log[idx].popped_pc,
+            s_rtst.log[idx].hrv, s_rtst.log[idx].s_eq, s_rtst.log[idx].found, dec[d],
+            s_rtst.log[idx].e3, s_rtst.log[idx].e4);
+        n++;
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "],\"emitted\":%d}", n);
+    send_line(buf);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"ping",          cmd_ping},
+    {"oamblk_range",  cmd_oamblk_range},
+    {"get_oamblk",    cmd_get_oamblk},
+    {"rtstrace_range", cmd_rtstrace_range},
+    {"get_rtstrace",  cmd_get_rtstrace},
     {"post_mortem_dump", cmd_post_mortem_dump},
     {"get_v2_cpu",    cmd_get_v2_cpu},
     {"trace_dump",     cmd_trace_dump},

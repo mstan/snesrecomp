@@ -1733,8 +1733,31 @@ def _emit_return(op: Return) -> List[str]:
     lines.extend([
         "  uint32 _rpc = (uint32)((((_rpch << 8) | _rpcl) + 1) & 0xFFFFu);",
         "  uint32 _rpc24 = ((uint32)_rpb << 16) | _rpc;",
+        # task #7 RTS-decision trace (debug builds only). Records the exact
+        # host-return-vs-dispatch-vs-miss classification at this RTS/RTL,
+        # PC-range-filtered + tripwire-frozen in the recorder. Placed after
+        # the pop so cpu->S == S-after-pop.
+        "#if SNESRECOMP_TRACE",
+        f"  dbg_rts_trace(cpu, 0x{src24:06x}u, _entry_s, _ret_s, _rpc24, (uint8)_hrv);",
+        "#endif",
         "  if (_hrv && _ret_s == _entry_s) {",
         f"    return RECOMP_RETURN_NORMAL;  /* {label_inner} host return */ }}",
+        # Return-to-ancestor (multi-level non-local return). When the stack
+        # was manually rebalanced shallower than this frame's entry
+        # (_ret_s != _entry_s, e.g. an OAM-overflow PLX/PLX/PLB epilogue)
+        # and the popped PC is a host-return continuation (dispatch miss),
+        # the RTS targets an ANCESTOR frame's continuation, not this
+        # caller's. Resolve the ancestor by entry_s == _ret_s and unwind
+        # to it via the existing SKIP_N decrement contract, so the ancestor
+        # host-returns NORMAL and its caller resumes correctly. (A one-level
+        # NORMAL miss-unwind here instead resumes intermediate frames that
+        # hardware skipped — the fish-explosion OAM wipe; see ISSUES.md.)
+        "  if (_ret_s != _entry_s && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
+        "    int _anc_skip = cpu_resolve_ancestor_skip(_ret_s);",
+        "    if (_anc_skip >= 0) {",
+        "      cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
+        f"      return (RecompReturn)_anc_skip;  /* {label_inner} return-to-ancestor */ }}",
+        "  }",
         "  cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
         # Miss-restore = post-return-pop S (entry_s + frame_size). On a dispatch
         # MISS the popped PC is a normal return addr (mid-caller, not a function

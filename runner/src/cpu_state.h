@@ -403,6 +403,17 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
                                   uint16 entry_s_for_miss_restore,
                                   uint32 source_pc24);
 
+/* Read-only dispatch-table probe (task #7 RTS-decision trace). */
+int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24);
+
+/* Focused OAM-overflow observability recorders (debug_server.c).
+ * dbg_rts_trace is emitted by the RTS/RTL lowering; dbg_oam_block_trace
+ * is called from cpu_trace_block. Both are PC-range-filtered and frozen
+ * by the [oamdrop] g_boundary_frozen tripwire. */
+void dbg_rts_trace(CpuState *cpu, uint32 src_pc, uint16 entry_s,
+                   uint16 ret_s, uint32 popped_pc, uint8 hrv);
+void dbg_oam_block_trace(CpuState *cpu, uint32 pc24);
+
 #ifdef __cplusplus
 }
 #endif

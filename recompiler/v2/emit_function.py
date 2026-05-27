@@ -1405,6 +1405,11 @@ def emit_function(rom: bytes, bank: int, start: int,
     # branch (mmx_08_v2.c bank-08 build break, 2026-05-24).
     src.append(f'  uint16 _entry_s = cpu->S;')
     src.append(f'  (void)_entry_s;  /* used by trampoline balance check */')
+    # Record this frame's entry-S parallel to the recomp call stack so a
+    # return-to-ancestor RTS (manual PLA/PLX/PLB rebalance + RTS) can be
+    # resolved to a SKIP_N non-local return (cpu_resolve_ancestor_skip).
+    # Index by the just-pushed g_recomp_stack_top; pop is implicit (top--).
+    src.append(f'  if (g_recomp_stack_top >= 1) g_cpu_entry_s[g_recomp_stack_top - 1] = _entry_s;')
     # Option-1 cpu->S return-frame ABI (see IMPROVEMENTS.md): capture whether
     # a paired host-C caller exists at entry. RTS/RTL may host-return NORMAL
     # only when _hrv==1 AND the stack is balanced (cpu->S == _entry_s);

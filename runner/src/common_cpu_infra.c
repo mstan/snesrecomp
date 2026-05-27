@@ -58,6 +58,33 @@ const char *g_last_recomp_func = "(none)";
 const char *g_recomp_stack[RECOMP_STACK_DEPTH];
 int g_recomp_stack_top = 0;
 
+/* Per-frame 65816 stack-entry level (cpu->S at function entry), parallel
+ * to g_recomp_stack and indexed by the same g_recomp_stack_top. The
+ * function prologue records _entry_s here; pops are implicit (top--).
+ * Used by cpu_resolve_ancestor_skip() to turn a return-to-ancestor RTS
+ * (manual PLA/PLX/PLB rebalance to an ancestor's entry level, then RTS)
+ * into a SKIP_N non-local return through the existing call-site
+ * decrement contract. See ISSUES.md "shared-tail multi-level non-local
+ * return" (the fish-explosion OAM wipe). */
+uint16_t g_cpu_entry_s[RECOMP_STACK_DEPTH];
+
+int cpu_resolve_ancestor_skip(uint16_t ret_s) {
+  /* The current (top-1) frame is the one whose RTS we are resolving; it
+   * is NOT a match (its entry_s != ret_s, else the balanced host-return
+   * path handled it). Scan STRICT ancestors for the nearest frame whose
+   * entry_s == ret_s — that frame should host-return NORMAL to its
+   * caller (which resumes at its natural continuation). Return the SKIP
+   * count = how many RECOMP_RETURN levels to unwind to reach it; -1 if
+   * none (caller falls back to the normal dispatch-miss path, no change
+   * in behavior). */
+  int top = g_recomp_stack_top;
+  if (top < 2 || top > RECOMP_STACK_DEPTH) return -1;
+  for (int i = top - 2; i >= 0; i--) {
+    if (g_cpu_entry_s[i] == ret_s) return (top - 1) - i;
+  }
+  return -1;
+}
+
 // Function-boundary WRAM snapshot history (Phase B koopa-stomp).
 // When a TCP client sets g_recomp_snap_on_func to a non-NULL name,
 // every RecompStackPush whose name matches captures the LOW 8KB of

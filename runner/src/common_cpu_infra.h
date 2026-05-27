@@ -29,6 +29,12 @@ void WatchdogCheck(void);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
+/* Per-frame 65816 entry-S tracking for return-to-ancestor RTS resolution
+ * (see common_cpu_infra.c). The emitted function prologue records
+ * _entry_s into g_cpu_entry_s[g_recomp_stack_top-1]. */
+extern int g_recomp_stack_top;
+extern uint16_t g_cpu_entry_s[];
+int cpu_resolve_ancestor_skip(uint16_t ret_s);
 #include <setjmp.h>
 extern jmp_buf g_watchdog_jmp;
 extern int g_watchdog_tripped;

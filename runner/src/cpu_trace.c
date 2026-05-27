@@ -1174,6 +1174,9 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
     capture(cpu, pc24, CPU_TR_BLOCK, 0, 0);
+#if SNESRECOMP_TRACE
+    dbg_oam_block_trace(cpu, pc24);  /* task #7 PC-range block path trace */
+#endif
     phantom_check(cpu, pc24);
     cpu_trace_block_watch_check(cpu, pc24);
     cpu_trace_mx_async_check(cpu, pc24);
