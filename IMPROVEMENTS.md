@@ -162,6 +162,22 @@ interrupt-frame push, re-measure the boundary-ring S-delta and chase the next
 non-`+2`/`+3` function. The empirical loop (regen ~7min + build ~5min + boot +
 boundary S-delta) is the tool.
 
+### Update: interrupt-frame fix landed — necessary but NOT sufficient (2026-05-26)
+Implemented the fix (commit `f9c8350` + `mmx_rtl.c` entry pushes): RTI pops the
+native/emu interrupt frame; `mmx_rtl.c:395/:456` push it before I_IRQ/I_NMI.
+**Result:** `cpu->S` no longer drifts to page 2 — it stays in page 1 (`$01ff`),
+and `I_NMI`/`NmiHandler` now balance (+4 = they pop the pushed frame). BUT boot
+**still wedges** in `82C8`. Re-measured per-function S-deltas show MORE
+unbalanced idioms in the NMI/IRQ/DMA path:
+- `bank_00_83D9` **−9** (95×, consistent — pushes 9, never pops)
+- `I_IRQ` / `IrqHandler` **−14**
+- `bank_00_84C3` **+13**
+These are additional per-function stack idioms (PEI/PHA trampolines or
+interrupt-frame manipulation) that must each be reconciled. Option-1 is
+genuinely MULTI-LAYER: drift (fixed) → interrupt-frame (fixed) → per-function
+NMI/IRQ/DMA stack idioms (remaining). Next: disassemble `83D9` (clearest, −9),
+understand the idiom, reconcile, regen/build/re-measure, repeat for IRQ chain.
+
 ### Status
 Parked on `feat/cpu-s-stack-model`. Working game = Production v0.1.1 (untouched;
 its exe predates the Option-1 regen). To restore the Oracle dev build to
