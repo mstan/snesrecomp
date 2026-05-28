@@ -344,6 +344,20 @@ static inline void cpu_push_interrupt_frame(CpuState *cpu) {
     cpu_write8(cpu, 0x00, cpu->S, cpu->P); cpu->S = (uint16)(cpu->S - 1);
 }
 
+/* Model a 65816 hardware JSR's 2-byte return-frame push. Used by game glue
+ * that bare-calls a recomp entry point whose body TAIL-dispatches to handlers
+ * (host_return_valid=0) — those handlers' terminal RTS pops the *caller's*
+ * JSR frame (the hardware main loop did `JSR ProcessGameMode`). When the glue
+ * replaces that main loop with a plain host-C call it must push the same
+ * 2-byte frame, else the dispatched handler's trampoline-RTS over-pops cpu->S
+ * by 2 on every call (SMW's per-frame GameMode dispatch leaked exactly this).
+ * PC bytes are placeholders — the trampoline-RTS dispatch-misses on them and
+ * miss-restores S to entry_s + 2. Symmetric to cpu_push_interrupt_frame. */
+static inline void cpu_push_jsr_return_frame(CpuState *cpu) {
+    cpu_write8(cpu, 0x00, cpu->S, 0x00); cpu->S = (uint16)(cpu->S - 1);  /* PCH */
+    cpu_write8(cpu, 0x00, cpu->S, 0x00); cpu->S = (uint16)(cpu->S - 1);  /* PCL */
+}
+
 /* ── Initialisation ─────────────────────────────────────────────────────── */
 
 /* Initialise `cpu` to a 65816 reset state: emulation=1, P=0x34

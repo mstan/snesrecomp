@@ -5343,6 +5343,55 @@ static void cmd_stack_drift_disarm(const char *args) {
 #endif
 }
 
+/* ── Inspection-freeze (freeze-at-frame) ──────────────────────────────
+ * Deliberately stop ALL rings (cpu_trace + boundary + WRAM + rtstrace +
+ * oamblk) so a window survives a runaway/stuck game. Unlike tripwires,
+ * this also freezes the always-on cpu_trace ring (g_freeze_capture).
+ *   freeze_at_frame <N>  — freeze the first cpu_trace_block at frame >= N
+ *   freeze_now           — freeze immediately
+ *   unfreeze             — resume all rings
+ *   freeze_status        — report flags + current indices
+ * The env var SNESRECOMP_FREEZE_AT_FRAME=<N> arms this from boot (no race). */
+static void cmd_freeze_at_frame(const char *args) {
+    extern uint8_t g_freeze_capture; extern int g_freeze_at_frame;
+    extern uint8_t g_boundary_frozen;
+    int n = (args && *args) ? (int)strtol(args, NULL, 0) : -1;
+    g_freeze_at_frame = n;
+    g_freeze_capture = 0;   /* re-arm */
+    g_boundary_frozen = 0;
+    send_fmt("{\"ok\":1,\"freeze_at_frame\":%d}", n);
+}
+
+static void cmd_freeze_now(const char *args) {
+    (void)args;
+    extern uint8_t g_freeze_capture; extern uint8_t g_boundary_frozen;
+    g_freeze_capture = 1; g_boundary_frozen = 1;
+    send_fmt("{\"ok\":1,\"frozen\":1}");
+}
+
+static void cmd_unfreeze(const char *args) {
+    (void)args;
+    extern uint8_t g_freeze_capture; extern int g_freeze_at_frame;
+    extern uint8_t g_boundary_frozen;
+    g_freeze_capture = 0; g_boundary_frozen = 0; g_freeze_at_frame = -1;
+    send_fmt("{\"ok\":1,\"frozen\":0}");
+}
+
+static void cmd_freeze_status(const char *args) {
+    (void)args;
+    extern uint8_t g_freeze_capture; extern int g_freeze_at_frame;
+    extern uint8_t g_boundary_frozen;
+    extern uint64_t g_cpu_trace_idx; extern uint64_t g_boundary_idx;
+    extern int snes_frame_counter;
+    send_fmt("{\"freeze_capture\":%u,\"boundary_frozen\":%u,"
+             "\"freeze_at_frame\":%d,\"frame\":%d,"
+             "\"trace_idx\":%llu,\"boundary_idx\":%llu}",
+             g_freeze_capture, g_boundary_frozen, g_freeze_at_frame,
+             snes_frame_counter,
+             (unsigned long long)g_cpu_trace_idx,
+             (unsigned long long)g_boundary_idx);
+}
+
 /* ── Static M/X claim verifier TCP commands ────────────────────────────
  *
  * Companion to docs/ABSTRACT_INTERPRETATION_GAPS.md. Accumulating
@@ -6168,6 +6217,10 @@ static const CmdEntry s_commands[] = {
     {"offrails_get", cmd_offrails_get},
     {"stack_drift_clear", cmd_stack_drift_clear},
     {"stack_drift_disarm", cmd_stack_drift_disarm},
+    {"freeze_at_frame", cmd_freeze_at_frame},
+    {"freeze_now",      cmd_freeze_now},
+    {"unfreeze",        cmd_unfreeze},
+    {"freeze_status",   cmd_freeze_status},
     {"func_watch_arm", cmd_func_watch_arm},
     {"func_watch_get", cmd_func_watch_get},
     {"stack_op_enable",  cmd_stack_op_enable},

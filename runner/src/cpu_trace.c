@@ -77,6 +77,16 @@ uint64_t       g_boundary_idx = 0;
  * the first runtime imbalance. */
 uint8_t        g_boundary_frozen = 0;
 
+/* Deliberate inspection-freeze. Distinct from g_boundary_frozen: when set,
+ * the always-on cpu_trace ring (capture / func_entry / wram_write) ALSO
+ * stops, so a window can be inspected at leisure without the runaway game
+ * overwriting it. Armed via SNESRECOMP_FREEZE_AT_FRAME=<N> (from boot, no
+ * arming race) or the `freeze_at_frame` / `freeze_now` TCP commands.
+ * g_freeze_at_frame > 0 => freeze ALL rings the first cpu_trace_block at
+ * snes_frame_counter >= g_freeze_at_frame. -1 = disabled. */
+uint8_t        g_freeze_capture = 0;
+int            g_freeze_at_frame = -1;
+
 #define BOUNDARY_ACTIVE_DEPTH 64  /* matches RECOMP_STACK_DEPTH */
 typedef struct ActiveCall {
     uint64_t entry_seq;
@@ -1038,6 +1048,7 @@ static int scoped_tripwire_maybe_fire(CpuState *cpu, uint8_t bank,
 extern StackDriftTripwire g_stack_drift_tripwire;
 static void capture(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                     uint8_t extra0, uint16_t extra1) {
+    if (g_freeze_capture) return;  /* deliberate inspection-freeze */
     /* Ring is always-on. Tripwires snapshot via boundary_get / their own
      * struct copies; freezing capture() here destroys observability for
      * any investigation that runs *after* a tripwire fires (boundary
@@ -1173,6 +1184,32 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    /* Inspection-freeze trigger (reusable). Armed once from the
+     * environment so it covers the very first frames with no
+     * arming race; the TCP command can also set g_freeze_at_frame. */
+    {
+        static int s_freeze_env_read = 0;
+        if (!s_freeze_env_read) {
+            s_freeze_env_read = 1;
+            const char *e = getenv("SNESRECOMP_FREEZE_AT_FRAME");
+            if (e && *e) g_freeze_at_frame = atoi(e);
+        }
+    }
+    if (g_freeze_at_frame > 0 && !g_freeze_capture) {
+        extern int snes_frame_counter;
+        if (snes_frame_counter >= g_freeze_at_frame) {
+            g_freeze_capture = 1;
+            g_boundary_frozen = 1;
+            fprintf(stderr,
+                    "[freeze_at_frame] froze all rings at frame %d "
+                    "(target %d) trace_idx=%llu boundary_idx=%llu\n",
+                    snes_frame_counter, g_freeze_at_frame,
+                    (unsigned long long)g_cpu_trace_idx,
+                    (unsigned long long)g_boundary_idx);
+            fflush(stderr);
+        }
+    }
+    if (g_freeze_capture) return;
     capture(cpu, pc24, CPU_TR_BLOCK, 0, 0);
 #if SNESRECOMP_TRACE
     dbg_oam_block_trace(cpu, pc24);  /* task #7 PC-range block path trace */
@@ -1223,6 +1260,7 @@ static uint32_t fnv1a(const char *s) {
 }
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
+    if (g_freeze_capture) return;  /* deliberate inspection-freeze */
     /* Soundness check (one-shot, gated by armed flag). Compares the
      * decoder's static (M, X) claim — encoded in the function name's
      * trailing `_M{m}X{x}` suffix — against the runtime cpu->m_flag /
@@ -1892,6 +1930,7 @@ void cpu_trace_clear_wram_watches(void) {
 void cpu_trace_wram_write_check(CpuState *cpu, uint8_t bank, uint16_t addr,
                                 int32_t ram_off, uint16_t old_val,
                                 uint16_t new_val, int width) {
+    if (g_freeze_capture) return;  /* deliberate inspection-freeze */
     /* Scoped tripwire fires regardless of g_wram_watch_any — it has its
      * own armed/triggered gate. Check it here BEFORE the early-out so a
      * client can arm a tripwire without needing a parallel cpu_trace
