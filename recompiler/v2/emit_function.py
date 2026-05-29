@@ -825,14 +825,18 @@ def emit_function(rom: bytes, bank: int, start: int,
             # Demand all 4 variants so auto-promote synthesizes them (this
             # also subsumes the cross-variant-externals demand the prior
             # single-variant register_call_demand handled).
-            from v2.codegen import register_call_demand
+            from v2.codegen import register_call_demand, valid_variant_list
             tail_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
-            for _em, _ex in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            # Only the surviving (m,x) variants after the emit-truth
+            # prune pass — wrong-width siblings are dropped (no emitted
+            # body), so neither demand nor switch into them.
+            _vlist = valid_variant_list(tail_pc24)
+            for _em, _ex in _vlist:
                 register_call_demand(tail_pc24, _em, _ex)
             _sw = " ".join(
                 f"case {(_em << 1) | _ex}: _tc = {tail_call_target_name}"
                 f"{_variant_suffix(_em, _ex)}(cpu); break;"
-                for _em, _ex in ((0, 0), (0, 1), (1, 0), (1, 1))
+                for _em, _ex in _vlist
             )
             return (
                 f"{prefix}{{ RecompReturn _tc; "
@@ -867,7 +871,8 @@ def emit_function(rom: bytes, bank: int, start: int,
         # it isn't already in cfg.
         target_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
         src_pc24 = source_pc24 if source_pc24 is not None else 0
-        from v2.codegen import get_name_for_pc, register_call_demand
+        from v2.codegen import (get_name_for_pc, register_call_demand,
+                                 valid_variant_list)
         sibling_name = get_name_for_pc(target_pc24)
         if sibling_name is not None:
             # A fall-through into the sibling continues executing with the
@@ -881,12 +886,15 @@ def emit_function(rom: bytes, bank: int, start: int,
             # same way codegen._emit_call resolves JSR/JSL variants. Demand
             # all 4 variants so v2_regen auto-promote synthesizes whichever
             # the static analysis didn't produce.
-            for _em, _ex in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            # Only the surviving (m,x) variants after the emit-truth
+            # prune pass — wrong-width siblings have no emitted body.
+            _vlist = valid_variant_list(target_pc24)
+            for _em, _ex in _vlist:
                 register_call_demand(target_pc24, _em, _ex)
             _sw = " ".join(
                 f"case {(_em << 1) | _ex}: _tc = {sibling_name}"
                 f"{_variant_suffix(_em, _ex)}(cpu); break;"
-                for _em, _ex in ((0, 0), (0, 1), (1, 0), (1, 1))
+                for _em, _ex in _vlist
             )
             return (
                 f"{prefix}{{ RecompReturn _tc; "
@@ -1207,26 +1215,50 @@ def emit_function(rom: bytes, bank: int, start: int,
                                        if target_pc24 is not None else "0x000000")
                             if (target_pc24 is not None
                                     and ((target_pc24 >> 16) & 0xFF) != bank):
-                                from v2.codegen import register_call_demand
-                                register_call_demand(target_pc24, key.m, key.x)
-                                sib_suffix = _variant_suffix(key.m, key.x)
-                                tgt_bank = (target_pc24 >> 16) & 0xFF
-                                tgt16 = target_pc24 & 0xFFFF
-                                synth_name = (
-                                    f"bank_{tgt_bank:02X}_{tgt16:04X}"
-                                )
-                                lines.append(
-                                    f"cpu->PB = 0x{tgt_bank:02X}; /* JML "
-                                    f"into bank ${tgt_bank:02X} */"
-                                )
-                                lines.append(_tail_call_stmt(
-                                    f"{synth_name}{sib_suffix}(cpu)",
-                                    f"/* tail-call cross-bank into "
-                                    f"{synth_name}{sib_suffix} at "
-                                    f"${target_pc24:06X} (auto-promoted "
-                                    f"via Call demand) */",
-                                    nlr_info,
-                                ))
+                                from v2.codegen import (
+                                    register_call_demand,
+                                    _is_invalid_lorom_call_target,
+                                    get_name_for_pc)
+                                if (_is_invalid_lorom_call_target(target_pc24)
+                                        and get_name_for_pc(target_pc24)
+                                        is None):
+                                    # Cross-bank JML to a non-code address
+                                    # (beyond ROM extent or < $8000 RAM):
+                                    # the decoder followed a garbage operand
+                                    # past an RTS — data decoded as code.
+                                    # Don't auto-promote a function at a
+                                    # non-code target; emit a no-op return,
+                                    # mirroring _emit_call's skip for this
+                                    # exact class. (Would crash on real HW
+                                    # too — never reached in correct play.)
+                                    lines.append(
+                                        f"return RECOMP_RETURN_NORMAL; "
+                                        f"/* cross-bank JML to "
+                                        f"${target_pc24:06X} skipped — not a "
+                                        f"valid LoROM code address (decoder "
+                                        f"followed garbage operand past an "
+                                        f"RTS) */")
+                                else:
+                                    register_call_demand(target_pc24,
+                                                          key.m, key.x)
+                                    sib_suffix = _variant_suffix(key.m, key.x)
+                                    tgt_bank = (target_pc24 >> 16) & 0xFF
+                                    tgt16 = target_pc24 & 0xFFFF
+                                    synth_name = (
+                                        f"bank_{tgt_bank:02X}_{tgt16:04X}"
+                                    )
+                                    lines.append(
+                                        f"cpu->PB = 0x{tgt_bank:02X}; /* JML "
+                                        f"into bank ${tgt_bank:02X} */"
+                                    )
+                                    lines.append(_tail_call_stmt(
+                                        f"{synth_name}{sib_suffix}(cpu)",
+                                        f"/* tail-call cross-bank into "
+                                        f"{synth_name}{sib_suffix} at "
+                                        f"${target_pc24:06X} (auto-promoted "
+                                        f"via Call demand) */",
+                                        nlr_info,
+                                    ))
                             else:
                                 lines.append(
                                     f"return cpu_trace_unresolved_goto_trap(cpu, "

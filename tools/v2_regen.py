@@ -37,6 +37,7 @@ from v2.codegen import (  # noqa: E402
     set_name_resolver,
     set_rom_size,
     set_force_variant_at,
+    set_valid_variants,
     set_trampoline_returns,
     take_rejected_call_targets,
     take_trampoline_returns,
@@ -90,14 +91,30 @@ _STUB_MARKERS = (
 )
 
 
-def _lint_stubs(out_dir: pathlib.Path) -> list[tuple[str, int, str, str]]:
-    """Scan every emitted .c file in out_dir for stub markers.
+def _lint_stubs(out_dir: pathlib.Path,
+                prefix: "Optional[str]" = None) -> list[tuple[str, int, str, str]]:
+    """Scan the .c files THIS regen is responsible for, for stub markers.
+
+    When `prefix` is given, lint only `{prefix}_*.c` plus the shared
+    `unresolved_stubs_v2.c` this regen (re)wrote — NOT every `*.c` in
+    out_dir. A per-game `src/gen` can accumulate another game's stale
+    `<otherprefix>_*.c` from an earlier regen pointed at the same dir;
+    those foreign artifacts are not part of this game's build (the
+    vcxproj lists only this prefix) and must not fail this game's lint.
+    When `prefix` is None, fall back to scanning every `*.c` (legacy).
 
     Returns a list of (path, line_no, marker, line_text) tuples. Empty
     list means clean. Caller fails the build if non-empty.
     """
+    if prefix:
+        paths = sorted(out_dir.glob(f'{prefix}_*.c'))
+        shared = out_dir / 'unresolved_stubs_v2.c'
+        if shared.exists():
+            paths.append(shared)
+    else:
+        paths = sorted(out_dir.glob('*.c'))
     hits: list[tuple[str, int, str, str]] = []
-    for p in sorted(out_dir.glob('*.c')):
+    for p in paths:
         try:
             with p.open('r', encoding='utf-8', errors='replace') as f:
                 for ln, raw in enumerate(f, start=1):
@@ -108,6 +125,48 @@ def _lint_stubs(out_dir: pathlib.Path) -> list[tuple[str, int, str, str]]:
         except OSError as e:
             print(f"  lint: failed to read {p}: {e}", file=sys.stderr)
     return hits
+
+
+def _scan_dirty_variants(results, parsed) -> set:
+    """Emit-truth attribution: map each per-bank lint marker to the
+    (addr24, m, x) variant whose emitted body contains it.
+
+    A variant is 'dirty' iff its OWN body emitted a stub marker — this
+    is ground truth for the clean-sibling prune (no graph heuristic).
+    Markers in `unresolved_stubs_v2.c` are cross-bank discovery stubs,
+    not per-variant bodies, so they never appear in these per-bank
+    `src` blobs and are handled separately.
+
+    Returns a set of (addr24, entry_m, entry_x) keys.
+    """
+    base_start: dict = {}  # (bank, base_name) -> start pc16
+    for bank, _p, cfg in parsed:
+        for e in cfg.entries:
+            bn = e.name or f"bank_{bank:02X}_{e.start & 0xFFFF:04X}"
+            base_start[(bank, bn)] = e.start & 0xFFFF
+    defre = re.compile(
+        r'^RecompReturn\s+([A-Za-z0-9_]+)_M([01])X([01])\(CpuState')
+    dirty: set = set()
+    for r in results:
+        if r.get('status') != 'ok':
+            continue
+        bank = r['bank']
+        cur = None  # (addr24, m, x) of the body currently being scanned
+        for line in r['src'].split('\n'):
+            mm = defre.match(line)
+            if mm:
+                start = base_start.get((bank, mm.group(1)))
+                cur = (None if start is None else
+                       ((bank << 16) | start, int(mm.group(2)),
+                        int(mm.group(3))))
+                continue
+            if cur is None:
+                continue
+            for mk in _STUB_MARKERS:
+                if mk in line:
+                    dirty.add(cur)
+                    break
+    return dirty
 
 
 def _emit_bank_one(args_dict: dict) -> dict:
@@ -130,6 +189,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
     set_rom_size(args_dict['rom_size'])
     set_name_resolver(args_dict['name_map'])
     set_force_variant_at(args_dict['force_variant_at'])
+    set_valid_variants(args_dict.get('valid_variants') or {})
     set_trampoline_returns(args_dict['trampoline_returns'])
 
     bank = args_dict['bank']
@@ -764,6 +824,19 @@ def main() -> int:
               f"annotations ({len(declared_exit_mx)} unique targets); "
               f"{per_variant_count} per-variant overrides")
 
+    # Capture cfg-declared (canonical) variants BEFORE the clone step.
+    # These are the hand-verified entry widths; the emit-truth variant
+    # prune pass NEVER prunes them (the un-suffixed alias binds to the
+    # canonical, and a clean canonical is exactly what proves a
+    # wrong-width clone is the unreachable garbage variant). Keyed by
+    # 24-bit entry address -> set of (m, x).
+    canonical_variants: dict[int, set] = {}
+    for bank, _cfg_path, cfg in parsed:
+        for entry in cfg.entries:
+            addr = (bank << 16) | (entry.start & 0xFFFF)
+            canonical_variants.setdefault(addr, set()).add(
+                (entry.entry_m & 1, entry.entry_x & 1))
+
     # Apply per-(m,x) variants to existing cfg entries: for each cfg
     # entry whose target address has more than its declared (m, x)
     # variant, clone the entry with each additional (m, x). The
@@ -919,6 +992,17 @@ def main() -> int:
     cumulative_trampoline_returns: set = set()
     cumulative_rejected_calls: set = set()
 
+    # Emit-truth variant prune state. `valid_variants_map` is the
+    # per-target survivor set fed to codegen (empty on pass 0 => emit
+    # all four). `cumulative_dirty_variants` accumulates every variant
+    # whose body emitted a stub marker; `cumulative_pruned` is the set
+    # actually dropped (dirty non-canonical clones with a clean
+    # canonical sibling). Both grow monotonically -> the prune
+    # converges alongside auto-promote.
+    valid_variants_map: dict = {}
+    cumulative_dirty_variants: set = set()
+    cumulative_pruned: set = set()
+
     for pass_idx in range(max_passes):
         _phase(f"emit_pass_{pass_idx}")
         # Clear any leftovers from prior session/process.
@@ -968,6 +1052,7 @@ def main() -> int:
                 'indirect_dispatch_map': ind_dispatch_map,
                 'name_map': name_map,
                 'force_variant_at': force_variant_map,
+                'valid_variants': valid_variants_map,
                 'trampoline_returns': cumulative_trampoline_returns,
                 'callee_exit_mx': callee_exit_mx,
                 'callee_exit_mx_modes': callee_exit_mx_modes,
@@ -1011,18 +1096,73 @@ def main() -> int:
         # emit paths (none today) and keep main's view consistent.
         set_trampoline_returns(cumulative_trampoline_returns)
 
+        # ── Emit-truth clean-sibling variant prune ──────────────────
+        # A variant is 'dirty' iff its emitted body contains a stub
+        # marker (the genuine lint failure). When a dirty variant is a
+        # NON-canonical clone AND its entry has a clean canonical
+        # sibling, the canonical proves the bytes are valid code at the
+        # cfg-declared width — so the dirty clone is a wrong-width
+        # decode (misaligned operands -> phantom branches / garbage
+        # calls) that can never be validly reached. Drop it: remove the
+        # entry (no body, no forward decl) and record the survivor set
+        # so the runtime (m,x) dispatch switches stop referencing it.
+        # Never prune a canonical (the alias binds to it). Bases whose
+        # canonical is itself dirty, or with no clean canonical, are
+        # left intact and surface in the stub lint as genuine residue.
+        dirty_now = _scan_dirty_variants(results, parsed)
+        cumulative_dirty_variants |= dirty_now
+        dirty_mx_by_addr: dict = {}
+        for (addr, em, ex) in cumulative_dirty_variants:
+            dirty_mx_by_addr.setdefault(addr, set()).add((em, ex))
+        prunable: set = set()
+        for (addr, em, ex) in cumulative_dirty_variants:
+            canon = canonical_variants.get(addr, set())
+            if (em, ex) in canon:
+                continue  # never prune a cfg-declared canonical variant
+            # require a clean canonical sibling (declared width not dirty)
+            if any(c not in dirty_mx_by_addr.get(addr, set()) for c in canon):
+                prunable.add((addr, em, ex))
+        newly_pruned = prunable - cumulative_pruned
+        if newly_pruned:
+            cumulative_pruned |= newly_pruned
+            prune_by_bank: dict = {}
+            for (addr, em, ex) in cumulative_pruned:
+                prune_by_bank.setdefault((addr >> 16) & 0xFF, set()).add(
+                    (addr & 0xFFFF, em, ex))
+            for bank2, _p2, cfg2 in parsed:
+                pset = prune_by_bank.get(bank2)
+                if not pset:
+                    continue
+                cfg2.entries = [
+                    e for e in cfg2.entries
+                    if (e.start & 0xFFFF, e.entry_m & 1, e.entry_x & 1)
+                    not in pset]
+            valid_variants_map = {}
+            for bank2, _p2, cfg2 in parsed:
+                for e in cfg2.entries:
+                    a = (bank2 << 16) | (e.start & 0xFFFF)
+                    valid_variants_map.setdefault(a, set()).add(
+                        (e.entry_m & 1, e.entry_x & 1))
+            valid_variants_map = {a: frozenset(s)
+                                  for a, s in valid_variants_map.items()}
+            set_valid_variants(valid_variants_map)
+            print(f"  emit-truth prune: dropped {len(newly_pruned)} "
+                  f"wrong-width variant(s) this pass "
+                  f"({len(cumulative_pruned)} total); re-emitting")
+
         # Call-target demands. Workers drain their own globals during
         # emit and return them; pass_unresolved_calls is the union of
         # those drains. Also union main's set in case the autoroute
-        # pre-passes (which run in main) leaked any.
-        unresolved_calls = pass_unresolved_calls | take_unresolved_call_targets()
+        # pre-passes (which run in main) leaked any. Subtract pruned
+        # variants so auto-promote can't resurrect a dropped body.
+        unresolved_calls = (pass_unresolved_calls
+                            | take_unresolved_call_targets()) - cumulative_pruned
         last_unresolved = unresolved_calls
-        if not unresolved_calls:
-            break
 
-        added = _autopromote_targets(parsed, unresolved_calls, source_kind="call")
+        added = _autopromote_targets(
+            parsed, unresolved_calls, source_kind="call") if unresolved_calls else 0
 
-        if added == 0:
+        if added == 0 and not newly_pruned:
             break
         # Auto-promoted callees did not exist when the earlier exit-M/X
         # autoroute ran. Refresh the auto-detected per-variant exit map
@@ -1415,7 +1555,7 @@ def main() -> int:
     # See _STUB_MARKERS comment for the rationale. There is no
     # allowlist — every hit is a recompiler-level gap that must be
     # closed at the gen path, not silenced here.
-    lint_hits = _lint_stubs(out_dir)
+    lint_hits = _lint_stubs(out_dir, args.prefix)
     if lint_hits:
         print()
         print(f"=== STUB LINT — {len(lint_hits)} stub(s) in emitted output ===")

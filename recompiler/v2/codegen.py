@@ -218,6 +218,51 @@ def _variant_suffix(m: int, x: int) -> str:
 _MX_VARIANTS = ((0, 0), (0, 1), (1, 0), (1, 1))
 
 
+# Per-target surviving-(m, x) set, installed by v2_regen after its
+# emit-truth variant-prune pass. A function entered at a fixed width
+# (e.g. an 8-bit-A routine) has wrong-width variants that decode to
+# garbage — misaligned operands, phantom branches to non-code, calls
+# to invalid LoROM addresses. When such a variant ALSO has a clean
+# (marker-free) sibling variant, the clean sibling proves the bytes
+# are real code at some width, so the garbage variant is provably the
+# wrong width and is never validly reached. v2_regen prunes those
+# variants (drops their bodies) and records the survivors here. The
+# 4-way runtime (m, x) dispatch then emits cases ONLY for survivors,
+# so no switch references a pruned (undefined) symbol and no garbage
+# body emits a stub marker. Empty dict => pre-prune / unknown target
+# => emit all four (the historical default). Keyed by 24-bit target
+# address; the LoROM mirror ($00-$3F <-> $80-$BF) is consulted on a
+# miss, mirroring _NAME_RESOLVER's aliasing.
+_VALID_VARIANTS: Dict[int, frozenset] = {}
+
+
+def set_valid_variants(d) -> None:
+    """Install the per-target surviving-(m, x) map from v2_regen's
+    emit-truth prune pass. Pass an empty dict to clear (=> emit all
+    four everywhere, the pre-prune behaviour)."""
+    global _VALID_VARIANTS
+    _VALID_VARIANTS = d or {}
+
+
+def valid_variant_list(addr_24: int):
+    """Return the (m, x) variants a dispatch switch should emit a case
+    for at this call target, in canonical order. When v2_regen has
+    recorded a pruned survivor set for the target (or its LoROM
+    mirror), return that subset; otherwise return all four (pre-prune
+    or cross-bank target with no recorded set)."""
+    if not _VALID_VARIANTS:
+        return _MX_VARIANTS
+    a = addr_24 & 0xFFFFFF
+    s = _VALID_VARIANTS.get(a)
+    if s is None:
+        bank = (a >> 16) & 0xFF
+        if bank < 0x40 or 0x80 <= bank < 0xC0:
+            s = _VALID_VARIANTS.get(a ^ 0x800000)
+    if not s:
+        return _MX_VARIANTS
+    return tuple(mx for mx in _MX_VARIANTS if mx in s)
+
+
 def set_name_resolver(name_map: Dict[int, str]) -> None:
     """Replace the call-target name resolver. Pass an empty dict to clear.
 
@@ -1188,7 +1233,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 # General indirect dispatch: runtime (m, x) dispatch
                 # inside one PB save/restore envelope so the wrong-
                 # variant class is eliminated for indirect calls too.
-                for em_v, ex_v in _MX_VARIANTS:
+                for em_v, ex_v in valid_variant_list(tgt_addr):
                     _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
                 lines.append("      uint8 _saved_pb = cpu->PB;")
                 lines.append(
@@ -1198,7 +1243,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 lines.append("      RecompReturn _r;")
                 lines.append(
                     "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
-                for em_v, ex_v in _MX_VARIANTS:
+                for em_v, ex_v in valid_variant_list(tgt_addr):
                     idx_v = (em_v << 1) | ex_v
                     name_v = f"{base_name}{_variant_suffix(em_v, ex_v)}"
                     lines.append(f"        case {idx_v}: _r = {name_v}(cpu); break;")
@@ -1296,7 +1341,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # class for indirect calls (Dr. Light freeze 2026-05-23
             # traced into a CC84_M1X1 entered at runtime M1X0 via this
             # path).
-            for em_v, ex_v in _MX_VARIANTS:
+            for em_v, ex_v in valid_variant_list(tgt_addr):
                 _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
             lines.append("      uint8 _saved_pb = cpu->PB;")
             lines.append(
@@ -1306,7 +1351,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             lines.append("      RecompReturn _r;")
             lines.append(
                 "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
-            for em_v, ex_v in _MX_VARIANTS:
+            for em_v, ex_v in valid_variant_list(tgt_addr):
                 idx_v = (em_v << 1) | ex_v
                 name_v = f"{base_name}{_variant_suffix(em_v, ex_v)}"
                 lines.append(f"        case {idx_v}: _r = {name_v}(cpu); break;")
@@ -1531,8 +1576,10 @@ def _emit_call(op: Call) -> List[str]:
     # gets the operand widths right per (m, x); the unused variants
     # for a given runtime path are dead but compile cleanly. Demand
     # all 4 variants so v2_regen's autopromote synthesizes whichever
-    # the static analysis missed.
-    for em, ex in _MX_VARIANTS:
+    # the static analysis missed — EXCEPT variants pruned by the
+    # emit-truth prune pass (valid_variant_list), which we must not
+    # re-demand or auto-promote would resurrect the garbage body.
+    for em, ex in valid_variant_list(addr):
         _UNRESOLVED_CALL_TARGETS.add((addr, em, ex))
     # cfg-pinned variant override. When the cfg names this call site
     # via `force_variant_at <site_pc24> <m> <x>`, bypass the 4-way
@@ -1592,7 +1639,7 @@ def _emit_call(op: Call) -> List[str]:
             "  RecompReturn _r;",
             "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
         ]
-        for em, ex in _MX_VARIANTS:
+        for em, ex in valid_variant_list(addr):
             idx = (em << 1) | ex
             name = f"{base_name}{_variant_suffix(em, ex)}"
             lines.append(f"    case {idx}: _r = {name}(cpu); break;")
@@ -1619,7 +1666,7 @@ def _emit_call(op: Call) -> List[str]:
         "  RecompReturn _r;",
         "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
     ]
-    for em, ex in _MX_VARIANTS:
+    for em, ex in valid_variant_list(addr):
         idx = (em << 1) | ex
         name = f"{base_name}{_variant_suffix(em, ex)}"
         lines.append(f"    case {idx}: _r = {name}(cpu); break;")
