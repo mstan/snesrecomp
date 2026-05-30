@@ -122,7 +122,8 @@ void dsp_reset(Dsp* dsp) {
   memset(dsp->firBufferL, 0, sizeof(dsp->firBufferL));
   memset(dsp->firBufferR, 0, sizeof(dsp->firBufferR));
   memset(dsp->sampleBuffer, 0, sizeof(dsp->sampleBuffer));
-  dsp->sampleOffset = 0;
+  dsp->sampleWrite = 0;
+  dsp->sampleRead = 0;
 }
 
 void dsp_saveload(Dsp *dsp, SaveLoadInfo *sli) {
@@ -149,12 +150,15 @@ void dsp_cycle(Dsp* dsp) {
     totalR = 0;
   }
   dsp_handleNoise(dsp);
-  // put it in the samplebuffer
-  if (dsp->sampleOffset < 534) {
-    dsp->sampleBuffer[dsp->sampleOffset * 2] = totalL;
-    dsp->sampleBuffer[dsp->sampleOffset * 2 + 1] = totalR;
-    // prevent sampleOffset from going above 534-1 (out of sampleBuffer bounds)
-    dsp->sampleOffset++;
+  // Write into the output ring. Drop ONLY on a true ring overflow
+  // (~256 ms unconsumed = the audio thread has stalled), which never
+  // happens under normal pacing. The old code instead dropped on every
+  // catch-up burst past 534 samples, which is the music-rate tick.
+  if (dsp->sampleWrite - dsp->sampleRead < DSP_SAMPLE_RING) {
+    uint32_t w = dsp->sampleWrite & (DSP_SAMPLE_RING - 1);
+    dsp->sampleBuffer[w * 2] = totalL;
+    dsp->sampleBuffer[w * 2 + 1] = totalR;
+    dsp->sampleWrite++;
   }
   dsp->evenCycle = !dsp->evenCycle;
 }
@@ -566,13 +570,19 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
 }
 
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame) {
-  // resample from 534 samples per frame to wanted value
+  // Consume the oldest 534 native samples (one block) from the ring and
+  // resample to samplesPerFrame for the output rate. Caller guarantees
+  // >= 534 samples are available. Indexing by the absolute read counter
+  // (not a reset-to-0 offset) keeps any catch-up lead intact for the next
+  // call — FIFO, no sample loss at the block boundary.
   double adder = 534.0 / samplesPerFrame;
   double location = 0.0;
+  uint32_t base = dsp->sampleRead;
   for(int i = 0; i < samplesPerFrame; i++) {
-    sampleData[i * 2] = dsp->sampleBuffer[((int) location) * 2];
-    sampleData[i * 2 + 1] = dsp->sampleBuffer[((int) location) * 2 + 1];
+    uint32_t idx = (base + (uint32_t) location) & (DSP_SAMPLE_RING - 1);
+    sampleData[i * 2] = dsp->sampleBuffer[idx * 2];
+    sampleData[i * 2 + 1] = dsp->sampleBuffer[idx * 2 + 1];
     location += adder;
   }
-  dsp->sampleOffset = 0;
+  dsp->sampleRead += 534;
 }

@@ -13,6 +13,14 @@ typedef struct Dsp Dsp;
 
 typedef struct Apu Apu;
 
+// Output-sample ring capacity (stereo pairs). Must be a power of two so
+// the monotonic write/read counters can index with a mask and survive
+// uint32 wraparound. 8192 samples ≈ 256 ms at 32 kHz — far larger than
+// any single-frame APU catch-up burst, while typical fill stays ~534
+// (one block), so playback latency is unchanged. See the sampleBuffer
+// comment in struct Dsp and the music-tick post-mortem in MMX ISSUES.md.
+#define DSP_SAMPLE_RING 8192
+
 typedef struct DspChannel {
   // pitch
   uint16_t pitch;
@@ -76,9 +84,17 @@ struct Dsp {
   int8_t firValues[8];
   int16_t firBufferL[8];
   int16_t firBufferR[8];
-  // sample buffer (1 frame at 32040 Hz: 534 samples, *2 for stereo)
-  int16_t sampleBuffer[534 * 2];
-  uint16_t sampleOffset; // current offset in samplebuffer
+  // Output-sample ring. Two producers feed it (serialized by RtlApuLock):
+  // the audio thread (RtlRenderAudio) and the CPU thread (snes_catchupApu,
+  // on APU-port access). The old fixed 534-sample buffer dropped every
+  // sample produced past 534, so a catch-up burst between audio callbacks
+  // lost samples → music-rate ticks + timing jitter. The ring buffers the
+  // burst instead; the audio thread consumes the oldest 534 per block at
+  // the steady output rate, smoothing bursty production. (1 native block
+  // = 534 samples @ ~32 kHz; *2 for stereo.)
+  int16_t sampleBuffer[DSP_SAMPLE_RING * 2];
+  uint32_t sampleWrite; // total samples produced (monotonic; index = & mask)
+  uint32_t sampleRead;  // total samples consumed (monotonic; index = & mask)
 };
 
 

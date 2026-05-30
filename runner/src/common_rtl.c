@@ -444,13 +444,20 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * wait through a full audio batch. apu_cycle is single-threaded
    * regardless -- the lock just serialises access to inPorts/outPorts
    * shared with the CPU thread. */
-  while (g_snes->apu->dsp->sampleOffset < 534) {
+  // Ensure at least one block (534 native samples) is available in the
+  // ring, then consume it. The audio thread only produces the shortfall
+  // the CPU-thread catch-up (snes_catchupApu) hasn't already supplied, so
+  // it self-balances: total SPC advance stays at the consumption rate and
+  // bursty catch-up production is buffered, not dropped.
+  #define DSP_AVAIL(d) ((uint32_t)((d)->sampleWrite - (d)->sampleRead))
+  while (DSP_AVAIL(g_snes->apu->dsp) < 534) {
     RtlApuLock();
     int batch = 256;
-    while (batch-- > 0 && g_snes->apu->dsp->sampleOffset < 534)
+    while (batch-- > 0 && DSP_AVAIL(g_snes->apu->dsp) < 534)
       apu_cycle(g_snes->apu);
     RtlApuUnlock();
   }
+  #undef DSP_AVAIL
   RtlApuLock();
   dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
   RtlApuUnlock();
