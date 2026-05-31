@@ -504,6 +504,10 @@ struct emu_block_watch_hit {
     uint16_t r_A, r_X, r_Y, r_S, r_D;
     uint8_t  r_DB, r_PB;
     uint16_t r_P;
+    uint32_t r_ret;   /* 24-bit return address read off the stack at entry
+                       * ($00:[S+1..S+3]); caller = r_ret-2 (JSR) or -3 (JSL).
+                       * Only meaningful when the watched PC is a subroutine
+                       * entry (no pushes precede it). */
     uint8_t  vals[EMU_BLOCK_WATCH_ADDRS_MAX];
 };
 
@@ -622,6 +626,18 @@ extern "C" int snes9x_bridge_block_watch_get_hit(int slot, int hit,
     return 1;
 }
 
+/* Caller-context accessor: the 24-bit return address captured off the
+ * stack at entry. Separate from get_hit so the existing wire format is
+ * untouched. Returns 0 if slot/hit invalid. */
+extern "C" int snes9x_bridge_block_watch_get_ret(int slot, int hit,
+                                                   uint32_t *out_ret) {
+    if (slot < 0 || slot >= EMU_BLOCK_WATCH_MAX) return 0;
+    emu_block_watch *w = &s_emu_block_watches[slot];
+    if (!w->enabled || hit < 0 || hit >= w->hit_count) return 0;
+    if (out_ret) *out_ret = w->hits[hit].r_ret;
+    return 1;
+}
+
 void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
     /* Oracle GM14 entry-only trace. Fires every time PB:PC == $00:C47E.
      * No call-depth/return tracking needed for entry-only first pass. */
@@ -689,6 +705,12 @@ void s9x_bridge_insn_hook(uint8_t pb, uint16_t pc, uint8_t op) {
             h->r_DB  = Registers.DB;
             h->r_PB  = Registers.PB;
             h->r_P   = (uint16_t)Registers.P.W;
+            {   /* return address sitting on the stack at subroutine entry */
+                uint16_t s = Registers.S.W;
+                h->r_ret = (uint32_t)Memory.RAM[0x0100 | ((s + 1) & 0xFF)]
+                         | ((uint32_t)Memory.RAM[0x0100 | ((s + 2) & 0xFF)] << 8)
+                         | ((uint32_t)Memory.RAM[0x0100 | ((s + 3) & 0xFF)] << 16);
+            }
             for (int j = 0; j < w->n_addrs; j++) {
                 int32_t off = w->ram_offsets[j];
                 h->vals[j] = (off >= 0 && off < 0x20000) ? Memory.RAM[off] : 0;

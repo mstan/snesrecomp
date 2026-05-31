@@ -1460,15 +1460,18 @@ static void h_emu_block_watch_get(const char *args) {
             uint8_t vals[EMU_BW_ADDRS_MAX] = {0};
             if (!snes9x_bridge_block_watch_get_hit(i, h, &frame, regs, vals))
                 continue;
+            extern int snes9x_bridge_block_watch_get_ret(int, int, uint32_t *);
+            uint32_t ret24 = 0;
+            snes9x_bridge_block_watch_get_ret(i, h, &ret24);
             pos += snprintf(buf + pos, sizeof(buf) - pos,
                 "%s{\"hit\":%d,\"frame\":%d,"
                 "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
                 "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
                 "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%04x\","
-                "\"vals\":[",
+                "\"ret\":\"0x%06x\",\"vals\":[",
                 h ? "," : "", h, (int)frame,
                 regs[0], regs[1], regs[2], regs[3], regs[4],
-                (unsigned)regs[5], (unsigned)regs[6], regs[7]);
+                (unsigned)regs[5], (unsigned)regs[6], regs[7], ret24);
             for (int v = 0; v < n_addrs; v++) {
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "%s\"0x%02x\"", v ? "," : "", vals[v]);
