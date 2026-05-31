@@ -306,22 +306,35 @@ def _autorecover_dp_table_count(rom: bytes, bank: int,
 
 def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
                                  data_regions=None,
-                                 max_entries: int = 256) -> Optional[List[int]]:
-    """Walk the dispatch table for a `JMP (abs,X)` / `JML (abs,X)` at
-    `insn`. Returns a list of 24-bit target PCs, or None if the very
-    first entry already looks invalid (no table at this site).
+                                 max_entries: int = 256,
+                                 func_start: Optional[int] = None) -> Optional[List[int]]:
+    """Walk the dispatch table for a `JMP (abs,X)` / `JML (abs,X)` /
+    `JSR (abs,X)` at `insn`. Returns a list of 24-bit target PCs, or
+    None if the very first entry already looks invalid (no table at
+    this site).
 
     Termination rules (in order):
       1. table address would cross the bank boundary ($FFFF)
-      2. ROM-offset goes off the image
-      3. raw target value is null ($0000) AND the next entry is also
+      2. table would reach the dispatch site's own function start —
+         the table-precedes-dispatcher layout's hard code boundary
+      3. ROM-offset goes off the image
+      4. raw target value is null ($0000) AND the next entry is also
          null — pad detected. Single $0000 is preserved as a null-entry
          (some jump tables intentionally have a no-op slot)
-      4. raw target value is < $8000 (not LoROM code space)
-      5. target points into a cfg `data_region` for the resolved bank
-      6. target bytes look like padding ($FF / $00 fill) per
+      5. raw target value is < $8000 (not LoROM code space)
+      6. target points into a cfg `data_region` for the resolved bank
+      7. target bytes look like padding ($FF / $00 fill) per
          `_dispatch_target_is_padding`
-      7. max_entries hit (defensive)
+      8. max_entries hit (defensive)
+
+    `func_start` (16-bit) is the entry PC of the function containing the
+    dispatch site. The dominant 65816 layout puts the table immediately
+    BEFORE its dispatcher (`<table bytes> ; <dispatcher code>`), so when
+    `base < func_start` the table cannot extend at/beyond `func_start`
+    without overrunning into the dispatcher's own opcodes. Without this
+    bound the walk reads the dispatcher bytes (e.g. `A5 B0 0A AA …`) as
+    bogus entries whenever none of the real handlers happens to sit at
+    the table's true end.
 
     Entry size: 2 for JMP (length 3) — INDIR_X target stays in current
     bank. 3 for JML (length 4) — INDIR_X target is a 24-bit pointer.
@@ -331,6 +344,11 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
     entries: List[int] = []
     tbl_pc = base
     nulls_in_a_row = 0
+    # Hard code boundary for the table-precedes-dispatcher layout: the
+    # table ends where the dispatcher's own function begins.
+    code_boundary = None
+    if func_start is not None and base < (func_start & 0xFFFF):
+        code_boundary = func_start & 0xFFFF
     # In-bank handler PCs we've already accepted. Used as an upper bound
     # on the table — once tbl_pc would meet or cross any accepted
     # in-bank handler, we've walked into that handler's code and any
@@ -342,12 +360,26 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
     # promoted to a phony function entry — manifests downstream as a
     # cross-fn goto trap to garbage (MMX bank 01 $848E from the
     # $01:D11B dispatch + bank 02 $8F20 from the $02:CFD4 dispatch).
+    #
+    # Only handlers AT OR ABOVE the table base count: the walk grows
+    # upward from `base`, so a target that lives BELOW the table (a
+    # handler elsewhere in the bank, e.g. Zelda Module11's submodule-3
+    # handler at $8D10 sitting below its table at $9AED) can never be
+    # "code the table ran into" and must not terminate the walk. Before
+    # this filter, accepting such an entry falsely capped the table at
+    # the next slot (Module11 truncated 6→4 entries → submodule-4
+    # dispatch_oob trap on walking up into a dungeon falling entrance).
     inbank_handler_pcs: List[int] = []
     while len(entries) < max_entries:
         if tbl_pc + entry_size - 1 > 0xFFFF:
             break
+        # Stop at the dispatcher's own function start (table-precedes-
+        # dispatcher layout): no entry can begin at/after it.
+        if code_boundary is not None and tbl_pc >= code_boundary:
+            break
         # Stop if the next entry's read range would overlap any already-
-        # accepted in-bank handler. Equivalent to: table_top >= min_handler_pc.
+        # accepted in-bank handler at/above the table base. Equivalent
+        # to: table_top >= min(handler_pc for handler_pc >= base).
         if any(tbl_pc >= h for h in inbank_handler_pcs):
             break
         try:
@@ -389,8 +421,11 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
             break
         entries.append(full)
         # Track in-bank handler PCs so the next iteration's overlap
-        # check can stop walking once tbl_pc would cross into one.
-        if eb == bank and 0x8000 <= addr16 <= 0xFFFF:
+        # check can stop walking once tbl_pc would cross into one. Only
+        # handlers at/above the table base are candidates for "code the
+        # upward-growing table ran into"; targets below `base` live
+        # elsewhere in the bank and must not bound the walk.
+        if eb == bank and base <= addr16 <= 0xFFFF:
             inbank_handler_pcs.append(addr16)
         tbl_pc += entry_size
     return entries if entries else None
@@ -1422,7 +1457,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             # heuristic).
             if auth is None and insn.mode == INDIR_X:
                 entries = _autorecover_indirect_xtable(rom, bank, insn,
-                                                       data_regions)
+                                                       data_regions,
+                                                       func_start=start)
                 if entries:
                     auth = {
                         'count': len(entries),
@@ -1613,7 +1649,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             # present (explicit beats heuristic).
             if ud_auth is None:
                 entries = _autorecover_indirect_xtable(rom, bank, insn,
-                                                       data_regions)
+                                                       data_regions,
+                                                       func_start=start)
                 if entries:
                     ud_auth = {
                         'count': len(entries),
