@@ -36,6 +36,11 @@ unsigned  s_frame_width  = 256;
 unsigned  s_frame_height = 224;
 uint16_t  s_joypad[2]    = {0, 0};
 bool      s_loaded       = false;
+/* Pixel format the core requested via SET_PIXEL_FORMAT (libretro enum:
+ * 0=0RGB1555, 1=XRGB8888, 2=RGB565). snes9x-libretro requests RGB565 by
+ * default, so we must convert in retro_video_refresh rather than assume
+ * 32-bit (assuming 32-bit produced garbled/wrong-colour screenshots). */
+unsigned  s_pixel_format = 2; /* default RGB565 (snes9x default) */
 
 /* WRAM snapshot from before the most-recent retro_run(). Enables
  * emu_wram_delta: per-frame write observability without touching
@@ -163,13 +168,39 @@ void retro_video_refresh(const void *data, unsigned width, unsigned height, size
     if (!data) return;
     s_frame_width  = width;
     s_frame_height = height;
-    /* snes9x libretro default is XRGB8888. Copy what fits into 256x240. */
+    /* Convert the core's framebuffer to XRGB8888 honoring the requested
+     * pixel format (snes9x emits RGB565 by default). `pitch` is in bytes. */
     unsigned copy_h = height > 240 ? 240 : height;
     unsigned copy_w = width > 256 ? 256 : width;
-    for (unsigned y = 0; y < copy_h; y++) {
-        memcpy(s_framebuf_xrgb + y * 256,
-               (const uint8_t *)data + y * pitch,
-               copy_w * sizeof(uint32_t));
+    if (s_pixel_format == 1) {
+        /* XRGB8888: direct copy. */
+        for (unsigned y = 0; y < copy_h; y++)
+            memcpy(s_framebuf_xrgb + y * 256,
+                   (const uint8_t *)data + y * pitch,
+                   copy_w * sizeof(uint32_t));
+    } else {
+        /* 16-bit source (RGB565 or 0RGB1555). Expand each pixel to
+         * 0x00RRGGBB so the screenshot writer (which reads bytes B,G,R)
+         * gets correct colours. */
+        const int is565 = (s_pixel_format == 2);
+        for (unsigned y = 0; y < copy_h; y++) {
+            const uint16_t *srow = (const uint16_t *)((const uint8_t *)data + y * pitch);
+            uint32_t *drow = s_framebuf_xrgb + y * 256;
+            for (unsigned x = 0; x < copy_w; x++) {
+                uint16_t p = srow[x];
+                uint8_t r, g, b;
+                if (is565) {
+                    r = (uint8_t)((p >> 11) & 0x1F); r = (uint8_t)((r << 3) | (r >> 2));
+                    g = (uint8_t)((p >> 5)  & 0x3F); g = (uint8_t)((g << 2) | (g >> 4));
+                    b = (uint8_t)( p        & 0x1F); b = (uint8_t)((b << 3) | (b >> 2));
+                } else { /* 0RGB1555 */
+                    r = (uint8_t)((p >> 10) & 0x1F); r = (uint8_t)((r << 3) | (r >> 2));
+                    g = (uint8_t)((p >> 5)  & 0x1F); g = (uint8_t)((g << 3) | (g >> 2));
+                    b = (uint8_t)( p        & 0x1F); b = (uint8_t)((b << 3) | (b >> 2));
+                }
+                drow[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            }
+        }
     }
 }
 
@@ -229,7 +260,9 @@ bool retro_environment(unsigned cmd, void *data) {
             return true;
         }
         case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
-            /* Accept whatever snes9x wants (XRGB8888 by default on x64). */
+            /* Record the requested format so retro_video_refresh converts
+             * correctly (snes9x requests RGB565). */
+            if (data) s_pixel_format = *(const unsigned *)data;
             return true;
         }
         case RETRO_ENVIRONMENT_GET_VARIABLE: {
