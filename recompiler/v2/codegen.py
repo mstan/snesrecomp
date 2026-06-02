@@ -263,6 +263,73 @@ def valid_variant_list(addr_24: int):
     return tuple(mx for mx in _MX_VARIANTS if mx in s)
 
 
+def _nearest_survivor(survivors, m: int, x: int):
+    """Pick the surviving (m, x) variant closest to the requested mode.
+    Prefer a matching m_flag (accumulator width) over a matching x_flag,
+    then fall back to the first survivor in canonical order. Returns None
+    only when `survivors` is empty (which the prune pass never produces —
+    the effective canonical variant is never pruned)."""
+    best = None
+    best_cost = None
+    for sm, sx in survivors:
+        cost = (0 if sm == m else 2) + (0 if sx == x else 1)
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best = (sm, sx)
+    return best
+
+
+def variant_dispatch_case_lines(addr_24: int, base_name: str,
+                                indent: str = "    ", pre_call=None):
+    """Emit the case/default body for a runtime (m, x) dispatch switch.
+
+    A case is emitted for ALL FOUR (m, x) indices. Surviving variants call
+    their own body; combos pruned by the emit-truth prune pass route to the
+    nearest surviving CLEAN sibling. This is sound because the prune only
+    drops a variant when a clean sibling decoding the SAME bytes exists —
+    so the bytes are real code, and a function reached at a "wrong" static
+    width still executes correctly (the dominant pruned class re-normalizes
+    width early, e.g. CE9A's `REP #$30`). Routing the default to a real body
+    instead of `RECOMP_RETURN_NORMAL` fixes the silent no-op that left a
+    reached-but-pruned callee's outputs unwritten (root cause of the Rangda
+    Bangda eye flying ~17x too far: the m=0,x=1 JSL into CE9A hit `default`,
+    CE9A never ran, and the fly-timer was computed from the un-overwritten
+    eyeX input). Only changes behaviour when the no-op path is actually
+    taken — i.e. exactly the broken case.
+
+    `pre_call` is an optional list of statements emitted INSIDE each case
+    before the variant call (e.g. the JMP tail-call return-context inherit);
+    when given, the multi-line case form is used."""
+    survivors = list(valid_variant_list(addr_24))
+    survivor_set = set(survivors)
+    lines = []
+
+    def emit(label: str, name: str, comment: str = ""):
+        if pre_call:
+            lines.append(f"{indent}{label}:{comment}")
+            for stmt in pre_call:
+                lines.append(f"{indent}  {stmt}")
+            lines.append(f"{indent}  _r = {name}(cpu);")
+            lines.append(f"{indent}  break;")
+        else:
+            lines.append(f"{indent}{label}: _r = {name}(cpu); break;{comment}")
+
+    for m, x in _MX_VARIANTS:
+        idx = (m << 1) | x
+        if (m, x) in survivor_set:
+            emit(f"case {idx}", f"{base_name}{_variant_suffix(m, x)}")
+        elif survivors:
+            sm, sx = _nearest_survivor(survivors, m, x)
+            emit(f"case {idx}", f"{base_name}{_variant_suffix(sm, sx)}",
+                 f"  /* M{m}X{x} pruned -> nearest survivor M{sm}X{sx} */")
+    if survivors:
+        sm, sx = _nearest_survivor(survivors, 0, 0)
+        emit("default", f"{base_name}{_variant_suffix(sm, sx)}")
+    else:
+        lines.append(f"{indent}default: _r = RECOMP_RETURN_NORMAL; break;")
+    return lines
+
+
 def set_name_resolver(name_map: Dict[int, str]) -> None:
     """Replace the call-target name resolver. Pass an empty dict to clear.
 
@@ -1245,11 +1312,8 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 lines.append("      RecompReturn _r;")
                 lines.append(
                     "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
-                for em_v, ex_v in valid_variant_list(tgt_addr):
-                    idx_v = (em_v << 1) | ex_v
-                    name_v = f"{base_name}{_variant_suffix(em_v, ex_v)}"
-                    lines.append(f"        case {idx_v}: _r = {name_v}(cpu); break;")
-                lines.append("        default: _r = RECOMP_RETURN_NORMAL; break;")
+                lines += variant_dispatch_case_lines(
+                    tgt_addr, base_name, indent="        ")
                 lines.append("      }")
                 lines.append(
                     "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
@@ -1356,18 +1420,10 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             lines.append("      RecompReturn _r;")
             lines.append(
                 "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
-            for em_v, ex_v in valid_variant_list(tgt_addr):
-                idx_v = (em_v << 1) | ex_v
-                name_v = f"{base_name}{_variant_suffix(em_v, ex_v)}"
-                if not is_jsr:
-                    lines.append(f"        case {idx_v}:")
-                    lines.append(
-                        "          cpu_tailcall_inherit_return_context(_entry_s, _hrv);")
-                    lines.append(f"          _r = {name_v}(cpu);")
-                    lines.append("          break;")
-                    continue
-                lines.append(f"        case {idx_v}: _r = {name_v}(cpu); break;")
-            lines.append("        default: _r = RECOMP_RETURN_NORMAL; break;")
+            _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
+                    if not is_jsr else None)
+            lines += variant_dispatch_case_lines(
+                tgt_addr, base_name, indent="        ", pre_call=_pre)
             lines.append("      }")
             lines.append(
                 "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
@@ -1651,12 +1707,8 @@ def _emit_call(op: Call) -> List[str]:
             "  RecompReturn _r;",
             "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
         ]
-        for em, ex in valid_variant_list(addr):
-            idx = (em << 1) | ex
-            name = f"{base_name}{_variant_suffix(em, ex)}"
-            lines.append(f"    case {idx}: _r = {name}(cpu); break;")
+        lines += variant_dispatch_case_lines(addr, base_name)
         lines.extend([
-            "    default: _r = RECOMP_RETURN_NORMAL; break;",
             "  }",
             "  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
             "  cpu->PB = _saved_pb;",
@@ -1678,12 +1730,8 @@ def _emit_call(op: Call) -> List[str]:
         "  RecompReturn _r;",
         "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
     ]
-    for em, ex in valid_variant_list(addr):
-        idx = (em << 1) | ex
-        name = f"{base_name}{_variant_suffix(em, ex)}"
-        lines.append(f"    case {idx}: _r = {name}(cpu); break;")
+    lines += variant_dispatch_case_lines(addr, base_name)
     lines.extend([
-        "    default: _r = RECOMP_RETURN_NORMAL; break;",
         "  }",
         "  if (_r != RECOMP_RETURN_NORMAL) {",
         "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",

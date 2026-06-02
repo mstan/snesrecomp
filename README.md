@@ -11,12 +11,11 @@ as a normal binary rather than under interpretation.
 > ## Status: alpha, three games at varying playability
 >
 > **Super Mario World is believed fully playable** through the
-> recompiler. **A Link to the Past** is playable through the early
-> dungeon. **Mega Man X 0.1.0** boots into the attract demo and title
-> screen with frequent lockups and visual bugs. The framework itself
-> is still pre-release: APIs change without warning, internal docs
-> assume active-session context. Treat what you see here as a working
-> snapshot, not a release.
+> recompiler. **Mega Man X is believed fully playable** end-to-end.
+> **A Link to the Past** is playable through the early dungeon. The
+> framework itself is still pre-release: APIs change without warning,
+> internal docs assume active-session context. Treat what you see here
+> as a working snapshot, not a release.
 
 ## Per-game runner repos
 
@@ -41,10 +40,11 @@ the game-specific runtime, `.cfg`, and build glue.
 
 - **Mega Man X** —
   [mstan/MegaManXSNESRecomp](https://github.com/mstan/MegaManXSNESRecomp).
-  **0.1.0 — playable, with frequent lockups and visual bugs.** Boots
-  through Capcom logo, attract intro, title screen. Expect to need
-  save states; the C-host fiber scheduler can stall at various points
-  and visual rough edges are common.
+  **Believed playable end-to-end.** Boot → Capcom logo → attract intro
+  → title screen → intro stage and the Maverick stages with their
+  bosses play through; the earlier lockups (cooperative-scheduler
+  stalls, dispatch-site m/x mistranslations) and visual rough edges
+  have been resolved.
 
 The intent is for snesrecomp to be **game-agnostic** — adding a new
 game should cost mostly per-game `.cfg` work, not months of framework
