@@ -5755,14 +5755,14 @@ static void cmd_get_spc_writes(const char *args) {
     send_line(buf);
 }
 
-/* Post-mortem JSON dump — calls into smw_post_mortem_dump (in src/post_mortem.c).
- * Declared weakly so non-SMW projects sharing this debug_server.c don't
- * fail to link; if no implementation is present, the command just emits
- * a sentinel reply. */
-extern void smw_post_mortem_dump(const char *reason, void *fault_info);
+/* Post-mortem JSON dump — calls into recomp_post_mortem_dump (in
+ * src/post_mortem.c). Declared weakly so projects sharing this
+ * debug_server.c don't fail to link; if no implementation is present,
+ * the command just emits a sentinel reply. */
+extern void recomp_post_mortem_dump(const char *reason, void *fault_info);
 static void cmd_post_mortem_dump(const char *args) {
     (void)args;
-    smw_post_mortem_dump("on_demand", NULL);
+    recomp_post_mortem_dump("on_demand", NULL);
     send_line("{\"ok\":true,\"path\":\"build/last_run_report.json\"}");
 }
 
