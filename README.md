@@ -60,6 +60,19 @@ LttP and MMX have each surfaced their own framework gaps (LoROM
 bank-mirror routing, MMX cooperative-scheduler HLE, abs-indirect
 dispatch emit, dispatch-site m/x tracking) that are now baked in.
 
+## Conventions for per-game repos
+
+To keep new games consistent and free of leftover game-specific naming:
+
+- **Window title** (`kWindowTitle` in the game's `src/main.c`):
+  `"<Full Game Name> (Recompiled)"` — e.g. `Super Mario World (Recompiled)`,
+  `Megaman X (Recompiled)`, `Legend of Zelda: A Link to the Past (Recompiled)`.
+- **Config file:** a generic `config.ini` (plus optional `config.user.ini` /
+  `config.local.ini`) — not a per-game-named `.ini`.
+- **Shared framework hooks** use neutral, game-agnostic names (e.g.
+  `RunOneFrameOfGame` / `RunOneFrameOfGame_Internal`, `recomp_post_mortem_dump`) —
+  never a game prefix.
+
 ## What's in this repo
 
 - `recompiler/` — Python code that decodes 65816 ROM bytes,
@@ -70,8 +83,8 @@ dispatch emit, dispatch-site m/x tracking) that are now baked in.
   L3 fixtures.
 - `fuzz/` — differential fuzzer over synthetic 65816 snippets.
 - `tools/` — scripts for regen, trace diffing, etc., plus
-  [`tools/mmxref/`](tools/mmxref/): a standalone SDL2 libretro frontend
-  that serves as the hardware-accurate timing/state reference for
+  [`tools/snes-oracle/`](tools/snes-oracle/): a standalone SDL2 libretro
+  frontend that serves as the hardware-accurate timing/state reference for
   diffing the recompiled build.
 
 ## Public API / docs
