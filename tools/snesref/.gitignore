@@ -1,4 +1,4 @@
-# snes-oracle ships only its own source (frontend.cpp, libretro.h, build.bat).
+# snesref ships only its own source (frontend.cpp, libretro.h, build.bat).
 # Everything below is supplied locally by the developer and is deliberately
 # NOT committed — chiefly to keep separately-licensed binaries out of this
 # repo (libretro cores carry their own, sometimes non-commercial, licenses;
@@ -16,7 +16,7 @@ cores/
 *_libretro.dll.zip
 
 # build + run artifacts
-snes-oracle.exe
+snesref.exe
 *.obj
 *.exe
 *_state*.bin

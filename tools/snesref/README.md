@@ -1,7 +1,13 @@
-# snes-oracle
+# snesref
 
 A standalone, hardware-accurate **reference interpreter with debugging tools**,
 used as the differential oracle when chasing bugs in the recompiled build.
+
+> Formerly named `mmxref`, then `snes-oracle`; settled on **snesref** to pair
+> with the Genesis equivalent [`mdref`](https://github.com/mstan/mdref). Also
+> published as a standalone repo at
+> [`mstan/snesref`](https://github.com/mstan/snesref); this copy is vendored
+> in-tree for convenience.
 
 Under the hood it is a minimal SDL2 [libretro](https://www.libretro.com/)
 frontend that loads a real SNES emulator core (an interpreter such as
@@ -50,13 +56,13 @@ for any libretro SNES core.
 build.bat
 ```
 
-Produces `snes-oracle.exe`.
+Produces `snesref.exe`.
 
 ## Run
 
 ```bat
-snes-oracle.exe <core.dll> <rom.sfc>
-:: e.g. snes-oracle.exe snes9x_libretro.dll mmx.sfc
+snesref.exe <core.dll> <rom.sfc>
+:: e.g. snesref.exe snes9x_libretro.dll mmx.sfc
 ```
 
 Place the libretro core DLL (and its `SDL2.dll`) next to the exe, or pass a path.

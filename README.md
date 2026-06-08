@@ -83,9 +83,10 @@ To keep new games consistent and free of leftover game-specific naming:
   L3 fixtures.
 - `fuzz/` — differential fuzzer over synthetic 65816 snippets.
 - `tools/` — scripts for regen, trace diffing, etc., plus
-  [`tools/snes-oracle/`](tools/snes-oracle/): a standalone SDL2 libretro
+  [`tools/snesref/`](tools/snesref/): a standalone SDL2 libretro
   frontend that serves as the hardware-accurate timing/state reference for
-  diffing the recompiled build.
+  diffing the recompiled build (also published standalone as
+  [`mstan/snesref`](https://github.com/mstan/snesref); formerly `mmxref`).
 
 ## Public API / docs
 
@@ -94,10 +95,39 @@ Internal docs assume context from active development sessions and
 will not make sense without it. This will change once the framework
 stabilizes.
 
+## Acknowledgements
+
+snesrecomp did not start from scratch — its runtime and tooling stand on
+prior reverse-engineering and emulation work, and we're grateful for it:
+
+- **[snesrev](https://github.com/snesrev)** (`snesrev/zelda3`,
+  `snesrev/smw`) — the C runner and surrounding ecosystem were heavily
+  based on the snesrev reverse-engineered ports. The "recompile/port the
+  CPU code to C, emulate the rest of the silicon, and verify against a
+  reference emulator" model is theirs, and concrete pieces were adapted
+  directly: the function-boundary conventions consumed by
+  `tools/ingest_zelda3_decomp.py`, runtime utilities (`runner/src/util.h`
+  still carries the `ZELDA3_UTIL_H_` guard), the SHA-256 ROM-verification
+  path, and the default keybind layout.
+- The C SNES hardware core under
+  [`runner/src/snes/`](runner/src/snes/) (PPU, APU, DSP, SPC700, DMA,
+  cart mapping) is derived from the **[LakeSnes](https://github.com/elzo-d/LakeSnes)**
+  (elzo-d) C emulator that snesrev's projects vendor, with individual
+  algorithms credited inline to **snes9x**.
+- **[IsoFrieze/SMWDisX](https://github.com/IsoFrieze/SMWDisX)** — the
+  Super Mario World disassembly used as the symbol/RAM-map basis and as
+  the conformance oracle for the SMW port (see
+  `tools/cfg_override_smwdisx_crosscheck.py`,
+  `tests/test_smwdisx_compare.py`). SMWDisX in turn credits mikeyk's
+  original 2013 disassembly and loveemu's SPC700 work.
+
 ## License
 
-Not yet declared. Code in this repo is original, except the libretro
-API header `tools/mmxref/libretro.h`, which is MIT (RetroArch team).
-The reference tool (`tools/mmxref/`) loads a libretro emulator core as
-a runtime DLL — no emulator source or binary is vendored in this repo,
-so it carries none of a core's licensing terms; supply a core yourself.
+Not yet declared. Code in this repo is original except where noted in
+**Acknowledgements** above. The libretro API header
+`tools/snesref/libretro.h` is MIT (RetroArch team). The reference tool
+(`tools/snesref/`) loads a libretro emulator core as a runtime DLL — no
+emulator source or binary is vendored in this repo, so it carries none of
+a core's licensing terms; supply a core yourself. The `runner/src/snes/`
+hardware core derives from LakeSnes (and, transitively, snes9x); their
+respective terms apply to that code.

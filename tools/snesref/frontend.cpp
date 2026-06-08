@@ -1,10 +1,10 @@
-/* snes-oracle — minimal SDL2 libretro frontend: a known-good SNES interpreter
+/* snesref — minimal SDL2 libretro frontend: a known-good SNES interpreter
  * with recomp debugging instrumentation, used as the differential oracle for
  * the recompiler. Loads a libretro SNES core, plays a ROM with reliable SDL
  * keyboard input, and logs per-frame WRAM changes (same JSON shape as the
  * recomp debug_server's wram_writes_at) to mmx_trace.jsonl.
  *
- *   snes-oracle.exe <core.dll> <rom.sfc>
+ *   snesref.exe <core.dll> <rom.sfc>
  *
  * Keys (match the recomp keybinds): arrows=D-pad, Z=B(jump), X=A, A=Y(fire),
  *   S=X, C=L, V=R, Enter=Start, RShift=Select.
@@ -198,7 +198,7 @@ static void load_state(int slot) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr,"usage: snes-oracle <core.dll> <rom.sfc>\n"); return 1; }
+    if (argc < 3) { fprintf(stderr,"usage: snesref <core.dll> <rom.sfc>\n"); return 1; }
     const char* corePath = argv[1];
     const char* romPath  = argv[2];
 
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) { fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 5; }
     open_first_pad();
-    g_win = SDL_CreateWindow("snes-oracle (libretro) — Fn load / Shift+Fn save / Backspace clear-trace",
+    g_win = SDL_CreateWindow("snesref (libretro) — Fn load / Shift+Fn save / Backspace clear-trace",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, vw*2, vh*2, SDL_WINDOW_RESIZABLE);
     g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     SDL_RenderSetLogicalSize(g_ren, vw, vh);
