@@ -85,7 +85,8 @@ def emit_bank(rom: bytes, bank: int,
               callee_exit_mx_modes=None,
               hle_spc_upload=None,
               hle_func=None,
-              hle_dispatch=None) -> str:
+              hle_dispatch=None,
+              inline_arg_map=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -180,6 +181,7 @@ def emit_bank(rom: bytes, bank: int,
             hle_spc_upload=hle_spc_upload,
             hle_func=hle_func,
             hle_dispatch=hle_dispatch,
+            inline_arg_map=inline_arg_map,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

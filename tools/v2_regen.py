@@ -46,6 +46,7 @@ from v2.codegen import (  # noqa: E402
 )
 from v2.decoder import (  # noqa: E402
     classify_dispatch_helper, decode_function, analyze_function_exit_mx,
+    detect_inline_arg_bytes, set_active_inline_arg_map,
     set_decode_cache_enabled, clear_decode_cache, decode_cache_stats,
 )
 from v2.emit_bank import BankEntry, emit_bank  # noqa: E402
@@ -198,7 +199,8 @@ def _scan_dirty_variants(results, parsed) -> tuple:
 
 
 def _compute_prunable(dirty_variants: set, emitted_variants: set,
-                      canonical_variants: dict) -> set:
+                      canonical_variants: dict,
+                      protected_variants: set | None = None) -> set:
     """Decide which dirty (addr24, m, x) variants the emit-truth prune
     may drop, given the cumulative dirty + emitted variant sets and the
     cfg-declared canonical widths.
@@ -212,6 +214,10 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
       proves the bytes are real code at that width, so the dirty clone is
       a wrong-width decode (misaligned operands -> phantom branches /
       garbage calls) that can never be validly reached.
+    - It is NOT `protected` (see below): a variant that is the target of a
+      DIRECT (non-dispatch) reference from a never-pruned body is provably
+      reached at that width, so its stub marker is pending dispatch
+      residue — NOT wrong-width garbage.
 
     Effective canonical = the cfg-declared width(s) when the base has a
     cfg entry, else the default 65816 reset width (1, 1). Auto-promoted
@@ -224,7 +230,24 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
     clean-canonical test fails, and NOTHING is pruned — the genuine site
     survives as loud trap residue (matching the oracle baseline) for cfg
     `indirect_dispatch` / `hle_dispatch` follow-up.
+
+    `protected_variants` closes a hole the clean-canonical test alone
+    cannot: when the cfg-DEFAULT width (the effective canonical) is itself
+    the WRONG-width decode — i.e. the ingester defaulted a genuinely 16-bit
+    routine to (1, 1) — the clean-canonical test protects the garbage
+    canonical and instead prunes the REAL non-canonical variant. That real
+    variant is reached by a DIRECT tail-call/call from a never-pruned body
+    (canonically, the fall-through sibling that `REP`s the width before
+    the boundary), and that direct reference dangles at link time
+    (LNK2019) with no prune able to repair it (canonicals are unprunable).
+    The caller passes the set of variants directly referenced by a
+    canonical body (see `_canonical_ref_targets`); they are provably
+    reached and must survive. Observed: Super Metroid
+    `sub_82BB7F` / `sub_82BBDD` (the baby-Metroid cluster runs under
+    HandleGameOverBabyMetroid's `REP #$30`, so the real width is M0X0, the
+    cfg-default M1X1 is the garbage decode). 2026-06-08.
     """
+    protected_variants = protected_variants or set()
     dirty_mx: dict = {}
     for (addr, em, ex) in dirty_variants:
         dirty_mx.setdefault(addr, set()).add((em, ex))
@@ -233,6 +256,8 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
         emitted_mx.setdefault(addr, set()).add((em, ex))
     prunable: set = set()
     for (addr, em, ex) in dirty_variants:
+        if (addr, em, ex) in protected_variants:
+            continue  # directly referenced by a never-pruned body — reached
         canon = canonical_variants.get(addr) or {(1, 1)}
         if (em, ex) in canon:
             continue  # never prune the (effective) canonical variant
@@ -345,6 +370,31 @@ def _scan_variant_refs(results, parsed) -> dict:
                     continue  # self-reference (recursion) is not a taint
                 refs.setdefault(cur, set()).add(tv)
     return refs
+
+
+def _canonical_ref_targets(refs: dict, canonical_variants: dict) -> set:
+    """Return every variant that is the target of a DIRECT reference from a
+    CANONICAL body.
+
+    A canonical (cfg-declared, alias-bound) variant is NEVER pruned, so its
+    DIRECT (non-dispatch) tail-call / single-call references are permanent
+    in the linked binary and MUST resolve. The boundary `(m, x)` of each
+    such reference is computed from the canonical body's own decode, so the
+    referenced (addr, m, x) is provably reached at that width — even when
+    it differs from the target's cfg-default width (the
+    HandleGameOverBabyMetroid `REP #$30` fall-through case). Feeding these
+    to `_compute_prunable` as `protected` stops the emit-truth /
+    reference-taint prune from dropping a genuinely-reached variant whose
+    only blemish is a pending indirect-dispatch stub marker.
+
+    `refs` is `_scan_variant_refs` output (dispatch-switch cases already
+    excluded, so only danglable direct references are present)."""
+    protected: set = set()
+    for (saddr, sm, sx), targets in refs.items():
+        canon = canonical_variants.get(saddr) or {(1, 1)}
+        if (sm, sx) in canon:
+            protected |= targets
+    return protected
 
 
 def _propagate_reference_taint(dirty: set, refs: dict, emitted: set,
@@ -639,6 +689,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
     set_force_variant_at(args_dict['force_variant_at'])
     set_valid_variants(args_dict.get('valid_variants') or {})
     set_trampoline_returns(args_dict['trampoline_returns'])
+    set_active_inline_arg_map(args_dict.get('inline_arg_map') or None)
 
     bank = args_dict['bank']
     cfg = args_dict['cfg']
@@ -658,6 +709,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
 
     try:
         src = emit_bank(rom, bank=bank, entries=cfg.entries,
+                        inline_arg_map=args_dict.get('inline_arg_map') or None,
                         dispatch_helpers=args_dict['dispatch_helpers'],
                         indirect_call_tables=getattr(
                             cfg, 'indirect_call_tables', None),
@@ -953,6 +1005,7 @@ def main() -> int:
     print("Auto-detecting JSL dispatch helpers...")
     dispatch_helpers: dict = {}
     jsl_targets: set = set()
+    call_targets: set = set()   # every JSR/JSL target (for inline-arg scan)
     for bank, _cfg_path, cfg in parsed:
         for entry in cfg.entries:
             try:
@@ -967,8 +1020,11 @@ def main() -> int:
                 # JSL or JML (JMP LONG)
                 if ins.mnem == 'JSL':
                     jsl_targets.add(ins.operand & 0xFFFFFF)
+                    call_targets.add(ins.operand & 0xFFFFFF)
                 elif ins.mnem == 'JMP' and ins.length == 4:
                     jsl_targets.add(ins.operand & 0xFFFFFF)
+                elif ins.mnem == 'JSR' and ins.length == 3:
+                    call_targets.add((bank << 16) | (ins.operand & 0xFFFF))
     classified = {'short': 0, 'long': 0}
     for tgt in jsl_targets:
         tbank = (tgt >> 16) & 0xFF
@@ -979,6 +1035,83 @@ def main() -> int:
             classified[kind] += 1
     print(f"  detected {classified['short']} short + {classified['long']} long dispatch helpers "
           f"(scanned {len(jsl_targets)} JSL/JML targets)")
+
+    # Auto-detect JSR/JSL INLINE-ARGUMENT routines (no cfg hint — the
+    # byte count is a property of the callee's own code; see
+    # detect_inline_arg_bytes / PRINCIPLES "hints are not correctness").
+    # Such a callee reads its return address off the stack, consumes the
+    # N bytes after the call site as a parameter, and advances the stacked
+    # return address by N. The decoder must skip those N bytes at every
+    # call site (see _labeled_successors) or it runs into the inline data
+    # and misdecodes it as code. Probe each call target at both common
+    # entry widths (the ADC #imm that encodes N is m-dependent, so the
+    # idiom only resolves at the routine's real width); accept only a
+    # unique result. Canonical case: Super Metroid APU_UploadBankIP
+    # ($80:800A), a 3-byte inline ROM pointer the reset embeds after its
+    # JSL — without this, I_RESET decodes the pointer as BRK and returns
+    # early (black screen).
+    _phase("inline_arg_discovery")
+    print("Auto-detecting JSR/JSL inline-argument routines...")
+    # Transitive closure of call targets. The initial scan above only saw
+    # the immediate instructions of cfg entries; an inline-arg callee can
+    # sit deeper — e.g. Super Metroid's APU_UploadBankIP ($80:800A) is
+    # reached via I_RESET -> cross-bank JMP $80:8423 -> JSL $80:800A, and
+    # $8423 is not a cfg entry until auto-promote (which runs later). Walk
+    # JSL/JSR/JMP-long from every cfg entry to a fixpoint, decoding each
+    # function once (default width suffices — we only need the call-target
+    # operands, captured before any inline-data truncation) so every
+    # transitively-reachable callee is probed.
+    _wl: list = []
+    for bank, _cfg_path, cfg in parsed:
+        for entry in cfg.entries:
+            _wl.append(((bank << 16) | (entry.start & 0xFFFF),
+                        entry.entry_m & 1, entry.entry_x & 1))
+    _decoded_for_calls: set = set()
+    while _wl:
+        pc24, em, ex = _wl.pop()
+        if pc24 in _decoded_for_calls:
+            continue
+        _decoded_for_calls.add(pc24)
+        dbank, daddr = (pc24 >> 16) & 0xFF, pc24 & 0xFFFF
+        try:
+            g = decode_function(rom, dbank, daddr, entry_m=em, entry_x=ex)
+        except Exception:
+            continue
+        for di in g.insns.values():
+            ins = di.insn
+            if ins.mnem == 'JSL' or (ins.mnem == 'JMP' and ins.length == 4):
+                t = ins.operand & 0xFFFFFF
+            elif ins.mnem == 'JSR' and ins.length == 3:
+                t = (dbank << 16) | (ins.operand & 0xFFFF)
+            else:
+                continue
+            call_targets.add(t)
+            if t not in _decoded_for_calls:
+                _wl.append((t, 1, 1))
+    inline_arg_map: dict = {}
+    for tgt in sorted(call_targets):
+        tbank = (tgt >> 16) & 0xFF
+        taddr = tgt & 0xFFFF
+        seen_n: set = set()
+        for em, ex in ((0, 0), (1, 1)):
+            n = detect_inline_arg_bytes(rom, tbank, taddr, em, ex)
+            if n:
+                seen_n.add(n)
+        if len(seen_n) == 1:
+            inline_arg_map[tgt] = seen_n.pop()
+    if inline_arg_map:
+        print(f"  detected {len(inline_arg_map)} inline-argument routine(s):")
+        for tgt, n in sorted(inline_arg_map.items()):
+            nm = name_map.get(tgt, name_map.get(tgt ^ 0x800000, ''))
+            print(f"    ${tgt:06X} consumes {n} inline byte(s)"
+                  f"{(' (' + nm + ')') if nm else ''}")
+    else:
+        print(f"  none (scanned {len(call_targets)} call targets)")
+    # Install as the process-wide default so every main-process decode
+    # (variant discovery, exit-mx, etc.) skips inline-arg bytes. The
+    # multiprocessing emit workers receive it via the work-item dict and
+    # set it in their own process (see _emit_bank_one).
+    set_active_inline_arg_map(inline_arg_map)
 
     # Auto-detect leaf-function exit-(M, X) state mutations. Pattern:
     # cfg `func F` whose decoded body has NO JSR/JSL inside AND whose
@@ -1607,6 +1740,7 @@ def main() -> int:
                 'trampoline_returns': cumulative_trampoline_returns,
                 'callee_exit_mx': callee_exit_mx,
                 'callee_exit_mx_modes': callee_exit_mx_modes,
+                'inline_arg_map': inline_arg_map,
             })
 
         # Run emit. Pool path used when --jobs > 1 and there's more
@@ -1676,9 +1810,17 @@ def main() -> int:
         dirty_now, emitted_now = _scan_dirty_variants(results, parsed)
         cumulative_dirty_variants |= dirty_now
         cumulative_emitted_variants |= emitted_now
+        # Variants directly referenced by a canonical (never-pruned) body
+        # are provably reached at the referenced width; protect them from
+        # the wrong-width prune so a genuinely-reached variant whose body
+        # carries a pending indirect-dispatch stub is never dropped (which
+        # would dangle the canonical caller's direct reference -> LNK2019).
+        emit_ref_graph = _scan_variant_refs(results, parsed)
+        protected_variants = _canonical_ref_targets(
+            emit_ref_graph, canonical_variants)
         prunable = _compute_prunable(
             cumulative_dirty_variants, cumulative_emitted_variants,
-            canonical_variants)
+            canonical_variants, protected_variants)
         newly_pruned = prunable - cumulative_pruned
         if newly_pruned:
             cumulative_pruned |= newly_pruned
@@ -1727,6 +1869,8 @@ def main() -> int:
             # iterates to a fixpoint (monotonic — cumulative_pruned only
             # grows).
             ref_graph = _scan_variant_refs(results, parsed)
+            ref_protected = _canonical_ref_targets(
+                ref_graph, canonical_variants)
             ref_prunable = set()
             while True:
                 tainted = _propagate_reference_taint(
@@ -1735,7 +1879,8 @@ def main() -> int:
                     cumulative_pruned | ref_prunable)
                 next_ref_prunable = (
                     _compute_prunable(
-                        tainted, emitted_now, canonical_variants)
+                        tainted, emitted_now, canonical_variants,
+                        ref_protected)
                     - cumulative_pruned
                     - ref_prunable)
                 if not next_ref_prunable:

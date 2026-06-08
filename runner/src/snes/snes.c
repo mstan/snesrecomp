@@ -226,15 +226,27 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return val;
     }
     case 0x4212: {
-      // Static-recomp h-counter model: real hardware updates hPos every
+      // Static-recomp h/v-counter model: real hardware updates hPos every
       // dot-clock; recomp has no dot-clock, so each $4212 read advances
       // hPos by a fixed step. Calibrated so a typical busy-wait crosses
       // both edges in ~10-20 reads. Bit 6 = hblank (dots ~1024..1364 of
       // a 1364-dot scanline). See docs/VIRTUAL_HW_CONTRACT.md.
+      uint32_t prev_h = snes->hPos;
       snes->hPos = (snes->hPos + 64) % 1364;
+      // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
+      // inVblank (inVblank is never set true), so on the static-recomp
+      // path bit 7 must be SYNTHESIZED the same way bit 6 is — otherwise a
+      // boot vblank-wait loop that polls $4212 bit 7 BEFORE the first NMI
+      // (while the single host fiber is blocked in SwitchToFiber and real
+      // frame timing is frozen) never sees the edge and spins forever
+      // (Super Metroid I_RESET $00:843C: `LDA $4212 / BPL` x4 settle).
+      // Advance a synthetic scanline (vPos, 0..261 NTSC) each time the dot
+      // counter wraps; vblank is the post-render region (vPos >= 225). OR
+      // in the real inVblank so an authoritative vblank still reads true.
+      if (snes->hPos < prev_h) snes->vPos = (snes->vPos + 1) % 262;
       uint8_t val = (snes->autoJoyTimer > 0);
       val |= (snes->hPos >= 1024) << 6;
-      val |= snes->inVblank << 7;
+      val |= (snes->inVblank || snes->vPos >= 225) << 7;
       return val;
     }
     case 0x4213:

@@ -793,7 +793,8 @@ def _successors(insn: Insn, key: DecodeKey, bank: int,
 def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                         callee_exit_mx: Optional[Dict] = None,
                         callee_exit_mx_modes: Optional[Dict] = None,
-                        rom: Optional[bytes] = None):
+                        rom: Optional[bytes] = None,
+                        inline_arg_map: Optional[Dict[int, int]] = None):
     """Compute (DecodeKey, edge_kind) tuples for one decoded instruction.
 
     `edge_kind` is one of:
@@ -872,6 +873,26 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
             target_pc24 = addr24(bank, insn.operand & 0xFFFF)
         elif mnem == 'JSL':
             target_pc24 = insn.operand & 0xFFFFFF
+        # JSR/JSL to an INLINE-ARGUMENT routine: the callee reads its own
+        # return address off the stack, consumes the N bytes that follow
+        # the call as a parameter, and advances the stacked return address
+        # by N so its RTS/RTL returns past them (the classic 65816
+        # inline-arg idiom; see detect_inline_arg_bytes). The recompiled
+        # callee still reads those bytes correctly (the emitted JSL pushes
+        # the real return PC), but the CALLER's fall-through must skip them
+        # — otherwise the decoder runs straight into the argument data and
+        # misdecodes it as code (Super Metroid I_RESET: the 3-byte ROM
+        # pointer after `JSL APU_UploadBankIP` decoded as BRK, truncating
+        # reset). Auto-detected per callee, applied at every call site — no
+        # cfg hint. Skip N bytes for the return/fall-through key.
+        if inline_arg_map and target_pc24 is not None:
+            nskip = inline_arg_map.get(target_pc24)
+            if nskip is None:
+                tbank = (target_pc24 >> 16) & 0xFF
+                if tbank < 0x40 or 0x80 <= tbank < 0xC0:
+                    nskip = inline_arg_map.get(target_pc24 ^ 0x800000)
+            if nskip:
+                next_pc = (next_pc + nskip) & 0xFFFF
         if callee_exit_mx is not None:
             target_pc24: Optional[int] = None
             if mnem == 'JSR' and insn.length == 3:
@@ -929,6 +950,97 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
 
     # Default: linear fall-through with post-instruction mode.
     return [(DecodeKey(addr24(bank, next_pc), post_m, post_x, post_p_stack), 'fall')]
+
+
+def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
+                            entry_m: int = 1, entry_x: int = 1):
+    """Detect whether the subroutine at (bank, addr) is a JSR/JSL
+    INLINE-ARGUMENT routine, returning the inline byte count N (or None).
+
+    An inline-arg routine reads its own return address off the stack, uses
+    the N bytes immediately following the call site as a parameter, and
+    ADVANCES the stacked return address by a constant N so its RTS/RTL
+    returns PAST the inline data. The game-agnostic 65816 signature:
+
+        LDA $rr,S        ; load the return-address-low slot (rr=1 here)
+        ... (A preserved: STA dp/abs, CLC/SEC) ...
+        ADC #N           ; advance the return address by N
+        STA $rr,S        ; write it back to the SAME slot
+
+    N is the count of inline bytes every call site must skip after the
+    JSR/JSL (see `_labeled_successors`). Auto-detecting this from the
+    callee — rather than a per-target cfg hint — is the correct fix
+    (PRINCIPLES: hints are not correctness; the byte count is a property
+    of the callee's own code). Canonical case: Super Metroid
+    APU_UploadBankIP ($80:800A), 3-byte inline ROM pointer.
+
+    Conservative by construction: only the exact load-add-store-back-to-
+    same-slot idiom matches, and any A-clobbering instruction in between
+    resets the match — so a routine that merely reads its return address
+    (e.g. a JSL dispatch helper) without adding a constant and storing it
+    back is NOT flagged. Returns None on the first terminator or after a
+    short instruction budget."""
+    from snes65816 import decode_insn, lorom_offset, STK
+    # Opcodes that PRESERVE A (may appear between the load and the
+    # add/store-back): stores, flag set/clear, register transfers that
+    # read A, pushes, index ops, compares, NOPs.
+    A_PRESERVING = {
+        0x85, 0x8D, 0x8F, 0x95, 0x9D, 0x99, 0x92, 0x87, 0x97, 0x81, 0x91,
+        0x9C, 0x9E,                                   # STA / STZ
+        0x86, 0x8E, 0x96, 0x84, 0x8C, 0x94,           # STX / STY
+        0x18, 0x38, 0xD8, 0xF8, 0x58, 0x78, 0xB8,     # CLC/SEC/CLD/SED/CLI/SEI/CLV
+        0xAA, 0xA8,                                   # TAX/TAY (read A)
+        0xE8, 0xC8, 0xCA, 0x88,                       # INX/INY/DEX/DEY
+        0xA2, 0xA6, 0xB6, 0xAE, 0xBE,                 # LDX
+        0xA0, 0xA4, 0xB4, 0xAC, 0xBC,                 # LDY
+        0xE0, 0xE4, 0xEC, 0xC0, 0xC4, 0xCC,           # CPX/CPY
+        0x48, 0xDA, 0x5A, 0x08, 0x8B, 0x4B, 0x0B,     # PHA/PHX/PHY/PHP/PHB/PHK/PHD
+        0xEA, 0x42,                                   # NOP / WDM
+    }
+    pc = addr & 0xFFFF
+    m, x = entry_m & 1, entry_x & 1
+    a_slot = None     # stack slot the live A value came from (LDA $nn,S)
+    a_added = 0       # constant added to that value since the load
+    budget = 0
+    while budget < 96:
+        budget += 1
+        if not (0x8000 <= pc <= 0xFFFF):
+            return None
+        try:
+            off = lorom_offset(bank, pc)
+        except AssertionError:
+            return None
+        if off >= len(rom):
+            return None
+        try:
+            ins = decode_insn(rom, off, pc, bank, m=m, x=x)
+        except Exception:
+            return None
+        op, mn = ins.opcode, ins.mnem
+        if mn in _TERMINATORS:
+            return None
+        if mn == 'REP':
+            if ins.operand & 0x20: m = 0
+            if ins.operand & 0x10: x = 0
+        elif mn == 'SEP':
+            if ins.operand & 0x20: m = 1
+            if ins.operand & 0x10: x = 1
+        elif mn == 'LDA' and ins.mode == STK:
+            a_slot = ins.operand & 0xFF       # (re)start tracking from this slot
+            a_added = 0
+        elif op == 0x69 and a_slot is not None:   # ADC #imm (m-dependent)
+            a_added = (a_added + ins.operand) & 0xFFFF
+        elif op == 0x83 and ins.mode == STK:      # STA $nn,S — return-addr write-back
+            if a_slot is not None and (ins.operand & 0xFF) == a_slot and a_added:
+                return a_added & 0xFF             # inline byte count
+            # store-back without an add (or to a different slot): not it
+        elif op in A_PRESERVING:
+            pass                                  # A unchanged; keep tracking
+        else:
+            a_slot = None                         # A clobbered — reset
+            a_added = 0
+        pc = (pc + ins.length) & 0xFFFF
+    return None
 
 
 def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
@@ -1050,6 +1162,23 @@ _DECODE_CACHE_HITS = 0
 _DECODE_CACHE_MISSES = 0
 _DECODE_CACHE_ENABLED = False  # off by default (cache key bug)
 
+# Process-wide default inline-argument map (see detect_inline_arg_bytes /
+# _labeled_successors). v2_regen builds it once per regen and installs it
+# here so EVERY decode_function caller in the process picks it up without
+# threading the param through every pre-pass call site. An explicit
+# `inline_arg_map=` arg still overrides this (used on the multiprocessing
+# emit-worker path, which can't see a main-process global). None => no
+# inline-arg routines known (pre-detection / no callers declared).
+_ACTIVE_INLINE_ARG_MAP: Optional[Dict[int, int]] = None
+
+
+def set_active_inline_arg_map(m: Optional[Dict[int, int]]) -> None:
+    """Install the process-wide default inline-arg map used as the
+    fall-back when decode_function is called without an explicit
+    `inline_arg_map`. Pass None/{} to clear."""
+    global _ACTIVE_INLINE_ARG_MAP
+    _ACTIVE_INLINE_ARG_MAP = m or None
+
 
 def set_decode_cache_enabled(enabled: bool) -> None:
     """Enable/disable decode_function memoization. Disabling clears."""
@@ -1115,6 +1244,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     callee_exit_mx: Optional[Dict] = None,
                     callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
+                    inline_arg_map: Optional[Dict[int, int]] = None,
                     ) -> "FunctionDecodeGraph":
     """Public cached wrapper around `_decode_function_uncached`.
 
@@ -1122,6 +1252,8 @@ def decode_function(rom: bytes, bank: int, start: int,
     process-local; callers must treat the returned graph as immutable
     (it is shared across cache hits with the same key). v2_regen.py
     calls clear_decode_cache() between phases to bound memory."""
+    if inline_arg_map is None:
+        inline_arg_map = _ACTIVE_INLINE_ARG_MAP
     if not _DECODE_CACHE_ENABLED:
         return _decode_function_uncached(
             rom, bank, start, entry_m, entry_x,
@@ -1134,6 +1266,7 @@ def decode_function(rom: bytes, bank: int, start: int,
             callee_exit_mx=callee_exit_mx,
             callee_exit_mx_modes=callee_exit_mx_modes,
             sibling_entry_pcs=sibling_entry_pcs,
+            inline_arg_map=inline_arg_map,
         )
 
     cache_key = (
@@ -1146,6 +1279,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         id(callee_exit_mx) if callee_exit_mx is not None else 0,
         id(callee_exit_mx_modes) if callee_exit_mx_modes is not None else 0,
         id(sibling_entry_pcs) if sibling_entry_pcs is not None else 0,
+        id(inline_arg_map) if inline_arg_map is not None else 0,
     )
     cached = _DECODE_CACHE.get(cache_key)
     if cached is not None:
@@ -1166,6 +1300,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         callee_exit_mx=callee_exit_mx,
         callee_exit_mx_modes=callee_exit_mx_modes,
         sibling_entry_pcs=sibling_entry_pcs,
+        inline_arg_map=inline_arg_map,
     )
     _DECODE_CACHE[cache_key] = graph
     return graph
@@ -1183,6 +1318,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     callee_exit_mx: Optional[Dict] = None,
                     callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
+                    inline_arg_map: Optional[Dict[int, int]] = None,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
 
@@ -1673,7 +1809,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         insn, key, bank,
                         callee_exit_mx=callee_exit_mx,
                         callee_exit_mx_modes=callee_exit_mx_modes,
-                        rom=rom)
+                        rom=rom, inline_arg_map=inline_arg_map)
                     site_m = insn.m_flag & 1
                     site_x = insn.x_flag & 1
                     for e in entries:
@@ -1729,7 +1865,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn, key, bank,
                     callee_exit_mx=callee_exit_mx,
                     callee_exit_mx_modes=callee_exit_mx_modes,
-                    rom=rom)
+                    rom=rom, inline_arg_map=inline_arg_map)
                 # Append jump-kind edges to the in-bank handlers. Each
                 # dispatch target enters as its own function — empty
                 # p_stack, not the caller's.
@@ -1765,7 +1901,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             insn, key, bank,
             callee_exit_mx=callee_exit_mx,
             callee_exit_mx_modes=callee_exit_mx_modes,
-            rom=rom)
+            rom=rom, inline_arg_map=inline_arg_map)
         succ = [k for (k, _) in labeled_succ]
         graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)
 

@@ -9,6 +9,8 @@
 #include "cpu_trace.h"
 #include "debug_server.h"
 #include <setjmp.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -208,6 +210,48 @@ void WatchdogFrameStart(void) {
 
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
+  /* Boot-spin observability. During boot (frame 0) the normal frame
+   * watchdog is disabled below (the SPC IPL upload is legitimately slow,
+   * real-time paced by the audio thread). But a genuine boot spin
+   * (I_RESET never reaching the first WaitForNMI yield) otherwise hangs
+   * SILENTLY: the host's SwitchToFiber never returns, the window goes
+   * black + "Not Responding", and frame_counter stays 0 forever so the
+   * frame watchdog never arms. Sample the live recomp call stack at
+   * intervals during boot so (a) a true spin's location is named and
+   * (b) a slow-but-progressing upload (stack CHANGES between samples) is
+   * distinguishable from a real spin (stack IDENTICAL). Pure sampling:
+   * no longjmp (the boot fiber has no valid g_watchdog_jmp setjmp frame)
+   * and no abort, so a healthy slow boot is never disturbed — once the
+   * first NMI bumps frame_counter past 0 this whole branch goes dormant.
+   * Tunable via SNESRECOMP_BOOT_WATCHDOG_SECS (default: first sample at
+   * 8 s, then every 3 s). Shared across every game's bring-up. */
+  if (snes_frame_counter == 0) {
+    static long    boot_calls = 0;
+    static clock_t boot_first = 0, boot_last_print = 0;
+    static double  boot_first_secs = -1.0;
+    if (boot_first == 0) boot_first = clock();
+    if (++boot_calls % 2000 != 0) return;   /* throttle clock() reads */
+    if (boot_first_secs < 0.0) {
+      const char *e = getenv("SNESRECOMP_BOOT_WATCHDOG_SECS");
+      boot_first_secs = e ? atof(e) : 8.0;
+    }
+    clock_t now = clock();
+    double since_start = (double)(now - boot_first) / CLOCKS_PER_SEC;
+    double since_print = (double)(now - boot_last_print) / CLOCKS_PER_SEC;
+    if (since_start > boot_first_secs && since_print > 3.0) {
+      boot_last_print = now;
+      fprintf(stderr,
+        "[boot-watchdog] %.1fs in boot (frame 0); recomp depth=%d, "
+        "top=%s\n", since_start, g_recomp_stack_top,
+        g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1]
+                               : (g_last_recomp_func ? g_last_recomp_func
+                                                     : "(none)"));
+      for (int i = g_recomp_stack_top - 1, n = 0; i >= 0 && n < 16; i--, n++)
+        fprintf(stderr, "    [%d] %s\n", n, g_recomp_stack[i]);
+      fflush(stderr);
+    }
+    return;
+  }
   if (!g_watchdog_enabled) return;
   // Only check clock() every 10000 iterations to avoid overhead
   if (++g_watchdog_counter < 10000) return;
