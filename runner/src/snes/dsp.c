@@ -8,8 +8,7 @@
 
 #include "dsp.h"
 #include "apu.h"
-
-#define MY_CHANGES 1
+#include "../audio_trace.h"
 
 static const int rateValues[32] = {
   0, 2048, 1536, 1280, 1024, 768, 640, 512,
@@ -154,12 +153,16 @@ void dsp_cycle(Dsp* dsp) {
   // (~256 ms unconsumed = the audio thread has stalled), which never
   // happens under normal pacing. The old code instead dropped on every
   // catch-up burst past 534 samples, which is the music-rate tick.
-  if (dsp->sampleWrite - dsp->sampleRead < DSP_SAMPLE_RING) {
+  uint32_t fill = dsp->sampleWrite - dsp->sampleRead;
+  int dropped = fill >= DSP_SAMPLE_RING;
+  if (!dropped) {
     uint32_t w = dsp->sampleWrite & (DSP_SAMPLE_RING - 1);
     dsp->sampleBuffer[w * 2] = totalL;
     dsp->sampleBuffer[w * 2 + 1] = totalR;
     dsp->sampleWrite++;
   }
+  audio_trace_on_sample((int16_t)totalL, (int16_t)totalR, dropped,
+                        dropped ? fill : fill + 1);
   dsp->evenCycle = !dsp->evenCycle;
 }
 
@@ -246,7 +249,15 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   } else {
     sample = dsp_getSample(dsp, ch, dsp->channel[ch].pitchCounter >> 12, (dsp->channel[ch].pitchCounter >> 4) & 0xff);
   }
-#if !MY_CHANGES
+  // Key-on/off is LATCHED and polled every other sample, KOF taking
+  // priority — hardware behavior (and what the snes9x oracle does).
+  // The inherited port code (`MY_CHANGES`) instead applied KON/KOF
+  // immediately inside dsp_write, a hardware deviation kept here since
+  // the initial import with no recorded rationale; issue #4 made it a
+  // suspect for note-level divergence, so it was removed in favor of
+  // this latched path. A pending keyOn survives while keyOff is held
+  // (engine clears $5C later -> voice starts at the next poll), exactly
+  // as on hardware.
   if(dsp->evenCycle) {
     // handle keyon/off (every other cycle)
     if(dsp->channel[ch].keyOff) {
@@ -264,7 +275,6 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
       dsp->channel[ch].adsrState = dsp->channel[ch].useGain ? 3 : 0;
     }
   }
-#endif
   // handle reset
   if(dsp->reset) {
     dsp->channel[ch].adsrState = 4;
@@ -425,6 +435,7 @@ uint8_t dsp_read(Dsp* dsp, uint8_t adr) {
 }
 
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
+  audio_trace_on_reg_write(adr, val);
   int ch = adr >> 4;
   switch(adr) {
     case 0x00: case 0x10: case 0x20: case 0x30: case 0x40: case 0x50: case 0x60: case 0x70: {
@@ -485,33 +496,16 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
       break;
     }
     case 0x4c: {
+      // Latch only; the per-channel poll in dsp_cycleChannel applies
+      // KON every other sample with KOF priority (hardware behavior).
       for(int ch = 0; ch < 8; ch++) {
         dsp->channel[ch].keyOn = val & (1 << ch);
-#if MY_CHANGES
-        if (dsp->channel[ch].keyOn) {
-          dsp->channel[ch].keyOn = false;
-          // restart current sample
-          dsp->channel[ch].previousFlags = 0;
-          uint16_t samplePointer = dsp->dirPage + 4 * dsp->channel[ch].srcn;
-          dsp->channel[ch].decodeOffset = dsp->apu_ram[samplePointer];
-          dsp->channel[ch].decodeOffset |= dsp->apu_ram[(samplePointer + 1) & 0xffff] << 8;
-          memset(dsp->channel[ch].decodeBuffer, 0, sizeof(dsp->channel[ch].decodeBuffer));
-          dsp->channel[ch].gain = 0;
-          dsp->channel[ch].adsrState = dsp->channel[ch].useGain ? 3 : 0;
-        }
-#endif
       }
       break;
     }
     case 0x5c: {
       for(int ch = 0; ch < 8; ch++) {
         dsp->channel[ch].keyOff = val & (1 << ch);
-#if MY_CHANGES
-        if (dsp->channel[ch].keyOff) {
-          // go to release
-          dsp->channel[ch].adsrState = 4;
-        }
-#endif
       }
       break;
     }
@@ -585,4 +579,5 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame) {
     location += adder;
   }
   dsp->sampleRead += 534;
+  audio_trace_on_consume(base, 534, dsp->sampleWrite - dsp->sampleRead);
 }
