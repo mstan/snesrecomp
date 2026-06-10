@@ -35,6 +35,9 @@ extern uint8 g_snesrecomp_last_hdmaen;
 // Main-CPU cycle estimate for APU pacing. Incremented per RDB_BLOCK_HOOK.
 // See common_rtl.c rtl_accumulate_apu_catchup() for usage.
 extern uint64_t g_main_cpu_cycles_estimate;
+// APU-port-touch-only estimate; the only counter that feeds APU catch-up.
+// See the definition in common_rtl.c for the issue #4 rationale.
+extern uint64_t g_apu_pace_cycles_estimate;
 extern uint64_t g_apu_last_sync_cycles;
 void rtl_accumulate_apu_catchup(void);
 

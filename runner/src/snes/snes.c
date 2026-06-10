@@ -15,6 +15,7 @@
 #include "variables.h"
 #include "../common_rtl.h"
 #include "../debug_server.h"
+#include "../audio_trace.h"
 
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
@@ -91,6 +92,7 @@ void snes_reset(Snes* snes, bool hard) {
 static uint64_t s_catchup_calls = 0;
 static uint64_t s_catchup_cycles_total = 0;
 uint64_t g_apu_timer0_total_ticks = 0;
+
 void snes_catchupApu(Snes* snes) {
   /* Upper cap is a guard against accumulator runaway after a long
    * stall; SPC runs at ~1 MHz so 10000 cycles is about 10 ms of real
@@ -114,9 +116,11 @@ void snes_catchupApu(Snes* snes) {
   int catchupCycles = (int) snes->apuCatchupCycles;
   if (catchupCycles < 0) catchupCycles = 0;
 
+  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
   for(int i = 0; i < catchupCycles; i++) {
     apu_cycle(snes->apu);
   }
+  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
   snes->apuCatchupCycles -= (double) catchupCycles;
   if (snes->apuCatchupCycles < 0.0) snes->apuCatchupCycles = 0.0;
   s_catchup_calls++;

@@ -11,6 +11,7 @@
 #include "cpu_state.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
+#include "audio_trace.h"
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -27,6 +28,21 @@ uint8 g_snesrecomp_last_hdmaen;
 // "wait for APU ack" loops resolved instantly, racing through ~200 frames worth of game
 // logic in ~95 frames. Tracking real elapsed cycles makes those waits actually wait.
 uint64_t g_main_cpu_cycles_estimate = 0;
+// APU-port-touch-only estimate (issue #4). Only touches of $2140-$217F
+// count toward APU catch-up pacing. The general estimate above counts
+// EVERY HW-reg touch, which wildly over-counts during load-heavy phases:
+// graphics decompression hammers $2118/$2122 thousands of times per
+// frame, and the next APU-port access used to convert that entire
+// fictional backlog into SPC cycles at once. Measured on MMX (audio_trace
+// rings, 300 s boot→attract): 237,426 native samples — 7.4 s of SPC
+// over-advance — dropped at the output ring, clustered at scene
+// transitions, audibly skipping the music forward at every stage load.
+// Genuine APU handshakes (boot/bank uploads, command acks) self-pace
+// through their own port polls — each poll is an APU touch — so they
+// still over-clock the SPC and complete fast; that part is required:
+// at hardware-real SPC pace MMX's boot upload blocks a single frame
+// for >5 s and trips the per-frame watchdog (measured, 2026-06-09).
+uint64_t g_apu_pace_cycles_estimate = 0;
 uint64_t g_apu_last_sync_cycles = 0;
 
 // FILE-backed SaveLoadInfo. snes_saveload calls back into func() once per
@@ -53,6 +69,7 @@ static void file_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 void RtlReset(int mode) {
   snes_frame_counter = 0;
   g_main_cpu_cycles_estimate = 0;
+  g_apu_pace_cycles_estimate = 0;
   g_apu_last_sync_cycles = 0;
   snes_reset(g_snes, true);
   SnesEnterNativeMode();
@@ -312,20 +329,56 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 
 /* IndirWriteByte is now inline in common_rtl.h */
 
-// Convert main-CPU cycle delta into APU cycles (ratio ~3.5:1) and accumulate
-// into apuCatchupCycles. Caller holds RtlApuLock and is responsible for the
-// snes_catchupApu() call. Sets g_apu_last_sync_cycles to the current main-CPU
-// estimate so subsequent calls only see incremental work.
+// Convert the APU-touch cycle delta into APU cycles (ratio ~3.5:1) and
+// accumulate into apuCatchupCycles. Caller holds RtlApuLock and is
+// responsible for the snes_catchupApu() call. Sets g_apu_last_sync_cycles
+// to the current APU-touch estimate so subsequent calls only see
+// incremental work. (See g_apu_pace_cycles_estimate's comment for why
+// this deliberately ignores non-APU HW touches.)
 //
 // Public so snes.c's snes_readBBus (the APU read path) can use the same
 // pacing -- both reads and writes need to advance APU.
 void rtl_accumulate_apu_catchup(void) {
-  uint64_t delta = g_main_cpu_cycles_estimate - g_apu_last_sync_cycles;
-  g_apu_last_sync_cycles = g_main_cpu_cycles_estimate;
+  uint64_t delta = g_apu_pace_cycles_estimate - g_apu_last_sync_cycles;
+  g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   // 2/7 is about 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
   // (back-to-back APU touches with no block hooks between them) just don't
   // advance APU on this pass; cycles accumulate for the next touch.
   g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
+
+  // Real-time baseline when nothing is draining the DSP output ring
+  // (EnableAudio=0, headless runs, the pre-callback boot window, a
+  // stalled device). With audio on, the audio thread's RtlRenderAudio
+  // top-up advances the SPC at the device's real consumption rate; with
+  // no consumer that baseline vanishes and the SPC would advance only on
+  // the (possibly rare) APU touches. Inject wall-clock time at the SPC's
+  // real rate (~1.024 MHz) so engine state keeps tracking real time and
+  // handshakes can never freeze. ADDITIVE to the touch credit, never a
+  // limit — handshake over-clock must stay possible (see above).
+  // Consumer presence is inferred from sampleRead movement, so this is
+  // automatic per game and per moment, no config.
+  {
+    static uint32_t last_sample_read;
+    static uint64_t consume_seen_ms, wall_last_ms;
+    Dsp *dsp = g_snes->apu->dsp;
+    uint64_t now_ms = audio_trace_wall_ms();
+    uint32_t rd = dsp->sampleRead;
+    if (rd != last_sample_read) {
+      last_sample_read = rd;
+      consume_seen_ms = now_ms;
+    }
+    int consumer_active = consume_seen_ms != 0 &&
+                          now_ms - consume_seen_ms < 250;
+    uint32_t baseline = 0;
+    if (!consumer_active && wall_last_ms != 0) {
+      uint64_t elapsed = now_ms - wall_last_ms;
+      if (elapsed > 32) elapsed = 32;  /* burst cap: ~32 ms of SPC time */
+      baseline = (uint32_t)(elapsed * 1024);  /* SPC ~1.024 MHz */
+      g_snes->apuCatchupCycles += (double)baseline;
+    }
+    wall_last_ms = now_ms;
+    audio_trace_on_pace(consumer_active, baseline);
+  }
 }
 
 void RtlApuWrite(uint16 adr, uint8 val) {
@@ -406,7 +459,7 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
       g_snes->apu->spc->pc = final_pc;
     }
   }
-  g_apu_last_sync_cycles = g_main_cpu_cycles_estimate;
+  g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   RtlApuUnlock();
 
   if (update_cpu_result) {
@@ -452,9 +505,11 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   #define DSP_AVAIL(d) ((uint32_t)((d)->sampleWrite - (d)->sampleRead))
   while (DSP_AVAIL(g_snes->apu->dsp) < 534) {
     RtlApuLock();
+    audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
     int batch = 256;
     while (batch-- > 0 && DSP_AVAIL(g_snes->apu->dsp) < 534)
       apu_cycle(g_snes->apu);
+    audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
     RtlApuUnlock();
   }
   #undef DSP_AVAIL

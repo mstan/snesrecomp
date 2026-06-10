@@ -96,9 +96,19 @@ static int cpu_sram_offset(uint8 bank, uint16 addr) {
  * The 256-cycle increment is tuned to roughly match v1's per-block
  * pacing amortised over the recomp's tight CPU read loops. The
  * minimum-cycle floor in snes_catchupApu (snes.c) ensures the SPC
- * actually progresses on each call. */
-static inline void cpu_pace_cycles(void) {
+ * actually progresses on each call.
+ *
+ * Only APU-port touches ($2140-$217F) feed the APU catch-up counter
+ * (issue #4): general HW touches massively over-count during load-heavy
+ * phases ($2118 decompression spam) and used to convert into SPC-cycle
+ * bursts that overflowed the DSP output ring at scene transitions,
+ * audibly skipping the music. Handshake loops poll the ports themselves,
+ * so APU touches alone keep every upload/ack protocol self-pacing. The
+ * all-touch estimate stays for trace timestamps and diagnostics. */
+static inline void cpu_pace_cycles(uint16 addr) {
     g_main_cpu_cycles_estimate += 256;
+    if (addr >= 0x2140 && addr <= 0x217F)
+        g_apu_pace_cycles_estimate += 256;
 }
 
 /* Optional debug — disabled in release. Set BUILD_CPU_HW_LOG=1 in the
@@ -142,7 +152,7 @@ static void cpu_hw_log(uint16 addr, int is_read, uint16 val) {
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0) return cpu->ram[off];
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 1, 0); return ReadReg(addr); }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 1, 0); return ReadReg(addr); }
     int sram = cpu_sram_offset(bank, addr);
     if (sram >= 0) return g_sram[sram];
     /* ROM read. RomPtr requires the global g_rom pointer to be live. */
@@ -153,7 +163,7 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0 && off + 1 < 0x20000)
         return (uint16)cpu->ram[off] | ((uint16)cpu->ram[off + 1] << 8);
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 1, 0); return ReadRegWord(addr); }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 1, 0); return ReadRegWord(addr); }
     int sram_lo = cpu_sram_offset(bank, addr);
     if (sram_lo >= 0) {
         /* Compose word from two byte fetches. If the high byte crosses
@@ -190,7 +200,7 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
 #endif
         return;
     }
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
     int sram = cpu_sram_offset(bank, addr);
     if (sram >= 0) { g_sram[sram] = v; return; }
     /* ROM / unmapped write: drop. */
@@ -210,7 +220,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
 #endif
         return;
     }
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
     int sram_lo = cpu_sram_offset(bank, addr);
     if (sram_lo >= 0) {
         g_sram[sram_lo] = (uint8)(v & 0xFF);
