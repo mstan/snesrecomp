@@ -20,25 +20,112 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <commdlg.h>
+#  include <direct.h>
+#  define snesrecomp_chdir _chdir
+#  define snesrecomp_getcwd _getcwd
 #  pragma comment(lib, "comdlg32.lib")
+#else
+#  include <unistd.h>
+#  define snesrecomp_chdir chdir
+#  define snesrecomp_getcwd getcwd
+#endif
+#ifdef __APPLE__
+#  include <mach-o/dyld.h>
 #endif
 
 /* ---- exe-dir helpers ---- */
 
-static void get_exe_dir(char *out, size_t max_len) {
-#ifdef _WIN32
-    char exe_path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) {
-        snprintf(out, max_len, ".");
-        return;
-    }
-    char *last_sep = strrchr(exe_path, '\\');
-    if (last_sep) *(last_sep + 1) = '\0';
-    snprintf(out, max_len, "%s", exe_path);
+/* Full path of the running executable. Returns 1 on success. Platforms
+ * without a query mechanism (e.g. Switch homebrew) return 0 and callers
+ * fall back to cwd-relative behavior. */
+static int get_exe_path(char *out, size_t max_len) {
+#if defined(_WIN32)
+    DWORD n = GetModuleFileNameA(NULL, out, (DWORD)max_len);
+    return (n > 0 && n < max_len) ? 1 : 0;
+#elif defined(__APPLE__)
+    uint32_t size = (uint32_t)max_len;
+    return _NSGetExecutablePath(out, &size) == 0 ? 1 : 0;
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", out, max_len - 1);
+    if (n <= 0) return 0;
+    out[n] = '\0';
+    return 1;
 #else
-    snprintf(out, max_len, "./");
+    (void)out; (void)max_len;
+    return 0;
 #endif
+}
+
+/* Directory containing the executable, with trailing separator.
+ * Falls back to "./" when the exe path can't be determined. */
+static void get_exe_dir(char *out, size_t max_len) {
+    char exe_path[1024];
+    if (get_exe_path(exe_path, sizeof(exe_path))) {
+        char *last_sep = NULL;
+        for (char *p = exe_path; *p; p++)
+            if (*p == '/' || *p == '\\') last_sep = p;
+        if (last_sep) {
+            *(last_sep + 1) = '\0';
+            snprintf(out, max_len, "%s", exe_path);
+            return;
+        }
+    }
+    snprintf(out, max_len, "./");
+}
+
+int snesrecomp_abspath(const char *path, char *out, size_t max_len) {
+    if (!path || !*path || !out || max_len == 0) return 0;
+#ifdef _WIN32
+    char tmp[1024];
+    if (!_fullpath(tmp, path, sizeof(tmp))) return 0;
+    if (strlen(tmp) >= max_len) return 0;
+    strcpy(out, tmp);
+    return 1;
+#else
+    if (path[0] == '/') {
+        if (strlen(path) >= max_len) return 0;
+        strcpy(out, path);
+        return 1;
+    }
+    char cwd[1024];
+    if (!snesrecomp_getcwd(cwd, sizeof(cwd))) return 0;
+    if (snprintf(out, max_len, "%s/%s", cwd, path) >= (int)max_len) return 0;
+    return 1;
+#endif
+}
+
+/* Can we create files in `dir`? Probed by actually creating one —
+ * access(W_OK) lies on Windows and inside sandboxed mounts. */
+static int dir_is_writable(const char *dir) {
+    char probe[1024];
+    if (snprintf(probe, sizeof(probe), "%s.snesrecomp_write_probe",
+                 dir) >= (int)sizeof(probe))
+        return 0;
+    FILE *f = fopen(probe, "wb");
+    if (!f) return 0;
+    fclose(f);
+    remove(probe);
+    return 1;
+}
+
+int snesrecomp_anchor_to_exe_dir(void) {
+    char dir[1024];
+    get_exe_dir(dir, sizeof(dir));
+    if (dir[0] == '.' && (dir[1] == '/' || dir[1] == '\0')) {
+        /* Exe path unavailable on this platform — cwd stays authoritative. */
+        return 0;
+    }
+    if (!dir_is_writable(dir)) {
+        fprintf(stderr,
+                "[Launcher] Executable directory '%s' is not writable; "
+                "config and saves stay in the current directory.\n", dir);
+        return 0;
+    }
+    if (snesrecomp_chdir(dir) != 0) {
+        fprintf(stderr, "[Launcher] Could not change directory to '%s'.\n", dir);
+        return 0;
+    }
+    return 1;
 }
 
 static void get_rom_cfg_path(char *out, size_t max_len) {
@@ -193,10 +280,14 @@ int snesrecomp_launcher_resolve_rom(int argc, char **argv,
                                     uint32_t expected_crc) {
     out_path[0] = '\0';
 
-    /* (1) argv[1] override (back-compat with command-line invocation). */
+    /* (1) argv[1] override (back-compat with command-line invocation).
+     * Absolutized so the rom.cfg cache stays valid however the next
+     * launch's cwd differs from this one's. */
     if (argc >= 2 && argv[1] && argv[1][0] != '-' && argv[1][0] != '\0') {
-        strncpy(out_path, argv[1], max_len - 1);
-        out_path[max_len - 1] = '\0';
+        if (!snesrecomp_abspath(argv[1], out_path, max_len)) {
+            strncpy(out_path, argv[1], max_len - 1);
+            out_path[max_len - 1] = '\0';
+        }
         if (expected_crc != 0 && !verify_rom(out_path, expected_crc)) {
             fprintf(stderr, "[Launcher] Warning: CRC mismatch for '%s' — continuing anyway\n", out_path);
         }
@@ -232,10 +323,14 @@ int snesrecomp_launcher_resolve_rom_sha256(int argc, char **argv,
                                            const uint8_t *expected_sha256) {
     out_path[0] = '\0';
 
-    /* (1) argv[1] override (back-compat with command-line invocation). */
+    /* (1) argv[1] override (back-compat with command-line invocation).
+     * Absolutized so the rom.cfg cache stays valid however the next
+     * launch's cwd differs from this one's. */
     if (argc >= 2 && argv[1] && argv[1][0] != '-' && argv[1][0] != '\0') {
-        strncpy(out_path, argv[1], max_len - 1);
-        out_path[max_len - 1] = '\0';
+        if (!snesrecomp_abspath(argv[1], out_path, max_len)) {
+            strncpy(out_path, argv[1], max_len - 1);
+            out_path[max_len - 1] = '\0';
+        }
         if (expected_sha256 && !verify_rom_sha256(out_path, expected_sha256)) {
             fprintf(stderr, "[Launcher] Warning: SHA-256 mismatch for '%s' — continuing anyway\n", out_path);
         }

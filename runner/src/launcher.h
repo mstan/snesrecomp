@@ -55,6 +55,37 @@ int snesrecomp_launcher_resolve_rom_sha256(int argc, char **argv,
                                            char *out_path, size_t max_len,
                                            const uint8_t *expected_sha256);
 
+/*
+ * snesrecomp_anchor_to_exe_dir
+ *
+ * chdir() to the directory containing the running executable, so every
+ * relative path the runner opens (game ini, keybinds.ini, rom.cfg, the
+ * saves/ directory) resolves next to the exe — regardless of which cwd
+ * the process was launched from. This is the whole config-discovery
+ * policy: the config is the ini next to the exe, nothing else.
+ *
+ * Call it first thing in main(), before any file is opened. If any
+ * command-line argument carries a relative path, absolutize it with
+ * snesrecomp_abspath() BEFORE calling this, since the anchor changes
+ * what relative paths mean.
+ *
+ * If the exe directory is not writable (AppImage squashfs mount, locked
+ * system install) or can't be determined (no OS query mechanism), the
+ * cwd is left untouched so saves and config land somewhere writable.
+ * Returns 1 if cwd is now the exe directory, 0 if it was left alone.
+ */
+int snesrecomp_anchor_to_exe_dir(void);
+
+/*
+ * snesrecomp_abspath
+ *
+ * Resolve `path` against the CURRENT working directory into an absolute
+ * path in `out`. Works for not-yet-existing files. Returns 1 on success;
+ * on failure `out` is unspecified and the caller should keep the
+ * original path.
+ */
+int snesrecomp_abspath(const char *path, char *out, size_t max_len);
+
 #ifdef __cplusplus
 }
 #endif
