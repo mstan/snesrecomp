@@ -1530,6 +1530,105 @@ static void set_nonblocking(socket_t sock) {
 #endif
 }
 
+// ===== Always-on OAM observability (widescreen sprite-margin diagnosis) =====
+//
+// Two always-on rings answer one question precisely: "when/where does
+// ppu->oam receive each frame's real sprite tiles, vs when does ppu_runLine
+// read them at render?" No arming — both rings record continuously from the
+// moment debug_server_init() runs. A single monotonic sequence counter
+// (s_oam_seq) stamps every event in BOTH rings, so OAM writes (DMA bursts and
+// stray CPU pokes) and render-reads share one total order: a write with a
+// LOWER seq than the render-read that consumes the same frame landed first.
+//
+//   - write ring : every word landed in ppu->oam (low table) or byte landed
+//     in ppu->highOam (high table). OAM DMA routes $2104 through ppu_write,
+//     so DMA fills are captured too; g_last_recomp_func distinguishes the
+//     OAM-DMA burst from any direct CPU store.
+//   - render ring: a compact 128-slot snapshot of ppu->oam taken at the top
+//     of ppu_runLine(line 0) — exactly the bytes the scanline renderer is
+//     about to consume. `active` counts slots whose Y is on/near screen
+//     (Y < 0xE0); SMW parks unused slots at Y = 0xF0, so a near-zero active
+//     count at render means ppu->oam holds the cleared/parked buffer.
+//
+// Both rings are tiny (write ~30 MB, render ~170 KB) and unconditional
+// (allocated whenever the debug server is built), unlike the REVERSE_DEBUG-
+// gated VRAM rings. Probes connect → query [recent window] → analyze; they
+// never arm-then-capture.
+
+#define OAM_WRITE_RING_ENTRIES (512u * 1024u)
+#define OAM_RENDER_RING_ENTRIES 256u
+
+typedef struct {
+    uint64_t seq;
+    int      frame;
+    uint8_t  is_high;   /* 0 = low-table word, 1 = high-table byte           */
+    uint16_t index;     /* low: word index 0..255; high: byte index 0..31    */
+    uint16_t value;     /* low: 16-bit word (hi=Y or attr, lo=Xlow or tile); */
+                        /* high: byte value                                  */
+    char     func[40];  /* g_last_recomp_func at write time                  */
+} OamWriteEntry;
+
+static struct {
+    uint64_t write_idx;
+    uint64_t count;
+    OamWriteEntry *log; /* calloc'd at init */
+} s_oam_wr = {0};
+
+typedef struct { uint8_t y, xlow, tile, attr, xhigh; } OamSlotSnap;
+
+typedef struct {
+    uint64_t    seq;
+    int         frame;
+    int         active;       /* # slots with Y < 0xE0 (not parked off-screen) */
+    OamSlotSnap slot[128];
+} OamRenderEntry;
+
+static struct {
+    uint64_t write_idx;
+    uint64_t count;
+    OamRenderEntry *log;      /* calloc'd at init */
+} s_oam_rd = {0};
+
+static uint64_t s_oam_seq = 0;
+
+void debug_server_on_oam_write(int is_high, uint16_t index, uint16_t value) {
+    if (!s_oam_wr.log) return;
+    uint64_t i = s_oam_wr.write_idx % OAM_WRITE_RING_ENTRIES;
+    OamWriteEntry *e = &s_oam_wr.log[i];
+    e->seq = s_oam_seq++;
+    e->frame = snes_frame_counter;
+    e->is_high = (uint8_t)(is_high ? 1 : 0);
+    e->index = index;
+    e->value = value;
+    if (g_last_recomp_func) { strncpy(e->func, g_last_recomp_func, 39); e->func[39] = 0; }
+    else e->func[0] = 0;
+    s_oam_wr.write_idx++;
+    if (s_oam_wr.count < OAM_WRITE_RING_ENTRIES) s_oam_wr.count++;
+}
+
+void debug_server_on_oam_render(void) {
+    if (!s_oam_rd.log || !g_ppu) return;
+    uint64_t i = s_oam_rd.write_idx % OAM_RENDER_RING_ENTRIES;
+    OamRenderEntry *e = &s_oam_rd.log[i];
+    e->seq = s_oam_seq++;
+    e->frame = snes_frame_counter;
+    int active = 0;
+    for (int s = 0; s < 128; s++) {
+        uint16_t w0 = g_ppu->oam[s * 2];      /* (Y << 8) | Xlow      */
+        uint16_t w1 = g_ppu->oam[s * 2 + 1];  /* (attr << 8) | tile   */
+        uint8_t y = (uint8_t)(w0 >> 8);
+        e->slot[s].y     = y;
+        e->slot[s].xlow  = (uint8_t)(w0 & 0xff);
+        e->slot[s].tile  = (uint8_t)(w1 & 0xff);
+        e->slot[s].attr  = (uint8_t)(w1 >> 8);
+        e->slot[s].xhigh = (uint8_t)((g_ppu->highOam[s >> 2] >> ((s & 3) * 2)) & 1);
+        if (y < 0xE0) active++;
+    }
+    e->active = active;
+    s_oam_rd.write_idx++;
+    if (s_oam_rd.count < OAM_RENDER_RING_ENTRIES) s_oam_rd.count++;
+}
+
 static void send_line(const char *line) {
     if (s_client_sock == SOCKET_INVALID) return;
     send(s_client_sock, line, (int)strlen(line), 0);
@@ -2143,6 +2242,86 @@ static void cmd_get_vram_trace(const char *args) {
             }
             pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
         }
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+/* oam_state — ring depths + the current monotonic seq. Cheap heartbeat to
+ * confirm the always-on OAM rings are recording. */
+static void cmd_oam_state(const char *args) {
+    (void)args;
+    send_fmt("{\"ok\":true,\"frame\":%d,\"seq\":%llu,"
+             "\"write_count\":%llu,\"write_cap\":%u,"
+             "\"render_count\":%llu,\"render_cap\":%u}",
+             snes_frame_counter, (unsigned long long)s_oam_seq,
+             (unsigned long long)s_oam_wr.count, OAM_WRITE_RING_ENTRIES,
+             (unsigned long long)s_oam_rd.count, OAM_RENDER_RING_ENTRIES);
+}
+
+/* oam_write_get [count=64] — most recent N OAM write events, oldest-first.
+ * Each: seq, frame f, h=is_high, i=index, v=value (hex), func. The seq lets
+ * you interleave these against oam_render_get to see whether the DMA burst
+ * for a frame landed BEFORE the render-read that consumed it, and whether the
+ * written Y bytes were real sprites or the parked 0xF0 clear buffer. */
+static void cmd_oam_write_get(const char *args) {
+    unsigned n = 64;
+    if (args && *args) { unsigned v; if (sscanf(args, "%u", &v) == 1 && v) n = v; }
+    if (!s_oam_wr.log) { send_fmt("{\"error\":\"oam write ring not allocated\"}"); return; }
+    uint64_t have = s_oam_wr.count;
+    if ((uint64_t)n > have) n = (unsigned)have;
+    if (n > 4000) n = 4000;  /* wire/buffer cap */
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"frame\":%d,\"seq\":%llu,\"count\":%u,\"events\":[",
+        snes_frame_counter, (unsigned long long)s_oam_seq, n);
+    uint64_t start = s_oam_wr.write_idx - n;
+    int budget = (int)sizeof(buf) - 256;
+    for (unsigned k = 0; k < n && pos < budget; k++) {
+        uint64_t idx = (start + k) % OAM_WRITE_RING_ENTRIES;
+        OamWriteEntry *e = &s_oam_wr.log[idx];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"f\":%d,\"h\":%u,\"i\":%u,\"v\":\"0x%04x\",\"func\":\"%s\"}",
+            k ? "," : "", (unsigned long long)e->seq, e->frame,
+            (unsigned)e->is_high, (unsigned)e->index, (unsigned)e->value, e->func);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+/* oam_render_get [count=4] [slots=16] — most recent N render-time snapshots
+ * (oldest-first). Each: seq, frame f, active count, and the first `slots`
+ * OAM slots as [y,xlow,xhigh,tile,attr] (all decimal). This is the state the
+ * scanline renderer actually consumed. active≈0 => ppu->oam was the parked
+ * clear buffer at render. Default 16 slots keeps the payload small; pass a
+ * larger slots= to inspect more. */
+static void cmd_oam_render_get(const char *args) {
+    unsigned n = 4, slots = 16;
+    if (args && *args) { unsigned a, b; int got = sscanf(args, "%u %u", &a, &b);
+        if (got >= 1 && a) n = a; if (got >= 2 && b) slots = b; }
+    if (slots > 128) slots = 128;
+    if (!s_oam_rd.log) { send_fmt("{\"error\":\"oam render ring not allocated\"}"); return; }
+    uint64_t have = s_oam_rd.count;
+    if ((uint64_t)n > have) n = (unsigned)have;
+    if (n > OAM_RENDER_RING_ENTRIES) n = OAM_RENDER_RING_ENTRIES;
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"frame\":%d,\"seq\":%llu,\"count\":%u,\"slots\":%u,\"snaps\":[",
+        snes_frame_counter, (unsigned long long)s_oam_seq, n, slots);
+    uint64_t start = s_oam_rd.write_idx - n;
+    int budget = (int)sizeof(buf) - 256;
+    for (unsigned k = 0; k < n && pos < budget; k++) {
+        uint64_t idx = (start + k) % OAM_RENDER_RING_ENTRIES;
+        OamRenderEntry *e = &s_oam_rd.log[idx];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"f\":%d,\"active\":%d,\"slot\":[",
+            k ? "," : "", (unsigned long long)e->seq, e->frame, e->active);
+        for (unsigned s = 0; s < slots && pos < budget; s++)
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s[%u,%u,%u,%u,%u]", s ? "," : "",
+                e->slot[s].y, e->slot[s].xlow, e->slot[s].xhigh,
+                e->slot[s].tile, e->slot[s].attr);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
@@ -5947,6 +6126,9 @@ static const CmdEntry s_commands[] = {
     {"audio_events",  cmd_audio_events},
     {"audio_wav",     cmd_audio_wav},
     {"ping",          cmd_ping},
+    {"oam_state",      cmd_oam_state},
+    {"oam_write_get",  cmd_oam_write_get},
+    {"oam_render_get", cmd_oam_render_get},
     {"oamblk_range",  cmd_oamblk_range},
     {"get_oamblk",    cmd_get_oamblk},
     {"rtstrace_range", cmd_rtstrace_range},
@@ -6155,6 +6337,20 @@ int debug_server_init(int port) {
     set_nonblocking(s_listen_sock);
 
     memset(s_watchpoints, 0, sizeof(s_watchpoints));
+
+    /* Always-on OAM observability rings — unconditional (small: write ring
+     * ~30 MB, render ring ~170 KB), unlike the REVERSE_DEBUG-gated VRAM
+     * rings. They record from this point so probes query a recent window
+     * rather than arm-then-capture. */
+    s_oam_wr.log = (OamWriteEntry *)calloc(OAM_WRITE_RING_ENTRIES, sizeof(OamWriteEntry));
+    s_oam_rd.log = (OamRenderEntry *)calloc(OAM_RENDER_RING_ENTRIES, sizeof(OamRenderEntry));
+    fprintf(stderr,
+        "[debug_server] OAM rings: write %u entries (~%llu MB), render %u snaps (~%llu KB)%s\n",
+        OAM_WRITE_RING_ENTRIES,
+        (unsigned long long)(((uint64_t)OAM_WRITE_RING_ENTRIES * sizeof(OamWriteEntry)) >> 20),
+        OAM_RENDER_RING_ENTRIES,
+        (unsigned long long)(((uint64_t)OAM_RENDER_RING_ENTRIES * sizeof(OamRenderEntry)) >> 10),
+        (s_oam_wr.log && s_oam_rd.log) ? "" : " [ALLOC FAILED]");
 
 #if SNESRECOMP_REVERSE_DEBUG
     // Always-on WRAM trace: arm a single full-WRAM range so every store

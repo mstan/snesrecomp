@@ -109,6 +109,8 @@ static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
 
 void ppu_runLine(Ppu* ppu, int line) {
   if(line == 0) {
+    // Always-on: snapshot the OAM the scanline renderer is about to consume.
+    debug_server_on_oam_render();
     if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
       int mod = PPU_mosaicSize(ppu);
       ppu->lastMosaicModulo = mod;
@@ -1007,7 +1009,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       break;
     case 0x04: {
       if(ppu->oamInHigh) {
-        ppu->highOam[((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite] = val;
+        int hidx = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
+        ppu->highOam[hidx] = val;
+        debug_server_on_oam_write(1, (uint16_t)hidx, (uint16_t)val);
         if(ppu->oamSecondWrite) {
           ppu->oamAdr++;
           if(ppu->oamAdr == 0) ppu->oamInHigh = false;
@@ -1016,7 +1020,10 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
         if(!ppu->oamSecondWrite) {
           ppu->oamBuffer = val;
         } else {
-          ppu->oam[ppu->oamAdr++] = (val << 8) | ppu->oamBuffer;
+          uint16_t widx = ppu->oamAdr;
+          uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
+          ppu->oam[ppu->oamAdr++] = word;
+          debug_server_on_oam_write(0, widx, word);
           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
         }
       }

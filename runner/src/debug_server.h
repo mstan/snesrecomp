@@ -86,6 +86,17 @@ void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value);
 // divergent (byte_addr, value) pair across the streams.
 void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value);
 
+// Always-on OAM observability. on_oam_write records every word landed in
+// ppu->oam (is_high=0; index = word index 0..255) or byte landed in
+// ppu->highOam (is_high=1; index = byte index 0..31) — call from ppu_write's
+// OAMDATA ($2104) case, which also carries OAM DMA. on_oam_render snapshots
+// the 128-slot OAM digest the scanline renderer is about to consume — call at
+// the top of ppu_runLine(line 0). Both stamp a shared monotonic seq so writes
+// and render-reads form one total order. Queried via oam_write_get /
+// oam_render_get / oam_state.
+void debug_server_on_oam_write(int is_high, uint16_t index, uint16_t value);
+void debug_server_on_oam_render(void);
+
 // Per-function profiling — called from RecompStackPush and at the
 // watchdog trip point in common_cpu_infra.c. Records a histogram of
 // function names and the frame they were latched at.
@@ -107,6 +118,8 @@ static inline void debug_server_set_ram(uint8_t *ram, uint32_t ram_size) { (void
 static inline void debug_server_on_reg_write(uint16_t adr, uint8_t val) { (void)adr; (void)val; }
 static inline void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) { (void)byte_addr; (void)value; }
 static inline void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value) { (void)byte_addr; (void)value; }
+static inline void debug_server_on_oam_write(int is_high, uint16_t index, uint16_t value) { (void)is_high; (void)index; (void)value; }
+static inline void debug_server_on_oam_render(void) { }
 static inline void debug_server_profile_push(const char *name) { (void)name; }
 static inline void debug_server_profile_latch(int frame_num) { (void)frame_num; }
 
