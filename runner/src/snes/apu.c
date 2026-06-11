@@ -11,6 +11,7 @@
 #include "snes.h"
 #include "spc.h"
 #include "dsp.h"
+#include "../audio_trace.h"
 
 static const uint8_t bootRom[0x40] = {
   0xcd, 0xef, 0xbd, 0xe8, 0x00, 0xc6, 0x1d, 0xd0, 0xfc, 0x8f, 0xaa, 0xf4, 0x8f, 0xbb, 0xf5, 0x78,
@@ -23,6 +24,7 @@ Apu* apu_init(void) {
   Apu* apu = malloc(sizeof(Apu));
   apu->spc = spc_init(apu);
   apu->dsp = dsp_init(apu->ram);
+  apu_clearPortQueue(apu);
   return apu;
 }
 
@@ -49,6 +51,44 @@ void apu_reset(Apu* apu) {
     apu->timer[i].enabled = false;
   }
   apu->cpuCyclesLeft = 7;
+  apu_clearPortQueue(apu);
+}
+
+void apu_clearPortQueue(Apu* apu) {
+  apu->portQHead = apu->portQTail = 0;
+}
+
+static void apu_applyPortWrite(Apu* apu, const ApuPortWrite *w) {
+  apu->inPorts[w->port & 3] = w->val;
+  audio_trace_on_cpu_port_apply(w->port, w->val);
+}
+
+void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
+                           uint64_t target_sample) {
+  if (apu->portQTail - apu->portQHead >= APU_PORT_QUEUE_LEN) {
+    /* Full — apply the oldest immediately so ordering survives. */
+    apu_applyPortWrite(apu, &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)]);
+    apu->portQHead++;
+  }
+  ApuPortWrite *w = &apu->portQueue[apu->portQTail & (APU_PORT_QUEUE_LEN - 1)];
+  w->target_sample = target_sample;
+  w->port = (uint8_t)(port & 3);
+  w->val = val;
+  apu->portQTail++;
+}
+
+/* Apply every queued write whose target the produced-sample clock has
+ * reached. Called at each DSP sample boundary inside apu_cycle. */
+static void apu_drainPortQueue(Apu* apu) {
+  uint64_t produced;
+  audio_trace_sample_clocks(&produced, NULL);
+  while (apu->portQHead != apu->portQTail) {
+    ApuPortWrite *w = &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
+    if (w->target_sample > produced)
+      break;
+    apu_applyPortWrite(apu, w);
+    apu->portQHead++;
+  }
 }
 
 void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
@@ -72,6 +112,7 @@ void apu_cycle(Apu* apu) {
 
   if((apu->cycles & 0x1f) == 0) {
     // every 32 cycles
+    apu_drainPortQueue(apu);
     dsp_cycle(apu->dsp);
   }
 
@@ -114,7 +155,11 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
     case 0xf4:
     case 0xf5:
     case 0xf6:
-    case 0xf7:
+    case 0xf7: {
+      uint8_t v = apu->inPorts[adr - 0xf4];
+      audio_trace_on_spc_port_read((uint8_t)(adr - 0xf4), v);
+      return v;
+    }
     case 0xf8:
     case 0xf9: {
       return apu->inPorts[adr - 0xf4];
@@ -192,6 +237,7 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
     case 0xf5:
     case 0xf6:
     case 0xf7: {
+      audio_trace_on_spc_port_write((uint8_t)(adr - 0xf4), val);
       apu->outPorts[adr - 0xf4] = val;
       break;
     }

@@ -383,13 +383,61 @@ void rtl_accumulate_apu_catchup(void) {
 
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
-  // Catch the APU up to the current cycle and write the port value
-  // directly. Serialise with the audio thread via RtlApuLock -- it
-  // holds the same lock while cycling the APU in RtlRenderAudio.
+  // Catch the APU up to the current cycle, then SCHEDULE the port write
+  // in APU-sample time rather than mutating inPorts at wall time.
+  //
+  // Rationale (SMW missed-SFX root cause): the audio thread advances
+  // the SPC in whole-callback bursts, so a wall-time port mutation gives
+  // the value a lifetime of however many samples happen to be produced
+  // before the next mutation — measured ~9 samples (vs the 64 an engine
+  // poll needs) whenever the 60.0988 Hz NMI beats across the 60.00 Hz
+  // callback phase. Anchoring each write one callback quantum past the
+  // CONSUMED clock keeps successive frame writes a full frame apart in
+  // the SPC's own execution time, so the engine always polls every
+  // value, exactly as on hardware. Steady-state added latency is ~zero:
+  // consumed + quantum ~= produced, i.e. the next burst applies it.
+  // Serialise with the audio thread via RtlApuLock -- it holds the same
+  // lock while cycling the APU in RtlRenderAudio.
   RtlApuLock();
   rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
-  g_snes->apu->inPorts[adr & 0x3] = val;
+  audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
+  {
+    /* Write clock: each target advances from the PREVIOUS write's target
+     * by the real wall-time gap between the two writes, converted to
+     * samples. This preserves hardware-faithful inter-write spacing in
+     * the SPC's execution timeline — frame-spaced NMI writes stay ~534
+     * samples apart, same-frame double writes keep their ms-scale gap —
+     * independent of where the audio thread's burst boundaries fall.
+     *
+     * (First attempt anchored targets at consumed+quantum; that fails
+     * because produced runs AHEAD of consumed by the output-ring fill,
+     * so every target was in the past and the floor collapsed
+     * consecutive writes onto the same sample — measured as +0-sample
+     * command lifetimes, i.e. the original race in a new costume.)
+     *
+     * Floor at produced: a target in the APU's past applies on the next
+     * executed sample. Ceiling at produced + 3 callback quanta bounds
+     * worst-case latency (~50 ms) and sheds the slow forward drift from
+     * the NMI(60.0988 Hz)/callback(60.00 Hz) rate mismatch. */
+    enum { PORT_DELTA_CAP    = 2136,  /* 4 x 534-sample quanta */
+           PORT_LATENCY_CAP  = 1602   /* 3 quanta past produced */ };
+    static uint64_t s_port_clock;     /* previous write's target */
+    static uint64_t s_port_clock_ns;  /* wall_ns of previous write */
+    uint64_t now_ns = audio_trace_wall_ns();
+    uint64_t produced, consumed;
+    audio_trace_sample_clocks(&produced, &consumed);
+    uint64_t delta = 0;
+    if (s_port_clock_ns != 0)
+      delta = (now_ns - s_port_clock_ns) * 32040u / 1000000000u;
+    if (delta > PORT_DELTA_CAP) delta = PORT_DELTA_CAP;
+    uint64_t target = s_port_clock + delta;
+    if (target < produced) target = produced;
+    if (target > produced + PORT_LATENCY_CAP) target = produced + PORT_LATENCY_CAP;
+    s_port_clock = target;
+    s_port_clock_ns = now_ns;
+    apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, target);
+  }
   RtlApuUnlock();
 }
 
@@ -444,6 +492,10 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
    * apu_reset() and only flipped false here, so on the IPL-phase
    * upload it's still true. */
   bool ipl_phase = g_snes->apu->romReadable;
+  /* The upload supersedes any not-yet-applied scheduled port writes;
+   * a stale pre-upload command landing on the freshly cleared ports
+   * would replay into the re-initialised engine. */
+  apu_clearPortQueue(g_snes->apu);
   memset(g_snes->apu->inPorts, 0, sizeof(g_snes->apu->inPorts));
   memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
   if (ipl_phase) {

@@ -7,12 +7,26 @@
 #ifdef _WIN32
 #include <windows.h>
 static uint64_t wall_ms(void) { return (uint64_t)GetTickCount64(); }
+/* High-resolution monotonic nanoseconds — GetTickCount64's ~15 ms
+ * granularity is far too coarse for intra-frame port-write spacing. */
+static uint64_t wall_ns(void) {
+  static LARGE_INTEGER freq;
+  LARGE_INTEGER now;
+  if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&now);
+  return (uint64_t)((double)now.QuadPart * 1e9 / (double)freq.QuadPart);
+}
 #else
 #include <time.h>
 static uint64_t wall_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+static uint64_t wall_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 #endif
 
@@ -98,6 +112,84 @@ void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles) {
   s_stats.pace_accumulate_calls++;
 }
 
+/* ---- CPU<->SPC port traffic ----
+ * All hooks run under RtlApuLock (RtlApuWrite / snes_readBBus take it;
+ * apu_cycle is only reached with it held), so plain fields suffice.
+ * Gating state per port:
+ *   - s_spc_rd_last/s_cpu_rd_last: last value the reader saw; unchanged
+ *     re-reads (steady-state polling) are elided from the ring.
+ *   - s_spc_rd_fresh/s_cpu_rd_fresh: counterpart wrote since the last
+ *     recorded read, so the next read is recorded even if the value is
+ *     unchanged (same sound ID queued twice must show two observations).
+ *   - s_cpu_wr_pending: a CPU port write not yet observed by any SPC
+ *     read; a second CPU write while pending increments the per-port
+ *     overwrite counter — the "engine never saw it" drop signature. */
+extern int snes_frame_counter; /* common_rtl.c — game frame number */
+static uint8_t s_spc_rd_last[4], s_cpu_rd_last[4];
+static uint8_t s_spc_rd_fresh[4], s_cpu_rd_fresh[4];
+static uint8_t s_cpu_wr_pending[4];
+
+static AudioTraceEvent *push_port_event(uint8_t type, uint8_t port, uint8_t val) {
+  AudioTraceEvent *e = push_event(type);
+  e->addr = port;
+  e->val = val;
+  e->aux = (uint32_t)snes_frame_counter;
+  return e;
+}
+
+void audio_trace_on_cpu_port_write(uint8_t port, uint8_t val) {
+  /* Request only — the write is queued and lands in inPorts at its
+   * scheduled APU-sample target. Loss accounting and SPC-read gating
+   * key off the APPLY hook below, where the engine can actually see
+   * the value. */
+  port &= 3;
+  s_stats.cpu_port_writes++;
+  push_port_event(AUDIO_TRACE_EV_CPU_PORT_WRITE, port, val);
+}
+
+void audio_trace_on_cpu_port_apply(uint8_t port, uint8_t val) {
+  port &= 3;
+  if (s_cpu_wr_pending[port])
+    s_stats.cpu_port_overwrites[port]++;
+  /* Only a NONZERO value is a command that can be lost; the per-frame
+   * zero-writes (SMW NMI clears the mirrors) just retire the port. */
+  s_cpu_wr_pending[port] = (uint8_t)(val != 0);
+  s_spc_rd_fresh[port] = 1;
+  push_port_event(AUDIO_TRACE_EV_CPU_PORT_APPLY, port, val);
+}
+
+void audio_trace_on_spc_port_read(uint8_t port, uint8_t val) {
+  port &= 3;
+  s_stats.spc_port_reads_seen++;
+  s_cpu_wr_pending[port] = 0;
+  if (!s_spc_rd_fresh[port] && val == s_spc_rd_last[port]) return;
+  s_spc_rd_fresh[port] = 0;
+  s_spc_rd_last[port] = val;
+  s_stats.spc_port_reads_logged++;
+  push_port_event(AUDIO_TRACE_EV_SPC_PORT_READ, port, val);
+}
+
+void audio_trace_on_spc_port_write(uint8_t port, uint8_t val) {
+  port &= 3;
+  s_stats.spc_port_writes++;
+  s_cpu_rd_fresh[port] = 1;
+  /* Engine outPort writes are frequent (per-tick echoes); record only
+   * value changes. The raw total is still counted above. */
+  static uint8_t last[4];
+  if (val == last[port]) return;
+  last[port] = val;
+  push_port_event(AUDIO_TRACE_EV_SPC_PORT_WRITE, port, val);
+}
+
+void audio_trace_on_cpu_port_read(uint8_t port, uint8_t val) {
+  port &= 3;
+  if (!s_cpu_rd_fresh[port] && val == s_cpu_rd_last[port]) return;
+  s_cpu_rd_fresh[port] = 0;
+  s_cpu_rd_last[port] = val;
+  s_stats.cpu_port_reads_logged++;
+  push_port_event(AUDIO_TRACE_EV_CPU_PORT_READ, port, val);
+}
+
 uint64_t audio_trace_wall_ms(void) {
   return wall_ms();
 }
@@ -109,6 +201,15 @@ void audio_trace_on_consume(uint64_t read_idx, uint32_t count, uint32_t avail_af
   s_stats.consumed += count;
   s_stats.consume_calls++;
   s_open_drop_event = UINT64_MAX;
+}
+
+uint64_t audio_trace_wall_ns(void) {
+  return wall_ns();
+}
+
+void audio_trace_sample_clocks(uint64_t *produced, uint64_t *consumed) {
+  if (produced) *produced = s_stats.produced;
+  if (consumed) *consumed = s_stats.consumed;
 }
 
 void audio_trace_get_stats(AudioTraceStats *out) {

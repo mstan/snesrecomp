@@ -37,6 +37,29 @@ enum {
   AUDIO_TRACE_EV_REG     = 1, /* DSP register write: addr, val            */
   AUDIO_TRACE_EV_DROP    = 2, /* output-ring overflow run: aux = run len  */
   AUDIO_TRACE_EV_CONSUME = 3, /* dsp_getSamples: aux = avail after read   */
+  /* CPU<->SPC port traffic ($2140-43 <-> $F4-F7). addr = port index 0-3,
+   * aux = snes_frame_counter at event time. Together these four event
+   * classes make every sound-command handoff auditable: a game sound
+   * request is a CPU_PORT_WRITE; the SPC engine observing it is the
+   * following SPC_PORT_READ of the same port/value; a request that is
+   * overwritten by a later CPU_PORT_WRITE with no SPC_PORT_READ in
+   * between was dropped before the engine ever saw it. */
+  AUDIO_TRACE_EV_CPU_PORT_WRITE = 4, /* CPU wrote $2140+n (RtlApuWrite)   */
+  AUDIO_TRACE_EV_SPC_PORT_READ  = 5, /* SPC read $F4+n; recorded only on
+                                      * value change or first read after a
+                                      * CPU write (steady-state polling of
+                                      * an unchanged port is elided)      */
+  AUDIO_TRACE_EV_SPC_PORT_WRITE = 6, /* SPC wrote outPort $F4+n; recorded
+                                      * only on value change              */
+  AUDIO_TRACE_EV_CPU_PORT_READ  = 7, /* CPU read $2140+n; recorded only on
+                                      * value change or first read after an
+                                      * SPC outPort write                 */
+  AUDIO_TRACE_EV_CPU_PORT_APPLY = 8, /* queued CPU port write actually
+                                      * landed in inPorts at its scheduled
+                                      * APU-sample target (apu.c drain).
+                                      * CPU_PORT_WRITE is the request;
+                                      * APPLY is when the engine can see
+                                      * it. */
 };
 
 /* Producer attribution for samples (who is cycling the APU). */
@@ -81,6 +104,16 @@ typedef struct AudioTraceStats {
                                   /* no consumer was draining the ring  */
   uint64_t pace_accumulate_calls; /* catch-up accumulations (APU touches)*/
   uint32_t pace_consumer_active;  /* consumer draining at last catch-up */
+  /* Port-traffic totals (appended; events themselves are in the ring). */
+  uint64_t cpu_port_writes;       /* every CPU write to $2140-43        */
+  uint64_t spc_port_reads_seen;   /* every SPC read of $F4-F7 (raw)     */
+  uint64_t spc_port_reads_logged; /* ... of which recorded in the ring  */
+  uint64_t spc_port_writes;       /* SPC outPort writes (raw)           */
+  uint64_t cpu_port_reads_logged; /* CPU port reads recorded in the ring*/
+  /* CPU port writes that were OVERWRITTEN by a later CPU write to the
+   * same port before any SPC read observed them — the "command lost
+   * before the engine saw it" counter. Per-port. */
+  uint64_t cpu_port_overwrites[4];
 } AudioTraceStats;
 
 /* ---- record hooks (call sites: dsp.c, snes.c, common_rtl.c) ---- */
@@ -91,10 +124,28 @@ void audio_trace_set_producer(int producer);
 /* Per catch-up accumulation: consumer state + wall-clock baseline cycles
  * injected (0 when a consumer is draining or no wall time elapsed). */
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles);
+/* CPU<->SPC port traffic. port = 0-3. All call sites hold RtlApuLock.
+ * The SPC-read / CPU-read hooks gate internally (value change or fresh
+ * counterpart write); callers pass every access unconditionally. */
+void audio_trace_on_cpu_port_write(uint8_t port, uint8_t val);
+void audio_trace_on_cpu_port_apply(uint8_t port, uint8_t val);
+void audio_trace_on_spc_port_read(uint8_t port, uint8_t val);
+void audio_trace_on_spc_port_write(uint8_t port, uint8_t val);
+void audio_trace_on_cpu_port_read(uint8_t port, uint8_t val);
+
+/* Authoritative native-sample clocks (produced = samples the DSP has
+ * emitted; consumed = samples the audio callback has read). Exported so
+ * the port-write scheduler anchors its targets on the same clock the
+ * trace uses. Caller must hold RtlApuLock. */
+void audio_trace_sample_clocks(uint64_t *produced, uint64_t *consumed);
 
 /* Monotonic wall-clock milliseconds — the same timebase the snapshot ring
  * uses, exported so the catch-up pacer and any analysis share one clock. */
 uint64_t audio_trace_wall_ms(void);
+/* Monotonic high-resolution nanoseconds (QPC / CLOCK_MONOTONIC) — for
+ * sub-frame spacing of scheduled port writes; wall_ms granularity
+ * (~15 ms on Windows) is coarser than a frame. */
+uint64_t audio_trace_wall_ns(void);
 
 /* ---- query/dump (any thread; takes RtlApuLock internally) ---- */
 void audio_trace_get_stats(AudioTraceStats *out);

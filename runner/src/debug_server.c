@@ -6042,6 +6042,10 @@ static void cmd_audio_stats(const char *args) {
         "\"reg_writes\":%llu,\"kon_writes\":%llu,\"occupancy_highwater\":%u,"
         "\"pace_baseline_cycles\":%llu,\"pace_accumulate_calls\":%llu,"
         "\"pace_consumer_active\":%u,"
+        "\"cpu_port_writes\":%llu,\"spc_port_reads_seen\":%llu,"
+        "\"spc_port_reads_logged\":%llu,\"spc_port_writes\":%llu,"
+        "\"cpu_port_reads_logged\":%llu,"
+        "\"cpu_port_overwrites\":[%llu,%llu,%llu,%llu],"
         "\"event_count\":%llu,\"snap_count\":%llu,\"snaps\":[",
         (unsigned long long)st.produced, (unsigned long long)st.produced_cpu,
         (unsigned long long)st.produced_audio, (unsigned long long)st.dropped,
@@ -6050,6 +6054,15 @@ static void cmd_audio_stats(const char *args) {
         (unsigned long long)st.kon_writes, st.occupancy_highwater,
         (unsigned long long)st.pace_baseline_cycles,
         (unsigned long long)st.pace_accumulate_calls, st.pace_consumer_active,
+        (unsigned long long)st.cpu_port_writes,
+        (unsigned long long)st.spc_port_reads_seen,
+        (unsigned long long)st.spc_port_reads_logged,
+        (unsigned long long)st.spc_port_writes,
+        (unsigned long long)st.cpu_port_reads_logged,
+        (unsigned long long)st.cpu_port_overwrites[0],
+        (unsigned long long)st.cpu_port_overwrites[1],
+        (unsigned long long)st.cpu_port_overwrites[2],
+        (unsigned long long)st.cpu_port_overwrites[3],
         (unsigned long long)st.event_count, (unsigned long long)st.snap_count);
     uint64_t first = st.snap_count > (uint64_t)want ? st.snap_count - want : 0;
     static AudioTraceSnap snaps[256];
@@ -6067,8 +6080,10 @@ static void cmd_audio_stats(const char *args) {
     send_line(buf);
 }
 
-/* audio_events — DSP reg writes / drop runs / consume events.
- * Args: <first_idx> [max=2000] [reg_only=0] */
+/* audio_events — DSP reg writes / drop runs / consume events / CPU<->SPC
+ * port traffic. For port events (cpu_wr/spc_rd/spc_wr/cpu_rd) adr is the
+ * port index 0-3 ($2140+n / $F4+n) and aux is snes_frame_counter.
+ * Args: <first_idx> [max=2000] [filter=0]   (1=reg only, 2=ports only) */
 static void cmd_audio_events(const char *args) {
     unsigned long long first = 0; int max = 2000, reg_only = 0;
     sscanf(args, "%llu %d %d", &first, &max, &reg_only);
@@ -6082,12 +6097,17 @@ static void cmd_audio_events(const char *args) {
         "{\"ok\":true,\"oldest\":%llu,\"first\":%llu,\"events\":[",
         (unsigned long long)oldest,
         (unsigned long long)(first < oldest ? oldest : first));
-    static const char *tn[] = { "?", "reg", "drop", "consume" };
+    static const char *tn[] = { "?", "reg", "drop", "consume",
+                                "cpu_wr", "spc_rd", "spc_wr", "cpu_rd",
+                                "cpu_ap" };
     int emitted = 0;
     for (uint32_t i = 0; i < n && pos < (int)sizeof(buf) - 256; i++) {
         int t = ev[i].type;
-        if (t < 1 || t > 3) t = 0;
-        if (reg_only && t != AUDIO_TRACE_EV_REG) continue;
+        if (t < 1 || t > 8) t = 0;
+        /* filter: 0 = all, 1 = DSP reg writes only, 2 = port traffic only */
+        if (reg_only == 1 && t != AUDIO_TRACE_EV_REG) continue;
+        if (reg_only == 2 && (t < AUDIO_TRACE_EV_CPU_PORT_WRITE ||
+                              t > AUDIO_TRACE_EV_CPU_PORT_APPLY)) continue;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s{\"s\":%llu,\"t\":\"%s\",\"adr\":\"0x%02x\",\"val\":\"0x%02x\","
             "\"aux\":%u,\"p\":%u}",

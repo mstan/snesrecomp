@@ -146,6 +146,7 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     rtl_accumulate_apu_catchup();
     snes_catchupApu(snes);
     uint8_t v = snes->apu->outPorts[adr & 0x3];
+    audio_trace_on_cpu_port_read((uint8_t)(adr & 0x3), v);
     RtlApuUnlock();
     return v;
   }
