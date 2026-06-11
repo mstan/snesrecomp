@@ -808,8 +808,11 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       // left straddle range. With extraRightCur==0 this is the authentic
       // `if (x > 255) x -= 512`.
       if (x >= 256 + ppu->extraRightCur) x -= 512;
-      // if in x-range
-      if(x > -spriteSize) {
+      // if in x-range: include sprites whose body pokes into the visible
+      // area, which in widescreen starts at -extraLeftCur (the per-tile
+      // gate below clips columns the same way). With extraLeftCur==0 this
+      // is the authentic `x > -spriteSize`.
+      if(x + spriteSize > -ppu->extraLeftCur) {
         // break if we found 32 sprites already
         spritesFound++;
         if(spritesFound > 32) {
