@@ -418,22 +418,24 @@ void RtlApuWrite(uint16 adr, uint8 val) {
      *
      * Floor at produced: a target in the APU's past applies on the next
      * executed sample. Ceiling at produced + 3 callback quanta bounds
-     * worst-case latency (~50 ms) and sheds the slow forward drift from
-     * the NMI(60.0988 Hz)/callback(60.00 Hz) rate mismatch. */
-    enum { PORT_DELTA_CAP    = 2136,  /* 4 x 534-sample quanta */
-           PORT_LATENCY_CAP  = 1602   /* 3 quanta past produced */ };
+     * worst-case latency and sheds the slow forward drift from the
+     * NMI(60.0988 Hz)/callback(60.00 Hz) rate mismatch. Both caps scale
+     * with the observed burst granularity (audio_samples in config.ini
+     * is user-tunable): a ceiling smaller than the real burst would pin
+     * late-window writes to the same target and re-collapse spacing. */
     static uint64_t s_port_clock;     /* previous write's target */
     static uint64_t s_port_clock_ns;  /* wall_ns of previous write */
+    uint64_t quantum = audio_trace_consume_quantum();
     uint64_t now_ns = audio_trace_wall_ns();
     uint64_t produced, consumed;
     audio_trace_sample_clocks(&produced, &consumed);
     uint64_t delta = 0;
     if (s_port_clock_ns != 0)
       delta = (now_ns - s_port_clock_ns) * 32040u / 1000000000u;
-    if (delta > PORT_DELTA_CAP) delta = PORT_DELTA_CAP;
+    if (delta > 4u * quantum) delta = 4u * quantum;
     uint64_t target = s_port_clock + delta;
     if (target < produced) target = produced;
-    if (target > produced + PORT_LATENCY_CAP) target = produced + PORT_LATENCY_CAP;
+    if (target > produced + 3u * quantum) target = produced + 3u * quantum;
     s_port_clock = target;
     s_port_clock_ns = now_ns;
     apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, target);

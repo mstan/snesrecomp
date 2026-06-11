@@ -146,6 +146,11 @@ uint64_t audio_trace_wall_ms(void);
  * sub-frame spacing of scheduled port writes; wall_ms granularity
  * (~15 ms on Windows) is coarser than a frame. */
 uint64_t audio_trace_wall_ns(void);
+/* APU burst granularity: the largest native-sample chunk a callback has
+ * consumed (floor 534). The port-write scheduler's caps scale with this
+ * so larger user-configured audio buffers can't re-collapse command
+ * spacing. Caller must hold RtlApuLock. */
+uint32_t audio_trace_consume_quantum(void);
 
 /* ---- query/dump (any thread; takes RtlApuLock internally) ---- */
 void audio_trace_get_stats(AudioTraceStats *out);

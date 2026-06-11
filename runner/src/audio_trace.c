@@ -194,17 +194,28 @@ uint64_t audio_trace_wall_ms(void) {
   return wall_ms();
 }
 
+static uint32_t s_max_consume_chunk;
+
 void audio_trace_on_consume(uint64_t read_idx, uint32_t count, uint32_t avail_after) {
   AudioTraceEvent *e = push_event(AUDIO_TRACE_EV_CONSUME);
   e->aux = avail_after;
   (void)read_idx;
   s_stats.consumed += count;
   s_stats.consume_calls++;
+  if (count > s_max_consume_chunk) s_max_consume_chunk = count;
   s_open_drop_event = UINT64_MAX;
 }
 
 uint64_t audio_trace_wall_ns(void) {
   return wall_ns();
+}
+
+uint32_t audio_trace_consume_quantum(void) {
+  /* Largest native-sample chunk an audio callback has consumed — the
+   * APU's burst granularity. audio_samples in config.ini (and host-rate
+   * resampling) make this per-game and per-user; 534 (one DSP block,
+   * 32040/60) is the floor before the first callback. */
+  return s_max_consume_chunk > 534u ? s_max_consume_chunk : 534u;
 }
 
 void audio_trace_sample_clocks(uint64_t *produced, uint64_t *consumed) {
