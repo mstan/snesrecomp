@@ -8,7 +8,9 @@
 #include "util.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
+#include "cpu_state.h"
 #include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +87,111 @@ int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv) {
   if (hrv) *hrv = g_tailcall_hrv;
   g_tailcall_context_valid = 0;
   return 1;
+}
+
+void cpu_tailcall_context_save(CpuTailcallContextSave *out) {
+  if (!out) return;
+  out->valid = g_tailcall_context_valid;
+  out->entry_s = g_tailcall_entry_s;
+  out->hrv = g_tailcall_hrv;
+}
+
+void cpu_tailcall_context_restore(const CpuTailcallContextSave *in) {
+  if (!in) return;
+  g_tailcall_context_valid = in->valid;
+  g_tailcall_entry_s = in->entry_s;
+  g_tailcall_hrv = in->hrv;
+}
+
+/* ── Unresolved-site balanced abandon + ALWAYS-ON hit accounting ──────
+ * Correctness layer (compiled in every configuration, unlike the
+ * cpu_trace_* slot table which no-ops at SNESRECOMP_TRACE=0). Every
+ * abandon is a real worklist item — a control transfer the recompiler
+ * could not resolve whose handler's side effects were skipped — so the
+ * hit table is the primary signal for WHICH dispatch sites to
+ * authorize next. Bounded per-site table; first hit per site emits one
+ * stderr line; the post-mortem report dumps the whole table. */
+#define UNRESOLVED_ABANDON_MAX 256
+typedef struct UnresolvedAbandonSite {
+  uint32_t site_pc24;
+  uint64_t hits;
+  int32_t first_frame;
+  int32_t last_frame;
+  uint8_t last_hrv;
+} UnresolvedAbandonSite;
+static UnresolvedAbandonSite g_unresolved_abandons[UNRESOLVED_ABANDON_MAX];
+static int g_unresolved_abandon_count;
+static uint64_t g_unresolved_abandon_total;
+static uint64_t g_unresolved_abandon_overflow;
+
+RecompReturn cpu_unresolved_abandon_balanced(CpuState *cpu, uint32_t site_pc24,
+                                             uint16_t entry_s, uint8_t hrv) {
+  extern int snes_frame_counter;
+  /* hrv carries the paired caller's pushed frame SIZE (0/2/3) under the
+   * 2026-06-09 host_return_valid encoding. A literal 1 means a setter
+   * missed the encoding upgrade — warn once, loudly, and treat it as
+   * size-unknown (restore the entry baseline only; the 2-3 byte frame
+   * leak it leaves is the pre-fix behavior, strictly no worse). */
+  static int warned_legacy_hrv;
+  if (hrv == 1) {
+    if (!warned_legacy_hrv) {
+      warned_legacy_hrv = 1;
+      fprintf(stderr,
+              "[abandon_balanced] LEGACY hrv==1 seen at $%06X (S=$%04X "
+              "entry_s=$%04X) — a host_return_valid setter still writes "
+              "boolean 1; frame size unknown, restoring entry baseline only\n",
+              (unsigned)site_pc24, cpu->S, entry_s);
+    }
+    hrv = 0;
+  }
+  g_unresolved_abandon_total++;
+  int i;
+  for (i = 0; i < g_unresolved_abandon_count; i++) {
+    if (g_unresolved_abandons[i].site_pc24 == site_pc24) break;
+  }
+  if (i == g_unresolved_abandon_count) {
+    if (i < UNRESOLVED_ABANDON_MAX) {
+      g_unresolved_abandon_count++;
+      g_unresolved_abandons[i].site_pc24 = site_pc24;
+      g_unresolved_abandons[i].hits = 0;
+      g_unresolved_abandons[i].first_frame = snes_frame_counter;
+      fprintf(stderr,
+              "[unresolved-abandon] first hit site=$%06X frame=%d "
+              "entry_s=$%04X hrv=%u (handler side effects SKIPPED — "
+              "authorize this dispatch)\n",
+              (unsigned)site_pc24, snes_frame_counter, entry_s, hrv);
+    } else {
+      g_unresolved_abandon_overflow++;
+      i = -1;
+    }
+  }
+  if (i >= 0) {
+    g_unresolved_abandons[i].hits++;
+    g_unresolved_abandons[i].last_frame = snes_frame_counter;
+    g_unresolved_abandons[i].last_hrv = hrv;
+  }
+  cpu->S = (uint16_t)(entry_s + hrv);
+  return RECOMP_RETURN_NORMAL;
+}
+
+void CpuUnresolvedAbandonDumpJson(FILE *f) {
+  fprintf(f, "  \"unresolved_abandons\": {\n"
+             "    \"total_hits\": %llu,\n"
+             "    \"distinct_sites\": %d,\n"
+             "    \"overflowed_hits\": %llu,\n"
+             "    \"sites\": [",
+          (unsigned long long)g_unresolved_abandon_total,
+          g_unresolved_abandon_count,
+          (unsigned long long)g_unresolved_abandon_overflow);
+  for (int i = 0; i < g_unresolved_abandon_count; i++) {
+    const UnresolvedAbandonSite *s = &g_unresolved_abandons[i];
+    fprintf(f, "%s\n      {\"site\": \"0x%06X\", \"hits\": %llu, "
+               "\"first_frame\": %d, \"last_frame\": %d, \"last_hrv\": %u}",
+            i ? "," : "", (unsigned)s->site_pc24,
+            (unsigned long long)s->hits, s->first_frame, s->last_frame,
+            s->last_hrv);
+  }
+  fprintf(f, "\n    ]\n  },\n");
 }
 
 int cpu_resolve_ancestor_skip(uint16_t ret_s) {
@@ -180,11 +287,88 @@ void RecompStackDump(void) {
     fprintf(stderr, "  [%d] %s\n", g_recomp_stack_top - 1 - i, g_recomp_stack[i]);
 }
 
+/* ── Always-on stack-balance auditor ──────────────────────────────────────
+ * JSL/JSR/RTS/RTL are 0-delta in the codegen (their hardware frame is NOT
+ * pushed onto cpu->S — only explicit push/pull move it). So a correctly
+ * recompiled function returns with cpu->S == its entry S. A persistent net
+ * delta means an unbalanced push/pull on the taken exit path (e.g. a
+ * PHP/PHA/PHX/PHY prologue whose matching pulls are skipped by a mis-routed
+ * early exit). We accumulate net delta per function name (pointer-keyed —
+ * the generated code passes interned string literals) so a per-frame leaker
+ * stands out by sheer magnitude. Always on; dumped by the watchdog/crash
+ * path and the post-mortem report. */
+#define STACKBAL_MAX 2048
+typedef struct {
+  const char *name;
+  long long   total_delta;  /* sum of (exit_s - entry_s) across all returns */
+  long        calls;
+  long        nonzero;      /* # returns with a nonzero delta */
+  int         last_delta;
+} StackBalEntry;
+static StackBalEntry g_stackbal[STACKBAL_MAX];
+
+static StackBalEntry *stackbal_find(const char *name) {
+  unsigned h = (unsigned)(((uintptr_t)name >> 4) & (STACKBAL_MAX - 1));
+  for (int i = 0; i < STACKBAL_MAX; i++) {
+    unsigned idx = (h + i) & (STACKBAL_MAX - 1);
+    if (g_stackbal[idx].name == name) return &g_stackbal[idx];
+    if (g_stackbal[idx].name == NULL) { g_stackbal[idx].name = name; return &g_stackbal[idx]; }
+  }
+  return NULL; /* table full — drop */
+}
+
+/* Comparator helper: collect non-zero-delta entries into `out`, return count. */
+static int stackbal_collect(StackBalEntry **out, int cap) {
+  int n = 0;
+  for (int i = 0; i < STACKBAL_MAX && n < cap; i++)
+    if (g_stackbal[i].name && g_stackbal[i].total_delta != 0)
+      out[n++] = &g_stackbal[i];
+  /* simple selection sort by |total_delta| desc (n is small) */
+  for (int a = 0; a < n; a++) {
+    int best = a;
+    for (int b = a + 1; b < n; b++)
+      if (llabs(out[b]->total_delta) > llabs(out[best]->total_delta)) best = b;
+    StackBalEntry *t = out[a]; out[a] = out[best]; out[best] = t;
+  }
+  return n;
+}
+
+void RecompStackBalDumpStderr(int topn) {
+  StackBalEntry *top[64];
+  if (topn > 64) topn = 64;
+  int n = stackbal_collect(top, topn);
+  fprintf(stderr, "=== stack-balance auditor: top %d net-imbalanced funcs ===\n", n);
+  for (int i = 0; i < n; i++)
+    fprintf(stderr, "  %+lld bytes net over %ld calls (%ld nonzero, last %+d): %s\n",
+            top[i]->total_delta, top[i]->calls, top[i]->nonzero,
+            top[i]->last_delta, top[i]->name ? top[i]->name : "?");
+  fflush(stderr);
+}
+
+void RecompStackBalDumpJson(FILE *f) {
+  StackBalEntry *top[64];
+  int n = stackbal_collect(top, 40);
+  fprintf(f, "  \"stack_balance\": [");
+  for (int i = 0; i < n; i++)
+    fprintf(f, "%s{\"name\":\"%s\",\"total_delta\":%lld,\"calls\":%ld,"
+               "\"nonzero\":%ld,\"last_delta\":%d}",
+            (i ? "," : ""), top[i]->name ? top[i]->name : "?",
+            top[i]->total_delta, top[i]->calls, top[i]->nonzero, top[i]->last_delta);
+  fprintf(f, "],\n");
+}
+
 void RecompStackPop(void) {
   // Record exit BEFORE the pop so stack_depth reflects pre-pop state and
   // the function name is still the topmost entry. Defensive against
   // empty stack: the auditor must NOT consume an entry_seq it didn't push.
   if (g_recomp_stack_top > 0) {
+    const char *fn = g_recomp_stack[g_recomp_stack_top - 1];
+    int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[g_recomp_stack_top - 1]);
+    StackBalEntry *e = stackbal_find(fn);
+    if (e) {
+      e->calls++;
+      if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
+    }
     boundary_audit_record_exit(g_recomp_stack[g_recomp_stack_top - 1]);
     g_recomp_stack_top--;
   }
@@ -281,6 +465,7 @@ void WatchdogCheck(void) {
     if (g_recomp_stack_top == 0)
       fprintf(stderr, "  (empty — last was %s)\n", g_last_recomp_func);
     fprintf(stderr, "\n");
+    RecompStackBalDumpStderr(15);
     fflush(stderr);
     g_watchdog_enabled = 0;
     g_watchdog_tripped = 1;

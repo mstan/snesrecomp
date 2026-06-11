@@ -82,6 +82,18 @@ entry S).
 - **Direct generated JSR/JSL call** (`_emit_call`): push the hardware return
   frame AND set `cpu->host_return_valid = 1` before the C call. Callee enters
   with `_hrv = 1`.
+  > **2026-06-09 encoding upgrade (orphaned-frame leak class):**
+  > `host_return_valid` now carries the pushed frame SIZE, not a boolean —
+  > 0 = no paired caller, **2 = JSR-paired, 3 = JSL-paired**. Every truthiness
+  > check above stays valid; the payload exists so
+  > `cpu_unresolved_abandon_balanced()` (common_cpu_infra.c) can pop the
+  > paired caller's frame at UNRESOLVED control-transfer sites (unresolved
+  > indirect dispatch / OOB index / null entry, cross-ROM-bank stub bodies,
+  > unresolvable cross-bank gotos), where no RTS/RTL op exists to take a
+  > static frame size from. Those sites previously returned NORMAL with the
+  > caller's frame + local pushes orphaned on cpu->S (SM cinematic
+  > sub-dispatchers leaked 4-7 B/frame → WILD STACK crash). The literal
+  > value 1 is INVALID under the new encoding; setters write 0/2/3 only.
 - **Tail JMP/JML** (indirect-dispatch tail emitters, `emit_function.py`
   tail-calls past `end:`): do NOT push; set `cpu->host_return_valid = _hrv`
   (propagate THIS function's entry validity — a tail-call hands off our return

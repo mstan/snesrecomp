@@ -53,16 +53,23 @@ typedef struct CpuState {
     uint8  DB;
     uint8  PB;
 
-    /* Option-1 cpu->S return-frame ABI (see IMPROVEMENTS.md). 1 when the
-     * current function was entered via a direct generated JSR/JSL C call
-     * (a paired host-C caller exists and pushed a matching return frame on
-     * cpu->S). 0 when entered via cpu_dispatch_pc_from / PEI-RTL trampoline
-     * / interrupt / dynarec (no proven paired host caller). Each function
-     * captures it into a local `_hrv` at entry; the caller sets it right
-     * before every invoke (direct call -> 1; tail JMP/JML -> propagate the
+    /* Option-1 cpu->S return-frame ABI (see IMPROVEMENTS.md). NON-ZERO
+     * when the current function was entered via a direct generated JSR/JSL
+     * C call (a paired host-C caller exists and pushed a matching return
+     * frame on cpu->S) — and the value IS the pushed frame size in bytes:
+     * 2 for a JSR-paired caller, 3 for a JSL-paired caller. 0 when entered
+     * via cpu_dispatch_pc_from / PEI-RTL trampoline / interrupt / dynarec
+     * (no proven paired host caller). Each function captures it into a
+     * local `_hrv` at entry; the caller sets it right before every invoke
+     * (direct JSR call -> 2, JSL -> 3; tail JMP/JML -> propagate the
      * caller's _hrv; dispatch -> 0). RTS/RTL may return RECOMP_RETURN_NORMAL
-     * only when _hrv==1 AND the stack was balanced at entry (cpu->S ==
-     * _entry_s); otherwise it dispatches on the popped PC24. */
+     * only when _hrv!=0 AND the stack was balanced at entry (cpu->S ==
+     * _entry_s); otherwise it dispatches on the popped PC24. The frame-size
+     * payload exists for cpu_unresolved_abandon_balanced(): at an
+     * unresolved control transfer there is no RTS/RTL op to take a static
+     * frame size from, so the abandon path pops the caller's frame by the
+     * size the caller actually pushed. The legacy boolean value 1 is
+     * INVALID — every setter must write 0/2/3. */
     uint8  host_return_valid;
 
     /* Status register P (full byte). Individual bit mirrors below for
@@ -356,7 +363,7 @@ static inline void cpu_push_interrupt_frame(CpuState *cpu) {
 static inline void cpu_push_jsr_return_frame(CpuState *cpu) {
     cpu_write8(cpu, 0x00, cpu->S, 0x00); cpu->S = (uint16)(cpu->S - 1);  /* PCH */
     cpu_write8(cpu, 0x00, cpu->S, 0x00); cpu->S = (uint16)(cpu->S - 1);  /* PCL */
-    cpu->host_return_valid = 1;
+    cpu->host_return_valid = 2;  /* JSR-paired: 2-byte frame */
 }
 
 /* Model a 65816 hardware JSL's 3-byte return-frame push for host glue
@@ -367,7 +374,7 @@ static inline void cpu_push_jsl_return_frame(CpuState *cpu) {
     cpu_write8(cpu, 0x00, cpu->S, 0xFF); cpu->S = (uint16)(cpu->S - 1);  /* PB */
     cpu_write8(cpu, 0x00, cpu->S, 0xFF); cpu->S = (uint16)(cpu->S - 1);  /* PCH */
     cpu_write8(cpu, 0x00, cpu->S, 0xFF); cpu->S = (uint16)(cpu->S - 1);  /* PCL */
-    cpu->host_return_valid = 1;
+    cpu->host_return_valid = 3;  /* JSL-paired: 3-byte frame */
 }
 
 /* ── Initialisation ─────────────────────────────────────────────────────── */
@@ -431,6 +438,28 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
 
 /* Read-only dispatch-table probe (task #7 RTS-decision trace). */
 int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24);
+
+/* Balanced abandon of the current function invocation at an UNRESOLVED
+ * control-transfer site (unresolved indirect dispatch / OOB index,
+ * cross-ROM-bank stub body, unresolvable cross-bank goto). Sets
+ * cpu->S = entry_s + hrv — discarding anything the function pushed
+ * below its entry baseline AND popping the paired host caller's return
+ * frame by the size the caller actually pushed (hrv: 0 = no paired
+ * caller, 2 = JSR, 3 = JSL; see host_return_valid above) — then
+ * returns RECOMP_RETURN_NORMAL so the host C caller resumes as if the
+ * unreached handler had returned immediately. CORRECTNESS infra
+ * (always compiled, lives in common_cpu_infra.c), NOT trace infra:
+ * without it every unresolved-site hit orphans the caller's frame and
+ * cpu->S drifts until the stack corrupts (SM cinematic sub-dispatchers
+ * leaked 4-7 B/frame -> WILD STACK crash ~f1516, 2026-06-09). The
+ * skipped handler's SIDE EFFECTS are still missing — every hit remains
+ * a real worklist item, accounted by an ALWAYS-ON per-site hit table
+ * inside this helper (first hit per site -> one stderr line; full table
+ * -> post-mortem JSON via CpuUnresolvedAbandonDumpJson) plus the richer
+ * cpu_trace_dispatch_oob / cpu_trace_unresolved_stub_trap slot capture
+ * when SNESRECOMP_TRACE is on. */
+RecompReturn cpu_unresolved_abandon_balanced(CpuState *cpu, uint32 site_pc24,
+                                             uint16 entry_s, uint8 hrv);
 
 /* Focused OAM-overflow observability recorders (debug_server.c).
  * dbg_rts_trace is emitted by the RTS/RTL lowering; dbg_oam_block_trace

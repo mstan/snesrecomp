@@ -32,7 +32,7 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from typing import Dict, List, Tuple  # noqa: E402
+from typing import Dict, List, Optional, Tuple  # noqa: E402
 
 # Resolver: 24-bit address (bank << 16 | pc) -> friendly C function name.
 # Populated by emit_bank before each bank emit (a process-wide map of every
@@ -83,6 +83,15 @@ def set_rom_size(size: int) -> None:
 # and hardcodes the single variant for the bound (m, x). Diagnostic
 # only; see cfg_loader.BankCfg.force_variant_at for use rationale.
 _FORCE_VARIANT_AT: Dict[int, Tuple[int, int]] = {}
+
+# Source PC for the IR op currently being emitted. IR ops intentionally
+# stay small and do not carry instruction addresses; emit_function passes
+# the decoded instruction's pc24 through emit_op for trace attribution.
+_CURRENT_SOURCE_PC24: int = 0
+
+
+def _trace_pc_arg() -> str:
+    return f"0x{_CURRENT_SOURCE_PC24 & 0xFFFFFF:06x}u"
 
 
 # Per-RTS/RTL-site flag: populated by the post-lowering stack-delta
@@ -279,6 +288,26 @@ def _nearest_survivor(survivors, m: int, x: int):
     return best
 
 
+def resolve_variant_for_target(addr_24: int, m: int, x: int):
+    """Return the emitted (m, x) variant to call for a target address.
+
+    Before the emit-truth prune map is installed, every target reports all
+    four variants and this returns the requested mode. After pruning, direct
+    call sites must not name a dropped symbol; route them to the same nearest
+    surviving variant used by runtime (m, x) dispatch switches.
+    """
+    rm, rx = m & 1, x & 1
+    survivors = list(valid_variant_list(addr_24))
+    if not survivors:
+        return rm, rx
+    if (rm, rx) in set(survivors):
+        return rm, rx
+    picked = _nearest_survivor(survivors, rm, rx)
+    if picked is None:
+        return rm, rx
+    return picked
+
+
 def variant_dispatch_case_lines(addr_24: int, base_name: str,
                                 indent: str = "    ", pre_call=None):
     """Emit the case/default body for a runtime (m, x) dispatch switch.
@@ -429,7 +458,7 @@ from v2.ir import (  # noqa: E402
     Transfer, XBA, Nop, Break, Stop, PushEffectiveAddress,
     Reg, SegRef, SegKind, Value,
 )
-from snes65816 import INDIR  # noqa: E402
+from snes65816 import INDIR, INDIR_X  # noqa: E402
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -998,18 +1027,20 @@ def _emit_pullreg(op: PullReg) -> List[str]:
                 "  cpu_trace_px_record(cpu, 0, 2 /*PLP*/, _old_p, cpu->P); }"]
     if op.reg == Reg.DB:
         # PLB sets N/Z from popped value.
+        trace_pc = _trace_pc_arg()
         return ["{ uint8 _old_db = cpu->DB; uint16 _old_s = cpu->S;",
                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
                 *(f"  {s}" for s in widths.set_nz(field, 1)),
                 "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLB, _old_s, +1);",
-                "  cpu_trace_db_change(cpu, 0, _old_db, cpu->DB, CPU_TR_PLB); }"]
+                f"  cpu_trace_db_change(cpu, {trace_pc}, _old_db, cpu->DB, CPU_TR_PLB); }}"]
     if op.reg == Reg.PB:
         # PLK doesn't exist on the 65816 but IR routes any PullReg(PB) here.
+        trace_pc = _trace_pc_arg()
         return ["{ uint8 _old_pb = cpu->PB; uint16 _old_s = cpu->S;",
                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
                 *(f"  {s}" for s in widths.set_nz(field, 1)),
                 "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLB, _old_s, +1);",
-                "  cpu_trace_pb_change(cpu, 0, _old_pb, cpu->PB, CPU_TR_PB_WRITE); }"]
+                f"  cpu_trace_pb_change(cpu, {trace_pc}, _old_pb, cpu->PB, CPU_TR_PB_WRITE); }}"]
     if op.reg == Reg.D:
         # PLD: 16-bit, sets N/Z from popped 16-bit value.
         return emitter_helpers.stack_op_traced(
@@ -1213,6 +1244,12 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # JSR → emit `break;`, fall through to next block.
     # JMP/JML → emit `return RECOMP_RETURN_NORMAL;` (terminal).
     is_jsr = getattr(insn, 'mnem', '') == 'JSR'
+    # Pointer-sourced CALL idiom (`PEA <ret>; JMP (ptr)`): a JMP that is NOT a
+    # tail transfer — the PEA already pushed the real return frame, the
+    # dispatched handler RTSes back to it, and execution resumes the next
+    # sequential block. So it behaves like a JSR call (fall through, handler
+    # host-returns) but WITHOUT synthesizing its own return frame.
+    is_call = bool(getattr(insn, 'dispatch_call', False))
 
     # Variant suffix for dispatched handlers follows the live width state
     # at the dispatch site. The PHA/SEP/RTS idiom is the exception: it
@@ -1230,13 +1267,18 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # regression tests.
     if is_rts_stack_dispatch:
         _comment = "RTS-stack dispatch terminator: cfg-resolved target list"
+    elif is_jsr and is_call:
+        _comment = "indirect dispatch pointer-call (JSR (abs,X)): cfg-resolved target list"
+    elif is_call:
+        _comment = "indirect dispatch ptr-call (PEA+JMP idiom): cfg-resolved target list"
     else:
         _comment = ("indirect dispatch call: cfg-resolved target list" if is_jsr
                     else "indirect dispatch terminator: cfg-resolved target list")
     lines = [f"{{ /* {_comment} */"]
     # Option-1 cpu->S ABI: a real JSR (abs,X) call pushes a 2-byte return
-    # frame and enters the handler with host_return_valid=1. A JMP/JML
-    # indirect dispatch is a tail transfer — no frame pushed; the handler
+    # frame and enters the handler with host_return_valid=2 (the frame
+    # size — see cpu_state.h). A JMP/JML indirect dispatch is a tail
+    # transfer — no frame pushed; the handler
     # inherits THIS function's host-return validity (_hrv). The handler also
     # inherits THIS function's entry-S baseline at the individual call site,
     # so split shared suffixes do not record a fresh stack baseline after the
@@ -1245,7 +1287,12 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         _iret16 = (site_pc24 + 2) & 0xFFFF  # JSR (abs,X) is 3 bytes; push return-1
         lines.append(f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(_iret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
         lines.append(f"  cpu_write8(cpu, 0x00, cpu->S, 0x{_iret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
-        lines.append("  cpu->host_return_valid = 1;  /* indirect JSR call */")
+        lines.append("  cpu->host_return_valid = 2;  /* indirect JSR call, 2-byte frame */")
+    elif is_call:
+        # PEA already pushed the return frame; enter the handler as a paired
+        # host call so its balanced RTS host-returns here (and pops the PEA'd
+        # frame), then we fall through to the next block.
+        lines.append("  cpu->host_return_valid = 2;  /* PEA+JMP indirect call, 2-byte PEA frame */")
     else:
         lines.append("  cpu->host_return_valid = _hrv;  /* JMP/JML indirect tail dispatch */")
     # Index source: X or Y register. For JMP/JSR (abs,X)-style dispatch
@@ -1262,12 +1309,80 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     kind = getattr(insn, 'dispatch_kind', 'short')
     entry_size = 3 if kind == 'long' else 2
     table_bases = tuple(getattr(insn, 'dispatch_table_bases', ()) or ())
-    if getattr(insn, 'mode', None) == INDIR and len(table_bases) == 1:
+    if getattr(insn, 'dispatch_local_goto', False):
         ptr = insn.operand & 0xFFFF
+        lines = [
+            "{ /* local computed-goto dispatch: recovered same-function runway */",
+            (
+                f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
+                "  /* absolute indirect dispatch: switch on the loaded pointer */"
+            ),
+            "  switch (_target) {",
+        ]
+        seen_cases = set()
+        for e in entries:
+            if e is None or e == 0:
+                continue
+            target_bank = (e >> 16) & 0xFF
+            if target_bank != bank:
+                continue
+            local_pc = e & 0xFFFF
+            if local_pc in seen_cases:
+                continue
+            seen_cases.add(local_pc)
+            lines.append(
+                f"    case 0x{local_pc:04x}: goto L_{local_pc:04X}{suffix};")
+        lines.append("    default:")
         lines.append(
-            f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
-            "  /* absolute indirect dispatch: switch on the loaded pointer */"
-        )
+            f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+        lines.append(
+            f"      return cpu_unresolved_abandon_balanced(cpu, "
+            f"0x{site_pc24:06x}u, _entry_s, _hrv);")
+        lines.append("  }")
+        lines.append("}")
+        return lines
+    value_pointer_dispatch = False
+    pointer_is_indexed = False
+    if getattr(insn, 'mode', None) == INDIR and len(table_bases) == 1:
+        value_pointer_dispatch = True
+    elif (is_jsr and is_call and
+          getattr(insn, 'mode', None) == INDIR_X and len(table_bases) == 1):
+        value_pointer_dispatch = True
+        pointer_is_indexed = True
+    if value_pointer_dispatch:
+        ptr = insn.operand & 0xFFFF
+        if kind == 'long' and pointer_is_indexed:
+            lines.append(
+                f"  uint16 _ptr = (uint16)(0x{ptr:04x} + (cpu->{idx_field} & 0xFFFF));"
+                "  /* long pointer descriptor selected at runtime */")
+            lines.append(
+                "  uint16 _target_lo = cpu_read16(cpu, 0x00, _ptr);")
+            lines.append(
+                "  uint8 _target_bank = cpu_read8(cpu, 0x00, (uint16)(_ptr + 2));")
+            lines.append(
+                "  uint32 _target = ((uint32)_target_bank << 16) | (uint32)_target_lo;"
+                "  /* switch on the loaded long pointer */")
+        elif kind == 'long':
+            lines.append(
+                f"  uint16 _target_lo = cpu_read16(cpu, 0x00, (uint16)0x{ptr:04x});")
+            lines.append(
+                f"  uint8 _target_bank = cpu_read8(cpu, 0x00, (uint16)(0x{ptr:04x} + 2));")
+            lines.append(
+                "  uint32 _target = ((uint32)_target_bank << 16) | (uint32)_target_lo;"
+                "  /* absolute long-indirect dispatch: switch on the loaded pointer */"
+            )
+        elif pointer_is_indexed:
+            lines.append(
+                f"  uint16 _ptr = (uint16)(0x{ptr:04x} + (cpu->{idx_field} & 0xFFFF));"
+                "  /* JSR (abs,X): X selects a runtime pointer descriptor */")
+            lines.append(
+                "  uint16 _target = cpu_read16(cpu, cpu->PB, _ptr);"
+                "  /* switch on the loaded pointer */")
+        else:
+            lines.append(
+                f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
+                "  /* absolute indirect dispatch: switch on the loaded pointer */"
+            )
         if is_rts_stack_dispatch:
             lines.append("  {")
             for stmt in emitter_helpers.modify_p_via_mirrors(0x30, "sep"):
@@ -1293,14 +1408,16 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             base_name = _NAME_RESOLVER.get(tgt_addr)
             if base_name is None:
                 base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
-            lines.append(f"    case 0x{case_value:04x}: {{")
+            case_label = f"0x{case_value:06x}" if kind == 'long' else f"0x{case_value:04x}"
+            lines.append(f"    case {case_label}: {{")
             if is_rts_stack_dispatch:
                 # SEP #$30 forced m=x=1 immediately above; the M1X1
                 # variant is the only one ever entered. Keep the
                 # single-variant call.
                 _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
                 name = f"{base_name}{suffix}"
-                env = emitter_helpers.call_with_pb_save(target_bank, name)
+                env = emitter_helpers.call_with_pb_save(
+                    target_bank, name, trace_pc24=site_pc24)
                 for stmt in env:
                     lines.append(f"      {stmt}")
             else:
@@ -1311,7 +1428,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                     _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
                 lines.append("      uint8 _saved_pb = cpu->PB;")
                 lines.append(
-                    f"      cpu_trace_pb_change(cpu, 0, _saved_pb,"
+                    f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, _saved_pb,"
                     f" {target_bank:#04x}, CPU_TR_JSL);")
                 lines.append(f"      cpu->PB = {target_bank:#04x};")
                 lines.append("      RecompReturn _r;")
@@ -1321,7 +1438,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                     tgt_addr, base_name, indent="        ")
                 lines.append("      }")
                 lines.append(
-                    "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
+                    f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, cpu->PB, _saved_pb, CPU_TR_RTL);")
                 lines.append("      cpu->PB = _saved_pb;")
                 lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
                 lines.append(
@@ -1330,18 +1447,41 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                     "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
                 lines.append("        return (RecompReturn)((int)_r - 1);")
                 lines.append("      }")
-            if is_jsr:
+            if is_jsr or is_call:
                 lines.append("      break;")
             else:
                 lines.append("      return RECOMP_RETURN_NORMAL;")
             lines.append("    }")
-        lines.append("    default: break;")
-        lines.append("  }")
-        if is_jsr:
-            lines.append("  /* fall through to post-JSR block */")
-        else:
+        if is_jsr or is_call:
+            # Unknown runtime pointer on a CALL-form dispatch: account
+            # the miss (was previously SILENT — no dispatch_oob call at
+            # all), then unpop the unconsumed 2-byte call frame (the JSR
+            # form pushed it above; the PEA+JMP form's PEA pushed it) so
+            # the fall-through resumes balanced — as if the unreached
+            # handler had returned immediately.
+            lines.append("    default:")
             lines.append(
-                f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+                f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+            lines.append(
+                "      cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */")
+            lines.append("      break;")
+        else:
+            lines.append("    default: break;")
+        lines.append("  }")
+        if is_jsr or is_call:
+            lines.append("  /* fall through to post-dispatch block */")
+        else:
+            # Terminal tail dispatch with an unknown pointer: account the
+            # miss, then abandon this invocation balanced (discard locals
+            # below _entry_s, pop the paired caller's frame per _hrv).
+            # The pre-2026-06-09 bare `return cpu_trace_dispatch_oob(...)`
+            # orphaned the caller's frame on every hit (SM cinematic
+            # sub-dispatcher leak -> WILD STACK crash).
+            lines.append(
+                f"  (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+            lines.append(
+                f"  return cpu_unresolved_abandon_balanced(cpu, "
+                f"0x{site_pc24:06x}u, _entry_s, _hrv);")
         lines.append("}")
         return lines
     if len(table_bases) >= 2:
@@ -1362,26 +1502,54 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append("  }")
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append("  if (_idx >= _disp_n) {")
-    if is_jsr:
-        # Non-terminal: dispatch_oob is a function that returns NORMAL,
-        # but its return value is OUR caller's, not the dispatcher
-        # block's. For a JSR dispatcher we need to fall through to the
-        # post-JSR block — calling dispatch_oob and ignoring its return
-        # is the closest equivalent to "this case had no handler".
+    if is_jsr or is_call:
+        # Non-terminal CALL-form dispatch: account the OOB index, then
+        # unpop the unconsumed 2-byte call frame (the JSR form pushed it
+        # above; the PEA+JMP form's PEA pushed it) and fall through to
+        # the post-dispatch block balanced — as if the unreached handler
+        # had returned immediately. (The switch below falls out via its
+        # default arm.)
         lines.append(
             f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
-    else:
         lines.append(
-            f"    return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+            "    cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */")
+    else:
+        # Terminal tail dispatch with an OOB index: account the miss,
+        # then abandon this invocation balanced (discard locals below
+        # _entry_s, pop the paired caller's frame per _hrv). The bare
+        # `return cpu_trace_dispatch_oob(...)` this replaces orphaned
+        # the caller's frame on every hit.
+        lines.append(
+            f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+        lines.append(
+            f"    return cpu_unresolved_abandon_balanced(cpu, "
+            f"0x{site_pc24:06x}u, _entry_s, _hrv);")
     lines.append("  }")
     lines.append("  switch (_idx) {")
     for i, e in enumerate(entries):
         if e is None or e == 0:
-            if is_jsr:
-                lines.append(f"    case {i}: break; /* null entry */")
-            else:
+            if is_jsr or is_call:
+                # Null entry on a CALL-form dispatch: no handler runs, so
+                # the call frame pushed above is never consumed — unpop it
+                # before falling through, same as the OOB arm. (A hit is
+                # still suspicious — real hw would JSR into $0000 — so
+                # account it like an OOB index.)
+                lines.append(f"    case {i}:")
                 lines.append(
-                    f"    case {i}: return RECOMP_RETURN_NORMAL; /* null entry */")
+                    f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+                lines.append(
+                    "      cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */")
+                lines.append("      break; /* null entry */")
+            else:
+                # Null entry on a terminal tail dispatch: the bare
+                # `return RECOMP_RETURN_NORMAL` this replaces orphaned
+                # the caller's frame exactly like the OOB arm.
+                lines.append(f"    case {i}:")
+                lines.append(
+                    f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+                lines.append(
+                    f"      return cpu_unresolved_abandon_balanced(cpu, "
+                    f"0x{site_pc24:06x}u, _entry_s, _hrv); /* null entry */")
             continue
         target_bank = (e >> 16) & 0xFF
         local_pc = e & 0xFFFF
@@ -1403,9 +1571,10 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # _M1X1 is the only one ever entered.
             _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
             name = f"{base_name}{suffix}"
-            env = emitter_helpers.call_with_pb_save(target_bank, name)
+            env = emitter_helpers.call_with_pb_save(
+                target_bank, name, trace_pc24=site_pc24)
             for stmt in env:
-                if not is_jsr and stmt.endswith(f"{name}(cpu);"):
+                if not (is_jsr or is_call) and stmt.endswith(f"{name}(cpu);"):
                     lines.append(
                         "      cpu_tailcall_inherit_return_context(_entry_s, _hrv);")
                 lines.append(f"      {stmt}")
@@ -1419,19 +1588,24 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
             lines.append("      uint8 _saved_pb = cpu->PB;")
             lines.append(
-                f"      cpu_trace_pb_change(cpu, 0, _saved_pb,"
+                f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, _saved_pb,"
                 f" {target_bank:#04x}, CPU_TR_JSL);")
             lines.append(f"      cpu->PB = {target_bank:#04x};")
             lines.append("      RecompReturn _r;")
             lines.append(
                 "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
+            # Tail-context inherit is for TRUE tail transfers only. A JSR
+            # dispatch and a PEA+JMP ptr-call both enter the handler as a
+            # paired host call (fresh frame on cpu->S, hrv=2 set above) —
+            # inheriting OUR baseline there would make the handler's RTS
+            # misclassify its own balanced return.
             _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
-                    if not is_jsr else None)
+                    if not (is_jsr or is_call) else None)
             lines += variant_dispatch_case_lines(
                 tgt_addr, base_name, indent="        ", pre_call=_pre)
             lines.append("      }")
             lines.append(
-                "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
+                f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, cpu->PB, _saved_pb, CPU_TR_RTL);")
             lines.append("      cpu->PB = _saved_pb;")
             lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
             lines.append(
@@ -1440,20 +1614,32 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
             lines.append("        return (RecompReturn)((int)_r - 1);")
             lines.append("      }")
-        if is_jsr:
+        if is_jsr or is_call:
+            # Handler host-returned (it popped the call frame). Fall
+            # through to the post-dispatch block. (is_call previously
+            # emitted a terminal `return NORMAL` here, inconsistent with
+            # the Form-A switch-on-pointer emit AND with emit_function's
+            # `block_terminated = not dispatch_call` — it silently
+            # dropped the post-JMP code the PEA'd return targets.)
             lines.append("      break;")
         else:
             lines.append("      return RECOMP_RETURN_NORMAL;")
         lines.append("    }")
     lines.append("    default: break; /* unreachable: gated above */")
     lines.append("  }")
-    if is_jsr:
+    if is_jsr or is_call:
         # Switch ended; fall through into the next block emitted after
-        # this dispatcher (the post-JSR block in the original asm).
+        # this dispatcher (the post-JSR / post-ptr-call block in the
+        # original asm).
         lines.append("  /* fall through to post-JSR block */")
     else:
+        # Unreachable (OOB gated above), kept as a defensive backstop —
+        # balanced like the gate arm.
         lines.append(
-            f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+            f"  (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+        lines.append(
+            f"  return cpu_unresolved_abandon_balanced(cpu, "
+            f"0x{site_pc24:06x}u, _entry_s, _hrv);")
     lines.append("}")
     return lines
 
@@ -1497,10 +1683,22 @@ def _emit_dispatch(insn) -> List[str]:
     em = 1
     ex = 1
     suffix = _variant_suffix(em, ex)
+    site_pc24 = insn.addr & 0xFFFFFF
     lines = ["{ /* JSL dispatch — short=2B / long=3B table */"]
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append(f"  uint16 _idx = (uint16){widths.masked('cpu->A', 1)};")
-    lines.append("  if (_idx >= _disp_n) { return RECOMP_RETURN_NORMAL; /* dispatch OOB */ }")
+    # OOB index: account the miss (previously a SILENT bare `return
+    # NORMAL`), then abandon this invocation balanced. The dispatch is a
+    # terminator — the matched handler's RTS pops the containing
+    # function's caller's frame on its behalf, so a no-handler exit must
+    # pop it too (cpu_unresolved_abandon_balanced) or the frame orphans.
+    lines.append("  if (_idx >= _disp_n) {")
+    lines.append(
+        f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+    lines.append(
+        f"    return cpu_unresolved_abandon_balanced(cpu, "
+        f"0x{site_pc24:06x}u, _entry_s, _hrv); /* dispatch OOB */")
+    lines.append("  }")
     # Trampoline contract: dispatched handler observes (m=1, x=1). Mirror
     # the SEP #$30 the asm trampoline does before its JML.
     lines.append("  {")
@@ -1519,7 +1717,17 @@ def _emit_dispatch(insn) -> List[str]:
     lines.append("  switch (_idx) {")
     for i, e in enumerate(entries):
         if e == 0:
-            lines.append(f"    case {i}: break;  /* null entry */")
+            # Null entry: real hw would JMP through $0000 — a hit is a
+            # bug worth accounting. The old `break` fell through to the
+            # terminal `return NORMAL` WITHOUT popping the containing
+            # function's caller's frame (the matched-handler path pops it
+            # via the handler's RTS) — orphan leak. Abandon balanced.
+            lines.append(f"    case {i}:")
+            lines.append(
+                f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+            lines.append(
+                f"      return cpu_unresolved_abandon_balanced(cpu, "
+                f"0x{site_pc24:06x}u, _entry_s, _hrv); /* null entry */")
             continue
         if kind == 'long':
             target_bank = (e >> 16) & 0xFF
@@ -1542,7 +1750,8 @@ def _emit_dispatch(insn) -> List[str]:
         # Single-line emit silently dropped the RecompStackPop on NLR
         # paths through the dispatcher — caught by GameMode oscillation
         # at boot 2026-05-02.
-        env = emitter_helpers.call_with_pb_save(target_bank, name)
+        env = emitter_helpers.call_with_pb_save(
+            target_bank, name, trace_pc24=site_pc24)
         lines.append(f"    case {i}: {{")
         for stmt in env:
             lines.append(f"      {stmt}")
@@ -1571,8 +1780,8 @@ def _emit_return_frame_push(op: 'Call') -> List[str]:
     """
     site = (op.source_pc24 & 0xFFFFFF) if op.source_pc24 is not None else None
     # A direct generated JSR/JSL call always has a paired host-C caller +
-    # a pushed return frame, so the callee enters with host_return_valid=1.
-    hrv = "  cpu->host_return_valid = 1;  /* paired host caller */"
+    # a pushed return frame, so the callee enters with host_return_valid
+    # = the pushed frame SIZE (JSR -> 2, JSL -> 3; see cpu_state.h).
     if op.long:
         ret16 = ((site + 3) & 0xFFFF) if site is not None else 0xFFFF
         pbr = ((site >> 16) & 0xFF) if site is not None else 0xFF
@@ -1581,14 +1790,14 @@ def _emit_return_frame_push(op: 'Call') -> List[str]:
             f"  cpu_write8(cpu, 0x00, cpu->S, 0x{pbr:02x}); cpu->S = (uint16)(cpu->S - 1);",
             f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
             f"  cpu_write8(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
-            hrv,
+            "  cpu->host_return_valid = 3;  /* paired host caller, JSL frame */",
         ]
     ret16 = ((site + 2) & 0xFFFF) if site is not None else 0xFFFF
     return [
         "  /* JSR return frame -> cpu->S (Option-1) */",
         f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
         f"  cpu_write8(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
-        hrv,
+        "  cpu->host_return_valid = 2;  /* paired host caller, JSR frame */",
     ]
 
 
@@ -1654,6 +1863,7 @@ def _emit_call(op: Call) -> List[str]:
     # re-demand or auto-promote would resurrect the garbage body.
     for em, ex in valid_variant_list(addr):
         _UNRESOLVED_CALL_TARGETS.add((addr, em, ex))
+    call_trace_pc = f"0x{((op.source_pc24 or 0) & 0xFFFFFF):06x}u"
     # cfg-pinned variant override. When the cfg names this call site
     # via `force_variant_at <site_pc24> <m> <x>`, bypass the 4-way
     # runtime switch and emit a hardcoded single-variant call. Used as
@@ -1672,12 +1882,12 @@ def _emit_call(op: Call) -> List[str]:
             return [
                 "{",
                 "  uint8 _saved_pb = cpu->PB;",
-                f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
+                f"  cpu_trace_pb_change(cpu, {call_trace_pc}, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
                 f"  cpu->PB = {target_bank:#04x};",
                 f"  RecompReturn _r = {pinned_name}(cpu);  "
                 f"/* cfg force_variant_at ${op.source_pc24:06X} -> "
                 f"M{pm}X{px} */",
-                "  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
+                f"  cpu_trace_pb_change(cpu, {call_trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
                 "  cpu->PB = _saved_pb;",
                 "  if (_r != RECOMP_RETURN_NORMAL) {",
                 "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
@@ -1707,7 +1917,7 @@ def _emit_call(op: Call) -> List[str]:
         lines += _emit_return_frame_push(op)
         lines += [
             "  uint8 _saved_pb = cpu->PB;",
-            f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
+            f"  cpu_trace_pb_change(cpu, {call_trace_pc}, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
             f"  cpu->PB = {target_bank:#04x};",
             "  RecompReturn _r;",
             "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
@@ -1715,7 +1925,7 @@ def _emit_call(op: Call) -> List[str]:
         lines += variant_dispatch_case_lines(addr, base_name)
         lines.extend([
             "  }",
-            "  cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
+            f"  cpu_trace_pb_change(cpu, {call_trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
             "  cpu->PB = _saved_pb;",
             "  if (_r != RECOMP_RETURN_NORMAL) {",
             "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
@@ -1864,7 +2074,9 @@ def _emit_return(op: Return) -> List[str]:
         # host-returns NORMAL and its caller resumes correctly. (A one-level
         # NORMAL miss-unwind here instead resumes intermediate frames that
         # hardware skipped — the fish-explosion OAM wipe; see ISSUES.md.)
-        "  if (_ret_s != _entry_s && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
+        # Intentionally not gated by cpu_dispatch_has_entry(): a popped PC can
+        # be both a valid continuation entry and a return-to-ancestor target.
+        "  if (_ret_s != _entry_s) {",
         "    int _anc_skip = cpu_resolve_ancestor_skip(_ret_s);",
         "    if (_anc_skip >= 0) {",
         "      cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
@@ -1923,6 +2135,7 @@ def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
 def _emit_blockmove(op: BlockMove) -> List[str]:
     delta = "+1" if op.direction == "mvn" else "-1"
     et = "CPU_TR_MVN" if op.direction == "mvn" else "CPU_TR_MVP"
+    trace_pc = _trace_pc_arg()
     return [
         "{",
         f"  uint8 _src_b = {op.src_bank:#04x};",
@@ -1937,7 +2150,7 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
         "    cpu->A = (uint16)(cpu->A - 1);",
         "  }",
         "  cpu->DB = _dst_b;",
-        f"  cpu_trace_db_change(cpu, 0, _old_db, _dst_b, {et});",
+        f"  cpu_trace_db_change(cpu, {trace_pc}, _old_db, _dst_b, {et});",
         "}",
     ]
 
@@ -1986,12 +2199,18 @@ _DISPATCH = {
 }
 
 
-def emit_op(op: IROp) -> List[str]:
+def emit_op(op: IROp, source_pc24: Optional[int] = None) -> List[str]:
     """Lower a single IR op to one or more lines of C."""
     h = _DISPATCH.get(type(op))
     if h is None:
         return [f"/* UNHANDLED IR op {type(op).__name__} */"]
-    return [ln for ln in h(op) if ln]
+    global _CURRENT_SOURCE_PC24
+    old_source_pc24 = _CURRENT_SOURCE_PC24
+    _CURRENT_SOURCE_PC24 = (int(source_pc24) & 0xFFFFFF) if source_pc24 is not None else 0
+    try:
+        return [ln for ln in h(op) if ln]
+    finally:
+        _CURRENT_SOURCE_PC24 = old_source_pc24
 
 
 def emit_block(block: IRBlock, *, indent: str = "  ") -> List[str]:

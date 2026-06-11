@@ -29,6 +29,8 @@
 
 #if SNESRECOMP_TRACE
 
+typedef struct CpuState CpuState;
+
 // Initialize the debug TCP server on the given port. Non-blocking.
 // Returns 0 on success, -1 on failure.
 int debug_server_init(int port);
@@ -46,6 +48,11 @@ void debug_server_start_paused(void);
 
 // Block until unpaused. Call this once per frame in the main game loop.
 void debug_server_wait_if_paused(void);
+
+// Called from cpu_trace_block() in normal trace builds. Lets the TCP
+// breakpoint commands park on generated basic-block PCs without requiring
+// reverse-debug WRAM-store instrumentation.
+void debug_server_on_trace_block(CpuState *cpu, uint32_t pc24);
 
 // Returns slot number (0-9) if a loadstate was requested via TCP, or -1 if none.
 // Consumes the request (only returns it once).
@@ -99,6 +106,7 @@ static inline void debug_server_poll(void) { }
 static inline void debug_server_shutdown(void) { }
 static inline void debug_server_start_paused(void) { }
 static inline void debug_server_wait_if_paused(void) { }
+static inline void debug_server_on_trace_block(void *cpu, uint32_t pc24) { (void)cpu; (void)pc24; }
 static inline int debug_server_consume_loadstate(void) { return -1; }
 static inline uint32_t debug_server_get_controller_inputs(void) { return 0; }
 static inline uint32_t debug_server_get_controller_active_mask(void) { return 0; }

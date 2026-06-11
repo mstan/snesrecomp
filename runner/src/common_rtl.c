@@ -11,6 +11,7 @@
 #include "cpu_state.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
+#include "ppu_dma_trace.h"
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -92,6 +93,10 @@ bool RtlRunFrame(uint32 inputs) {
     extern void debug_server_record_frame(int);
     debug_server_record_frame(snes_frame_counter);
   }
+
+  /* Always-on PPU/DMA observability: snapshot the live PPU once per frame
+   * (forced-blank/brightness, screen-enable, CGRAM/VRAM occupancy). */
+  ppudma_frame_snapshot(snes_frame_counter);
 
   snes_frame_counter++;
   return false;

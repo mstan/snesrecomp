@@ -24,6 +24,7 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/keybinds.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_state.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_trace.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/ppu_dma_trace.c
     ${SNESRECOMP_RUNNER_ROOT}/src/util.c
     # SNES hardware model
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/apu.c
@@ -47,8 +48,17 @@ option(SNESRECOMP_ENABLE_TRACE "Build the TCP debug server / observability rings
 if(SNESRECOMP_ENABLE_TRACE)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         ${SNESRECOMP_RUNNER_ROOT}/src/debug_server.c
-        ${SNESRECOMP_RUNNER_ROOT}/src/emu_oracle_cmds.c
     )
+    if(EXISTS ${SNESRECOMP_RUNNER_ROOT}/src/emu_oracle_cmds.c)
+        list(APPEND SNESRECOMP_RUNNER_SOURCES
+            ${SNESRECOMP_RUNNER_ROOT}/src/emu_oracle_cmds.c
+        )
+    endif()
+endif()
+
+set(SNESRECOMP_RUNNER_LIBRARIES)
+if(SNESRECOMP_ENABLE_TRACE AND WIN32)
+    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
 endif()
 
 set(SNESRECOMP_RUNNER_INCLUDE_DIRS

@@ -132,7 +132,12 @@ def modify_p_via_mirrors(mask: int, kind: str) -> List[str]:
     ]
 
 
-def call_with_pb_save(target_bank: int, callee_name: str) -> List[str]:
+def call_with_pb_save(
+    target_bank: int,
+    callee_name: str,
+    *,
+    trace_pc24: int = 0,
+) -> List[str]:
     """Emit the JSL bank-save/restore envelope as a list of raw C
     statements (no indentation). Caller is responsible for indent /
     brace wrapping as needed.
@@ -152,12 +157,13 @@ def call_with_pb_save(target_bank: int, callee_name: str) -> List[str]:
     "return" — that catches the propagation `return` here without an
     explicit pop (which would double-pop).
     """
+    trace_pc = f"0x{trace_pc24 & 0xFFFFFF:06x}u"
     return [
         "uint8 _saved_pb = cpu->PB;",
-        f"cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
+        f"cpu_trace_pb_change(cpu, {trace_pc}, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
         f"cpu->PB = {target_bank:#04x};",
         f"RecompReturn _r = {callee_name}(cpu);",
-        f"cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);",
+        f"cpu_trace_pb_change(cpu, {trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
         "cpu->PB = _saved_pb;",
         "if (_r != RECOMP_RETURN_NORMAL) {",
         "  cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",

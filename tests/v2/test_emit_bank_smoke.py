@@ -75,6 +75,28 @@ def test_entry_order_is_preserved():
     assert -1 < pos_first < pos_second < pos_third
 
 
+def test_overlapping_entry_inside_range_remains_local_branch():
+    """A named entry inside another entry's explicit range is a shared body.
+
+    The outer entry's branch to that shared entry must decode as a local
+    label/goto. Treating it as a sibling tail-call splits one guest stack
+    frame across generated functions.
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x80, 0x03]),  # BRA $8005
+        0x8005: bytes([0xEA, 0x60]),  # shared body: NOP; RTS
+    })
+    src = emit_bank(rom, bank=0, entries=[
+        BankEntry(name="wrapper", start=0x8000, end=0x8007),
+        BankEntry(name="shared", start=0x8005, end=0x8007),
+    ])
+
+    assert "RecompReturn wrapper_M1X1(CpuState *cpu)" in src
+    assert "L_8005_M1X1:" in src
+    assert "goto L_8005_M1X1;" in src
+    assert "cpu_trace_unresolved_goto_trap" not in src
+
+
 if __name__ == '__main__':
     import sys, traceback
     failed = 0

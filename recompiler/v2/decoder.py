@@ -88,6 +88,20 @@ def _dispatch_target_is_padding(rom: bytes, bank: int, pc16: int,
     return False
 
 
+def _is_abs_indirect_long_jmp(insn) -> bool:
+    """True for opcode DC, the 3-byte `JMP [abs]` long-indirect form."""
+    return (getattr(insn, 'mnem', '') == 'JMP'
+            and getattr(insn, 'opcode', None) == 0xDC)
+
+
+def _dispatch_kind(insn, table_bases=()) -> str:
+    """Return target width for authorized indirect dispatch codegen."""
+    return ('long' if (_is_abs_indirect_long_jmp(insn)
+                      or getattr(insn, 'length', 3) == 4
+                      or len(table_bases or ()) == 3)
+            else 'short')
+
+
 def _autorecover_indirect_dp(rom: bytes, bank: int, func_start: int,
                              site_pc: int, dp_addr: int,
                              insn_length: int,
@@ -340,7 +354,7 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
     bank. 3 for JML (length 4) — INDIR_X target is a 24-bit pointer.
     """
     base = insn.operand & 0xFFFF
-    entry_size = 3 if getattr(insn, 'length', 3) == 4 else 2
+    entry_size = 3 if _dispatch_kind(insn) == 'long' else 2
     entries: List[int] = []
     tbl_pc = base
     nulls_in_a_row = 0
@@ -429,6 +443,126 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
             inbank_handler_pcs.append(addr16)
         tbl_pc += entry_size
     return entries if entries else None
+
+
+def _autorecover_local_stride_runway(rom: bytes, bank: int, func_start: int,
+                                     site_pc: int, insn,
+                                     *,
+                                     end: Optional[int] = None,
+                                     data_regions=None,
+                                     max_entries: int = 4096
+                                     ) -> Optional[List[int]]:
+    """Recover same-function Duff-runway computed jumps.
+
+    Super Metroid clears OAM with a computed `JMP ($dp)` into the middle
+    of a same-function run of `STA abs` instructions:
+
+        LSR A
+        STA $dp
+        LSR A
+        ADC $dp
+        CLC
+        ADC #runway_base
+        STA $dp
+        LDA #imm16
+        SEP #$30
+        JMP ($dp)
+
+    The target pointer is `runway_base + 3 * logical_index`, so every valid
+    target is an interior label in the current generated C function. These
+    entries must be decoded as local successors, not auto-promoted as
+    standalone callable functions.
+    """
+    if not (insn.mnem == 'JMP' and insn.mode == INDIR and insn.length == 3):
+        return None
+    dp_addr = insn.operand & 0xFFFF
+    if dp_addr > 0x00FF:
+        return None
+
+    def read8(pc16: int) -> Optional[int]:
+        if not (0x8000 <= pc16 <= 0xFFFF):
+            return None
+        try:
+            off = lorom_offset(bank, pc16)
+        except AssertionError:
+            return None
+        if off >= len(rom):
+            return None
+        return rom[off]
+
+    site_pc &= 0xFFFF
+    p = site_pc - 17
+    if p < 0x8000:
+        return None
+
+    dp = dp_addr & 0xFF
+    expected = (
+        (0, 0x4A),        # LSR A
+        (1, 0x85),        # STA dp
+        (2, dp),
+        (3, 0x4A),        # LSR A
+        (4, 0x65),        # ADC dp
+        (5, dp),
+        (6, 0x18),        # CLC
+        (7, 0x69),        # ADC #imm16
+        (10, 0x85),       # STA dp
+        (11, dp),
+        (12, 0xA9),       # LDA #imm16
+        (15, 0xE2),       # SEP #$30
+        (16, 0x30),
+        (17, 0x6C),       # JMP ($dp)
+        (18, dp),
+        (19, 0x00),
+    )
+    for rel, byte in expected:
+        got = read8(p + rel)
+        if got != byte:
+            return None
+
+    base_lo = read8(p + 8)
+    base_hi = read8(p + 9)
+    if base_lo is None or base_hi is None:
+        return None
+    base = base_lo | (base_hi << 8)
+    if not (0x8000 <= base <= 0xFFFF):
+        return None
+    start16 = func_start & 0xFFFF
+    if base < start16:
+        return None
+    if end is not None and base >= (end & 0xFFFF):
+        return None
+    if _addr_in_data_regions(data_regions, bank, base):
+        return None
+    if _dispatch_target_is_padding(rom, bank, base):
+        return None
+
+    entries: List[int] = []
+    first_store_addr: Optional[int] = None
+    for i in range(max_entries):
+        target_pc = base + i * 3
+        if target_pc + 2 > 0xFFFF:
+            break
+        if end is not None and target_pc >= (end & 0xFFFF):
+            break
+        if _addr_in_data_regions(data_regions, bank, target_pc):
+            break
+        op = read8(target_pc)
+        lo = read8(target_pc + 1)
+        hi = read8(target_pc + 2)
+        if op != 0x8D or lo is None or hi is None:
+            break
+        store_addr = lo | (hi << 8)
+        if first_store_addr is None:
+            first_store_addr = store_addr
+        elif store_addr != ((first_store_addr + i * 4) & 0xFFFF):
+            break
+        entries.append((bank << 16) | target_pc)
+
+    # Require several consecutive runway slots. A one- or two-instruction
+    # match is more likely ordinary code than a computed Duff runway.
+    if len(entries) < 4:
+        return None
+    return entries
 
 
 def _addr_in_data_regions(data_regions, bank: int, pc16: int) -> bool:
@@ -639,7 +773,8 @@ def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
     Resolution rules:
       ()         — table base is `insn.operand` (JSR/JMP/JML (abs,X) form,
                    or JMP (abs)/JML [abs] with operand as table addr).
-                   Entry size = 3 if `insn.length == 4` (JML) else 2.
+                   Entry size = 3 for JML/JSL and opcode DC (`JMP [abs]`),
+                   else 2.
       (lo,)      — single static table at `lo`. Entry size from `insn`.
       (lo, hi)   — 2 parallel byte-tables forming a 16-bit pointer per
                    index. Target = (bank << 16) | (rom[hi+i] << 8) | rom[lo+i].
@@ -653,6 +788,19 @@ def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
     """
     count = int(auth['count'])
     bases = auth.get('table_bases') or ()
+
+    # Explicit target list: no ROM table to walk. Used by pointer-sourced
+    # CALL cfg (`ptrcall`) and by local computed-goto runway recovery.
+    if auth.get('targets'):
+        entries: List[int] = []
+        for t in auth['targets']:
+            tv = int(t)
+            if tv > 0xFFFFFF:
+                return None
+            entries.append(tv if tv > 0xFFFF else ((bank << 16) | (tv & 0xFFFF)))
+        if len(entries) != count:
+            return None
+        return entries
 
     if len(bases) >= 2:
         # Parallel byte-tables. Walk i = 0..count-1, read one byte from
@@ -689,8 +837,9 @@ def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
         base = bases[0] & 0xFFFF
     else:
         base = insn.operand & 0xFFFF
-    # Entry size: 3 for JML (4-byte insn) and JSL; 2 for JMP/JSR (3 bytes).
-    entry_size = 3 if getattr(insn, 'length', 3) == 4 else 2
+    # Entry size: 3 for JML/JSL and for opcode DC (`JMP [abs]`, a
+    # 3-byte instruction that loads a 24-bit target); otherwise 2.
+    entry_size = 3 if _dispatch_kind(insn) == 'long' else 2
     entries: List[int] = []
     tbl_pc = base
     for _i in range(count):
@@ -952,6 +1101,29 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
     return [(DecodeKey(addr24(bank, next_pc), post_m, post_x, post_p_stack), 'fall')]
 
 
+def _pea_ptrcall_return_pc(rom: Optional[bytes], bank: int, pc: int,
+                           fallback_next: int) -> int:
+    """Return the RTS destination for `PEA <ret_minus_1>; JMP (ptr)`.
+
+    The dispatched handler does not return to the byte after the JMP. It
+    returns through the 16-bit value pushed by PEA, so hardware resumes at
+    `PEA_operand + 1`. Some state-machine dispatchers choose that to equal
+    the lexical fall-through; instruction-list loops intentionally point it
+    back to their loop body.
+    """
+    if rom is None:
+        return fallback_next & 0xFFFF
+    prev_pc = (pc - 3) & 0xFFFF
+    try:
+        off = lorom_offset(bank, prev_pc)
+    except AssertionError:
+        return fallback_next & 0xFFFF
+    if off + 2 >= len(rom) or rom[off] != 0xF4:  # PEA abs
+        return fallback_next & 0xFFFF
+    pea_operand = rom[off + 1] | (rom[off + 2] << 8)
+    return (pea_operand + 1) & 0xFFFF
+
+
 def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
                             entry_m: int = 1, entry_x: int = 1):
     """Detect whether the subroutine at (bank, addr) is a JSR/JSL
@@ -1001,6 +1173,8 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
     m, x = entry_m & 1, entry_x & 1
     a_slot = None     # stack slot the live A value came from (LDA $nn,S)
     a_added = 0       # constant added to that value since the load
+    y_slot = None     # stack slot copied through Y via TAY/TYA
+    y_added = 0
     budget = 0
     while budget < 96:
         budget += 1
@@ -1028,6 +1202,20 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
         elif mn == 'LDA' and ins.mode == STK:
             a_slot = ins.operand & 0xFF       # (re)start tracking from this slot
             a_added = 0
+        elif op == 0xA8:                       # TAY
+            if a_slot is not None:
+                y_slot = a_slot
+                y_added = a_added
+            else:
+                y_slot = None
+                y_added = 0
+        elif op == 0x98:                       # TYA
+            if y_slot is not None:
+                a_slot = y_slot
+                a_added = y_added
+            else:
+                a_slot = None
+                a_added = 0
         elif op == 0x69 and a_slot is not None:   # ADC #imm (m-dependent)
             a_added = (a_added + ins.operand) & 0xFFFF
         elif op == 0x83 and ins.mode == STK:      # STA $nn,S — return-addr write-back
@@ -1035,6 +1223,9 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
                 return a_added & 0xFF             # inline byte count
             # store-back without an add (or to a different slot): not it
         elif op in A_PRESERVING:
+            if op in (0xA0, 0xA4, 0xB4, 0xAC, 0xBC, 0xC8, 0x88, 0x7A):
+                y_slot = None
+                y_added = 0
             pass                                  # A unchanged; keep tracking
         else:
             a_slot = None                         # A clobbered — reset
@@ -1629,6 +1820,19 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                                 'table_bases': table_bases,
                                 '_autorecovered': True,
                             }
+                if auth is None:
+                    entries = _autorecover_local_stride_runway(
+                        rom, bank, start, pc, insn,
+                        end=end, data_regions=data_regions)
+                    if entries:
+                        auth = {
+                            'count': len(entries),
+                            'idx_reg': 'X',
+                            'table_bases': (insn.operand & 0xFFFF,),
+                            'targets': tuple(e & 0xFFFF for e in entries),
+                            'local_goto': True,
+                            '_autorecovered': True,
+                        }
             # Static single-target form: `JMP ($<abs>)` / `JML [$<abs>]`
             # where <abs> is in ROM range ($8000+). The pointer lives
             # directly in ROM at (bank, abs) — read it once at decode
@@ -1638,20 +1842,22 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             if (auth is None and insn.mode == INDIR
                     and (insn.operand & 0xFFFF) >= 0x8000):
                 tbl_pc = insn.operand & 0xFFFF
+                entry_size = 3 if _dispatch_kind(insn) == 'long' else 2
                 try:
                     tbl_off = lorom_offset(bank, tbl_pc)
-                    rom_ok = tbl_off + (3 if insn.length == 4 else 2) - 1 < len(rom)
+                    rom_ok = tbl_off + entry_size - 1 < len(rom)
                 except AssertionError:
                     rom_ok = False
                 if rom_ok:
                     tgt_lo = rom[tbl_off]
                     tgt_hi = rom[tbl_off + 1]
                     tgt16 = tgt_lo | (tgt_hi << 8)
+                    tgt_bank = rom[tbl_off + 2] if entry_size == 3 else bank
                     if (tgt16 >= 0x8000
                             and not _addr_in_data_regions(
-                                data_regions, bank, tgt16)
+                                data_regions, tgt_bank, tgt16)
                             and not _dispatch_target_is_padding(
-                                rom, bank, tgt16)):
+                                rom, tgt_bank, tgt16)):
                         auth = {
                             'count': 1,
                             # Index isn't really used (count=1), but the
@@ -1667,12 +1873,25 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                 entries = _resolve_indirect_dispatch_targets(
                     rom, bank, insn, auth)
                 if entries is not None:
+                    is_ptr_call = bool(auth.get('ptr_call'))
+                    is_local_goto = bool(auth.get('local_goto'))
                     insn.dispatch_entries = entries
-                    insn.dispatch_kind = ('long' if (insn.length == 4
-                                                    or len(auth.get('table_bases', ())) == 3)
-                                          else 'short')
+                    insn.dispatch_kind = _dispatch_kind(
+                        insn, auth.get('table_bases', ()))
                     insn.dispatch_idx_reg = auth['idx_reg']
-                    insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
+                    insn.dispatch_local_goto = is_local_goto
+                    if is_ptr_call:
+                        # Value-matched switch on the pointer loaded from the
+                        # operand address (codegen INDIR path keys on a single
+                        # table_base to read `cpu_read16(PB, operand)`).
+                        insn.dispatch_table_bases = (insn.operand & 0xFFFF,)
+                        insn.dispatch_call = True
+                    elif is_local_goto:
+                        # Value-matched switch on the computed pointer, but
+                        # targets are labels inside this generated function.
+                        insn.dispatch_table_bases = (insn.operand & 0xFFFF,)
+                    else:
+                        insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
                     # Register each in-bank target as a decode successor
                     # so reach-analysis + auto-promote pick up the handlers.
                     extra_succs = []
@@ -1687,12 +1906,22 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                             extra_succs.append(
                                 (DecodeKey(addr24(eb, e16), site_m, site_x, ()),
                                  'jump'))
-                    # JMP/JML indirect is a TERMINATOR (no fall-through).
-                    # All decoded successors come from the resolved table.
+                    # JMP/JML indirect is normally a TERMINATOR (no
+                    # fall-through). The pointer-sourced CALL form (PEA <ret>;
+                    # JMP (ptr)) is non-terminal: the dispatched handler RTSes
+                    # to the PEA'd return, resuming the next sequential block —
+                    # so add it as a fall-through successor.
                     succ = [k for (k, _) in extra_succs]
+                    decode_succs = list(extra_succs)
+                    if is_ptr_call:
+                        nxt = _pea_ptrcall_return_pc(
+                            rom, bank, pc, (pc + insn.length) & 0xFFFF)
+                        nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
+                        succ = [nxt_key]
+                        decode_succs.append((nxt_key, 'fall'))
                     graph.insns[key] = DecodedInsn(key=key, insn=insn,
                                                    successors=succ)
-                    for s, sk in extra_succs:
+                    for s, sk in decode_succs:
                         if s not in graph.insns:
                             worklist.append((s, sk, pc))
                     continue
@@ -1740,8 +1969,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     rom, bank, insn, auth)
                 if entries is not None:
                     insn.dispatch_entries = entries
-                    insn.dispatch_kind = ('long' if len(auth.get('table_bases', ())) == 3
-                                          else 'short')
+                    insn.dispatch_kind = _dispatch_kind(
+                        insn, auth.get('table_bases', ()))
                     insn.dispatch_idx_reg = auth['idx_reg']
                     insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
                     insn.dispatch_terminal = True
@@ -1798,13 +2027,21 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                 entries = _resolve_indirect_dispatch_targets(
                     rom, bank, insn, ud_auth)
                 if entries is not None:
-                    kind = ('long' if (insn.length == 4
-                                       or len(ud_auth.get('table_bases', ())) == 3)
-                            else 'short')
+                    is_ptr_call = bool(ud_auth.get('ptr_call'))
+                    kind = _dispatch_kind(
+                        insn, ud_auth.get('table_bases', ()))
                     insn.dispatch_entries = entries
                     insn.dispatch_kind = kind
                     insn.dispatch_idx_reg = ud_auth['idx_reg']
-                    insn.dispatch_table_bases = tuple(ud_auth.get('table_bases', ()) or ())
+                    if is_ptr_call:
+                        # Explicit target-list JSR (abs,X): X points at a
+                        # runtime descriptor/pointer, not a contiguous ROM
+                        # dispatch table. Codegen must switch on the loaded
+                        # pointer value rather than X / entry_size.
+                        insn.dispatch_table_bases = (insn.operand & 0xFFFF,)
+                        insn.dispatch_call = True
+                    else:
+                        insn.dispatch_table_bases = tuple(ud_auth.get('table_bases', ()) or ())
                     labeled_succ = _labeled_successors(
                         insn, key, bank,
                         callee_exit_mx=callee_exit_mx,

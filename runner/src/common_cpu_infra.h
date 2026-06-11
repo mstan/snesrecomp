@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include <stdio.h>
 
 #ifdef _MSC_VER
 #pragma warning(disable: 4013 4028 4033 4090 4133 4305 4715 4716)
@@ -29,14 +30,30 @@ void WatchdogCheck(void);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
+/* Always-on stack-balance auditor (see common_cpu_infra.c): reports
+ * functions that return with cpu->S != their entry S (unbalanced push/pull). */
+void RecompStackBalDumpStderr(int topn);
+void RecompStackBalDumpJson(FILE *f);
+/* Always-on unresolved-abandon hit table (see cpu_unresolved_abandon_balanced
+ * in cpu_state.h): one JSON object per distinct unresolved dispatch/stub/goto
+ * site that actually fired this run — the authorization worklist, ordered by
+ * first hit. Emits a trailing comma like the other dump_*_json sections. */
+void CpuUnresolvedAbandonDumpJson(FILE *f);
 /* Per-frame 65816 entry-S tracking for return-to-ancestor RTS resolution
  * (see common_cpu_infra.c). The emitted function prologue records
  * _entry_s into g_cpu_entry_s[g_recomp_stack_top-1]. */
 extern int g_recomp_stack_top;
 extern uint16_t g_cpu_entry_s[];
 int cpu_resolve_ancestor_skip(uint16_t ret_s);
+typedef struct CpuTailcallContextSave {
+  uint8_t valid;
+  uint16_t entry_s;
+  uint8_t hrv;
+} CpuTailcallContextSave;
 void cpu_tailcall_inherit_return_context(uint16_t entry_s, uint8_t hrv);
 int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv);
+void cpu_tailcall_context_save(CpuTailcallContextSave *out);
+void cpu_tailcall_context_restore(const CpuTailcallContextSave *in);
 #include <setjmp.h>
 extern jmp_buf g_watchdog_jmp;
 extern int g_watchdog_tripped;
