@@ -77,6 +77,16 @@ void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget) {
   ppu->extraRightCur = 0;
 }
 
+void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
+                              uint8_t right_start) {
+  // See ppu.h. Chunk bounds must be ordered for the span construction in
+  // PpuDrawBackground_2bpp (strictly ascending edges); disable otherwise.
+  if (left_end == 0 || left_end >= right_start) height = 0;
+  ppu->wsHudSplitHeight = height;
+  ppu->wsHudLeftEnd = left_end;
+  ppu->wsHudRightStart = right_start;
+}
+
 bool ppu_checkOverscan(Ppu* ppu) {
   // called at (0,225)
   ppu->frameOverscan = PPU_overscan(ppu); // set if we have a overscan-frame
@@ -336,6 +346,28 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     return;  // layer is completely hidden
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
+  // Widescreen HUD split (PpuSetWidescreenHudSplit): on HUD scanlines,
+  // replace the single span with five — left chunk re-anchored to the left
+  // border edge, a transparent gap, the centered chunk, a gap, and the
+  // right chunk re-anchored to the right border edge. ws_bias shifts each
+  // drawn span's source x so the chunks keep sampling their authentic
+  // tilemap columns. Skipped when the layer is windowed (split + game
+  // windows don't compose; fall back to authentic centered).
+  int16 ws_bias[6] = { 0, 0, 0, 0, 0, 0 };
+  if (layer == 2 && y < ppu->wsHudSplitHeight &&
+      ppu->extraLeftCur && ppu->extraRightCur &&
+      !IS_SCREEN_WINDOWED(ppu, sub, layer)) {
+    win.nr = 5;
+    win.bits = 0x0A;  // spans 1 and 3 are the gaps
+    win.edges[0] = -ppu->extraLeftCur;
+    win.edges[1] = ppu->wsHudLeftEnd - ppu->extraLeftCur;
+    win.edges[2] = ppu->wsHudLeftEnd;
+    win.edges[3] = ppu->wsHudRightStart;
+    win.edges[4] = ppu->wsHudRightStart + ppu->extraRightCur;
+    win.edges[5] = 256 + ppu->extraRightCur;
+    ws_bias[0] = ppu->extraLeftCur;
+    ws_bias[4] = -(int16)ppu->extraRightCur;
+  }
   y += ppu->vScroll[layer];
   int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
@@ -351,7 +383,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
-    uint x = win.edges[windex] + ppu->hScroll[layer];
+    uint x = win.edges[windex] + ppu->hScroll[layer] + ws_bias[windex];
     uint w = win.edges[windex + 1] - win.edges[windex];
     PpuZbufType *dstz = ppu->bgBuffers[sub].data + win.edges[windex] + kPpuExtraLeftRight;
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);

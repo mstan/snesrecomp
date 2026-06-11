@@ -140,6 +140,8 @@ struct Ppu {
   // times 2 for even and odd frame
 
   uint8_t extraLeftCur, extraRightCur, extraLeftRight;
+  // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
+  uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -245,6 +247,17 @@ void PpuSetExtraSpace(Ppu *ppu, uint8_t extra);
 // framebuffer (no border columns drawn). For bounded screens; caller blacks
 // out the side margins to pillarbox.
 void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget);
+
+// Widescreen HUD split (opt-in, configured by the game frontend): for
+// scanlines < height, BG3 (layer 2) is drawn as three chunks — source
+// [0,left_end) anchored to the LEFT border edge, [left_end,right_start)
+// kept centered (unmoved), [right_start,256) anchored to the RIGHT border
+// edge. The vacated spans stay transparent. height 0 = off (authentic).
+// Only takes effect while extra border columns are active and BG3 is not
+// windowed; mosaic lines fall back to centered. Like the extra-space
+// setters, callers re-apply per frame (ppu_reset zeroes the fields).
+void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
+                              uint8_t right_start);
 
 int PpuGetCurrentRenderScale(Ppu *ppu, uint32_t render_flags);
 
