@@ -6,6 +6,31 @@ graduate to in-flight tasks only when explicitly scheduled.
 
 ---
 
+## Attribution — widescreen / extra-side-space PPU model
+
+The runner's widescreen rendering descends from **snesrev's `zelda3`**
+(https://github.com/snesrev/zelda3, MIT) — `runner/src/snes/ppu.c` is a fork
+of its `snes/ppu.c`, and the per-side margin machinery
+(`extraLeftCur`/`extraRightCur`/`extraLeftRight`/`extraBottomCur`,
+`PpuSetExtraSideSpace`) is reimplemented from that project. The dynamic
+room-bounds-clamped policy each game layers on top (e.g. ALttP's
+`ZeldaConfigurePpuSideSpace`) is reimplemented from zelda3's
+`ConfigurePpuSideSpace`, read over the recompiled ROM's live WRAM instead of
+zelda3's C globals.
+
+Widescreen and quality-of-life *concepts* for A Link to the Past (the
+widescreen fix, HUD rearrange, per-button item boxes, in-game settings menu)
+were referenced from **xander-haj's `Z3R`** (https://github.com/xander-haj/Z3R)
+and its commented `z3c` base — both forks of `zelda3` (MIT). We reimplement
+against the original ROM under the static-recompilation model rather than
+copying their C; credit and thanks to those authors.
+
+The PPU-level capability lives in the shared runner (`runner/src/snes/ppu.c`
++ `runner/src/widescreen.{c,h}`); per-game policy lives in each game repo
+behind its own opt-in config (see recomp-template/ENHANCEMENTS.md).
+
+---
+
 ## IN FLIGHT: Option-1 cpu->S model revival (2026-05-26) — de-risked & runtime-ready
 
 Branch `feat/cpu-s-stack-model`. Reviving the "Abandoned path" below, now
