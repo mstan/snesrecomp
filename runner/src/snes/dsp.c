@@ -7,6 +7,7 @@
 #include <stddef.h>
 
 #include "dsp.h"
+#include "dsp_shadow.h"
 #include "apu.h"
 #include "../audio_trace.h"
 
@@ -62,10 +63,12 @@ static void dsp_handleNoise(Dsp* dsp);
 Dsp* dsp_init(uint8_t *ram) {
   Dsp* dsp = malloc(sizeof(Dsp));
   dsp->apu_ram = ram;
+  dsp->shadow = dsp_shadow_create();  // opt-in; NULL/disabled unless env set
   return dsp;
 }
 
 void dsp_free(Dsp* dsp) {
+  dsp_shadow_free((DspShadow*)dsp->shadow);
   free(dsp);
 }
 
@@ -143,6 +146,17 @@ void dsp_cycle(Dsp* dsp) {
   totalR = (totalR * dsp->masterVolumeR) >> 7;
   totalL = totalL < -0x8000 ? -0x8000 : (totalL > 0x7fff ? 0x7fff : totalL); // clamp 16-bit
   totalR = totalR < -0x8000 ? -0x8000 : (totalR > 0x7fff ? 0x7fff : totalR); // clamp 16-bit
+  // Verified-enhancement shadow (opt-in, default off): re-render the dry voice
+  // mix with better interpolation and substitute it ONLY once it has proven it
+  // matches this canon dry mix. No-op (totalL/R unchanged) when disabled or
+  // unproven, so default output is byte-identical. Echo below applies to the
+  // chosen dry mix either way.
+  if (dsp->shadow) {
+    int sL = totalL, sR = totalR;
+    dsp_shadow_process((DspShadow*)dsp->shadow, dsp, totalL, totalR, &sL, &sR);
+    totalL = sL;
+    totalR = sR;
+  }
   dsp_handleEcho(dsp, &totalL, &totalR);
   if(dsp->mute) {
     totalL = 0;
