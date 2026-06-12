@@ -32,6 +32,9 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/cpu.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/dma.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/dsp.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/audio_shadow.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/dsp_shadow.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/color_lut.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/ppu.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/ppu_old.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/snes.c

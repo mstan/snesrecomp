@@ -56,6 +56,11 @@ typedef struct DspChannel {
 
 struct Dsp {
   uint8_t *apu_ram;
+  // MP2K-style verified-enhancement shadow mixer (opt-in; default off).
+  // Placed BEFORE `ram` so it lies outside the dsp_saveload region
+  // (which serializes from `ram` to end) — savestate layout is unchanged.
+  // void* to keep dsp.h free of the shadow header; dsp.c owns the type.
+  void *shadow;
   // mirror ram
   uint8_t ram[0x80];
   // 8 channels
