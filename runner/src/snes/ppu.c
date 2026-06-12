@@ -77,6 +77,17 @@ void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget) {
   ppu->extraRightCur = 0;
 }
 
+void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom) {
+  // Per-frame asymmetric fill within the centering budget (extraLeftRight).
+  // Mirrors zelda3's PpuSetExtraSideSpace; left/right clamp to the budget so
+  // the line renderer's window edges stay inside the priority buffers, bottom
+  // clamps to the 16px overscan band. See ppu.h for the symmetric-vs-dynamic
+  // distinction.
+  ppu->extraLeftCur = (uint8_t)IntMin(IntMax(left, 0), ppu->extraLeftRight);
+  ppu->extraRightCur = (uint8_t)IntMin(IntMax(right, 0), ppu->extraLeftRight);
+  ppu->extraBottomCur = (uint8_t)IntMin(IntMax(bottom, 0), 16);
+}
+
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start) {
   // See ppu.h. Chunk bounds must be ordered for the span construction in

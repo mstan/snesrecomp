@@ -139,7 +139,7 @@ struct Ppu {
   // pixel buffer (xbgr)
   // times 2 for even and odd frame
 
-  uint8_t extraLeftCur, extraRightCur, extraLeftRight;
+  uint8_t extraLeftCur, extraRightCur, extraLeftRight, extraBottomCur;
   // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
   uint8_t lastMosaicModulo;
@@ -247,6 +247,18 @@ void PpuSetExtraSpace(Ppu *ppu, uint8_t extra);
 // framebuffer (no border columns drawn). For bounded screens; caller blacks
 // out the side margins to pillarbox.
 void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget);
+
+// Asymmetric per-side widescreen margin (the snesrev/zelda3 model, see
+// attribution in IMPROVEMENTS.md). The centering budget (extraLeftRight) must
+// already be set via PpuSetExtraSpaceCentered/PpuSetExtraSpace; this fills the
+// per-frame extraLeftCur/extraRightCur/extraBottomCur within that budget,
+// clamped so the window/sprite/composite paths never read past the
+// priority-buffer capacity (left/right) or the 16px overscan bottom. Negative
+// inputs clamp to 0. (0,0,0) collapses to a centered pillarbox. Callers
+// re-apply per frame (ppu_reset zeroes the fields). Used by games whose own
+// scroll/room-bounds state drives the visible margin dynamically (Zelda),
+// versus PpuSetExtraSpace's fixed symmetric border (SMW).
+void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 
 // Widescreen HUD split (opt-in, configured by the game frontend): for
 // scanlines < height, BG3 (layer 2) is drawn as three chunks — source
