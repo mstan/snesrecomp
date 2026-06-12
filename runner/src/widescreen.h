@@ -32,7 +32,10 @@
 // True iff widescreen is active this run (i.e. g_ws_extra > 0). Read by the
 // game-logic override snippets the build-time injector adds to generated code.
 // With this false, every injected branch is not taken and behaviour is
-// byte-identical to the faithful build.
+// byte-identical to the faithful build. DEFINED BY EACH GAME (next to its
+// config wiring), not by the runner — so a title that already defines it (SMW)
+// adopts this header with no change. The injector's `extern bool g_ws_active;`
+// resolves to that per-game symbol.
 extern bool g_ws_active;
 
 // Extra columns rendered per side, baked into the framebuffer width

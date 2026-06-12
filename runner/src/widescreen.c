@@ -2,12 +2,12 @@
 
 #include <string.h>
 
-// Canonical storage for the widescreen master switch. A game's config sets
-// these once at startup (default off => byte-identical to the faithful build).
-// Single definition here so the injector-emitted `extern bool g_ws_active;`
-// references resolve to the same symbol in every title.
-bool g_ws_active = false;
-int g_ws_extra = 0;
+// NOTE: g_ws_active / g_ws_extra are *declared* in widescreen.h but defined by
+// each game (next to its config wiring), not here. Keeping the storage per-game
+// means a title that already defines them locally (SMW) needs no change when it
+// adopts this asset, while still sharing the contract + helper below. The
+// genuinely game-agnostic, identical-across-titles pieces are kWsExtraMax and
+// RtlWidescreenPresent.
 
 void RtlWidescreenPresent(uint8_t *dst, size_t pitch, const uint8_t *src,
                           int snes_width, int snes_height) {
