@@ -273,6 +273,38 @@ static int verify_rom_sha256(const char *path, const uint8_t *expected_sha256) {
     return 1;
 }
 
+/* Compute the ROM's SHA-256 (auto-stripping a 512-byte copier header) and
+ * return the index of the first matching entry in `hashes`, or -1 if none
+ * match. Quiet (no dialog) — callers decide how to treat a non-match. On
+ * non-match it logs the computed hash so it can be added if intended. */
+static int rom_sha256_match(const char *path,
+                            const uint8_t (*hashes)[32], size_t n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[Launcher] Cannot open '%s'\n", path); return -1; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0) { fclose(f); return -1; }
+    uint8_t *data = (uint8_t *)malloc((size_t)sz);
+    if (!data) { fclose(f); return -1; }
+    size_t rd = fread(data, 1, (size_t)sz, f);
+    fclose(f);
+    if (rd != (size_t)sz) { free(data); return -1; }
+
+    size_t hdr = ((size_t)sz % 1024 == 512) ? 512 : 0;
+    uint8_t actual[32];
+    sha256_compute(data + hdr, (size_t)sz - hdr, actual);
+    free(data);
+
+    for (size_t i = 0; i < n; i++)
+        if (memcmp(actual, hashes[i], 32) == 0) return (int)i;
+
+    char hex[65];
+    for (int i = 0; i < 32; i++) snprintf(hex + i*2, 3, "%02x", actual[i]);
+    fprintf(stderr, "[Launcher] ROM SHA-256 %s matches no known hash.\n", hex);
+    return -1;
+}
+
 /* ---- Public ---- */
 
 int snesrecomp_launcher_resolve_rom(int argc, char **argv,
@@ -358,5 +390,61 @@ int snesrecomp_launcher_resolve_rom_sha256(int argc, char **argv,
         }
         /* Wrong ROM — clear and re-prompt. */
         out_path[0] = '\0';
+    }
+}
+
+/* Like resolve_rom_sha256 but permissive: a ROM whose hash is in `hashes`
+ * loads silently; ANY other readable ROM also loads, but with a warning
+ * (so romhacks / other regions still work, just flagged). Only a missing/
+ * unreadable file or a cancelled picker re-prompts. `hashes` is an array of
+ * n_hashes 32-byte digests; pass n_hashes==0 to accept anything silently. */
+int snesrecomp_launcher_resolve_rom_sha256_multi(int argc, char **argv,
+                                                 char *out_path, size_t max_len,
+                                                 const uint8_t (*hashes)[32],
+                                                 size_t n_hashes) {
+    out_path[0] = '\0';
+
+    /* (1) argv[1] override. */
+    if (argc >= 2 && argv[1] && argv[1][0] != '-' && argv[1][0] != '\0') {
+        if (!snesrecomp_abspath(argv[1], out_path, max_len)) {
+            strncpy(out_path, argv[1], max_len - 1);
+            out_path[max_len - 1] = '\0';
+        }
+        if (n_hashes && rom_sha256_match(out_path, hashes, n_hashes) < 0)
+            fprintf(stderr, "[Launcher] Warning: '%s' is not a recognized ROM "
+                            "for this build — loading anyway; the game may "
+                            "misbehave.\n", out_path);
+        rom_cfg_write(out_path);
+        printf("[Launcher] ROM: %s\n", out_path);
+        return 1;
+    }
+
+    /* (2) Cached path from rom.cfg. */
+    rom_cfg_read(out_path, max_len);
+
+    /* (3) Picker. Accept any readable ROM; warn if unrecognized. Only a
+     * cancelled picker (or an unreadable cached path) re-prompts. */
+    for (;;) {
+        if (out_path[0] == '\0') {
+            if (!pick_rom_file(out_path, max_len)) {
+                fprintf(stderr, "[Launcher] No ROM selected — exiting.\n");
+                out_path[0] = '\0';
+                return 0;
+            }
+        }
+        FILE *probe = fopen(out_path, "rb");
+        if (!probe) {                 /* stale cache / vanished file */
+            fprintf(stderr, "[Launcher] '%s' is not readable — pick again.\n", out_path);
+            out_path[0] = '\0';
+            continue;
+        }
+        fclose(probe);
+        if (n_hashes && rom_sha256_match(out_path, hashes, n_hashes) < 0)
+            fprintf(stderr, "[Launcher] Warning: '%s' is not a recognized ROM "
+                            "for this build — loading anyway; the game may "
+                            "misbehave.\n", out_path);
+        rom_cfg_write(out_path);
+        printf("[Launcher] ROM: %s\n", out_path);
+        return 1;
     }
 }

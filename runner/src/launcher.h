@@ -56,6 +56,23 @@ int snesrecomp_launcher_resolve_rom_sha256(int argc, char **argv,
                                            const uint8_t *expected_sha256);
 
 /*
+ * snesrecomp_launcher_resolve_rom_sha256_multi
+ *
+ * Permissive multi-hash variant. A ROM whose SHA-256 is in `hashes` loads
+ * silently; ANY other readable ROM also loads, but emits a warning (so
+ * romhacks / other regions still run, just flagged). Only a missing/
+ * unreadable file or a cancelled picker re-prompts.
+ *
+ * `hashes` is an array of `n_hashes` 32-byte digests (e.g. a vanilla hash
+ * plus a known patched hash). Pass n_hashes==0 to accept anything silently.
+ * Same SMC-copier-header handling as the other variants.
+ */
+int snesrecomp_launcher_resolve_rom_sha256_multi(int argc, char **argv,
+                                                 char *out_path, size_t max_len,
+                                                 const uint8_t (*hashes)[32],
+                                                 size_t n_hashes);
+
+/*
  * snesrecomp_anchor_to_exe_dir
  *
  * chdir() to the directory containing the running executable, so every
