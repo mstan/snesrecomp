@@ -590,30 +590,55 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   RtlApuUnlock();
 }
 
+/* The battery-backed SRAM lives at a fixed, game-agnostic path next to the exe
+ * (each game has its own directory, so there is no collision). Older builds named
+ * it after the game's internal title — which happened to be "smw" for every game
+ * (a copy-paste leftover), so Mega Man X / Zelda also wrote saves/smw.srm.
+ * RtlMigrateLegacySram copies any such legacy save forward the first time the new
+ * generic path is used, so existing players keep their progress. */
+#define RTL_SRAM_FILE     "saves/save.srm"
+#define RTL_SRAM_BAK_FILE "saves/save.srm.bak"
+
+static void RtlMigrateLegacySram(void) {
+  FILE *cur = fopen(RTL_SRAM_FILE, "rb");
+  if (cur) { fclose(cur); return; }   /* already on the generic name */
+  char legacy[64];
+  snprintf(legacy, sizeof(legacy), "saves/%s.srm", g_rtl_game_info->title);
+  FILE *in = fopen(legacy, "rb");
+  if (!in) return;                    /* no legacy save to carry forward */
+  FILE *out = fopen(RTL_SRAM_FILE, "wb");
+  if (!out) { fclose(in); return; }   /* e.g. saves/ not writable */
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+    fwrite(buf, 1, n, out);
+  fclose(in);
+  fclose(out);
+  fprintf(stderr, "[saves] migrated legacy %s -> %s\n", legacy, RTL_SRAM_FILE);
+}
+
 void RtlReadSram(void) {
-  char filename[64];
-  snprintf(filename, sizeof(filename), "saves/%s.srm", g_rtl_game_info->title);
-  FILE *f = fopen(filename, "rb");
+  RtlMigrateLegacySram();
+  FILE *f = fopen(RTL_SRAM_FILE, "rb");
   if (f) {
     if (fread(g_sram, 1, g_sram_size, f) != g_sram_size)
-      fprintf(stderr, "Error reading %s\n", filename);
+      fprintf(stderr, "Error reading %s\n", RTL_SRAM_FILE);
     fclose(f);
   }
 }
 
 void RtlWriteSram(void) {
-  char filename[64], filename_bak[64];
-  snprintf(filename, sizeof(filename), "saves/%s.srm", g_rtl_game_info->title);
-  snprintf(filename_bak, sizeof(filename_bak), "saves/%s.srm.bak", g_rtl_game_info->title);
-  rename(filename, filename_bak);
-  FILE *f = fopen(filename, "wb");
+  rename(RTL_SRAM_FILE, RTL_SRAM_BAK_FILE);
+  FILE *f = fopen(RTL_SRAM_FILE, "wb");
   if (f) {
     fwrite(g_sram, 1, g_sram_size, f);
     fclose(f);
   } else {
-    fprintf(stderr, "Unable to write %s\n", filename);
+    fprintf(stderr, "Unable to write %s\n", RTL_SRAM_FILE);
   }
-}static const uint8 *SimpleHdma_GetPtr(uint32 p) {
+}
+
+static const uint8 *SimpleHdma_GetPtr(uint32 p) {
   uint8 bank = (uint8)(p >> 16);
   uint16 addr = (uint16)(p & 0xffff);
   if (bank == 0x7E) return g_ram + addr;
