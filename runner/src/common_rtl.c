@@ -438,6 +438,14 @@ void RtlApuWrite(uint16 adr, uint8 val) {
      * late-window writes to the same target and re-collapse spacing. */
     static uint64_t s_port_clock;     /* previous write's target */
     static uint64_t s_port_clock_ns;  /* wall_ns of previous write */
+    /* Per-port history for the minimum-dwell floor below. Statics, like
+     * s_port_clock: not reset across RtlReset/upload, which is benign —
+     * after a reset `produced` has advanced far past any stale target, so
+     * the floor (stale_target + dwell) is already in the past and never
+     * engages spuriously. */
+    static uint64_t s_port_last_target[4];
+    static uint8_t  s_port_last_val[4];
+    static uint8_t  s_port_last_valid[4];
     uint64_t quantum = audio_trace_consume_quantum();
     uint64_t now_ns = audio_trace_wall_ns();
     uint64_t produced, consumed;
@@ -449,6 +457,39 @@ void RtlApuWrite(uint16 adr, uint8 val) {
     uint64_t target = s_port_clock + delta;
     if (target < produced) target = produced;
     if (target > produced + 3u * quantum) target = produced + 3u * quantum;
+
+    /* Minimum per-port dwell — the turbo audio-dropout fix. A level
+     * transition fires several DISTINCT values at the same APU port
+     * (fade, silence, the new song; or a one-shot command then the NMI's
+     * next-frame 0-clear) within a few frames. The wall-clock spacing
+     * computed above reproduces hardware timing faithfully at 1x, but
+     * turbo runs the game thread uncapped while the SPC still advances at
+     * 1x, compressing that spacing below the engine's ~64-sample poll
+     * period — so an earlier value is overwritten in inPorts before the
+     * engine ever reads it and the command is silently lost (music/SFX
+     * drop out; because a surviving fade can zero global output, they do
+     * not come back until the next track change, i.e. never within a
+     * level). Floor a DISTINCT value's target so the previous distinct
+     * value on that port holds the bus for at least APU_PORT_MIN_DWELL
+     * produced-samples — one guaranteed engine poll. The drain runs once
+     * per produced sample (apu_cycle), so this target spacing becomes
+     * apply spacing directly. Bounded by produced + 8*quantum so a
+     * pathological sustained burst degrades to today's bounded latency
+     * rather than unbounding it. Identical repeats (e.g. repeated
+     * 0-clears) need no spacing. No effect at 1x: frame-spaced writes are
+     * already ~534 samples apart, far above the floor. */
+    {
+      int p = (int)(adr & 0x3);
+      if (s_port_last_valid[p] && val != s_port_last_val[p]) {
+        uint64_t floor = s_port_last_target[p] + APU_PORT_MIN_DWELL;
+        uint64_t ceil  = produced + 8u * quantum;
+        if (target < floor) target = floor < ceil ? floor : ceil;
+      }
+      s_port_last_target[p] = target;
+      s_port_last_val[p]    = val;
+      s_port_last_valid[p]  = 1;
+    }
+
     s_port_clock = target;
     s_port_clock_ns = now_ns;
     apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, target);

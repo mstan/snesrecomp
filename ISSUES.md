@@ -3,10 +3,34 @@
 Game-specific issues live in each game repo's ISSUES.md; this file tracks
 issues in the shared runner and recompiler that affect every port.
 
-## OPEN: Music command can drop under turbo (APU port-write scheduler vs uncapped game clock)
+## FIX IMPLEMENTED (pending playtest): Music/SFX command can drop under turbo (APU port-write scheduler vs uncapped game clock)
 
-**Status:** OPEN 2026-06-11. Deferred by choice ("maybe another time").
-Runner-level — affects all games. Observed on Zelda ALttP: overworld music
+**Status:** FIX IMPLEMENTED 2026-06-17 (pending user playtest). Previously
+OPEN/deferred since 2026-06-11. Runner-level — affects all games.
+
+**Escalation (2026-06-17):** users reported the symptom is worse than the
+original writeup assumed — audio can drop out ENTIRELY (music AND SFX) at
+level transitions and NOT come back, and it occurs occasionally even at
+normal speed (turbo just makes it reliably reproducible). Confirmed root
+cause is the same same-port command collapse documented below. "Entirely"
+= a level transition fires several DISTINCT values at one port (fade,
+silence, new song) and a surviving fade can zero global output, taking SFX
+down with it; "never comes back" = within a level no further command is
+sent, so the documented self-heal-at-next-transition never fires.
+
+**Fix:** per-port minimum dwell in `RtlApuWrite` (`runner/src/common_rtl.c`)
++ `APU_PORT_MIN_DWELL`/larger queue in `runner/src/snes/apu.h`. A DISTINCT
+value's scheduled target is floored so the previous distinct value on that
+port holds the bus ≥128 produced-samples (~2 engine poll periods) before
+being overwritten — guaranteeing the SPC polls every value. Bounded by
+produced + 8*quantum so pathological sustained bursts degrade to bounded
+latency, never unbounded. No effect at 1x (frame-spaced writes are already
+~534 samples apart), so normal-speed scheduling is byte-identical. The
+drain runs once per produced sample, so target spacing becomes apply
+spacing directly. Pure runner change — no regen; rebuild only.
+
+**Original writeup (mechanism still accurate):**
+Observed on Zelda ALttP: overworld music
 did not start after entering the overworld while holding Turbo (Tab).
 Self-heals at the next music transition. Normal-speed audio is unaffected
 (post-fix validation: SMW 100% across two runs, MMX no misses, Zelda clean

@@ -36,7 +36,30 @@ typedef struct Timer {
  * the consumption clock restores the hardware-faithful timeline: in
  * the SPC's own execution time, consecutive frame writes stay a full
  * frame (~534 samples) apart regardless of burst alignment. */
-#define APU_PORT_QUEUE_LEN 64u  /* power of 2; SMW peaks at 4 writes/frame */
+/* Power of 2. SMW peaks at ~4 writes/frame at 1x, but under turbo the
+ * uncapped game thread schedules many frames of writes into the bounded
+ * latency window faster than the 1x SPC drains them, and the per-port
+ * minimum-dwell floor (see APU_PORT_MIN_DWELL) pushes distinct values
+ * later still. 128 keeps the in-flight set inside the queue so the
+ * overflow force-apply path (which bypasses a write's target) stays a
+ * rare backstop rather than the common case under sustained turbo. */
+#define APU_PORT_QUEUE_LEN 128u
+
+/* Minimum produced-sample spacing the scheduler enforces between two
+ * DISTINCT values written to the SAME APU port. The SPC sound engine
+ * polls its command ports about every ~64 samples of its own time; if
+ * two distinct values to one port land closer than that, the engine
+ * never observes the first (it is overwritten in inPorts before any
+ * read) and that command is silently lost. At 1x the game spaces its
+ * per-frame writes ~534 samples apart so this floor never engages, but
+ * turbo runs the game thread uncapped while the SPC still advances at
+ * 1x, compressing successive same-port writes below the poll period --
+ * the audio-dropout-at-level-transition bug. Flooring distinct same-port
+ * writes two poll periods apart guarantees the engine polls every value.
+ * Expressed in native DSP samples (32040 Hz), so host resample rate is
+ * irrelevant. */
+#define APU_PORT_MIN_DWELL 128u
+
 typedef struct ApuPortWrite {
   uint64_t target_sample; /* apply when the produced-sample clock reaches this */
   uint8_t port;           /* 0-3 */
