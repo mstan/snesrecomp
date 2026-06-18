@@ -1185,6 +1185,30 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    /* Investigation: block-boundary DB shadow. Catches EVERY DB change
+     * (inline PLBs bypass cpu_trace_db_change), reporting the block where it
+     * was first observed + the immediately-preceding block (which did it).
+     * Same window as SNESRECOMP_DBTRACE. */
+    {
+        extern int snes_frame_counter;
+        static int dbs_init = 0, dbs_lo = -1, dbs_hi = -1;
+        static uint8_t dbs_last = 0xFF;
+        static uint32_t dbs_prev_pc = 0;
+        if (!dbs_init) {
+            dbs_init = 1;
+            const char *_e = getenv("SNESRECOMP_DBTRACE");
+            if (_e) sscanf(_e, "%d-%d", &dbs_lo, &dbs_hi);
+        }
+        if (dbs_lo >= 0 && cpu->DB != dbs_last &&
+            snes_frame_counter >= dbs_lo && snes_frame_counter <= dbs_hi) {
+            fprintf(stderr, "[dbs] f=%d DB $%02X->$%02X in block $%06X "
+                    "(prev block $%06X) S=%04X\n",
+                    snes_frame_counter, dbs_last, cpu->DB, dbs_prev_pc, pc24,
+                    cpu->S);
+        }
+        dbs_last = cpu->DB;
+        dbs_prev_pc = pc24;
+    }
     /* Inspection-freeze trigger (reusable). Armed once from the
      * environment so it covers the very first frames with no
      * arming race; the TCP command can also set g_freeze_at_frame. */
@@ -1762,6 +1786,22 @@ static int db_watch_hit(uint8_t db) {
 
 void cpu_trace_db_change(CpuState *cpu, uint32_t pc24, uint8_t old_db,
                          uint8_t new_db, uint8_t event_type) {
+    /* Investigation: windowed DB-WRITE log (same window as SNESRECOMP_DBTRACE).
+     * Every DB change with its PC so the unfaithful write can be checked
+     * against the ROM ASM (no oracle needed). */
+    {
+        extern int snes_frame_counter;
+        static int dbw_init = 0, dbw_lo = -1, dbw_hi = -1;
+        if (!dbw_init) {
+            dbw_init = 1;
+            const char *_e = getenv("SNESRECOMP_DBTRACE");
+            if (_e) sscanf(_e, "%d-%d", &dbw_lo, &dbw_hi);
+        }
+        if (dbw_lo >= 0 && new_db != old_db &&
+            snes_frame_counter >= dbw_lo && snes_frame_counter <= dbw_hi)
+            fprintf(stderr, "[dbw] f=%d PC=$%06X DB $%02X->$%02X S=%04X\n",
+                    snes_frame_counter, pc24, old_db, new_db, cpu->S);
+    }
     capture(cpu, pc24, event_type, old_db, (uint16_t)new_db);
     int slot = (int)(g_cpu_dbpb_idx++ & (CPU_DBPB_RING_LEN - 1));
     CpuDbpbEvent *d = &g_cpu_dbpb_ring[slot];
