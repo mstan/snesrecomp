@@ -1263,6 +1263,23 @@ static uint32_t fnv1a(const char *s) {
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
     if (g_freeze_capture) return;  /* deliberate inspection-freeze */
+    /* Investigation (env-gated): log DB/PB at every function entry inside a
+     * frame window so a data-bank divergence can be located by chain.
+     * SNESRECOMP_DBTRACE="lo-hi". Off by default, zero cost when unset. */
+    {
+        extern int snes_frame_counter;
+        static int dbt_init = 0, dbt_lo = -1, dbt_hi = -1;
+        if (!dbt_init) {
+            dbt_init = 1;
+            const char *_e = getenv("SNESRECOMP_DBTRACE");
+            if (_e) sscanf(_e, "%d-%d", &dbt_lo, &dbt_hi);
+        }
+        if (dbt_lo >= 0 && snes_frame_counter >= dbt_lo &&
+            snes_frame_counter <= dbt_hi)
+            fprintf(stderr, "[dbt] f=%d DB=%02X PB=%02X S=%04X %s\n",
+                    snes_frame_counter, cpu->DB, cpu->PB, cpu->S,
+                    name ? name : "?");
+    }
     /* Soundness check (one-shot, gated by armed flag). Compares the
      * decoder's static (M, X) claim — encoded in the function name's
      * trailing `_M{m}X{x}` suffix — against the runtime cpu->m_flag /
