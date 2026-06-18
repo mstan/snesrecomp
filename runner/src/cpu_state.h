@@ -461,6 +461,21 @@ int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24);
 RecompReturn cpu_unresolved_abandon_balanced(CpuState *cpu, uint32 site_pc24,
                                              uint16 entry_s, uint8 hrv);
 
+/* Interpreter-fallback tier (interp_bridge.c). Interpret the guest routine at
+ * target_pc24 sharing this CpuState — bouncing sub-calls into compiled code —
+ * and return when it RTS/RTLs past entry. See docs/MULTI_TIER.md.
+ *
+ * interp_tier_dispatch_balanced is the form used at unresolved tail-dispatch
+ * sites that otherwise call cpu_unresolved_abandon_balanced: it UPGRADES the
+ * stack-safe drop into actually running the routine. On a clean return the
+ * routine's own RTS/RTL balances the stack; on a bail (step cap / wedge) it
+ * falls back to cpu_unresolved_abandon_balanced(site,entry_s,hrv) so it is
+ * never worse than the drop path and still records the site. */
+RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
+RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
+                                           uint32 site_pc24, uint16 entry_s,
+                                           uint8 hrv);
+
 /* Focused OAM-overflow observability recorders (debug_server.c).
  * dbg_rts_trace is emitted by the RTS/RTL lowering; dbg_oam_block_trace
  * is called from cpu_trace_block. Both are PC-range-filtered and frozen

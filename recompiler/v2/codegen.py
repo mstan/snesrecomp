@@ -1335,8 +1335,12 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append("    default:")
         lines.append(
             f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+        # Interpreter-fallback tier: run the loaded target instead of dropping
+        # it (interp shares CpuState + the AOT bus; bail -> abandon-balanced
+        # fallback, never worse than the drop). See docs/MULTI_TIER.md.
         lines.append(
-            f"      return cpu_unresolved_abandon_balanced(cpu, "
+            f"      return interp_tier_dispatch_balanced(cpu, "
+            f"((uint32)cpu->PB << 16) | _target, "
             f"0x{site_pc24:06x}u, _entry_s, _hrv);")
         lines.append("  }")
         lines.append("}")
@@ -1479,8 +1483,11 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # sub-dispatcher leak -> WILD STACK crash).
             lines.append(
                 f"  (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+            # Interpreter-fallback tier: run the loaded target instead of
+            # dropping it; bail -> abandon-balanced fallback. docs/MULTI_TIER.md.
             lines.append(
-                f"  return cpu_unresolved_abandon_balanced(cpu, "
+                f"  return interp_tier_dispatch_balanced(cpu, "
+                f"((uint32)cpu->PB << 16) | _target, "
                 f"0x{site_pc24:06x}u, _entry_s, _hrv);")
         lines.append("}")
         return lines

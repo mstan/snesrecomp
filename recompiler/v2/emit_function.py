@@ -1573,10 +1573,17 @@ def emit_function(rom: bytes, bank: int, start: int,
                             lines.append(
                                 f"(void)cpu_trace_dispatch_oob(cpu, "
                                 f"0x{site_pc24:06x}, 0xFFFF);")
+                            # Interpreter-fallback tier: re-interpret from the
+                            # unresolved JMP itself (target == site). interp816
+                            # decodes the indirect jump, reads the pointer at
+                            # runtime, runs the real target (with any PEA'd
+                            # return), and unwinds to _entry_s. Bail -> the
+                            # stack-safe abandon, never worse. docs/MULTI_TIER.md
                             lines.append(
-                                f"return cpu_unresolved_abandon_balanced(cpu, "
-                                f"0x{site_pc24:06x}u, _entry_s, _hrv); "
-                                f"/* unresolved IndirectGoto — HLE pending */")
+                                f"return interp_tier_dispatch_balanced(cpu, "
+                                f"0x{site_pc24:06x}u, 0x{site_pc24:06x}u, "
+                                f"_entry_s, _hrv); "
+                                f"/* unresolved IndirectGoto -> interpreter tier */")
                         block_terminated = True
                 elif isinstance(op, PushReg) and getattr(
                         di_insn, 'dispatch_entries', None):

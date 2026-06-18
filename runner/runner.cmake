@@ -37,6 +37,9 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/snes.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/snes_other.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/spc.c
+    # Interpreter-fallback tier (docs/MULTI_TIER.md): LakeSnes core + bridge.
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/interp816.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/interp_bridge.c
 )
 
 # The TCP debug server + emulator-oracle command handlers are a developer-only
