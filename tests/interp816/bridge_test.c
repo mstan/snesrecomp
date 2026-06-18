@@ -27,6 +27,9 @@ static int      g_aot_called;
 #define FAKE_AOT 0x008100u
 
 /* ── fakes the bridge links against (cpu_state.c provides these in prod) ── */
+/* The Phase-2 manifest recorder stamps the live frame counter on each
+ * discovery; the bridge references it as extern. */
+int snes_frame_counter = 0;
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
 }

@@ -90,6 +90,14 @@ class BankCfg:
     # Lets a fresh game project ship a minimal bank00.cfg with just
     # the one directive instead of hand-decoding the vector table.
     auto_vectors: bool = False
+    # `tier_down_stubs` directive — when present in ANY cfg, v2_regen emits
+    # cross-ROM-bank unresolved-function stubs (unresolved_stubs_v2.c) as
+    # interpreter tier-downs (interp_tier_dispatch_bank_miss) that RUN the real
+    # ROM bytes, instead of the no-op cpu_trace_unresolved_stub_trap. Game-wide
+    # opt-in for the Phase-4 bank-miss tier (docs/MULTI_TIER.md); the
+    # --tier-down-stubs CLI flag forces it on regardless. Bring-up aid —
+    # shipped titles omit it (default off).
+    tier_down_stubs: bool = False
     # `indirect_dispatch` directives — authorise the decoder to recover
     # the static target list of an indirect JMP/JML/JSR. Each entry is
     # a dict with keys:
@@ -216,6 +224,13 @@ def load_bank_cfg(path: str) -> BankCfg:
             # other banks.
             if head == 'auto_vectors':
                 cfg.auto_vectors = True
+                continue
+
+            # tier_down_stubs — opt into the Phase-4 bank-miss interpreter
+            # tier (see BankCfg.tier_down_stubs). Game-wide; place once in any
+            # bank cfg. The --tier-down-stubs CLI flag forces it on regardless.
+            if head == 'tier_down_stubs':
+                cfg.tier_down_stubs = True
                 continue
 
             # entry_mx_at <pc16> <m> <x> — override a cfg entry's

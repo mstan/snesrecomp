@@ -475,6 +475,13 @@ RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
 RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
                                            uint32 site_pc24, uint16 entry_s,
                                            uint8 hrv);
+/* Phase-4 (opt-in) bank-miss tier-down: the body emitted for a cross-ROM-bank
+ * function the static pass couldn't translate (unresolved_stubs_v2.c). Runs
+ * the real ROM bytes at addr_pc24 instead of the no-op trap; bail -> the same
+ * cpu_unresolved_abandon_balanced drop (never worse). Records kind="bank_miss".
+ * Only emitted when v2_regen is run with --tier-down-stubs. */
+RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32 addr_pc24,
+                                            uint16 entry_s, uint8 hrv);
 
 /* Focused OAM-overflow observability recorders (debug_server.c).
  * dbg_rts_trace is emitted by the RTS/RTL lowering; dbg_oam_block_trace

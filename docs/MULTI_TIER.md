@@ -511,13 +511,46 @@ discoveries become cfg seeds, the next regen makes them Tier 1.
   (`cpu_trace.c`) into `interp_bridge_run` (push a sentinel return frame, then
   run), compile `interp816.c` + `interp_bridge.c` into one game build, and
   owner-playtest. First time the bridge carries a real game.
-- **Phase 2 — manifest recording.** Record each tier-down (site, target, mx,
-  hit_count) to the slim always-on manifest at the trap.
-- **Phase 3 — offline ingest tool.** Read the manifest, build the cfg-proposer
-  (auto-promote analog) that emits `func` / `indirect_dispatch` directives.
-  Close the loop: discover → propose → regen → Tier 1.
+- **Phase 2 — manifest recording. ✅ DONE.** Always-on tier-down coverage
+  table in `interp_bridge.c` keyed by (site, target, m/x), tracking
+  clean-return vs contained-bail counts + frame span, with a resolved-landing
+  capture (an indirect-goto records the *dynamically resolved* target, not the
+  JMP site). `Tier2CoverageDumpJson` embeds it in the unified post-mortem
+  (`last_run_report.json`); `Tier2CoverageWriteManifest` writes the slim
+  standalone `build/tier2_coverage.json` (schema "snesrecomp tier2 coverage
+  v1"). Wired into SM's always-on `recomp_post_mortem_dump` (so it harvests on
+  normal exit, atexit, SEH crash, and on-demand TCP — not gated behind
+  `SNESRECOMP_TRACE`). Recording adds no signature change → no regen, runtime
+  rebuild only. Interp harness still 17/17 + 20/20.
+- **Phase 3 — offline ingest tool. ✅ DONE.** `tools/tier2_ingest.py` reads the
+  manifest and proposes cfg directives, human-in-the-loop (prints, never
+  edits), in three buckets:
+  - **PROMOTE** — clean-only discoveries whose target has no `func` yet →
+    paste-ready `func bank_BB_AAAA <addr16>` grouped by `bankBB.cfg`.
+  - **SITE NEEDS AUTHORIZATION** — clean discoveries whose target is *already*
+    a `func` → the SITE needs an `indirect_dispatch`/`indirect_call_table`
+    directive (flagged, not fabricated — the index reg / table layout isn't in
+    a runtime tier-down).
+  - **INVESTIGATE** — bailed discoveries → bug leads, *never* promoted (no
+    laundering a mis-execution into trusted AOT).
+  Validated on the real SM manifest + a synthetic 3-branch fixture.
+  Close the loop: discover → propose → paste → regen → Tier 1.
 - **Phase 4 — bank-miss tier-down (opt-in).** The build-error relaxation for
   bring-up, behind a regen flag; shipped titles stay strict.
+
+- **Phase 4 — bank-miss tier-down. ✅ DONE (opt-in).** `v2_regen.py
+  --tier-down-stubs` emits each cross-ROM-bank unresolved-function stub
+  (`unresolved_stubs_v2.c`) as `interp_tier_dispatch_bank_miss` — running the
+  real ROM bytes through the interpreter instead of the no-op
+  `cpu_trace_unresolved_stub_trap`. A bail falls back to the same
+  `cpu_unresolved_abandon_balanced` drop (never worse); every fire records to
+  the manifest as a distinct `bank_miss` kind. Default OFF → shipped titles
+  stay strict; no effect on any game that regens without the flag. SM opted in
+  (14 stubs converted, built clean). **Finding:** none of SM's 14 bank-miss
+  stubs are reached on the boot→attract path (0 `bank_miss` fires), so Phase 4
+  is a no-op *for SM's current wall* — a useful negative result that rules out
+  untranslated bank-miss functions as the blocker. SM's wall remains the
+  `$0FE8B7` indirect-goto (`$0012=$FFFF` upstream corruption), unchanged.
 
 Phase 1a was the decision point and it **passed** — the bridge contract holds on
 the isolated case. (Had it proven intractable, the fallback was discovery-only:
@@ -612,6 +645,32 @@ scratch/RNG/timers/buffers legitimately differ between an HLE recomp and a
 cycle-accurate core; (b) lean on the **interp tier's gap worklist + post-mortem**
 as the primary signal rather than whole-WRAM diff. Instruction-level lockstep
 (the removed approach) is *not* recommended — it's the fragility this confirmed.
+
+### Gap-worklist loop — built + validated (2026-06-18)
+
+Decision (owner): drive bug-finding from the **interp tier's own gap worklist**,
+not a whole-WRAM differential (the timing verdict above killed that for SM).
+Phases 2 + 3 built on that basis (pure runtime + offline tool; no regen).
+
+Validated against a live SM run: the tier fired once (the only gap SM's
+boot→attract execution actually reaches), and the manifest captured it exactly:
+
+```
+{"site_pc24":"0x0FE8B7","target_pc24":"0x0FFFFF","entry_mx":"M0X0",
+ "site_kind":"indirect_goto","clean_hits":0,"bail_hits":1,"first_frame":2863}
+```
+
+`target_pc24 = 0x0FFFFF` is the **resolved-landing capture** working — it
+records where the garbage `JMP ($0012)=$FFFF` actually jumped, mechanically
+confirming the upstream-corruption finding (no hand-tracing). The run then
+reproduced SM's known wall verbatim (spin at f2911 → STATUS_BAD_STACK at
+`bank_00_82C5`), and the manifest was harvested via the SEH post-mortem path —
+so it survives a crash. `tier2_ingest.py` correctly routes `$0FE8B7` to
+**INVESTIGATE** (a bug lead, not a promote candidate), which is exactly right:
+SM's current wall is upstream state corruption, not a coverage gap. The PROMOTE
+path (auto-clear clean coverage gaps → `func` directives) is validated by a
+synthetic fixture and will activate for SM as bringup reaches more of the 225
+tier sites with valid targets.
 
 ### Tuning / status
 - Step cap is tunable (`SNESRECOMP_INTERP_STEP_CAP`, default 2M). A proper fix

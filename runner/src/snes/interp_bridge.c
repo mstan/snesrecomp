@@ -96,7 +96,7 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
  * enclosing function's _entry_s, NOT the current cpu->S (a PEA may have pushed
  * a return below entry, and the target's RTS-to-PEA must NOT end the bridge). */
 static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
-                                uint16_t s_exit) {
+                                uint16_t s_exit, uint32_t *out_landing) {
     /* Local interpreter context → nesting (an AOT bounce that itself traps and
      * re-enters the bridge) gets its own frame; no shared mutable interp. */
     Interp816 in;
@@ -136,6 +136,14 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
 
         interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
 
+        /* Resolved-landing capture (Phase 2 manifest): the PC reached after
+         * the FIRST opcode. When entered at an indirect JMP/JML (the
+         * unresolved-IndirectGoto tier-down), this is the dynamically resolved
+         * target — the actual entry to record, not the JMP site. For a direct
+         * dispatch target the caller already knows the entry and ignores it. */
+        if (steps == 0 && out_landing)
+            *out_landing = ((uint32_t)in.k << 16) | in.pc;
+
         if (is_call) {
             /* The interp just pushed the real hardware return frame (return-1)
              * and set pc to the target. If the target has a compiled body for
@@ -174,10 +182,12 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
 /* Public entry: exit watermark = the current stack depth (the routine is
  * entered balanced at cpu->S). */
 int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24) {
-    return interp_bridge_run_ex(cpu, entry_pc24, cpu->S);
+    return interp_bridge_run_ex(cpu, entry_pc24, cpu->S, NULL);
 }
 
 /* ── tier-down entry (called from generated indirect-dispatch defaults) ───── */
+
+extern int snes_frame_counter;
 
 static long s_tier_hits = 0;
 long interp_tier_hit_count(void) { return s_tier_hits; }
@@ -192,14 +202,74 @@ static void interp_tier_note(uint32_t target_pc24) {
                 (unsigned)(target_pc24 & 0xFFFFFF));
 }
 
+/* ── Phase-2 gap manifest: always-on tier-down coverage worklist ───────────
+ * One record per distinct (site, target, m/x) tuple. clean_hits = the
+ * interpreter ran the gap and returned balanced (a pure coverage gap, safe to
+ * promote to AOT); bail_hits = the interpreter hit the step cap and fell back
+ * to abandon (the target was unrunnable — a strong signal of an UPSTREAM
+ * recomp-state bug at this site, e.g. SM's JMP ($0012)=$FFFF). The offline
+ * ingest tool (Phase 3) folds clean discoveries into cfg directives and ranks
+ * the bail sites as bug leads. Bounded; an overflow counter never lies about
+ * dropped tuples. */
+#define TIER2_COVERAGE_MAX 1024
+enum { TIER2_KIND_DISPATCH = 0, TIER2_KIND_INDIRECT_GOTO = 1,
+       TIER2_KIND_BANK_MISS = 2 };
+typedef struct {
+    uint32_t site_pc24;
+    uint32_t target_pc24;
+    uint8_t  mx;    /* ((m_flag&1)<<1)|(x_flag&1): 0=M0X0 1=M0X1 2=M1X0 3=M1X1 */
+    uint8_t  kind;  /* TIER2_KIND_* */
+    uint64_t clean_hits;
+    uint64_t bail_hits;
+    int32_t  first_frame;
+    int32_t  last_frame;
+} Tier2CovSite;
+static Tier2CovSite g_tier2_cov[TIER2_COVERAGE_MAX];
+static int          g_tier2_cov_count;
+static uint64_t     g_tier2_cov_overflow;
+
+static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
+                         uint8_t kind, int clean) {
+    int i;
+    for (i = 0; i < g_tier2_cov_count; i++) {
+        if (g_tier2_cov[i].site_pc24 == site &&
+            g_tier2_cov[i].target_pc24 == target &&
+            g_tier2_cov[i].mx == mx)
+            break;
+    }
+    if (i == g_tier2_cov_count) {
+        if (i >= TIER2_COVERAGE_MAX) { g_tier2_cov_overflow++; return; }
+        g_tier2_cov_count++;
+        g_tier2_cov[i].site_pc24   = site;
+        g_tier2_cov[i].target_pc24 = target;
+        g_tier2_cov[i].mx          = mx;
+        g_tier2_cov[i].kind        = kind;
+        g_tier2_cov[i].clean_hits  = 0;
+        g_tier2_cov[i].bail_hits   = 0;
+        g_tier2_cov[i].first_frame = snes_frame_counter;
+    }
+    if (clean) g_tier2_cov[i].clean_hits++;
+    else       g_tier2_cov[i].bail_hits++;
+    g_tier2_cov[i].last_frame = snes_frame_counter;
+}
+
+static uint8_t tier2_entry_mx(const CpuState *cpu) {
+    return (uint8_t)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+}
+
 RecompReturn interp_tier_dispatch(CpuState *cpu, uint32_t target_pc24) {
     interp_tier_note(target_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
     /* Interpret the routine the static pass couldn't resolve. It shares cpu's
      * stack, so its RTS/RTL pops the inherited caller frame and the bridge
      * exits past entry; control then unwinds to the dispatcher's caller, same
      * as an AOT tail-dispatch would. (Bail -> still NORMAL: contained, the
      * caller continues; a wedged gap is a bug to surface, not to hang on.) */
-    (void)interp_bridge_run(cpu, target_pc24 & 0xFFFFFF);
+    int ok = interp_bridge_run(cpu, target_pc24 & 0xFFFFFF);
+    /* No site PC at this absolute-indirect default entry; record site==target
+     * so the worklist still names the discovered entry. */
+    tier2_record(target_pc24 & 0xFFFFFF, target_pc24 & 0xFFFFFF, mx,
+                 TIER2_KIND_DISPATCH, ok);
     return RECOMP_RETURN_NORMAL;
 }
 
@@ -211,10 +281,119 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
                                            uint32_t site_pc24, uint16_t entry_s,
                                            uint8_t hrv) {
     interp_tier_note(target_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
+    /* The generated unresolved-IndirectGoto site passes target==site (we
+     * re-interpret FROM the JMP itself); a real dispatch default passes the
+     * loaded target. */
+    const uint8_t kind = (target_pc24 == site_pc24) ? TIER2_KIND_INDIRECT_GOTO
+                                                    : TIER2_KIND_DISPATCH;
+    uint32_t landing = target_pc24 & 0xFFFFFF;
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
-    if (interp_bridge_run_ex(cpu, target_pc24 & 0xFFFFFF, entry_s))
+    int ok = interp_bridge_run_ex(cpu, target_pc24 & 0xFFFFFF, entry_s, &landing);
+    /* For an indirect goto the recorded target is where the JMP actually
+     * resolved (the dynamically computed entry); for a dispatch default the
+     * passed target already IS the entry. */
+    uint32_t rec_target = (kind == TIER2_KIND_INDIRECT_GOTO)
+                          ? (landing & 0xFFFFFF) : (target_pc24 & 0xFFFFFF);
+    tier2_record(site_pc24 & 0xFFFFFF, rec_target, mx, kind, ok);
+    if (ok)
         return RECOMP_RETURN_NORMAL;
     return cpu_unresolved_abandon_balanced(cpu, site_pc24, entry_s, hrv);
+}
+
+/* Phase-4 bank-miss tier-down (opt-in). The generated stub for an untranslated
+ * cross-ROM-bank function calls this instead of the no-op trap; we run the
+ * real bytes at addr_pc24 (site == target == the function entry). On a bail
+ * fall back to the same stack-safe abandon the no-op stub used, so it is never
+ * worse than the drop path. Recorded distinctly as kind=bank_miss. */
+RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32_t addr_pc24,
+                                            uint16_t entry_s, uint8_t hrv) {
+    addr_pc24 &= 0xFFFFFF;
+    interp_tier_note(addr_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
+    uint32_t landing = addr_pc24;
+    int ok = interp_bridge_run_ex(cpu, addr_pc24, entry_s, &landing);
+    tier2_record(addr_pc24, addr_pc24, mx, TIER2_KIND_BANK_MISS, ok);
+    if (ok)
+        return RECOMP_RETURN_NORMAL;
+    return cpu_unresolved_abandon_balanced(cpu, addr_pc24, entry_s, hrv);
+}
+
+/* ── manifest serializers ──────────────────────────────────────────────────*/
+
+static const char *tier2_mx_str(uint8_t mx) {
+    switch (mx & 3) {
+        case 0:  return "M0X0";
+        case 1:  return "M0X1";
+        case 2:  return "M1X0";
+        default: return "M1X1";
+    }
+}
+static const char *tier2_kind_str(uint8_t k) {
+    switch (k) {
+        case TIER2_KIND_INDIRECT_GOTO: return "indirect_goto";
+        case TIER2_KIND_BANK_MISS:     return "bank_miss";
+        default:                       return "indirect_dispatch";
+    }
+}
+
+/* Shared discovery-array body, used by both serializers. */
+static void tier2_emit_discoveries(FILE *f, const char *indent) {
+    for (int i = 0; i < g_tier2_cov_count; i++) {
+        const Tier2CovSite *s = &g_tier2_cov[i];
+        fprintf(f,
+            "%s%s{\"site_pc24\": \"0x%06X\", \"target_pc24\": \"0x%06X\", "
+            "\"entry_mx\": \"%s\", \"site_kind\": \"%s\", "
+            "\"clean_hits\": %llu, \"bail_hits\": %llu, "
+            "\"first_frame\": %d, \"last_frame\": %d}",
+            i ? ",\n" : "\n", indent,
+            (unsigned)s->site_pc24, (unsigned)s->target_pc24,
+            tier2_mx_str(s->mx), tier2_kind_str(s->kind),
+            (unsigned long long)s->clean_hits,
+            (unsigned long long)s->bail_hits,
+            s->first_frame, s->last_frame);
+    }
+}
+
+void Tier2CoverageDumpJson(FILE *f) {
+    fprintf(f, "  \"tier2_coverage\": {\n"
+               "    \"total_tier_hits\": %ld,\n"
+               "    \"distinct_sites\": %d,\n"
+               "    \"overflowed_tuples\": %llu,\n"
+               "    \"discoveries\": [",
+            interp_tier_hit_count(), g_tier2_cov_count,
+            (unsigned long long)g_tier2_cov_overflow);
+    tier2_emit_discoveries(f, "      ");
+    fprintf(f, "\n    ]\n  },\n");
+}
+
+void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    /* Minimal title sanitize: drop quotes/backslashes/control so the JSON is
+     * always well-formed without a full escaper. Game titles are ASCII. */
+    char title[64];
+    size_t o = 0;
+    if (rom_title) {
+        for (const char *p = rom_title; *p && o + 1 < sizeof title; p++) {
+            unsigned char c = (unsigned char)*p;
+            title[o++] = (c == '"' || c == '\\' || c < 0x20) ? '_' : (char)c;
+        }
+    }
+    title[o] = 0;
+    fprintf(f,
+        "{\n"
+        "  \"schema\": \"snesrecomp tier2 coverage v1\",\n"
+        "  \"rom_title\": \"%s\",\n"
+        "  \"total_tier_hits\": %ld,\n"
+        "  \"distinct_sites\": %d,\n"
+        "  \"overflowed_tuples\": %llu,\n"
+        "  \"discoveries\": [",
+        title, interp_tier_hit_count(), g_tier2_cov_count,
+        (unsigned long long)g_tier2_cov_overflow);
+    tier2_emit_discoveries(f, "    ");
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
 }

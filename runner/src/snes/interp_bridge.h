@@ -29,6 +29,7 @@
 #define INTERP_BRIDGE_H
 
 #include <stdint.h>
+#include <stdio.h>
 #include "cpu_state.h"
 
 /*
@@ -48,5 +49,20 @@ int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24);
 /* Count of tier-downs taken this run (observability / tests / Phase-2
  * manifest). */
 long interp_tier_hit_count(void);
+
+/* ── Phase-2 gap manifest (always-on coverage worklist) ────────────────────
+ * Every tier-down is recorded into a bounded in-memory table keyed by
+ * (site, target, m/x width), tracking clean-return vs contained-bail counts
+ * and the frame span. This is the WORKLIST the offline ingest tool
+ * (tools/tier2_ingest.py, Phase 3) folds back into the cfg so the next regen
+ * makes the discovered entries Tier-1 AOT. Recording is cheap and lives in
+ * every config (Production included) — it is NOT gated behind SNESRECOMP_TRACE.
+ *
+ * Tier2CoverageDumpJson embeds the table into the unified post-mortem report
+ * (build/last_run_report.json), with a trailing comma like the other
+ * dump_*_json sections. Tier2CoverageWriteManifest writes the slim standalone
+ * manifest (schema "snesrecomp tier2 coverage v1") that the ingest tool reads. */
+void Tier2CoverageDumpJson(FILE *f);
+void Tier2CoverageWriteManifest(const char *path, const char *rom_title);
 
 #endif /* INTERP_BRIDGE_H */

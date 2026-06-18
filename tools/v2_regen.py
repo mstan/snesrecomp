@@ -1035,6 +1035,15 @@ def main() -> int:
                         '8C/16T desktop); hyperthreads rarely help '
                         'and compete for execution units.'.format(
                             _default_jobs))
+    p.add_argument('--tier-down-stubs', action='store_true',
+                   help='Opt-in (bring-up): emit cross-ROM-bank unresolved-'
+                        'function stubs (unresolved_stubs_v2.c) as interpreter '
+                        'tier-downs that RUN the real ROM bytes, instead of the '
+                        'no-op cpu_trace_unresolved_stub_trap. A bail falls back '
+                        'to the same stack-safe abandon (never worse), and every '
+                        'fire is recorded to the Tier-2 gap manifest. Shipped '
+                        'titles stay strict (default off). See docs/MULTI_TIER.md '
+                        'Phase 4.')
     args = p.parse_args()
 
     # ── Phase-tracking + watchdog ───────────────────────────────────
@@ -2371,9 +2380,11 @@ def main() -> int:
         ' * Stub bodies for Call targets that resolved to a ROM bank not',
         ' * in the cfg set. These are typically data decoded as code',
         ' * (garbled JSL operands). Real execution paths should never',
-        ' * reach them; each stub chains into cpu_trace_unresolved_stub_trap',
-        ' * so a runtime fire is captured (loud stderr line + TCP-queryable',
-        ' * snapshot via unresolved_stub_get) instead of silently returning.',
+        ' * reach them. By default each stub records the trap and returns a',
+        ' * stack-safe no-op; with --tier-down-stubs it instead runs the real',
+        ' * bytes via the interpreter tier (interp_tier_dispatch_bank_miss)',
+        ' * and records to the Tier-2 gap manifest. Either way cpu->S stays',
+        ' * balanced (pops the paired caller frame per hrv).',
         ' * One stub per (target, m, x) variant requested by the gen.',
         ' *',
         ' * Always emitted — file may be empty (no stubs needed) when',
@@ -2393,6 +2404,15 @@ def main() -> int:
         '',
     ]
     total_stubs = 0
+    # Effective bank-miss tier-down opt-in: the --tier-down-stubs CLI flag OR
+    # a `tier_down_stubs` directive in any cfg (game-wide, persists across
+    # regens without re-passing the flag). See docs/MULTI_TIER.md Phase 4.
+    tier_down_stubs_on = args.tier_down_stubs or any(
+        getattr(c, 'tier_down_stubs', False) for _b, _p, c in parsed)
+    if tier_down_stubs_on:
+        src = 'cfg directive' if not args.tier_down_stubs else '--tier-down-stubs'
+        print(f"  tier_down_stubs ON ({src}): bank-miss stubs run via the "
+              f"interpreter tier")
     for bank in sorted(by_bank):
         for pc, em, ex in sorted(by_bank[bank]):
             name = f'bank_{bank:02X}_{pc:04X}_M{em}X{ex}'
@@ -2403,11 +2423,19 @@ def main() -> int:
             lines.append('  if (cpu_take_tailcall_return_context(&_entry_s, &_hrv)) {')
             lines.append('    cpu->host_return_valid = _hrv;')
             lines.append('  }')
-            lines.append(
-                f'  (void)cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}");')
-            lines.append(
-                f'  return cpu_unresolved_abandon_balanced(cpu, '
-                f'0x{target_pc24:06x}u, _entry_s, _hrv);')
+            if tier_down_stubs_on:
+                # Phase-4 opt-in: run the real bytes via the interpreter tier
+                # instead of the no-op trap. Bail -> same abandon (never worse);
+                # every fire lands in the Tier-2 gap manifest as kind=bank_miss.
+                lines.append(
+                    f'  return interp_tier_dispatch_bank_miss(cpu, '
+                    f'0x{target_pc24:06x}u, _entry_s, _hrv);')
+            else:
+                lines.append(
+                    f'  (void)cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}");')
+                lines.append(
+                    f'  return cpu_unresolved_abandon_balanced(cpu, '
+                    f'0x{target_pc24:06x}u, _entry_s, _hrv);')
             lines.append('}')
             total_stubs += 1
     write_if_changed(stub_path, '\n'.join(lines) + '\n')
