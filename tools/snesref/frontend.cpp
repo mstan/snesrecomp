@@ -66,19 +66,25 @@ static void open_first_pad() {
 // which slot snes9x picks. Goal: read hardware eye [D+0x05] (eye X) and
 // $0BAD at the launch frame and compare to the recomp (eye X ~83 screen vs
 // $0BAD 5143 level). See MegamanXRecomp/ISSUES.md.
-static const int kSingles[] = {
-    0x00bad, 0x00bae, 0x00bb0, 0x00bb1,   // target X (16-bit), target Y (16-bit)
-};
-#define VRAM_TBL_LO 0x00e00
-#define VRAM_TBL_HI 0x01fff
+// Per-frame changed-byte trace over low WRAM ($0000-$1FFF: zero page, stack,
+// and game-logic state — where first divergences live). Widened from the old
+// MMX-specific region for general recomp-vs-oracle first-divergence diffing.
+// On the first tick the whole region is emitted as a baseline so the diff tool
+// can reconstruct absolute state at any frame. Output file is
+// SNESREF_TRACE_FILE (default snesref_trace.jsonl).
+#define WRAM_LO 0x00000
+#define WRAM_HI 0x01fff
 static FILE* g_log;
-static uint8_t g_prev_s[sizeof(kSingles)/sizeof(kSingles[0])];
-static uint8_t g_prev_t[VRAM_TBL_HI - VRAM_TBL_LO + 1];
+static uint8_t g_prev[WRAM_HI - WRAM_LO + 1];
 static bool    g_primed = false;
 static uint32_t g_frame = 0;
 
+static const char* trace_path() {
+    const char* p = getenv("SNESREF_TRACE_FILE");
+    return (p && p[0]) ? p : "snesref_trace.jsonl";
+}
 static void emit(int addr, uint8_t o, uint8_t n) {
-    if (!g_log) { g_log = fopen("mmx_trace.jsonl", "a"); if (!g_log) return; }
+    if (!g_log) { g_log = fopen(trace_path(), "a"); if (!g_log) return; }
     fprintf(g_log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
             g_frame, addr, o, n);
 }
@@ -86,21 +92,18 @@ static void emit(int addr, uint8_t o, uint8_t n) {
 static void trace_tick() {
     uint8_t* ram = (uint8_t*)p_retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
     size_t sz = p_retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
-    if (!ram || sz < (VRAM_TBL_HI+1)) return;
-    int n = (int)(sizeof(kSingles)/sizeof(kSingles[0]));
+    if (!ram || sz <= WRAM_HI) return;
     if (!g_primed) {
-        for (int i=0;i<n;i++) g_prev_s[i]=ram[kSingles[i]];
-        for (int a=VRAM_TBL_LO;a<=VRAM_TBL_HI;a++) g_prev_t[a-VRAM_TBL_LO]=ram[a];
+        for (int a=WRAM_LO;a<=WRAM_HI;a++){ g_prev[a-WRAM_LO]=ram[a]; emit(a,0,ram[a]); }
         g_primed=true; return;
     }
-    for (int i=0;i<n;i++){ uint8_t v=ram[kSingles[i]]; if(v!=g_prev_s[i]){ emit(kSingles[i],g_prev_s[i],v); g_prev_s[i]=v; } }
-    for (int a=VRAM_TBL_LO;a<=VRAM_TBL_HI;a++){ uint8_t v=ram[a]; if(v!=g_prev_t[a-VRAM_TBL_LO]){ emit(a,g_prev_t[a-VRAM_TBL_LO],v); g_prev_t[a-VRAM_TBL_LO]=v; } }
+    for (int a=WRAM_LO;a<=WRAM_HI;a++){ uint8_t v=ram[a]; if(v!=g_prev[a-WRAM_LO]){ emit(a,g_prev[a-WRAM_LO],v); g_prev[a-WRAM_LO]=v; } }
     if (g_log && (g_frame % 30)==0) fflush(g_log);
 }
 
 static void clear_trace() {
     if (g_log) { fclose(g_log); g_log=nullptr; }
-    FILE* f=fopen("mmx_trace.jsonl","w"); if(f) fclose(f);
+    FILE* f=fopen(trace_path(),"w"); if(f) fclose(f);
     g_primed=false;
     printf("[trace cleared]\n"); fflush(stdout);
 }
@@ -290,6 +293,10 @@ int main(int argc, char** argv) {
                   else if(g_frame==400){printf("[selftest] loading slot9 @f400\n");fflush(stdout);load_state(9);}
                   else if(g_frame==410){printf("[selftest] SURVIVED load, still running @f410\n");fflush(stdout);}
                   else if(g_frame>=600){running=false;} } }
+        // headless deterministic capture: SNESREF_FRAMES=N -> run N frames, no
+        // input (attract/boot is self-driving), then quit. For diff captures.
+        { static long fr=-2; if(fr==-2){const char*v=getenv("SNESREF_FRAMES"); fr=(v&&v[0])?atol(v):-1;}
+          if(fr>0 && (long)g_frame>=fr){ if(g_log)fflush(g_log); running=false; } }
         // 60fps cap
         for (;;) {
             Uint64 now=SDL_GetPerformanceCounter();
