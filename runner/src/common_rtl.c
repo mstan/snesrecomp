@@ -66,6 +66,47 @@ void RtlReset(int mode) {
   RtlApuUnlock();
 }
 
+/* Differential first-divergence trace (docs/MULTI_TIER.md §12a). Env-gated,
+ * always-compiled, zero cost when off. Emits per-frame changed bytes of low
+ * WRAM ($0000-$1FFF) in the EXACT jsonl shape snesref produces, so the two
+ * traces diff directly. Sampled at end-of-frame (after run_frame), mirroring
+ * snesref's post-retro_run trace_tick; frame numbering starts at 1 on the
+ * first completed frame, matching snesref, so frames align by construction. */
+static void recomp_wram_trace_tick(void) {
+    static int enabled = -1;
+    static FILE *log = NULL;
+    static unsigned char prev[0x2000];
+    static int primed = 0;
+    static unsigned frame = 0;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_WRAM_TRACE_FILE");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!log) {
+        log = fopen(getenv("SNESRECOMP_WRAM_TRACE_FILE"), "a");
+        if (!log) { enabled = 0; return; }
+    }
+    frame++;
+    if (!primed) {
+        for (int a = 0; a <= 0x1fff; a++) {
+            prev[a] = g_ram[a];
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    frame, a, g_ram[a]);
+        }
+        primed = 1; return;
+    }
+    for (int a = 0; a <= 0x1fff; a++) {
+        unsigned char v = g_ram[a];
+        if (v != prev[a]) {
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                    frame, a, prev[a], v);
+            prev[a] = v;
+        }
+    }
+    if ((frame % 30) == 0) fflush(log);
+}
+
 bool RtlRunFrame(uint32 inputs) {
   // Avoid up/down and left/right from being pressed at the same time
   if ((inputs & 0x30) == 0x30) inputs ^= 0x30;
@@ -97,6 +138,8 @@ bool RtlRunFrame(uint32 inputs) {
   /* Always-on PPU/DMA observability: snapshot the live PPU once per frame
    * (forced-blank/brightness, screen-enable, CGRAM/VRAM occupancy). */
   ppudma_frame_snapshot(snes_frame_counter);
+
+  recomp_wram_trace_tick();   /* differential first-divergence trace (env-gated) */
 
   snes_frame_counter++;
   return false;
