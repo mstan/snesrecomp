@@ -588,6 +588,31 @@ tier *feeds* this: it surfaces the gaps (which PCs tier down, with the live
 state) as worklist input. Next step is to build/extend that differential
 harness, not to hand-hunt `$0012`.
 
+### Differential harness — built, and the timing verdict
+
+Built the free-run (not lockstep) version: `snesref` widened to a general
+low-WRAM per-frame trace + headless capture; an env-gated recomp-side per-frame
+WRAM trace in `common_rtl.c` (same jsonl shape); `tools/wram_diff.py`
+(first-divergence, with power-on-fill masking — snes9x fills WRAM `$55`, recomp
+zero-inits) and `tools/align_scan.py` (offset detector).
+
+**Verdict (data, on SM): the recomp and snesref low-WRAM do NOT align** — no
+frame offset gives clean agreement (best ~46% of recomp-written bytes match at
+*any* oracle frame; "best" offsets inconsistent at -18/-87/-7). An HLE/frame-
+driven recomp vs a cycle-accurate oracle diverge in low-WRAM *pacing and values*
+too much for a per-frame whole-WRAM diff to isolate a single first divergence —
+exactly the timing fragility that got the old in-process lockstep oracle
+removed. The harness works mechanically; the *signal* is too timing-confounded
+for SM's boot.
+
+This is the "adjust or abandon" outcome (anticipated). Adjustments worth trying:
+(a) **targeted semantic-state compare** — diff a small set of known-stable game
+vars (from the snesrev/sm decomp symbols), not all of `$0000-$1FFF`, since
+scratch/RNG/timers/buffers legitimately differ between an HLE recomp and a
+cycle-accurate core; (b) lean on the **interp tier's gap worklist + post-mortem**
+as the primary signal rather than whole-WRAM diff. Instruction-level lockstep
+(the removed approach) is *not* recommended — it's the fragility this confirmed.
+
 ### Tuning / status
 - Step cap is tunable (`SNESRECOMP_INTERP_STEP_CAP`, default 2M). A proper fix
   detects the tight repeating-PC loop and bails early (future work).
