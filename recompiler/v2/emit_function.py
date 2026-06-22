@@ -1608,7 +1608,17 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # (abs,X) dispatches are ordinary calls: the selected
                     # handler RTSes back to the next instruction.
                     insn = di_insn
-                    if getattr(insn, 'dispatch_entries', None):
+                    if getattr(insn, 'dispatch_runtime', False):
+                        # Runtime-pointer JSR (abs,X) (WRAM handler pointer,
+                        # not statically enumerable — SM enemy/PLM/eproj AI).
+                        # Read the pointer + dispatch the live (m,x) variant
+                        # at run time (AOT body or interpreter tier). A JSR
+                        # call: handler returns, execution falls through to
+                        # the post-JSR block. See codegen._emit_runtime_dispatch.
+                        from v2.codegen import _emit_runtime_dispatch
+                        for ln in _emit_runtime_dispatch(insn):
+                            lines.append(ln)
+                    elif getattr(insn, 'dispatch_entries', None):
                         if getattr(insn, 'dispatch_idx_reg', None) in ('X', 'Y'):
                             from v2.codegen import _emit_indirect_dispatch
                             for ln in _emit_indirect_dispatch(insn):

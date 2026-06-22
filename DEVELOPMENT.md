@@ -85,6 +85,44 @@ in ~30s — so the post-mortem report is the only readable always-on ring).
 
 ---
 
+## SHIPPED (2026-06-22): runtime-pointer dispatch + interp-tier paired-ABI fix
+
+Both the planned runtime-dispatch fix above AND a second, deeper engine fix
+landed and are VERIFIED (SM attract demo runs past the old f2689 freeze to
+f4086+, no crash). Runtime-only; NO regen for the second fix.
+
+1. **Runtime-pointer `JSR (abs,X)` dispatch** (as planned): decoder marks
+   `dispatch_runtime` for reachable WRAM-operand (`< $2000`) sites, codegen
+   `_emit_runtime_dispatch` reads the live pointer + calls `cpu_dispatch_call_pc`
+   (cpu_state.c) — paired host-call to the AOT body, else interpreter tier
+   (`interp_tier_run_call`, interp_bridge.c). Suppressed-dispatch count 111→9.
+   New test `tests/v2/test_decoder_runtime_dispatch.py`. Observability:
+   `CpuDispatchLogDumpJson` (g_dispatch_log → report).
+
+2. **Interp-tier AOT-bounce ABI bug** (the actual f2689 root cause): the bridge
+   (`interp_bridge_run_ex`) bounced AOT sub-calls via `cpu_dispatch_pc`
+   (dispatch ABI, hrv=0), whose callee RTS **re-dispatches on the popped return
+   address**. When that address is itself a registered function entry (e.g.
+   `$90:EB55 sub_90EB55` right after `HandleChargingBeamGfxAudio`'s JSR, reached
+   via SamusDrawSprites's `$90:EB4E` unresolved-IndirectGoto tail dispatch), the
+   dispatch HITS it and runs the next routine as part of the callee's "return"
+   → over-pops `cpu->S` by the frame size (+2) → `DB=$74` leak → WriteEnemyOams
+   freeze. FIX = `cpu_dispatch_pc_paired(cpu, pc24, frame_size)` (cpu_state.c):
+   run the target with `host_return_valid=frame_size` so it HOST-RETURNS to the
+   bridge instead of re-dispatching; the bridge AOT-bounce now uses it. General
+   fix for ALL interp-tier AOT-bounces.
+
+   Diagnostic probes added (env-gated, default off): `SNESRECOMP_SBOUND=lo-hi`
+   (cpu->S+DB at every block in a pc24 range — cpu_trace.c), `SNESRECOMP_IBRWATCH=lo-hi`
+   (per-step interp-bridge trace — interp_bridge.c). GOTCHA: the stack-balance
+   auditor (`stack_balance` in the report) counts the return-frame pop, so a
+   balanced JSR reads as +2 / JSL as +3 — NOT a true-leak signal; use the
+   S-boundary probe to localize a real imbalance.
+
+Full SM-side writeup: `SuperMetroidRecomp/DEVELOPMENT.md` (2026-06-22 milestone).
+
+---
+
 ## Recent engine commits on this branch
 - `1b3201d` block-boundary DB shadow + DB-write log (catch inline PLBs)
 - `5bc8bf3` env-gated DB-trace at the function-entry hook

@@ -22,6 +22,7 @@ TEST_MODULES = [
     'test_decoder_repsep_independent_bits',
     'test_decoder_immediate_length_per_state',
     'test_decoder_smc_phantom_suppression',
+    'test_decoder_runtime_dispatch',
     'test_decoder_constant_z_fold',
     'test_decoder_dispatch_padding_gate',
     'test_decoder_data_region',

@@ -1651,6 +1651,45 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     return lines
 
 
+def _emit_runtime_dispatch(insn) -> List[str]:
+    """Emit a true RUNTIME-pointer indirect dispatch for a reachable
+    JSR (abs,X) whose pointer-table base lives in WRAM ($0000-$1FFF) and
+    whose target is written at run time (per-object handler pointer — SM's
+    enemy/PLM/eproj instruction-list interpreters dispatching
+    `JSR ($0FA8/$0FAE/$0FB0/$0FB2,X)` in banks $22-$2A). The decoder marks
+    these `dispatch_runtime` (see decoder.py runtime-pointer recovery); they
+    have NO statically-enumerable target list, so there is no switch.
+
+    Reads the 16-bit pointer from PB:(base + idx) at run time and hands
+    (PB<<16 | ptr) to cpu_dispatch_call_pc, which pushes the 2-byte JSR
+    return frame, looks up the live (m,x) variant, and either calls the AOT
+    body (paired host-call, host-returns through the frame) or runs the
+    target on the interpreter tier. Either way the stack is balanced and
+    execution falls through to the post-JSR block. Every dispatch is logged
+    in the always-on g_dispatch_log ring. A non-NORMAL return is an NLR
+    (return-to-ancestor) and is propagated like any other call site.
+    """
+    site_pc24 = insn.addr & 0xFFFFFF
+    base = insn.operand & 0xFFFF
+    idx_reg = getattr(insn, 'dispatch_idx_reg', 'X')
+    idx_field = 'Y' if idx_reg == 'Y' else 'X'
+    return [
+        f"{{ /* runtime indirect dispatch JSR (${base:04X},{idx_field}): "
+        f"per-object WRAM function pointer, resolved + dispatched at run time */",
+        f"  uint16 _disp_ptr = cpu_read16(cpu, cpu->PB, "
+        f"(uint16)(0x{base:04x}u + (uint16)(cpu->{idx_field} & 0xFFFFu)));",
+        f"  RecompReturn _disp_r = cpu_dispatch_call_pc(cpu, "
+        f"((uint32)cpu->PB << 16) | (uint32)_disp_ptr, 0x{site_pc24:06x}u);",
+        "  if (_disp_r != RECOMP_RETURN_NORMAL) {",
+        "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_disp_r, 0);",
+        "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
+        "    return (RecompReturn)((int)_disp_r - 1);",
+        "  }",
+        "  /* fall through to post-JSR block */",
+        "}",
+    ]
+
+
 def _emit_dispatch(insn) -> List[str]:
     """Emit a JSL-jump-table dispatch as a static function-pointer
     array indexed by A. The 65816 dispatcher pops its return PC,

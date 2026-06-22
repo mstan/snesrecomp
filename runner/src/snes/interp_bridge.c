@@ -113,6 +113,22 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
      * cpu->S strictly above this. */
     const uint16_t s_enter = s_exit;
 
+    /* Focused bridge trace: SNESRECOMP_IBRWATCH="lo-hi" (hex pc24). When the
+     * bridge entry_pc24 is in range, log every call/ret with sp + the AOT-bounce
+     * return value, to localize a tail-dispatch over-pop step by step. */
+    int _ibrw = 0;
+    {
+        static int _iw_init = 0; static long _iw_lo = -1, _iw_hi = -1;
+        if (!_iw_init) { _iw_init = 1;
+            const char *_e = getenv("SNESRECOMP_IBRWATCH");
+            if (_e) sscanf(_e, "%lx-%lx", &_iw_lo, &_iw_hi); }
+        if (_iw_lo >= 0 && (long)entry_pc24 >= _iw_lo && (long)entry_pc24 <= _iw_hi) {
+            _ibrw = 1;
+            fprintf(stderr, "[ibr] ENTER pc=$%06X s_exit=$%04X cpu->S=$%04X\n",
+                    (unsigned)entry_pc24, (unsigned)s_exit, (unsigned)cpu->S);
+        }
+    }
+
     const int trace = itrace_enabled();
     ITraceEnt head[8], ring[256];
     long itn = 0;
@@ -151,24 +167,56 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
             sync_interp_to_cpu(&in, cpu);          /* expose (m,x) + frame to AOT */
             const uint32_t target = ((uint32_t)in.k << 16) | in.pc;
             if (cpu_dispatch_has_entry(cpu, target)) {
-                /* cpu_dispatch_pc runs the variant with host_return_valid=0;
-                 * its RTS pops the frame the interp pushed and dispatch-misses
-                 * on the return addr → S restored to pre-call. Balanced. */
-                cpu_dispatch_pc(cpu, target, cpu->S);
+                /* Paired-call ABI: the interp already pushed the return frame, so
+                 * run the target with hrv=frame_size and let its RTS/RTL
+                 * HOST-RETURN to us (frame popped, S restored to pre-call). We
+                 * then resume interpreting at the return address. Using the
+                 * dispatch ABI (cpu_dispatch_pc, hrv=0) instead would re-dispatch
+                 * on the popped return addr — and over-pop whenever that addr is
+                 * itself a registered function entry (e.g. $90:EB55 sub_90EB55
+                 * right after HandleChargingBeamGfxAudio's JSR), the Samus-draw
+                 * +2 leak. frame: JSL(0x22)=3, JSR/JSR(abs,X)=2. */
+                const uint8_t _fs = (op == 0x22) ? 3 : 2;
+                uint16_t _sp_pre = in.sp;
+                RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
                 sync_cpu_to_interp(cpu, &in);
+                if (_ibrw)
+                    fprintf(stderr, "[ibr] call op=$%02X pc=$%06X -> $%06X "
+                            "sp_pre=$%04X aot_ret=%d sp_post=$%04X\n",
+                            op, (unsigned)pc_before, (unsigned)target,
+                            (unsigned)_sp_pre, (int)_air, (unsigned)in.sp);
+                if (_air != RECOMP_RETURN_NORMAL) {
+                    /* The bounced body did a non-local return that unwound past
+                     * this call (it pre-popped to an ancestor and returned an
+                     * NLR SKIP). Don't force-resume at ret; treat the interpreted
+                     * routine as having exited and let the unwind propagate. */
+                    sync_interp_to_cpu(&in, cpu);
+                    return 1;
+                }
                 const uint32_t ret = (pc_before + (uint32_t)call_len) & 0xFFFFFF;
                 in.k  = (uint8)((ret >> 16) & 0xFF);
                 in.pc = (uint16)(ret & 0xFFFF);
+            } else if (_ibrw) {
+                fprintf(stderr, "[ibr] call op=$%02X pc=$%06X -> $%06X "
+                        "(interp into target) sp=$%04X\n",
+                        op, (unsigned)pc_before, (unsigned)target, (unsigned)in.sp);
             }
             /* else: no compiled body → keep interpreting into the target
              * (this is the coverage-gap path; Phase 1b records it). */
             continue;
         }
 
-        if (is_ret && (uint16_t)in.sp > s_enter) {
-            /* The interpreted routine returned past its entry depth. */
-            sync_interp_to_cpu(&in, cpu);
-            return 1;
+        if (is_ret) {
+            if (_ibrw)
+                fprintf(stderr, "[ibr] ret  op=$%02X pc=$%06X sp=$%04X "
+                        "(s_enter=$%04X exit=%d)\n",
+                        op, (unsigned)pc_before, (unsigned)in.sp,
+                        (unsigned)s_enter, (int)((uint16_t)in.sp > s_enter));
+            if ((uint16_t)in.sp > s_enter) {
+                /* The interpreted routine returned past its entry depth. */
+                sync_interp_to_cpu(&in, cpu);
+                return 1;
+            }
         }
     }
 
@@ -301,6 +349,33 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     if (ok)
         return RECOMP_RETURN_NORMAL;
     return cpu_unresolved_abandon_balanced(cpu, site_pc24, entry_s, hrv);
+}
+
+/* Interpreter-tier fallback for a runtime-pointer JSR (abs,X) call whose
+ * loaded target has no AOT body for the live (m,x). cpu_dispatch_call_pc has
+ * ALREADY pushed the 2-byte JSR return frame, so:
+ *   - watermark = current S (post-push): the target's own RTS pops that
+ *     frame and lifts S strictly above the watermark, exiting the bridge.
+ *   - post_call = S + 2: the balanced S after the frame is consumed.
+ * On a clean return the target's RTS already left S == post_call; on a bail
+ * (step cap) we restore post_call ourselves so the frame is discarded and
+ * the caller still falls through balanced. Either way return NORMAL — this
+ * is a CALL, not a tail dispatch, so it never abandons the caller. Recorded
+ * in the tier-2 gap manifest (kind=dispatch) for the worklist. */
+RecompReturn interp_tier_run_call(CpuState *cpu, uint32_t target_pc24,
+                                  uint32_t source_pc24) {
+    target_pc24 &= 0xFFFFFF;
+    source_pc24 &= 0xFFFFFF;
+    interp_tier_note(target_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
+    const uint16_t watermark = cpu->S;
+    const uint16_t post_call = (uint16_t)(cpu->S + 2);
+    uint32_t landing = target_pc24;
+    int ok = interp_bridge_run_ex(cpu, target_pc24, watermark, &landing);
+    tier2_record(source_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
+    if (!ok)
+        cpu->S = post_call;  /* bail: discard the unconsumed JSR frame */
+    return RECOMP_RETURN_NORMAL;
 }
 
 /* Phase-4 bank-miss tier-down (opt-in). The generated stub for an untranslated

@@ -1209,6 +1209,24 @@ void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
         dbs_last = cpu->DB;
         dbs_prev_pc = pc24;
     }
+    /* S-boundary probe (reusable): log cpu->S + DB at every block whose PC is
+     * in SNESRECOMP_SBOUND="lo-hi" (hex pc24). Used to localize a stack
+     * imbalance to a specific call site by watching S step across a routine's
+     * sub-call boundaries (the block where S jumps is the over/under-popper).
+     * Default off; the watched range is narrow so it never floods. */
+    {
+        extern int snes_frame_counter;
+        static int sb_init = 0; static long sb_lo = -1, sb_hi = -1;
+        if (!sb_init) {
+            sb_init = 1;
+            const char *_e = getenv("SNESRECOMP_SBOUND");
+            if (_e) sscanf(_e, "%lx-%lx", &sb_lo, &sb_hi);
+        }
+        if (sb_lo >= 0 && (long)pc24 >= sb_lo && (long)pc24 <= sb_hi)
+            fprintf(stderr, "[sbound] f=%d pc=$%06X S=$%04X DB=$%02X\n",
+                    snes_frame_counter, (unsigned)pc24,
+                    (unsigned)cpu->S, (unsigned)cpu->DB);
+    }
     /* Inspection-freeze trigger (reusable). Armed once from the
      * environment so it covers the very first frames with no
      * arming race; the TCP command can also set g_freeze_at_frame. */

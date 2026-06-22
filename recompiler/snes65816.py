@@ -48,7 +48,7 @@ class Insn:
     __slots__ = ('addr', 'opcode', 'mnem', 'mode', 'operand', 'length',
                  'dispatch_entries', 'dispatch_kind', 'dispatch_idx_reg',
                  'dispatch_table_bases', 'm_flag', 'x_flag', 'dispatch_terminal',
-                 'dispatch_call', 'dispatch_local_goto',
+                 'dispatch_call', 'dispatch_local_goto', 'dispatch_runtime',
                  'const_z_fold_unconditional', 'const_z_fold_dead_pc24')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
@@ -76,6 +76,12 @@ class Insn:
         # Absolute-indirect dispatch that jumps to labels inside the current
         # decoded function, not to standalone handler functions.
         self.dispatch_local_goto = False
+        # Reachable JSR (abs,X) whose pointer-table base is in WRAM
+        # ($0000-$1FFF): a per-object runtime function-pointer dispatch whose
+        # target cannot be statically enumerated (SM enemy/PLM/eproj AI).
+        # Codegen routes it through cpu_dispatch_call_pc. See decoder
+        # runtime-pointer recovery + codegen._emit_runtime_dispatch.
+        self.dispatch_runtime = False
         self.m_flag = 1
         self.x_flag = 1
         # Constant-Z branch fold: when set on a BEQ/BNE, the preceding
