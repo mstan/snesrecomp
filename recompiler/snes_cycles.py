@@ -372,6 +372,70 @@ def instr_master_cycles(op: int, length: int, code_addr24: int,
 
 
 # ==============================================================================
+# Emitter support (step C) -- fold a block to a constant + runtime charges
+# ==============================================================================
+#
+# The recompiler tracks each instruction's M/X widths statically (Insn.m_flag /
+# Insn.x_flag) and recompiled game code runs in native mode (e=0). So the base
+# cost + the m=0/x=0 width adds + the native RTI/BRK/COP add are all resolvable
+# at gen time and collapse to a per-block integer constant (near-free at run
+# time). The remaining modifiers depend on runtime state and are reported
+# separately for the emitter to charge:
+#   - 'dp'      D.l != 0   (depends on the live Direct-Page register)
+#   - 'xcross'  index page-cross on a read (depends on the effective address)
+#   - 'branch'  taken / taken-and-page-cross (depends on the branch outcome)
+#   - 'block_move' MVN/MVP per-byte (depends on the move length = A)
+
+def instr_static_cycles(op: int, m_flag: int = 1, x_flag: int = 1,
+                        e: int = 0) -> int:
+    """CPU cycles resolvable at gen time for opcode `op` given its known M/X
+    widths and native mode. Excludes the runtime-only modifiers."""
+    c = base_cpu_cycles(op)
+    if m_flag == 0:
+        c += m_add(op)
+    if x_flag == 0:
+        c += x_add(op)
+    if e == 0:
+        c += e_add(op)
+    return c
+
+
+def instr_runtime_charges(op: int) -> dict:
+    """Runtime-only cycle charges for opcode `op` the emitter must add
+    conditionally (empty dict if the instruction is fully static)."""
+    out = {}
+    if dp_add(op):
+        out['dp'] = dp_add(op)
+    if xcross_add(op):
+        out['xcross'] = xcross_add(op)
+    bc = branch_class(op)
+    if bc:
+        out['branch'] = bc          # 1 conditional, 2 BRA
+    if op in _BLOCK_MOVE_OPS:
+        out['block_move'] = _SPECIAL_BASE[op]   # per byte
+    return out
+
+
+def block_static_cycles(items, e: int = 0):
+    """Fold a straight-line block to its gen-time cycle constant.
+
+    `items` is an iterable of (op, m_flag, x_flag) for the block's
+    instructions (the recompiler supplies M/X from Insn.m_flag/x_flag).
+    Returns (const, dynamics) where `const` is the summed statically-known
+    CPU cycles and `dynamics` is a list of (index, op, charges-dict) for the
+    instructions carrying runtime-only charges.
+    """
+    const = 0
+    dynamics = []
+    for i, (op, m_flag, x_flag) in enumerate(items):
+        const += instr_static_cycles(op, m_flag, x_flag, e)
+        charges = instr_runtime_charges(op)
+        if charges:
+            dynamics.append((i, op, charges))
+    return const, dynamics
+
+
+# ==============================================================================
 # C header generation (keeps the runtime/reference engine drift-free)
 # ==============================================================================
 

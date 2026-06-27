@@ -196,6 +196,48 @@ def test_every_decoded_opcode_has_a_base():
         assert c >= 2, f'op ${op:02X} base {c} < 2 (no instruction is < 2)'
 
 
+def test_instr_static_cycles_folds_known_widths():
+    # LDA #imm: base 2; native, 8-bit -> 2; 16-bit (m_flag=0) -> 3
+    assert sc.instr_static_cycles(0xA9, m_flag=1, x_flag=1) == 2
+    assert sc.instr_static_cycles(0xA9, m_flag=0, x_flag=1) == 3
+    # ASL abs RMW 16-bit: 6 + 2
+    assert sc.instr_static_cycles(0x0E, m_flag=0) == 8
+    # LDX #imm 16-bit (x_flag=0): 2 + 1
+    assert sc.instr_static_cycles(0xA2, x_flag=0) == 3
+    # native RTI folds the +1 (e=0): 6 + 1 = 7
+    assert sc.instr_static_cycles(0x40, e=0) == 7
+    assert sc.instr_static_cycles(0x40, e=1) == 6
+    # runtime-only modifiers are NOT folded into the static count:
+    # LDA dp base 3 regardless of D.l (the dp charge is dynamic)
+    assert sc.instr_static_cycles(0xA5) == 3
+    # LDA abs,X read base 4 regardless of page-cross (xcross is dynamic)
+    assert sc.instr_static_cycles(0xBD) == 4
+
+
+def test_instr_runtime_charges():
+    assert sc.instr_runtime_charges(0xA5) == {'dp': 1}        # LDA dp
+    assert sc.instr_runtime_charges(0xBD) == {'xcross': 1}    # LDA abs,X read
+    assert sc.instr_runtime_charges(0xD0) == {'branch': 1}    # BNE conditional
+    assert sc.instr_runtime_charges(0x80) == {'branch': 2}    # BRA
+    assert sc.instr_runtime_charges(0x54) == {'block_move': 7}  # MVN
+    assert sc.instr_runtime_charges(0xA9) == {}               # LDA #imm static
+    # (dp),Y read carries both a D.l and a page-cross charge
+    assert sc.instr_runtime_charges(0xB1) == {'dp': 1, 'xcross': 1}
+
+
+def test_block_static_cycles():
+    # The native-16-bit RMW loop body from tools/cyc_watch/cyc_trace.c:
+    #   LDA $1000 (AD) | INC A (1A) | STA $1000 (8D) | DEX (CA) | BNE (D0)
+    # all 16-bit (m=x=0). Static const = 5+2+5+2+2 = 16; the BNE's taken cost
+    # (+1) is the one runtime charge.
+    block = [(0xAD,0,0),(0x1A,0,0),(0x8D,0,0),(0xCA,0,0),(0xD0,0,0)]
+    const, dynamics = sc.block_static_cycles(block)
+    assert const == 16, const
+    assert dynamics == [(4, 0xD0, {'branch': 1})], dynamics
+    # With the taken branch (+1) the block matches cyc_trace's measured 17.
+    assert const + 1 == 17
+
+
 def test_generated_header_matches_authority():
     """The checked-in snes_cycles.h must be regenerated from the authority;
     if this fails, run: python recompiler/snes_cycles.py --emit-c
