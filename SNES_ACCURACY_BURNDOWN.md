@@ -172,11 +172,20 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
   (nothing reads `cpu->cycles` yet). Verified emit output + 3 regression tests
   (`tests/v2/test_emit_cycle_charge.py`, e.g. LDA# 2 + STA dp 3 + RTS 6 = 11);
   v2 suite failure-neutral (the 5 pre-existing stale RTS-ABI-shape failures are
-  unrelated). **Remaining for C:** the runtime-only DYNAMIC charges (D.l≠0,
-  index page-cross, branch-taken — `instr_runtime_charges` already lists them
-  per opcode) emitted conditionally on the live state/branch path; then the
-  segmented MMIO-boundary charge; then a full game regen+build+measure
-  (deferred — fragile in this worktree per the branch-union note, Axis 6).
+  unrelated). **DYNAMIC charges DONE (2026-06-27):** the emitter also charges
+  the runtime-only modifiers — `if (cpu->D & 0xFF) cpu->cycles += 1;` per
+  DP-mode insn; an abs,X / abs,Y read page-cross test (`(base & 0xFF00) !=
+  ((base + cpu->X/Y) & 0xFF00)`, base = static operand); `+1` on each taken
+  conditional-branch edge. Residuals (documented, to be measured vs bsnes):
+  `(dp),Y` page-cross (runtime pointer), MVN/MVP per-byte (static charges one
+  byte), emulation-only branch page-cross (SNES game code is native). 7 tests
+  in `tests/v2/test_emit_cycle_charge.py`; v2 suite failure-neutral.
+  **Remaining for C:** the segmented MMIO-boundary charge; then a full game
+  regen+build+measure (Axis-6 branch-union permitting).
+  **UNIT NOTE (loop closure):** the emitter charges CPU (bus) cycles, but
+  `bsnes_total_guest_cycles()` counts MASTER clocks (6/8/12 per access). For an
+  apples-to-apples diff, add a CPU-bus-cycle counter to bsnes (count CPU
+  read/write/io) — or run the recomp model through the region_speed combiner.
 - **D. On-demand derivation:** H/V counters ($2137/$213C-F/$4212) and H/V-timer
   IRQ ($4207-A) derived from the global cycle counter at read time; DMA/HDMA
   charge real cycles; devices on scheduled deadlines (not per-cycle ticking).

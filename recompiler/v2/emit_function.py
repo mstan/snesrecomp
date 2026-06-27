@@ -34,7 +34,8 @@ from v2.decoder import (  # noqa: E402
 from v2.cfg import V2Block, V2CFG, build_cfg  # noqa: E402
 from v2.lowering import lower  # noqa: E402
 from v2.codegen import emit_op  # noqa: E402
-from snes_cycles import block_static_cycles  # noqa: E402  (Axis-2 cost model)
+from snes_cycles import block_static_cycles, instr_runtime_charges  # noqa: E402
+from snes65816 import ABS_X as _MODE_ABS_X, ABS_Y as _MODE_ABS_Y  # noqa: E402
 from v2.ir import (  # noqa: E402
     IROp, IRBlock, Value,
     CondBranch, Goto, IndirectGoto, Call, Return,
@@ -69,6 +70,39 @@ def _block_cycle_const(pairs) -> int:
         return 0
     const, _dynamics = block_static_cycles(items)
     return const
+
+
+def _dynamic_charge_lines(insn) -> List[str]:
+    """Runtime-only per-instruction cycle charges (Axis-2 step C dynamics),
+    emitted as conditional `cpu->cycles += 1;` statements just before the
+    instruction's effect. Branch-taken is charged at the terminator instead.
+
+    Covered: D.l != 0 (any DP mode); index page-cross for abs,X / abs,Y READS
+    (the base is the static operand; the index is the live register). NOT yet
+    covered (documented residual, measured against bsnes): (dp),Y page-cross
+    (runtime pointer) and MVN/MVP per-byte (the static charge counts one byte).
+    """
+    op = getattr(insn, 'opcode', None)
+    if op is None:
+        return []
+    charges = instr_runtime_charges(op)
+    out: List[str] = []
+    if 'dp' in charges:
+        out.append("if (cpu->D & 0xFF) cpu->cycles += 1;  /* D.l != 0 */")
+    if 'xcross' in charges:
+        mode = getattr(insn, 'mode', None)
+        base = getattr(insn, 'operand', 0) & 0xFFFF
+        if mode == _MODE_ABS_X:
+            out.append(
+                f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->X) & 0xFF00))"
+                f" cpu->cycles += 1;  /* abs,X read page-cross */")
+        elif mode == _MODE_ABS_Y:
+            out.append(
+                f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->Y) & 0xFF00))"
+                f" cpu->cycles += 1;  /* abs,Y read page-cross */")
+        # INDIR_Y (dp),Y: effective pointer is loaded at runtime from DP — not
+        # reconstructable from the static operand; left as a measured residual.
+    return out
 
 
 def _default_func_name(bank: int, start: int) -> str:
@@ -1302,6 +1336,10 @@ def emit_function(rom: bytes, bank: int, start: int,
                         f"inlined into synthesized dispatch below */"
                     )
                 continue
+            # Axis-2 step C dynamics: charge runtime-only modifiers (D.l != 0,
+            # abs,X/Y read page-cross) for this instruction before its effect.
+            for _ln in _dynamic_charge_lines(di_insn):
+                lines.append(_ln)
             for op in ir_ops:
                 if isinstance(op, CondBranch):
                     # Cond branch: block has TWO successors: fall-through (0)
@@ -1313,7 +1351,11 @@ def emit_function(rom: bytes, bank: int, start: int,
                     blk_pc24 = (bank << 16) | (key.pc & 0xFFFF)
                     if taken is not None:
                         target_stmt = _goto_or_return(taken, source_pc24=blk_pc24)
-                        lines.append(f"if ({pred}) {{ {target_stmt} }}")
+                        # Axis-2: a taken conditional branch costs +1 cycle (the
+                        # block const charged the not-taken base). Native mode;
+                        # the emulation-only page-cross +1 is omitted (SNES game
+                        # code runs e=0).
+                        lines.append(f"if ({pred}) {{ cpu->cycles += 1; {target_stmt} }}")
                     if fall is not None:
                         lines.append(_goto_or_return(fall, source_pc24=blk_pc24)
                                      + " /* fall-through */")
