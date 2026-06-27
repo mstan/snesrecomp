@@ -33,6 +33,7 @@ TEST_MODULES = [
     'test_lowering_per_op_smoke',
     'test_codegen_per_op_smoke',
     'test_emit_function_smoke',
+    'test_emit_cycle_charge',
     'test_emit_bank_smoke',
     'test_cfg_loader',
     'test_v2_emit_lint',

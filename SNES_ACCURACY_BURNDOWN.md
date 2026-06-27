@@ -163,6 +163,20 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
   cycle at block-leader/branch boundaries). **Segmented charge** at every
   guest-visible time observation (MMIO to timers/PPU/DMA/IRQ) so both backends
   observe devices at the same architectural boundary.
+  **STATIC slice DONE (2026-06-27):** added `uint64_t cycles` to `CpuState`;
+  the v2 emitter (`emit_function.py`, alongside the existing per-block
+  `cpu_trace_block`/`WatchdogCheck`) charges each block's gen-time-resolvable
+  cost as one `cpu->cycles += <const>;` — folded via
+  `snes_cycles.block_static_cycles` from the per-insn M/X flags the decoder
+  already stamps (native e=0). Near-free (one add/block); behavior-identical
+  (nothing reads `cpu->cycles` yet). Verified emit output + 3 regression tests
+  (`tests/v2/test_emit_cycle_charge.py`, e.g. LDA# 2 + STA dp 3 + RTS 6 = 11);
+  v2 suite failure-neutral (the 5 pre-existing stale RTS-ABI-shape failures are
+  unrelated). **Remaining for C:** the runtime-only DYNAMIC charges (D.l≠0,
+  index page-cross, branch-taken — `instr_runtime_charges` already lists them
+  per opcode) emitted conditionally on the live state/branch path; then the
+  segmented MMIO-boundary charge; then a full game regen+build+measure
+  (deferred — fragile in this worktree per the branch-union note, Axis 6).
 - **D. On-demand derivation:** H/V counters ($2137/$213C-F/$4212) and H/V-timer
   IRQ ($4207-A) derived from the global cycle counter at read time; DMA/HDMA
   charge real cycles; devices on scheduled deadlines (not per-cycle ticking).

@@ -34,6 +34,7 @@ from v2.decoder import (  # noqa: E402
 from v2.cfg import V2Block, V2CFG, build_cfg  # noqa: E402
 from v2.lowering import lower  # noqa: E402
 from v2.codegen import emit_op  # noqa: E402
+from snes_cycles import block_static_cycles  # noqa: E402  (Axis-2 cost model)
 from v2.ir import (  # noqa: E402
     IROp, IRBlock, Value,
     CondBranch, Goto, IndirectGoto, Call, Return,
@@ -45,6 +46,29 @@ def _label_for(key: DecodeKey) -> str:
     """C label name for a block keyed by (pc, m, x)."""
     pc = key.pc & 0xFFFF
     return f"L_{pc:04X}_M{key.m}X{key.x}"
+
+
+def _block_cycle_const(pairs) -> int:
+    """Static (gen-time) 65816 CPU-cycle cost of a block's instructions.
+
+    Folds base + M/X-width + native adds via the shared cost model
+    (snes_cycles.block_static_cycles); the M/X widths come from the per-insn
+    flags the decoder already stamped. Runtime-only modifiers (D.l != 0,
+    index page-cross, branch taken) are NOT folded here — they are charged
+    dynamically in a later step C increment. Returns 0 for an empty/odd block
+    so the emitter can skip the add entirely.
+    """
+    items = []
+    for p in pairs:
+        insn = p[0]
+        op = getattr(insn, 'opcode', None)
+        if op is None:
+            return 0
+        items.append((op, getattr(insn, 'm_flag', 1), getattr(insn, 'x_flag', 1)))
+    if not items:
+        return 0
+    const, _dynamics = block_static_cycles(items)
+    return const
 
 
 def _default_func_name(bank: int, start: int) -> str:
@@ -1675,6 +1699,13 @@ def emit_function(rom: bytes, bank: int, start: int,
         # Cheap (counter bump + branch); v1 emitted at loop headers, v2
         # gets it at every block since we don't yet identify back-edges.
         src.append(f'    WatchdogCheck();')
+        # Axis-2: charge this block's static 65816 CPU cycles as one constant
+        # add (recompiler/snes_cycles.py). Near-free; nothing reads cpu->cycles
+        # yet so behavior is identical. Runtime-only modifiers (D.l/page-cross/
+        # branch-taken) are a later increment.
+        _cyc_const = _block_cycle_const(block_per_insn_ir.get(key, []))
+        if _cyc_const:
+            src.append(f'    cpu->cycles += {_cyc_const};')
         for ln in block_lines[key]:
             # Inject RecompStackPop before any return so the stack stays balanced.
             stripped = ln.strip()

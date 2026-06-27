@@ -91,6 +91,15 @@ typedef struct CpuState {
      * issue cpu_readN / cpu_writeN against this pointer so DB / D / S
      * / PB-relative addressing all resolve through the cpu_ helpers. */
     uint8 *ram;
+
+    /* Axis-2 cycle accounting (SNES_ACCURACY_BURNDOWN.md). Cumulative 65816
+     * CPU (bus) cycles, charged by the v2 emitter as a per-block integer
+     * constant (recompiler/snes_cycles.py is the authority; the interp816
+     * reference + bsnes hook validate it). One add per block — near-free, the
+     * "cheap inline accounting" of the anchors-not-lockstep model. Nothing
+     * reads it yet, so adding it is behavior-identical; once validated against
+     * bsnes it can drive APU pacing (Axis 5 off-cue) and H/V derivation. */
+    uint64_t cycles;
 } CpuState;
 
 /* NB: NLR pending-skip state is intentionally NOT a CpuState field.
