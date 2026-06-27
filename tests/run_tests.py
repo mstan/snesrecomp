@@ -29,6 +29,7 @@ TEST_MODULES = [
     'test_emitter_mask_shape',
     'test_smwdisx_compare',
     'test_sync_funcs_h',
+    'test_snes_cycles',
 ]
 
 

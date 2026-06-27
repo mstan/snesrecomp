@@ -227,6 +227,18 @@ def _build_opcode_table() -> dict:
 _OPCODES = _build_opcode_table()
 
 
+def opcode_table() -> dict:
+    """Public accessor for the canonical opcode -> (mnem, mode, length) map.
+
+    The value's third field (length) may be an int or a callable
+    ``(m, x, _l=None) -> int`` for the (M,X)-width-dependent immediates.
+    Cost modelling (``snes_cycles.py``) consumes only (mnem, mode); reusing
+    this table keeps the cycle model tied to the single decoder rather than
+    re-listing 256 opcodes.
+    """
+    return _OPCODES
+
+
 def decode_insn(data: bytes, offset: int, pc: int, bank: int,
                 m: int = 1, x: int = 1) -> Optional[Insn]:
     """Decode one 65816 instruction. Returns None on unknown opcode."""
