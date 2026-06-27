@@ -133,9 +133,21 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
   (read page-cross omitted, write page-cross spuriously added, RTI/COP apply
   the native +1 unconditionally — the latter two only differ in emulation mode,
   not the native SNES game state). See `tools/cyc_watch/README.md`.
-  **Remaining for B:** drive interp816 boot-to-anchor over a real ROM (memory
-  bus + reset vector + synthetic MMIO) and emit a per-hit cycle ring — the
-  `cyc_watch` REGION harness — then validate against the bsnes hook.
+  **cyc_watch ring/REGION mechanism DONE (2026-06-27):** `tools/cyc_watch/
+  cyc_ring.{c,h}` is an always-on per-instruction ring `{seq, pc24, opcode,
+  cyc_auth, cyc_ref, master}` (eviction-bounded; query a window, never
+  arm-then-capture) with anchor lookup + the two-anchor REGION query (offset
+  cancels). `cyc_trace.c` drives interp816 over a controlled loop, fills the
+  ring with the authority count (pre-state + runtime predicates: D.l / read
+  page-cross / branch taken+cross) AND interp816's native count, and asserts
+  the REGION delta vs the hand-computed datasheet value (1 iter = 17 cyc, full
+  loop = 50) plus authority==reference over the whole trace. The reusable
+  plumbing is ready to attach to a real bus or the bsnes hook.
+  **Remaining for B:** wrap interp816 in a SNES bus (ROM map + WRAM + synthetic
+  MMIO) to free-run a real ROM to an anchor — OR go straight to the bsnes hook
+  as the real-ROM ground truth (the accurate full-system oracle is better
+  suited to real-ROM cycle truth than a CPU-only interpreter). Owner sign-off
+  pending on the bsnes build commitment.
 - **C. Recomp emit:** the recompiler emits exact accumulated charges collapsing
   to a **per-block integer constant** (near-free; stays fast). Delay-of-control
   and branch/page-cross owned by the block bundle (psx P2 lesson: don't lose a
@@ -312,7 +324,7 @@ per-sample. The seed already exists: **`dsp_shadow`** runs a parallel dry-mix
 | Axis taxonomy + living burndown | **this doc** |
 | Reference shelf + GREEN gate | partial (bsnes source on hand; no test ROMs wired) |
 | Two-process ring-buffer diff | **audio: done**; MMIO/VRAM: rings exist on recomp, need oracle side |
-| Two-anchor REGION cycle gate | not started (needs bsnes cycle hook) |
+| Two-anchor REGION cycle gate | **mechanism done** (`tools/cyc_watch`, ring + REGION, validated vs interp816); real-ROM ground truth still needs the bsnes cycle hook |
 | Three-layer first-divergence | WRAM-lo layer exists; fingerprint/read-watch not ported |
 | Coverage audits, fail-closed | opcode decode fail-closed; codegen/dispatch audits exist |
 | State-surface diffs | audio sample-stream **done**; VRAM/event-ring next |

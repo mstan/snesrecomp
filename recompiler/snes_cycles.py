@@ -384,10 +384,13 @@ def _gen_c_header() -> str:
     bclass = [0] * 256
     eadd = [0] * 256
     valid = [0] * 256
+    mode = [0xFF] * 256   # addressing mode (snes65816 constant); 0xFF = invalid
     for op in range(256):
-        if _info(op) is None:
+        info = _info(op)
+        if info is None:
             continue
         valid[op] = 1
+        mode[op] = info[1]
         base[op] = base_cpu_cycles(op)
         madd[op] = m_add(op)
         xadd[op] = x_add(op)
@@ -395,6 +398,16 @@ def _gen_c_header() -> str:
         xcross[op] = xcross_add(op)
         bclass[op] = branch_class(op)
         eadd[op] = e_add(op)
+
+    # addressing-mode #defines, generated from the snes65816 constants so the
+    # ring driver's mode comparisons can't drift from the decoder.
+    _mode_names = ['IMP', 'ACC', 'IMM', 'DP', 'DP_X', 'DP_Y', 'ABS', 'ABS_X',
+                   'ABS_Y', 'LONG', 'LONG_X', 'REL', 'REL16', 'STK', 'INDIR',
+                   'INDIR_X', 'INDIR_Y', 'INDIR_LY', 'INDIR_L', 'INDIR_DPX',
+                   'DP_INDIR', 'STK_IY']
+    mode_defs = '\n'.join(
+        f'#define SNES_MODE_{n:<9} {getattr(_d, n)}' for n in _mode_names)
+    mode_defs += '\n#define SNES_MODE_INVALID 255'
 
     def arr(name, vals):
         rows = []
@@ -433,6 +446,10 @@ def _gen_c_header() -> str:
 {arr('SNES_BRANCH_CLASS', bclass)} /* 0 none, 1 conditional, 2 BRA */
 {arr('SNES_E_ADD', eadd)}       /* added in native mode (e==0): RTI/BRK/COP */
 {arr('SNES_OP_VALID', valid)}   /* 1 if opcode decodes */
+{arr('SNES_OP_MODE', mode)}     /* addressing mode (SNES_MODE_*), 255 invalid */
+
+/* Addressing-mode ids (mirror recompiler/snes65816.py constants). */
+{mode_defs}
 
 /* Master clocks for one access at a 24-bit address. memsel = $420D bit 0. */
 static inline int snes_region_speed(uint32_t addr24, int memsel) {{

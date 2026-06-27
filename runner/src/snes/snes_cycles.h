@@ -162,6 +162,49 @@ static const uint8_t SNES_OP_VALID[256] = {
      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 };   /* 1 if opcode decodes */
+static const uint8_t SNES_OP_MODE[256] = {
+     2,19, 2,13, 3, 3, 3,18, 0, 2, 1, 0, 6, 6, 6, 9,
+    11,16,20,21, 3, 4, 4,17, 0, 8, 1, 0, 6, 7, 7,10,
+     6,19, 9,13, 3, 3, 3,18, 0, 2, 1, 0, 6, 6, 6, 9,
+    11,16,20,21, 4, 4, 4,17, 0, 8, 1, 0, 7, 7, 7,10,
+     0,19, 2,13, 2, 3, 3,18, 0, 2, 1, 0, 6, 6, 6, 9,
+    11,16,20,21, 2, 4, 4,17, 0, 8, 0, 0, 9, 7, 7,10,
+     0,19,12,13, 3, 3, 3,18, 0, 2, 1, 0,14, 6, 6, 9,
+    11,16,20,21, 4, 4, 4,17, 0, 8, 0, 0,15, 7, 7,10,
+    11,19,12,13, 3, 3, 3,18, 0, 2, 0, 0, 6, 6, 6, 9,
+    11,16,20,21, 4, 4, 5,17, 0, 8, 0, 0, 6, 7, 7,10,
+     2,19, 2,13, 3, 3, 3,18, 0, 2, 0, 0, 6, 6, 6, 9,
+    11,16,20,21, 4, 4, 5,17, 0, 8, 0, 0, 7, 7, 8,10,
+     2,19, 2,13, 3, 3, 3,18, 0, 2, 0, 0, 6, 6, 6, 9,
+    11,16,20,21, 3, 4, 4,17, 0, 8, 0, 0,14, 7, 7,10,
+     2,19, 2,13, 3, 3, 3,18, 0, 2, 0, 0, 6, 6, 6, 9,
+    11,16,20,21, 6, 4, 4,17, 0, 8, 0, 0,15, 7, 7,10,
+};     /* addressing mode (SNES_MODE_*), 255 invalid */
+
+/* Addressing-mode ids (mirror recompiler/snes65816.py constants). */
+#define SNES_MODE_IMP       0
+#define SNES_MODE_ACC       1
+#define SNES_MODE_IMM       2
+#define SNES_MODE_DP        3
+#define SNES_MODE_DP_X      4
+#define SNES_MODE_DP_Y      5
+#define SNES_MODE_ABS       6
+#define SNES_MODE_ABS_X     7
+#define SNES_MODE_ABS_Y     8
+#define SNES_MODE_LONG      9
+#define SNES_MODE_LONG_X    10
+#define SNES_MODE_REL       11
+#define SNES_MODE_REL16     12
+#define SNES_MODE_STK       13
+#define SNES_MODE_INDIR     14
+#define SNES_MODE_INDIR_X   15
+#define SNES_MODE_INDIR_Y   16
+#define SNES_MODE_INDIR_LY  17
+#define SNES_MODE_INDIR_L   18
+#define SNES_MODE_INDIR_DPX 19
+#define SNES_MODE_DP_INDIR  20
+#define SNES_MODE_STK_IY    21
+#define SNES_MODE_INVALID 255
 
 /* Master clocks for one access at a 24-bit address. memsel = $420D bit 0. */
 static inline int snes_region_speed(uint32_t addr24, int memsel) {

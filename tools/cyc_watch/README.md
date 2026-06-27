@@ -48,5 +48,35 @@ authority matches the 65816 datasheet and LakeSnes does not.
 
 These findings make `interp816` usable as a stepping reference engine, with
 its cycle output corrected against the authority at the four documented sites.
-The next step is the boot-to-anchor `cyc_watch` ring (two-anchor REGION diff
-vs the bsnes ground-truth hook).
+
+## `cyc_ring.{c,h}` — always-on per-instruction cycle ring
+
+Bounded circular buffer recording EVERY executed instruction
+`{seq, pc24, opcode, cyc_auth, cyc_ref, master}` from boot (eviction keeps
+memory flat). Probes QUERY a window after the fact — never arm-then-capture
+(ring-buffer discipline). API: `cyc_ring_find_pc` (anchor lookup),
+`cyc_ring_region` (sum over a seq window), and `cyc_ring_region_anchors` —
+the **two-anchor REGION** that measures the cycle cost of one START->END pass
+(offset cancels; `start_pc == end_pc` measures one loop iteration).
+
+## `cyc_trace.c` — ring demonstrator + self-test
+
+Steps interp816 over a controlled native-16-bit RMW loop, filling the ring
+with the shared-authority count (computed from pre-state + runtime predicates:
+D.l, read page-cross, branch taken/cross) AND interp816's native count, then
+queries it. Asserts the REGION delta against the hand-computed datasheet value
+(one iteration = 17 cyc; full 3-iter loop = 50 cyc) and that authority ==
+reference over the whole trace (this path hits none of the 4 divergence
+sites). Build:
+
+```powershell
+& $gcc -std=c99 -Wall -Wextra -I "$wt\runner\src\snes" -I "$wt\tools\cyc_watch" `
+    "$wt\tools\cyc_watch\cyc_trace.c" "$wt\tools\cyc_watch\cyc_ring.c" `
+    "$wt\runner\src\snes\interp816.c" -o "$wt\tools\cyc_watch\cyc_trace.exe"
+```
+
+**Scope:** flat-RAM bus, not a full SNES bus (no PPU/DMA/APU/MMIO). This
+validates the ring + REGION mechanism and the authority's runtime-predicate
+path on a known code path. Booting a real ROM to an anchor needs a SNES bus
+around interp816 (separate component); for real-ROM cycle ground truth the
+bsnes source hook is the intended oracle (`bsnes_total_guest_cycles()`).
