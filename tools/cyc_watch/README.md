@@ -78,5 +78,48 @@ sites). Build:
 **Scope:** flat-RAM bus, not a full SNES bus (no PPU/DMA/APU/MMIO). This
 validates the ring + REGION mechanism and the authority's runtime-predicate
 path on a known code path. Booting a real ROM to an anchor needs a SNES bus
-around interp816 (separate component); for real-ROM cycle ground truth the
-bsnes source hook is the intended oracle (`bsnes_total_guest_cycles()`).
+around interp816 (separate component); for real-ROM cycle ground truth use the
+bsnes hook below.
+
+## bsnes ground-truth cycle hook (`bsnes_cycle_hook.patch` + `bsnes_cycles_probe.c`)
+
+The external accuracy oracle: a monotonic guest master-clock counter added to
+bsnes, exported as `bsnes_total_guest_cycles()` (analog of psx Beetle's
+`beetle_total_guest_cycles`). This is what breaks the "both can be identically
+wrong" trap — the homemade model is validated against an accuracy-grade
+emulator, not just against interp816.
+
+`bsnes_cycle_hook.patch` (dev-only; bsnes source lives OUTSIDE the recomp repo
+at `F:\Projects\_bsnes_src`) adds, atop libretro/bsnes @ `591b7e1`:
+- a `uint64_t g_bsnes_total_master_cycles` incremented by 2 in
+  `SuperFamicom::CPU::stepOnce` (sfc/cpu/timing.cpp) — the single master-clock
+  chokepoint (CPU + DMA/HDMA both step the CPU thread through it);
+- `extern "C" __declspec(dllexport)` getters `bsnes_total_guest_cycles()` /
+  `bsnes_reset_guest_cycles()` in target-libretro/libretro.cpp (+ reset on
+  retro_reset), with `bsnes_*` added to the link.T version script;
+- two build fixes for the modern toolchain (GCC 15.2): reformulated the
+  `~0ull >> 64 - Precision` constexpr in nall (GCC-15 ICE), and `-D_GNU_SOURCE`
+  for the bundled SameBoy `gb` core's `vasprintf`.
+
+Apply + build (mingw):
+```
+git clone https://github.com/libretro/bsnes.git && cd bsnes
+git checkout 591b7e13b6914beffaa01084e4c0b7a5d9cc0673
+git apply /path/to/bsnes_cycle_hook.patch
+make platform=win -j6        # -> bsnes_libretro.dll with the cycle exports
+```
+
+`bsnes_cycles_probe.c` validates the hook end-to-end (LoadLibrary + libretro
+boot, headless): the counter advances **357368 master cyc/frame** — exactly
+one NTSC frame (262 lines x 1364) — confirming a faithful master-clock count.
+Build/run:
+```powershell
+& $gcc -O2 -I F:/Projects/_bsnes_src/bsnes/target-libretro `
+    "$wt\tools\cyc_watch\bsnes_cycles_probe.c" -o "$wt\tools\cyc_watch\bsnes_cycles_probe.exe"
+& "$wt\tools\cyc_watch\bsnes_cycles_probe.exe" F:\Projects\_bsnes_src\bsnes_libretro.dll <rom.sfc>
+```
+
+**Keep overclocking OFF** in the core config so every CPU cycle is counted.
+
+Next: anchor the recomp/authority and bsnes on the same guest-PC pair and diff
+the two-anchor REGION delta (recomp Δ == reference Δ == bsnes Δ over a region).

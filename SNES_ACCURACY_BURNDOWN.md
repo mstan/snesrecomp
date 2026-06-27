@@ -49,7 +49,7 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
 |---|---|---|
 | **State / divergence** | `tools/snesref` + **bsnes Accuracy** libretro core | Core-agnostic SDL2 libretro frontend. **Was loading snes9x (approximate); now use `bsnes_libretro.dll`** — same byuu/higan lineage as ares, embeds blargg's cycle-exact S-DSP. Drop-in: `snesref.exe bsnes_libretro.dll rom.sfc`. |
 | **Audio** | bsnes Accuracy via snesref WAV dump | bsnes emits 48000 Hz (internal cycle-exact 32040 DSP, resampled up). See Axis 5. |
-| **Cycle timing** | *(none yet)* — would require a bsnes source hook | bsnes is open-source and cycle-stepped; a `bsnes_total_guest_cycles()` export read from snesref mirrors the psx Beetle `beetle_total_guest_cycles` pattern. Not built. |
+| **Cycle timing** | **bsnes source hook — BUILT + verified (2026-06-27)** | `bsnes_total_guest_cycles()` exported from a patched libretro/bsnes (dev-only clone at `F:\Projects\_bsnes_src`; patch = `tools/cyc_watch/bsnes_cycle_hook.patch`). Monotonic master-clock counter at the `CPU::stepOnce` chokepoint. End-to-end probe confirms **357368 master cyc/frame** = exactly one NTSC frame (262×1364). The psx Beetle `beetle_total_guest_cycles` analog, realized. |
 | **Higher fidelity** | **ares** (standalone) / **Mesen2** (debugger) | ares = gold standard but **no libretro core** (standalone integration only). Mesen2 = best introspection. Reserve for register/DB-level or deep cycle work. |
 
 > **zsnes is NOT a reference** — it is famously inaccurate. snes9x is
@@ -143,11 +143,20 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
   the REGION delta vs the hand-computed datasheet value (1 iter = 17 cyc, full
   loop = 50) plus authority==reference over the whole trace. The reusable
   plumbing is ready to attach to a real bus or the bsnes hook.
-  **Remaining for B:** wrap interp816 in a SNES bus (ROM map + WRAM + synthetic
-  MMIO) to free-run a real ROM to an anchor — OR go straight to the bsnes hook
-  as the real-ROM ground truth (the accurate full-system oracle is better
-  suited to real-ROM cycle truth than a CPU-only interpreter). Owner sign-off
-  pending on the bsnes build commitment.
+  **bsnes ground-truth hook DONE (2026-06-27):** owner sanctioned large
+  dev-only infra (see [[validators-are-dev-only]]); built it. A patched
+  libretro/bsnes (dev-only clone `F:\Projects\_bsnes_src`, reproducible via
+  `tools/cyc_watch/bsnes_cycle_hook.patch` atop @591b7e1) exports
+  `bsnes_total_guest_cycles()` — a monotonic master-clock counter at the
+  `CPU::stepOnce` chokepoint. `tools/cyc_watch/bsnes_cycles_probe.c` verifies
+  it end-to-end: 357368 master cyc/frame = exactly one NTSC frame. Required two
+  modern-toolchain fixes (GCC-15 constexpr ICE in nall; `-D_GNU_SOURCE` for the
+  SameBoy gb core). The external accuracy truth now exists — the
+  "both-identically-wrong" trap is closed.
+  **Remaining for B:** anchor the bsnes oracle and the recomp/reference on the
+  same guest-PC pair and diff the two-anchor REGION delta (wire
+  `bsnes_total_guest_cycles()` into snesref at PC anchors). That closes the
+  loop: recomp Δ == reference Δ == bsnes Δ over a region.
 - **C. Recomp emit:** the recompiler emits exact accumulated charges collapsing
   to a **per-block integer constant** (near-free; stays fast). Delay-of-control
   and branch/page-cross owned by the block bundle (psx P2 lesson: don't lose a

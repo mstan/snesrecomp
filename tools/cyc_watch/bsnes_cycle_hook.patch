@@ -1,0 +1,123 @@
+# bsnes Axis-2 cycle hook — apply atop libretro/bsnes @ 591b7e13b6914beffaa01084e4c0b7a5d9cc0673
+# git clone https://github.com/libretro/bsnes.git && cd bsnes && git checkout 591b7e13b6914beffaa01084e4c0b7a5d9cc0673
+# git apply <this>.patch ; make platform=win -j6  (mingw g++; needs the GCC-15 ICE + _GNU_SOURCE fixes included here)
+# exports: bsnes_total_guest_cycles(), bsnes_reset_guest_cycles()
+
+diff --git a/Makefile b/Makefile
+index 80ea1da..60d0b64 100644
+--- a/Makefile
++++ b/Makefile
+@@ -451,6 +451,9 @@ LDFLAGS += $(fpic) $(SHARED)
+ FLAGS += $(fpic) $(NEW_GCC_FLAGS) $(INCFLAGS)
+ 
+ FLAGS += $(ENDIANNESS_DEFINES) $(WARNINGS) $(CORE_DEFINE) -DSTDC_HEADERS -D__STDC_LIMIT_MACROS -D__LIBRETRO__ -DSFC_LAGFIX -DGB_INTERNAL -DDISABLE_DEBUGGER $(EXTRA_INCLUDES) $(SOUND_DEFINE)
++# snesrecomp: expose vasprintf etc. (the bundled SameBoy gb core needs it;
++# GCC 15 makes implicit declarations a hard error on mingw).
++FLAGS += -D_GNU_SOURCE
+ 
+ CXXFLAGS += -std=c++17 $(FLAGS)
+ CFLAGS   += $(FLAGS)
+diff --git a/bsnes/sfc/cpu/timing.cpp b/bsnes/sfc/cpu/timing.cpp
+index 987c0dd..f418e8f 100644
+--- a/bsnes/sfc/cpu/timing.cpp
++++ b/bsnes/sfc/cpu/timing.cpp
+@@ -8,8 +8,17 @@ auto CPU::joypadCounter() const -> uint {
+   return counter.cpu & 255;
+ }
+ 
++//snesrecomp Axis-2 cycle hook (dev-only): monotonic master-clock accumulator.
++//Every 2 master clocks the CPU thread consumes (CPU + DMA/HDMA, which also
++//step the CPU thread) funnel through stepOnce, so this is the cumulative
++//guest master-clock count — the analog of psx Beetle's
++//beetle_total_guest_cycles. Defined in target-libretro/libretro.cpp and
++//exported as bsnes_total_guest_cycles().
++extern "C" uint64_t g_bsnes_total_master_cycles;
++
+ auto CPU::stepOnce() -> void {
+   counter.cpu += 2;
++  g_bsnes_total_master_cycles += 2;
+   tick();
+   if(hcounter() & 2) nmiPoll(), irqPoll();
+   if(joypadCounter() == 0) joypadEdge();
+diff --git a/bsnes/target-libretro/libretro.cpp b/bsnes/target-libretro/libretro.cpp
+index 8010816..cf9c14e 100644
+--- a/bsnes/target-libretro/libretro.cpp
++++ b/bsnes/target-libretro/libretro.cpp
+@@ -1,6 +1,28 @@
+ #include <cassert>
++#include <cstdint>
+ #include "libretro.h"
+ 
++// snesrecomp Axis-2 cycle hook (dev-only). Monotonic guest master-clock
++// counter, incremented in SuperFamicom::CPU::stepOnce (sfc/cpu/timing.cpp)
++// and exported for the snesref oracle frontend. The two-anchor REGION diff
++// reads this at guest-PC anchors; the absolute origin is irrelevant (offset
++// cancels), but bsnes_reset_guest_cycles() / retro_reset zero it for clean
++// runs. NOTE: keep overclocking OFF so every CPU cycle is counted.
++// PE/mingw selects exports by __declspec(dllexport) (the version-script only
++// localizes; it does not ADD exports), so mark these explicitly.
++#if defined(_WIN32)
++  #define BSNES_HOOK_EXPORT __declspec(dllexport)
++#else
++  #define BSNES_HOOK_EXPORT __attribute__((visibility("default")))
++#endif
++extern "C" uint64_t g_bsnes_total_master_cycles = 0;  // C linkage: shared with sfc/cpu/timing.cpp
++extern "C" BSNES_HOOK_EXPORT uint64_t bsnes_total_guest_cycles(void) {
++	return g_bsnes_total_master_cycles;
++}
++extern "C" BSNES_HOOK_EXPORT void bsnes_reset_guest_cycles(void) {
++	g_bsnes_total_master_cycles = 0;
++}
++
+ static retro_environment_t environ_cb;
+ static retro_video_refresh_t video_cb;
+ static retro_audio_sample_t audio_cb;
+@@ -605,6 +627,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
+ 
+ RETRO_API void retro_reset()
+ {
++	g_bsnes_total_master_cycles = 0;   // Axis-2 hook: clean origin per reset
+ 	emulator->reset();
+ }
+ 
+diff --git a/bsnes/target-libretro/link.T b/bsnes/target-libretro/link.T
+index 9e82b5d..88e03ca 100644
+--- a/bsnes/target-libretro/link.T
++++ b/bsnes/target-libretro/link.T
+@@ -1,4 +1,4 @@
+ {
+-   global: retro_*;
++   global: retro_*; bsnes_*;
+    local: *;
+ };
+diff --git a/nall/primitives/integer.hpp b/nall/primitives/integer.hpp
+index 92e6e89..252fa40 100644
+--- a/nall/primitives/integer.hpp
++++ b/nall/primitives/integer.hpp
+@@ -12,8 +12,9 @@ template<uint Precision> struct Integer {
+     conditional_t<bits() <= 64, int64_t,
+     void>>>>;
+   using utype = typename Natural<Precision>::utype;
+-  static inline constexpr auto mask() -> utype { return ~0ull >> 64 - Precision; }
+-  static inline constexpr auto sign() -> utype { return 1ull << Precision - 1; }
++  // snesrecomp: reformulated to dodge a GCC 15 constexpr ICE; value-identical.
++  static inline constexpr auto mask() -> utype { return Precision >= 64 ? (utype)~0ull : (utype)(((uint64_t)1 << Precision) - 1); }
++  static inline constexpr auto sign() -> utype { return (utype)((uint64_t)1 << (Precision - 1)); }
+ 
+   inline Integer() : data(0) {}
+   template<uint Bits> inline Integer(Integer<Bits> value) { data = cast(value); }
+diff --git a/nall/primitives/natural.hpp b/nall/primitives/natural.hpp
+index 7bf3237..bedb006 100644
+--- a/nall/primitives/natural.hpp
++++ b/nall/primitives/natural.hpp
+@@ -11,7 +11,9 @@ template<uint Precision> struct Natural {
+     conditional_t<bits() <= 32, uint32_t,
+     conditional_t<bits() <= 64, uint64_t,
+     void>>>>;
+-  static inline constexpr auto mask() -> utype { return ~0ull >> 64 - Precision; }
++  // snesrecomp: reformulated from `~0ull >> 64 - Precision` to dodge a GCC 15
++  // constexpr ICE (segfault) on this idiom; value-identical.
++  static inline constexpr auto mask() -> utype { return Precision >= 64 ? (utype)~0ull : (utype)(((uint64_t)1 << Precision) - 1); }
+ 
+   inline Natural() : data(0) {}
+   template<uint Bits> inline Natural(Natural<Bits> value) { data = cast(value); }
