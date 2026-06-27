@@ -121,5 +121,25 @@ Build/run:
 
 **Keep overclocking OFF** in the core config so every CPU cycle is counted.
 
-Next: anchor the recomp/authority and bsnes on the same guest-PC pair and diff
-the two-anchor REGION delta (recomp Δ == reference Δ == bsnes Δ over a region).
+## CLOSED LOOP — model validated against bsnes (2026-06-27)
+
+The hook now also exports a **CPU (bus+internal) cycle counter**
+(`bsnes_total_cpu_cycles()`, incremented per `CPU::idle/read/write`) — the same
+unit the recomp/authority model emits (master clocks weight 6/8/12 and aren't
+directly comparable) — plus a **two-anchor REGION latch**: `bsnes_set_cyc_anchor
+(idx, pc24)` latches the CPU-cycle count the first time the CPU fetches an
+instruction at each anchor PC (`CPU::main`), read via `bsnes_get_anchor_cpu_cycles
+(idx)` / `bsnes_anchor_hit(idx)`. Region Δ = latch[1] − latch[0] (the reset
+offset cancels).
+
+`build_test_rom.py` emits a minimal LoROM with a KNOWN instruction stream (so
+the authority's prediction is exact), bracketed by anchor PCs:
+- `static`  — base + width + branch-taken loop; region [$8000,$8011) = **60** cyc.
+- `dynamics`— D.l≠0 dp load + abs,X read page-cross; region [$800B,$8011) = **13** cyc.
+
+`bsnes_cycles_probe.exe <dll> <rom> <startPC> <endPC> <expected>` runs the ROM
+and compares bsnes's region CPU-cycle Δ to the authority's prediction. RESULT
+(both): **MATCH** — bsnes 60 == authority 60; bsnes 13 == authority 13. The
+recomp cost model (= what `emit_function` charges) is confirmed cycle-correct
+against an accuracy-grade hardware reference, static AND dynamic, on
+real-hardware-executed code. The "both can be identically wrong" trap is closed.

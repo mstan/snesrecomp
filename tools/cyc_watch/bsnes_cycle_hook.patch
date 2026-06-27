@@ -1,7 +1,9 @@
 # bsnes Axis-2 cycle hook — apply atop libretro/bsnes @ 591b7e13b6914beffaa01084e4c0b7a5d9cc0673
 # git clone https://github.com/libretro/bsnes.git && cd bsnes && git checkout 591b7e13b6914beffaa01084e4c0b7a5d9cc0673
 # git apply <this>.patch ; make platform=win -j6  (mingw g++; needs the GCC-15 ICE + _GNU_SOURCE fixes included here)
-# exports: bsnes_total_guest_cycles(), bsnes_reset_guest_cycles()
+# Exports: bsnes_total_guest_cycles() [master clocks], bsnes_total_cpu_cycles()
+# [CPU bus+internal cycles], and the two-anchor REGION latch: bsnes_set_cyc_anchor(idx,pc24),
+# bsnes_get_anchor_cpu_cycles(idx), bsnes_anchor_hit(idx), bsnes_reset_guest_cycles().
 
 diff --git a/Makefile b/Makefile
 index 80ea1da..60d0b64 100644
@@ -17,6 +19,74 @@ index 80ea1da..60d0b64 100644
  
  CXXFLAGS += -std=c++17 $(FLAGS)
  CFLAGS   += $(FLAGS)
+diff --git a/bsnes/sfc/cpu/cpu.cpp b/bsnes/sfc/cpu/cpu.cpp
+index b6fec16..934547c 100644
+--- a/bsnes/sfc/cpu/cpu.cpp
++++ b/bsnes/sfc/cpu/cpu.cpp
+@@ -10,6 +10,13 @@ CPU cpu;
+ #include "irq.cpp"
+ #include "serialization.cpp"
+ 
++// snesrecomp Axis-2 REGION anchor globals (defined in target-libretro/
++// libretro.cpp). extern "C" so they resolve to the same symbols.
++extern "C" uint32_t g_bsnes_cyc_anchor[2];
++extern "C" uint64_t g_bsnes_anchor_latch[2];
++extern "C" uint8_t  g_bsnes_anchor_hit[2];
++extern "C" uint64_t g_bsnes_total_cpu_cycles;
++
+ auto CPU::synchronizeSMP() -> void {
+   if(smp.clock < 0) scheduler.resume(smp.thread);
+ }
+@@ -32,6 +39,19 @@ auto CPU::Enter() -> void {
+ }
+ 
+ auto CPU::main() -> void {
++  // snesrecomp Axis-2: latch the CPU-cycle count the first time an instruction
++  // is fetched at each REGION anchor PC (PB:PC). r.pc.d is the 24-bit PC of the
++  // about-to-execute instruction, so the latch holds cycles consumed *before*
++  // it — exactly the region boundary. (Globals in target-libretro/libretro.cpp.)
++  {
++    uint32_t _pc = (uint32_t)(r.pc.d & 0xFFFFFF);
++    for(int _i = 0; _i < 2; _i++) {
++      if(!g_bsnes_anchor_hit[_i] && _pc == g_bsnes_cyc_anchor[_i]) {
++        g_bsnes_anchor_latch[_i] = g_bsnes_total_cpu_cycles;
++        g_bsnes_anchor_hit[_i] = 1;
++      }
++    }
++  }
+   if(r.wai) return instructionWait();
+   if(r.stp) return instructionStop();
+   if(!status.interruptPending) return instruction();
+diff --git a/bsnes/sfc/cpu/memory.cpp b/bsnes/sfc/cpu/memory.cpp
+index c63de17..2eb9eb2 100644
+--- a/bsnes/sfc/cpu/memory.cpp
++++ b/bsnes/sfc/cpu/memory.cpp
+@@ -1,4 +1,9 @@
++// snesrecomp Axis-2: count CPU (bus + internal) cycles — one per idle/read/
++// write. This is the unit the recomp/authority model emits.
++extern "C" uint64_t g_bsnes_total_cpu_cycles;
++
+ auto CPU::idle() -> void {
++  g_bsnes_total_cpu_cycles++;
+   status.clockCount = 6;
+   dmaEdge();
+   step<6,0>();
+@@ -7,6 +12,7 @@ auto CPU::idle() -> void {
+ }
+ 
+ auto CPU::read(uint address) -> uint8 {
++  g_bsnes_total_cpu_cycles++;
+   if(address & 0x408000) {
+     if(address & 0x800000 && io.fastROM) {
+       status.clockCount = 6;
+@@ -46,6 +52,7 @@ auto CPU::read(uint address) -> uint8 {
+ }
+ 
+ auto CPU::write(uint address, uint8 data) -> void {
++  g_bsnes_total_cpu_cycles++;
+   aluEdge();
+ 
+   if(address & 0x408000) {
 diff --git a/bsnes/sfc/cpu/timing.cpp b/bsnes/sfc/cpu/timing.cpp
 index 987c0dd..f418e8f 100644
 --- a/bsnes/sfc/cpu/timing.cpp
@@ -40,10 +110,10 @@ index 987c0dd..f418e8f 100644
    if(hcounter() & 2) nmiPoll(), irqPoll();
    if(joypadCounter() == 0) joypadEdge();
 diff --git a/bsnes/target-libretro/libretro.cpp b/bsnes/target-libretro/libretro.cpp
-index 8010816..cf9c14e 100644
+index 8010816..1b7d718 100644
 --- a/bsnes/target-libretro/libretro.cpp
 +++ b/bsnes/target-libretro/libretro.cpp
-@@ -1,6 +1,28 @@
+@@ -1,6 +1,60 @@
  #include <cassert>
 +#include <cstdint>
  #include "libretro.h"
@@ -65,18 +135,50 @@ index 8010816..cf9c14e 100644
 +extern "C" BSNES_HOOK_EXPORT uint64_t bsnes_total_guest_cycles(void) {
 +	return g_bsnes_total_master_cycles;
 +}
++
++// CPU (bus + internal) cycle counter — the unit the recomp/authority model
++// emits (master clocks weight 6/8/12 per access and aren't directly
++// comparable). Incremented once per CPU::idle/read/write (sfc/cpu/memory.cpp).
++extern "C" uint64_t g_bsnes_total_cpu_cycles = 0;
++// Two-anchor REGION latch: set anchor guest-PCs (PB:PC), and the first time
++// the CPU fetches an instruction at each (sfc/cpu/cpu.cpp CPU::main), latch the
++// CPU-cycle count. Region delta = latch[1] - latch[0]. -1 anchor = disabled.
++extern "C" uint32_t g_bsnes_cyc_anchor[2]  = {0xFFFFFFFFu, 0xFFFFFFFFu};
++extern "C" uint64_t g_bsnes_anchor_latch[2] = {0, 0};
++extern "C" uint8_t  g_bsnes_anchor_hit[2]   = {0, 0};
++
++extern "C" BSNES_HOOK_EXPORT uint64_t bsnes_total_cpu_cycles(void) {
++	return g_bsnes_total_cpu_cycles;
++}
++extern "C" BSNES_HOOK_EXPORT void bsnes_set_cyc_anchor(int idx, uint32_t pc24) {
++	if (idx == 0 || idx == 1) {
++		g_bsnes_cyc_anchor[idx] = pc24;
++		g_bsnes_anchor_hit[idx] = 0;
++		g_bsnes_anchor_latch[idx] = 0;
++	}
++}
++extern "C" BSNES_HOOK_EXPORT uint64_t bsnes_get_anchor_cpu_cycles(int idx) {
++	return (idx == 0 || idx == 1) ? g_bsnes_anchor_latch[idx] : 0;
++}
++extern "C" BSNES_HOOK_EXPORT int bsnes_anchor_hit(int idx) {
++	return (idx == 0 || idx == 1) ? (int)g_bsnes_anchor_hit[idx] : 0;
++}
++
 +extern "C" BSNES_HOOK_EXPORT void bsnes_reset_guest_cycles(void) {
 +	g_bsnes_total_master_cycles = 0;
++	g_bsnes_total_cpu_cycles = 0;
++	g_bsnes_anchor_hit[0] = g_bsnes_anchor_hit[1] = 0;
++	g_bsnes_anchor_latch[0] = g_bsnes_anchor_latch[1] = 0;
 +}
 +
  static retro_environment_t environ_cb;
  static retro_video_refresh_t video_cb;
  static retro_audio_sample_t audio_cb;
-@@ -605,6 +627,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
+@@ -605,6 +659,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
  
  RETRO_API void retro_reset()
  {
-+	g_bsnes_total_master_cycles = 0;   // Axis-2 hook: clean origin per reset
++	bsnes_reset_guest_cycles();        // Axis-2 hook: clean origin per reset
  	emulator->reset();
  }
  

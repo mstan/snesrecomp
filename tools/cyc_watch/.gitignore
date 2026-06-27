@@ -1,2 +1,3 @@
-# built validation harnesses
+# built validation harnesses + generated test ROMs
 *.exe
+*.sfc

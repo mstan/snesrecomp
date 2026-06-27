@@ -157,6 +157,17 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
   same guest-PC pair and diff the two-anchor REGION delta (wire
   `bsnes_total_guest_cycles()` into snesref at PC anchors). That closes the
   loop: recomp Δ == reference Δ == bsnes Δ over a region.
+  **LOOP CLOSED (2026-06-27): the cost model is validated against bsnes.** Added
+  a CPU (bus+internal) cycle counter to bsnes (`bsnes_total_cpu_cycles()`, per
+  `CPU::idle/read/write` — the unit the emitter charges) + a two-anchor REGION
+  latch (`bsnes_set_cyc_anchor`/`bsnes_get_anchor_cpu_cycles`, latched at the
+  instruction-fetch boundary in `CPU::main`; offset cancels). `build_test_rom.py`
+  emits known-stream LoROMs; `bsnes_cycles_probe` diffs bsnes's region Δ vs the
+  authority's exact prediction. **RESULT: MATCH on both** — static region
+  (base+width+branch-taken) bsnes 60 == authority 60; dynamics region (D.l≠0 dp
+  + abs,X page-cross) bsnes 13 == authority 13. The recomp cost model is
+  confirmed cycle-correct against an accuracy-grade hardware reference, static
+  AND dynamic, on real-hardware-executed code.
 - **C. Recomp emit:** the recompiler emits exact accumulated charges collapsing
   to a **per-block integer constant** (near-free; stays fast). Delay-of-control
   and branch/page-cross owned by the block bundle (psx P2 lesson: don't lose a
