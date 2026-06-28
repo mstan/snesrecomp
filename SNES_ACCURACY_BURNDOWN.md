@@ -72,7 +72,28 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
 - **Next lever:** run a 65816 test ROM (e.g. a SNES CPU test) on recomp vs bsnes,
   diff result registers — highest-leverage single validator, not yet built.
 
-## Axis 2 — Cycle / timing · **COST MODEL LANDED (step A); reference/emit pending**
+## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
+
+> **Axis-2 close-out (2026-06-27).** Validated to the maximum the codebase state
+> allows: (1) the cost model is cycle-correct vs **bsnes** hardware truth — REGION
+> diffs MATCH for both the static model (60==60) and the dynamics (D.l + abs,X
+> page-cross, 13==13); (2) the recomp **emits** the model (per-block static
+> constant + dynamic D.l/page-cross/branch-taken charges), unit-tested (7 tests);
+> (3) a **full SMW regen** produces correct charges at scale (24k+ in bank00:
+> block constants + `if(...) cpu->cycles += 1; goto` branch edges + dp/cross
+> conditionals) and a regenerated 14 MB bank **compiles clean** (0 errors
+> attributable to `cpu->cycles`/`CpuState`; the only diagnostics are cross-bank
+> implicit decls that `funcs.h` resolves at full-build). The add is behavior-inert
+> (nothing reads `cpu->cycles` yet), so it is byte-identical-safe.
+>
+> **NOT done — orthogonal blocker (Axis 6, not Axis 2):** the full SMW `.exe`
+> link is blocked by the pre-existing branch-union breakage — the SMW vcxproj
+> references `runner/src/launcher/launcher_gui.c`, which exists on NO current
+> checkout (last smw.exe is Jun 18), and `interp_bridge.c` lives only on the
+> investigate lineage. This is the "reconcile owed" (Axis 6 §note), independent
+> of the cycle work. **Wiring `cpu->cycles` to actually DRIVE behavior** (replace
+> the synthetic `cpu_pace_cycles` APU clock; H/V derivation) is Axis-5/Axis-3
+> work, not Axis-2 — Axis-2 is the cost model, and it is correct.
 
 - **Accurate =** cumulative guest master-clock matches bsnes; memory access
   honors the SNES variable speed (6/8/12 master cyc/access by region + FastROM
