@@ -374,12 +374,24 @@ per-sample. The seed already exists: **`dsp_shadow`** runs a parallel dry-mix
 - Dispatch completeness (no missed indirect/jump-table targets), Tier-2 interp
   floor, gap manifest — the most-developed axis. Differential tool: `wram_diff.py`
   + the snesref WRAM-lo per-frame trace (the psx `divergence/` analog).
-- **Note:** the multi-tier interp (`interp816.c`) lives on the
+- **Note:** the multi-tier interp (`interp816.c`) lived on the
   `feat/multi-tier-interp-fallback` / `investigate` lineage, NOT on `main`; the
-  audio stack (`audio_trace`) + launcher + shadow/msu1 live on `main`. **No single
-  branch is the union** — a reconcile is owed before a clean game build tracks
-  both. (This worktree builds against `main`; the SMW vcxproj's `interp816`
-  reference is uncommitted local multi-tier work.)
+  audio stack (`audio_trace`) + launcher + shadow/msu1 live on `main`. No single
+  branch was the union.
+- **RECONCILE DONE (2026-06-27): `reconcile/cycle-multitier`.** Merged
+  `integ/sm-interp` (multi-tier) into the cycle-accuracy branch — 4 conflicts,
+  all combined (audio + multi-tier trace files, tailcall/abandon infra). The
+  union now has: main's audio/launcher/shadow/msu1 + the Axis-2 cycle work +
+  the multi-tier interp/bridge + dispatch tier-down. v2 suite 241/246 (only the
+  5 pre-existing stale RTS-ABI tests fail). **SMW builds + runs:** repointed the
+  junction, full regen (multi-tier tier-down cleared the unresolved-IndirectGoto
+  stubs → `interp_tier_dispatch_balanced`), synced funcs.h, inited the
+  RmlUi/freetype submodules + built their libs, added `ppu_dma_trace.c` to the
+  vcxproj (SMW branch `reconcile/multitier-cycle-build`). **Production|x64
+  built, 0 errors; soak = PASS:** ~130 s of attract (frames 59→7859) at a
+  locked 60 fps (one 59 at first-second ramp), zero watchdog/abandon/stub-fire/
+  crash. The cycle emit runs in a real built game at full speed. Slowdown
+  measured via an env-gated FPS heartbeat (`SNESRECOMP_FPS`, dev-only).
 
 ## Axis 7 — Determinism · **assumed, untracked**
 
