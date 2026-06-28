@@ -6333,6 +6333,7 @@ static void cmd_get_rtstrace(const char *args) {
 
 /* ---- Audio observability (always-on rings in audio_trace.c) ---- */
 #include "audio_trace.h"
+#include <math.h>  /* sqrt/log10 for cmd_audio_shadow_div */
 
 /* audio_stats — counters + the most recent per-second snapshots.
  * Args: [snap_count=30] */
@@ -6448,11 +6449,32 @@ static void cmd_audio_wav(const char *args) {
              path, (unsigned long long)out_start, (unsigned long long)out_count);
 }
 
+/* audio_shadow_div — in-process DSP reference tone divergence (dev only).
+ * Reports the canon-vs-reference (cubic) per-sample RMS + peak over non-silent
+ * audio, in the normalized domain and dB. The artifact-free internal tone
+ * oracle: no cross-process resample/alignment (unlike the bsnes WAV diff). */
+static void cmd_audio_shadow_div(const char *args) {
+    (void)args;
+    AudioTraceStats st;
+    audio_trace_get_stats(&st);
+    double rms = st.shadow_div_count
+                     ? sqrt(st.shadow_div_sumsq / (double)st.shadow_div_count)
+                     : 0.0;
+    double rms_db = rms > 1e-12 ? 20.0 * log10(rms) : -240.0;
+    double max_db = st.shadow_div_max > 1e-12 ? 20.0 * log10(st.shadow_div_max)
+                                              : -240.0;
+    send_fmt("{\"ok\":true,\"count\":%llu,\"rms\":%.8f,\"rms_db\":%.2f,"
+             "\"max\":%.8f,\"max_db\":%.2f}",
+             (unsigned long long)st.shadow_div_count, rms, rms_db,
+             st.shadow_div_max, max_db);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"audio_stats",   cmd_audio_stats},
     {"audio_events",  cmd_audio_events},
     {"audio_wav",     cmd_audio_wav},
+    {"audio_shadow_div", cmd_audio_shadow_div},
     {"ping",          cmd_ping},
     {"oam_state",      cmd_oam_state},
     {"oam_write_get",  cmd_oam_write_get},

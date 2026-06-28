@@ -106,6 +106,15 @@ void audio_trace_on_reg_write(uint8_t addr, uint8_t val) {
   s_open_drop_event = UINT64_MAX;
 }
 
+void audio_trace_on_shadow_div(double dl, double dr) {
+  double a = dl < 0 ? -dl : dl;
+  double b = dr < 0 ? -dr : dr;
+  if (a > s_stats.shadow_div_max) s_stats.shadow_div_max = a;
+  if (b > s_stats.shadow_div_max) s_stats.shadow_div_max = b;
+  s_stats.shadow_div_sumsq += (dl * dl + dr * dr) * 0.5;
+  s_stats.shadow_div_count++;
+}
+
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles) {
   s_stats.pace_consumer_active = (uint32_t)(consumer_active != 0);
   s_stats.pace_baseline_cycles += baseline_cycles;
@@ -279,7 +288,15 @@ int audio_trace_dump_wav(const char *path, int64_t start_idx, uint64_t count,
   FILE *f = fopen(path, "wb");
   if (!f) return -1;
   uint32_t data_bytes = (uint32_t)(count * 4);
-  uint32_t sample_rate = 32000; /* host plays the native stream 1:1 at 32000 */
+  /* The PCM ring stores DSP output at the S-DSP NATIVE rate, which is 32040 Hz
+   * (1364*262*60 master / 32 per sample; the same rate apuCyclesPerMaster and
+   * the config default are derived from, and byuu's measured real-SNES DSP
+   * rate). A previous 32000 here mislabeled the dump: every drift-tolerant A/B
+   * (tools/audio_ab_diff.py) then resampled the recomp 32000->32040 against the
+   * 32040 oracle, stretching it ~1250 ppm and misaligning onsets -- inflating
+   * the apparent "off-cue" (measured 2026-06-28: fixing this alone moved SMW
+   * drift -4013 -> -2272 ppm and onset match 53% -> 71%). Label the true rate. */
+  uint32_t sample_rate = 32040; /* native S-DSP rate (see above) */
   uint32_t byte_rate = sample_rate * 4;
   uint32_t riff_size = 36 + data_bytes;
   uint16_t fmt16;

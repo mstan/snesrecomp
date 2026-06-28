@@ -333,6 +333,55 @@ Results (steady title-music window):
   attacks → brighter), (3) the nearest-sample host resample (`dsp_getSamples`;
   owner deferred this — generation ring is the surface for now).
 
+### Off-tone re-examined (2026-06-28) — "brighter" is largely a RESAMPLE artifact
+
+Two of the three suspects above are now closed/exonerated:
+- **(2) immediate-KON is ALREADY removed** — `dsp.c` ~L266 runs the hardware-
+  latched KON (polled every other sample, KOF priority); the `MY_CHANGES`
+  immediate path is gone. Not the off-tone source.
+- **(1) the per-voice dry math is hardware-faithful** — `dsp_getSample` (L367) is
+  the exact 4-tap Gaussian *with the intermediate 16-bit clip* (L375) + final
+  clamp (the hardware Gaussian-overflow behavior); `dsp_decodeBrr` (L381) has the
+  standard BRR filters + clamps. Nothing obviously deviates from blargg/bsnes.
+- **The "recomp brighter" is mostly the cross-process RESAMPLE asymmetry.**
+  Test (after fixing the 32040 dump label): recomp **direct** 32040 vs bsnes =
+  centroid **+40 Hz**; recomp **round-tripped** 32040→48000→32040 (matching
+  bsnes's libretro 48000 path) vs bsnes = centroid **+1 Hz** — the brightness
+  collapses. bsnes's 48000 output, double-resampled back to 32040, loses treble
+  the recomp's direct 32040 keeps. The absolute LSD is **resampler-dependent**
+  (rose 2.7→3.3 dB under a different resampler) → the bsnes-WAV LSD is NOT a
+  trustworthy off-tone metric.
+
+**Conclusion:** like off-cue, the off-tone is substantially a cross-process
+measurement artifact; the recomp DSP looks hardware-faithful. The ONLY way to a
+trustworthy per-sample/per-stage tone number is the **in-process lockstep
+reference** (no resampling, no alignment error) — now being built. Its purpose is
+sharpened: *prove* the canon DSP faithful (or surface a genuine small residual),
+artifact-free.
+
+### In-process tone oracle — FOUNDATION SHIPPED (2026-06-28)
+
+Built the always-on internal divergence readout (the artifact-free instrument):
+- `dsp_shadow` now, in **dev (SNESRECOMP_TRACE) builds only**, ALWAYS re-renders
+  the reference dry mix every output sample and records the canon-vs-reference
+  divergence into `audio_trace` (`audio_trace_on_shadow_div`), independent of the
+  opt-in substitution (output stays byte-identical when the enhancement is off).
+  Production pays zero cost (early-return when the enhancement isn't armed).
+- Query: debug-server `audio_shadow_div` → `{count, rms, rms_db, max, max_db}`,
+  RMS over non-silent samples in the normalized domain.
+- **First number (SMW attract, ~26 s):** RMS **−35.06 dB**, peak **−9.89 dB**
+  (835 k samples). This is the **Gaussian-interpolation tone contribution** (canon
+  hardware Gaussian vs the cubic reference) — measured in-process, no resample.
+  It confirms the recomp carries the expected hardware Gaussian muffling and gives
+  a permanent always-on tone guard.
+
+**Still open (the bug-finder upgrade):** the current reference is the *cubic
+enhancement* (deliberately brighter than hardware), so −35 dB is the Gaussian's
+*character*, not a canon-vs-spec error. To turn this into a faithfulness PROOF /
+bug-finder, swap in a hardware-FAITHFUL, independently-coded reference (blargg
+Gaussian table + BRR, separate from canon's code path): then divergence ~0 proves
+canon's per-voice math, and any spike localizes a real deviation. Echo stage next.
+
 ### Internal lockstep reference (the real audio oracle) — DESIGN
 
 Per owner: don't diff two separate emulators (never sample-align). Embed a
@@ -354,9 +403,97 @@ per-sample. The seed already exists: **`dsp_shadow`** runs a parallel dry-mix
    existing cubic shadow) → first internal-reference tone number, no new deps.
 2. Promote `dsp_shadow` to a full faithful reference S-DSP for per-stage attribution.
 3. Self-A/B the **immediate-KON vs `#if !MY_CHANGES` hardware-cycle KON** path.
-4. Off-cue cure ties to Axis 2 (real SPC clock from a real cycle estimate).
+4. ~~Off-cue cure ties to Axis 2 (real SPC clock from a real cycle estimate).~~
+   **TRIED + DISPROVEN 2026-06-28 — see "Off-cue experiment" below.**
 5. Robust pitch tracker (the dominant-bin metric is unreliable for polyphony).
 6. Extend to MMX / Zelda themes and SFX-heavy scenes.
+
+### Off-cue experiment (2026-06-28) — master-clock SPC pacing REGRESSES, reverted
+
+**Hypothesis (Axis-2→Axis-5 tie):** replace the synthetic `+256-main-cycles-per-
+APU-touch` SPC pacing (`cpu_pace_cycles` → `rtl_accumulate_apu_catchup`, ×2/7)
+with a *real* clock — pace the SPC from the recompiler's region-weighted MASTER-
+clock accumulator. **Built it fully:** added `cpu->master_cycles` (companion to
+`cpu->cycles`), emitted per-block `CPU cycles × code-region speed` (memsel-aware;
+`recompiler/snes_cycles.py` `region_speed`), and drove `apuCatchupCycles` from
+the per-touch master delta (`× 1.024 MHz / 21.477 MHz`; the all-fast case reduces
+to the old 2/7). 22/22 cycle tests pass; SMW regen+build clean; booted fine (no
+watchdog stall — the fast recomp spin keeps the handshake over-clocking).
+
+**Measured A/B vs the bsnes oracle (SMW attract, full-overlap, identical window):**
+
+| build | pacing | drift | onset match | \|err\| med |
+|---|---|---|---|---|
+| BEFORE | +256/touch | −4013 ppm | 53% (24/45) | 8.0 ms |
+| AFTER  | master-clock | **−5900 ppm** | **29% (18/63)** | **28.0 ms** |
+| REVERT | +256/touch | −4013 ppm | 53% (24/45) | 8.0 ms |
+
+**Verdict: REGRESSION.** Master-clock pacing made the SPC run *faster* (drift more
+negative), halving onset match. The REVERT capture reproduces BEFORE bit-for-bit
+— which also proves **SMW attract is deterministic** and the A/B metric is
+reliable (so the regression is real, not capture noise).
+
+**Root cause:** `master_cycles` counts every recompiled block executed per
+*wall-frame*, but the recomp runs frames **host-driven** (60 fps via the host
+loop), NOT by counting 357368 master clocks/frame. Its per-frame execution-cycle
+total therefore does NOT track real elapsed time (spin-wait / non-HLE'd polling
+inflate it), so multiplying by region speed *over-paces* the SPC. The crude
+`+256/touch` is decoupled from this and happens to sit closer. **Pacing the SPC
+from accumulated GUEST-EXECUTION cycles is structurally wrong** — the SPC is a
+real-time clock domain; it must be paced by WALL time / consumer rate, which the
+audio thread (`RtlRenderAudio`, consumer-rate top-up) already does.
+
+**Reverted:** `rtl_accumulate_apu_catchup` restored to `+256/touch`. The
+`master_cycles` accumulator + `g_memsel` tracking are KEPT as **inert** Axis-5
+infra (mirrors the already-inert `cpu->cycles`; tested; near-free) so a *correct*
+pacing attempt can reuse it — they drive nothing now.
+
+### Off-cue follow-up (2026-06-28) — RING measurement + a measurement-bug fix
+
+After the failed pacing experiment, **measured** the steady-state SPC production
+via the always-on `audio_trace` ring (`audio_stats`, no pause), instead of
+guessing again. Two decisive results:
+
+1. **The SPC is paced 98.3% by the AUDIO THREAD (consumer rate), 1.7% by the
+   CPU-thread catch-up.** (SMW attract, 33 s window: produced 1,131,546 = 19,267
+   CPU + 1,112,279 audio; 0 drops.) So the `cpu_pace_cycles`/`rtl_accumulate_apu_
+   catchup` path — the one the failed experiment rewired — drives almost none of
+   the tempo. **Any off-cue fix must change the audio-thread / `dsp_getSamples`
+   path, not the CPU-thread catch-up.** This is the deeper reason master-clock
+   pacing couldn't help.
+2. **The native S-DSP production rate is 32040.3 samples/s — i.e. exactly the
+   intended 32040 Hz** (`apuCyclesPerMaster = 32040*32/(1364*262*60)`; byuu's
+   measured real-SNES rate; bsnes uses it too). The steady-state rate is *correct*.
+
+**Measurement bug found + fixed:** `audio_trace_dump_wav` hardcoded a **32000 Hz**
+WAV header for the 32040-rate PCM ring. So every `audio_ab_diff` run resampled the
+recomp 32000→32040 against the 32040 oracle — a systematic ~1250 ppm stretch +
+onset misalignment that **inflated the apparent off-cue**. Fixed the header to
+32040 (`runner/src/audio_trace.c`; dev-only dump path, no player-audio change).
+
+A/B effect (SMW attract vs bsnes), recomp WAV labeled correctly:
+
+| label | drift | onset | timbre LSD |
+|---|---|---|---|
+| 32000 (bug) | −4013 ppm (consistent) | 53% | 4.3 dB |
+| 32040 (fixed) | +754 .. −2272 ppm (noisy, weak corr) | 51–71% | **2.7 dB** |
+
+The systematic −4000 ppm is gone; the residual drift is small and **noise-
+dominated** (varies ±2000 ppm by capture window at corr ~0.2 — this metric is not
+trustworthy for <~kppm claims). The robust, repeatable gain is **LSD 4.3 → 2.7 dB**
+(spectral match; less alignment-sensitive). **Conclusion: the recomp's steady-state
+audio tempo is substantially correct; the "off-cue" was largely a dump-rate
+mislabel plus an unreliable drift metric.**
+
+**Next off-cue hypotheses (un-tried), now better-targeted:**
+- A trustworthy **per-sample tempo oracle** is needed (the `audio_ab_diff` drift
+  is too noisy at corr ~0.2). The internal lockstep S-DSP reference (dsp_shadow,
+  below) is the right instrument — diff per-sample note-event timing, not a
+  cross-correlation lag slope on two separately-produced WAVs.
+- If a real residual remains, audit **command scheduling** (`RtlApuWrite` anchors
+  each port write in SPC-sample time from wall gaps) for hardware-faithful target
+  placement — that shifts *when* notes trigger, the true "cue".
+- The CPU-thread catch-up (1.7%) is NOT the lever; don't re-touch it.
 
 ## Axis 5 (cont.) — PPU / video · **SCANLINE-accurate render, frame-accurate timing**
 

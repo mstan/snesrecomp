@@ -114,6 +114,18 @@ typedef struct AudioTraceStats {
    * same port before any SPC read observed them — the "command lost
    * before the engine saw it" counter. Per-port. */
   uint64_t cpu_port_overwrites[4];
+
+  /* In-process DSP reference divergence (dev / SNESRECOMP_TRACE builds only).
+   * Per output sample, the canon dry mix vs the dsp_shadow reference re-render,
+   * in the normalized [-1,1] domain, accumulated only while the canon mix is
+   * non-silent. This is the internal lockstep tone oracle: artifact-free (no
+   * cross-process resample / alignment that confounds the bsnes WAV diff). The
+   * current reference is the cubic-interpolation render, so the number is the
+   * Gaussian-interpolation tone contribution (canon Gaussian vs ideal cubic).
+   * RMS = sqrt(shadow_div_sumsq / shadow_div_count); report 20*log10(RMS) dB. */
+  uint64_t shadow_div_count;   /* non-silent output samples measured        */
+  double   shadow_div_sumsq;   /* sum over samples of (dL^2 + dR^2) / 2     */
+  double   shadow_div_max;     /* peak |d| (max of |dL|,|dR|) over session  */
 } AudioTraceStats;
 
 /* ---- record hooks (call sites: dsp.c, snes.c, common_rtl.c) ---- */
@@ -121,6 +133,11 @@ void audio_trace_on_sample(int16_t l, int16_t r, int dropped, uint32_t ring_fill
 void audio_trace_on_reg_write(uint8_t addr, uint8_t val);
 void audio_trace_on_consume(uint64_t read_idx, uint32_t count, uint32_t avail_after);
 void audio_trace_set_producer(int producer);
+/* Record one output sample's canon-vs-reference DSP divergence (normalized
+ * [-1,1] domain). Dev-only tone measurement; called from dsp_shadow under
+ * RtlApuLock. Silent samples (both args ~0 with a silent canon) should be
+ * filtered by the caller so the RMS reflects active audio. */
+void audio_trace_on_shadow_div(double dl, double dr);
 /* Per catch-up accumulation: consumer state + wall-clock baseline cycles
  * injected (0 when a consumer is draining or no wall time elapsed). */
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles);
