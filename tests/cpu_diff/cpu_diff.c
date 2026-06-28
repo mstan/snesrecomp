@@ -109,6 +109,20 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     uint16_t xv = op->idx ? (uint16_t)(st->x % 0xF00) : st->x;
     uint16_t yv = op->idx ? (uint16_t)(st->y % 0xF00) : st->y;
 
+    /* indirect ops: plant a pointer (into low WRAM) at the dp slot, identically
+     * in both buses, so the indirect EA resolves into the filled WRAM window.
+     * (dp,X) reads the pointer at D+dp+X; the rest at D+dp. */
+    if (op->ind) {
+        uint32_t dp = op->code[1];
+        uint32_t loc = (op->ind == 3) ? (uint32_t)((st->d + dp + xv) & 0xFFFF)
+                                      : (uint32_t)((st->d + dp) & 0xFFFF);
+        uint32_t pr = rnd() % 0x1000;
+        uint32_t c = mapa(0x00, loc);
+        RAM[c]     = RAM2[c]     = (uint8_t)pr;
+        RAM[c + 1] = RAM2[c + 1] = (uint8_t)(pr >> 8);
+        if (op->ind == 2) { RAM[c + 2] = RAM2[c + 2] = 0x00; }  /* 24-bit: bank 0 */
+    }
+
     /* recomp side */
     memset(&g_cpu, 0, sizeof g_cpu);
     g_cpu.ram = RAM; g_cpu.A = st->a; g_cpu.X = xv; g_cpu.Y = yv;

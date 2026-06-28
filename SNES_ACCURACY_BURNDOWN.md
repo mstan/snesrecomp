@@ -110,13 +110,16 @@ Harness now uses SEPARATE buses for recomp vs interp816 (so stores diff
 independently) with a low-WRAM mirror canonicalization (the recomp routes dp to
 $7E; interp reads $00 — mapped to one physical offset in both), addressing bounded
 to WRAM (<$2000). The core memory-addressing + RMW + store path is validated
-clean. **Indexed added (2026-06-28):** abs,X / abs,Y / dp,X for load/store/ALU/RMW
-(index bounded so EA stays in WRAM) — now **395 opcode variants, 0 divergences**
-(1.185M checks). Coverage = immediate + implied + transfer + flags + dp + abs +
-indexed, all matching interp816. **Next lever:** indirect ((dp),Y / [dp] / (dp,X))
-+ long (needs a pointer/ROM set-up in the bus) + stack (PHA/PLA/PEA/PEI) + block
-move (MVN/MVP); the bank-carry / high-D dp ($7E-routing) edge is the known risk
-surface still untested.
+clean. **Indexed + indirect + stack added (2026-06-28):** abs,X/Y, dp,X; (dp,X),
+(dp), (dp),Y, [dp], [dp],Y (pointer planted in the bus); and PHA/PLA/PHX/PLX/PHY/
+PLY/PHP/PLP/PHB/PLB/PHD/PLD/PHK (the harness S-=2 RTS-undo recovers the push/pull
+S effect). Now **501 opcode variants, 0 divergences (1.503M checks)** vs interp816.
+Coverage = immediate + implied + transfer + flags + dp + abs + indexed + indirect
++ stack — essentially the whole load/store/ALU/RMW/stack/transfer set across all
+common addressing modes, all matching. **Next lever (diminishing):** long
+addressing + MVN/MVP + PEA/PEI/PER + control flow (branches/JSR/RTI — harder in a
+single-op harness); the bank-carry / high-D dp ($7E-routing) edge is the known
+untested modeling assumption.
 
 ## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
 

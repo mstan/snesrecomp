@@ -12,6 +12,10 @@ typedef struct {
     uint8_t m, x;
     uint8_t wmem;  /* 1 = writes memory (store/RMW): also diff the RAM window */
     uint8_t idx;   /* 1 = index-addressed: bound X/Y so the EA stays in WRAM */
+    uint8_t ind;   /* indirect: plant a pointer at the dp slot.
+                    *   1 = 16-bit ptr at D+dp  ((dp), (dp),Y)
+                    *   2 = 24-bit ptr at D+dp  ([dp], [dp],Y)
+                    *   3 = 16-bit ptr at D+dp+X ((dp,X)) */
 } OpTest;
 
 extern const OpTest g_ops[];

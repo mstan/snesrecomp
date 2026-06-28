@@ -45,7 +45,7 @@ funcs = []      # emitted C source blocks
 table = []      # (cname, codebytes, m, x, wmem)
 
 
-def emit(label, code, m, x, wmem=0, idx=0):
+def emit(label, code, m, x, wmem=0, idx=0, ind=0):
     fn = f"op_{label}"
     rom = make_lorom_bank0({0x8000: bytes(code) + bytes([RTS])})
     src = emit_function(rom, bank=0, start=0x8000, entry_m=m, entry_x=x,
@@ -53,7 +53,7 @@ def emit(label, code, m, x, wmem=0, idx=0):
     cname = f"{fn}_M{m}X{x}"
     if cname not in [t[0] for t in table]:
         funcs.append(src)
-        table.append((cname, code, m, x, wmem, idx))
+        table.append((cname, code, m, x, wmem, idx, ind))
 
 
 for label, op, _ in IMM_OPS:
@@ -115,6 +115,35 @@ for label, dpx, absx, absy, kind in IDX:
         if absy is not None:
             emit(f"{label}_absy", [absy, ABS & 0xff, ABS >> 8], m, x, wmem, idx=1)
 
+# ── indirect addressing: (dp,X) (dp) (dp),Y [dp] [dp],Y — pointer planted ──
+# (label, dpx, dp, dpy, ldp, ldpy)  opcodes per ALU op
+INDIR = [
+    ("ora", 0x01, 0x12, 0x11, 0x07, 0x17), ("and", 0x21, 0x32, 0x31, 0x27, 0x37),
+    ("eor", 0x41, 0x52, 0x51, 0x47, 0x57), ("adc", 0x61, 0x72, 0x71, 0x67, 0x77),
+    ("sta", 0x81, 0x92, 0x91, 0x87, 0x97), ("lda", 0xA1, 0xB2, 0xB1, 0xA7, 0xB7),
+    ("cmp", 0xC1, 0xD2, 0xD1, 0xC7, 0xD7), ("sbc", 0xE1, 0xF2, 0xF1, 0xE7, 0xF7),
+]
+for label, dpx, dp, dpy, ldp, ldpy in INDIR:
+    wmem = 1 if label == "sta" else 0
+    for m, x in ((1, 1), (0, 1)):
+        emit(f"{label}_indx", [dpx, DP], m, x, wmem, idx=1, ind=3)  # (dp,X)
+        emit(f"{label}_ind",  [dp,  DP], m, x, wmem, ind=1)         # (dp)
+        emit(f"{label}_indy", [dpy, DP], m, x, wmem, idx=1, ind=1)  # (dp),Y
+        emit(f"{label}_lind", [ldp, DP], m, x, wmem, ind=2)         # [dp]
+        emit(f"{label}_lindy",[ldpy,DP], m, x, wmem, idx=1, ind=2)  # [dp],Y
+
+# ── stack push/pull (operand-less). Pushes write the stack (wmem=1); the
+# harness's S-=2 RTS-undo recovers the push/pull effect on S. ──
+STACK = [
+    ("pha", 0x48, 1), ("pla", 0x68, 0), ("phx", 0xDA, 1), ("plx", 0xFA, 0),
+    ("phy", 0x5A, 1), ("ply", 0x7A, 0), ("php", 0x08, 1), ("plp", 0x28, 0),
+    ("phb", 0x8B, 1), ("plb", 0xAB, 0), ("phd", 0x0B, 1), ("pld", 0x2B, 0),
+    ("phk", 0x4B, 1),
+]
+for label, op, push in STACK:
+    for m, x in ((1, 1), (0, 0)):
+        emit(f"{label}", [op], m, x, wmem=push)
+
 for label, op in IMPLIED:
     emit(f"{label}_m1", [op], 1, 1)
     # also a 16-bit-width variant for the width-sensitive ops
@@ -133,9 +162,9 @@ with open(out, "w", newline="\n") as f:
         f.write(s)
         f.write("\n")
     f.write(f"\nconst OpTest g_ops[] = {{\n")
-    for cname, code, m, x, wmem, idx in table:
+    for cname, code, m, x, wmem, idx, ind in table:
         cb = ",".join(f"0x{b:02x}" for b in code)
-        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}, {idx}}},\n')
+        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}, {idx}, {ind}}},\n')
     f.write("};\n")
     f.write(f"const int g_nops = {len(table)};\n")
 print(f"wrote {out}: {len(table)} opcode variants")
