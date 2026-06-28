@@ -531,16 +531,41 @@ mislabel plus an unreliable drift metric.**
   placement — that shifts *when* notes trigger, the true "cue".
 - The CPU-thread catch-up (1.7%) is NOT the lever; don't re-touch it.
 
-## Axis 5 (cont.) — PPU / video · **SCANLINE-accurate render, frame-accurate timing**
+## Axis 5 (cont.) — PPU / video · **VERIFIED PIXEL-EXACT vs bsnes (2026-06-28)**
 
 - Scanline rasterizer (bsnes/LakeSnes lineage, `ppu.c`), all modes 0-7 + windows
   + mosaic + sprites. Frame produced in one burst by the game-side draw loop;
   **no free-running dot clock** (`inVblank` never set; comment `ppu.c:847`).
 - DMA/HDMA functionally modeled (8 modes, indirect HDMA) but **timing-transparent**
   — `dmaTimer` is not fed back to the scheduler. Always-on `$420B` DMA trace ring.
-- **Next lever:** per-frame VRAM byte-diff vs bsnes (the psx `axis5_gpu` VRAM-diff
-  analog); requires exposing VRAM from the oracle (snesref currently exposes only
-  WRAM-lo via `RETRO_MEMORY_SYSTEM_RAM`).
+
+### Framebuffer diff — recomp output is BIT-IDENTICAL to bsnes (2026-06-28)
+
+Built a two-process per-frame **framebuffer** diff (more complete than VRAM-only:
+tests guest→VRAM/OAM/CGRAM *and* the rasterizer end-to-end; frames are discrete +
+deterministic so frame-N alignment is clean, unlike audio). Infra:
+- recomp: debug-server `dump_frame_raw <N> <path>` — arms a NON-PAUSING capture in
+  `debug_server_record_frame` (re-renders the present PPU into a private 256x224
+  buffer, the proven `cmd_screenshot` path; RULE-0 safe) and writes raw BGRX.
+- oracle: `tools/snesref` `cb_video` dumps listed frames raw (env
+  `SNESREF_FRAME_DUMP_DIR/_FROM/_TO/_STEP`); converts 0RGB1555 (bsnes 115's format)
+  → BGRX to match.
+- analysis: `tools/ppu_frame_diff.py` — per-frame exact/tolerant pixel match, MAD,
+  PSNR, boot-offset search.
+
+**Result (SMW title, authentic 4:3):** recomp frame 300 == bsnes 504 and recomp
+700 == bsnes 904 — a single constant boot offset **+204** (bsnes runs the full real
+boot; the recomp HLEs it ~204 frames faster) — each at **100.00% exact pixel match,
+ZERO of 57,344 pixels different**, sprites included. The recomp's PPU output is
+**bit-identical to the bsnes oracle**. (Gotcha that masked it first pass: the dev
+config had `Widescreen=1` + `NoSpriteLimits=1` → the 256-wide crop grabbed the
+16:9 left-extension and matched ~36%; set authentic 4:3 → 100%.)
+
+*Caveat:* verified on the title screen (BG + animated sprites + palette). The
+attract DEMO (scrolling/HDMA/sprite-heavy gameplay) is not yet bit-aligned — those
+frames were sprite-phase-offset in the coarse search; a fine-aligned demo pass is
+the obvious extension. Title-screen bit-exactness is already strong evidence the
+rasterizer + DMA-to-VRAM path are faithful.
 
 ## Axis 6 — Static-vs-dynamic recompiler fidelity · **STRONG**
 

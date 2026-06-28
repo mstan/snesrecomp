@@ -129,8 +129,64 @@ static void ensure_texture(unsigned w, unsigned h) {
     g_tex = SDL_CreateTexture(g_ren, sf, SDL_TEXTUREACCESS_STREAMING, w, h);
     g_tex_w=w; g_tex_h=h;
 }
+// Raw frame dump for the PPU framebuffer diff vs the recomp. Controlled by env:
+//   SNESREF_FRAME_DUMP_DIR + _FROM/_TO/_STEP. Writes <dir>/frame_NNNNNN.raw as
+//   256x224 BGRX (XRGB8888 byte order = same as the recomp's dump). g_frame here
+//   is the pre-increment frame number (first produced frame = 0).
+static void maybe_dump_frame(const void* data, unsigned w, unsigned h, size_t pitch) {
+    static int inited = 0;
+    static const char* dir = nullptr;
+    static long from = -1, to = -1, step = 1;
+    if (!inited) {
+        inited = 1;
+        dir = getenv("SNESREF_FRAME_DUMP_DIR");
+        const char* f = getenv("SNESREF_FRAME_DUMP_FROM"); if (f && f[0]) from = atol(f);
+        const char* t = getenv("SNESREF_FRAME_DUMP_TO");   if (t && t[0]) to   = atol(t);
+        const char* s = getenv("SNESREF_FRAME_DUMP_STEP"); if (s && s[0]) step = atol(s);
+        if (step < 1) step = 1;
+    }
+    static int announced = 0;
+    if (!announced) { announced = 1;
+        fprintf(stderr, "[framedump] fmt=%d w=%u h=%u pitch=%zu dir=%s\n",
+                (int)g_fmt, w, h, pitch, dir); fflush(stderr); }
+    if (!dir || !dir[0] || !data) return;
+    long fr = (long)g_frame;
+    if (fr < from || fr > to || ((fr - from) % step) != 0) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/frame_%06ld.raw", dir, fr);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    int cols = (w < 256) ? (int)w : 256;
+    int rows = (h < 224) ? (int)h : 224;
+    const unsigned char* p = (const unsigned char*)data;
+    unsigned char row[256 * 4];
+    for (int y = 0; y < 224; y++) {
+        memset(row, 0, sizeof(row));
+        if (y < rows) {
+            const unsigned char* sr = p + (size_t)y * pitch;
+            for (int x = 0; x < cols; x++) {
+                unsigned char B, G, R;
+                if (g_fmt == RETRO_PIXEL_FORMAT_XRGB8888) {
+                    B = sr[x*4+0]; G = sr[x*4+1]; R = sr[x*4+2];  // already BGRX
+                } else if (g_fmt == RETRO_PIXEL_FORMAT_RGB565) {
+                    unsigned v = sr[x*2+0] | (sr[x*2+1] << 8);
+                    unsigned r5=(v>>11)&0x1f, g6=(v>>5)&0x3f, b5=v&0x1f;
+                    R=(unsigned char)((r5<<3)|(r5>>2)); G=(unsigned char)((g6<<2)|(g6>>4)); B=(unsigned char)((b5<<3)|(b5>>2));
+                } else { // 0RGB1555
+                    unsigned v = sr[x*2+0] | (sr[x*2+1] << 8);
+                    unsigned r5=(v>>10)&0x1f, g5=(v>>5)&0x1f, b5=v&0x1f;
+                    R=(unsigned char)((r5<<3)|(r5>>2)); G=(unsigned char)((g5<<3)|(g5>>2)); B=(unsigned char)((b5<<3)|(b5>>2));
+                }
+                row[x*4+0]=B; row[x*4+1]=G; row[x*4+2]=R; row[x*4+3]=0;
+            }
+        }
+        fwrite(row, 1, 256 * 4, f);
+    }
+    fclose(f);
+}
 static void cb_video(const void* data, unsigned w, unsigned h, size_t pitch) {
     if (data && w && h) {
+        maybe_dump_frame(data, w, h, pitch);
         ensure_texture(w,h);
         SDL_UpdateTexture(g_tex, nullptr, data, (int)pitch);
     }

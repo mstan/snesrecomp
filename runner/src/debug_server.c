@@ -1397,6 +1397,15 @@ static int s_history_count = 0;
 
 // Called from the verify system after each frame comparison (main thread).
 // Protected by mutex since the network thread reads frame history.
+/* Raw frame-N dump (PPU verification vs the bsnes oracle). Armed by
+ * cmd_dump_frame_raw; captured here at present-time WITHOUT pausing (RULE 0):
+ * when the armed frame passes, re-render the current PPU into a private 256x224
+ * BGRX buffer (the proven cmd_screenshot path) and write it raw. No effect on
+ * the live window or the run loop. */
+static volatile int s_fdump_target = -1;
+static volatile int s_fdump_done   = -1;
+static char s_fdump_path[512];
+
 void debug_server_record_frame(int frame) {
     extern uint8_t g_ram[];
 
@@ -1409,6 +1418,20 @@ void debug_server_record_frame(int frame) {
     if (s_run_to_frame_target >= 0 && frame >= s_run_to_frame_target) {
         s_run_to_frame_target = -1;
         s_paused = 1;
+    }
+
+    if (s_fdump_target >= 0 && frame == s_fdump_target && g_ppu) {
+        static uint8_t fdump_scr[256 * 4 * 240];
+        uint8_t *saved_rb = g_ppu->renderBuffer;
+        uint32_t saved_rp = g_ppu->renderPitch;
+        PpuBeginDrawing(g_ppu, fdump_scr, 256 * 4, 0);
+        for (int i = 0; i <= 224; i++) ppu_runLine(g_ppu, i);
+        g_ppu->renderBuffer = saved_rb;
+        g_ppu->renderPitch  = saved_rp;
+        FILE *f = fopen(s_fdump_path, "wb");
+        if (f) { fwrite(fdump_scr, 1, 256 * 224 * 4, f); fclose(f); }
+        s_fdump_target = -1;
+        s_fdump_done = frame;
     }
 
     lock_mutex();
@@ -6491,6 +6514,36 @@ static void cmd_audio_shadow_div(const char *args) {
              (unsigned long long)st.echo_div_count, erms_db, emax_db);
 }
 
+/* dump_frame_raw <frame> <path> — arm a non-pausing capture of frame N's pixels
+ * (debug_server_record_frame writes raw BGRX 256x224x4 when the frame passes) and
+ * block until done. For the PPU framebuffer diff vs the bsnes oracle. */
+static void cmd_dump_frame_raw(const char *args) {
+    char path[512] = {0};
+    int n = -1;
+    if (sscanf(args, "%d %511s", &n, path) < 2 || n < 0) {
+        send_fmt("{\"error\":\"usage: dump_frame_raw <frame> <path>\"}");
+        return;
+    }
+    strncpy(s_fdump_path, path, sizeof(s_fdump_path) - 1);
+    s_fdump_path[sizeof(s_fdump_path) - 1] = 0;
+    s_fdump_done = -1;
+    s_fdump_target = n;  /* arm; the emulation thread captures when frame==n */
+    for (int i = 0; i < 1500 && s_fdump_done != n; i++) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+    if (s_fdump_done == n)
+        send_fmt("{\"ok\":true,\"frame\":%d,\"path\":\"%s\",\"width\":256,\"height\":224}",
+                 n, path);
+    else {
+        s_fdump_target = -1;
+        send_fmt("{\"error\":\"timeout; frame %d not reached (already passed?)\"}", n);
+    }
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"audio_stats",   cmd_audio_stats},
@@ -6661,6 +6714,7 @@ static const CmdEntry s_commands[] = {
     {"get_apu_state", cmd_get_apu_state},
     {"dump_apu_ram",  cmd_dump_apu_ram},
     {"screenshot",     cmd_screenshot},
+    {"dump_frame_raw", cmd_dump_frame_raw},
     {"get_frame_extended", cmd_get_frame_extended},
     {"get_frame_range_extended", cmd_get_frame_range_extended},
     {NULL, NULL}
