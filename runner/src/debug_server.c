@@ -6471,15 +6471,24 @@ static void cmd_audio_shadow_div(const char *args) {
     double frms_db = frms > 1e-12 ? 20.0 * log10(frms) : -240.0;
     double fmax_db = st.faithful_div_max > 1e-12
                          ? 20.0 * log10(st.faithful_div_max) : -240.0;
+    /* BRR-decode + echo-FIR faithful divergence. */
+    double brms = st.brr_div_count
+                      ? sqrt(st.brr_div_sumsq / (double)st.brr_div_count) : 0.0;
+    double brms_db = brms > 1e-12 ? 20.0 * log10(brms) : -240.0;
+    double bmax_db = st.brr_div_max > 1e-12 ? 20.0 * log10(st.brr_div_max) : -240.0;
+    double erms = st.echo_div_count
+                      ? sqrt(st.echo_div_sumsq / (double)st.echo_div_count) : 0.0;
+    double erms_db = erms > 1e-12 ? 20.0 * log10(erms) : -240.0;
+    double emax_db = st.echo_div_max > 1e-12 ? 20.0 * log10(st.echo_div_max) : -240.0;
     send_fmt("{\"ok\":true,"
-             "\"cubic\":{\"count\":%llu,\"rms\":%.8f,\"rms_db\":%.2f,"
-             "\"max\":%.8f,\"max_db\":%.2f},"
-             "\"faithful\":{\"count\":%llu,\"rms\":%.8f,\"rms_db\":%.2f,"
-             "\"max\":%.8f,\"max_db\":%.2f}}",
-             (unsigned long long)st.shadow_div_count, rms, rms_db,
-             st.shadow_div_max, max_db,
-             (unsigned long long)st.faithful_div_count, frms, frms_db,
-             st.faithful_div_max, fmax_db);
+             "\"cubic\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f},"
+             "\"faithful_gauss\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f},"
+             "\"faithful_brr\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f},"
+             "\"faithful_echo\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f}}",
+             (unsigned long long)st.shadow_div_count, rms_db, max_db,
+             (unsigned long long)st.faithful_div_count, frms_db, fmax_db,
+             (unsigned long long)st.brr_div_count, brms_db, bmax_db,
+             (unsigned long long)st.echo_div_count, erms_db, emax_db);
 }
 
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;

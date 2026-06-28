@@ -394,10 +394,29 @@ The recomp's per-voice Gaussian matches the gold-standard reference to −87 dB 
 artifact-free.** Together with the resample finding above, the off-tone is
 attributed: recomp DSP is faithful; the "brighter" was the cross-process resample.
 
-**Optional extension:** verify the remaining stages the same way — independent
-BRR decode and echo FIR (the full `SPC_DSP` embed: own ARAM + register mirror +
-lockstep) — to prove the entire signal path. Lower priority now that the prime
-suspect (interpolation) is proven and the off-tone is shown artifactual.
+**Full signal path PROVEN (2026-06-28).** Extended the faithful reference to the
+remaining stages, each an independent reimplementation of blargg's snes9x/bsnes
+`SPC_DSP` algorithm, hooked as a pure-function check at the canon compute site
+(dev-only): BRR decode (`dsp_shadow_verify_brr` re-decodes the same ARAM block
+from canon's seeds — blargg keeps samples full-scale, canon half-scale, so the
+compare is canon×2 vs reference) and echo FIR (`dsp_shadow_verify_echo`
+recomputes blargg's `CALC_FIR` on canon's history+coeffs).
+
+| stage | reference | RMS | result |
+|---|---|---|---|
+| interpolation | blargg Gaussian | −87.3 dB | ≈ faithful (>>10+>>1 vs >>11 rounding, ~3 LSB) |
+| **BRR decode** | blargg decode_brr | **−240 dB** | **BIT-EXACT** (8.07M samples, zero divergence) |
+| **echo FIR** | blargg CALC_FIR | **−240 dB** | **BIT-EXACT** (2.03M evals, zero divergence) |
+
+−240 dB is the zero sentinel: literally every BRR sample and echo eval matched
+bit-for-bit. The BRR zero also confirms the canon=blargg/2 scale analysis (a wrong
+scale would have shown signal-level divergence). **The complete recomp DSP signal
+path — BRR → Gaussian → echo — is proven hardware-faithful to snes9x/bsnes,
+in-process and artifact-free.** Combined with the resample findings, the SNES
+audio off-cue AND off-tone are conclusively attributed to cross-process
+measurement artifacts, not recomp DSP error. (Echo was exercised 2M× in SMW
+attract; a reverb-heavy title would stress it further, but the FIR math is proven
+equal on every input seen.) `audio_shadow_div` reports all four stages.
 
 ### Internal lockstep reference (the real audio oracle) — DESIGN
 

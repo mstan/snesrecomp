@@ -122,6 +122,20 @@ void audio_trace_on_faithful_div(double d) {
   s_stats.faithful_div_count++;
 }
 
+void audio_trace_on_brr_div(double d) {
+  double a = d < 0 ? -d : d;
+  if (a > s_stats.brr_div_max) s_stats.brr_div_max = a;
+  s_stats.brr_div_sumsq += d * d;
+  s_stats.brr_div_count++;
+}
+
+void audio_trace_on_echo_div(double d) {
+  double a = d < 0 ? -d : d;
+  if (a > s_stats.echo_div_max) s_stats.echo_div_max = a;
+  s_stats.echo_div_sumsq += d * d;
+  s_stats.echo_div_count++;
+}
+
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles) {
   s_stats.pace_consumer_active = (uint32_t)(consumer_active != 0);
   s_stats.pace_baseline_cycles += baseline_cycles;

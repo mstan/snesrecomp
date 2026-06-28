@@ -87,6 +87,77 @@ static int ref_gauss(const int16_t* buf, int n, int offset) {
 }
 #endif
 
+// Faithful BRR reference = blargg's snes9x/bsnes SPC_DSP decode_brr, re-decoding
+// the same ARAM block. blargg keeps samples at FULL scale (final *2); canon keeps
+// HALF scale (compensated later by the Gaussian >>10 vs blargg >>11), so the
+// reference is seeded with 2x canon's prior samples and the comparison is canon*2
+// vs the reference. Isolates the BRR filter/shift/clamp logic vs the gold standard.
+#if defined(SNESRECOMP_TRACE)
+void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
+                           int oldSeed, int olderSeed, const int16_t* canonOut16) {
+  int header = aram[blockStart];
+  int shift = header >> 4;
+  int filter = header & 0x0C;        // blargg keeps the 2 filter bits in place
+  int prev1 = oldSeed * 2;           // blargg full scale = 2x canon half scale
+  int prev2 = olderSeed * 2;
+  for (int i = 0; i < 16; i++) {
+    int byte = aram[(uint16_t)(blockStart + 1 + (i >> 1))];
+    int nib = (i & 1) ? (byte & 0xf) : (byte >> 4);
+    int s = (int)((int16_t)(nib << 12)) >> 12;   // sign-extend 4-bit nibble
+    if (shift <= 12) s = (s << shift) >> 1;
+    else s &= ~0x7ff;
+    int p1 = prev1, p2 = prev2 >> 1;
+    if (filter >= 8) {
+      s += p1; s -= p2;
+      if (filter == 8) { s += p2 >> 4; s += (p1 * -3) >> 6; }
+      else             { s += (p1 * -13) >> 7; s += (p2 * 3) >> 4; }
+    } else if (filter) {
+      s += p1 >> 1; s += (-p1) >> 5;
+    }
+    if (s < -0x8000) s = -0x8000; else if (s > 0x7fff) s = 0x7fff;  // CLAMP16
+    s = (int16_t)(s * 2);
+    prev2 = prev1; prev1 = s;
+    int canon_full = (int)canonOut16[i] * 2;     // canon half -> full scale
+    audio_trace_on_brr_div((double)(canon_full - s) / 32768.0);
+  }
+}
+#else
+void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
+                           int oldSeed, int olderSeed, const int16_t* canonOut16) {
+  (void)aram; (void)blockStart; (void)oldSeed; (void)olderSeed; (void)canonOut16;
+}
+#endif
+
+// Faithful echo-FIR reference = blargg's snes9x/bsnes CALC_FIR: taps 0-6 summed,
+// (int16) clip, then tap 7 ADDED AS (int16), CLAMP16, clear LSB. Canon adds tap 7
+// raw (no int16 cast) and omits the LSB clear -- the only differences, isolated.
+#if defined(SNESRECOMP_TRACE)
+static int ref_echo_fir(const int16_t* fir, const int8_t* coeff, int idx) {
+  int sum = 0;
+  for (int i = 0; i < 7; i++)
+    sum += (fir[(idx + i + 1) & 7] * (int)coeff[i]) >> 6;
+  sum = (int16_t)sum;  // clip after tap 6
+  sum += (int16_t)((fir[(idx + 8) & 7] * (int)coeff[7]) >> 6);  // tap 7, int16-cast
+  if (sum < -0x8000) sum = -0x8000; else if (sum > 0x7fff) sum = 0x7fff;
+  sum &= ~1;
+  return sum;
+}
+void dsp_shadow_verify_echo(const int16_t* firL, const int16_t* firR,
+                            const int8_t* coeff, int idx,
+                            int canonSumL, int canonSumR) {
+  int refL = ref_echo_fir(firL, coeff, idx);
+  int refR = ref_echo_fir(firR, coeff, idx);
+  audio_trace_on_echo_div((double)(canonSumL - refL) / 32768.0);
+  audio_trace_on_echo_div((double)(canonSumR - refR) / 32768.0);
+}
+#else
+void dsp_shadow_verify_echo(const int16_t* firL, const int16_t* firR,
+                            const int8_t* coeff, int idx,
+                            int canonSumL, int canonSumR) {
+  (void)firL; (void)firR; (void)coeff; (void)idx; (void)canonSumL; (void)canonSumR;
+}
+#endif
+
 void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
                         int* outL, int* outR) {
   *outL = canonL;

@@ -208,6 +208,10 @@ static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR) {
   }
   sumL = sumL < -0x8000 ? -0x8000 : (sumL > 0x7fff ? 0x7fff : sumL); // clamp 16-bit
   sumR = sumR < -0x8000 ? -0x8000 : (sumR > 0x7fff ? 0x7fff : sumR); // clamp 16-bit
+#if defined(SNESRECOMP_TRACE)
+  dsp_shadow_verify_echo(dsp->firBufferL, dsp->firBufferR, dsp->firValues,
+                         dsp->firBufferIndex, sumL, sumR);
+#endif
   // modify output with sum
   int outL = *outputL + ((sumL * dsp->echoVolumeL) >> 7);
   int outR = *outputR + ((sumR * dsp->echoVolumeR) >> 7);
@@ -400,6 +404,13 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
     }
     dsp->ram[0x7c] |= 1 << ch; // set ENDx
   }
+#if defined(SNESRECOMP_TRACE)
+  /* Dev faithful-reference: capture this BRR block's start + the two seed
+   * samples before canon decodes, so the reference can re-decode the same block
+   * (dsp_shadow_verify_brr below). */
+  uint16_t _brr_blk = dsp->channel[ch].decodeOffset;
+  int _brr_old = dsp->channel[ch].old, _brr_older = dsp->channel[ch].older;
+#endif
   uint8_t header = dsp->apu_ram[dsp->channel[ch].decodeOffset++];
   int shift = header >> 4;
   int filter = (header & 0xc) >> 2;
@@ -434,6 +445,10 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
   }
   dsp->channel[ch].older = older;
   dsp->channel[ch].old = old;
+#if defined(SNESRECOMP_TRACE)
+  dsp_shadow_verify_brr(dsp->apu_ram, _brr_blk, _brr_old, _brr_older,
+                        &dsp->channel[ch].decodeBuffer[3]);
+#endif
 }
 
 static void dsp_handleNoise(Dsp* dsp) {

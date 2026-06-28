@@ -138,6 +138,22 @@ typedef struct AudioTraceStats {
   uint64_t faithful_div_count;
   double   faithful_div_sumsq;
   double   faithful_div_max;
+
+  /* BRR-decode faithful-reference divergence (dev only). Per decoded BRR sample,
+   * canon dsp_decodeBrr vs blargg's snes9x/bsnes decode_brr (re-decoded from the
+   * same ARAM block + seeds), compared in a common full-scale domain (canon
+   * stores half-scale; blargg full-scale = 2x). ~0 proves the recomp BRR decode;
+   * a residual is the shift>12 invalid-block / rounding handling. */
+  uint64_t brr_div_count;
+  double   brr_div_sumsq;
+  double   brr_div_max;
+
+  /* Echo-FIR faithful-reference divergence (dev only). Per output sample, canon
+   * dsp_handleEcho 8-tap FIR sum vs blargg's CALC_FIR reference on the same FIR
+   * history + coefficients, normalized [-1,1]. ~0 proves the recomp echo FIR. */
+  uint64_t echo_div_count;
+  double   echo_div_sumsq;
+  double   echo_div_max;
 } AudioTraceStats;
 
 /* ---- record hooks (call sites: dsp.c, snes.c, common_rtl.c) ---- */
@@ -153,6 +169,12 @@ void audio_trace_on_shadow_div(double dl, double dr);
 /* Record one active-voice sample's canon-vs-faithful-reference Gaussian
  * divergence (normalized [-1,1]). Dev-only; called from dsp_shadow per voice. */
 void audio_trace_on_faithful_div(double d);
+/* Record one BRR-decoded sample's canon-vs-reference divergence (normalized).
+ * Dev-only; called from dsp_shadow_verify_brr. */
+void audio_trace_on_brr_div(double d);
+/* Record one output sample's canon-vs-reference echo-FIR divergence (normalized
+ * [-1,1], L/R averaged). Dev-only; called from dsp_handleEcho. */
+void audio_trace_on_echo_div(double d);
 /* Per catch-up accumulation: consumer state + wall-clock baseline cycles
  * injected (0 when a consumer is draining or no wall time elapsed). */
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles);
