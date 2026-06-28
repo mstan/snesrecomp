@@ -40,3 +40,6 @@ cfg_audit_results/
 
 # launcher dep build artifacts (rebuilt via tools/build_launcher_deps.ps1)
 lib/_build/
+
+# cpu_diff harness generated/built artifacts
+tests/cpu_diff/gen_ops.c

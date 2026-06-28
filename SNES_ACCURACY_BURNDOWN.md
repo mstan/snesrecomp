@@ -66,11 +66,37 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
 - **Status:** complete-or-fail by construction. `recompiler/snes65816.py` defines
   all **256** opcodes; an undecodable byte is a hard build error
   (`decoder.py:1640`). No runtime "unimplemented opcode" path.
-- **Gaps:** no CPU **test-ROM** validation (the psx Amidog analog). The real
-  semantic risk is abstract (M,X)-width soundness, tracked in
-  `docs/ABSTRACT_INTERPRETATION_GAPS.md`.
-- **Next lever:** run a 65816 test ROM (e.g. a SNES CPU test) on recomp vs bsnes,
-  diff result registers — highest-leverage single validator, not yet built.
+- **Gaps:** the real semantic risk is abstract (M,X)-width soundness + BCD,
+  tracked in `docs/ABSTRACT_INTERPRETATION_GAPS.md`.
+
+### Codegen differential validator BUILT — 3 real bugs found (2026-06-28)
+
+A test ROM is the wrong tool for a STATIC recompiler (it needs a from-scratch
+game bring-up). Built the right one instead: `tests/cpu_diff/` — a per-opcode
+**differential** harness that runs each opcode's REAL recompiled function (v2
+emitter) and one `interp816` reference step (LakeSnes) from an identical
+randomized CPU state and diffs registers+flags. No ROM, no game: a flat-RAM bus
+serves interp816 fetches + the emitted RTS pops; the recomp runtime seam is
+stubbed; run with `host_return_valid=0` and `S-=2` to recover the opcode's true S
+effect. 239 opcode variants (ALU-imm, index-imm, flags, shifts, transfers; m/x
+widths), 3000 randomized states each. Build/run: `tests/cpu_diff/run.ps1`.
+
+**Result: 183/239 opcodes bit-match interp816** (validates the harness); **56
+diverge in 3 confirmed recompiler bugs** (interp816 + the 65816 spec agree
+against the recomp):
+1. **ADC/SBC ignore decimal (D) mode** — emitted code is pure binary
+   `(A&0xFF)+imm+C`, no BCD adjustment; wrong on every D=1 input.
+2. **BIT #imm sets N and V** from the immediate — but immediate BIT ($89) must
+   affect ONLY Z (N/V are set only by BIT with a memory operand).
+3. **TDC / TSC do an 8-bit A write when M=1** — but TCD/TDC/TCS/TSC are ALWAYS
+   16-bit (M-independent); the recomp gates the A width on m_flag.
+
+These are exactly the flagged "(M,X)-width soundness + BCD" risks, now concrete.
+All are recompiler codegen fixes (recompiler/v2 emit/lowering), then regen+retest
+all games — the validator now verifies them. Whether any shipped game exercises
+them is unmeasured (SMW likely avoids BCD; BIT #imm / 8-bit TDC are plausible).
+**Next lever:** fix the 3, re-run to green; extend coverage to memory-addressing
+modes (DP/abs/indexed/indirect) + the remaining opcodes.
 
 ## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
 
