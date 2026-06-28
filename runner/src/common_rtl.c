@@ -1,6 +1,8 @@
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #include <setjmp.h>
+#include <time.h>
+#include <stdlib.h>
 #include "recomp_hw.h"
 #include "framedump.h"
 #include "util.h"
@@ -160,6 +162,25 @@ bool RtlRunFrame(uint32 inputs) {
   recomp_wram_trace_tick();   /* differential first-divergence trace (env-gated) */
 
   snes_frame_counter++;
+
+  /* Axis-2 soak instrumentation: env-gated FPS heartbeat to stderr. Counts
+   * frames completed per wall-clock second (the frame loop caps at ~60 fps, so
+   * ~60 = full speed; a sustained dip = slowdown). Zero cost when off; never
+   * pauses the runtime (RULE 0). Enable with SNESRECOMP_FPS=1. */
+  if (getenv("SNESRECOMP_FPS")) {
+    static long s_last_sec = 0;
+    static int  s_frames = 0;
+    long now = (long)time(NULL);
+    s_frames++;
+    if (s_last_sec == 0) {
+      s_last_sec = now;
+    } else if (now != s_last_sec) {
+      fprintf(stderr, "[fps] %d fps (frame=%d)\n", s_frames, snes_frame_counter);
+      s_frames = 0;
+      s_last_sec = now;
+    }
+  }
+
   return false;
 }
 
