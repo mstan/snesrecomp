@@ -34,7 +34,9 @@ from v2.decoder import (  # noqa: E402
 from v2.cfg import V2Block, V2CFG, build_cfg  # noqa: E402
 from v2.lowering import lower  # noqa: E402
 from v2.codegen import emit_op  # noqa: E402
-from snes_cycles import block_static_cycles, instr_runtime_charges  # noqa: E402
+from snes_cycles import (  # noqa: E402
+    block_static_cycles, instr_runtime_charges, region_speed,
+)
 from snes65816 import ABS_X as _MODE_ABS_X, ABS_Y as _MODE_ABS_Y  # noqa: E402
 from v2.ir import (  # noqa: E402
     IROp, IRBlock, Value,
@@ -72,10 +74,33 @@ def _block_cycle_const(pairs) -> int:
     return const
 
 
-def _dynamic_charge_lines(insn) -> List[str]:
+def _block_speed(bank: int, pc: int):
+    """Master-clocks-per-CPU-cycle for the CODE region of a block at (bank, pc).
+
+    Returns (expr, const) where `expr` is a C expression yielding the speed and
+    `const` is the int value when it's memsel-independent (then expr == str(int)),
+    else None and expr is the runtime `(g_memsel ? 6 : 8)` form. Per Axis-5
+    off-cue: the SPC is paced in master clocks, so each block's CPU-cycle charge
+    is weighted by its code region's access speed (snes_cycles.region_speed).
+    Only $80-$FF:$8000-$FFFF (WS2 LoROM) and $C0-$FF (WS2 HiROM) depend on the
+    live FastROM bit; everything else (all of a SlowROM game like SMW) is a
+    constant resolved here at gen time."""
+    addr24 = ((bank & 0xFF) << 16) | (pc & 0xFFFF)
+    s_slow = region_speed(addr24, 0)
+    s_fast = region_speed(addr24, 1)
+    if s_slow == s_fast:
+        return (str(s_slow), s_slow)
+    # memsel-dependent: fast when $420D bit 0 set, slow otherwise.
+    return (f"(g_memsel ? {s_fast} : {s_slow})", None)
+
+
+def _dynamic_charge_lines(insn, speed_expr: str = "8") -> List[str]:
     """Runtime-only per-instruction cycle charges (Axis-2 step C dynamics),
     emitted as conditional `cpu->cycles += 1;` statements just before the
     instruction's effect. Branch-taken is charged at the terminator instead.
+
+    Each +1 CPU-cycle charge also adds `speed_expr` master clocks (Axis-5), so
+    the master-clock accumulator stays region-weighted-consistent with `cycles`.
 
     Covered: D.l != 0 (any DP mode); index page-cross for abs,X / abs,Y READS
     (the base is the static operand; the index is the live register). NOT yet
@@ -88,18 +113,22 @@ def _dynamic_charge_lines(insn) -> List[str]:
     charges = instr_runtime_charges(op)
     out: List[str] = []
     if 'dp' in charges:
-        out.append("if (cpu->D & 0xFF) cpu->cycles += 1;  /* D.l != 0 */")
+        out.append(
+            f"if (cpu->D & 0xFF) {{ cpu->cycles += 1; "
+            f"cpu->master_cycles += {speed_expr}; }}  /* D.l != 0 */")
     if 'xcross' in charges:
         mode = getattr(insn, 'mode', None)
         base = getattr(insn, 'operand', 0) & 0xFFFF
         if mode == _MODE_ABS_X:
             out.append(
                 f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->X) & 0xFF00))"
-                f" cpu->cycles += 1;  /* abs,X read page-cross */")
+                f" {{ cpu->cycles += 1; cpu->master_cycles += {speed_expr}; }}"
+                f"  /* abs,X read page-cross */")
         elif mode == _MODE_ABS_Y:
             out.append(
                 f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->Y) & 0xFF00))"
-                f" cpu->cycles += 1;  /* abs,Y read page-cross */")
+                f" {{ cpu->cycles += 1; cpu->master_cycles += {speed_expr}; }}"
+                f"  /* abs,Y read page-cross */")
         # INDIR_Y (dp),Y: effective pointer is loaded at runtime from DP — not
         # reconstructable from the static operand; left as a measured residual.
     return out
@@ -1229,6 +1258,9 @@ def emit_function(rom: bytes, bank: int, start: int,
         block = cfg.blocks[key]
         lines: List[str] = []
         block_terminated = False  # True if last op was branch/goto/return/call
+        # Axis-5: master-clocks-per-CPU-cycle for this block's code region, used
+        # to weight the dynamic (D.l/page-cross/branch-taken) master charges.
+        _blk_spd_expr, _blk_spd_const = _block_speed(bank, key.pc)
 
         # Iterate the pre-lowered (Insn, [IROp]) pairs. Calling lower()
         # again here would mint fresh Value-ids and break codegen's
@@ -1380,7 +1412,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                 continue
             # Axis-2 step C dynamics: charge runtime-only modifiers (D.l != 0,
             # abs,X/Y read page-cross) for this instruction before its effect.
-            for _ln in _dynamic_charge_lines(di_insn):
+            for _ln in _dynamic_charge_lines(di_insn, _blk_spd_expr):
                 lines.append(_ln)
             for op in ir_ops:
                 if isinstance(op, CondBranch):
@@ -1397,7 +1429,9 @@ def emit_function(rom: bytes, bank: int, start: int,
                         # block const charged the not-taken base). Native mode;
                         # the emulation-only page-cross +1 is omitted (SNES game
                         # code runs e=0).
-                        lines.append(f"if ({pred}) {{ cpu->cycles += 1; {target_stmt} }}")
+                        lines.append(
+                            f"if ({pred}) {{ cpu->cycles += 1; "
+                            f"cpu->master_cycles += {_blk_spd_expr}; {target_stmt} }}")
                     if fall is not None:
                         lines.append(_goto_or_return(fall, source_pc24=blk_pc24)
                                      + " /* fall-through */")
@@ -1827,12 +1861,18 @@ def emit_function(rom: bytes, bank: int, start: int,
         # gets it at every block since we don't yet identify back-edges.
         src.append(f'    WatchdogCheck();')
         # Axis-2: charge this block's static 65816 CPU cycles as one constant
-        # add (recompiler/snes_cycles.py). Near-free; nothing reads cpu->cycles
-        # yet so behavior is identical. Runtime-only modifiers (D.l/page-cross/
-        # branch-taken) are a later increment.
+        # add (recompiler/snes_cycles.py). Near-free. Runtime-only modifiers
+        # (D.l/page-cross/branch-taken) are charged dynamically in block_lines.
+        # Axis-5: also charge the region-weighted MASTER clocks (CPU cycles x
+        # code-region speed) into cpu->master_cycles, which paces the SPC700.
         _cyc_const = _block_cycle_const(block_per_insn_ir.get(key, []))
         if _cyc_const:
             src.append(f'    cpu->cycles += {_cyc_const};')
+            _spd_expr, _spd_const = _block_speed(bank, key.pc)
+            if _spd_const is not None:
+                src.append(f'    cpu->master_cycles += {_cyc_const * _spd_const};')
+            else:
+                src.append(f'    cpu->master_cycles += {_cyc_const} * {_spd_expr};')
         for ln in block_lines[key]:
             # Inject RecompStackPop before any return so the stack stays balanced.
             stripped = ln.strip()

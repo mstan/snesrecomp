@@ -19,7 +19,11 @@ def test_linear_block_charges_static_cycles():
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
     charges = _STATIC_CHARGE.findall(src)
     assert charges == ['11'], f'expected one static block charge of 11, got {charges}'
-    assert "if (cpu->D & 0xFF) cpu->cycles += 1;" in src  # dp dynamic present
+    # dp dynamic present (Axis-5 reworded it to also charge master clocks).
+    assert "if (cpu->D & 0xFF) { cpu->cycles += 1;" in src
+    # Axis-5: the static block charge is region-weighted into master_cycles.
+    # Bank 0 LoROM = SLOW (8 master/CPU cycle) -> 11 * 8 = 88.
+    assert "cpu->master_cycles += 88;" in src, src
 
 
 def test_width_widens_static_charge():
@@ -42,7 +46,8 @@ def test_dp_dynamic_charge_emitted():
     # LDA $00 (DP mode) ; RTS — the D.l!=0 charge is runtime-conditional.
     rom = make_lorom_bank0({0x8000: bytes([0xA5, 0x00, 0x60])})
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
-    assert "if (cpu->D & 0xFF) cpu->cycles += 1;" in src, src
+    # The runtime D.l!=0 charge bumps both cycles and the region-weighted master.
+    assert "if (cpu->D & 0xFF) { cpu->cycles += 1; cpu->master_cycles += 8; }" in src, src
 
 
 def test_abs_x_page_cross_dynamic_charge_emitted():
@@ -61,7 +66,9 @@ def test_taken_branch_charges_one_cycle():
         0xEA, 0x60,  # NOP; RTS (taken)
     ])})
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
-    assert re.search(r'if \(.*\) \{ cpu->cycles \+= 1; goto ', src), src
+    # Taken edge: +1 CPU cycle plus its region-weighted master charge, then goto.
+    assert re.search(
+        r'if \(.*\) \{ cpu->cycles \+= 1; cpu->master_cycles \+= \d+; goto ', src), src
 
 
 def test_store_abs_x_has_no_page_cross_charge():
@@ -82,3 +89,21 @@ def test_every_block_with_insns_is_charged():
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
     charges = re.findall(r'cpu->cycles \+= (\d+);', src)
     assert len(charges) >= 3, f'expected a charge per block (>=3), got {charges}'
+
+
+def test_master_cycles_region_weighted_static_charge():
+    # Axis-5 off-cue: each static block charge gets a paired master-clock charge
+    # equal to (CPU cycles x code-region speed). Bank 0 ($00:$8000-$FFFF) is
+    # LoROM SLOW = 8 master clocks per CPU cycle, memsel-independent.
+    # LDA #$05 (2) ; RTS (6) = 8 CPU cycles -> 8 * 8 = 64 master clocks.
+    rom = make_lorom_bank0({0x8000: bytes([0xA9, 0x05, 0x60])})
+    src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
+    assert "cpu->cycles += 8;" in src, src
+    assert "cpu->master_cycles += 64;" in src, src
+    # Every static cpu->cycles charge has exactly one master partner (no orphan).
+    cyc = re.findall(r'^\s*cpu->cycles \+= (\d+);\s*$', src, re.M)
+    mas = re.findall(r'^\s*cpu->master_cycles \+= (\d+);\s*$', src, re.M)
+    assert len(cyc) == len(mas), f'static charge pairing mismatch: {cyc} vs {mas}'
+    # And the weighting holds term-by-term (slow region => master == 8*cpu).
+    for c, m in zip(cyc, mas):
+        assert int(m) == int(c) * 8, f'master {m} != 8*{c}'

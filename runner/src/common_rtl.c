@@ -49,6 +49,18 @@ uint64_t g_main_cpu_cycles_estimate = 0;
 uint64_t g_apu_pace_cycles_estimate = 0;
 uint64_t g_apu_last_sync_cycles = 0;
 
+// Axis-5 off-cue: APU pacing now derives from the recompiler's region-weighted
+// MASTER-clock accumulator (g_cpu.master_cycles) instead of the +256-per-touch
+// synthetic estimate. g_apu_last_sync_master is the master-clock count at the
+// last APU sync; rtl_accumulate_apu_catchup() converts the delta to SPC cycles.
+uint64_t g_apu_last_sync_master = 0;
+// $420D bit 0 (FastROM / MEMSEL): 1 => $80-$FF:$8000-$FFFF code runs fast (6
+// master clocks/access) instead of slow (8). Tracked here so emitted blocks in
+// the WS2 mirror banks weight their master-cycle charge correctly at runtime.
+// SlowROM games (e.g. SMW) never set it and run all code from $00-$3F (speed is
+// memsel-independent there), so this stays 0 and the emitted charge is constant.
+uint8_t g_memsel = 0;
+
 // FILE-backed SaveLoadInfo. snes_saveload calls back into func() once per
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
@@ -75,6 +87,10 @@ void RtlReset(int mode) {
   g_main_cpu_cycles_estimate = 0;
   g_apu_pace_cycles_estimate = 0;
   g_apu_last_sync_cycles = 0;
+  // master_cycles is monotonic across soft reset (RtlReset doesn't re-init
+  // g_cpu); anchor the sync pointer to its current value so the first post-reset
+  // catch-up sees a zero delta rather than the whole run's accumulated cycles.
+  g_apu_last_sync_master = g_cpu.master_cycles;
   snes_reset(g_snes, true);
   SnesEnterNativeMode();
   ppu_reset(g_ppu);
@@ -309,6 +325,8 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x4200 && reg < 0x4220) {
     if (reg == 0x420C)
       g_snesrecomp_last_hdmaen = value;
+    if (reg == 0x420D)
+      g_memsel = (uint8_t)(value & 1);  /* FastROM select; paces $80-FF code */
     recomp_write_internal_reg(reg, value);
   } else if (reg >= 0x4300 && reg < 0x4380) {
     dma_write(g_dma, reg, value);
@@ -421,12 +439,27 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 // Public so snes.c's snes_readBBus (the APU read path) can use the same
 // pacing -- both reads and writes need to advance APU.
 void rtl_accumulate_apu_catchup(void) {
+  // NOTE (Axis-5 off-cue experiment, 2026-06-28): pacing the SPC from the
+  // recompiler's region-weighted MASTER-clock accumulator (g_cpu.master_cycles,
+  // = sum of CPU cycles x code-region speed) was tried here in place of the
+  // +256/touch estimate below. Measured A/B vs the bsnes oracle REGRESSED it:
+  // SMW drift -4013 -> -5900 ppm, onset match 53% -> 29%. Root: master_cycles
+  // counts every recompiled block executed per wall-frame, but the recomp runs
+  // frames host-driven (not by counting 357368 master clocks/frame), so its
+  // per-frame execution-cycle total over-counts real elapsed time and the SPC
+  // over-advances (music runs fast). The accumulator stays emitted as inert
+  // Axis-5 infra (companion to cpu->cycles); a correct off-cue cure must pace by
+  // WALL time / consumer rate, not accumulated execution cycles -- see
+  // SNES_ACCURACY_BURNDOWN.md. Reverted to the known-good touch estimate:
   uint64_t delta = g_apu_pace_cycles_estimate - g_apu_last_sync_cycles;
   g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   // 2/7 is about 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
   // (back-to-back APU touches with no block hooks between them) just don't
   // advance APU on this pass; cycles accumulate for the next touch.
   g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
+  // Keep the master sync pointer current so the (now inert) accumulator's delta
+  // never balloons if a future change re-enables master-clock pacing.
+  g_apu_last_sync_master = g_cpu.master_cycles;
 
   // Real-time baseline when nothing is draining the DSP output ring
   // (EnableAudio=0, headless runs, the pre-callback boot window, a
@@ -637,6 +670,10 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
     }
   }
   g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
+  // Resync the master pointer too: an IPL-phase upload zeroes apuCatchupCycles,
+  // so the next catch-up must start its delta from here, not replay the master
+  // cycles burned during the upload spin.
+  g_apu_last_sync_master = g_cpu.master_cycles;
   RtlApuUnlock();
 
   if (update_cpu_result) {

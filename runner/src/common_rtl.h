@@ -39,6 +39,10 @@ extern uint64_t g_main_cpu_cycles_estimate;
 // See the definition in common_rtl.c for the issue #4 rationale.
 extern uint64_t g_apu_pace_cycles_estimate;
 extern uint64_t g_apu_last_sync_cycles;
+// Axis-5 off-cue: master-clock APU pacing (see common_rtl.c). The live $420D
+// FastROM bit (g_memsel) is declared in cpu_state.h so generated blocks can see
+// it; it's defined alongside the pacing state in common_rtl.c.
+extern uint64_t g_apu_last_sync_master;
 void rtl_accumulate_apu_catchup(void);
 
 #define GET_BYTE(p) (*(uint8*)(p))

@@ -393,6 +393,8 @@ void cpu_state_init(CpuState *cpu, uint8 *ram) {
     cpu->_flag_C = 0;
     cpu->_flag_I = 1;
     cpu->_flag_D = 0;
+    cpu->cycles = 0;
+    cpu->master_cycles = 0;
     cpu->ram = ram;
     /* NLR pending-skip is NOT on CpuState — it's a function-local in
      * each emitted v2 function. See cpu_state.h for design rationale. */

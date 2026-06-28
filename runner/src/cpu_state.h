@@ -107,6 +107,18 @@ typedef struct CpuState {
      * reads it yet, so adding it is behavior-identical; once validated against
      * bsnes it can drive APU pacing (Axis 5 off-cue) and H/V derivation. */
     uint64_t cycles;
+
+    /* Axis-5 off-cue: cumulative SNES MASTER clocks (21.47727 MHz), the
+     * region-weighted companion to `cycles`. Each block charges its CPU-cycle
+     * contribution multiplied by the code region's access speed (6 fast /
+     * 8 slow / 12 xslow; memsel-aware for $80-FF), per recompiler/snes_cycles.py
+     * region_speed(). Unlike `cycles` (bus cycles, validated vs bsnes), this is
+     * elapsed *time* in master clocks — the correct unit to pace the SPC700,
+     * which runs in its own clock domain. rtl_accumulate_apu_catchup() converts
+     * the per-touch delta to SPC cycles (x 1.024MHz / 21.477MHz), REPLACING the
+     * old +256-main-cycles-per-APU-touch synthetic estimate (the off-cue root).
+     * Charged in the same one-add-per-block spot as `cycles` (near-free). */
+    uint64_t master_cycles;
 } CpuState;
 
 /* NB: NLR pending-skip state is intentionally NOT a CpuState field.
@@ -397,6 +409,13 @@ void cpu_state_init(CpuState *cpu, uint8 *ram);
  * common_rtl.c. v2-recompiled code passes &g_cpu when it doesn't
  * thread `cpu` explicitly. */
 extern CpuState g_cpu;
+
+/* Live $420D FastROM (MEMSEL) bit, tracked in common_rtl.c WriteReg. Generated
+ * blocks in the $80-$FF WS2 mirror banks reference it to weight their Axis-5
+ * master-cycle charge (6 fast clocks/access when set, 8 slow when clear); it's
+ * declared here so every generated translation unit (which always includes
+ * cpu_state.h) can see it. SlowROM games never set it and emit no reference. */
+extern uint8_t g_memsel;
 
 /* Diagnostic — generated functions can call this to log entry. */
 void cpu_dbg_funcname(const char *name);
