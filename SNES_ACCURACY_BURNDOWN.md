@@ -660,11 +660,18 @@ rasterizer + DMA-to-VRAM path are faithful.
   crash. The cycle emit runs in a real built game at full speed. Slowdown
   measured via an env-gated FPS heartbeat (`SNESRECOMP_FPS`, dev-only).
 
-## Axis 7 — Determinism · **assumed, untracked**
+## Axis 7 — Determinism · **TRACKED + VERIFIED (SMW) 2026-06-28**
 
-- The WRAM-diff and audio-diff loops presuppose run-to-run reproducibility from a
-  fixed start. No dedicated tracking; the always-on frame fingerprint (psx
-  Layer-1 analog) is not yet ported.
+- Every other diff loop (WRAM / audio / PPU / cycle) presupposes run-to-run
+  reproducibility from a fixed reset. Now instrumented: an **always-on per-frame
+  WRAM fingerprint ring** (FNV-1a of the full 128 KB g_ram each frame, keyed by
+  frame number; `common_rtl.c`), dumped on demand via the debug server
+  (`fingerprint <path> [count]`) and compared with `tools/fp_compare.py`.
+- **VERIFIED:** two independent SMW runs from reset produced **identical WRAM
+  fingerprints on all 588 overlapping attract frames** — bit-for-bit
+  deterministic. This is the foundation the session's audio/PPU/cycle results
+  rest on (and it independently corroborates the audio BEFORE==REVERT and PPU
+  frame-reproduction observations). Cross-game (MMX/Zelda) pending the rollout.
 
 ---
 

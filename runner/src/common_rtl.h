@@ -45,6 +45,11 @@ extern uint64_t g_apu_last_sync_cycles;
 extern uint64_t g_apu_last_sync_master;
 void rtl_accumulate_apu_catchup(void);
 
+// Axis-7 determinism per-frame WRAM fingerprint ring (common_rtl.c).
+#define FP_RING 8192
+extern uint64_t g_fp_ring[FP_RING];
+extern uint64_t g_fp_max_frame;
+
 #define GET_BYTE(p) (*(uint8*)(p))
 
 extern int snes_frame_counter;

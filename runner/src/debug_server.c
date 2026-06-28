@@ -6566,6 +6566,30 @@ static void cmd_stackbal(const char *args) {
              path, snes_frame_counter, (unsigned)g_cpu.S);
 }
 
+/* fingerprint <path> [count] — dump the last [count] per-frame WRAM fingerprints
+ * (frame hash, common_rtl.c) as "frame hex" lines. Two runs from reset produce
+ * identical sequences iff the recomp is deterministic (Axis 7). */
+static void cmd_fingerprint(const char *args) {
+    char path[512] = {0};
+    int count = 600;
+    if (sscanf(args, "%511s %d", path, &count) < 1 || !path[0]) {
+        send_fmt("{\"error\":\"usage: fingerprint <path> [count]\"}"); return;
+    }
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+    extern uint64_t g_fp_ring[]; extern uint64_t g_fp_max_frame;
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_fmt("{\"error\":\"cannot write %s\"}", path); return; }
+    uint64_t maxf = g_fp_max_frame;
+    uint64_t first = (maxf + 1 >= (uint64_t)count) ? maxf + 1 - (uint64_t)count : 0;
+    for (uint64_t fr = first; fr <= maxf; fr++)
+        fprintf(f, "%llu %016llx\n", (unsigned long long)fr,
+                (unsigned long long)g_fp_ring[fr & 8191]);
+    fclose(f);
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"first\":%llu,\"last\":%llu}",
+             path, (unsigned long long)first, (unsigned long long)maxf);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"audio_stats",   cmd_audio_stats},
@@ -6738,6 +6762,7 @@ static const CmdEntry s_commands[] = {
     {"screenshot",     cmd_screenshot},
     {"dump_frame_raw", cmd_dump_frame_raw},
     {"stackbal",       cmd_stackbal},
+    {"fingerprint",    cmd_fingerprint},
     {"get_frame_extended", cmd_get_frame_extended},
     {"get_frame_range_extended", cmd_get_frame_range_extended},
     {NULL, NULL}

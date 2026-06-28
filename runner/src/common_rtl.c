@@ -61,6 +61,20 @@ uint64_t g_apu_last_sync_master = 0;
 // memsel-independent there), so this stays 0 and the emitted charge is constant.
 uint8_t g_memsel = 0;
 
+// Axis-7 determinism: always-on per-frame WRAM fingerprint ring. FNV-1a of the
+// full 128KB g_ram each frame, keyed by frame number. Two runs from the same
+// reset produce identical sequences iff the recompiler is deterministic — which
+// every diff loop (audio / PPU / cycle) silently presupposes. Cheap (~128K hash
+// ops/frame). Dumped on demand via the debug server (`fingerprint`). FP_RING is
+// defined in common_rtl.h.
+uint64_t g_fp_ring[FP_RING];
+uint64_t g_fp_max_frame;
+static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+  return h;
+}
+
 // FILE-backed SaveLoadInfo. snes_saveload calls back into func() once per
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
@@ -176,6 +190,10 @@ bool RtlRunFrame(uint32 inputs) {
   ppudma_frame_snapshot(snes_frame_counter);
 
   recomp_wram_trace_tick();   /* differential first-divergence trace (env-gated) */
+
+  /* Axis-7 determinism fingerprint: hash the full WRAM for this frame. */
+  g_fp_ring[snes_frame_counter & (FP_RING - 1)] = fp_fnv1a(g_ram, sizeof(g_ram));
+  g_fp_max_frame = (uint64_t)snes_frame_counter;
 
   snes_frame_counter++;
 
