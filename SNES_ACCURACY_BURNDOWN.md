@@ -79,12 +79,20 @@ Three cross-cutting rules carried over from psxrecomp `PRINCIPLES.md`:
 > diffs MATCH for both the static model (60==60) and the dynamics (D.l + abs,X
 > page-cross, 13==13); (2) the recomp **emits** the model (per-block static
 > constant + dynamic D.l/page-cross/branch-taken charges), unit-tested (7 tests);
-> (3) a **full SMW regen** produces correct charges at scale (24k+ in bank00:
-> block constants + `if(...) cpu->cycles += 1; goto` branch edges + dp/cross
-> conditionals) and a regenerated 14 MB bank **compiles clean** (0 errors
-> attributable to `cpu->cycles`/`CpuState`; the only diagnostics are cross-bank
-> implicit decls that `funcs.h` resolves at full-build). The add is behavior-inert
-> (nothing reads `cpu->cycles` yet), so it is byte-identical-safe.
+> (3) a **full SMW regen** (all 11 banks, 146k+ charges) produces correct
+> charges at scale — block constants + `if(...) cpu->cycles += 1; goto` branch
+> edges + dp/cross conditionals — and a regenerated 14 MB bank **C-compiles
+> clean** (0 errors attributable to `cpu->cycles`/`CpuState`; the only
+> diagnostics are cross-bank implicit decls that `funcs.h` resolves). The add is
+> behavior-inert (nothing reads `cpu->cycles` yet), so byte-identical-safe.
+>
+> *Honest caveat:* that same full regen also surfaces a few **unresolved-
+> IndirectGoto dispatch stubs** (`cpu_trace_dispatch_oob … HLE pending`) which
+> the project policy treats as hard build errors. These are a PRE-EXISTING
+> recompiler gap (the `_wt-accuracy`/main recompiler lacks the dispatch cfg
+> directives + fixes that live on the investigate lineage — same branch-union
+> root as below), NOT caused by the cycle emit. So the cycle work is validated
+> independently; a stub-free SMW regen needs the Axis-6 reconcile too.
 >
 > **NOT done — orthogonal blocker (Axis 6, not Axis 2):** the full SMW `.exe`
 > link is blocked by the pre-existing branch-union breakage — the SMW vcxproj
