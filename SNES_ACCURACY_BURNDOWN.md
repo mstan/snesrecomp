@@ -100,10 +100,19 @@ These are exactly the flagged "(M,X)-width soundness + BCD" risks, now concrete.
    unchanged). `if (cpu->_flag_D) { BCD } else { binary }`.
 2. BIT #imm: added `imm` to the `BitTest` IR; `_emit_bittest` sets ONLY Z for it.
 3. TDC/TSC: `_emit_transfer` now forces 16-bit (M-independent) for src∈{D,S}→A.
-v2 suite still 256/261 (only the pre-existing RTS-ABI failures). Full game
-regen+build to confirm at scale. **Next lever:** extend harness coverage to
-memory-addressing modes (DP/abs/indexed/indirect), RMW, stack ops, the rest of
-the 256.
+v2 suite still 256/261 (only the pre-existing RTS-ABI failures). Full SMW
+regen+build confirmed (0 errors, attract soak clean).
+
+**Memory-mode coverage added (2026-06-28):** extended the harness with dp + abs
+addressing — LDA/STA/ADC/SBC/AND/ORA/EOR/CMP, STZ, RMW (INC/DEC/ASL/LSR/ROL/ROR),
+LDX/LDY/STX/STY/CPX/CPY — 323 opcode variants, **all 0 divergences** (969k checks).
+Harness now uses SEPARATE buses for recomp vs interp816 (so stores diff
+independently) with a low-WRAM mirror canonicalization (the recomp routes dp to
+$7E; interp reads $00 — mapped to one physical offset in both), addressing bounded
+to WRAM (<$2000). The core memory-addressing + RMW + store path is validated
+clean. **Next lever:** indexed (abs,X/Y, dp,X) + indirect ((dp),Y, [dp]) + stack
+(PHA/PLA) + long addressing; the bank-carry / high-D dp ($7E-routing) edge is the
+known risk surface still untested.
 
 ## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
 

@@ -23,26 +23,46 @@
 #include "interp816.h"
 #include "cpu_diff.h"
 
-/* ── shared flat bus (interp816 fetches; the emitted RTS pops harmlessly) ── */
+/* ── SEPARATE buses so memory stores diff independently: the recomp writes RAM,
+ * interp816 writes RAM2; both are restored from REF each iteration. WIN (banks
+ * 0-1) is the working window the test addressing stays inside. ── */
 #define MEMSZ 0x1000000u
-static uint8_t *RAM;
+#define WRAM  0x7E0000u   /* canonical low-WRAM base; both buses mirror $00/$7E here */
+#define WSZ   0x2000u     /* low-WRAM mirror size (dp/abs tests stay inside) */
+static uint8_t *RAM;    /* recomp bus */
+static uint8_t *RAM2;   /* interp816 bus */
+static uint8_t *REF;    /* reference WRAM pattern, copied into both each iter */
 
+/* Canonicalize an address so the SNES low-WRAM mirror ($00-$3F/$80-$BF:0000-1FFF
+ * and $7E:0000-1FFF) is ONE physical location — matching what the recomp does
+ * (it routes dp/WRAM to $7E). Without this the recomp's $7E read and interp816's
+ * $00 read would hit different bytes. Applied identically to both buses. */
+static uint32_t mapa(uint32_t bank, uint32_t addr) {
+    bank &= 0xFF; addr &= 0xFFFF;
+    if (addr < 0x2000 && (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)))
+        return WRAM + addr;
+    return (bank << 16) | addr;
+}
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
-    (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
+    (void)cpu; return RAM[mapa(bank, addr)];
 }
 uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     return (uint16)cpu_read8(cpu, bank, addr) |
            ((uint16)cpu_read8(cpu, bank, (uint16)(addr + 1)) << 8);
 }
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
-    (void)cpu; RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF] = v;
+    (void)cpu; RAM[mapa(bank, addr)] = v;
 }
 void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     cpu_write8(cpu, bank, addr, (uint8)v);
     cpu_write8(cpu, bank, (uint16)(addr + 1), (uint8)(v >> 8));
 }
-static uint8_t i816_read(void *mem, uint32_t adr) { (void)mem; return RAM[adr & 0xFFFFFF]; }
-static void    i816_write(void *mem, uint32_t adr, uint8_t v) { (void)mem; RAM[adr & 0xFFFFFF] = v; }
+static uint8_t i816_read(void *mem, uint32_t adr) {
+    return ((uint8_t *)mem)[mapa(adr >> 16, adr)];
+}
+static void i816_write(void *mem, uint32_t adr, uint8_t v) {
+    ((uint8_t *)mem)[mapa(adr >> 16, adr)] = v;
+}
 
 /* ── recomp runtime seam stubs (cpu_state.c / common_cpu_infra.c in prod) ── */
 CpuState g_cpu;
@@ -77,8 +97,13 @@ typedef struct { uint16_t a, x, y, s, d; uint8_t db, C, Z, V, N, D, I; } St;
 static int d_fail = 0, d_checks = 0;
 
 static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
-    /* place the opcode bytes for interp816 to fetch at $00:8000 */
-    memcpy(&RAM[0x8000], op->code, (size_t)op->len);
+    /* restore both buses to the reference pattern, then drop the opcode bytes
+     * (identical in both) at $00:8000 — interp816 fetches them; the recomp has
+     * the operand baked but may read $8000 as data, so both must match there. */
+    memcpy(&RAM[WRAM], REF, WSZ);
+    memcpy(&RAM2[WRAM], REF, WSZ);
+    memcpy(&RAM[0x8000], op->code, (size_t)op->len);   /* $00:8000 (not WRAM-mirrored) */
+    memcpy(&RAM2[0x8000], op->code, (size_t)op->len);
 
     /* recomp side */
     memset(&g_cpu, 0, sizeof g_cpu);
@@ -99,7 +124,7 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     ip->d = st->D; ip->i = st->I; ip->mf = op->m; ip->xf = op->x;
     interp816_runOpcode(ip);
 
-    /* diff */
+    /* diff registers + flags */
     d_checks++;
     int bad = 0;
     char msg[256] = {0};
@@ -111,18 +136,28 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     CK("V", g_cpu._flag_V, ip->v); CK("N", g_cpu._flag_N, ip->n);
     CK("Df", g_cpu._flag_D, ip->d); CK("M", g_cpu.m_flag, ip->mf);
     CK("Xf", g_cpu.x_flag, ip->xf);
+    /* diff the memory window for store/RMW ops (skip $8000-2: the opcode bytes) */
+    if (op->wmem) {
+        for (uint32_t a = 0; a < WSZ; a++) {
+            if (RAM[WRAM + a] != RAM2[WRAM + a]) { bad = 1;
+                snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
+                         " WRAM[%04X]=%02X/%02X", a, RAM[WRAM + a], RAM2[WRAM + a]); break; }
+        }
+    }
     if (bad) {
         d_fail++;
         if (d_fail <= 40)
-            printf("  DIVERGE %-16s in:A=%04X X=%04X Y=%04X C%d Z%d V%d N%d D%d | recomp/interp:%s\n",
-                   op->name, st->a, st->x, st->y, st->C, st->Z, st->V, st->N, st->D, msg);
+            printf("  DIVERGE %-16s in:A=%04X X=%04X Y=%04X D=%04X DB=%X C%d Z%d V%d N%d D%d | r/i:%s\n",
+                   op->name, st->a, st->x, st->y, st->d, st->db,
+                   st->C, st->Z, st->V, st->N, st->D, msg);
     }
 }
 
 int main(void) {
-    RAM = malloc(MEMSZ);
-    memset(RAM, 0, MEMSZ);
-    Interp816 *ip = interp816_init(RAM, i816_read, i816_write);
+    RAM = malloc(MEMSZ); RAM2 = malloc(MEMSZ); REF = malloc(WSZ);
+    memset(RAM, 0, MEMSZ); memset(RAM2, 0, MEMSZ);
+    for (uint32_t i = 0; i < WSZ; i++) REF[i] = (uint8_t)rnd();  /* random WRAM pattern */
+    Interp816 *ip = interp816_init(RAM2, i816_read, i816_write);  /* interp bus = RAM2 */
 
     const int ITERS = 3000;
     int per_op_fail[4096];
@@ -135,7 +170,8 @@ int main(void) {
         for (int it = 0; it < ITERS; it++) {
             St st;
             st.a = (uint16)rnd(); st.x = (uint16)rnd(); st.y = (uint16)rnd();
-            st.d = (uint16)rnd(); st.db = (uint8)rnd(); st.s = 0x01FF;
+            /* D bounded so dp EAs (D+dp, dp<=0xFF) stay in low WRAM (<0x2000). */
+            st.d = (uint16)(rnd() % 0x1F00); st.db = (uint8)(rnd() & 1); st.s = 0x01FF;
             st.C = rnd() & 1; st.Z = rnd() & 1; st.V = rnd() & 1;
             st.N = rnd() & 1; st.D = rnd() & 1; st.I = rnd() & 1;
             run_one(&g_ops[o], &st, ip);

@@ -42,10 +42,10 @@ IMPLIED = [
 ]
 
 funcs = []      # emitted C source blocks
-table = []      # (cname, codebytes, m, x)
+table = []      # (cname, codebytes, m, x, wmem)
 
 
-def emit(label, code, m, x):
+def emit(label, code, m, x, wmem=0):
     fn = f"op_{label}"
     rom = make_lorom_bank0({0x8000: bytes(code) + bytes([RTS])})
     src = emit_function(rom, bank=0, start=0x8000, entry_m=m, entry_x=x,
@@ -53,7 +53,7 @@ def emit(label, code, m, x):
     cname = f"{fn}_M{m}X{x}"
     if cname not in [t[0] for t in table]:
         funcs.append(src)
-        table.append((cname, code, m, x))
+        table.append((cname, code, m, x, wmem))
 
 
 for label, op, _ in IMM_OPS:
@@ -65,6 +65,34 @@ for label, op in IMMX_OPS:
     for imm in IMM8:
         emit(f"{label}_{imm:02x}_x1", [op, imm], 1, 1)            # 8-bit index
         emit(f"{label}_{imm:02x}_lo_x0", [op, imm, 0x00], 1, 0)   # 16-bit index
+# ── memory-addressing modes: dp ($10) and abs ($0040), DB in {0,1} at runtime ──
+# kind: 'load' (reads mem, A-width), 'store', 'rmw', 'loadx'/'storex' (X-width)
+DP, ABS = 0x10, 0x0040
+MEM = [
+    # A-width loads / ALU
+    ("lda", 0xA5, 0xAD, 'load'),  ("adc", 0x65, 0x6D, 'load'),
+    ("sbc", 0xE5, 0xED, 'load'),  ("and", 0x25, 0x2D, 'load'),
+    ("ora", 0x05, 0x0D, 'load'),  ("eor", 0x45, 0x4D, 'load'),
+    ("cmp", 0xC5, 0xCD, 'load'),
+    # A-width stores
+    ("sta", 0x85, 0x8D, 'store'), ("stz", 0x64, 0x9C, 'store'),
+    # RMW (A-width on memory)
+    ("inc", 0xE6, 0xEE, 'rmw'),   ("dec", 0xC6, 0xCE, 'rmw'),
+    ("asl", 0x06, 0x0E, 'rmw'),   ("lsr", 0x46, 0x4E, 'rmw'),
+    ("rol", 0x26, 0x2E, 'rmw'),   ("ror", 0x66, 0x6E, 'rmw'),
+    # X-width loads/stores/compares (index-width)
+    ("ldx", 0xA6, 0xAE, 'loadx'), ("ldy", 0xA4, 0xAC, 'loadx'),
+    ("stx", 0x86, 0x8E, 'storex'),("sty", 0x84, 0x8C, 'storex'),
+    ("cpx", 0xE4, 0xEC, 'loadx'), ("cpy", 0xC4, 0xCC, 'loadx'),
+]
+for label, dpop, absop, kind in MEM:
+    wmem = 1 if kind in ('store', 'rmw', 'storex') else 0
+    # width flags: A-width ops vary m (x=1); X-width ops vary x (m=1)
+    widths = [(1, 1), (0, 1)] if kind in ('load', 'store', 'rmw') else [(1, 1), (1, 0)]
+    for m, x in widths:
+        emit(f"{label}_dp", [dpop, DP], m, x, wmem)
+        emit(f"{label}_abs", [absop, ABS & 0xff, ABS >> 8], m, x, wmem)
+
 for label, op in IMPLIED:
     emit(f"{label}_m1", [op], 1, 1)
     # also a 16-bit-width variant for the width-sensitive ops
@@ -83,9 +111,9 @@ with open(out, "w", newline="\n") as f:
         f.write(s)
         f.write("\n")
     f.write(f"\nconst OpTest g_ops[] = {{\n")
-    for cname, code, m, x in table:
+    for cname, code, m, x, wmem in table:
         cb = ",".join(f"0x{b:02x}" for b in code)
-        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}}},\n')
+        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}}},\n')
     f.write("};\n")
     f.write(f"const int g_nops = {len(table)};\n")
 print(f"wrote {out}: {len(table)} opcode variants")

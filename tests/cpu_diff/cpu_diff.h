@@ -10,6 +10,7 @@ typedef struct {
     int len;
     RecompReturn (*fn)(CpuState *);
     uint8_t m, x;
+    uint8_t wmem;  /* 1 = writes memory (store/RMW): also diff the RAM window */
 } OpTest;
 
 extern const OpTest g_ops[];
