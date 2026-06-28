@@ -11,6 +11,7 @@ typedef struct {
     RecompReturn (*fn)(CpuState *);
     uint8_t m, x;
     uint8_t wmem;  /* 1 = writes memory (store/RMW): also diff the RAM window */
+    uint8_t idx;   /* 1 = index-addressed: bound X/Y so the EA stays in WRAM */
 } OpTest;
 
 extern const OpTest g_ops[];

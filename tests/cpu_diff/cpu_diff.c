@@ -105,9 +105,13 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     memcpy(&RAM[0x8000], op->code, (size_t)op->len);   /* $00:8000 (not WRAM-mirrored) */
     memcpy(&RAM2[0x8000], op->code, (size_t)op->len);
 
+    /* index-addressed ops: bound X/Y so base+index stays in WRAM (<$2000). */
+    uint16_t xv = op->idx ? (uint16_t)(st->x % 0xF00) : st->x;
+    uint16_t yv = op->idx ? (uint16_t)(st->y % 0xF00) : st->y;
+
     /* recomp side */
     memset(&g_cpu, 0, sizeof g_cpu);
-    g_cpu.ram = RAM; g_cpu.A = st->a; g_cpu.X = st->x; g_cpu.Y = st->y;
+    g_cpu.ram = RAM; g_cpu.A = st->a; g_cpu.X = xv; g_cpu.Y = yv;
     g_cpu.S = st->s; g_cpu.D = st->d; g_cpu.DB = st->db; g_cpu.PB = 0;
     g_cpu.m_flag = op->m; g_cpu.x_flag = op->x; g_cpu.emulation = 0;
     g_cpu._flag_C = st->C; g_cpu._flag_Z = st->Z; g_cpu._flag_V = st->V;
@@ -118,7 +122,7 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     g_cpu.S = (uint16)(g_cpu.S - 2);  /* undo the RTS frame pop */
 
     /* interp816 side: same state, one opcode */
-    ip->a = st->a; ip->x = st->x; ip->y = st->y; ip->sp = st->s; ip->dp = st->d;
+    ip->a = st->a; ip->x = xv; ip->y = yv; ip->sp = st->s; ip->dp = st->d;
     ip->k = 0; ip->db = st->db; ip->pc = 0x8000; ip->e = false;
     ip->c = st->C; ip->z = st->Z; ip->v = st->V; ip->n = st->N;
     ip->d = st->D; ip->i = st->I; ip->mf = op->m; ip->xf = op->x;
@@ -148,7 +152,7 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
         d_fail++;
         if (d_fail <= 40)
             printf("  DIVERGE %-16s in:A=%04X X=%04X Y=%04X D=%04X DB=%X C%d Z%d V%d N%d D%d | r/i:%s\n",
-                   op->name, st->a, st->x, st->y, st->d, st->db,
+                   op->name, st->a, xv, yv, st->d, st->db,
                    st->C, st->Z, st->V, st->N, st->D, msg);
     }
 }
@@ -170,8 +174,8 @@ int main(void) {
         for (int it = 0; it < ITERS; it++) {
             St st;
             st.a = (uint16)rnd(); st.x = (uint16)rnd(); st.y = (uint16)rnd();
-            /* D bounded so dp EAs (D+dp, dp<=0xFF) stay in low WRAM (<0x2000). */
-            st.d = (uint16)(rnd() % 0x1F00); st.db = (uint8)(rnd() & 1); st.s = 0x01FF;
+            /* D bounded so dp/dp,X EAs (D+dp+X, bounded index) stay in WRAM. */
+            st.d = (uint16)(rnd() % 0xF00); st.db = (uint8)(rnd() & 1); st.s = 0x01FF;
             st.C = rnd() & 1; st.Z = rnd() & 1; st.V = rnd() & 1;
             st.N = rnd() & 1; st.D = rnd() & 1; st.I = rnd() & 1;
             run_one(&g_ops[o], &st, ip);

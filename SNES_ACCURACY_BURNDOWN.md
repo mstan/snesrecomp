@@ -110,9 +110,13 @@ Harness now uses SEPARATE buses for recomp vs interp816 (so stores diff
 independently) with a low-WRAM mirror canonicalization (the recomp routes dp to
 $7E; interp reads $00 — mapped to one physical offset in both), addressing bounded
 to WRAM (<$2000). The core memory-addressing + RMW + store path is validated
-clean. **Next lever:** indexed (abs,X/Y, dp,X) + indirect ((dp),Y, [dp]) + stack
-(PHA/PLA) + long addressing; the bank-carry / high-D dp ($7E-routing) edge is the
-known risk surface still untested.
+clean. **Indexed added (2026-06-28):** abs,X / abs,Y / dp,X for load/store/ALU/RMW
+(index bounded so EA stays in WRAM) — now **395 opcode variants, 0 divergences**
+(1.185M checks). Coverage = immediate + implied + transfer + flags + dp + abs +
+indexed, all matching interp816. **Next lever:** indirect ((dp),Y / [dp] / (dp,X))
++ long (needs a pointer/ROM set-up in the bus) + stack (PHA/PLA/PEA/PEI) + block
+move (MVN/MVP); the bank-carry / high-D dp ($7E-routing) edge is the known risk
+surface still untested.
 
 ## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
 

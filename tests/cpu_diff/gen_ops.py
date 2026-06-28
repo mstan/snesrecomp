@@ -45,7 +45,7 @@ funcs = []      # emitted C source blocks
 table = []      # (cname, codebytes, m, x, wmem)
 
 
-def emit(label, code, m, x, wmem=0):
+def emit(label, code, m, x, wmem=0, idx=0):
     fn = f"op_{label}"
     rom = make_lorom_bank0({0x8000: bytes(code) + bytes([RTS])})
     src = emit_function(rom, bank=0, start=0x8000, entry_m=m, entry_x=x,
@@ -53,7 +53,7 @@ def emit(label, code, m, x, wmem=0):
     cname = f"{fn}_M{m}X{x}"
     if cname not in [t[0] for t in table]:
         funcs.append(src)
-        table.append((cname, code, m, x, wmem))
+        table.append((cname, code, m, x, wmem, idx))
 
 
 for label, op, _ in IMM_OPS:
@@ -93,6 +93,28 @@ for label, dpop, absop, kind in MEM:
         emit(f"{label}_dp", [dpop, DP], m, x, wmem)
         emit(f"{label}_abs", [absop, ABS & 0xff, ABS >> 8], m, x, wmem)
 
+# ── indexed addressing: abs,X / abs,Y / dp,X (index bounded at runtime) ──
+# (label, dpx_op, absx_op, absy_op, kind)  — None where the mode doesn't exist
+IDX = [
+    ("lda", 0xB5, 0xBD, 0xB9, 'load'),  ("adc", 0x75, 0x7D, 0x79, 'load'),
+    ("sbc", 0xF5, 0xFD, 0xF9, 'load'),  ("and", 0x35, 0x3D, 0x39, 'load'),
+    ("ora", 0x15, 0x1D, 0x19, 'load'),  ("eor", 0x55, 0x5D, 0x59, 'load'),
+    ("cmp", 0xD5, 0xDD, 0xD9, 'load'),
+    ("sta", 0x95, 0x9D, 0x99, 'store'),
+    ("inc", 0xF6, 0xFE, None,  'rmw'),  ("dec", 0xD6, 0xDE, None,  'rmw'),
+    ("asl", 0x16, 0x1E, None,  'rmw'),  ("lsr", 0x56, 0x5E, None,  'rmw'),
+    ("rol", 0x36, 0x3E, None,  'rmw'),  ("ror", 0x76, 0x7E, None,  'rmw'),
+]
+for label, dpx, absx, absy, kind in IDX:
+    wmem = 1 if kind in ('store', 'rmw') else 0
+    for m, x in ((1, 1), (0, 1)):
+        if dpx is not None:
+            emit(f"{label}_dpx", [dpx, DP], m, x, wmem, idx=1)
+        if absx is not None:
+            emit(f"{label}_absx", [absx, ABS & 0xff, ABS >> 8], m, x, wmem, idx=1)
+        if absy is not None:
+            emit(f"{label}_absy", [absy, ABS & 0xff, ABS >> 8], m, x, wmem, idx=1)
+
 for label, op in IMPLIED:
     emit(f"{label}_m1", [op], 1, 1)
     # also a 16-bit-width variant for the width-sensitive ops
@@ -111,9 +133,9 @@ with open(out, "w", newline="\n") as f:
         f.write(s)
         f.write("\n")
     f.write(f"\nconst OpTest g_ops[] = {{\n")
-    for cname, code, m, x, wmem in table:
+    for cname, code, m, x, wmem, idx in table:
         cb = ",".join(f"0x{b:02x}" for b in code)
-        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}}},\n')
+        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}, {idx}}},\n')
     f.write("};\n")
     f.write(f"const int g_nops = {len(table)};\n")
 print(f"wrote {out}: {len(table)} opcode variants")
