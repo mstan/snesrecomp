@@ -6544,6 +6544,28 @@ static void cmd_dump_frame_raw(const char *args) {
     }
 }
 
+/* stackbal <path> — dump the always-on per-function cpu->S balance auditor
+ * (common_cpu_infra.c) to a JSON file. For the Axis-3 interrupt/DMA stack-balance
+ * audit: a nonzero total_delta on I_NMI/I_IRQ/handlers/DMA-chain funcs = a leak. */
+static void cmd_stackbal(const char *args) {
+    char path[512] = {0};
+    if (sscanf(args, "%511s", path) < 1 || !path[0]) {
+        send_fmt("{\"error\":\"usage: stackbal <path>\"}"); return;
+    }
+    extern void RecompStackBalDumpJson(FILE *);
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_fmt("{\"error\":\"cannot write %s\"}", path); return; }
+    fprintf(f, "{\n");
+    RecompStackBalDumpJson(f);
+    fprintf(f, "  \"cpu_s\": \"0x%04x\",\n  \"frame\": %d\n}\n",
+            (unsigned)g_cpu.S, snes_frame_counter);
+    fclose(f);
+    /* g_cpu.S is the live recomp stack pointer: if it stays in page 1 (~$01xx)
+     * after thousands of frames, the interrupt/DMA path is net-balanced. */
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"frame\":%d,\"cpu_s\":\"0x%04x\"}",
+             path, snes_frame_counter, (unsigned)g_cpu.S);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"audio_stats",   cmd_audio_stats},
@@ -6715,6 +6737,7 @@ static const CmdEntry s_commands[] = {
     {"dump_apu_ram",  cmd_dump_apu_ram},
     {"screenshot",     cmd_screenshot},
     {"dump_frame_raw", cmd_dump_frame_raw},
+    {"stackbal",       cmd_stackbal},
     {"get_frame_extended", cmd_get_frame_extended},
     {"get_frame_range_extended", cmd_get_frame_range_extended},
     {NULL, NULL}

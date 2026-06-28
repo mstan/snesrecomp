@@ -304,9 +304,20 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
   frame by the per-game generated `I_NMI`; H/V-IRQ timing is delegated to the
   game-side scanline draw loop (it compares $4207-$420A itself). `$4212` H/V
   readback is **synthesized** per-read (`snes.c:240-263`) so busy-polls terminate.
-- **Gap:** no hardware H/V-timer IRQ engine. Live *correctness* risk (separate
-  from timing) is `cpu->S` stack balance across the NMI/IRQ/DMA interrupt frame
-  (IMPROVEMENTS.md measured −14 on `I_IRQ`).
+- **Gap:** no hardware H/V-timer IRQ engine (timing fidelity; the game-delegated
+  IRQ works in practice).
+- **Stack-balance correctness — VERIFIED CLEAN (2026-06-28).** The −14 `I_IRQ` /
+  −9 / +500 leaks were from the old MMX `feat/cpu-s-stack-model` branch; the
+  dispatch/multi-tier work on `reconcile/cycle-multitier` resolved them. Measured
+  on the current SMW build via a new on-demand `stackbal` debug command (dumps the
+  always-on `g_stackbal` auditor + live `g_cpu.S`): across a ~49 s attract run
+  (which exercises IRQ via the HUD split), **`g_cpu.S` is rock-stable at `$01FF`
+  at frames 468 / 1708 / 2945 — zero net drift.** The auditor's remaining +2/+3
+  per-function deltas are the *balanced* dispatch ABI (caller pushes the JSR/JSL
+  frame, callee's RTS pops it), not leaks — proven by S returning to `$01FF` every
+  frame, and by the 7859-frame soak that never blew the stack. No I_NMI/I_IRQ/
+  handler/DMA-chain function appears as a leaker. (Cross-game: confirmed on SMW;
+  MMX/Zelda pending the rollout.)
 
 ## Axis 4 — Memory map / MMIO · **FUNCTIONAL + well-instrumented**
 
