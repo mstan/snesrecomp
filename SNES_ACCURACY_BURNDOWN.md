@@ -328,8 +328,20 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
   (`debug_server_on_reg_write`) — the snesrecomp analog of psx `mmio_tally.py`.
 - **Simplified registers:** mul/div instant (not multi-cycle), H/V counter
   synthetic, JOYSER returns a constant presence signature.
-- **Next lever:** add the matching MMIO ring on the bsnes side and diff
-  `(addr,width,value)` tuples (two-process ring diff).
+- **Mul/div VALUES verified clean (2026-06-28).** Most of Axis 4 is already
+  validated *indirectly*: the PPU framebuffer is bit-identical to bsnes (so the
+  `$2100-$213F` + DMA-to-VRAM path is correct) and the DSP is proven faithful (so
+  the APU-port path is exercised correctly). The genuinely-unverified slice is the
+  CPU-internal regs (`$4200-$421F`). Added a `muldiv_check` debug command that
+  drives the REAL recomp mul/div register path (`recomp_hw.c` -> snes.c
+  `snes_writeReg/readReg`, $4202-$4217) over random operands vs the documented
+  hardware arithmetic (8x8 product; 16/8 divide; /0 => quotient $FFFF, remainder
+  = dividend). **Result: 0/50000 mismatches (709 /0 cases included).** The
+  *values* are correct; only the multi-cycle *timing* is simplified (instant).
+- **Next lever (the $4200-range timing + H/V/joypad):** these are the only Axis-4
+  bits a value-diff can't reach — they need the cycle-accurate bsnes oracle: the
+  MMIO ring on the bsnes side + a `(addr,width,value,cycle)` two-process diff,
+  frame-aligned at the +204 boot offset. (Owner: pursue as the deep MMIO pass.)
 
 ## Axis 5 — Peripherals: **AUDIO** (APU = SPC700 + S-DSP) · **MEASURED — see below**
 

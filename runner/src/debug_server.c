@@ -6590,6 +6590,57 @@ static void cmd_fingerprint(const char *args) {
              path, (unsigned long long)first, (unsigned long long)maxf);
 }
 
+/* muldiv_check [count] — Axis-4 differential for the $4202-$4217 hardware
+ * multiply/divide registers (the recomp drives these via snes_writeReg/readReg,
+ * recomp_hw.c -> snes.c). Drives the REAL register path with random operands and
+ * compares against the documented hardware arithmetic (8x8 unsigned product;
+ * 16/8 unsigned divide; divide-by-zero => quotient $FFFF, remainder=dividend).
+ * Non-destructive: snapshots + restores the 4 mul/div state fields. A systematic
+ * mismatch (~100%) = a real value bug; a stray few = a race with the game's own
+ * NMI use (the emulation thread shares these fields), which is harmless. */
+static void cmd_muldiv_check(const char *args) {
+    if (!g_snes) { send_fmt("{\"error\":\"snes not available\"}"); return; }
+    int n = 5000;
+    sscanf(args, "%d", &n);
+    if (n < 1) n = 1; if (n > 200000) n = 200000;
+    uint8_t  sA = g_snes->multiplyA; uint16_t sDA = g_snes->divideA;
+    uint16_t sMR = g_snes->multiplyResult, sDR = g_snes->divideResult;
+    uint32_t rng = 0x12345678u;
+    int mul_bad = 0, div_bad = 0, divz = 0;
+    char ex[256] = {0};
+    for (int i = 0; i < n; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        uint8_t a = (uint8_t)(rng >> 16), b = (uint8_t)(rng >> 8);
+        snes_writeReg(g_snes, 0x4202, a);
+        snes_writeReg(g_snes, 0x4203, b);
+        uint16_t mg = (uint16_t)(snes_readReg(g_snes, 0x4216) |
+                                 (snes_readReg(g_snes, 0x4217) << 8));
+        if (mg != (uint16_t)((unsigned)a * b)) { if (!mul_bad)
+            snprintf(ex, sizeof ex, "mul %u*%u=%04X exp %04X", a, b, mg, (uint16_t)(a*b));
+            mul_bad++; }
+        rng = rng * 1664525u + 1013904223u;
+        uint16_t dvd = (uint16_t)(rng >> 8);
+        uint8_t  dvr = (uint8_t)((rng >> 1) & ((i % 97 == 0) ? 0 : 0xff)); /* sprinkle /0 */
+        if (dvr == 0) divz++;
+        snes_writeReg(g_snes, 0x4204, (uint8_t)dvd);
+        snes_writeReg(g_snes, 0x4205, (uint8_t)(dvd >> 8));
+        snes_writeReg(g_snes, 0x4206, dvr);
+        uint16_t q = (uint16_t)(snes_readReg(g_snes, 0x4214) |
+                                (snes_readReg(g_snes, 0x4215) << 8));
+        uint16_t r = (uint16_t)(snes_readReg(g_snes, 0x4216) |
+                                (snes_readReg(g_snes, 0x4217) << 8));
+        uint16_t eq = dvr ? (uint16_t)(dvd / dvr) : 0xFFFF;
+        uint16_t er = dvr ? (uint16_t)(dvd % dvr) : dvd;
+        if (q != eq || r != er) { if (!div_bad)
+            snprintf(ex, sizeof ex, "div %u/%u q=%04X/%04X r=%04X/%04X", dvd, dvr, q, eq, r, er);
+            div_bad++; }
+    }
+    g_snes->multiplyA = sA; g_snes->divideA = sDA;
+    g_snes->multiplyResult = sMR; g_snes->divideResult = sDR;
+    send_fmt("{\"ok\":true,\"n\":%d,\"mul_bad\":%d,\"div_bad\":%d,\"divz\":%d,\"ex\":\"%s\"}",
+             n, mul_bad, div_bad, divz, ex);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"audio_stats",   cmd_audio_stats},
@@ -6763,6 +6814,7 @@ static const CmdEntry s_commands[] = {
     {"dump_frame_raw", cmd_dump_frame_raw},
     {"stackbal",       cmd_stackbal},
     {"fingerprint",    cmd_fingerprint},
+    {"muldiv_check",   cmd_muldiv_check},
     {"get_frame_extended", cmd_get_frame_extended},
     {"get_frame_range_extended", cmd_get_frame_range_extended},
     {NULL, NULL}
