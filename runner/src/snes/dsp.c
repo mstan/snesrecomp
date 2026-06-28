@@ -18,7 +18,11 @@ static const int rateValues[32] = {
   10, 8, 6, 5, 4, 3, 2, 1
 };
 
-static const uint16_t gaussValues[512] = {
+/* Non-static: the dev faithful reference (dsp_shadow) reuses this canonical
+ * Gaussian table (verified byte-identical to blargg's snes9x/bsnes gauss[512])
+ * with blargg's exact integer algorithm, to isolate the canon-vs-reference
+ * arithmetic difference (>>10+>>1 vs >>11). Declared in dsp.h. */
+const uint16_t gaussValues[512] = {
   0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000,
   0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x002, 0x002, 0x002, 0x002, 0x002,
   0x002, 0x002, 0x003, 0x003, 0x003, 0x003, 0x003, 0x004, 0x004, 0x004, 0x004, 0x004, 0x005, 0x005, 0x005, 0x005,
@@ -57,7 +61,7 @@ static void dsp_cycleChannel(Dsp* dsp, int ch);
 static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR);
 static void dsp_handleGain(Dsp* dsp, int ch);
 static void dsp_decodeBrr(Dsp* dsp, int ch);
-static int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset);
+/* dsp_getSample is declared non-static in dsp.h (dev faithful reference uses it). */
 static void dsp_handleNoise(Dsp* dsp);
 
 Dsp* dsp_init(uint8_t *ram) {
@@ -364,7 +368,7 @@ static void dsp_handleGain(Dsp* dsp, int ch) {
   }
 }
 
-static int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset) {
+int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset) {
   int16_t news = dsp->channel[ch].decodeBuffer[sampleNum + 3];
   int16_t olds = dsp->channel[ch].decodeBuffer[sampleNum + 2];
   int16_t olders = dsp->channel[ch].decodeBuffer[sampleNum + 1];

@@ -67,6 +67,26 @@ static void shadow_render_dry(DspShadow* sh, Dsp* dsp, float* dryLOut,
   *dryROut = dryR;
 }
 
+#if defined(SNESRECOMP_TRACE)
+// blargg (snes9x/bsnes) reference Gaussian, applied to the canonical gaussValues
+// table (verified byte-identical to blargg's gauss[512]). The ONLY difference
+// vs canon dsp_getSample: blargg shifts >>11 per term with the intermediate
+// (int16) truncation at the >>11 scale and clears the result LSB; canon shifts
+// >>10, truncates at the >>10 scale, then >>1. Same indices, same table, same
+// scale -- so the per-voice diff isolates exactly that rounding choice.
+static int ref_gauss(const int16_t* buf, int n, int offset) {
+  int in0 = buf[n], in1 = buf[n + 1], in2 = buf[n + 2], in3 = buf[n + 3];
+  int out  = (gaussValues[0x0ff - offset] * in0) >> 11;
+  out += (gaussValues[0x1ff - offset] * in1) >> 11;
+  out += (gaussValues[0x100 + offset] * in2) >> 11;
+  out  = (int16_t)out;  // intermediate 16-bit truncation at the >>11 scale
+  out += (gaussValues[offset] * in3) >> 11;
+  if (out < -0x8000) out = -0x8000; else if (out > 0x7fff) out = 0x7fff;
+  out &= ~1;            // blargg clears the output LSB
+  return out;
+}
+#endif
+
 void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
                         int* outL, int* outR) {
   *outL = canonL;
@@ -89,6 +109,19 @@ void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
   if (canonL != 0 || canonR != 0) {
     audio_trace_on_shadow_div((double)(canonL - (int)dryL) / 32768.0,
                               (double)(canonR - (int)dryR) / 32768.0);
+  }
+  // FAITHFUL reference: per active (non-noise, audible) voice, diff canon's
+  // hardware Gaussian (dsp_getSample) against blargg's snes9x/bsnes reference
+  // Gaussian on the same samples. Isolates the recomp's interpolation arithmetic
+  // vs the gold-standard, in-process (no cross-process resample artifact).
+  for (int ch = 0; ch < 8; ++ch) {
+    DspChannel* c = &dsp->channel[ch];
+    if (c->useNoise || c->gain == 0) continue;
+    int sampleNum = c->pitchCounter >> 12;
+    int offset = (c->pitchCounter >> 4) & 0xff;
+    int canon = dsp_getSample(dsp, ch, sampleNum, offset);
+    int ref = ref_gauss(c->decodeBuffer, sampleNum, offset);
+    audio_trace_on_faithful_div((double)(canon - ref) / 32768.0);
   }
 #endif
 

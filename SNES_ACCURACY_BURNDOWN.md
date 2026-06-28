@@ -375,12 +375,29 @@ Built the always-on internal divergence readout (the artifact-free instrument):
   It confirms the recomp carries the expected hardware Gaussian muffling and gives
   a permanent always-on tone guard.
 
-**Still open (the bug-finder upgrade):** the current reference is the *cubic
-enhancement* (deliberately brighter than hardware), so −35 dB is the Gaussian's
-*character*, not a canon-vs-spec error. To turn this into a faithfulness PROOF /
-bug-finder, swap in a hardware-FAITHFUL, independently-coded reference (blargg
-Gaussian table + BRR, separate from canon's code path): then divergence ~0 proves
-canon's per-voice math, and any spike localizes a real deviation. Echo stage next.
+**Faithful reference — Gaussian PROVEN (2026-06-28).** Added the bug-finder: an
+independent reference Gaussian = blargg's snes9x/bsnes `SPC_DSP` algorithm
+(vendored from `_mmx_snesrecomp/runner/snes9x-core/.../SPC_DSP.cpp`) applied to
+the canonical `gaussValues` table (verified **byte-identical** to blargg's
+`gauss[512]`, all 512 entries). Per active voice per sample, diff canon
+`dsp_getSample` vs this reference (`dsp_shadow` ref_gauss; `audio_trace`
+faithful_div; `audio_shadow_div` reports both `cubic` and `faithful`).
+
+| reference | RMS | peak | meaning |
+|---|---|---|---|
+| cubic enhancement | −35.0 dB | −7.5 dB | Gaussian tone *character* (what cubic changes) |
+| **blargg faithful** | **−87.3 dB** | **−80.8 dB** | canon vs snes9x/bsnes — **~3 LSB, PROVEN faithful** |
+
+The recomp's per-voice Gaussian matches the gold-standard reference to −87 dB RMS
+(the only residual is the canon `>>10+>>1` vs blargg `>>11` low-bit rounding, max
+~3 LSB / 32768 — inaudible). **The prime off-tone suspect is cleared in-process,
+artifact-free.** Together with the resample finding above, the off-tone is
+attributed: recomp DSP is faithful; the "brighter" was the cross-process resample.
+
+**Optional extension:** verify the remaining stages the same way — independent
+BRR decode and echo FIR (the full `SPC_DSP` embed: own ARAM + register mirror +
+lockstep) — to prove the entire signal path. Lower priority now that the prime
+suspect (interpolation) is proven and the off-tone is shown artifactual.
 
 ### Internal lockstep reference (the real audio oracle) — DESIGN
 

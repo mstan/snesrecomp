@@ -110,6 +110,15 @@ void dsp_cycle(Dsp* dsp);
 uint8_t dsp_read(Dsp* dsp, uint8_t adr);
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val);
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame);
+/* Per-voice Gaussian-interpolated sample (canon hardware math). Exposed for the
+ * dev-only in-process faithful reference (dsp_shadow) to diff against blargg's
+ * reference Gaussian. Pure: reads channel[ch].decodeBuffer[sampleNum..+3], no
+ * state change. */
+int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset);
+/* Canonical SNES Gaussian table (byte-identical to blargg's snes9x/bsnes
+ * gauss[512]); exposed so the dev faithful reference can apply blargg's exact
+ * integer algorithm to it. */
+extern const uint16_t gaussValues[512];
 void dsp_saveload(Dsp *dsp, SaveLoadInfo *sli);
 
 #endif

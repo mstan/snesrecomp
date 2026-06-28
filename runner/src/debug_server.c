@@ -6457,16 +6457,29 @@ static void cmd_audio_shadow_div(const char *args) {
     (void)args;
     AudioTraceStats st;
     audio_trace_get_stats(&st);
+    /* cubic ENHANCEMENT divergence (Gaussian tone-character meter). */
     double rms = st.shadow_div_count
                      ? sqrt(st.shadow_div_sumsq / (double)st.shadow_div_count)
                      : 0.0;
     double rms_db = rms > 1e-12 ? 20.0 * log10(rms) : -240.0;
     double max_db = st.shadow_div_max > 1e-12 ? 20.0 * log10(st.shadow_div_max)
                                               : -240.0;
-    send_fmt("{\"ok\":true,\"count\":%llu,\"rms\":%.8f,\"rms_db\":%.2f,"
-             "\"max\":%.8f,\"max_db\":%.2f}",
+    /* FAITHFUL reference divergence (canon vs blargg snes9x/bsnes Gaussian). */
+    double frms = st.faithful_div_count
+                      ? sqrt(st.faithful_div_sumsq / (double)st.faithful_div_count)
+                      : 0.0;
+    double frms_db = frms > 1e-12 ? 20.0 * log10(frms) : -240.0;
+    double fmax_db = st.faithful_div_max > 1e-12
+                         ? 20.0 * log10(st.faithful_div_max) : -240.0;
+    send_fmt("{\"ok\":true,"
+             "\"cubic\":{\"count\":%llu,\"rms\":%.8f,\"rms_db\":%.2f,"
+             "\"max\":%.8f,\"max_db\":%.2f},"
+             "\"faithful\":{\"count\":%llu,\"rms\":%.8f,\"rms_db\":%.2f,"
+             "\"max\":%.8f,\"max_db\":%.2f}}",
              (unsigned long long)st.shadow_div_count, rms, rms_db,
-             st.shadow_div_max, max_db);
+             st.shadow_div_max, max_db,
+             (unsigned long long)st.faithful_div_count, frms, frms_db,
+             st.faithful_div_max, fmax_db);
 }
 
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;

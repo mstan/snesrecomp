@@ -115,6 +115,13 @@ void audio_trace_on_shadow_div(double dl, double dr) {
   s_stats.shadow_div_count++;
 }
 
+void audio_trace_on_faithful_div(double d) {
+  double a = d < 0 ? -d : d;
+  if (a > s_stats.faithful_div_max) s_stats.faithful_div_max = a;
+  s_stats.faithful_div_sumsq += d * d;
+  s_stats.faithful_div_count++;
+}
+
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles) {
   s_stats.pace_consumer_active = (uint32_t)(consumer_active != 0);
   s_stats.pace_baseline_cycles += baseline_cycles;

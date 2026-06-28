@@ -126,6 +126,18 @@ typedef struct AudioTraceStats {
   uint64_t shadow_div_count;   /* non-silent output samples measured        */
   double   shadow_div_sumsq;   /* sum over samples of (dL^2 + dR^2) / 2     */
   double   shadow_div_max;     /* peak |d| (max of |dL|,|dR|) over session  */
+
+  /* FAITHFUL-reference divergence (dev / SNESRECOMP_TRACE only). Per active
+   * voice per output sample: canon dsp_getSample vs blargg's snes9x/bsnes
+   * reference Gaussian (same canonical gaussValues table, blargg's exact integer
+   * algorithm), normalized [-1,1]. Unlike shadow_div (canon vs the cubic
+   * ENHANCEMENT, a tone-character meter), this is canon vs the HARDWARE
+   * reference: ~0 proves the recomp Gaussian matches snes9x/bsnes; a residual is
+   * the canon >>10+>>1 vs blargg >>11 rounding difference, attributed in-process
+   * (no cross-process resample). RMS = sqrt(faithful_div_sumsq/faithful_div_count). */
+  uint64_t faithful_div_count;
+  double   faithful_div_sumsq;
+  double   faithful_div_max;
 } AudioTraceStats;
 
 /* ---- record hooks (call sites: dsp.c, snes.c, common_rtl.c) ---- */
@@ -138,6 +150,9 @@ void audio_trace_set_producer(int producer);
  * RtlApuLock. Silent samples (both args ~0 with a silent canon) should be
  * filtered by the caller so the RMS reflects active audio. */
 void audio_trace_on_shadow_div(double dl, double dr);
+/* Record one active-voice sample's canon-vs-faithful-reference Gaussian
+ * divergence (normalized [-1,1]). Dev-only; called from dsp_shadow per voice. */
+void audio_trace_on_faithful_div(double d);
 /* Per catch-up accumulation: consumer state + wall-clock baseline cycles
  * injected (0 when a consumer is draining or no wall time elapsed). */
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles);
