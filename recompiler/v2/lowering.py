@@ -277,7 +277,7 @@ def _h_bit(insn, vf):
     if insn.mode == IMM:
         rhs = vf()
         return [ConstI(value=insn.operand, width=width, out=rhs),
-                BitTest(operand=rhs, width=width)]
+                BitTest(operand=rhs, width=width, imm=True)]
     seg = _segref_for(insn)
     rhs = vf()
     return [Read(seg=seg, width=width, out=rhs),

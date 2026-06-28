@@ -202,9 +202,11 @@ class IncMem(IROp):
 # Bit test / set / clear (flags only or memory write)
 @dataclass(frozen=True)
 class BitTest(IROp):
-    """BIT — sets N V Z based on operand & A."""
+    """BIT — memory form sets N V Z; the IMMEDIATE form ($89) sets ONLY Z
+    (N/V unchanged). Set imm=True for the immediate form."""
     operand: Value
     width: int
+    imm: bool = False
 
 
 @dataclass(frozen=True)

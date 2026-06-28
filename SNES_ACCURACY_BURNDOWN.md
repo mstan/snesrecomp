@@ -92,11 +92,18 @@ against the recomp):
    16-bit (M-independent); the recomp gates the A width on m_flag.
 
 These are exactly the flagged "(M,X)-width soundness + BCD" risks, now concrete.
-All are recompiler codegen fixes (recompiler/v2 emit/lowering), then regen+retest
-all games — the validator now verifies them. Whether any shipped game exercises
-them is unmeasured (SMW likely avoids BCD; BIT #imm / 8-bit TDC are plausible).
-**Next lever:** fix the 3, re-run to green; extend coverage to memory-addressing
-modes (DP/abs/indexed/indirect) + the remaining opcodes.
+
+**ALL 3 FIXED + verified (2026-06-28)** — `tests/cpu_diff/run.ps1` now reports
+**0 divergences across all 239 opcodes (717k checks), ALL MATCH interp816**:
+1. ADC/SBC: added a decimal (BCD) branch in `codegen._emit_addsub`, mirroring
+   interp816's nibble-wise algorithm exactly (8- and 16-bit; binary path
+   unchanged). `if (cpu->_flag_D) { BCD } else { binary }`.
+2. BIT #imm: added `imm` to the `BitTest` IR; `_emit_bittest` sets ONLY Z for it.
+3. TDC/TSC: `_emit_transfer` now forces 16-bit (M-independent) for src∈{D,S}→A.
+v2 suite still 256/261 (only the pre-existing RTS-ABI failures). Full game
+regen+build to confirm at scale. **Next lever:** extend harness coverage to
+memory-addressing modes (DP/abs/indexed/indirect), RMW, stack ops, the rest of
+the 256.
 
 ## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
 

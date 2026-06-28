@@ -641,6 +641,87 @@ def _emit_consti(op: ConstI) -> List[str]:
     return [f"{_ctype(op.width)} {_v(op.out)} = {op.value:#x};"]
 
 
+def _emit_addsub(tname, lhs_m, rhs_m, out_v, width, is_sub) -> List[str]:
+    """ADC / SBC with a decimal (BCD) branch. The binary branch is the proven
+    path (unchanged); the decimal branch mirrors interp816 (LakeSnes) nibble-wise
+    exactly so the cpu_diff differential stays green. V is computed at the same
+    point interp816 does (after the nibble add, before the final >9.. fixup)."""
+    ct = widths.ctype(width)
+    L, R = lhs_m, rhs_m
+    lines = [f"{ct} {out_v};", "if (cpu->_flag_D) {"]
+    if not is_sub:
+        if width == 1:
+            bcd = [
+                f"int _bcd = ({L} & 0xf) + ({R} & 0xf) + cpu->_flag_C;",
+                "if (_bcd > 0x9) _bcd = ((_bcd + 0x6) & 0xf) + 0x10;",
+                f"_bcd = ({L} & 0xf0) + ({R} & 0xf0) + _bcd;",
+                f"cpu->_flag_V = (({L} & 0x80) == ({R} & 0x80)) && (({R} & 0x80) != (_bcd & 0x80)) ? 1 : 0;",
+                "if (_bcd > 0x9f) _bcd += 0x60;",
+                "cpu->_flag_C = (_bcd > 0xff) ? 1 : 0;",
+                f"{out_v} = (uint8)(_bcd & 0xff);",
+            ]
+        else:
+            bcd = [
+                f"int _bcd = ({L} & 0xf) + ({R} & 0xf) + cpu->_flag_C;",
+                "if (_bcd > 0x9) _bcd = ((_bcd + 0x6) & 0xf) + 0x10;",
+                f"_bcd = ({L} & 0xf0) + ({R} & 0xf0) + _bcd;",
+                "if (_bcd > 0x9f) _bcd = ((_bcd + 0x60) & 0xff) + 0x100;",
+                f"_bcd = ({L} & 0xf00) + ({R} & 0xf00) + _bcd;",
+                "if (_bcd > 0x9ff) _bcd = ((_bcd + 0x600) & 0xfff) + 0x1000;",
+                f"_bcd = ({L} & 0xf000) + ({R} & 0xf000) + _bcd;",
+                f"cpu->_flag_V = (({L} & 0x8000) == ({R} & 0x8000)) && (({R} & 0x8000) != (_bcd & 0x8000)) ? 1 : 0;",
+                "if (_bcd > 0x9fff) _bcd += 0x6000;",
+                "cpu->_flag_C = (_bcd > 0xffff) ? 1 : 0;",
+                f"{out_v} = (uint16)_bcd;",
+            ]
+    else:
+        if width == 1:
+            bcd = [
+                f"int _bcv = ({R} ^ 0xff) & 0xff;",
+                f"int _bcd = ({L} & 0xf) + (_bcv & 0xf) + cpu->_flag_C;",
+                "if (_bcd < 0x10) _bcd = (_bcd - 0x6) & ((_bcd - 0x6 < 0) ? 0xf : 0x1f);",
+                f"_bcd = ({L} & 0xf0) + (_bcv & 0xf0) + _bcd;",
+                f"cpu->_flag_V = (({L} & 0x80) == (_bcv & 0x80)) && ((_bcv & 0x80) != (_bcd & 0x80)) ? 1 : 0;",
+                "if (_bcd < 0x100) _bcd -= 0x60;",
+                "cpu->_flag_C = (_bcd > 0xff) ? 1 : 0;",
+                f"{out_v} = (uint8)(_bcd & 0xff);",
+            ]
+        else:
+            bcd = [
+                f"int _bcv = ({R} ^ 0xffff) & 0xffff;",
+                f"int _bcd = ({L} & 0xf) + (_bcv & 0xf) + cpu->_flag_C;",
+                "if (_bcd < 0x10) _bcd = (_bcd - 0x6) & ((_bcd - 0x6 < 0) ? 0xf : 0x1f);",
+                f"_bcd = ({L} & 0xf0) + (_bcv & 0xf0) + _bcd;",
+                "if (_bcd < 0x100) _bcd = (_bcd - 0x60) & ((_bcd - 0x60 < 0) ? 0xff : 0x1ff);",
+                f"_bcd = ({L} & 0xf00) + (_bcv & 0xf00) + _bcd;",
+                "if (_bcd < 0x1000) _bcd = (_bcd - 0x600) & ((_bcd - 0x600 < 0) ? 0xfff : 0x1fff);",
+                f"_bcd = ({L} & 0xf000) + (_bcv & 0xf000) + _bcd;",
+                f"cpu->_flag_V = (({L} & 0x8000) == (_bcv & 0x8000)) && ((_bcv & 0x8000) != (_bcd & 0x8000)) ? 1 : 0;",
+                "if (_bcd < 0x10000) _bcd -= 0x6000;",
+                "cpu->_flag_C = (_bcd > 0xffff) ? 1 : 0;",
+                f"{out_v} = (uint16)_bcd;",
+            ]
+    lines += ["  " + s for s in bcd]
+    lines.append("} else {")
+    if not is_sub:
+        bin_lines = [
+            f"uint32 {tname} = (uint32){L} + (uint32){R} + cpu->_flag_C;",
+            f"{out_v} = ({ct}){tname};",
+            widths.set_carry_from_overflow(tname, width, "add"),
+            widths.set_v_adc(L, R, out_v, width),
+        ]
+    else:
+        bin_lines = [
+            f"uint32 {tname} = (uint32){L} - (uint32){R} - (1 - cpu->_flag_C);",
+            f"{out_v} = ({ct}){tname};",
+            widths.set_carry_from_overflow(tname, width, "sub"),
+            widths.set_v_sbc(L, R, out_v, width),
+        ]
+    lines += ["  " + s for s in bin_lines]
+    lines.append("}")
+    return lines
+
+
 def _emit_alu(op: Alu) -> List[str]:
     """Emit an ALU op. Internal `_t` temp is named per-output-vid (or
     per-lhs-vid for CMP which has no out) so multiple ALU ops in the
@@ -661,25 +742,10 @@ def _emit_alu(op: Alu) -> List[str]:
     lhs_m = widths.masked(_v(op.lhs), op.width)
     rhs_m = widths.masked(_v(op.rhs), op.width)
     if op.op == AluOp.ADD:
-        lines.append(
-            f"uint32 {tname} = (uint32){lhs_m} + (uint32){rhs_m} + cpu->_flag_C;"
-        )
-        if op.out is not None:
-            lines.append(f"{widths.ctype(op.width)} {_v(op.out)} = ({widths.ctype(op.width)}){tname};")
-        lines.append(widths.set_carry_from_overflow(tname, op.width, "add"))
-        # V flag for ADC: (lhs ^ result) & (rhs ^ result) & sign_bit
-        if op.out is not None:
-            lines.append(widths.set_v_adc(lhs_m, rhs_m, _v(op.out), op.width))
+        # ADC always writes A; decimal-aware (binary path unchanged).
+        lines.extend(_emit_addsub(tname, lhs_m, rhs_m, _v(op.out), op.width, False))
     elif op.op == AluOp.SUB:
-        lines.append(
-            f"uint32 {tname} = (uint32){lhs_m} - (uint32){rhs_m} - (1 - cpu->_flag_C);"
-        )
-        if op.out is not None:
-            lines.append(f"{widths.ctype(op.width)} {_v(op.out)} = ({widths.ctype(op.width)}){tname};")
-        lines.append(widths.set_carry_from_overflow(tname, op.width, "sub"))
-        # V flag for SBC: (lhs ^ rhs) & (lhs ^ result) & sign_bit
-        if op.out is not None:
-            lines.append(widths.set_v_sbc(lhs_m, rhs_m, _v(op.out), op.width))
+        lines.extend(_emit_addsub(tname, lhs_m, rhs_m, _v(op.out), op.width, True))
     elif op.op == AluOp.AND:
         lines.append(
             f"{widths.ctype(op.width)} {_v(op.out)} = "
@@ -816,6 +882,14 @@ def _emit_bittest(op: BitTest) -> List[str]:
     ctype = widths.ctype(op.width)
     a_m = widths.masked("cpu->A", op.width)
     operand_m = widths.masked(_v(op.operand), op.width)
+    if getattr(op, "imm", False):
+        # BIT #imm ($89): immediate form sets ONLY Z (N/V unchanged).
+        return [
+            "{",
+            f"  {ctype} _bt = ({ctype})({a_m} & {operand_m});",
+            f"  cpu->_flag_Z = (_bt == 0) ? 1 : 0;",
+            "}",
+        ]
     return [
         "{",
         f"  {ctype} _bt = ({ctype})({a_m} & {operand_m});",
@@ -1143,6 +1217,11 @@ def _emit_transfer(op: Transfer) -> List[str]:
             "  cpu_trace_event(cpu, 0, CPU_TR_DB_WRITE,",
             "                  (uint8)(_old_s >> 8), cpu->S); }",
         ]
+    # TDC (D->A) / TSC (S->A): the C-register transfers are ALWAYS 16-bit,
+    # independent of the M flag (unlike TXA/TYA). Both set N/Z on the 16-bit
+    # value. (TCD/TCS, the A->D/S direction, already go 16-bit via dst==D/S.)
+    if op.dst == Reg.A and op.src in (Reg.D, Reg.S):
+        return [f"{dst} = (uint16)({src});"] + widths.set_nz(dst, 2)
     # Determine destination width from controlling flag.
     if op.dst == Reg.A:
         flag = "cpu->m_flag"
