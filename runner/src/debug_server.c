@@ -77,9 +77,23 @@ static uint32_t s_ram_size = 0;
 // Note: s_frame_counter pointer removed — use snes_frame_counter directly
 static volatile int s_paused = 0;
 static volatile int s_step_remaining = 0;  // frames remaining before auto-re-pause
+static volatile int s_run_to_frame_target = -1;  // -1 = disabled
 static volatile int s_pending_loadstate = -1;  // -1 = none, 0-9 = slot to load
 static volatile uint32_t s_controller_inputs = 0;  // p1 bits 0..11, p2 bits 12..23
 static volatile uint32_t s_controller_active = 0;  // bit0=p1 present, bit1=p2 present
+
+// Lightweight block breakpoints for normal SNESRECOMP_TRACE builds. These
+// use the always-emitted cpu_trace_block() hooks and do not require
+// SNESRECOMP_REVERSE_DEBUG or reverse-debug generated WRAM stores.
+#define TRACE_BREAK_MAX 32
+#define TRACE_BREAK_STACK_DEPTH 16
+static volatile int s_trace_break_armed = 0;
+static uint32_t s_trace_break_pcs[TRACE_BREAK_MAX] = {0};
+static int s_trace_break_count = 0;
+static volatile int s_trace_step_pending = 0;
+static volatile uint32_t s_trace_parked_pc = 0;
+static char s_trace_parked_stack[TRACE_BREAK_STACK_DEPTH][48];
+static volatile int s_trace_parked_stack_depth = 0;
 
 // Threading state
 #ifdef _WIN32
@@ -104,6 +118,14 @@ static void lock_mutex(void) {
     EnterCriticalSection(&s_mutex);
 #else
     pthread_mutex_lock(&s_mutex);
+#endif
+}
+
+static int try_lock_mutex(void) {
+#ifdef _WIN32
+    return TryEnterCriticalSection(&s_mutex) != 0;
+#else
+    return pthread_mutex_trylock(&s_mutex) == 0;
 #endif
 }
 
@@ -422,6 +444,10 @@ void debug_server_arm_default_reg_trace(void) {
     s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x2119; s_reg_trace.nranges++;
     s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x2121;
     s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x2122; s_reg_trace.nranges++;
+    /* WRAM data-port address/data. DMA to $2180 can bulk-mutate WRAM
+     * without going through generated cpu_write* helpers. */
+    s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x2180;
+    s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x2183; s_reg_trace.nranges++;
     /* DMA channel descriptors */
     s_reg_trace.ranges[s_reg_trace.nranges].lo = 0x4300;
     s_reg_trace.ranges[s_reg_trace.nranges].hi = 0x437F; s_reg_trace.nranges++;
@@ -793,6 +819,20 @@ static struct {
     } log[BLOCK_TRACE_LOG_SIZE];
 } s_block_trace = {0};
 
+#endif  /* SNESRECOMP_REVERSE_DEBUG */
+
+#if !SNESRECOMP_REVERSE_DEBUG
+volatile uint64_t g_block_counter = 0;
+
+void debug_server_arm_default_wram_trace(void) {
+    /* Full WRAM write tracing requires reverse-debug store hooks. Plain
+     * trace builds still call this from cpu_trace bootstrap, so keep the
+     * trace server linkable without enabling the heavier WRAM machinery. */
+}
+#endif
+
+#if SNESRECOMP_TRACE || SNESRECOMP_REVERSE_DEBUG
+
 // ====================================================================
 // Focused OAM-overflow observability (task #7). Two always-on,
 // tripwire-frozen, PC-range-filtered traces used to pin the exact
@@ -920,6 +960,10 @@ void dbg_rts_trace(CpuState *cpu, uint32_t src_pc, uint16_t entry_s,
         g_boundary_frozen = 1;
     }
 }
+
+#endif  /* SNESRECOMP_TRACE || SNESRECOMP_REVERSE_DEBUG */
+
+#if SNESRECOMP_REVERSE_DEBUG
 
 // ---- Tier 2.5: pause-on-block (breakpoints + single-stepping) ----
 // Mirrors the Sonic-recomp design (rdb_on_block_slow / step / continue),
@@ -1362,6 +1406,10 @@ void debug_server_record_frame(int frame) {
             s_paused = 1;
         }
     }
+    if (s_run_to_frame_target >= 0 && frame >= s_run_to_frame_target) {
+        s_run_to_frame_target = -1;
+        s_paused = 1;
+    }
 
     lock_mutex();
 
@@ -1519,15 +1567,85 @@ static FrameRecord *find_frame(int frame_num) {
 
 static char s_recv_buf[4096];
 static int s_recv_len = 0;
+static int s_client_idle_spins = 0;
 
-static void set_nonblocking(socket_t sock) {
+static int set_nonblocking(socket_t sock) {
 #ifdef _WIN32
     u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
+    int rc = ioctlsocket(sock, FIONBIO, &mode);
+    if (rc != 0) {
+        fprintf(stderr, "[debug_server] ioctlsocket(FIONBIO) failed: %d\n",
+                WSAGetLastError());
+        return 0;
+    }
 #else
     int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) != 0) {
+        fprintf(stderr, "[debug_server] fcntl(O_NONBLOCK) failed: %d\n", errno);
+        return 0;
+    }
 #endif
+    return 1;
+}
+
+static void set_socket_timeouts(socket_t sock) {
+#ifdef _WIN32
+    DWORD ms = 100;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof(ms));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
+#else
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+static void close_client_socket(void) {
+    if (s_client_sock == SOCKET_INVALID) return;
+    CLOSESOCKET(s_client_sock);
+    s_client_sock = SOCKET_INVALID;
+    s_recv_len = 0;
+    s_client_idle_spins = 0;
+}
+
+static int send_all_bounded(const char *data, int len) {
+    if (s_client_sock == SOCKET_INVALID) return 0;
+    int sent = 0;
+    int blocked_spins = 0;
+    while (sent < len) {
+        int n = send(s_client_sock, data + sent, len - sent, 0);
+        if (n > 0) {
+            sent += n;
+            blocked_spins = 0;
+            continue;
+        }
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+            if (++blocked_spins > 1000) {
+                fprintf(stderr, "[debug_server] send timed out after WSAEWOULDBLOCK\n");
+                return 0;
+            }
+            Sleep(1);
+            continue;
+        }
+        fprintf(stderr, "[debug_server] send failed: %d\n", err);
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (++blocked_spins > 1000) {
+                fprintf(stderr, "[debug_server] send timed out after EWOULDBLOCK\n");
+                return 0;
+            }
+            usleep(1000);
+            continue;
+        }
+        fprintf(stderr, "[debug_server] send failed: %d\n", errno);
+#endif
+        return 0;
+    }
+    return 1;
 }
 
 // ===== Always-on OAM observability (widescreen sprite-margin diagnosis) =====
@@ -1631,8 +1749,8 @@ void debug_server_on_oam_render(void) {
 
 static void send_line(const char *line) {
     if (s_client_sock == SOCKET_INVALID) return;
-    send(s_client_sock, line, (int)strlen(line), 0);
-    send(s_client_sock, "\n", 1, 0);
+    if (!send_all_bounded(line, (int)strlen(line))) return;
+    send_all_bounded("\n", 1);
 }
 
 static void send_fmt(const char *fmt, ...) {
@@ -1781,9 +1899,91 @@ static void cmd_pause(const char *args) {
 }
 
 static void cmd_continue(const char *args) {
+    (void)args;
+    s_run_to_frame_target = -1;
     s_paused = 0;
     send_fmt("{\"ok\":true,\"paused\":false}");
 }
+
+#if !SNESRECOMP_REVERSE_DEBUG
+static void cmd_break_add(const char *args) {
+    uint32_t pc = 0;
+    if (!args || sscanf(args, "%x", &pc) != 1) {
+        send_fmt("{\"error\":\"usage: break_add <hex_pc>\"}"); return;
+    }
+    for (int i = 0; i < s_trace_break_count; i++) {
+        if (s_trace_break_pcs[i] == pc) {
+            send_fmt("{\"ok\":true,\"pc\":\"0x%06x\",\"count\":%d,\"duplicate\":true}",
+                     pc, s_trace_break_count);
+            return;
+        }
+    }
+    if (s_trace_break_count >= TRACE_BREAK_MAX) {
+        send_fmt("{\"error\":\"break table full (max %d)\"}", TRACE_BREAK_MAX); return;
+    }
+    s_trace_break_pcs[s_trace_break_count++] = pc;
+    s_trace_break_armed = 1;
+    send_fmt("{\"ok\":true,\"pc\":\"0x%06x\",\"count\":%d}", pc, s_trace_break_count);
+}
+
+static void cmd_break_clear(const char *args) {
+    (void)args;
+    s_trace_break_count = 0;
+    s_trace_break_armed = 0;
+    s_trace_step_pending = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_break_list(const char *args) {
+    (void)args;
+    char buf[1024];
+    int pos = snprintf(buf, sizeof(buf), "{\"count\":%d,\"pcs\":[", s_trace_break_count);
+    for (int i = 0; i < s_trace_break_count && pos + 32 < (int)sizeof(buf); i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%06x\"",
+                        i ? "," : "", s_trace_break_pcs[i]);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+static void cmd_step_block(const char *args) {
+    (void)args;
+    s_trace_step_pending = 1;
+    s_paused = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_break_continue(const char *args) {
+    (void)args;
+    s_paused = 0;
+    send_fmt("{\"ok\":true}");
+}
+
+static void cmd_parked(const char *args) {
+    (void)args;
+    char stack_buf[TRACE_BREAK_STACK_DEPTH * 56 + 64] = {0};
+    if (s_trace_parked_stack_depth > 0) {
+        int depth = s_trace_parked_stack_depth;
+        int shown = depth < TRACE_BREAK_STACK_DEPTH ? depth : TRACE_BREAK_STACK_DEPTH;
+        int pos = snprintf(stack_buf, sizeof(stack_buf),
+                           ",\"stack_depth\":%d,\"stack\":[", depth);
+        for (int i = 0; i < shown && pos + 80 < (int)sizeof(stack_buf); i++) {
+            pos += snprintf(stack_buf + pos, sizeof(stack_buf) - pos,
+                            "%s\"%s\"", i ? "," : "", s_trace_parked_stack[i]);
+        }
+        snprintf(stack_buf + pos, sizeof(stack_buf) - pos, "]");
+    }
+    send_fmt("{\"parked\":%s,\"reason\":\"%s\",\"pc\":\"0x%06x\","
+             "\"break_armed\":%d,\"step_pending\":%d,\"break_count\":%d%s}",
+             s_trace_parked_pc ? "true" : "false",
+             s_trace_parked_pc ? "break" : "none",
+             s_trace_parked_pc,
+             s_trace_break_armed,
+             s_trace_step_pending,
+             s_trace_break_count,
+             stack_buf);
+}
+#endif
 
 /* func_snap_set <name>     — register a function name to snapshot.
  *                             Subsequent calls populate a 256-deep
@@ -1872,15 +2072,12 @@ static void cmd_step(const char *args) {
     int n = 1;
     if (args[0]) sscanf(args, "%d", &n);
     int start_frame = snes_frame_counter;
+    s_run_to_frame_target = -1;
     s_step_remaining = n;
     s_paused = 0;
-    /* Release the mutex so the main thread can run frames and call
-     * debug_server_record_frame (which also needs the mutex for snapshotting).
-     * Without releasing here, the main thread deadlocks: it decrements
-     * s_step_remaining before the mutex lock, then blocks waiting for the
-     * mutex the TCP thread still holds, so s_step_remaining never reaches 0.
-     * Re-acquire before returning; caller (try_recv_and_process) expects it. */
-    unlock_mutex();
+    /* Command dispatch is intentionally not run under s_mutex. The main
+     * thread must be able to enter debug_server_record_frame while we wait
+     * for the requested frames to complete. */
     int waited = 0;
     while (s_step_remaining > 0) {
 #ifdef _WIN32
@@ -1892,7 +2089,6 @@ static void cmd_step(const char *args) {
         if (++waited >= 150000) break;    /* cap at 4.5 s */
 #endif
     }
-    lock_mutex();
     send_fmt("{\"ok\":true,\"stepped\":%d,\"frame_before\":%d,\"frame_after\":%d%s}",
              n, start_frame, snes_frame_counter,
              (s_step_remaining > 0) ? ",\"timeout\":true" : "");
@@ -1905,9 +2101,9 @@ static void cmd_run_to_frame(const char *args) {
         send_fmt("{\"error\":\"target frame %d <= current %d\"}", target, snes_frame_counter);
         return;
     }
+    s_run_to_frame_target = target;
     s_paused = 0;
     send_fmt("{\"ok\":true,\"running_to\":%d,\"current\":%d}", target, snes_frame_counter);
-    // The poll function will re-pause when we reach the target
 }
 
 typedef struct ControllerName {
@@ -4283,8 +4479,8 @@ static void cmd_trace_dump(const char *args) {
  *     frame_hi=N          — only events at/before this host frame
  *     before_idx=N        — start scan from absolute idx N-1 (default = g_cpu_trace_idx)
  *
- * Each emitted event is JSON: idx, event, frame, pc24, A,X,Y,S,D, DB,PB,P,m,x,
- * extra0, extra1.
+ * Each emitted event is JSON: idx, event, frame, pc24, A,X,Y,S,D,
+ * DB,PB,P,m_flag,x_flag, extra0, extra1.
  */
 static void cmd_trace_get_v2(const char *args) {
 #if SNESRECOMP_TRACE
@@ -4348,7 +4544,7 @@ static void cmd_trace_get_v2(const char *args) {
             "\"A\":\"0x%04x\",\"X\":\"0x%04x\",\"Y\":\"0x%04x\","
             "\"S\":\"0x%04x\",\"D\":\"0x%04x\","
             "\"DB\":\"0x%02x\",\"PB\":\"0x%02x\",\"P\":\"0x%02x\","
-            "\"m\":%u,\"x\":%u,"
+            "\"m_flag\":%u,\"x_flag\":%u,"
             "\"extra0\":\"0x%02x\",\"extra1\":\"0x%04x\","
             "\"bank\":\"0x%02x\",\"addr16\":\"0x%04x\",\"width\":%u,"
             "\"old_value\":\"0x%04x\",\"new_value\":\"0x%04x\","
@@ -5706,6 +5902,118 @@ static void cmd_clear_wram_watches(const char *args) {
     send_fmt("{\"ok\":true,\"cleared\":true}");
 }
 
+/* wram_watch_log_get <hex_addr|all> [from_frame=0] [to_frame=current] [limit=64]
+ *
+ * Queries the normal CPU trace ring for CPU_TR_WRAM_WRITE events captured by
+ * set_wram_watch / SNESRECOMP_HEARTBEAT_WRAM. This stays available in normal
+ * trace builds; it does not require SNESRECOMP_REVERSE_DEBUG. Results are
+ * oldest-first within the retained ring so the first bad write is visible. */
+static void cmd_wram_watch_log_get(const char *args) {
+#if SNESRECOMP_TRACE
+    char addr_tok[32] = {0};
+    int from_frame = 0;
+    int to_frame = snes_frame_counter;
+    int limit = 64;
+    int n = sscanf(args ? args : "", "%31s %d %d %d",
+                   addr_tok, &from_frame, &to_frame, &limit);
+    if (n < 1) {
+        send_fmt("{\"ok\":false,\"error\":\"usage: wram_watch_log_get <hex_addr|all> [from_frame=0] [to_frame=current] [limit=64]\"}");
+        return;
+    }
+    if (limit <= 0) limit = 64;
+    if (limit > 1024) limit = 1024;
+    if (to_frame < from_frame) {
+        send_fmt("{\"ok\":false,\"error\":\"to_frame < from_frame\"}");
+        return;
+    }
+    int addr_filter = -1;
+    if (strcmp(addr_tok, "all") != 0 && strcmp(addr_tok, "*") != 0) {
+        const char *p = addr_tok;
+        if (*p == '$') p++;
+        addr_filter = (int)(strtoul(p, NULL, 16) & 0xFFFFu);
+    }
+    if (!g_cpu_trace_ring || g_cpu_trace_capacity == 0) {
+        send_fmt("{\"ok\":false,\"error\":\"cpu trace ring unavailable\"}");
+        return;
+    }
+
+    uint64_t total = (g_cpu_trace_idx < g_cpu_trace_capacity) ?
+                     g_cpu_trace_idx : g_cpu_trace_capacity;
+    uint64_t oldest = g_cpu_trace_idx - total;
+    int returned = 0;
+    int matched = 0;
+
+    char header[512];
+    int hlen = snprintf(header, sizeof(header),
+        "{\"ok\":true,\"addr\":\"%s\",\"from_frame\":%d,\"to_frame\":%d,"
+        "\"limit\":%d,\"order\":\"oldest_first\",\"ring_idx\":%llu,"
+        "\"ring_capacity\":%llu,\"events\":[",
+        (addr_filter < 0) ? "all" : addr_tok, from_frame, to_frame, limit,
+        (unsigned long long)g_cpu_trace_idx,
+        (unsigned long long)g_cpu_trace_capacity);
+    send(s_client_sock, header, hlen, 0);
+
+    for (uint64_t abs_idx = oldest; abs_idx < g_cpu_trace_idx; abs_idx++) {
+        CpuTraceEvent *e = &g_cpu_trace_ring[abs_idx & (g_cpu_trace_capacity - 1)];
+        if (e->event_type != CPU_TR_WRAM_WRITE) continue;
+        if (e->frame < from_frame || e->frame > to_frame) continue;
+        if (addr_filter >= 0 && e->addr16 != (uint16_t)addr_filter) continue;
+        matched++;
+        if (returned >= limit) continue;
+
+        uint32_t func_pc = 0;
+        uint32_t func_hash = 0;
+        uint32_t block_pc = 0;
+        int func_found = 0;
+        int block_found = 0;
+        int scanned = 0;
+        for (uint64_t prev = abs_idx; prev > oldest && scanned < 4096; scanned++) {
+            prev--;
+            CpuTraceEvent *p = &g_cpu_trace_ring[prev & (g_cpu_trace_capacity - 1)];
+            if (!func_found && p->event_type == CPU_TR_FUNC_ENTRY) {
+                func_pc = p->pc24;
+                func_hash = p->native_func_id_or_hash;
+                func_found = 1;
+            }
+            if (!block_found && p->event_type == CPU_TR_BLOCK) {
+                block_pc = p->pc24;
+                block_found = 1;
+            }
+            if (func_found && block_found) break;
+        }
+
+        char entry[768];
+        int elen = snprintf(entry, sizeof(entry),
+            "%s{\"idx\":%llu,\"frame\":%d,\"pc24\":\"0x%06X\","
+            "\"addr\":\"0x%04X\",\"bank\":\"0x%02X\",\"width\":%u,"
+            "\"byte_index\":%u,\"byte_new\":\"0x%02X\","
+            "\"old_value\":\"0x%04X\",\"new_value\":\"0x%04X\","
+            "\"A\":\"0x%04X\",\"X\":\"0x%04X\",\"Y\":\"0x%04X\","
+            "\"S\":\"0x%04X\",\"D\":\"0x%04X\",\"DB\":\"0x%02X\","
+            "\"PB\":\"0x%02X\",\"P\":\"0x%02X\",\"m_flag\":%u,\"x_flag\":%u,"
+            "\"func_pc\":\"0x%06X\",\"func_hash\":\"0x%08X\","
+            "\"block_pc\":\"0x%06X\"}",
+            returned ? "," : "",
+            (unsigned long long)abs_idx, e->frame, e->pc24 & 0xFFFFFFu,
+            e->addr16, e->bank, e->width,
+            (unsigned)(e->extra1 & 0xFF), e->extra0,
+            e->old_value, e->new_value,
+            e->A, e->X, e->Y, e->S, e->D, e->DB, e->PB, e->P,
+            e->M, e->XF, func_pc & 0xFFFFFFu, func_hash, block_pc & 0xFFFFFFu);
+        send(s_client_sock, entry, elen, 0);
+        returned++;
+    }
+    char tail[160];
+    int tlen = snprintf(tail, sizeof(tail),
+                        "],\"returned\":%d,\"matched\":%d}\n",
+                        returned, matched);
+    send(s_client_sock, tail, tlen, 0);
+#else
+    (void)args;
+    send_fmt("{\"ok\":false,\"error\":\"SNESRECOMP_TRACE not enabled\"}");
+#endif
+}
+
 /* block_watch_arm <pc24_hex> <ram_off1>[,<ram_off2>,...] [max_hits=8]
  *
  * Arms a block-keyed sampler at `pc24`. On every entry to that block,
@@ -6205,6 +6513,7 @@ static const CmdEntry s_commands[] = {
     {"arm_watches",    cmd_arm_watches},
     {"set_wram_watch", cmd_set_wram_watch},
     {"clear_wram_watches", cmd_clear_wram_watches},
+    {"wram_watch_log_get", cmd_wram_watch_log_get},
     {"block_watch_arm",   cmd_block_watch_arm},
     {"block_watch_get",   cmd_block_watch_get},
     {"block_watch_clear", cmd_block_watch_clear},
@@ -6247,6 +6556,14 @@ static const CmdEntry s_commands[] = {
     {"get_oracle_vram_trace", cmd_get_oracle_vram_trace},
     {"vram_write_diff", cmd_vram_write_diff},
     {"last_vram_write_to", cmd_last_vram_write_to},
+#if !SNESRECOMP_REVERSE_DEBUG
+    {"break_add",          cmd_break_add},
+    {"break_clear",        cmd_break_clear},
+    {"break_list",         cmd_break_list},
+    {"break_continue",     cmd_break_continue},
+    {"step_block",         cmd_step_block},
+    {"parked",             cmd_parked},
+#endif
 #if SNESRECOMP_REVERSE_DEBUG
     {"trace_wram",        cmd_trace_wram},
     {"trace_wram_reset",  cmd_trace_wram_reset},
@@ -6338,9 +6655,16 @@ int debug_server_init(int port) {
     s_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (s_listen_sock == SOCKET_INVALID) return -1;
 
-    // Allow reuse
     int opt = 1;
+#ifdef _WIN32
+    // Windows SO_REUSEADDR permits multiple listeners on the same port,
+    // which can route TCP tooling to the wrong process. Require exclusivity.
+    setsockopt(s_listen_sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               (const char *)&opt, sizeof(opt));
+#else
+    // Allow quick restarts on POSIX while still preventing live duplicates.
     setsockopt(s_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+#endif
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
@@ -6483,6 +6807,7 @@ static void try_recv_and_process(void) {
     int n = recv(s_client_sock, s_recv_buf + s_recv_len,
                  (int)(sizeof(s_recv_buf) - s_recv_len - 1), 0);
     if (n > 0) {
+        s_client_idle_spins = 0;
         s_recv_len += n;
         s_recv_buf[s_recv_len] = 0;
 
@@ -6491,29 +6816,37 @@ static void try_recv_and_process(void) {
         while ((nl = strchr(s_recv_buf, '\n')) != NULL) {
             *nl = 0;
             process_command(s_recv_buf);
-            int remaining = s_recv_len - (int)(nl + 1 - s_recv_buf);
-            memmove(s_recv_buf, nl + 1, remaining);
-            s_recv_len = remaining;
-            s_recv_buf[s_recv_len] = 0;
+            close_client_socket();
+            return;
         }
     } else if (n == 0) {
         // Client disconnected
         fprintf(stderr, "[debug_server] Client disconnected\n");
-        CLOSESOCKET(s_client_sock);
-        s_client_sock = SOCKET_INVALID;
-        s_paused = 0;
+        close_client_socket();
+        /* Preserve pause state across short-lived TCP clients. Tooling often
+         * connects, sends one query, and disconnects; that must not resume the
+         * game behind the driver's back. */
     }
 #ifdef _WIN32
-    else if (WSAGetLastError() != WSAEWOULDBLOCK) {
-        CLOSESOCKET(s_client_sock);
-        s_client_sock = SOCKET_INVALID;
-        s_paused = 0;
+    else {
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) {
+            if (++s_client_idle_spins > 200) {
+                fprintf(stderr, "[debug_server] Closing idle client\n");
+                close_client_socket();
+            }
+            return;
+        }
+        close_client_socket();
     }
 #else
-    else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        CLOSESOCKET(s_client_sock);
-        s_client_sock = SOCKET_INVALID;
-        s_paused = 0;
+    else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (++s_client_idle_spins > 200) {
+            fprintf(stderr, "[debug_server] Closing idle client\n");
+            close_client_socket();
+        }
+    } else {
+        close_client_socket();
     }
 #endif
 }
@@ -6525,24 +6858,28 @@ static void debug_server_poll_internal(void) {
     if (s_client_sock == SOCKET_INVALID && s_listen_sock != SOCKET_INVALID) {
         s_client_sock = accept(s_listen_sock, NULL, NULL);
         if (s_client_sock != SOCKET_INVALID) {
+            set_socket_timeouts(s_client_sock);
             set_nonblocking(s_client_sock);
             s_recv_len = 0;
+            s_client_idle_spins = 0;
             fprintf(stderr, "[debug_server] Client connected\n");
-            send_fmt("{\"connected\":true,\"frame\":%d}", snes_frame_counter);
         }
     }
 
-    // Check watchpoints and address trace (reads s_ram)
-    lock_mutex();
-    check_watchpoints();
-    check_addr_trace();
-    check_range_trace();
-    unlock_mutex();
+    // Check watchpoints and address trace (reads s_ram). Never let this
+    // maintenance path block the network thread after accept: paused/startup
+    // code can hold s_mutex while tools still need to send continue/frame.
+    if (try_lock_mutex()) {
+        check_watchpoints();
+        check_addr_trace();
+        check_range_trace();
+        unlock_mutex();
+    }
 
-    // Process commands (command handlers read shared state)
-    lock_mutex();
+    // Process commands. Handlers that need frame-history consistency take
+    // s_mutex around their own snapshots; control commands must not be
+    // blocked behind a paused main-thread snapshot.
     try_recv_and_process();
-    unlock_mutex();
 }
 
 // Background thread entry point: loops poll + sleep until shutdown.
@@ -6578,6 +6915,46 @@ void debug_server_wait_if_paused(void) {
         usleep(10000);
 #endif
     }
+}
+
+void debug_server_on_trace_block(CpuState *cpu, uint32_t pc24) {
+    (void)cpu;
+    if (!s_trace_break_armed && !s_trace_step_pending)
+        return;
+
+    int hit = s_trace_step_pending;
+    if (!hit) {
+        for (int i = 0; i < s_trace_break_count; i++) {
+            if (s_trace_break_pcs[i] == pc24) {
+                hit = 1;
+                break;
+            }
+        }
+    }
+    if (!hit)
+        return;
+
+    s_trace_step_pending = 0;
+    {
+        int top = g_recomp_stack_top;
+        int shown = top < TRACE_BREAK_STACK_DEPTH ? top : TRACE_BREAK_STACK_DEPTH;
+        int skip = top - shown;
+        for (int i = 0; i < shown; i++) {
+            const char *name = g_recomp_stack[skip + i];
+            if (name) {
+                strncpy(s_trace_parked_stack[i], name, sizeof(s_trace_parked_stack[i]) - 1);
+                s_trace_parked_stack[i][sizeof(s_trace_parked_stack[i]) - 1] = 0;
+            } else {
+                s_trace_parked_stack[i][0] = 0;
+            }
+        }
+        s_trace_parked_stack_depth = top;
+    }
+    s_trace_parked_pc = pc24;
+    s_paused = 1;
+    debug_server_wait_if_paused();
+    s_trace_parked_pc = 0;
+    s_trace_parked_stack_depth = 0;
 }
 
 int debug_server_consume_loadstate(void) {

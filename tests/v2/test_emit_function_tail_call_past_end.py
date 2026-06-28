@@ -42,6 +42,19 @@ def _with_name_resolver(name_map):
     return _Ctx()
 
 
+def _with_valid_variants(valid_map):
+    """Save+restore the codegen-global post-prune valid-variant map."""
+    class _Ctx:
+        def __enter__(self):
+            self.saved = dict(v2_codegen._VALID_VARIANTS)
+            v2_codegen.set_valid_variants(valid_map)
+            return self
+
+        def __exit__(self, *a):
+            v2_codegen.set_valid_variants(self.saved)
+    return _Ctx()
+
+
 def test_fallthrough_past_end_into_named_sibling_emits_tail_call():
     """A: LDA #$01; STA $00; end:$8005. Linear, no terminator.
     B at $8005 is declared as 'IntroInitContinue' in the name resolver.
@@ -200,6 +213,41 @@ def test_tail_called_shared_epilogue_consumes_inherited_return_context():
     assert 'cpu_take_tailcall_return_context(&_entry_s, &_hrv)' in src_b, src_b
 
 
+def test_tail_call_past_end_routes_pruned_variant_to_survivor():
+    """A sibling tail call must not name a variant pruned from the callee.
+
+    Super Metroid hit this with MotherBrain_Phase2_DecideAttackStrategy
+    tail-calling MotherBrain_FiringBomb_DecideOnWalking_M0X1 after the
+    callee's M0X1 body was dropped. Runtime dispatch already routes pruned
+    cases to a survivor; direct sibling tail calls need the same rule.
+    """
+    target = (0x00 << 16) | 0x8003
+    rom = make_lorom_bank0({
+        0x8000: bytes([0xC2, 0x20,  # REP #$20 -> m=0, x stays 1
+                       0xEA]),       # NOP, then fall through into B
+        0x8003: bytes([0x60]),       # B body
+    })
+    name_map = {
+        target: 'NextSibling',
+    }
+    valid_map = {
+        target: frozenset({(0, 0), (1, 1)}),
+    }
+    v2_codegen.take_unresolved_call_targets()
+    with _with_name_resolver(name_map), _with_valid_variants(valid_map):
+        src = emit_function(rom, bank=0, start=0x8000,
+                            entry_m=1, entry_x=1,
+                            end=0x8003,
+                            func_name='Caller')
+    demand = v2_codegen.take_unresolved_call_targets()
+
+    assert 'NextSibling_M0X0(cpu)' in src, src
+    assert 'NextSibling_M0X1(cpu)' not in src, src
+    assert (target, 0, 0) in demand, demand
+    assert (target, 0, 1) not in demand, demand
+    assert 'tail-call past end:' in src, src
+
+
 def test_cross_bank_tail_call_keeps_positional_nlr_argument_out_of_prefix():
     """Cross-bank JML tail-call sites pass the NLR info as the third
     positional argument. That must not become text before the opening brace."""
@@ -219,3 +267,32 @@ def test_cross_bank_tail_call_keeps_positional_nlr_argument_out_of_prefix():
     assert 'None{' not in src, src
     assert 'CrossBankTail_M1X1(cpu)' in src, src
     assert 'cpu_tailcall_inherit_return_context(_entry_s, _hrv);' in src, src
+
+
+def test_cross_bank_jml_tail_call_uses_instruction_mx_after_rep():
+    """A JML tail target is entered with the M/X state at the JML itself.
+
+    Super Metroid's NMI vector does `REP #$30; JML $80:9589`. The block
+    starts M1X1, but the target body must be emitted/called as M0X0.
+    """
+    target = (0x80 << 16) | 0x9000
+    rom = make_lorom_bank0({
+        # REP #$30 -> M0X0, then JML $80:9000.
+        0x8000: bytes([0xC2, 0x30, 0x5C, 0x00, 0x90, 0x80]),
+    })
+    name_map = {
+        target: 'InterruptBody',
+    }
+
+    v2_codegen.take_unresolved_call_targets()
+    with _with_name_resolver(name_map):
+        src = emit_function(rom, bank=0, start=0x8000,
+                            entry_m=1, entry_x=1,
+                            end=0x8006,
+                            func_name='Vector')
+    demand = v2_codegen.take_unresolved_call_targets()
+
+    assert 'InterruptBody_M0X0(cpu)' in src, src
+    assert 'InterruptBody_M1X1(cpu)' not in src, src
+    assert (target, 0, 0) in demand, demand
+    assert (target, 1, 1) not in demand, demand

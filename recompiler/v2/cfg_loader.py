@@ -15,9 +15,13 @@ v2 IGNORES the v1 ABI-fiction directives:
 v2 KEEPS:
 - `bank = NN`
 - `includes = ...` (used to extend the default emit_bank header).
-- `func <name> <hex_pc> [end:<hex_end>]` — the entry list. Anything
-  on the line after the address is parsed for `end:` and otherwise
-  discarded.
+- `func <name> <hex_pc> [end:<hex_end>] [entry_mx:M,X]` — the entry
+  list. `entry_mx` overrides the default reset-state M/X width for
+  hand-written entries whose ABI is only valid after caller-side setup.
+- `entry_mx_at <hex_pc> <M> <X>` — the same entry-width override, kept
+  outside auto-ingested func blocks so those blocks stay regeneratable.
+- `end_at <hex_pc> <hex_end>` — override a generated function's
+  exclusive end boundary outside auto-ingested func blocks.
 - `name <hex_addr> <name>` — friendly-naming for cross-bank labels.
   v2 emits these as `void NAME(CpuState *cpu);` forward declarations
   in funcs.h (Phase 6e/f). For now we just retain them.
@@ -86,6 +90,14 @@ class BankCfg:
     # Lets a fresh game project ship a minimal bank00.cfg with just
     # the one directive instead of hand-decoding the vector table.
     auto_vectors: bool = False
+    # `tier_down_stubs` directive — when present in ANY cfg, v2_regen emits
+    # cross-ROM-bank unresolved-function stubs (unresolved_stubs_v2.c) as
+    # interpreter tier-downs (interp_tier_dispatch_bank_miss) that RUN the real
+    # ROM bytes, instead of the no-op cpu_trace_unresolved_stub_trap. Game-wide
+    # opt-in for the Phase-4 bank-miss tier (docs/MULTI_TIER.md); the
+    # --tier-down-stubs CLI flag forces it on regardless. Bring-up aid —
+    # shipped titles omit it (default off).
+    tier_down_stubs: bool = False
     # `indirect_dispatch` directives — authorise the decoder to recover
     # the static target list of an indirect JMP/JML/JSR. Each entry is
     # a dict with keys:
@@ -175,6 +187,8 @@ def load_bank_cfg(path: str) -> BankCfg:
     have v1-only directives the v2 pipeline doesn't need).
     """
     cfg = BankCfg(bank=-1)
+    entry_mx_at: dict[int, Tuple[int, int]] = {}
+    end_at: dict[int, int] = {}
 
     with open(path, 'r', encoding='utf-8', errors='replace') as fp:
         for raw in fp:
@@ -210,6 +224,50 @@ def load_bank_cfg(path: str) -> BankCfg:
             # other banks.
             if head == 'auto_vectors':
                 cfg.auto_vectors = True
+                continue
+
+            # tier_down_stubs — opt into the Phase-4 bank-miss interpreter
+            # tier (see BankCfg.tier_down_stubs). Game-wide; place once in any
+            # bank cfg. The --tier-down-stubs CLI flag forces it on regardless.
+            if head == 'tier_down_stubs':
+                cfg.tier_down_stubs = True
+                continue
+
+            # entry_mx_at <pc16> <m> <x> — override a cfg entry's
+            # canonical decode width without modifying auto-ingested
+            # `func` lines.
+            if head == 'entry_mx_at':
+                if len(tokens) != 4:
+                    raise ValueError(
+                        f"{path}: entry_mx_at needs <pc16> <m> <x>, "
+                        f"got: {stripped!r}")
+                try:
+                    pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                    m_val = int(tokens[2]) & 1
+                    x_val = int(tokens[3]) & 1
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: entry_mx_at bad argument in "
+                        f"{stripped!r}: {e}")
+                entry_mx_at[pc16] = (m_val, x_val)
+                continue
+
+            # end_at <pc16> <end> — override a cfg entry's exclusive
+            # decode boundary without modifying auto-ingested `func`
+            # lines.
+            if head == 'end_at':
+                if len(tokens) != 3:
+                    raise ValueError(
+                        f"{path}: end_at needs <pc16> <end>, "
+                        f"got: {stripped!r}")
+                try:
+                    pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                    end_val = _parse_hex(tokens[2])
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: end_at bad argument in "
+                        f"{stripped!r}: {e}")
+                end_at[pc16] = end_val
                 continue
 
             # hle_spc_upload <hex_pc> — mark the function at <pc> as
@@ -338,6 +396,52 @@ def load_bank_cfg(path: str) -> BankCfg:
                 if count <= 0 or count > 4096:
                     raise ValueError(
                         f"{path}: indirect_dispatch count {count} out of range (1..4096)")
+                # Pointer-sourced CALL form (the `PEA <ret>; JMP (ptr)` /
+                # `JSR (ptr)` idiom, where `ptr` is a WRAM word holding the
+                # current handler address — e.g. SM's cinematic_function).
+                # Unlike the register-indexed table form, there is no ROM
+                # table to walk: the candidate target set is given explicitly
+                # (sourced from the decomp's dispatcher switch). The dispatch
+                # is a CALL (the pushed PEA return resumes the next block),
+                # not a tail transfer.
+                #   indirect_dispatch <site_pc16> <count> ptrcall targets:<t1,t2,...>
+                #
+                # Targets may be 16-bit local PCs or full 24-bit SNES
+                # pointers. Keep full-width values intact: long pointer
+                # dispatches such as SM's HDMA pre-instruction call need
+                # to distinguish $88:EBB0 from local $08:EBB0.
+                if 'ptrcall' in tokens[3:]:
+                    targets: Tuple[int, ...] = ()
+                    for t in tokens[3:]:
+                        if t == 'ptrcall':
+                            continue
+                        if t.startswith('targets:'):
+                            raw = t[len('targets:'):].split(',')
+                            try:
+                                targets = tuple(_parse_hex(b) & 0xFFFFFF for b in raw if b)
+                            except ValueError as e:
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch targets: bad hex {t!r}: {e}")
+                        else:
+                            raise ValueError(
+                                f"{path}: indirect_dispatch ptrcall unknown option {t!r}")
+                    if not targets:
+                        raise ValueError(
+                            f"{path}: indirect_dispatch ptrcall needs targets:<...> — got: {stripped!r}")
+                    if len(targets) != count:
+                        raise ValueError(
+                            f"{path}: indirect_dispatch ptrcall count {count} != "
+                            f"{len(targets)} targets")
+                    cfg.indirect_dispatch.append({
+                        'site_pc16': site_pc16,
+                        'count': count,
+                        'idx_reg': 'X',          # unused (value-matched), kept for emit path
+                        'table_bases': (),
+                        'ptr_call': True,
+                        'targets': targets,
+                    })
+                    continue
+
                 idx_reg: Optional[str] = None
                 table_bases: Tuple[int, ...] = ()
                 for t in tokens[3:]:
@@ -372,7 +476,7 @@ def load_bank_cfg(path: str) -> BankCfg:
                 })
                 continue
 
-            # func <name> <hex_pc> [end:<hex_end>] [tail_call:<hex>] [exit_mx:M,X]
+            # func <name> <hex_pc> [end:<hex_end>] [entry_mx:M,X] [tail_call:<hex>] [exit_mx:M,X]
             #                      [entry_s_offset:<n>] [sig:...] [...]
             if head == 'func':
                 if len(tokens) < 3:
@@ -380,6 +484,7 @@ def load_bank_cfg(path: str) -> BankCfg:
                 name = tokens[1]
                 start = _parse_hex(tokens[2])
                 end: Optional[int] = None
+                entry_m, entry_x = entry_mx_at.get(start & 0xFFFF, (1, 1))
                 tail_call_pc16: Optional[int] = None
                 exit_mx: Optional[Tuple[int, int]] = None
                 entry_s_offset_val: int = 0
@@ -423,13 +528,25 @@ def load_bank_cfg(path: str) -> BankCfg:
                                            int(parts[1]) & 1)
                         except (ValueError, IndexError):
                             pass
+                    elif t.startswith('entry_mx:'):
+                        try:
+                            mx_str = t[len('entry_mx:'):]
+                            parts = mx_str.split(',')
+                            if len(parts) == 2:
+                                entry_m = int(parts[0]) & 1
+                                entry_x = int(parts[1]) & 1
+                        except (ValueError, IndexError):
+                            pass
                     elif t.startswith('entry_s_offset:'):
                         try:
                             entry_s_offset_val = int(t[len('entry_s_offset:'):])
                         except ValueError:
                             pass
+                if (start & 0xFFFF) in end_at:
+                    end = end_at[start & 0xFFFF]
                 be = BankEntry(
                     name=name, start=start, end=end,
+                    entry_m=entry_m, entry_x=entry_x,
                     tail_call_pc16=tail_call_pc16,
                     entry_s_offset=entry_s_offset_val)
                 # Non-default attribute on BankEntry; assign post-init.
@@ -498,6 +615,14 @@ def load_bank_cfg(path: str) -> BankCfg:
 
     if cfg.bank < 0:
         raise ValueError(f"{path}: missing 'bank = NN' line")
+
+    for entry in cfg.entries:
+        override = entry_mx_at.get(entry.start & 0xFFFF)
+        if override is not None:
+            entry.entry_m, entry.entry_x = override
+        end_override = end_at.get(entry.start & 0xFFFF)
+        if end_override is not None:
+            entry.end = end_override
 
     # Auto-promote in-bank `name <addr> <friendly>` declarations to emit
     # entries. v1's recompiler auto-promoted JSL/JSR targets into their

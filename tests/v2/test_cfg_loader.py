@@ -44,6 +44,46 @@ func WithEnd 8000 end:806b sig:void() # MANUAL
         os.unlink(path)
 
 
+def test_func_with_entry_mx_parses_entry_widths():
+    path = _write("""\
+bank = 0d
+func PalInstr_Wait c595 end:c599 entry_mx:0,0
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.entries[0].entry_m == 0
+        assert cfg.entries[0].entry_x == 0
+    finally:
+        os.unlink(path)
+
+
+def test_entry_mx_at_overrides_generated_func_entry_widths():
+    path = _write("""\
+bank = 0d
+entry_mx_at c595 0 0
+func PalInstr_Wait c595 end:c599
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.entries[0].entry_m == 0
+        assert cfg.entries[0].entry_x == 0
+    finally:
+        os.unlink(path)
+
+
+def test_end_at_overrides_generated_func_boundary():
+    path = _write("""\
+bank = 0d
+end_at c5dd c5e4
+func PalInstr_ClearPreInstr c5dd end:c61e
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.entries[0].end == 0xc5e4
+    finally:
+        os.unlink(path)
+
+
 def test_v1_abi_directives_ignored():
     """v2 ignores sig:/ret_y/carry_ret/y_after/x_after/restores_x."""
     path = _write("""\
@@ -103,6 +143,35 @@ func A 8000
         cfg = load_bank_cfg(path)
         assert cfg.exclude_ranges == [(0x8FCF, 0x8FD6)]
         assert cfg.data_regions == [(0x02, 0xb000, 0xb100)]
+    finally:
+        os.unlink(path)
+
+
+def test_ptrcall_targets_preserve_24_bit_values():
+    path = _write("""\
+bank = 08
+indirect_dispatch 852c 2 ptrcall targets:8884B8,91D27F
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['ptr_call'] is True
+        assert auth['targets'] == (0x8884B8, 0x91D27F)
+    finally:
+        os.unlink(path)
+
+
+def test_ptrcall_targets_keep_16_bit_values_local():
+    path = _write("""\
+bank = 08
+indirect_dispatch 8552 2 ptrcall targets:8569,EB9F
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['targets'] == (0x8569, 0xEB9F)
     finally:
         os.unlink(path)
 

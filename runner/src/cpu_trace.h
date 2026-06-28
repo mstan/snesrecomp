@@ -448,15 +448,15 @@ extern int g_unresolved_stub_hit_count;
 RecompReturn cpu_trace_unresolved_stub_trap(
     CpuState *cpu, uint32_t target_pc24, const char *func_name);
 
-/* Out-of-range dispatch index in a cfg-resolved `indirect_dispatch`
- * site. Generated code calls this when the runtime index register
- * exceeds the cfg-declared `count`. This is ALWAYS a real bug —
- * either the cfg `count` is too small or the runtime ran with a
- * corrupted index. Returns RECOMP_RETURN_NORMAL after capturing a
- * single stderr line + reusing the UnresolvedStubHit slot table for
- * inspection via the existing `unresolved_stub_get` TCP command. */
+/* Out-of-range dispatch value in a cfg-resolved `indirect_dispatch`
+ * site. Generated code calls this when the runtime index/pointer does
+ * not match the cfg-declared target set. This is ALWAYS a real bug:
+ * either the cfg target set is incomplete or the runtime state is
+ * corrupt. Returns RECOMP_RETURN_NORMAL after capturing a single
+ * stderr line + reusing the UnresolvedStubHit slot table for inspection
+ * via the existing `unresolved_stub_get` TCP command. */
 RecompReturn cpu_trace_dispatch_oob(
-    CpuState *cpu, uint32_t site_pc24, uint16_t idx);
+    CpuState *cpu, uint32_t site_pc24, uint32_t value);
 
 /* Called by RomPtr-invalid + cart_readLorom-out-of-range + any other
  * "off-the-rails" softfail. Deduplicates by (tag, high-16-of-hint)
@@ -1360,8 +1360,8 @@ static inline RecompReturn cpu_trace_unresolved_stub_trap(
     return RECOMP_RETURN_NORMAL;
 }
 static inline RecompReturn cpu_trace_dispatch_oob(
-    CpuState *c, uint32_t s, uint16_t i) {
-    (void)c; (void)s; (void)i;
+    CpuState *c, uint32_t s, uint32_t v) {
+    (void)c; (void)s; (void)v;
     return RECOMP_RETURN_NORMAL;
 }
 

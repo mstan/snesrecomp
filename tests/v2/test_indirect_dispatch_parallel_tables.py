@@ -145,3 +145,37 @@ def test_absolute_indirect_dispatch_switches_on_loaded_pointer():
     assert 'case 0x9000:' in src
     assert 'case 0x9100:' in src
     assert 'cpu->X & 0xFFFF) / 2' not in src
+
+
+def test_absolute_indirect_long_dispatch_reads_24bit_pointer():
+    """Opcode DC (`JMP [abs]`) is a 3-byte insn with a 24-bit target."""
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0xDC, 0x12, 0x00,  # JMP [$0012]
+        ]),
+    })
+
+    src = emit_function(
+        rom=rom,
+        bank=0,
+        start=0x8000,
+        entry_m=1,
+        entry_x=1,
+        func_name='AbsoluteIndirectLongPointerDispatch',
+        indirect_dispatch={
+            0x008002: {
+                'count': 1,
+                'idx_reg': 'X',
+                'table_bases': (0x0012,),
+                'targets': (0x019000,),
+            },
+        },
+    )
+
+    assert 'absolute long-indirect dispatch: switch on the loaded pointer' in src
+    assert 'uint16 _target_lo = cpu_read16(cpu, 0x00, (uint16)0x0012);' in src
+    assert 'uint8 _target_bank = cpu_read8(cpu, 0x00, (uint16)(0x0012 + 2));' in src
+    assert 'uint32 _target = ((uint32)_target_bank << 16) | (uint32)_target_lo;' in src
+    assert 'case 0x019000:' in src
+    assert 'uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x0012)' not in src

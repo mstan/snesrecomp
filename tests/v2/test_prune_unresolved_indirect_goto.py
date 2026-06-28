@@ -69,6 +69,24 @@ def test_unresolved_indirect_goto_is_a_stub_marker():
         "loudly on genuine residue")
 
 
+def test_brk_and_cop_are_stub_markers():
+    assert 'BRK: software interrupt' in v2_regen._STUB_MARKERS
+    assert 'COP: software interrupt' in v2_regen._STUB_MARKERS
+
+
+def test_brk_variant_marked_dirty_clean_sibling_is_not():
+    parsed = _make_parsed()
+    results = _make_results([
+        ('_M0X1', ["    /* BRK: software interrupt */"]),
+        ('_M1X1', ["    RecompStackPop(); return RECOMP_RETURN_NORMAL;"]),
+    ])
+    dirty, emitted = v2_regen._scan_dirty_variants(results, parsed)
+    addr = (0x02 << 16) | 0x885E
+    assert (addr, 0, 1) in dirty
+    assert (addr, 1, 1) not in dirty
+    assert (addr, 0, 1) in emitted and (addr, 1, 1) in emitted
+
+
 def test_phantom_variant_marked_dirty_clean_sibling_is_not():
     parsed = _make_parsed()
     # M1X0 (X=0) misdecodes -> phantom JML -> unresolved IndirectGoto.
@@ -432,6 +450,48 @@ def test_reference_taint_ignores_out_of_set_bank_targets():
     tainted = v2_regen._propagate_reference_taint(
         set(), refs, emitted, {0x01}, set())
     assert (a, 1, 0) not in tainted, "out-of-set target must not taint"
+
+
+def test_clean_noncanonical_direct_ref_protects_dirty_target_variant():
+    """A clean non-canonical body can be a legitimate runtime-M/X target.
+
+    Super Metroid shape: DemoSetFunc_2_M0X0 is clean and tail-calls
+    DemoSetFunc_Common_M0X0. The callee body carries unresolved residue, but
+    pruning it leaves the surviving clean caller hardwired to the M1X1
+    callee, which misdecodes the 16-bit argument write.
+    """
+    source = (0x11 << 16) | 0x8A49
+    target = (0x11 << 16) | 0x8A56
+    refs = {(source, 0, 0): {(target, 0, 0)}}
+    canonical = {source: {(1, 1)}, target: {(1, 1)}}
+    dirty = {(target, 0, 0)}
+    emitted = {
+        (source, 0, 0), (source, 1, 1),
+        (target, 0, 0), (target, 1, 1),
+    }
+    protected = v2_regen._protected_ref_targets(refs, canonical, dirty)
+    assert (target, 0, 0) in protected
+    prunable = v2_regen._compute_prunable(
+        dirty, emitted, canonical, protected)
+    assert (target, 0, 0) not in prunable
+
+
+def test_dirty_noncanonical_direct_ref_does_not_protect_target_variant():
+    """Wrong-width source residue must not keep its garbage call chain alive."""
+    source = (0x11 << 16) | 0x8A49
+    target = (0x11 << 16) | 0x8A56
+    refs = {(source, 0, 0): {(target, 0, 0)}}
+    canonical = {source: {(1, 1)}, target: {(1, 1)}}
+    dirty = {(source, 0, 0), (target, 0, 0)}
+    emitted = {
+        (source, 0, 0), (source, 1, 1),
+        (target, 0, 0), (target, 1, 1),
+    }
+    protected = v2_regen._protected_ref_targets(refs, canonical, dirty)
+    assert (target, 0, 0) not in protected
+    prunable = v2_regen._compute_prunable(
+        dirty, emitted, canonical, protected)
+    assert (target, 0, 0) in prunable
 
 
 def test_resolved_dispatch_default_is_not_a_false_positive():

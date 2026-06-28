@@ -16,12 +16,24 @@
 #include "../common_rtl.h"
 #include "../debug_server.h"
 #include "../audio_trace.h"
+#include "../cpu_trace.h"
+#include "../ppu_dma_trace.h"
 
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
 
 uint8_t snes_readReg(Snes* snes, uint16_t adr);
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
+
+#if SNESRECOMP_TRACE
+static void snes_trace_direct_wram_write(uint32_t off, uint8_t old, uint8_t val) {
+  extern CpuState g_cpu;
+  uint8_t bank = (off >= 0x10000u) ? 0x7f : 0x7e;
+  uint16_t addr = (uint16_t)(off & 0xffffu);
+  cpu_trace_wram_write_check(&g_cpu, bank, addr, (int32_t)off,
+                             (uint16_t)old, (uint16_t)val, 1);
+}
+#endif
 
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = malloc(sizeof(Snes));
@@ -176,17 +188,17 @@ void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val) {
   }
   switch(adr) {
     case 0x80: {
+      uint32_t wa = snes->ramAdr & 0x1ffffu;
+      uint8_t old = snes->ram[wa];
+      snes->ram[wa] = val;
+#if SNESRECOMP_TRACE
+      snes_trace_direct_wram_write(wa, old, val);
+#endif
 #if SNESRECOMP_REVERSE_DEBUG
       { extern void debug_on_wram_write_byte(uint32_t, uint8_t, uint8_t);
-        uint32_t wa = snes->ramAdr & 0x1ffffu;
-        uint8_t old = snes->ram[wa];
-        snes->ram[wa] = val;
-        debug_on_wram_write_byte(wa, old, val);
-        snes->ramAdr = (wa + 1u) & 0x1ffffu; }
-#else
-      snes->ram[snes->ramAdr++] = val;
-      snes->ramAdr &= 0x1ffff;
+        debug_on_wram_write_byte(wa, old, val); }
 #endif
+      snes->ramAdr = (wa + 1u) & 0x1ffffu;
       break;
     }
     case 0x81: {
@@ -231,15 +243,27 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return val;
     }
     case 0x4212: {
-      // Static-recomp h-counter model: real hardware updates hPos every
+      // Static-recomp h/v-counter model: real hardware updates hPos every
       // dot-clock; recomp has no dot-clock, so each $4212 read advances
       // hPos by a fixed step. Calibrated so a typical busy-wait crosses
       // both edges in ~10-20 reads. Bit 6 = hblank (dots ~1024..1364 of
       // a 1364-dot scanline). See docs/VIRTUAL_HW_CONTRACT.md.
+      uint32_t prev_h = snes->hPos;
       snes->hPos = (snes->hPos + 64) % 1364;
+      // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
+      // inVblank (inVblank is never set true), so on the static-recomp
+      // path bit 7 must be SYNTHESIZED the same way bit 6 is — otherwise a
+      // boot vblank-wait loop that polls $4212 bit 7 BEFORE the first NMI
+      // (while the single host fiber is blocked in SwitchToFiber and real
+      // frame timing is frozen) never sees the edge and spins forever
+      // (Super Metroid I_RESET $00:843C: `LDA $4212 / BPL` x4 settle).
+      // Advance a synthetic scanline (vPos, 0..261 NTSC) each time the dot
+      // counter wraps; vblank is the post-render region (vPos >= 225). OR
+      // in the real inVblank so an authoritative vblank still reads true.
+      if (snes->hPos < prev_h) snes->vPos = (snes->vPos + 1) % 262;
       uint8_t val = (snes->autoJoyTimer > 0);
       val |= (snes->hPos >= 1024) << 6;
-      val |= snes->inVblank << 7;
+      val |= (snes->inVblank || snes->vPos >= 225) << 7;
       return val;
     }
     case 0x4213:
@@ -362,6 +386,14 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420b: {
+      /* Always-on observability: record each triggered channel's config
+       * before the transfer consumes aAdr/size (see ppu_dma_trace.h). */
+      for (int ch = 0; ch < 8; ch++) {
+        if (val & (1 << ch)) {
+          DmaChannel *c = &snes->dma->channel[ch];
+          ppudma_record_dma(ch, c->fromB, c->aBank, c->aAdr, c->bAdr, c->size);
+        }
+      }
       dma_startDma(snes->dma, val, false);
       while (dma_cycle(snes->dma)) {}
       break;
@@ -409,24 +441,26 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
   adr &= 0xffff;
   if(bank == 0x7e || bank == 0x7f) {
     uint32_t addr = ((bank & 1) << 16) | adr;
+    uint8_t old = snes->ram[addr];
+    snes->ram[addr] = val; // ram
+#if SNESRECOMP_TRACE
+    snes_trace_direct_wram_write(addr, old, val);
+#endif
 #if SNESRECOMP_REVERSE_DEBUG
     { extern void debug_on_wram_write_byte(uint32_t, uint8_t, uint8_t);
-      uint8_t old = snes->ram[addr];
-      snes->ram[addr] = val;
       debug_on_wram_write_byte(addr, old, val); }
-#else
-    snes->ram[addr] = val; // ram
 #endif
   }
   if(bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) {
     if(adr < 0x2000) {
+      uint8_t old = snes->ram[adr];
+      snes->ram[adr] = val; // ram mirror
+#if SNESRECOMP_TRACE
+      snes_trace_direct_wram_write((uint32_t)adr, old, val);
+#endif
 #if SNESRECOMP_REVERSE_DEBUG
       { extern void debug_on_wram_write_byte(uint32_t, uint8_t, uint8_t);
-        uint8_t old = snes->ram[adr];
-        snes->ram[adr] = val;
         debug_on_wram_write_byte((uint32_t)adr, old, val); }
-#else
-      snes->ram[adr] = val; // ram mirror
 #endif
     }
     if(adr >= 0x2100 && adr < 0x2200) {
@@ -445,4 +479,3 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
   // write to cart
   cart_write(snes->cart, bank, adr, val);
 }
-

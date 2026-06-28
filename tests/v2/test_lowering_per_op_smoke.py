@@ -160,6 +160,14 @@ def test_jmp_indir_emits_indirect_goto():
     assert any(isinstance(o, IndirectGoto) for o in ops)
 
 
+def test_jmp_abs_indirect_long_emits_long_indirect_goto():
+    insn = _decode(bytes([0xDC, 0x34, 0x12]))  # JMP [$1234]
+    ops = lowering.lower(insn, value_factory=_vf())
+    assert len(ops) == 1
+    assert isinstance(ops[0], IndirectGoto)
+    assert ops[0].seg.kind == SegKind.ABS_INDIRECT_LONG
+
+
 def test_jsr_abs_emits_call_short():
     insn = _decode(bytes([0x20, 0x34, 0x80]))  # JSR $8034
     ops = lowering.lower(insn, value_factory=_vf())

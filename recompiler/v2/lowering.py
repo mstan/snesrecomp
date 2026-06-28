@@ -362,6 +362,10 @@ def _h_brl(insn, vf): return [Goto()]
 
 # Control flow
 def _h_jmp(insn, vf):
+    if insn.mode == INDIR and getattr(insn, 'opcode', None) == 0xDC:
+        return [IndirectGoto(seg=SegRef(
+            kind=SegKind.ABS_INDIRECT_LONG,
+            offset=insn.operand & 0xFFFF))]
     if insn.mode in (INDIR, INDIR_X):
         seg = _segref_for(insn)
         return [IndirectGoto(seg=seg)]

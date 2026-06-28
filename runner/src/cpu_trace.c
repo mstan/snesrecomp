@@ -4,6 +4,7 @@
 
 #if SNESRECOMP_TRACE
 
+#include "debug_server.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -1216,6 +1217,7 @@ void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
 #endif
     phantom_check(cpu, pc24);
     cpu_trace_block_watch_check(cpu, pc24);
+    debug_server_on_trace_block(cpu, pc24);
     cpu_trace_mx_async_check(cpu, pc24);
     /* Stack-range tripwire — fires once when S first leaves the
      * configured range. Disarms after firing to avoid spam. */
@@ -1680,16 +1682,16 @@ RecompReturn cpu_trace_unresolved_stub_trap(
  * stderr line tags it loudly.
  */
 RecompReturn cpu_trace_dispatch_oob(
-    CpuState *cpu, uint32_t site_pc24, uint16_t idx)
+    CpuState *cpu, uint32_t site_pc24, uint32_t value)
 {
     char name[64];
-    snprintf(name, sizeof(name), "dispatch_oob_$%06X[%u]",
-             (unsigned)site_pc24, (unsigned)idx);
+    snprintf(name, sizeof(name), "dispatch_oob_$%06X[%06X]",
+             (unsigned)(site_pc24 & 0xFFFFFFu),
+             (unsigned)(value & 0xFFFFFFu));
     /* Delegate to the unresolved-stub path for slot accounting +
-     * stderr emission. target_pc24 carries the (site << 16) | idx
-     * pair so the caller can decode it from the captured hit. */
-    uint32_t encoded = (site_pc24 & 0xFFFF) | ((uint32_t)idx << 16);
-    return cpu_trace_unresolved_stub_trap(cpu, encoded, name);
+     * stderr emission. target_pc24 carries the full miss value; the
+     * synthesized name carries the dispatch site. */
+    return cpu_trace_unresolved_stub_trap(cpu, value & 0xFFFFFFu, name);
 }
 
 void cpu_trace_phantom_arm_unresolvable_goto_set(void) {
@@ -2205,8 +2207,19 @@ void cpu_trace_arm_default_watches(void) {
      * corrupts to $C0 at every ProcessGameMode entry (DBPB ring shows
      * the steady-state but not the first transition). This catches the
      * FIRST sane→$C0 transition with full boundary-event history. */
-    cpu_trace_arm_db_tripwire(0xC0);
-    fprintf(stderr, "[cpu_trace] DB tripwire armed (first transition to $C0)\n");
+    {
+        uint8_t trip_target = 0xC0;
+        const char *v = getenv("SNESRECOMP_DB_TRIP_TARGET");
+        if (v && v[0]) {
+            char *endp = NULL;
+            unsigned long parsed = strtoul(v, &endp, 16);
+            if (endp != v) trip_target = (uint8_t)(parsed & 0xFFu);
+        }
+        cpu_trace_arm_db_tripwire(trip_target);
+        fprintf(stderr,
+                "[cpu_trace] DB tripwire armed (first transition to $%02X)\n",
+                trip_target);
+    }
     /* Auto-arm SMC-phantom PC trap — investigation 2026-05-03: the 11
      * unique CALL_INDIRECT sites cf_debt_report flagged are decoder
      * phantoms (M=0 wrong-mode decode of M=1 SMC-dispatch byte

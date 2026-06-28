@@ -452,6 +452,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                   hle_spc_upload=None,
                   hle_func=None,
                   hle_dispatch=None,
+                  inline_arg_map=None,
                   entry_s_offset: int = 0) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
@@ -466,7 +467,8 @@ def emit_function(rom: bytes, bank: int, start: int,
     base_func_name = func_name if func_name is not None else _default_func_name(bank, start)
     # HLE bypass: if cfg declared this function's PC as the SPC upload
     # entry (`hle_spc_upload <pc>` in the bank cfg), replace the entire
-    # decoded body with a single RtlUploadSpcImageFromDp call. The
+    # decoded body with a RtlUploadSpcImageFromDp call followed by an
+    # RTS-equivalent return-frame pop. The
     # standard SNES SPC upload protocol is a length/target/data block
     # stream pointed to by a 24-bit ROM pointer in direct page; the
     # runtime walks it directly and writes into apu->ram. Game-agnostic
@@ -484,13 +486,37 @@ def emit_function(rom: bytes, bank: int, start: int,
             f"  RecompStackPush(\"{variant_name}\");",
             f"  cpu_dbg_funcname(\"{variant_name}\");",
             f"  cpu_trace_func_entry(cpu, 0x{pc24:06X}, \"{variant_name}\");",
+            "  uint16 _entry_s = cpu->S;",
+            "  uint8 _hrv = cpu->host_return_valid;",
             f"  cpu_trace_block(cpu, 0x{pc24:06X});",
             "  WatchdogCheck();",
             "  if (!RtlUploadSpcImageFromDp(cpu)) {",
             f"    fprintf(stderr, \"[apu] {base_func_name} HLE upload failed\\n\");",
             "  }",
-            "  RecompStackPop();",
-            "  return RECOMP_RETURN_NORMAL;",
+            "  { uint16 _ret_s = cpu->S;  /* HLE SPC upload RTS pop hardware return frame */",
+            "    cpu->S = (uint16)(cpu->S + 1);",
+            "    uint16 _rpcl = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
+            "    cpu->S = (uint16)(cpu->S + 1);",
+            "    uint16 _rpch = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
+            "    uint8 _rpb = cpu->PB;",
+            "    uint32 _rpc = (uint32)((((_rpch << 8) | _rpcl) + 1) & 0xFFFFu);",
+            "    uint32 _rpc24 = ((uint32)_rpb << 16) | _rpc;",
+            "#if SNESRECOMP_TRACE",
+            f"    dbg_rts_trace(cpu, 0x{pc24:06x}u, _entry_s, _ret_s, _rpc24, (uint8)_hrv);",
+            "#endif",
+            "    if (_hrv && _ret_s == _entry_s) {",
+            "      RecompStackPop();",
+            "      return RECOMP_RETURN_NORMAL;  /* HLE RTS host return */ }",
+            "    if (_ret_s != _entry_s && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
+            "      int _anc_skip = cpu_resolve_ancestor_skip(_ret_s);",
+            "      if (_anc_skip >= 0) {",
+            "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
+            "        RecompStackPop();",
+            "        return (RecompReturn)_anc_skip;  /* HLE RTS return-to-ancestor */ }",
+            "    }",
+            "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
+            "    RecompStackPop();",
+            f"    return cpu_dispatch_pc_from(cpu, _rpc24, (uint16)(_entry_s + 2u), 0x{pc24:06x}u);  /* HLE RTS dispatch */ }}",
             "}",
             "",
         ])
@@ -527,7 +553,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                             data_regions=data_regions,
                             callee_exit_mx=callee_exit_mx,
                             callee_exit_mx_modes=callee_exit_mx_modes,
-                            sibling_entry_pcs=sibling_entry_pcs)
+                            sibling_entry_pcs=sibling_entry_pcs,
+                            inline_arg_map=inline_arg_map)
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:
@@ -1092,7 +1119,6 @@ def emit_function(rom: bytes, bank: int, start: int,
         if (tail_call_pc16 is not None
                 and tail_call_target_name is not None
                 and (target.pc & 0xFFFF) == (tail_call_pc16 & 0xFFFF)):
-            sib_suffix = _variant_suffix(target.m, target.x)
             # Register cross-variant Call demand so v2_regen's auto-
             # promote synthesizes the (m, x) body when it differs from
             # the sibling's cfg-declared default. Without this, the
@@ -1102,9 +1128,13 @@ def emit_function(rom: bytes, bank: int, start: int,
             # variant externals (NMI_RunTileMapUpdateDMA_M0X1,
             # SpotlightInternal_M1X0, etc.) on the 2026-05-17
             # tail-call-past-end class fix.
-            from v2.codegen import register_call_demand
             tail_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
-            register_call_demand(tail_pc24, target.m, target.x)
+            from v2.codegen import (register_call_demand,
+                                     resolve_variant_for_target)
+            sib_m, sib_x = resolve_variant_for_target(
+                tail_pc24, target.m, target.x)
+            sib_suffix = _variant_suffix(sib_m, sib_x)
+            register_call_demand(tail_pc24, sib_m, sib_x)
             return _tail_call_stmt(
                 f"{tail_call_target_name}{sib_suffix}(cpu)",
                 f"/* tail_call into sibling fn at ${target.pc & 0xFFFF:04X} "
@@ -1137,11 +1167,13 @@ def emit_function(rom: bytes, bank: int, start: int,
         target_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
         src_pc24 = source_pc24 if source_pc24 is not None else 0
         from v2.codegen import (get_name_for_pc, register_call_demand,
-                                 valid_variant_list)
+                                 resolve_variant_for_target)
         sibling_name = get_name_for_pc(target_pc24)
         if sibling_name is not None:
-            sib_suffix = _variant_suffix(target.m, target.x)
-            register_call_demand(target_pc24, target.m, target.x)
+            sib_m, sib_x = resolve_variant_for_target(
+                target_pc24, target.m, target.x)
+            sib_suffix = _variant_suffix(sib_m, sib_x)
+            register_call_demand(target_pc24, sib_m, sib_x)
             return _tail_call_stmt(
                 f"{sibling_name}{sib_suffix}(cpu)",
                 f"/* tail-call past end: into {sibling_name}{sib_suffix} "
@@ -1175,10 +1207,20 @@ def emit_function(rom: bytes, bank: int, start: int,
         # happen to share source PCs. The trap returns NORMAL after
         # capture (Release path) or aborts (Oracle/debug); see
         # runner/src/cpu_trace.c.
+        # Braced compound statement (mirrors _tail_call_stmt): `prefix` may
+        # be a conditional, and the explicit RecompStackPop replaces the
+        # per-line scanner's auto-injection (the line no longer starts with
+        # "return"). Account the hit, then abandon balanced — the bare
+        # `return ..._goto_trap(...)` this replaces returned NORMAL with
+        # the caller's frame + locals still on cpu->S (orphaned-frame leak
+        # class, 2026-06-09).
         return (
-            f"{prefix}return cpu_trace_unresolved_goto_trap(cpu, "
+            f"{prefix}{{ (void)cpu_trace_unresolved_goto_trap(cpu, "
             f"0x{src_pc24:06X}, 0x{target_pc24:06X}, "
-            f"\"{func_name}\", \"{label}\");"
+            f"\"{func_name}\", \"{label}\"); "
+            f"RecompStackPop(); "
+            f"return cpu_unresolved_abandon_balanced(cpu, "
+            f"0x{src_pc24:06X}u, _entry_s, _hrv); }}"
             f" /* {label} unresolvable cross-fn goto — "
             f"target outside this bank's import range */"
         )
@@ -1385,7 +1427,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                             # 2026-05-18 class fix: if the JML operand
                             # resolves to a registered named function in
                             # ANY bank, emit a tail-call to its
-                            # M{m}X{x} variant (using the current block's
+                            # M{m}X{x} variant (using the JML instruction's
                             # (m, x) — JML doesn't touch the status
                             # register's M/X bits). This is the cross-
                             # bank analogue of the same-bank tail-call-
@@ -1404,13 +1446,22 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 if insn.mode == _LONG_MODE:
                                     target_pc24 = insn.operand & 0xFFFFFF
                             if target_pc24 is not None:
-                                from v2.codegen import (get_name_for_pc,
-                                                          register_call_demand)
+                                # The block key is the mode at block entry.
+                                # REP/SEP earlier in this same block can
+                                # change the JML target's entry mode.
+                                jml_m = getattr(insn, 'm_flag', key.m) & 1
+                                jml_x = getattr(insn, 'x_flag', key.x) & 1
+                                from v2.codegen import (
+                                    get_name_for_pc,
+                                    register_call_demand,
+                                    resolve_variant_for_target)
                                 tgt_name = get_name_for_pc(target_pc24)
                                 if tgt_name is not None:
-                                    sib_suffix = _variant_suffix(key.m, key.x)
+                                    sib_m, sib_x = resolve_variant_for_target(
+                                        target_pc24, jml_m, jml_x)
+                                    sib_suffix = _variant_suffix(sib_m, sib_x)
                                     register_call_demand(target_pc24,
-                                                          key.m, key.x)
+                                                          sib_m, sib_x)
                                     tgt_bank = (target_pc24 >> 16) & 0xFF
                                     # JML changes PB on real hardware
                                     # (the destination bank byte becomes
@@ -1467,10 +1518,13 @@ def emit_function(rom: bytes, bank: int, start: int,
                                        if target_pc24 is not None else "0x000000")
                             if (target_pc24 is not None
                                     and ((target_pc24 >> 16) & 0xFF) != bank):
+                                jml_m = getattr(insn, 'm_flag', key.m) & 1
+                                jml_x = getattr(insn, 'x_flag', key.x) & 1
                                 from v2.codegen import (
                                     register_call_demand,
                                     _is_invalid_lorom_call_target,
-                                    get_name_for_pc)
+                                    get_name_for_pc,
+                                    resolve_variant_for_target)
                                 if (_is_invalid_lorom_call_target(target_pc24)
                                         and get_name_for_pc(target_pc24)
                                         is None):
@@ -1491,9 +1545,11 @@ def emit_function(rom: bytes, bank: int, start: int,
                                         f"followed garbage operand past an "
                                         f"RTS) */")
                                 else:
+                                    sib_m, sib_x = resolve_variant_for_target(
+                                        target_pc24, jml_m, jml_x)
                                     register_call_demand(target_pc24,
-                                                          key.m, key.x)
-                                    sib_suffix = _variant_suffix(key.m, key.x)
+                                                          sib_m, sib_x)
+                                    sib_suffix = _variant_suffix(sib_m, sib_x)
                                     tgt_bank = (target_pc24 >> 16) & 0xFF
                                     tgt16 = target_pc24 & 0xFFFF
                                     synth_name = (
@@ -1512,17 +1568,25 @@ def emit_function(rom: bytes, bank: int, start: int,
                                         nlr_info,
                                     ))
                             else:
+                                # Account the hit, then abandon balanced —
+                                # the bare `return ..._goto_trap(...)` this
+                                # replaces returned NORMAL with the caller's
+                                # frame + any locals still on cpu->S
+                                # (orphaned-frame leak class, 2026-06-09).
                                 lines.append(
-                                    f"return cpu_trace_unresolved_goto_trap(cpu, "
+                                    f"(void)cpu_trace_unresolved_goto_trap(cpu, "
                                     f"0x{src_pc24:06X}, {tgt_str}, "
                                     f"\"{func_name}\", \"L_{key.pc & 0xFFFF:04X}_"
-                                    f"M{key.m}X{key.x}\");"
+                                    f"M{key.m}X{key.x}\");")
+                                lines.append(
+                                    f"return cpu_unresolved_abandon_balanced(cpu, "
+                                    f"0x{src_pc24:06X}u, _entry_s, _hrv);"
                                     f"  /* unresolvable cross-bank goto — "
                                     f"no named function at target */"
                                 )
                         block_terminated = True
                 elif isinstance(op, Return):
-                    for ln in emit_op(op):
+                    for ln in emit_op(op, getattr(di_insn, 'addr', None)):
                         lines.append(ln)
                     block_terminated = True
                 elif isinstance(op, IndirectGoto):
@@ -1538,7 +1602,10 @@ def emit_function(rom: bytes, bank: int, start: int,
                         from v2.codegen import _emit_indirect_dispatch
                         for ln in _emit_indirect_dispatch(insn):
                             lines.append(ln)
-                        block_terminated = True
+                        # Pointer-sourced CALL form (PEA <ret>; JMP (ptr)) is
+                        # non-terminal: the handler RTSes back to the PEA'd
+                        # return, so execution falls through to the next block.
+                        block_terminated = not getattr(insn, 'dispatch_call', False)
                     else:
                         # No resolution. Two sub-cases:
                         #   (a) cfg `hle_dispatch <pc16> <c_helper>` claims
@@ -1561,10 +1628,28 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 f"host-side dispatcher */"
                             )
                         else:
+                            # Account the hit, then abandon this invocation
+                            # balanced (discard locals below _entry_s, pop
+                            # the paired caller's frame per _hrv). The bare
+                            # `return cpu_trace_dispatch_oob(...)` this
+                            # replaces orphaned the caller's frame AND any
+                            # locals (PHP/PHX/PHY) still on cpu->S at the
+                            # unresolved JMP — the SM cinematic
+                            # sub-dispatcher 4-7 B/frame leak (2026-06-09).
                             lines.append(
-                                f"return cpu_trace_dispatch_oob(cpu, "
-                                f"0x{site_pc24:06x}, 0xFFFF); "
-                                f"/* unresolved IndirectGoto — HLE pending */")
+                                f"(void)cpu_trace_dispatch_oob(cpu, "
+                                f"0x{site_pc24:06x}, 0xFFFF);")
+                            # Interpreter-fallback tier: re-interpret from the
+                            # unresolved JMP itself (target == site). interp816
+                            # decodes the indirect jump, reads the pointer at
+                            # runtime, runs the real target (with any PEA'd
+                            # return), and unwinds to _entry_s. Bail -> the
+                            # stack-safe abandon, never worse. docs/MULTI_TIER.md
+                            lines.append(
+                                f"return interp_tier_dispatch_balanced(cpu, "
+                                f"0x{site_pc24:06x}u, 0x{site_pc24:06x}u, "
+                                f"_entry_s, _hrv); "
+                                f"/* unresolved IndirectGoto -> interpreter tier */")
                         block_terminated = True
                 elif isinstance(op, PushReg) and getattr(
                         di_insn, 'dispatch_entries', None):
@@ -1602,11 +1687,11 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 lines.append(ln)
                             block_terminated = True
                     else:
-                        for ln in emit_op(op):
+                        for ln in emit_op(op, getattr(di_insn, 'addr', None)):
                             lines.append(ln)
                 else:
                     # ReadReg, ALU, Read/Write, etc. — non-terminating.
-                    for ln in emit_op(op):
+                    for ln in emit_op(op, getattr(di_insn, 'addr', None)):
                         lines.append(ln)
         # NLR with no terminator IR (block IR was pure-PullReg, like
         # $01:A3CB's [PLA, PLA, fall-through]). The SKIP setter wasn't

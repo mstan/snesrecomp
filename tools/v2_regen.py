@@ -46,6 +46,7 @@ from v2.codegen import (  # noqa: E402
 )
 from v2.decoder import (  # noqa: E402
     classify_dispatch_helper, decode_function, analyze_function_exit_mx,
+    detect_inline_arg_bytes, set_active_inline_arg_map,
     set_decode_cache_enabled, clear_decode_cache, decode_cache_stats,
 )
 from v2.emit_bank import BankEntry, emit_bank  # noqa: E402
@@ -114,6 +115,8 @@ _STUB_MARKERS = (
     'Goto with no successor',                # emit_function cross-bank-goto bail (2026-05-18)
     'unresolvable cross-bank goto',          # emit_function cross-bank trap fallback (2026-05-18)
     'unresolved IndirectGoto',               # emit_function indirect JMP/JML with no resolution (2026-05-29)
+    'BRK: software interrupt',               # wrong-width decode or unsupported interrupt opcode
+    'COP: software interrupt',               # wrong-width decode or unsupported interrupt opcode
 )
 
 
@@ -197,8 +200,200 @@ def _scan_dirty_variants(results, parsed) -> tuple:
     return dirty, emitted
 
 
+_VARIANT_DEF_RE = re.compile(
+    r'^RecompReturn\s+([A-Za-z0-9_]+)_M([01])X([01])'
+    r'\(CpuState\s+\*cpu\)\s*\{')
+_SYNTHETIC_BASE_RE = re.compile(r'^bank_([0-9a-fA-F]{2})_([0-9a-fA-F]{4})$')
+_GEN_BANK_RE = re.compile(r'^bank([0-9a-fA-F]{2})_v2\.c$')
+
+
+def _variant_base_pc24(base_name: str, name_to_pc24: dict) -> int | None:
+    """Resolve an emitted variant base name back to its 24-bit entry PC."""
+    m = _SYNTHETIC_BASE_RE.match(base_name)
+    if m:
+        return (int(m.group(1), 16) << 16) | int(m.group(2), 16)
+    return name_to_pc24.get(base_name)
+
+
+def _scan_generated_variant_defs(out_dir: pathlib.Path,
+                                 name_to_pc24: dict) -> dict:
+    """Return variants whose C definitions are actually present in src/gen.
+
+    The trampoline dispatch table must contain fnptrs only for emitted
+    symbols. This matters especially for --banks partial regens: skipped
+    bank sources stay on disk, while the just-regenerated bank may have a
+    narrower surviving variant set. Scanning generated definitions makes
+    dispatch_v2.c reflect the build inputs exactly instead of the broader
+    in-memory cfg entry set.
+    """
+    variants: dict[int, set] = {}
+    paths = sorted(out_dir.glob('bank*_v2.c'))
+    stub_path = out_dir / 'unresolved_stubs_v2.c'
+    if stub_path.exists():
+        paths.append(stub_path)
+    for p in paths:
+        try:
+            with p.open('r', encoding='utf-8', errors='replace') as f:
+                for raw in f:
+                    m = _VARIANT_DEF_RE.match(raw)
+                    if not m:
+                        continue
+                    pc24 = _variant_base_pc24(m.group(1), name_to_pc24)
+                    if pc24 is None:
+                        continue
+                    variants.setdefault(pc24, set()).add(
+                        (int(m.group(2)), int(m.group(3))))
+        except OSError as e:
+            print(f"  dispatch scan: failed to read {p}: {e}",
+                  file=sys.stderr)
+    return variants
+
+
+def _build_name_to_pc24(parsed) -> dict:
+    """Return the generated-symbol base-name -> cfg PC mapping."""
+    name_to_pc24: dict[str, int] = {}
+    for bank2, _cfg_path2, cfg2 in parsed:
+        for entry in cfg2.entries:
+            if not entry.name:
+                continue
+            pc24 = (bank2 << 16) | (entry.start & 0xFFFF)
+            name_to_pc24.setdefault(entry.name, pc24)
+    return name_to_pc24
+
+
+def _scan_skipped_bank_valid_variants(out_dir: pathlib.Path, parsed,
+                                      only_banks: set | None) -> dict:
+    """Seed codegen survivor sets from generated sources for skipped banks.
+
+    Partial regen preserves bank sources outside --banks. Calls emitted by the
+    regenerated bank must therefore target the variant symbols that are
+    actually present on disk for preserved banks, not every variant currently
+    present in the in-memory cfg clone set.
+    """
+    if only_banks is None:
+        return {}
+    name_to_pc24 = _build_name_to_pc24(parsed)
+    disk_variants = _scan_generated_variant_defs(out_dir, name_to_pc24)
+    out: dict[int, frozenset] = {}
+    for pc24, mxs in disk_variants.items():
+        if ((pc24 >> 16) & 0xFF) in only_banks or not mxs:
+            continue
+        out[pc24] = frozenset(mxs)
+    return out
+
+
+def _read_skipped_bank_results(out_dir: pathlib.Path,
+                               only_banks: set | None) -> list[dict]:
+    """Load generated source blobs for banks preserved by --banks.
+
+    Partial regen must treat these on-disk sources as live link inputs:
+    their direct references can protect regenerated-bank targets from the
+    prune, and their emitted variants count as available for reference-taint.
+    """
+    if only_banks is None:
+        return []
+    results: list[dict] = []
+    for p in sorted(out_dir.glob('bank*_v2.c')):
+        m = _GEN_BANK_RE.match(p.name)
+        if not m:
+            continue
+        bank = int(m.group(1), 16)
+        if bank in only_banks:
+            continue
+        try:
+            src = p.read_text(encoding='utf-8', errors='replace')
+        except OSError as e:
+            print(f"  partial scan: failed to read {p}: {e}",
+                  file=sys.stderr)
+            continue
+        results.append({'status': 'ok', 'bank': bank, 'src': src})
+    return results
+
+
+def _emit_dispatch_table(out_dir: pathlib.Path, parsed,
+                         cumulative_pruned: set) -> None:
+    """Emit dispatch_v2.c from generated C definitions on disk."""
+    name_for_pc24: dict[int, str] = {}
+    name_to_pc24 = _build_name_to_pc24(parsed)
+    for bank2, _cfg_path2, cfg2 in parsed:
+        for entry in cfg2.entries:
+            if not entry.name:
+                continue
+            pc24 = (bank2 << 16) | (entry.start & 0xFFFF)
+            name_for_pc24[pc24] = entry.name
+
+    def _disp_name(pc24: int) -> str:
+        n = name_for_pc24.get(pc24)
+        if n is not None:
+            return n
+        bank = (pc24 >> 16) & 0xFF
+        pc = pc24 & 0xFFFF
+        return f"bank_{bank:02X}_{pc:04X}"
+
+    disp_variants = _scan_generated_variant_defs(out_dir, name_to_pc24)
+    for (addr, em, ex) in cumulative_pruned:
+        s = disp_variants.get(addr)
+        if s is not None:
+            s.discard((em & 1, ex & 1))
+    sorted_pc24s = sorted(pc24 for pc24, mxs in disp_variants.items() if mxs)
+
+    disp_path = out_dir / 'dispatch_v2.c'
+    disp_lines = [
+        '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',
+        ' *',
+        ' * PEI-trampoline dispatch table - runtime cpu_dispatch_pc() looks',
+        ' * up function entries here when an RTS/RTL on a trampoline-flagged',
+        ' * function hits the unbalanced-cpu->S branch in _emit_return.',
+        ' *',
+        ' * Sorted by pc24 for binary search. variant[] holds fnptrs for',
+        ' * (M0X0, M0X1, M1X0, M1X1) - NULL when that variant was not emitted.',
+        ' */',
+        '',
+        '#include "cpu_state.h"',
+        '',
+    ]
+    fwd_seen: set[str] = set()
+    for pc24 in sorted_pc24s:
+        base = _disp_name(pc24)
+        for em in (0, 1):
+            for ex in (0, 1):
+                if (em, ex) not in disp_variants[pc24]:
+                    continue
+                name = f"{base}_M{em}X{ex}"
+                if name in fwd_seen:
+                    continue
+                fwd_seen.add(name)
+                disp_lines.append(f"RecompReturn {name}(CpuState *cpu);")
+    disp_lines.append('')
+    disp_lines.append('const DispatchEntry g_dispatch_table[] = {')
+    if not sorted_pc24s:
+        disp_lines.append(
+            "    { 0xFFFFFFu, { NULL, NULL, NULL, NULL } },  /* sentinel - empty cfg */"
+        )
+    for pc24 in sorted_pc24s:
+        base = _disp_name(pc24)
+        slots = ['NULL', 'NULL', 'NULL', 'NULL']
+        for em, ex in disp_variants[pc24]:
+            idx = ((em & 1) << 1) | (ex & 1)
+            slots[idx] = f"{base}_M{em & 1}X{ex & 1}"
+        disp_lines.append(
+            f"    {{ 0x{pc24:06X}u, {{ {', '.join(slots)} }} }},  "
+            f"/* {base} */"
+        )
+    disp_lines.append('};')
+    disp_lines.append('')
+    disp_lines.append(
+        f"const unsigned g_dispatch_table_count = "
+        f"(unsigned)(sizeof(g_dispatch_table) / sizeof(g_dispatch_table[0]));"
+    )
+    disp_lines.append('')
+    write_if_changed(disp_path, '\n'.join(disp_lines) + '\n')
+    print(f"  emitted dispatch table with {len(sorted_pc24s)} entries -> {disp_path}")
+
+
 def _compute_prunable(dirty_variants: set, emitted_variants: set,
-                      canonical_variants: dict) -> set:
+                      canonical_variants: dict,
+                      protected_variants: set | None = None) -> set:
     """Decide which dirty (addr24, m, x) variants the emit-truth prune
     may drop, given the cumulative dirty + emitted variant sets and the
     cfg-declared canonical widths.
@@ -212,6 +407,10 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
       proves the bytes are real code at that width, so the dirty clone is
       a wrong-width decode (misaligned operands -> phantom branches /
       garbage calls) that can never be validly reached.
+    - It is NOT `protected` (see below): a variant that is the target of a
+      DIRECT (non-dispatch) reference from a never-pruned body is provably
+      reached at that width, so its stub marker is pending dispatch
+      residue — NOT wrong-width garbage.
 
     Effective canonical = the cfg-declared width(s) when the base has a
     cfg entry, else the default 65816 reset width (1, 1). Auto-promoted
@@ -224,7 +423,24 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
     clean-canonical test fails, and NOTHING is pruned — the genuine site
     survives as loud trap residue (matching the oracle baseline) for cfg
     `indirect_dispatch` / `hle_dispatch` follow-up.
+
+    `protected_variants` closes a hole the clean-canonical test alone
+    cannot: when the cfg-DEFAULT width (the effective canonical) is itself
+    the WRONG-width decode — i.e. the ingester defaulted a genuinely 16-bit
+    routine to (1, 1) — the clean-canonical test protects the garbage
+    canonical and instead prunes the REAL non-canonical variant. That real
+    variant is reached by a DIRECT tail-call/call from a never-pruned body
+    (canonically, the fall-through sibling that `REP`s the width before
+    the boundary), and that direct reference dangles at link time
+    (LNK2019) with no prune able to repair it (canonicals are unprunable).
+    The caller passes the set of variants directly referenced by a
+    never-pruned body (see `_protected_ref_targets`); they are provably
+    reached and must survive. Observed: Super Metroid
+    `sub_82BB7F` / `sub_82BBDD` (the baby-Metroid cluster runs under
+    HandleGameOverBabyMetroid's `REP #$30`, so the real width is M0X0, the
+    cfg-default M1X1 is the garbage decode). 2026-06-08.
     """
+    protected_variants = protected_variants or set()
     dirty_mx: dict = {}
     for (addr, em, ex) in dirty_variants:
         dirty_mx.setdefault(addr, set()).add((em, ex))
@@ -233,6 +449,8 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
         emitted_mx.setdefault(addr, set()).add((em, ex))
     prunable: set = set()
     for (addr, em, ex) in dirty_variants:
+        if (addr, em, ex) in protected_variants:
+            continue  # directly referenced by a never-pruned body — reached
         canon = canonical_variants.get(addr) or {(1, 1)}
         if (em, ex) in canon:
             continue  # never prune the (effective) canonical variant
@@ -266,7 +484,8 @@ _SYNTHETIC_NAME_RE = re.compile(r'^bank_([0-9A-Fa-f]{2})_([0-9A-Fa-f]{4})$')
 _MX_DISPATCH_CASE_RE = re.compile(r'^\s*(case\s+[0-3]\s*:|default\s*:)')
 
 
-def _scan_variant_refs(results, parsed) -> dict:
+def _scan_variant_refs(results, parsed,
+                       include_dispatch_cases: bool = False) -> dict:
     """Build the DIRECT cross-variant reference graph from the emitted
     bodies.
 
@@ -284,7 +503,12 @@ def _scan_variant_refs(results, parsed) -> dict:
     (LNK2019), so the caller clone is itself wrong-width and must be
     pruned. Names resolve via cfg `name` directives; synthetic
     `bank_BB_AAAA` targets encode the address. Unresolvable names are
-    skipped (conservative: never over-taint)."""
+    skipped (conservative: never over-taint).
+
+    `include_dispatch_cases` is only for partial-regeneration link
+    preservation: skipped sources are already on disk and their switch cases
+    name real symbols, so a regenerated target bank must keep those symbols
+    defined even though the cases are not semantic direct refs."""
     name_to_addr: dict = {}
     base_start: dict = {}
     for bank, _p, cfg in parsed:
@@ -334,7 +558,8 @@ def _scan_variant_refs(results, parsed) -> dict:
                 continue
             if cur is None:
                 continue
-            if _MX_DISPATCH_CASE_RE.match(line):
+            if (not include_dispatch_cases
+                    and _MX_DISPATCH_CASE_RE.match(line)):
                 continue  # runtime-(m,x) switch case — not a direct ref
             for cm in _VARIANT_CALL_RE.finditer(line):
                 taddr = _resolve(cm.group(1))
@@ -345,6 +570,50 @@ def _scan_variant_refs(results, parsed) -> dict:
                     continue  # self-reference (recursion) is not a taint
                 refs.setdefault(cur, set()).add(tv)
     return refs
+
+
+def _merge_variant_ref_graphs(*graphs: dict) -> dict:
+    merged: dict = {}
+    for graph in graphs:
+        for source, targets in graph.items():
+            merged.setdefault(source, set()).update(targets)
+    return merged
+
+
+def _variant_ref_targets(refs: dict) -> set:
+    targets: set = set()
+    for ts in refs.values():
+        targets |= ts
+    return targets
+
+
+def _protected_ref_targets(refs: dict, canonical_variants: dict,
+                           dirty_variants: set | None = None) -> set:
+    """Return DIRECT targets from source bodies that cannot be pruned.
+
+    Canonical and clean non-canonical source variants are never pruned, so
+    their DIRECT (non-dispatch) tail-call / single-call references are
+    permanent in the linked binary and MUST resolve. The boundary `(m, x)` of
+    each such reference is computed from the source body's own decode, so the
+    referenced (addr, m, x) is provably reached at that width — even when
+    it differs from the target's cfg-default width (the
+    HandleGameOverBabyMetroid `REP #$30` fall-through case). Feeding these
+    to `_compute_prunable` as `protected` stops the emit-truth /
+    reference-taint prune from dropping a genuinely-reached variant whose
+    only blemish is a pending indirect-dispatch stub marker.
+
+    Dirty non-canonical sources are excluded: those are exactly the
+    wrong-width bodies the prune may remove.
+
+    `refs` is `_scan_variant_refs` output (dispatch-switch cases already
+    excluded, so only danglable direct references are present)."""
+    dirty_variants = dirty_variants or set()
+    protected: set = set()
+    for (saddr, sm, sx), targets in refs.items():
+        canon = canonical_variants.get(saddr) or {(1, 1)}
+        if (sm, sx) in canon or (saddr, sm, sx) not in dirty_variants:
+            protected |= targets
+    return protected
 
 
 def _propagate_reference_taint(dirty: set, refs: dict, emitted: set,
@@ -384,12 +653,14 @@ def _propagate_reference_taint(dirty: set, refs: dict, emitted: set,
     return tainted
 
 
-def _apply_variant_prune(parsed, cumulative_pruned: set) -> dict:
+def _apply_variant_prune(parsed, cumulative_pruned: set,
+                         preserved_valid_variants: dict | None = None) -> dict:
     """Drop every pruned (addr24, m, x) variant's cfg entry and rebuild
     the survivor valid-variants map fed to codegen (also pushed via
     set_valid_variants so the runtime-(m,x) switch stops emitting the
-    pruned case). Returns the new valid_variants_map. Idempotent: safe
-    to call repeatedly as cumulative_pruned grows."""
+    pruned case). `preserved_valid_variants` carries on-disk survivor
+    sets for --banks-skipped sources. Returns the new valid_variants_map.
+    Idempotent: safe to call repeatedly as cumulative_pruned grows."""
     prune_by_bank: dict = {}
     for (addr, em, ex) in cumulative_pruned:
         prune_by_bank.setdefault((addr >> 16) & 0xFF, set()).add(
@@ -402,10 +673,14 @@ def _apply_variant_prune(parsed, cumulative_pruned: set) -> dict:
             e for e in cfg2.entries
             if (e.start & 0xFFFF, e.entry_m & 1, e.entry_x & 1)
             not in pset]
-    vvm: dict = {}
+    preserved_valid_variants = preserved_valid_variants or {}
+    preserved_addrs = set(preserved_valid_variants)
+    vvm: dict = {a: set(s) for a, s in preserved_valid_variants.items()}
     for bank2, _p2, cfg2 in parsed:
         for e in cfg2.entries:
             a = (bank2 << 16) | (e.start & 0xFFFF)
+            if a in preserved_addrs:
+                continue
             vvm.setdefault(a, set()).add((e.entry_m & 1, e.entry_x & 1))
     vvm = {a: frozenset(s) for a, s in vvm.items()}
     set_valid_variants(vvm)
@@ -639,6 +914,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
     set_force_variant_at(args_dict['force_variant_at'])
     set_valid_variants(args_dict.get('valid_variants') or {})
     set_trampoline_returns(args_dict['trampoline_returns'])
+    set_active_inline_arg_map(args_dict.get('inline_arg_map') or None)
 
     bank = args_dict['bank']
     cfg = args_dict['cfg']
@@ -658,6 +934,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
 
     try:
         src = emit_bank(rom, bank=bank, entries=cfg.entries,
+                        inline_arg_map=args_dict.get('inline_arg_map') or None,
                         dispatch_helpers=args_dict['dispatch_helpers'],
                         indirect_call_tables=getattr(
                             cfg, 'indirect_call_tables', None),
@@ -758,6 +1035,15 @@ def main() -> int:
                         '8C/16T desktop); hyperthreads rarely help '
                         'and compete for execution units.'.format(
                             _default_jobs))
+    p.add_argument('--tier-down-stubs', action='store_true',
+                   help='Opt-in (bring-up): emit cross-ROM-bank unresolved-'
+                        'function stubs (unresolved_stubs_v2.c) as interpreter '
+                        'tier-downs that RUN the real ROM bytes, instead of the '
+                        'no-op cpu_trace_unresolved_stub_trap. A bail falls back '
+                        'to the same stack-safe abandon (never worse), and every '
+                        'fire is recorded to the Tier-2 gap manifest. Shipped '
+                        'titles stay strict (default off). See docs/MULTI_TIER.md '
+                        'Phase 4.')
     args = p.parse_args()
 
     # ── Phase-tracking + watchdog ───────────────────────────────────
@@ -953,6 +1239,7 @@ def main() -> int:
     print("Auto-detecting JSL dispatch helpers...")
     dispatch_helpers: dict = {}
     jsl_targets: set = set()
+    call_targets: set = set()   # every JSR/JSL target (for inline-arg scan)
     for bank, _cfg_path, cfg in parsed:
         for entry in cfg.entries:
             try:
@@ -967,8 +1254,11 @@ def main() -> int:
                 # JSL or JML (JMP LONG)
                 if ins.mnem == 'JSL':
                     jsl_targets.add(ins.operand & 0xFFFFFF)
+                    call_targets.add(ins.operand & 0xFFFFFF)
                 elif ins.mnem == 'JMP' and ins.length == 4:
                     jsl_targets.add(ins.operand & 0xFFFFFF)
+                elif ins.mnem == 'JSR' and ins.length == 3:
+                    call_targets.add((bank << 16) | (ins.operand & 0xFFFF))
     classified = {'short': 0, 'long': 0}
     for tgt in jsl_targets:
         tbank = (tgt >> 16) & 0xFF
@@ -979,6 +1269,83 @@ def main() -> int:
             classified[kind] += 1
     print(f"  detected {classified['short']} short + {classified['long']} long dispatch helpers "
           f"(scanned {len(jsl_targets)} JSL/JML targets)")
+
+    # Auto-detect JSR/JSL INLINE-ARGUMENT routines (no cfg hint — the
+    # byte count is a property of the callee's own code; see
+    # detect_inline_arg_bytes / PRINCIPLES "hints are not correctness").
+    # Such a callee reads its return address off the stack, consumes the
+    # N bytes after the call site as a parameter, and advances the stacked
+    # return address by N. The decoder must skip those N bytes at every
+    # call site (see _labeled_successors) or it runs into the inline data
+    # and misdecodes it as code. Probe each call target at both common
+    # entry widths (the ADC #imm that encodes N is m-dependent, so the
+    # idiom only resolves at the routine's real width); accept only a
+    # unique result. Canonical case: Super Metroid APU_UploadBankIP
+    # ($80:800A), a 3-byte inline ROM pointer the reset embeds after its
+    # JSL — without this, I_RESET decodes the pointer as BRK and returns
+    # early (black screen).
+    _phase("inline_arg_discovery")
+    print("Auto-detecting JSR/JSL inline-argument routines...")
+    # Transitive closure of call targets. The initial scan above only saw
+    # the immediate instructions of cfg entries; an inline-arg callee can
+    # sit deeper — e.g. Super Metroid's APU_UploadBankIP ($80:800A) is
+    # reached via I_RESET -> cross-bank JMP $80:8423 -> JSL $80:800A, and
+    # $8423 is not a cfg entry until auto-promote (which runs later). Walk
+    # JSL/JSR/JMP-long from every cfg entry to a fixpoint, decoding each
+    # function once (default width suffices — we only need the call-target
+    # operands, captured before any inline-data truncation) so every
+    # transitively-reachable callee is probed.
+    _wl: list = []
+    for bank, _cfg_path, cfg in parsed:
+        for entry in cfg.entries:
+            _wl.append(((bank << 16) | (entry.start & 0xFFFF),
+                        entry.entry_m & 1, entry.entry_x & 1))
+    _decoded_for_calls: set = set()
+    while _wl:
+        pc24, em, ex = _wl.pop()
+        if pc24 in _decoded_for_calls:
+            continue
+        _decoded_for_calls.add(pc24)
+        dbank, daddr = (pc24 >> 16) & 0xFF, pc24 & 0xFFFF
+        try:
+            g = decode_function(rom, dbank, daddr, entry_m=em, entry_x=ex)
+        except Exception:
+            continue
+        for di in g.insns.values():
+            ins = di.insn
+            if ins.mnem == 'JSL' or (ins.mnem == 'JMP' and ins.length == 4):
+                t = ins.operand & 0xFFFFFF
+            elif ins.mnem == 'JSR' and ins.length == 3:
+                t = (dbank << 16) | (ins.operand & 0xFFFF)
+            else:
+                continue
+            call_targets.add(t)
+            if t not in _decoded_for_calls:
+                _wl.append((t, 1, 1))
+    inline_arg_map: dict = {}
+    for tgt in sorted(call_targets):
+        tbank = (tgt >> 16) & 0xFF
+        taddr = tgt & 0xFFFF
+        seen_n: set = set()
+        for em, ex in ((0, 0), (1, 1)):
+            n = detect_inline_arg_bytes(rom, tbank, taddr, em, ex)
+            if n:
+                seen_n.add(n)
+        if len(seen_n) == 1:
+            inline_arg_map[tgt] = seen_n.pop()
+    if inline_arg_map:
+        print(f"  detected {len(inline_arg_map)} inline-argument routine(s):")
+        for tgt, n in sorted(inline_arg_map.items()):
+            nm = name_map.get(tgt, name_map.get(tgt ^ 0x800000, ''))
+            print(f"    ${tgt:06X} consumes {n} inline byte(s)"
+                  f"{(' (' + nm + ')') if nm else ''}")
+    else:
+        print(f"  none (scanned {len(call_targets)} call targets)")
+    # Install as the process-wide default so every main-process decode
+    # (variant discovery, exit-mx, etc.) skips inline-arg bytes. The
+    # multiprocessing emit workers receive it via the work-item dict and
+    # set it in their own process (see _emit_bank_one).
+    set_active_inline_arg_map(inline_arg_map)
 
     # Auto-detect leaf-function exit-(M, X) state mutations. Pattern:
     # cfg `func F` whose decoded body has NO JSR/JSL inside AND whose
@@ -1485,13 +1852,51 @@ def main() -> int:
     cumulative_rejected_calls: set = set()
 
     # Emit-truth variant prune state. `valid_variants_map` is the
-    # per-target survivor set fed to codegen (empty on pass 0 => emit
-    # all four). `cumulative_dirty_variants` accumulates every variant
-    # whose body emitted a stub marker; `cumulative_pruned` is the set
-    # actually dropped (dirty non-canonical clones with a clean
-    # canonical sibling). Both grow monotonically -> the prune
-    # converges alongside auto-promote.
-    valid_variants_map: dict = {}
+    # per-target survivor set fed to codegen (empty on full-regeneration
+    # pass 0 => emit all four). With --banks partial regen, seed it from
+    # generated definitions for skipped banks so regenerated callers do
+    # not reference variant symbols that the preserved sources do not
+    # actually define.
+    preserved_valid_variants = _scan_skipped_bank_valid_variants(
+        out_dir, parsed, only_banks)
+    if preserved_valid_variants:
+        count = sum(len(v) for v in preserved_valid_variants.values())
+        print(f"  --banks filter active; seeded {count} emitted variant "
+              f"definition(s) from skipped bank sources")
+    skipped_bank_results = _read_skipped_bank_results(out_dir, only_banks)
+    skipped_ref_graph = _scan_variant_refs(skipped_bank_results, parsed)
+    skipped_link_ref_graph = _scan_variant_refs(
+        skipped_bank_results, parsed, include_dispatch_cases=True)
+    skipped_link_targets = _variant_ref_targets(skipped_link_ref_graph)
+    skipped_dirty_variants, skipped_emitted_variants = _scan_dirty_variants(
+        skipped_bank_results, parsed)
+    if skipped_bank_results:
+        ref_count = sum(len(v) for v in skipped_ref_graph.values())
+        link_ref_count = sum(len(v) for v in skipped_link_ref_graph.values())
+        print(f"  --banks filter active; scanned {len(skipped_bank_results)} "
+              f"skipped bank source(s), {ref_count} direct ref(s), "
+              f"{link_ref_count} link ref(s), "
+              f"{len(skipped_dirty_variants)} dirty variant marker(s)")
+    if only_banks is not None and skipped_link_targets:
+        partial_link_demands = {
+            v for v in skipped_link_targets
+            if ((v[0] >> 16) & 0xFF) in only_banks
+        }
+        if partial_link_demands:
+            promoted = _autopromote_targets(
+                parsed, partial_link_demands, source_kind="partial-link")
+            promoted = promoted or set()
+            pending_variant_entries |= partial_link_demands | promoted
+            print(f"  --banks filter active; seeded "
+                  f"{len(partial_link_demands)} variant demand(s) from "
+                  f"skipped source link refs "
+                  f"({len(promoted)} promoted)")
+    valid_variants_map: dict = dict(preserved_valid_variants)
+    set_valid_variants(valid_variants_map)
+    # `cumulative_dirty_variants` accumulates every variant whose body
+    # emitted a stub marker; `cumulative_pruned` is the set actually
+    # dropped (dirty non-canonical clones with a clean canonical sibling).
+    # Both grow monotonically -> the prune converges alongside auto-promote.
     cumulative_dirty_variants: set = set()
     cumulative_emitted_variants: set = set()
     cumulative_pruned: set = set()
@@ -1573,9 +1978,9 @@ def main() -> int:
             pending_variant_entries = set()
             exit_mx_rescan_all = False
         if variant_added:
-            if valid_variants_map:
+            if cumulative_pruned:
                 valid_variants_map = _apply_variant_prune(
-                    parsed, cumulative_pruned)
+                    parsed, cumulative_pruned, preserved_valid_variants)
             print(f"  variant discovery refresh: added {variant_added} "
                   f"entry variant(s) from current cfg entries")
         # Build per-bank work items. Banks outside the --banks filter
@@ -1607,6 +2012,7 @@ def main() -> int:
                 'trampoline_returns': cumulative_trampoline_returns,
                 'callee_exit_mx': callee_exit_mx,
                 'callee_exit_mx_modes': callee_exit_mx_modes,
+                'inline_arg_map': inline_arg_map,
             })
 
         # Run emit. Pool path used when --jobs > 1 and there's more
@@ -1676,14 +2082,26 @@ def main() -> int:
         dirty_now, emitted_now = _scan_dirty_variants(results, parsed)
         cumulative_dirty_variants |= dirty_now
         cumulative_emitted_variants |= emitted_now
+        # Variants directly referenced by a surviving body
+        # are provably reached at the referenced width; protect them from
+        # the wrong-width prune so a genuinely-reached variant whose body
+        # carries a pending indirect-dispatch stub is never dropped (which
+        # would dangle the caller's direct reference -> LNK2019).
+        emit_ref_graph = _scan_variant_refs(results, parsed)
+        protect_ref_graph = _merge_variant_ref_graphs(
+            skipped_ref_graph, emit_ref_graph)
+        protected_variants = _protected_ref_targets(
+            protect_ref_graph, canonical_variants,
+            cumulative_dirty_variants | skipped_dirty_variants)
+        protected_variants |= skipped_link_targets
         prunable = _compute_prunable(
             cumulative_dirty_variants, cumulative_emitted_variants,
-            canonical_variants)
+            canonical_variants, protected_variants)
         newly_pruned = prunable - cumulative_pruned
         if newly_pruned:
             cumulative_pruned |= newly_pruned
             valid_variants_map = _apply_variant_prune(
-                parsed, cumulative_pruned)
+                parsed, cumulative_pruned, preserved_valid_variants)
             print(f"  emit-truth prune: dropped {len(newly_pruned)} "
                   f"wrong-width variant(s) this pass "
                   f"({len(cumulative_pruned)} total); re-emitting")
@@ -1727,15 +2145,23 @@ def main() -> int:
             # iterates to a fixpoint (monotonic — cumulative_pruned only
             # grows).
             ref_graph = _scan_variant_refs(results, parsed)
+            protect_ref_graph = _merge_variant_ref_graphs(
+                skipped_ref_graph, ref_graph)
+            ref_protected = _protected_ref_targets(
+                protect_ref_graph, canonical_variants,
+                cumulative_dirty_variants | skipped_dirty_variants)
+            ref_protected |= skipped_link_targets
+            emitted_for_ref = emitted_now | skipped_emitted_variants
             ref_prunable = set()
             while True:
                 tainted = _propagate_reference_taint(
                     cumulative_dirty_variants, ref_graph,
-                    emitted_now, bank_set,
+                    emitted_for_ref, bank_set,
                     cumulative_pruned | ref_prunable)
                 next_ref_prunable = (
                     _compute_prunable(
-                        tainted, emitted_now, canonical_variants)
+                        tainted, emitted_for_ref, canonical_variants,
+                        ref_protected)
                     - cumulative_pruned
                     - ref_prunable)
                 if not next_ref_prunable:
@@ -1788,7 +2214,7 @@ def main() -> int:
                     pass
             cumulative_pruned |= ref_prunable
             valid_variants_map = _apply_variant_prune(
-                parsed, cumulative_pruned)
+                parsed, cumulative_pruned, preserved_valid_variants)
             print(f"  reference-taint prune: dropped {len(ref_prunable)} "
                   f"wrong-width caller clone(s) "
                   f"({len(cumulative_pruned)} total); re-emitting "
@@ -1944,7 +2370,9 @@ def main() -> int:
         else:
             print(f"  --banks filter active; no existing {stub_path} to preserve "
                   f"(run a full regen first)")
-        # Skip the rewrite entirely.
+        # Skip the stub rewrite entirely, but keep dispatch_v2.c in sync
+        # with the generated sources that are actually on disk.
+        _emit_dispatch_table(out_dir, parsed, cumulative_pruned)
         return 0 if not failed else 1
     lines = [
         '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',
@@ -1952,29 +2380,63 @@ def main() -> int:
         ' * Stub bodies for Call targets that resolved to a ROM bank not',
         ' * in the cfg set. These are typically data decoded as code',
         ' * (garbled JSL operands). Real execution paths should never',
-        ' * reach them; each stub chains into cpu_trace_unresolved_stub_trap',
-        ' * so a runtime fire is captured (loud stderr line + TCP-queryable',
-        ' * snapshot via unresolved_stub_get) instead of silently returning.',
+        ' * reach them. By default each stub records the trap and returns a',
+        ' * stack-safe no-op; with --tier-down-stubs it instead runs the real',
+        ' * bytes via the interpreter tier (interp_tier_dispatch_bank_miss)',
+        ' * and records to the Tier-2 gap manifest. Either way cpu->S stays',
+        ' * balanced (pops the paired caller frame per hrv).',
         ' * One stub per (target, m, x) variant requested by the gen.',
         ' *',
         ' * Always emitted — file may be empty (no stubs needed) when',
         ' * every (target, m, x) demand resolved within the cfg set.',
+        ' *',
+        ' * Each body mirrors the emitted-function prologue (entry-S /',
+        ' * host-return-validity capture incl. tailcall-context take) and',
+        ' * exits via cpu_unresolved_abandon_balanced so a runtime fire',
+        ' * leaves cpu->S balanced (pops the paired caller frame per hrv)',
+        ' * instead of orphaning it — see the 2026-06-09 orphaned-frame',
+        ' * leak class (cpu_state.h host_return_valid).',
         ' */',
         '',
         '#include "cpu_state.h"',
         '#include "cpu_trace.h"',
+        '#include "common_cpu_infra.h"',
         '',
     ]
     total_stubs = 0
+    # Effective bank-miss tier-down opt-in: the --tier-down-stubs CLI flag OR
+    # a `tier_down_stubs` directive in any cfg (game-wide, persists across
+    # regens without re-passing the flag). See docs/MULTI_TIER.md Phase 4.
+    tier_down_stubs_on = args.tier_down_stubs or any(
+        getattr(c, 'tier_down_stubs', False) for _b, _p, c in parsed)
+    if tier_down_stubs_on:
+        src = 'cfg directive' if not args.tier_down_stubs else '--tier-down-stubs'
+        print(f"  tier_down_stubs ON ({src}): bank-miss stubs run via the "
+              f"interpreter tier")
     for bank in sorted(by_bank):
         for pc, em, ex in sorted(by_bank[bank]):
             name = f'bank_{bank:02X}_{pc:04X}_M{em}X{ex}'
             target_pc24 = (bank << 16) | (pc & 0xFFFF)
-            lines.append(
-                f'RecompReturn {name}(CpuState *cpu) {{ '
-                f'return cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}"); '
-                f'}}'
-            )
+            lines.append(f'RecompReturn {name}(CpuState *cpu) {{')
+            lines.append('  uint16 _entry_s = cpu->S;')
+            lines.append('  uint8 _hrv = cpu->host_return_valid;')
+            lines.append('  if (cpu_take_tailcall_return_context(&_entry_s, &_hrv)) {')
+            lines.append('    cpu->host_return_valid = _hrv;')
+            lines.append('  }')
+            if tier_down_stubs_on:
+                # Phase-4 opt-in: run the real bytes via the interpreter tier
+                # instead of the no-op trap. Bail -> same abandon (never worse);
+                # every fire lands in the Tier-2 gap manifest as kind=bank_miss.
+                lines.append(
+                    f'  return interp_tier_dispatch_bank_miss(cpu, '
+                    f'0x{target_pc24:06x}u, _entry_s, _hrv);')
+            else:
+                lines.append(
+                    f'  (void)cpu_trace_unresolved_stub_trap(cpu, 0x{target_pc24:06x}, "{name}");')
+                lines.append(
+                    f'  return cpu_unresolved_abandon_balanced(cpu, '
+                    f'0x{target_pc24:06x}u, _entry_s, _hrv);')
+            lines.append('}')
             total_stubs += 1
     write_if_changed(stub_path, '\n'.join(lines) + '\n')
     if total_stubs:
@@ -1990,10 +2452,13 @@ def main() -> int:
     # entry contributes a row keyed by pc24 with up to 4 fnptrs
     # (one per (m,x) variant; NULL when that variant wasn't emitted).
     name_for_pc24: dict[int, str] = {}
+    name_to_pc24: dict[str, int] = {}
     for bank2, _cfg_path2, cfg2 in parsed:
         for entry in cfg2.entries:
             if entry.name:
-                name_for_pc24[(bank2 << 16) | (entry.start & 0xFFFF)] = entry.name
+                pc24 = (bank2 << 16) | (entry.start & 0xFFFF)
+                name_for_pc24[pc24] = entry.name
+                name_to_pc24.setdefault(entry.name, pc24)
     def _disp_name(pc24: int) -> str:
         n = name_for_pc24.get(pc24)
         if n is not None:
@@ -2001,32 +2466,15 @@ def main() -> int:
         bank = (pc24 >> 16) & 0xFF
         pc = pc24 & 0xFFFF
         return f"bank_{bank:02X}_{pc:04X}"
-    disp_variants: dict[int, set] = {}
-    for bank3, _cfg_path3, cfg3 in parsed:
-        for entry in cfg3.entries:
-            pc24 = (bank3 << 16) | (entry.start & 0xFFFF)
-            mx = (entry.entry_m & 1, entry.entry_x & 1)
-            disp_variants.setdefault(pc24, set()).add(mx)
-    for bank3, mx_set in by_bank.items():
-        for pc, em, ex in mx_set:
-            pc24 = (bank3 << 16) | (pc & 0xFFFF)
-            disp_variants.setdefault(pc24, set()).add((em, ex))
+    disp_variants = _scan_generated_variant_defs(out_dir, name_to_pc24)
     # Never reference a PRUNED variant from the dispatch table. The
-    # emit-truth / reference-taint prune drops a variant's definition,
-    # but cfg.entries can re-accumulate the clone in a later auto-promote
-    # pass (so disp_variants, built from cfg.entries above, still lists
-    # it). A fnptr to a dropped variant dangles -> LNK2001 (observed:
-    # MMX, 316 unresolved externals == the 316 emit-truth-pruned
-    # variants, all referenced by mmx_dispatch_v2.obj). The runtime
-    # dispatches by live (m,x) to a SURVIVING variant; the pruned slot
-    # must stay NULL (exactly the table's documented "NULL when that
-    # variant wasn't emitted" contract). No-op for games whose dispatch
-    # table never listed a pruned variant (SMW/ALttP).
+    # table is built from generated definitions above, so this is mostly
+    # a safety net for stale partial-regeneration inputs.
     for (addr, em, ex) in cumulative_pruned:
         s = disp_variants.get(addr)
         if s is not None:
             s.discard((em & 1, ex & 1))
-    sorted_pc24s = sorted(disp_variants.keys())
+    sorted_pc24s = sorted(pc24 for pc24, mxs in disp_variants.items() if mxs)
     disp_path = out_dir / 'dispatch_v2.c'
     disp_lines = [
         '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',

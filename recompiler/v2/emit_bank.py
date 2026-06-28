@@ -85,7 +85,8 @@ def emit_bank(rom: bytes, bank: int,
               callee_exit_mx_modes=None,
               hle_spc_upload=None,
               hle_func=None,
-              hle_dispatch=None) -> str:
+              hle_dispatch=None,
+              inline_arg_map=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -153,6 +154,24 @@ def emit_bank(rom: bytes, bank: int,
                 )
             tail_call_target_name = by_start[tgt]
         sibling_pcs = all_entry_pcs - {entry.start & 0xFFFF}
+        if entry.end is not None:
+            start16 = entry.start & 0xFFFF
+            end16 = entry.end & 0xFFFF
+
+            def _inside_entry_range(pc16: int) -> bool:
+                pc16 &= 0xFFFF
+                if start16 <= end16:
+                    return start16 <= pc16 < end16
+                return pc16 >= start16 or pc16 < end16
+
+            # Some asm has multiple callable entry points into one body.
+            # If this entry's explicit range includes another entry PC,
+            # branches to that PC are local control flow, not sibling
+            # tail-calls. Keep the gate for true cross-function jumps.
+            sibling_pcs = {
+                pc for pc in sibling_pcs
+                if not _inside_entry_range(pc)
+            }
         src = emit_function(
             rom=rom,
             bank=bank,
@@ -180,6 +199,7 @@ def emit_bank(rom: bytes, bank: int,
             hle_spc_upload=hle_spc_upload,
             hle_func=hle_func,
             hle_dispatch=hle_dispatch,
+            inline_arg_map=inline_arg_map,
         )
         parts.append(src)
         parts.append("")  # blank line between functions

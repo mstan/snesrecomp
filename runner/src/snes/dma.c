@@ -9,6 +9,7 @@
 
 #include "dma.h"
 #include "snes.h"
+#include "../debug_server.h"
 
 static const int bAdrOffsets[8][4] = {
   {0, 0, 0, 0},
@@ -236,7 +237,9 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
   if(fromB) {
     snes_write(dma->snes, (aBank << 16) | aAdr, snes_readBBus(dma->snes, bAdr));
   } else {
-    snes_writeBBus(dma->snes, bAdr, snes_read(dma->snes, (aBank << 16) | aAdr));
+    uint8_t val = snes_read(dma->snes, (aBank << 16) | aAdr);
+    debug_server_on_reg_write((uint16_t)(0x2100u + bAdr), val);
+    snes_writeBBus(dma->snes, bAdr, val);
   }
 }
 
