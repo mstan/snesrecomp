@@ -16,6 +16,8 @@ typedef struct {
                     *   1 = 16-bit ptr at D+dp  ((dp), (dp),Y)
                     *   2 = 24-bit ptr at D+dp  ([dp], [dp],Y)
                     *   3 = 16-bit ptr at D+dp+X ((dp,X)) */
+    uint8_t far;   /* 1 = long ($C0:FFF0-based): use the far window ($C0-$C1),
+                    * which exercises ROM-bank addressing + long,X bank-carry */
 } OpTest;
 
 extern const OpTest g_ops[];

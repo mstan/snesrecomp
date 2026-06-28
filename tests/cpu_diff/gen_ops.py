@@ -45,7 +45,7 @@ funcs = []      # emitted C source blocks
 table = []      # (cname, codebytes, m, x, wmem)
 
 
-def emit(label, code, m, x, wmem=0, idx=0, ind=0):
+def emit(label, code, m, x, wmem=0, idx=0, ind=0, far=0):
     fn = f"op_{label}"
     rom = make_lorom_bank0({0x8000: bytes(code) + bytes([RTS])})
     src = emit_function(rom, bank=0, start=0x8000, entry_m=m, entry_x=x,
@@ -53,7 +53,7 @@ def emit(label, code, m, x, wmem=0, idx=0, ind=0):
     cname = f"{fn}_M{m}X{x}"
     if cname not in [t[0] for t in table]:
         funcs.append(src)
-        table.append((cname, code, m, x, wmem, idx, ind))
+        table.append((cname, code, m, x, wmem, idx, ind, far))
 
 
 for label, op, _ in IMM_OPS:
@@ -132,6 +132,19 @@ for label, dpx, dp, dpy, ldp, ldpy in INDIR:
         emit(f"{label}_lind", [ldp, DP], m, x, wmem, ind=2)         # [dp]
         emit(f"{label}_lindy",[ldpy,DP], m, x, wmem, idx=1, ind=2)  # [dp],Y
 
+# ── long (far) addressing: long ($C0:FFF0) and long,X — bank-carry surface ──
+LONG_BASE = [0xF0, 0xFF, 0xC0]   # $C0:FFF0, near the bank boundary
+LONG = [
+    ("ora", 0x0F, 0x1F), ("and", 0x2F, 0x3F), ("eor", 0x4F, 0x5F),
+    ("adc", 0x6F, 0x7F), ("sta", 0x8F, 0x9F), ("lda", 0xAF, 0xBF),
+    ("cmp", 0xCF, 0xDF), ("sbc", 0xEF, 0xFF),
+]
+for label, lop, lxop in LONG:
+    wmem = 1 if label == "sta" else 0
+    for m, x in ((1, 1), (0, 1)):
+        emit(f"{label}_long",  [lop] + LONG_BASE, m, x, wmem, far=1)
+        emit(f"{label}_longx", [lxop] + LONG_BASE, m, x, wmem, idx=1, far=1)
+
 # ── stack push/pull (operand-less). Pushes write the stack (wmem=1); the
 # harness's S-=2 RTS-undo recovers the push/pull effect on S. ──
 STACK = [
@@ -162,9 +175,9 @@ with open(out, "w", newline="\n") as f:
         f.write(s)
         f.write("\n")
     f.write(f"\nconst OpTest g_ops[] = {{\n")
-    for cname, code, m, x, wmem, idx, ind in table:
+    for cname, code, m, x, wmem, idx, ind, far in table:
         cb = ",".join(f"0x{b:02x}" for b in code)
-        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}, {idx}, {ind}}},\n')
+        f.write(f'  {{"{cname}", {{{cb}}}, {len(code)}, {cname}, {m}, {x}, {wmem}, {idx}, {ind}, {far}}},\n')
     f.write("};\n")
     f.write(f"const int g_nops = {len(table)};\n")
 print(f"wrote {out}: {len(table)} opcode variants")

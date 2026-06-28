@@ -29,9 +29,12 @@
 #define MEMSZ 0x1000000u
 #define WRAM  0x7E0000u   /* canonical low-WRAM base; both buses mirror $00/$7E here */
 #define WSZ   0x2000u     /* low-WRAM mirror size (dp/abs tests stay inside) */
+#define FAR   0xC00000u   /* far window base (banks $C0-$C1) for long addressing */
+#define FSZ   0x20000u    /* far window size: long $C0:FFF0 + long,X bank-carry */
 static uint8_t *RAM;    /* recomp bus */
 static uint8_t *RAM2;   /* interp816 bus */
 static uint8_t *REF;    /* reference WRAM pattern, copied into both each iter */
+static uint8_t *REFF;   /* reference FAR pattern (long addressing) */
 
 /* Canonicalize an address so the SNES low-WRAM mirror ($00-$3F/$80-$BF:0000-1FFF
  * and $7E:0000-1FFF) is ONE physical location — matching what the recomp does
@@ -46,16 +49,21 @@ static uint32_t mapa(uint32_t bank, uint32_t addr) {
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[mapa(bank, addr)];
 }
+/* The real cpu_read16/write16 (cpu_state.c) read PHYSICALLY-CONTIGUOUS bytes
+ * (cpu->ram[off],[off+1] / RomPtr p[0],p[1]), i.e. the 24-bit address increments
+ * across a bank boundary ($C0:FFFF -> $C1:0000) — it does NOT wrap within the
+ * bank. Mirror that here so the harness tests the recomp's real word semantics. */
 uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
-    return (uint16)cpu_read8(cpu, bank, addr) |
-           ((uint16)cpu_read8(cpu, bank, (uint16)(addr + 1)) << 8);
+    (void)cpu; uint32_t a = ((uint32)bank << 16) | addr;
+    return (uint16)RAM[mapa(a >> 16, a)] | ((uint16)RAM[mapa((a + 1) >> 16, a + 1)] << 8);
 }
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     (void)cpu; RAM[mapa(bank, addr)] = v;
 }
 void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
-    cpu_write8(cpu, bank, addr, (uint8)v);
-    cpu_write8(cpu, bank, (uint16)(addr + 1), (uint8)(v >> 8));
+    (void)cpu; uint32_t a = ((uint32)bank << 16) | addr;
+    RAM[mapa(a >> 16, a)] = (uint8)v;
+    RAM[mapa((a + 1) >> 16, a + 1)] = (uint8)(v >> 8);
 }
 static uint8_t i816_read(void *mem, uint32_t adr) {
     return ((uint8_t *)mem)[mapa(adr >> 16, adr)];
@@ -102,6 +110,7 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
      * the operand baked but may read $8000 as data, so both must match there. */
     memcpy(&RAM[WRAM], REF, WSZ);
     memcpy(&RAM2[WRAM], REF, WSZ);
+    if (op->far) { memcpy(&RAM[FAR], REFF, FSZ); memcpy(&RAM2[FAR], REFF, FSZ); }
     memcpy(&RAM[0x8000], op->code, (size_t)op->len);   /* $00:8000 (not WRAM-mirrored) */
     memcpy(&RAM2[0x8000], op->code, (size_t)op->len);
 
@@ -156,10 +165,11 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     CK("Xf", g_cpu.x_flag, ip->xf);
     /* diff the memory window for store/RMW ops (skip $8000-2: the opcode bytes) */
     if (op->wmem) {
-        for (uint32_t a = 0; a < WSZ; a++) {
-            if (RAM[WRAM + a] != RAM2[WRAM + a]) { bad = 1;
+        uint32_t base = op->far ? FAR : WRAM, sz = op->far ? FSZ : WSZ;
+        for (uint32_t a = 0; a < sz; a++) {
+            if (RAM[base + a] != RAM2[base + a]) { bad = 1;
                 snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
-                         " WRAM[%04X]=%02X/%02X", a, RAM[WRAM + a], RAM2[WRAM + a]); break; }
+                         " MEM[%06X]=%02X/%02X", base + a, RAM[base + a], RAM2[base + a]); break; }
         }
     }
     if (bad) {
@@ -172,9 +182,10 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
 }
 
 int main(void) {
-    RAM = malloc(MEMSZ); RAM2 = malloc(MEMSZ); REF = malloc(WSZ);
+    RAM = malloc(MEMSZ); RAM2 = malloc(MEMSZ); REF = malloc(WSZ); REFF = malloc(FSZ);
     memset(RAM, 0, MEMSZ); memset(RAM2, 0, MEMSZ);
-    for (uint32_t i = 0; i < WSZ; i++) REF[i] = (uint8_t)rnd();  /* random WRAM pattern */
+    for (uint32_t i = 0; i < WSZ; i++) REF[i] = (uint8_t)rnd();   /* WRAM pattern */
+    for (uint32_t i = 0; i < FSZ; i++) REFF[i] = (uint8_t)rnd();  /* far pattern  */
     Interp816 *ip = interp816_init(RAM2, i816_read, i816_write);  /* interp bus = RAM2 */
 
     const int ITERS = 3000;

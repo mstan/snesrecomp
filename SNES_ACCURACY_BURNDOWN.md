@@ -114,12 +114,21 @@ clean. **Indexed + indirect + stack added (2026-06-28):** abs,X/Y, dp,X; (dp,X),
 (dp), (dp),Y, [dp], [dp],Y (pointer planted in the bus); and PHA/PLA/PHX/PLX/PHY/
 PLY/PHP/PLP/PHB/PLB/PHD/PLD/PHK (the harness S-=2 RTS-undo recovers the push/pull
 S effect). Now **501 opcode variants, 0 divergences (1.503M checks)** vs interp816.
-Coverage = immediate + implied + transfer + flags + dp + abs + indexed + indirect
-+ stack — essentially the whole load/store/ALU/RMW/stack/transfer set across all
-common addressing modes, all matching. **Next lever (diminishing):** long
-addressing + MVN/MVP + PEA/PEI/PER + control flow (branches/JSR/RTI — harder in a
-single-op harness); the bank-carry / high-D dp ($7E-routing) edge is the known
-untested modeling assumption.
+**Long (far) addressing added (2026-06-28):** long / long,X based at $C0:FFF0 (a
+far $C0-$C1 window) — exercises ROM-bank addressing AND long,X 16-bit bank-carry
+at $C0:FFFF. Now **533 opcode variants, 0 divergences (1.599M checks)**. (This
+surfaced — and then exonerated — a subtlety: the real cpu_read16/write16 read
+PHYSICALLY-CONTIGUOUS bytes, so a word access at $xx:FFFF CROSSES to $(xx+1):0000;
+the harness's fake initially wrapped within the bank, a false positive, now fixed
+to mirror the real semantics.) Coverage = immediate + implied + transfer + flags +
+dp + abs + indexed + indirect + stack + long — essentially the entire testable
+(non-control-flow) opcode space, all matching interp816.
+
+**Untested edges (documented):** (1) ABS/DP 16-bit word access exactly at $xx:FFFF
+— the recomp's cpu_read16 crosses the bank for ALL modes (correct for long; the
+65816 *may* wrap for abs/dp, but it's rare + the spec is debated; not tested);
+(2) high-D dp ($7E-routing when D+dp>=$2000); (3) MVN/MVP, PEA/PEI/PER, control
+flow (branches/JSR/RTI — structurally hard in a single-op harness).
 
 ## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
 
