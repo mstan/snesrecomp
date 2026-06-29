@@ -143,3 +143,58 @@ and compares bsnes's region CPU-cycle Δ to the authority's prediction. RESULT
 recomp cost model (= what `emit_function` charges) is confirmed cycle-correct
 against an accuracy-grade hardware reference, static AND dynamic, on
 real-hardware-executed code. The "both can be identically wrong" trap is closed.
+
+## REAL-ROM validation — recomp emit vs bsnes on actual game code (2026-06-28)
+
+The synthetic test ROMs validate the *authority model*. This step validates
+the **recomp's actually-emitted `cpu->cycles`** against bsnes over **real game
+code** (Zelda: ALttP). Two new pieces:
+
+1. **Recomp side (`runner/src/debug_server.c`, dev-only).** An always-on
+   per-block cycle ring records `(pc24, cpu->cycles)` at every block leader
+   (`debug_server_on_trace_block`, *before* the block's `cpu->cycles += const`
+   charge — same fetch-boundary semantics as the bsnes `CPU::main` latch).
+   Commands: `cyc_ring <path> [count]` dumps the ring; `cyc_anchor <0|1> <pc>` /
+   `cyc_region` / `cyc_anchor_reset` are a live two-anchor latch. The Δ between
+   two consecutive ring entries is exactly one block's emitted charge, and its
+   two PCs bracket exactly that block's instructions in bsnes too.
+2. **`ring_pick.py`** finds block transitions whose Δ is IDENTICAL across every
+   occurrence in the ring (data-independent control flow) — the regions where
+   bsnes's reset-first-hit latch measures the same work as the recomp's
+   steady-state ring.
+
+**Ordered latch (both sides).** The anchor latch now records `start` on its
+first hit, then `end` only on its first hit AFTER start — isolating ONE
+start→end pass. Independent first-hit mis-brackets backward (loop tail→head)
+and non-adjacent regions; ordered latching fixes them. (bsnes: `CPU::main` in
+`bsnes_cycle_hook.patch`; recomp: `debug_server_on_trace_block`.)
+
+Workflow: launch the recomp (TRACE build) → `cyc_ring` dump from attract →
+`ring_pick.py` → feed each `(start,end,recomp_Δ)` to
+`bsnes_cycles_probe.exe <dll> <rom> <start> <end> <recomp_Δ>`
+(`tools/cyc_watch/_realrom_diff.ps1` drives the batch).
+
+**RESULT (Zelda attract, 6 reachable data-independent regions):** recomp ==
+bsnes EXACTLY on every one — spanning 3 → 197 CPU cycles and including a
+backward loop-branch:
+
+| region | recomp | bsnes |
+|---|---|---|
+| `$0092B2→$009328` | 118 | 118 |
+| `$009328→$009341` |  40 |  40 |
+| `$009341→$0092B2` (loop back) | 3 | 3 |
+| `$00814C→$008200` | 197 | 197 |
+| `$008719→$00874E` |  17 |  17 |
+| `$00811E→$00813C` |  39 |  39 |
+
+The recomp's *emitted* cycle charges are confirmed cycle-correct against bsnes
+on real game code, not just synthetic streams.
+
+**Known harness limit (not a model error).** Blocks whose successor is
+data-dependent (a self-loop + a conditional exit, e.g. `$008420`, `$0085FE`)
+mismatch: bsnes's single boot-pass start→end crosses a variable number of loop
+iterations, while the recomp ring measured the isolated exit transition.
+`ring_pick.py` flags these (the same `start` PC also appears as a self-loop
+transition). Closing them needs occurrence/frame alignment (latch the Nth pass,
+not boot-first) — a future refinement. Bank-02/0C attract PCs that bsnes does
+not reach within the probe's frame budget report `NOT-HIT`.

@@ -20,7 +20,7 @@ index 80ea1da..60d0b64 100644
  CXXFLAGS += -std=c++17 $(FLAGS)
  CFLAGS   += $(FLAGS)
 diff --git a/bsnes/sfc/cpu/cpu.cpp b/bsnes/sfc/cpu/cpu.cpp
-index b6fec16..934547c 100644
+index b6fec16..d6129f4 100644
 --- a/bsnes/sfc/cpu/cpu.cpp
 +++ b/bsnes/sfc/cpu/cpu.cpp
 @@ -10,6 +10,13 @@ CPU cpu;
@@ -37,21 +37,27 @@ index b6fec16..934547c 100644
  auto CPU::synchronizeSMP() -> void {
    if(smp.clock < 0) scheduler.resume(smp.thread);
  }
-@@ -32,6 +39,19 @@ auto CPU::Enter() -> void {
+@@ -32,6 +39,25 @@ auto CPU::Enter() -> void {
  }
  
  auto CPU::main() -> void {
-+  // snesrecomp Axis-2: latch the CPU-cycle count the first time an instruction
-+  // is fetched at each REGION anchor PC (PB:PC). r.pc.d is the 24-bit PC of the
-+  // about-to-execute instruction, so the latch holds cycles consumed *before*
-+  // it — exactly the region boundary. (Globals in target-libretro/libretro.cpp.)
++  // snesrecomp Axis-2: latch the CPU-cycle count at each REGION anchor PC
++  // (PB:PC). r.pc.d is the 24-bit PC of the about-to-execute instruction, so
++  // the latch holds cycles consumed *before* it — exactly the region boundary.
++  // ORDERED latch: anchor[0]=start latches on its first hit; anchor[1]=end
++  // latches only on its first hit AFTER start has latched. This isolates ONE
++  // start->end pass and works for forward, backward (loop tail->head), and
++  // non-adjacent regions — independent first-hit would mis-bracket those.
++  // (Globals in target-libretro/libretro.cpp.)
 +  {
 +    uint32_t _pc = (uint32_t)(r.pc.d & 0xFFFFFF);
-+    for(int _i = 0; _i < 2; _i++) {
-+      if(!g_bsnes_anchor_hit[_i] && _pc == g_bsnes_cyc_anchor[_i]) {
-+        g_bsnes_anchor_latch[_i] = g_bsnes_total_cpu_cycles;
-+        g_bsnes_anchor_hit[_i] = 1;
-+      }
++    if(!g_bsnes_anchor_hit[0] && _pc == g_bsnes_cyc_anchor[0]) {
++      g_bsnes_anchor_latch[0] = g_bsnes_total_cpu_cycles;
++      g_bsnes_anchor_hit[0] = 1;
++    } else if(g_bsnes_anchor_hit[0] && !g_bsnes_anchor_hit[1]
++              && _pc == g_bsnes_cyc_anchor[1]) {
++      g_bsnes_anchor_latch[1] = g_bsnes_total_cpu_cycles;
++      g_bsnes_anchor_hit[1] = 1;
 +    }
 +  }
    if(r.wai) return instructionWait();

@@ -130,7 +130,22 @@ dp + abs + indexed + indirect + stack + long — essentially the entire testable
 (2) high-D dp ($7E-routing when D+dp>=$2000); (3) MVN/MVP, PEA/PEI/PER, control
 flow (branches/JSR/RTI — structurally hard in a single-op harness).
 
-## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale**
+## Axis 2 — Cycle / timing · **COMPLETE: model validated vs bsnes; recomp emits + compiles at scale; REAL-ROM emit verified**
+
+> **Real-ROM close-out (2026-06-28).** The recomp's *actually-emitted*
+> `cpu->cycles` is now verified against bsnes on **real game code** (Zelda
+> attract), not just synthetic streams. Added a dev-only always-on per-block
+> cycle ring + two-anchor latch in `runner/src/debug_server.c` (`cyc_ring` /
+> `cyc_anchor` / `cyc_region`), `tools/cyc_watch/ring_pick.py` (picks
+> data-independent regions), and an **ordered** anchor latch on both sides
+> (start, then end-after-start; fixes backward/non-adjacent regions —
+> `bsnes_cycle_hook.patch` `CPU::main` + `debug_server_on_trace_block`).
+> **RESULT: recomp == bsnes EXACTLY on all 6 reachable data-independent
+> regions** (3 → 197 CPU cycles, incl. a backward loop-branch `$009341→$0092B2`
+> = 3==3). The 2 mismatches are a documented harness limit, NOT a model error
+> (data-dependent self-loop blocks `$008420`/`$0085FE`: bsnes's boot-pass spans
+> a variable iteration count vs the recomp ring's isolated exit edge — needs
+> occurrence/frame alignment). See `tools/cyc_watch/README.md` §REAL-ROM.
 
 > **Axis-2 close-out (2026-06-27).** Validated to the maximum the codebase state
 > allows: (1) the cost model is cycle-correct vs **bsnes** hardware truth — REGION

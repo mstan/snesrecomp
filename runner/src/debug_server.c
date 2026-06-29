@@ -6641,8 +6641,98 @@ static void cmd_muldiv_check(const char *args) {
              n, mul_bad, div_bad, divz, ex);
 }
 
+/* ── Axis-2 cycle-accuracy measurement (dev-only) ────────────────────────
+ * The recomp emits per-block `cpu->cycles += <const>` charges (CPU bus
+ * cycles: base + M/X width + D.l + page-cross + branch-taken), folded from
+ * the shared cost model. To validate that model against bsnes ground truth
+ * on REAL game code, we expose the recomp's accumulated cpu->cycles at
+ * guest-PC anchors — the exact analog of bsnes_set_cyc_anchor /
+ * bsnes_get_anchor_cpu_cycles. The latch fires in debug_server_on_trace_block
+ * (a block-leader hook), BEFORE the block's own charge accrues, matching
+ * bsnes's CPU::main fetch-boundary latch. Region Δ = latch[1]-latch[0]
+ * cancels the boot offset, so it is directly comparable to the probe's
+ * `bsnes_get_anchor_cpu_cycles` delta over the same [start,end) PC range.
+ *
+ * In addition to the two-anchor latch we keep an ALWAYS-ON per-block cycle
+ * ring (ring-buffer discipline: query a window post-hoc, never
+ * arm-then-capture). The ring lets us pick a clean region from real
+ * execution and recover any region Δ without re-running. */
+#define CYC_RING_SZ 8192u   /* power of two */
+static uint32_t s_cyc_ring_pc[CYC_RING_SZ];
+static uint64_t s_cyc_ring_cyc[CYC_RING_SZ];
+static uint64_t s_cyc_ring_idx;            /* monotonic count of blocks seen */
+static uint32_t s_cyc_anchor_pc[2]    = {0xFFFFFFFFu, 0xFFFFFFFFu};
+static uint64_t s_cyc_anchor_latch[2] = {0, 0};
+static int      s_cyc_anchor_hit[2]   = {0, 0};
+
+/* cyc_anchor <0|1> <pc24hex> — arm one of the two CPU-cycle anchors. */
+static void cmd_cyc_anchor(const char *args) {
+    int idx = -1; unsigned int pc = 0;
+    if (sscanf(args, "%d %x", &idx, &pc) < 2 || idx < 0 || idx > 1) {
+        send_fmt("{\"error\":\"usage: cyc_anchor <0|1> <pc24hex>\"}"); return;
+    }
+    s_cyc_anchor_pc[idx]    = pc & 0xFFFFFFu;
+    s_cyc_anchor_latch[idx] = 0;
+    s_cyc_anchor_hit[idx]   = 0;
+    send_fmt("{\"ok\":true,\"idx\":%d,\"pc\":\"0x%06x\"}", idx, s_cyc_anchor_pc[idx]);
+}
+
+/* cyc_region — report both latches + the region Δ (recomp CPU cycles). */
+static void cmd_cyc_region(const char *args) {
+    (void)args;
+    long long d = (long long)s_cyc_anchor_latch[1] - (long long)s_cyc_anchor_latch[0];
+    send_fmt("{\"hit0\":%d,\"hit1\":%d,\"latch0\":%llu,\"latch1\":%llu,"
+             "\"delta\":%lld,\"frame\":%d}",
+             s_cyc_anchor_hit[0], s_cyc_anchor_hit[1],
+             (unsigned long long)s_cyc_anchor_latch[0],
+             (unsigned long long)s_cyc_anchor_latch[1],
+             d, snes_frame_counter);
+}
+
+/* cyc_anchor_reset — disarm both anchors. */
+static void cmd_cyc_anchor_reset(const char *args) {
+    (void)args;
+    for (int i = 0; i < 2; i++) {
+        s_cyc_anchor_pc[i] = 0xFFFFFFFFu;
+        s_cyc_anchor_latch[i] = 0;
+        s_cyc_anchor_hit[i] = 0;
+    }
+    send_fmt("{\"ok\":true}");
+}
+
+/* cyc_ring <path> [count] — dump the last [count] per-block (seq pc cycles)
+ * entries from the always-on ring as "seq 0xPC cycles" lines. Two block
+ * leaders' cycles difference is the recomp's region Δ for that [start,end). */
+static void cmd_cyc_ring(const char *args) {
+    char path[512] = {0};
+    int count = 2048;
+    if (sscanf(args, "%511s %d", path, &count) < 1 || !path[0]) {
+        send_fmt("{\"error\":\"usage: cyc_ring <path> [count]\"}"); return;
+    }
+    if (count < 1) count = 1;
+    if (count > (int)CYC_RING_SZ) count = (int)CYC_RING_SZ;
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_fmt("{\"error\":\"cannot write %s\"}", path); return; }
+    uint64_t total = s_cyc_ring_idx;
+    uint64_t first = (total >= (uint64_t)count) ? total - (uint64_t)count : 0;
+    for (uint64_t s = first; s < total; s++) {
+        uint64_t slot = s & (CYC_RING_SZ - 1);
+        fprintf(f, "%llu 0x%06x %llu\n", (unsigned long long)s,
+                s_cyc_ring_pc[slot], (unsigned long long)s_cyc_ring_cyc[slot]);
+    }
+    fclose(f);
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"first\":%llu,\"last\":%llu,\"total\":%llu}",
+             path, (unsigned long long)first,
+             (unsigned long long)(total ? total - 1 : 0),
+             (unsigned long long)total);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
+    {"cyc_anchor",       cmd_cyc_anchor},
+    {"cyc_region",       cmd_cyc_region},
+    {"cyc_anchor_reset", cmd_cyc_anchor_reset},
+    {"cyc_ring",         cmd_cyc_ring},
     {"audio_stats",   cmd_audio_stats},
     {"audio_events",  cmd_audio_events},
     {"audio_wav",     cmd_audio_wav},
@@ -7116,7 +7206,26 @@ void debug_server_wait_if_paused(void) {
 }
 
 void debug_server_on_trace_block(CpuState *cpu, uint32_t pc24) {
-    (void)cpu;
+    /* Axis-2 (dev-only): always-on per-block cycle ring + two-anchor latch.
+     * Record BEFORE this block's `cpu->cycles += const` charge, so the
+     * latched value is the cumulative cost of all PRIOR blocks — same
+     * fetch-boundary semantics as the bsnes anchor. Runs every block,
+     * ahead of the trace-break early-return below. */
+    {
+        uint64_t slot = (s_cyc_ring_idx++) & (CYC_RING_SZ - 1);
+        s_cyc_ring_pc[slot]  = pc24;
+        s_cyc_ring_cyc[slot] = cpu->cycles;
+        /* ORDERED latch (matches the bsnes CPU::main latch): start latches on
+         * its first hit; end latches only on its first hit AFTER start. */
+        if (!s_cyc_anchor_hit[0] && pc24 == s_cyc_anchor_pc[0]) {
+            s_cyc_anchor_latch[0] = cpu->cycles;
+            s_cyc_anchor_hit[0] = 1;
+        } else if (s_cyc_anchor_hit[0] && !s_cyc_anchor_hit[1]
+                   && pc24 == s_cyc_anchor_pc[1]) {
+            s_cyc_anchor_latch[1] = cpu->cycles;
+            s_cyc_anchor_hit[1] = 1;
+        }
+    }
     if (!s_trace_break_armed && !s_trace_step_pending)
         return;
 
