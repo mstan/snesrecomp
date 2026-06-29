@@ -17,7 +17,7 @@ $cases = @(
 
 Write-Host ("{0,-10} {1,-10} {2,8} {3,10}  {4}" -f 'start','end','recomp','bsnes','verdict')
 foreach ($c in $cases) {
-  $out = & "$cw\bsnes_cycles_probe.exe" $dll $rom $c[0] $c[1] $c[2] 2>&1
+  $out = & "$cw\bsnes_cycles_probe.exe" $dll $rom $c[0] $c[1] $c[2] 7200 2>&1
   $line = ($out | Out-String)
   $bsnes = 'n/a'; $verdict = '?'
   if ($line -match 'bsnes CPU cycles = (-?\d+)') { $bsnes = $matches[1] }

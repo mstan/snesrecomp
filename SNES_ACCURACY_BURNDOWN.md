@@ -154,10 +154,16 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
 > World (`smw.sfc`, :4377): 8 clean regions (banks 00/01/02) + 4 loop-exit edges,
 > recomp == bsnes EXACTLY (4 → 76 CPU cyc). **Combined: 20/20 real-ROM regions
 > across two games → the emitted cost model is game-agnostic.** (MMX cycle diff
-> attempted but all NOT-HIT: bsnes booted passively/headless sits at PRESS-START
-> and never reaches the attract code the recomp ring sampled — a repro limit, not
-> a model concern; would need input injection into the probe. SMW+Zelda already
-> establish game-agnosticism.)
+> attempted but all NOT-HIT, even at a **20000-frame (~5.5 min) bsnes budget**:
+> the recomp HLE-boots to its sampled attract PCs by frame ~330, but bsnes runs
+> the FULL real MMX intro — Capcom logo + the slow char-by-char "WARNING: X is the
+> first of a new generation…" story crawl (still showing at bsnes frame 3600) +
+> title timeout — so the recomp's demo PCs sit beyond a very long passive-boot
+> runway. Not a header issue (stripping the 512-byte SMC header changed nothing;
+> bsnes auto-strips). Input injection is ruled out (owner), so MMX cross-game
+> cycle is impractical via the passive oracle. SMW+Zelda already establish
+> game-agnosticism; the probe now takes an optional `<maxframes>` arg for future
+> long runs.)
 
 > **Axis-2 close-out (2026-06-27).** Validated to the maximum the codebase state
 > allows: (1) the cost model is cycle-correct vs **bsnes** hardware truth — REGION

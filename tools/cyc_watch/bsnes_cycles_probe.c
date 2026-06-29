@@ -118,9 +118,12 @@ int main(int argc, char **argv) {
     p_reset();                 /* retro_reset zeroes the counters + latches */
 
     if (anchor_mode) {
-        /* attract-reachable PCs can take a while; budget generously
-         * (1800 frames ~ 30 s of emulated boot+attract). */
-        for (int frame = 1; frame <= 1800 && !(p_anchor_hit(0) && p_anchor_hit(1)); frame++)
+        /* attract-reachable PCs can take a while; budget generously.
+         * Default 1800 frames (~30 s); arg 7 overrides for games whose
+         * attract demo starts later (e.g. MMX falls through after the
+         * Capcom intro + title timeout). */
+        int maxframes = (argc >= 7) ? (int)strtol(argv[6], NULL, 0) : 1800;
+        for (int frame = 1; frame <= maxframes && !(p_anchor_hit(0) && p_anchor_hit(1)); frame++)
             p_run();
         if (!p_anchor_hit(0) || !p_anchor_hit(1)) {
             printf("FAIL: anchors not both hit (start=%d end=%d)\n",
