@@ -203,6 +203,36 @@ cycles). Combined with Zelda: **20/20 real-ROM regions across two games** → th
 emitted cost model is game-agnostic. (`_realrom_diff_smw.ps1` drives the SMW
 batch; same probe + ring + ring_pick.)
 
+## Axis-4 MMIO write-pattern diff — recomp vs bsnes (2026-06-28)
+
+Separate from cycles: does the recomp drive the CPU **control registers** the
+same way hardware does? The bit-exact PPU framebuffer diff covers `$2100-$213F`
+(rendering) but not the non-rendering control block `$4200-$421F` (NMI/IRQ
+enable, H/V timer, DMA/HDMA trigger, joypad enable). New pieces:
+
+- **bsnes side** (`bsnes_cycle_hook.patch`): an MMIO write log in `CPU::write`
+  (`bsnes_mmio_on_write`, excludes WRAM banks $7E/$7F), armed over a range via
+  `bsnes_mmio_arm(lo,hi)`, frame-stamped by `bsnes_mmio_set_frame`, read via
+  `bsnes_mmio_count`/`bsnes_mmio_get`. The probe's `--mmio <lo> <hi> <frames>
+  <out>` mode dumps `frame 0xADDR 0xVAL` lines. **GOTCHA:** bsnes unity-includes
+  `memory.cpp` into `cpu.o` (`cpu.cpp` does `#include "memory.cpp"`), so editing
+  `memory.cpp` needs `rm bsnes/sfc/cpu/cpu.o` before `make` — else the call site
+  is stale while the new exports still link (silent: 0 writes logged).
+- **recomp side**: the existing `trace_reg <lo> <hi>` / `get_reg_trace nostack`
+  (frame,adr,val). **Send `trace_reg_reset` first** — ranges accumulate and a
+  default set is pre-armed.
+- **`mmio_align.py`**: groups each side into per-frame ordered `(adr,val)`
+  patterns and checks the recomp's recurring patterns all occur in bsnes. Run
+  bsnes long enough (e.g. 1000 frames) to cover the same attract scenes — the
+  recomp arms mid-run, so its window is a subset; comparing unequal windows
+  shows false divergences (different scenes stream different amounts of DMA).
+
+**RESULT (SMW, `$4200-421F`):** every recurring (≥3 occ) recomp per-frame write
+pattern occurs in bsnes, dominant patterns match exactly — the recomp issues the
+same NMI/DMA/HDMA control-register writes as hardware. This is the write
+**value+order** diff; sub-frame cycle *timing* and H/V-counter *read* values are
+not covered (would need cycle-stamped writes + read-side instrumentation).
+
 **Remaining scope.** Bank-02/0C/1B attract PCs that bsnes does not reach within
 the probe's frame budget report `NOT-HIT` (need a longer run or input to enter
 those scenes). A region where an interrupt/DMA fires between the last `start`

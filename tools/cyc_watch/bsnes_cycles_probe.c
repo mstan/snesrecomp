@@ -60,6 +60,10 @@ int main(int argc, char **argv) {
     void (*p_set_anchor)(int, uint32_t)              = req(core, "bsnes_set_cyc_anchor");
     uint64_t (*p_anchor_cyc)(int)                    = req(core, "bsnes_get_anchor_cpu_cycles");
     int (*p_anchor_hit)(int)                         = req(core, "bsnes_anchor_hit");
+    void (*p_mmio_arm)(uint32_t, uint32_t)           = req(core, "bsnes_mmio_arm");
+    void (*p_mmio_frame)(int)                        = req(core, "bsnes_mmio_set_frame");
+    uint32_t (*p_mmio_count)(void)                   = req(core, "bsnes_mmio_count");
+    int (*p_mmio_get)(uint32_t, int*, uint32_t*, uint32_t*) = req(core, "bsnes_mmio_get");
 
     p_set_environment(env_cb); p_set_video(video_cb);
     p_set_audio(audio_cb); p_set_audio_b(audio_batch_cb);
@@ -75,6 +79,31 @@ int main(int argc, char **argv) {
     struct retro_game_info gi; memset(&gi, 0, sizeof gi);
     gi.path = argv[2]; gi.data = buf; gi.size = (size_t)sz;
     if (!p_load(&gi)) { fprintf(stderr, "retro_load_game failed\n"); return 3; }
+
+    /* MMIO write-log mode: probe <dll> <rom> --mmio <lo> <hi> <frames> <out>
+     * Arms the bsnes MMIO write logger over [lo,hi], runs <frames> frames
+     * (stamping the frame index), and dumps "frame 0xADDR 0xVAL" lines. */
+    if (argc >= 8 && strcmp(argv[3], "--mmio") == 0) {
+        uint32_t lo = (uint32_t)strtoul(argv[4], NULL, 0);
+        uint32_t hi = (uint32_t)strtoul(argv[5], NULL, 0);
+        int frames  = (int)strtol(argv[6], NULL, 0);
+        const char *out = argv[7];
+        p_reset();
+        p_mmio_arm(lo, hi);
+        for (int f = 0; f < frames; f++) { p_mmio_frame(f); p_run(); }
+        FILE *of = fopen(out, "wb");
+        if (!of) { fprintf(stderr, "open out failed\n"); return 2; }
+        uint32_t n = p_mmio_count();
+        for (uint32_t i = 0; i < n; i++) {
+            int fr; uint32_t a, v;
+            if (p_mmio_get(i, &fr, &a, &v))
+                fprintf(of, "%d 0x%04x 0x%02x\n", fr, a, v);
+        }
+        fclose(of);
+        printf("MMIO log: %u writes in [$%04X,$%04X] over %d frames -> %s\n",
+               n, lo, hi, frames, out);
+        return 0;
+    }
 
     int anchor_mode = (argc >= 5);
     uint32_t startPC = 0, endPC = 0; long expected = -1;

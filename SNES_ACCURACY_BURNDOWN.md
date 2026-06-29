@@ -365,10 +365,19 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
   hardware arithmetic (8x8 product; 16/8 divide; /0 => quotient $FFFF, remainder
   = dividend). **Result: 0/50000 mismatches (709 /0 cases included).** The
   *values* are correct; only the multi-cycle *timing* is simplified (instant).
-- **Next lever (the $4200-range timing + H/V/joypad):** these are the only Axis-4
-  bits a value-diff can't reach — they need the cycle-accurate bsnes oracle: the
-  MMIO ring on the bsnes side + a `(addr,width,value,cycle)` two-process diff,
-  frame-aligned at the +204 boot offset. (Owner: pursue as the deep MMIO pass.)
+- **$4200-421F write-pattern diff DONE (2026-06-28).** Built the bsnes-side MMIO
+  write log (`bsnes_mmio_on_write` in `CPU::write`, armed via `bsnes_mmio_arm`,
+  dumped by the probe's `--mmio` mode) and diffed it against the recomp's
+  `trace_reg 4200 421F` / `get_reg_trace` via `tools/cyc_watch/mmio_align.py`
+  (per-frame ordered `(adr,val)` patterns). **RESULT (SMW): every recurring
+  recomp per-frame write pattern occurs in bsnes, dominant patterns match
+  exactly** — the recomp drives NMI-enable/`$420B` DMA-trigger/`$420C` HDMA-enable
+  the same as hardware. (bsnes must run long enough — ~1000 frames — to cover the
+  same attract scenes; the recomp arms mid-run so its window is a subset.)
+- **Still open (the genuinely hard slice):** sub-frame cycle *timing* of those
+  writes + H/V counter / joypad *read* values — needs cycle-stamped writes
+  (`(addr,val,cycle)`) + read-side instrumentation on both sides. The
+  write-VALUE+ORDER diff above is the tractable part and it passes.
 
 ## Axis 5 — Peripherals: **AUDIO** (APU = SPC700 + S-DSP) · **MEASURED — see below**
 

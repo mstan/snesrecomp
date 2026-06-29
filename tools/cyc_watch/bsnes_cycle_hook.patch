@@ -67,20 +67,23 @@ index b6fec16..27862c8 100644
    if(r.stp) return instructionStop();
    if(!status.interruptPending) return instruction();
 diff --git a/bsnes/sfc/cpu/memory.cpp b/bsnes/sfc/cpu/memory.cpp
-index c63de17..2eb9eb2 100644
+index c63de17..8fa10c5 100644
 --- a/bsnes/sfc/cpu/memory.cpp
 +++ b/bsnes/sfc/cpu/memory.cpp
-@@ -1,4 +1,9 @@
+@@ -1,4 +1,12 @@
 +// snesrecomp Axis-2: count CPU (bus + internal) cycles — one per idle/read/
 +// write. This is the unit the recomp/authority model emits.
 +extern "C" uint64_t g_bsnes_total_cpu_cycles;
++// snesrecomp Axis-4: log MMIO register writes (frame, addr16, val) for a
++// configured range; defined in target-libretro/libretro.cpp.
++extern "C" void bsnes_mmio_on_write(uint32_t address, uint8_t data);
 +
  auto CPU::idle() -> void {
 +  g_bsnes_total_cpu_cycles++;
    status.clockCount = 6;
    dmaEdge();
    step<6,0>();
-@@ -7,6 +12,7 @@ auto CPU::idle() -> void {
+@@ -7,6 +15,7 @@ auto CPU::idle() -> void {
  }
  
  auto CPU::read(uint address) -> uint8 {
@@ -88,11 +91,12 @@ index c63de17..2eb9eb2 100644
    if(address & 0x408000) {
      if(address & 0x800000 && io.fastROM) {
        status.clockCount = 6;
-@@ -46,6 +52,7 @@ auto CPU::read(uint address) -> uint8 {
+@@ -46,6 +55,8 @@ auto CPU::read(uint address) -> uint8 {
  }
  
  auto CPU::write(uint address, uint8 data) -> void {
 +  g_bsnes_total_cpu_cycles++;
++  bsnes_mmio_on_write(address, data);   // Axis-4 MMIO write log (dev-only)
    aluEdge();
  
    if(address & 0x408000) {
@@ -119,10 +123,10 @@ index 987c0dd..f418e8f 100644
    if(hcounter() & 2) nmiPoll(), irqPoll();
    if(joypadCounter() == 0) joypadEdge();
 diff --git a/bsnes/target-libretro/libretro.cpp b/bsnes/target-libretro/libretro.cpp
-index 8010816..1b7d718 100644
+index 8010816..eb23b55 100644
 --- a/bsnes/target-libretro/libretro.cpp
 +++ b/bsnes/target-libretro/libretro.cpp
-@@ -1,6 +1,60 @@
+@@ -1,6 +1,98 @@
  #include <cassert>
 +#include <cstdint>
  #include "libretro.h"
@@ -180,10 +184,48 @@ index 8010816..1b7d718 100644
 +	g_bsnes_anchor_latch[0] = g_bsnes_anchor_latch[1] = 0;
 +}
 +
++// snesrecomp Axis-4: MMIO register-write log (dev-only). Records (frame,
++// addr16, val) for CPU writes whose low-16 address is in [lo,hi], excluding
++// WRAM banks $7E/$7F (where $4200 etc. are RAM, not MMIO). The probe sets the
++// frame index before each retro_run; the recomp's get_reg_trace produces the
++// same (frame,adr,val) stream, and an offline aligner diffs the two.
++#define BSNES_MMIO_LOG_CAP 262144u
++struct BsnesMmioEntry { int frame; unsigned short addr; unsigned char val; };
++static BsnesMmioEntry g_bsnes_mmio_log[BSNES_MMIO_LOG_CAP];
++static unsigned g_bsnes_mmio_count = 0;
++static unsigned g_bsnes_mmio_lo = 0xFFFFu, g_bsnes_mmio_hi = 0u;   // empty until armed
++static int      g_bsnes_mmio_frame = 0;
++
++extern "C" void bsnes_mmio_on_write(uint32_t address, uint8_t data) {
++	unsigned bank = (address >> 16) & 0xFF;
++	if(bank == 0x7E || bank == 0x7F) return;          // WRAM, not MMIO
++	unsigned lo16 = address & 0xFFFF;
++	if(lo16 < g_bsnes_mmio_lo || lo16 > g_bsnes_mmio_hi) return;
++	if(g_bsnes_mmio_count >= BSNES_MMIO_LOG_CAP) return;
++	BsnesMmioEntry &e = g_bsnes_mmio_log[g_bsnes_mmio_count++];
++	e.frame = g_bsnes_mmio_frame;
++	e.addr  = (unsigned short)lo16;
++	e.val   = data;
++}
++extern "C" BSNES_HOOK_EXPORT void bsnes_mmio_arm(uint32_t lo, uint32_t hi) {
++	g_bsnes_mmio_lo = lo; g_bsnes_mmio_hi = hi;
++	g_bsnes_mmio_count = 0; g_bsnes_mmio_frame = 0;
++}
++extern "C" BSNES_HOOK_EXPORT void bsnes_mmio_set_frame(int f) { g_bsnes_mmio_frame = f; }
++extern "C" BSNES_HOOK_EXPORT uint32_t bsnes_mmio_count(void) { return g_bsnes_mmio_count; }
++extern "C" BSNES_HOOK_EXPORT int bsnes_mmio_get(uint32_t i, int *frame,
++                                                uint32_t *addr, uint32_t *val) {
++	if(i >= g_bsnes_mmio_count) return 0;
++	*frame = g_bsnes_mmio_log[i].frame;
++	*addr  = g_bsnes_mmio_log[i].addr;
++	*val   = g_bsnes_mmio_log[i].val;
++	return 1;
++}
++
  static retro_environment_t environ_cb;
  static retro_video_refresh_t video_cb;
  static retro_audio_sample_t audio_cb;
-@@ -605,6 +659,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
+@@ -605,6 +697,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
  
  RETRO_API void retro_reset()
  {
