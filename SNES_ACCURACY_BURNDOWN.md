@@ -153,7 +153,11 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
 > **Cross-game (2026-06-28): SMW 12/12 MATCH** — re-ran the flow on Super Mario
 > World (`smw.sfc`, :4377): 8 clean regions (banks 00/01/02) + 4 loop-exit edges,
 > recomp == bsnes EXACTLY (4 → 76 CPU cyc). **Combined: 20/20 real-ROM regions
-> across two games → the emitted cost model is game-agnostic.**
+> across two games → the emitted cost model is game-agnostic.** (MMX cycle diff
+> attempted but all NOT-HIT: bsnes booted passively/headless sits at PRESS-START
+> and never reaches the attract code the recomp ring sampled — a repro limit, not
+> a model concern; would need input injection into the probe. SMW+Zelda already
+> establish game-agnosticism.)
 
 > **Axis-2 close-out (2026-06-27).** Validated to the maximum the codebase state
 > allows: (1) the cost model is cycle-correct vs **bsnes** hardware truth — REGION
@@ -721,7 +725,11 @@ rasterizer + DMA-to-VRAM path are faithful.
   rest on (and it independently corroborates the audio BEFORE==REVERT and PPU
   frame-reproduction observations). **Cross-game: Zelda VERIFIED 2026-06-28**
   (two soaks of the freshly-regen'd Release build, `fp_compare` 560/560 overlapping
-  frames identical). MMX confirmed clean earlier this session.
+  frames identical), and **MMX VERIFIED 2026-06-28** (`fp_compare` 596/596
+  overlapping frames identical; stackbal stable at `$02FF` (MMX uses stack page 2),
+  `muldiv_check` 50000 → 0/0). **Determinism + stackbal + muldiv now pass on all
+  three games (SMW + Zelda + MMX).** (MMX needs `SNESRECOMP_NO_LAUNCHER=1` to boot
+  headless — its config.ini has a misplaced `SkipLauncher`; debug server :4379.)
 
 ---
 
