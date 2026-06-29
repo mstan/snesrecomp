@@ -317,7 +317,11 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
   frame, callee's RTS pops it), not leaks — proven by S returning to `$01FF` every
   frame, and by the 7859-frame soak that never blew the stack. No I_NMI/I_IRQ/
   handler/DMA-chain function appears as a leaker. (Cross-game: confirmed on SMW;
-  MMX/Zelda pending the rollout.)
+  **Zelda VERIFIED 2026-06-28** — regen'd with the 3 CPU codegen fixes, Release
+  build 0 errors, two ~26 s soaks ran past the launcher at ~62 fps with **`g_cpu.S`
+  stable at `$01FF`**, `muldiv_check` 50000 → 0/0 mul/div bad (709 ÷0), and
+  `fp_compare` 560/560 overlapping frames identical → bit-for-bit deterministic.
+  MMX confirmed clean earlier this session.)
 
 ## Axis 4 — Memory map / MMIO · **FUNCTIONAL + well-instrumented**
 
@@ -683,7 +687,9 @@ rasterizer + DMA-to-VRAM path are faithful.
   fingerprints on all 588 overlapping attract frames** — bit-for-bit
   deterministic. This is the foundation the session's audio/PPU/cycle results
   rest on (and it independently corroborates the audio BEFORE==REVERT and PPU
-  frame-reproduction observations). Cross-game (MMX/Zelda) pending the rollout.
+  frame-reproduction observations). **Cross-game: Zelda VERIFIED 2026-06-28**
+  (two soaks of the freshly-regen'd Release build, `fp_compare` 560/560 overlapping
+  frames identical). MMX confirmed clean earlier this session.
 
 ---
 
