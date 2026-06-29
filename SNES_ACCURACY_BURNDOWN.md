@@ -688,6 +688,22 @@ frames were sprite-phase-offset in the coarse search; a fine-aligned demo pass i
 the obvious extension. Title-screen bit-exactness is already strong evidence the
 rasterizer + DMA-to-VRAM path are faithful.
 
+**Cross-game (Zelda, 2026-06-28) — bit-identical on static content; only the
+unaligned title ANIMATION differs.** Ran the same flow on ALttP (recomp :4378,
+4:3 forced) vs snesref/bsnes. At the best-aligned frame the **static background +
+copyright text are bit-identical**; the entire pixel delta (1792/57344 ≈ 3.1%) is
+EXACTLY the three Triforce-assembly intro pieces, which are *moving* sprites at
+different fly-in positions because the recomp/bsnes boot offsets don't align a
+translating (non-periodic) animation. Confirmed via diff-mask (three triangular
+blobs, nothing else) + `tools/cyc_watch/raw_to_png.py`. Unlike SMW's rock-static
+title, ALttP's intro animates every frame, so a literal 100% frame needs a static
+ALttP scene + per-scene offset alignment (not yet found; consecutive-frame capture
+is blocked — frames advance faster than the 1-cmd-per-connection dump-arm latency).
+The PPU code is the SAME shared runner proven 100% bit-exact on SMW, so this is an
+alignment artifact, not a Zelda PPU bug. **MMX PPU not attempted** — passive
+headless boot sits at PRESS-START (same wall as the MMX cycle diff), so there is
+no comparable rendered scene without input injection.
+
 ## Axis 6 — Static-vs-dynamic recompiler fidelity · **STRONG**
 
 - Dispatch completeness (no missed indirect/jump-table targets), Tier-2 interp
