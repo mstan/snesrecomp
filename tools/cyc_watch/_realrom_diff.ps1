@@ -9,18 +9,20 @@ Write-Host "=== rebuild probe (1800-frame budget) ==="
 & $gcc -O2 -I 'F:/Projects/_bsnes_src/bsnes/target-libretro' "$cw\bsnes_cycles_probe.c" -o "$cw\bsnes_cycles_probe.exe"
 if ($LASTEXITCODE -ne 0) { Write-Host "probe build FAILED"; exit 1 }
 
-# (start, end, recomp_delta) from the recomp ring (constant-d transitions)
+# (start, end, recomp_delta) from the recomp ring (constant-d transitions).
+# CLEAN = non-self-loop start (regression); LOOP-EXIT = start self-loops and
+# exits to end (the tight latch isolates the adjacent exit edge).
 $cases = @(
-  @('0x0092B2','0x009328',118),
-  @('0x009328','0x009341', 40),
-  @('0x009341','0x0092B2',  3),
-  @('0x00814C','0x008200',197),
-  @('0x008420','0x008489',172),
-  @('0x0085FE','0x00865C',150),
-  @('0x008719','0x00874E', 17),
-  @('0x00811E','0x00813C', 39),
-  @('0x02FF5F','0x02FF6B', 15),
-  @('0x0CCEEA','0x0CCF18', 24)
+  # --- clean regions (regression: must stay MATCH) ---
+  @('0x0092B2','0x009328',118),   # clean
+  @('0x009328','0x009341', 40),   # clean
+  @('0x009341','0x0092B2',  3),   # clean (backward loop-branch)
+  @('0x00814C','0x008200',197),   # clean
+  @('0x008719','0x00874E', 17),   # clean
+  @('0x00811E','0x00813C', 39),   # clean
+  # --- loop-exit edges (were MISMATCH under first-hit; tight latch fixes) ---
+  @('0x008420','0x008489',172),   # loop-exit (self-loop 173, exit 172)
+  @('0x0085FE','0x00865C',150)    # loop-exit (self-loop 151, exit 150)
 )
 
 Write-Host ""

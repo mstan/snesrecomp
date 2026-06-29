@@ -52,10 +52,25 @@ def main(argv):
     # sort: prefer many occurrences, then larger delta (meatier region)
     cands.sort(key=lambda t: (t[1], t[0]), reverse=True)
 
+    # Loop-exit edges: start PC that ALSO self-loops (start->start) but here
+    # exits to a different end. These are the data-dependent regions the TIGHT
+    # latch isolates (last start before end = the exit iteration).
+    self_loopers = {pc for (pc, npc) in trans if pc == npc}
+    exits = [(d, n, pc, npc) for (d, n, pc, npc) in cands
+             if pc in self_loopers and pc != npc]
+    exits.sort(key=lambda t: (t[1], t[0]), reverse=True)
+
     print(f"# {len(seqs)} ring entries, {len(trans)} distinct transitions, "
-          f"{len(cands)} constant-d single-block candidates")
+          f"{len(cands)} constant-d single-block candidates, "
+          f"{len(self_loopers)} self-looping PCs")
+    print(f"# --- clean (non-self-loop start) regions ---")
     print(f"# {'delta':>6} {'count':>6}  start_pc   end_pc")
     for d, n, pc, npc in cands[:topN]:
+        if pc in self_loopers or pc == npc:
+            continue
+        print(f"  {d:>6} {n:>6}  0x{pc:06X} 0x{npc:06X}")
+    print(f"# --- loop-exit edges (start self-loops; tight latch isolates) ---")
+    for d, n, pc, npc in exits[:topN]:
         print(f"  {d:>6} {n:>6}  0x{pc:06X} 0x{npc:06X}")
     return 0
 

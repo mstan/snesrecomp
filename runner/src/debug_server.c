@@ -7215,13 +7215,16 @@ void debug_server_on_trace_block(CpuState *cpu, uint32_t pc24) {
         uint64_t slot = (s_cyc_ring_idx++) & (CYC_RING_SZ - 1);
         s_cyc_ring_pc[slot]  = pc24;
         s_cyc_ring_cyc[slot] = cpu->cycles;
-        /* ORDERED latch (matches the bsnes CPU::main latch): start latches on
-         * its first hit; end latches only on its first hit AFTER start. */
-        if (!s_cyc_anchor_hit[0] && pc24 == s_cyc_anchor_pc[0]) {
+        /* TIGHT ordered latch (matches the bsnes CPU::main latch): start
+         * updates on EVERY hit (last start before end wins → isolates the
+         * adjacent start->end edge even when start sits in a loop); end
+         * freezes on its first hit after a start has been seen. */
+        if (!s_cyc_anchor_hit[1] && pc24 == s_cyc_anchor_pc[0]) {
             s_cyc_anchor_latch[0] = cpu->cycles;
             s_cyc_anchor_hit[0] = 1;
-        } else if (s_cyc_anchor_hit[0] && !s_cyc_anchor_hit[1]
-                   && pc24 == s_cyc_anchor_pc[1]) {
+        }
+        if (s_cyc_anchor_hit[0] && !s_cyc_anchor_hit[1]
+            && pc24 == s_cyc_anchor_pc[1]) {
             s_cyc_anchor_latch[1] = cpu->cycles;
             s_cyc_anchor_hit[1] = 1;
         }

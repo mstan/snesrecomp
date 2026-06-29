@@ -159,42 +159,45 @@ code** (Zelda: ALttP). Two new pieces:
    two consecutive ring entries is exactly one block's emitted charge, and its
    two PCs bracket exactly that block's instructions in bsnes too.
 2. **`ring_pick.py`** finds block transitions whose Δ is IDENTICAL across every
-   occurrence in the ring (data-independent control flow) — the regions where
-   bsnes's reset-first-hit latch measures the same work as the recomp's
-   steady-state ring.
+   occurrence in the ring (data-independent control flow), in two classes:
+   *clean* (start does not self-loop) and *loop-exit* (start self-loops and
+   exits to a different end — a conditional-branch block whose taken edge loops
+   and not-taken edge exits; the recomp charges the +1 only on the taken edge).
 
-**Ordered latch (both sides).** The anchor latch now records `start` on its
-first hit, then `end` only on its first hit AFTER start — isolating ONE
-start→end pass. Independent first-hit mis-brackets backward (loop tail→head)
-and non-adjacent regions; ordered latching fixes them. (bsnes: `CPU::main` in
-`bsnes_cycle_hook.patch`; recomp: `debug_server_on_trace_block`.)
+**TIGHT latch (both sides).** The anchor latch records `start` on EVERY hit
+(so the LAST start before `end` wins) and freezes `end` on its first hit after
+a start has been seen. Taking the last start isolates the adjacent start→end
+EDGE — exactly the single block the recomp ring measures — even when `start`
+sits in a loop. This subsumes plain ordered latching and additionally nails
+loop-exit edges (independent first-hit would span a variable iteration count;
+plain ordered first-hit still spanned the loop). bsnes: `CPU::main` in
+`bsnes_cycle_hook.patch`; recomp: `debug_server_on_trace_block`.
 
 Workflow: launch the recomp (TRACE build) → `cyc_ring` dump from attract →
 `ring_pick.py` → feed each `(start,end,recomp_Δ)` to
 `bsnes_cycles_probe.exe <dll> <rom> <start> <end> <recomp_Δ>`
 (`tools/cyc_watch/_realrom_diff.ps1` drives the batch).
 
-**RESULT (Zelda attract, 6 reachable data-independent regions):** recomp ==
-bsnes EXACTLY on every one — spanning 3 → 197 CPU cycles and including a
-backward loop-branch:
+**RESULT (Zelda attract, all 8 reachable regions):** recomp == bsnes EXACTLY on
+every one — clean forward, a backward loop-branch, AND data-dependent loop-exit
+edges, spanning 3 → 197 CPU cycles:
 
-| region | recomp | bsnes |
-|---|---|---|
-| `$0092B2→$009328` | 118 | 118 |
-| `$009328→$009341` |  40 |  40 |
-| `$009341→$0092B2` (loop back) | 3 | 3 |
-| `$00814C→$008200` | 197 | 197 |
-| `$008719→$00874E` |  17 |  17 |
-| `$00811E→$00813C` |  39 |  39 |
+| region | class | recomp | bsnes |
+|---|---|---|---|
+| `$0092B2→$009328` | clean | 118 | 118 |
+| `$009328→$009341` | clean |  40 |  40 |
+| `$009341→$0092B2` | clean (loop back) | 3 | 3 |
+| `$00814C→$008200` | clean | 197 | 197 |
+| `$008719→$00874E` | clean |  17 |  17 |
+| `$00811E→$00813C` | clean |  39 |  39 |
+| `$008420→$008489` | loop-exit | 172 | 172 |
+| `$0085FE→$00865C` | loop-exit | 150 | 150 |
 
 The recomp's *emitted* cycle charges are confirmed cycle-correct against bsnes
-on real game code, not just synthetic streams.
+on real game code — for clean, backward, and loop-exit edges alike.
 
-**Known harness limit (not a model error).** Blocks whose successor is
-data-dependent (a self-loop + a conditional exit, e.g. `$008420`, `$0085FE`)
-mismatch: bsnes's single boot-pass start→end crosses a variable number of loop
-iterations, while the recomp ring measured the isolated exit transition.
-`ring_pick.py` flags these (the same `start` PC also appears as a self-loop
-transition). Closing them needs occurrence/frame alignment (latch the Nth pass,
-not boot-first) — a future refinement. Bank-02/0C attract PCs that bsnes does
-not reach within the probe's frame budget report `NOT-HIT`.
+**Remaining scope.** Bank-02/0C/1B attract PCs that bsnes does not reach within
+the probe's frame budget report `NOT-HIT` (need a longer run or input to enter
+those scenes). A region where an interrupt/DMA fires between the last `start`
+and `end` would show bsnes > recomp by the handler cost — that is a true
+interrupt-timing finding (Axis 3), not a model error.
