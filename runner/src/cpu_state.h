@@ -464,6 +464,23 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
                                   uint16 entry_s_for_miss_restore,
                                   uint32 source_pc24);
 
+/* Runtime-pointer JSR (abs,X) call: paired host-call dispatch of a WRAM
+ * handler pointer the static pass cannot enumerate (SM enemy/PLM/eproj AI
+ * instruction-list interpreters). Pushes the 2-byte JSR return frame,
+ * dispatches the live (m,x) variant (AOT body host-returns through the
+ * frame; miss -> interpreter tier via interp_tier_run_call), and leaves the
+ * stack balanced so the caller falls through to the post-JSR block. Logged
+ * in g_dispatch_log. Emitted by codegen _emit_runtime_dispatch. */
+RecompReturn cpu_dispatch_call_pc(CpuState *cpu, uint32 pc24,
+                                  uint32 source_pc24);
+
+/* Paired-call dispatch for the interpreter bridge AOT-bounce (cpu_state.c): the
+ * interp already pushed the frame_size-byte return frame; run the target's live
+ * (m,x) variant with hrv=frame_size so it HOST-RETURNS to the bridge instead of
+ * re-dispatching on the popped return address (which over-pops when that address
+ * is a registered function entry). Returns the callee's value. */
+RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24, uint8 frame_size);
+
 /* Read-only dispatch-table probe (task #7 RTS-decision trace). */
 int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24);
 
@@ -503,6 +520,16 @@ RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
 RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
                                            uint32 site_pc24, uint16 entry_s,
                                            uint8 hrv);
+
+/* Interpreter-tier fallback for a runtime-pointer JSR (abs,X) whose loaded
+ * target has no AOT body for the live (m,x). Called by cpu_dispatch_call_pc
+ * AFTER it has pushed the 2-byte JSR return frame: the watermark is the
+ * current S (post-push) so the target's RTS pops that frame and exits the
+ * bridge; on a bail the post-call S is restored. Always balanced, always
+ * NORMAL — the caller falls through to the post-JSR block. Recorded in the
+ * tier-2 gap manifest (kind=dispatch). */
+RecompReturn interp_tier_run_call(CpuState *cpu, uint32 target_pc24,
+                                  uint32 source_pc24);
 /* Phase-4 (opt-in) bank-miss tier-down: the body emitted for a cross-ROM-bank
  * function the static pass couldn't translate (unresolved_stubs_v2.c). Runs
  * the real ROM bytes at addr_pc24 instead of the no-op trap; bail -> the same

@@ -39,6 +39,11 @@ void RecompStackBalDumpJson(FILE *f);
  * site that actually fired this run — the authorization worklist, ordered by
  * first hit. Emits a trailing comma like the other dump_*_json sections. */
 void CpuUnresolvedAbandonDumpJson(FILE *f);
+/* Always-on dispatch ring (see cpu_state.c): the last DISPATCH_LOG_CAP runtime
+ * indirect dispatches (cpu_dispatch_pc_from / cpu_dispatch_call_pc). `found:0`
+ * entries ran on the interpreter tier — the AOT-promotion worklist. Trailing
+ * comma like the other dump_*_json sections. */
+void CpuDispatchLogDumpJson(FILE *f);
 /* Per-frame 65816 entry-S tracking for return-to-ancestor RTS resolution
  * (see common_cpu_infra.c). The emitted function prologue records
  * _entry_s into g_cpu_entry_s[g_recomp_stack_top-1]. */

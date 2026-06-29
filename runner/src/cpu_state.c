@@ -296,6 +296,39 @@ const DispatchLogEntry *cpu_dispatch_log_at(unsigned i) {
     return &g_dispatch_log[i % DISPATCH_LOG_CAP];
 }
 
+/* Post-mortem JSON: serialize the always-on dispatch ring (last
+ * DISPATCH_LOG_CAP runtime indirect dispatches) into the unified report,
+ * with a trailing comma like the other dump_*_json sections. ALWAYS-ON
+ * (Production too) — it reads the ring, never arms it. Engine-shared so
+ * every game's post_mortem.c gets the section by calling this once.
+ *
+ * The ring records every cpu_dispatch_pc_from (RTS/RTL trampoline) AND
+ * cpu_dispatch_call_pc (runtime-pointer JSR (abs,X) — SM enemy/PLM/eproj
+ * AI). `found:0` entries name targets that missed the AOT dispatch table
+ * (they ran on the interpreter tier) — the promotion worklist. The TCP
+ * `dispatch_log_get` command dumps the same ring live; this is the only
+ * readable copy when the TCP server is unavailable (SM). */
+void CpuDispatchLogDumpJson(FILE *f) {
+    unsigned total = g_dispatch_log_idx;
+    unsigned n = total < DISPATCH_LOG_CAP ? total : DISPATCH_LOG_CAP;
+    unsigned start = total - n;
+    fprintf(f,
+        "  \"dispatch_log\": {\"total\": %u, \"shown\": %u, \"events\": [",
+        total, n);
+    for (unsigned i = 0; i < n; i++) {
+        const DispatchLogEntry *e = &g_dispatch_log[(start + i) % DISPATCH_LOG_CAP];
+        const char *nm = e->func_name ? e->func_name : "(none)";
+        fprintf(f,
+            "%s{\"i\":%u,\"pc24\":%u,\"source_pc24\":%u,\"func\":\"%s\","
+            "\"mx\":%u,\"found\":%u,\"mirror\":%u,\"frame\":%u}",
+            (i ? "," : ""), start + i,
+            (unsigned)e->pc24, (unsigned)e->source_pc24, nm,
+            (unsigned)e->mx_idx, (unsigned)e->found,
+            (unsigned)e->mirror, (unsigned)e->frame);
+    }
+    fprintf(f, "]},\n");
+}
+
 static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState *) {
     unsigned lo = 0;
     unsigned hi = g_dispatch_table_count;
@@ -357,6 +390,91 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
 RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24,
                               uint16 entry_s_for_miss_restore) {
     return cpu_dispatch_pc_from(cpu, pc24, entry_s_for_miss_restore, 0xFFFFFFu);
+}
+
+/* Runtime-pointer JSR (abs,X) call (cfg-free; emitted by codegen
+ * _emit_runtime_dispatch for a reachable WRAM-pointer dispatch — SM
+ * enemy/PLM/eproj AI interpreters). The 16-bit pointer was already read
+ * from WRAM by the caller; pc24 = PB:pointer is the live target.
+ *
+ * Unlike cpu_dispatch_pc_from (a trampoline/RTS dispatch — dispatch ABI,
+ * hrv=0, target re-dispatches its own RTS), this is a paired host CALL: we
+ * push the 2-byte JSR return frame here and enter the AOT body with hrv=2 so
+ * its RTS host-returns through that frame (popping it, S restored). The
+ * handler's return value (NORMAL, or an NLR SKIP_N) propagates to the
+ * caller, which falls through to the post-JSR block.
+ *
+ * On a lookup miss — the pointer names a target with no AOT body for the
+ * live (m,x) — fall to the interpreter tier (interp_tier_run_call) which
+ * runs the real ROM bytes and unwinds to the post-call S. The pushed frame
+ * is the target's return frame either way, so the stack stays balanced. The
+ * dispatch is recorded in the always-on g_dispatch_log ring (and the tier-2
+ * gap manifest when it falls to the interpreter). */
+RecompReturn cpu_dispatch_call_pc(CpuState *cpu, uint32 pc24,
+                                  uint32 source_pc24) {
+    pc24 &= 0xFFFFFFu;
+    source_pc24 &= 0xFFFFFFu;
+    /* Push the 2-byte JSR return frame (Option-1 cpu->S ABI): pushed value
+     * = return_addr - 1 = source_pc24 + 2 (JSR (abs,X) is 3 bytes; RTS adds
+     * 1 on pop -> source_pc24 + 3, the post-JSR instruction). */
+    uint16 iret16 = (uint16)((source_pc24 + 2) & 0xFFFFu);
+    cpu_write8(cpu, 0x00, cpu->S, (uint8)((iret16 >> 8) & 0xFF));
+    cpu->S = (uint16)(cpu->S - 1);
+    cpu_write8(cpu, 0x00, cpu->S, (uint8)(iret16 & 0xFF));
+    cpu->S = (uint16)(cpu->S - 1);
+
+    unsigned mx_idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+    int via_mirror = 0;
+    RecompReturn (*fp)(CpuState *) = _cpu_dispatch_lookup(cpu, pc24);
+    if (fp == NULL) {
+        uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+        if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
+            fp = _cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u);
+            if (fp != NULL) via_mirror = 1;
+        }
+    }
+    _dispatch_log_record(pc24, source_pc24, mx_idx, fp != NULL, via_mirror);
+    if (fp != NULL) {
+        /* Paired host-call: handler host-returns through the pushed frame. */
+        cpu->host_return_valid = 2;
+        return fp(cpu);
+    }
+    /* No AOT body for the live pointer -> interpreter tier. */
+    return interp_tier_run_call(cpu, pc24, source_pc24);
+}
+
+/* Paired-call dispatch for the interpreter bridge's AOT-bounce (interp_bridge.c).
+ * The interpreter has ALREADY pushed the call's return frame (frame_size bytes:
+ * JSR/JSR(abs,X)=2, JSL=3) onto cpu->S and set in.pc to the target. Run the
+ * target's live (m,x) variant with host_return_valid=frame_size so its RTS/RTL
+ * HOST-RETURNS to the bridge (popping that frame, S restored to pre-call) and
+ * the bridge resumes interpreting at the return address.
+ *
+ * This replaces the old bounce via cpu_dispatch_pc (dispatch ABI, hrv=0), whose
+ * callee RTS RE-DISPATCHES on the popped return address. That is wrong in the
+ * bridge context whenever the return address coincides with a registered
+ * function entry: e.g. SamusDrawHandler_Default's "JSR HandleChargingBeamGfxAudio"
+ * returns to $90:EB55, which is also the entry of sub_90EB55 — the dispatch HITS
+ * it and runs the next routine as part of the callee's return, over-popping
+ * cpu->S by the frame size and double-executing. Measured: the Samus-draw tail
+ * dispatch left S +2 -> DB=$74 -> WriteEnemyOams freeze. Host-returning instead
+ * makes the bounce stack-exact regardless of what sits at the return address. */
+RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24, uint8 frame_size) {
+    pc24 &= 0xFFFFFFu;
+    unsigned mx_idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+    int via_mirror = 0;
+    RecompReturn (*fp)(CpuState *) = _cpu_dispatch_lookup(cpu, pc24);
+    if (fp == NULL) {
+        uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+        if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
+            fp = _cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u);
+            if (fp != NULL) via_mirror = 1;
+        }
+    }
+    _dispatch_log_record(pc24, 0xFFFFFFu, mx_idx, fp != NULL, via_mirror);
+    if (fp == NULL) return RECOMP_RETURN_NORMAL;  /* caller already checked has_entry */
+    cpu->host_return_valid = frame_size;
+    return fp(cpu);
 }
 
 /* Read-only probe: would a dispatch to pc24 find a function entry?

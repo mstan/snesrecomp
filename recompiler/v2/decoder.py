@@ -2121,6 +2121,40 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     if s not in graph.insns:
                         worklist.append((s, sk, pc))
                 continue
+            # Runtime-pointer dispatch recovery (2026-06-21): a reachable
+            # JSR (abs,X) whose pointer-table base is in WRAM/DP/low-RAM
+            # ($0000-$1FFF) is a genuine per-object runtime function-pointer
+            # dispatch — SM's enemy/PLM/eproj instruction-list interpreters
+            # call `JSR ($0FA8/$0FAE/$0FB0/$0FB2,X)` where $0FAx holds a
+            # per-object handler pointer written at runtime. The target is a
+            # WRAM value, so it CANNOT be statically enumerated (the
+            # `indirect_dispatch ... ptrcall targets:` form does not apply).
+            # Route it through the runtime dispatcher (cpu_dispatch_call_pc):
+            # read the pointer + dispatch the live (m,x) variant at run time,
+            # AOT body if present else interpreter tier. The fall-through IS
+            # preserved (a JSR returns to the next instruction).
+            #
+            # Phantom JSR (abs,X) decoded from garbage past an RTS have
+            # ROM-range operands (>= $2000 — e.g. the $EA1D phantom pinned by
+            # test_decoder_smc_phantom_suppression), so they stay SUPPRESSED
+            # below. A WRAM-range operand is the discriminator: a function-
+            # pointer table never lives in PPU/APU registers ($2000-$5FFF)
+            # or ROM ($8000+); it lives in WRAM.
+            if (insn.operand & 0xFFFF) < 0x2000:
+                insn.dispatch_runtime = True
+                insn.dispatch_idx_reg = 'X'
+                labeled_succ = _labeled_successors(
+                    insn, key, bank,
+                    callee_exit_mx=callee_exit_mx,
+                    callee_exit_mx_modes=callee_exit_mx_modes,
+                    rom=rom, inline_arg_map=inline_arg_map)
+                succ = [k for (k, _) in labeled_succ]
+                graph.insns[key] = DecodedInsn(key=key, insn=insn,
+                                               successors=succ)
+                for s, sk in labeled_succ:
+                    if s not in graph.insns:
+                        worklist.append((s, sk, pc))
+                continue
             # UNAUTHORISED: drop fall-through; record for build report.
             # The insn lives in the graph (so predecessors' successor
             # edges still resolve) but with no outgoing successors.
