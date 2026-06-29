@@ -149,6 +149,11 @@ flow (branches/JSR/RTI — structurally hard in a single-op harness).
 > bsnes doesn't reach in the frame budget) remain unmeasured; an interrupt firing
 > mid-region would be an Axis-3 finding, not a model error. See
 > `tools/cyc_watch/README.md` §REAL-ROM.
+>
+> **Cross-game (2026-06-28): SMW 12/12 MATCH** — re-ran the flow on Super Mario
+> World (`smw.sfc`, :4377): 8 clean regions (banks 00/01/02) + 4 loop-exit edges,
+> recomp == bsnes EXACTLY (4 → 76 CPU cyc). **Combined: 20/20 real-ROM regions
+> across two games → the emitted cost model is game-agnostic.**
 
 > **Axis-2 close-out (2026-06-27).** Validated to the maximum the codebase state
 > allows: (1) the cost model is cycle-correct vs **bsnes** hardware truth — REGION

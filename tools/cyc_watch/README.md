@@ -196,6 +196,13 @@ edges, spanning 3 → 197 CPU cycles:
 The recomp's *emitted* cycle charges are confirmed cycle-correct against bsnes
 on real game code — for clean, backward, and loop-exit edges alike.
 
+**Cross-game (2026-06-28): SMW 12/12 MATCH too.** Re-ran the whole flow on Super
+Mario World (`smw.sfc`, debug server :4377) — 8 clean regions across banks
+00/01/02 + 4 loop-exit edges, recomp == bsnes EXACTLY on every one (4 → 76 CPU
+cycles). Combined with Zelda: **20/20 real-ROM regions across two games** → the
+emitted cost model is game-agnostic. (`_realrom_diff_smw.ps1` drives the SMW
+batch; same probe + ring + ring_pick.)
+
 **Remaining scope.** Bank-02/0C/1B attract PCs that bsnes does not reach within
 the probe's frame budget report `NOT-HIT` (need a longer run or input to enter
 those scenes). A region where an interrupt/DMA fires between the last `start`
