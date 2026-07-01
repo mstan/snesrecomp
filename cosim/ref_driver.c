@@ -183,7 +183,24 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "ref: interp816 + runner devices, headless attract\n");
     cosim_init();                 /* connect the coordinator before frame 1 */
-    for (;;) { run_one_frame(); cosim_frame(); }
+    for (;;) {
+        run_one_frame();
+        /* Deterministic audio consumer: drain one frame's worth so the DSP ring
+         * keeps flowing (else it fills to DSP_SAMPLE_RING and all further samples
+         * drop — the ref would look silent). Matches the A-side consumer rate so
+         * both produce audio at the SNES native 32040/60.0988 = 533.12/frame. */
+        {
+            static double acc = 0.0; static int16_t buf[1024 * 2];
+            acc += 32040.0 / 60.0988;
+            int want = (int)acc; acc -= (double)want;
+            while (want > 0) {
+                int c = want > 1024 ? 1024 : want;
+                dsp_getSamples(g_snes->apu->dsp, buf, c);
+                want -= c;
+            }
+        }
+        cosim_frame();
+    }
     return 0;
 }
 

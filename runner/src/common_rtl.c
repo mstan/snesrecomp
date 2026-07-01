@@ -184,6 +184,33 @@ bool RtlRunFrame(uint32 inputs) {
   if (setjmp(g_watchdog_jmp) == 0) {
     g_rtl_game_info->run_frame();
   }
+#ifdef SNES_COSIM
+  /* DETERMINISTIC AUDIO CONSUMER (SNES_COSIM_AUDIO=1). Production pins SPC tempo
+   * to the audio device's consumption rate: RtlRenderAudio cycles the SPC only
+   * for the shortfall, then drains a block — so the *consumer* sets the rate.
+   * Headless has no audio thread, so the SPC starves (~40x slow). Here we MODEL
+   * the consumer deterministically: drain one frame of samples at the exact SNES
+   * rate (32040 / 60.0988 = 533.12 samples/frame). This paces the SPC to the
+   * correct tempo, reproduces the producer(CPU-catchup)/consumer(this) dynamics
+   * incl. any ring drops, and stays fully deterministic (no host thread). The
+   * dev dump's samples= then reflects real production audio behaviour. */
+  {
+    static int s_audio = -1;
+    if (s_audio < 0) { const char *e = getenv("SNES_COSIM_AUDIO");
+                       s_audio = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    if (s_audio) {
+      static double s_acc = 0.0;
+      static int16 s_buf[1024 * 2];
+      s_acc += 32040.0 / 60.0988;           /* SNES native audio samples per frame */
+      int want = (int)s_acc; s_acc -= (double)want;
+      while (want > 0) {
+        int chunk = want > 1024 ? 1024 : want;
+        RtlRenderAudio(s_buf, chunk, 2);     /* self-balances SPC production to demand */
+        want -= chunk;
+      }
+    }
+  }
+#endif
   // If g_watchdog_tripped is set, frame was abandoned mid-execution;
   // continue to the next frame so the user can interrupt cleanly.
   if (g_framedump_callback)
