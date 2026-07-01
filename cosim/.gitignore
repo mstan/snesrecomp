@@ -1,1 +1,3 @@
 build/
+*.jsonl
+_*.txt
