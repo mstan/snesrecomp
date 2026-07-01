@@ -158,6 +158,128 @@ static void recomp_wram_trace_tick(void) {
     if ((frame % 30) == 0) fflush(log);
 }
 
+/* APU/SPC-RAM variant of the differential trace (co-sim step 1: audio hunt).
+ * Emits per-frame changed bytes of the full 64K SPC RAM (g_snes->apu->ram) in
+ * the SAME jsonl shape as the WRAM trace, so it aligns 1:1 against snesref's
+ * bsnes SPC-RAM trace (retro memory id 0x100) via align_diff.py --size 0x10000.
+ * The recomp runs a real SPC700 core (LakeSnes-derived apu/spc/dsp); only the
+ * IPL upload handshake is HLE'd, so apu->ram reflects the real uploaded SPC
+ * program plus the SPC700's runtime writes -- directly comparable to bsnes's
+ * dsp.apuram. Env-gated (SNESRECOMP_APURAM_TRACE_FILE), zero cost when off. */
+static void recomp_apuram_trace_tick(void) {
+    static int enabled = -1;
+    static FILE *log = NULL;
+    static unsigned char prev[0x10000];
+    static int primed = 0;
+    static unsigned frame = 0;
+    extern Snes *g_snes;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_APURAM_TRACE_FILE");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!g_snes || !g_snes->apu) return;
+    if (!log) {
+        log = fopen(getenv("SNESRECOMP_APURAM_TRACE_FILE"), "a");
+        if (!log) { enabled = 0; return; }
+    }
+    const unsigned char *ram = g_snes->apu->ram;
+    frame++;
+    if (!primed) {
+        for (int a = 0; a <= 0xffff; a++) {
+            prev[a] = ram[a];
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    frame, a, ram[a]);
+        }
+        primed = 1; return;
+    }
+    for (int a = 0; a <= 0xffff; a++) {
+        unsigned char v = ram[a];
+        if (v != prev[a]) {
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                    frame, a, prev[a], v);
+            prev[a] = v;
+        }
+    }
+    if ((frame % 30) == 0) fflush(log);
+}
+
+/* S-DSP register-file variant of the differential trace (co-sim audio hunt).
+ * Emits per-frame changed bytes of the 128-byte DSP register file
+ * (g_snes->apu->dsp->ram, the $00-$7F mirror incl. VxPITCHL/H, KON/KOFF, ADSR,
+ * echo). Same jsonl shape as the WRAM/APU-RAM traces => aligns 1:1 against
+ * snesref's bsnes DSP-reg trace (retro memory id 0x101) via align_diff.py
+ * --size 0x80. This is the state where "pitch" literally lives, so a persistent
+ * divergence here (esp. VxPITCH) localizes an off-pitch bug to driver-writes vs
+ * DSP synthesis. Env-gated (SNESRECOMP_DSPREG_TRACE_FILE). */
+static void recomp_dspreg_trace_tick(void) {
+    static int enabled = -1;
+    static FILE *log = NULL;
+    static unsigned char prev[0x80];
+    static int primed = 0;
+    static unsigned frame = 0;
+    extern Snes *g_snes;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_DSPREG_TRACE_FILE");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!g_snes || !g_snes->apu || !g_snes->apu->dsp) return;
+    if (!log) {
+        log = fopen(getenv("SNESRECOMP_DSPREG_TRACE_FILE"), "a");
+        if (!log) { enabled = 0; return; }
+    }
+    const unsigned char *r = g_snes->apu->dsp->ram;
+    frame++;
+    if (!primed) {
+        for (int a = 0; a < 0x80; a++) {
+            prev[a] = r[a];
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    frame, a, r[a]);
+        }
+        primed = 1; return;
+    }
+    for (int a = 0; a < 0x80; a++) {
+        unsigned char v = r[a];
+        if (v != prev[a]) {
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                    frame, a, prev[a], v);
+            prev[a] = v;
+        }
+    }
+    if ((frame % 30) == 0) fflush(log);
+}
+
+/* Native DSP output-stream capture (co-sim audio hunt). Reads the samples the
+ * S-DSP PRODUCED this frame straight from dsp->sampleBuffer (the always-on ring,
+ * per CLAUDE.md ring-buffer rule) using the monotonic sampleWrite counter, and
+ * appends them as raw s16 stereo PCM (~32040 Hz, pre-host-resample) — the exact
+ * game-agnostic audio the recomp generates, to align against bsnes's
+ * BSNES_COSIM_DSPOUT stream. Env-gated (SNESRECOMP_DSPOUT). */
+static void recomp_dspout_capture(void) {
+    static int enabled = -1;
+    static FILE *f = NULL;
+    static uint32_t prev_write = 0;
+    static int primed = 0;
+    extern Snes *g_snes;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_DSPOUT");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!g_snes || !g_snes->apu || !g_snes->apu->dsp) return;
+    if (!f) { f = fopen(getenv("SNESRECOMP_DSPOUT"), "wb"); if (!f) { enabled = 0; return; } }
+    Dsp *dsp = g_snes->apu->dsp;
+    uint32_t w = dsp->sampleWrite;
+    if (!primed) { prev_write = w; primed = 1; return; }
+    for (uint32_t s = prev_write; s != w; s++) {
+        uint32_t idx = (s & (DSP_SAMPLE_RING - 1)) * 2;
+        int16 pair[2] = { dsp->sampleBuffer[idx], dsp->sampleBuffer[idx + 1] };
+        fwrite(pair, sizeof(int16), 2, f);
+    }
+    prev_write = w;
+}
+
 bool RtlRunFrame(uint32 inputs) {
 #ifdef SNES_COSIM
   /* Co-sim (dev/diagnostics only): connect the coordinator once, before the
@@ -225,6 +347,9 @@ bool RtlRunFrame(uint32 inputs) {
   ppudma_frame_snapshot(snes_frame_counter);
 
   recomp_wram_trace_tick();   /* differential first-divergence trace (env-gated) */
+  recomp_apuram_trace_tick(); /* APU/SPC-RAM differential trace (audio hunt, env-gated) */
+  recomp_dspreg_trace_tick(); /* S-DSP register-file differential trace (env-gated) */
+  recomp_dspout_capture();    /* native DSP output-stream capture (env-gated) */
 
   /* Axis-7 determinism fingerprint: hash the full WRAM for this frame. */
   g_fp_ring[snes_frame_counter & (FP_RING - 1)] = fp_fnv1a(g_ram, sizeof(g_ram));

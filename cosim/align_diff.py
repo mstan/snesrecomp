@@ -12,11 +12,16 @@ offset. This tool:
      address as stack ($0100-$01FF) vs game-state, so HLE-artifacts (stack /
      NMI-frame) are visible but not silently suppressed.
 
-Usage: align_diff.py <oracle.jsonl> <recomp.jsonl> [--exclude-stack]
+The address space size is configurable (--size N, default 0x2000) so the same
+tool diffs low WRAM ($0000-$1FFF) OR the full 64K SPC/APU RAM (--size 0x10000)
+recomp-vs-bsnes for the audio hunt. The stack page $0100-$01FF is classified out
+for both spaces (it is the SPC700 stack too).
+
+Usage: align_diff.py <oracle.jsonl> <recomp.jsonl> [--exclude-stack] [--size N]
 """
 import json, sys
 
-WRAM = 0x2000
+WRAM = 0x2000                       # address-space size (overridable via --size)
 STACK_LO, STACK_HI = 0x0100, 0x01FF
 
 def load(path):
@@ -61,30 +66,56 @@ def agree_frac(sa, sb, exclude_stack):
     return (same / tot if tot else 0.0), tot
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    exclude_stack = "--exclude-stack" in sys.argv
+    global WRAM
+    argv = sys.argv[1:]
+    if "--size" in argv:
+        i = argv.index("--size")
+        WRAM = int(argv[i + 1], 0)
+        del argv[i:i + 2]
+    forced_O = None
+    if "--offset" in argv:
+        i = argv.index("--offset")
+        forced_O = int(argv[i + 1], 0)
+        del argv[i:i + 2]
+    args = [a for a in argv if not a.startswith("--")]
+    exclude_stack = "--exclude-stack" in argv
+    print(f"address-space size = 0x{WRAM:x} ({WRAM} bytes)")
     oracle_f, omax = load(args[0])
     recomp_f, rmax = load(args[1])
     print(f"oracle frames={omax} recomp frames={rmax}  exclude_stack={exclude_stack}")
     osnap = snapshots(oracle_f, omax)
     rsnap = snapshots(recomp_f, rmax)
 
-    # --- find boot offset O: recomp[i] <-> oracle[i+O], sampled mid-run ---
-    lo, hi = -30, max(60, omax - 40)
-    scores = []
-    probe = [f for f in range(20, rmax, 4)]
-    for O in range(lo, hi + 1):
+    # --- boot offset O: recomp[i] <-> oracle[i+O] ---
+    # The frame numbering of the APU trace is identical to the WRAM trace, so the
+    # WRAM-derived offset (+204) applies verbatim; --offset skips the O(space x
+    # offsets x frames) search that is prohibitive over the 64K SPC space.
+    if forced_O is not None:
+        O = forced_O
         acc = n = 0.0
-        for i in probe:
+        for i in [f for f in range(20, rmax, 4)]:
             j = i + O
             if 1 <= i <= rmax and 1 <= j <= omax and rsnap[i] and osnap[j]:
                 fr, tot = agree_frac(rsnap[i], osnap[j], exclude_stack)
                 if tot > 200: acc += fr; n += 1
-        if n: scores.append((acc / n, O))
-    scores.sort(reverse=True)
-    print("top offsets (agreement%, O):", [(round(s*100,1), o) for s, o in scores[:6]])
-    score, O = scores[0]
-    print(f"BEST boot offset O={O} (recomp[i] vs oracle[i+O]); mid-run agreement {score*100:.1f}%")
+        score = acc / n if n else 0.0
+        print(f"FORCED boot offset O={O} (recomp[i] vs oracle[i+O]); mid-run agreement {score*100:.1f}%")
+    else:
+        lo, hi = -30, max(60, omax - 40)
+        scores = []
+        probe = [f for f in range(20, rmax, 4)]
+        for O in range(lo, hi + 1):
+            acc = n = 0.0
+            for i in probe:
+                j = i + O
+                if 1 <= i <= rmax and 1 <= j <= omax and rsnap[i] and osnap[j]:
+                    fr, tot = agree_frac(rsnap[i], osnap[j], exclude_stack)
+                    if tot > 200: acc += fr; n += 1
+            if n: scores.append((acc / n, O))
+        scores.sort(reverse=True)
+        print("top offsets (agreement%, O):", [(round(s*100,1), o) for s, o in scores[:6]])
+        score, O = scores[0]
+        print(f"BEST boot offset O={O} (recomp[i] vs oracle[i+O]); mid-run agreement {score*100:.1f}%")
 
     # --- skip the boot transition: start where the offset alignment stabilizes ---
     start = 2
