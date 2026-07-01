@@ -333,6 +333,22 @@ bool RtlRunFrame(uint32 inputs) {
     }
   }
 #endif
+#ifdef SNES_COSIM
+  /* Co-sim fidelity (env-gated for A/B): production's main loop calls
+   * draw_ppu_frame() AFTER run_frame() every frame — PPU line render + HDMA +
+   * raster-IRQ simulation. The headless harness omits it, so the raster IRQ
+   * never fires and IRQ-managed guest state diverges from the oracle (e.g. MMX's
+   * $0BA0 raster-ack flag stays governed only by the bootstrap clear). Running it
+   * here makes the co-sim model the full production frame; the per-frame trace/
+   * hash below then capture post-IRQ state, matching bsnes's frame boundary. */
+  { static int s_draw = -1;
+    if (s_draw < 0) { const char *e = getenv("SNES_COSIM_DRAW_PPU");
+                      /* Default ON (faithful full production frame); opt-out with =0. */
+                      s_draw = (e && e[0] == '0') ? 0 : 1; }
+    if (s_draw && g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+      g_rtl_game_info->draw_ppu_frame();
+  }
+#endif
   // If g_watchdog_tripped is set, frame was abandoned mid-execution;
   // continue to the next frame so the user can interrupt cleanly.
   if (g_framedump_callback)

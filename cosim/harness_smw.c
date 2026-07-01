@@ -17,6 +17,7 @@
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #include "snes/snes.h"
+#include "snes/ppu.h"
 #include "spc_player.h"
 
 /* Provided by the SMW game sources linked alongside this harness. */
@@ -54,7 +55,17 @@ int main(int argc, char **argv) {
     g_spc_player = SmwSpcPlayer_Create();
     g_spc_player->initialize(g_spc_player);
 
-    fprintf(stderr, "cosim-harness: SMW booted headless; running attract (no input)\n");
+    /* Point the PPU at a render buffer so draw_ppu_frame() (which renders PPU
+     * lines + drives HDMA + fires the raster IRQ) can run headlessly under
+     * SNES_COSIM_DRAW_PPU=1 without a NULL renderBuffer deref. Matches main.c's
+     * PpuBeginDrawing(g_ppu, g_my_pixels, 256*4, 0). We never present the
+     * pixels; we only need the IRQ/HDMA side effects for co-sim fidelity. */
+    { extern Ppu *g_ppu;
+      static uint8_t s_cosim_pixels[256 * 4 * 256];  /* 256px * 4B * up to 256 lines */
+      if (g_ppu) PpuBeginDrawing(g_ppu, s_cosim_pixels, 256 * 4, 0);
+    }
+
+    fprintf(stderr, "cosim-harness: booted headless; running attract (no input)\n");
     for (;;) {
         /* attract/demo needs no controller input; identical inputs by
          * construction (Gate-1 determinism). cosim_init() connects the
