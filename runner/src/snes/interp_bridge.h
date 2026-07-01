@@ -40,6 +40,14 @@
  */
 int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24);
 
+/* Faithful LLE of an infinite cooperative-scheduler loop (e.g. MMX's $8099 task
+ * scheduler): run the real ROM scheduler under interp816 from entry_pc24 and
+ * yield after one frame's slot walk — when it reaches yield_pc (its vblank-wait
+ * spin) with the flag byte at flag_addr cleared. Tasks it dispatches bounce to
+ * compiled bodies via the paired ABI. Returns 1 on clean yield, 0 on cap bail. */
+int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
+                                uint32_t yield_pc, uint16_t flag_addr);
+
 /* Production tier-down entry, called from generated indirect-dispatch defaults
  * (an absolute-indirect JMP/JML whose loaded target isn't in the static case
  * list). Interprets the target instead of silently dropping the transfer;
