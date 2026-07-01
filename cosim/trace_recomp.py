@@ -32,7 +32,11 @@ if dspreg_out:
     env["SNESRECOMP_DSPREG_TRACE_FILE"] = dspreg_out
 if dspout_out:
     env["SNESRECOMP_DSPOUT"] = dspout_out
-p = subprocess.Popen([exe, rom], env=env)
+_errlog = os.environ.get("TRACE_RECOMP_STDERR")
+_errf = open(_errlog, "w") if _errlog else None
+p = subprocess.Popen([exe, rom], env=env,
+                     stderr=_errf if _errf else None,
+                     stdout=_errf if _errf else None)
 s = None
 for _ in range(80):
     try:
