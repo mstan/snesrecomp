@@ -36,7 +36,7 @@ static void snes_trace_direct_wram_write(uint32_t off, uint8_t old, uint8_t val)
 #endif
 
 Snes* snes_init(uint8_t *ram) {
-  Snes* snes = malloc(sizeof(Snes));
+  Snes* snes = calloc(1, sizeof(Snes));  /* zero padding: saveload/co-sim hash determinism */
   snes->ram = ram;
 
   snes->cpu = cpu_init();

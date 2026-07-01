@@ -55,7 +55,7 @@ static void spc_write(Spc* spc, uint16_t adr, uint8_t val) {
 }
 
 Spc* spc_init(Apu* apu) {
-  Spc* spc = malloc(sizeof(Spc));
+  Spc* spc = calloc(1, sizeof(Spc));  /* zero padding: saveload/co-sim hash determinism */
   spc->apu = apu;
   return spc;
 }

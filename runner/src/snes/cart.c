@@ -13,7 +13,7 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr);
 static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
 
 Cart* cart_init(Snes* snes) {
-  Cart* cart = malloc(sizeof(Cart));
+  Cart* cart = calloc(1, sizeof(Cart));  /* zero padding: saveload/co-sim hash determinism */
   cart->snes = snes;
   cart->type = 0;
   cart->rom = NULL;

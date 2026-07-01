@@ -21,7 +21,7 @@ static const uint8_t bootRom[0x40] = {
 };
 
 Apu* apu_init(void) {
-  Apu* apu = malloc(sizeof(Apu));
+  Apu* apu = calloc(1, sizeof(Apu));  /* zero padding: saveload/co-sim hash determinism */
   apu->spc = spc_init(apu);
   apu->dsp = dsp_init(apu->ram);
   apu_clearPortQueue(apu);

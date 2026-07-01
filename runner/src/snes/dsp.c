@@ -65,7 +65,7 @@ static void dsp_decodeBrr(Dsp* dsp, int ch);
 static void dsp_handleNoise(Dsp* dsp);
 
 Dsp* dsp_init(uint8_t *ram) {
-  Dsp* dsp = malloc(sizeof(Dsp));
+  Dsp* dsp = calloc(1, sizeof(Dsp));  /* zero padding: saveload/co-sim hash determinism */
   dsp->apu_ram = ram;
   dsp->shadow = dsp_shadow_create();  // opt-in; NULL/disabled unless env set
   return dsp;

@@ -70,6 +70,24 @@ if(SNESRECOMP_ENABLE_TRACE AND WIN32)
     list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
 endif()
 
+# Differential co-simulation (SNES_COSIM.md): full-state first-divergence oracle.
+# DEV/DIAGNOSTICS ONLY — must NEVER be enabled in a shipping Production config.
+# Adds the frame-keyed park/step engine (cosim.c) + canonical state hash
+# (cosim_state.c) + a loopback TCP server; needs ws2_32 on Windows. Defines
+# SNES_COSIM for every target configured after this include (the game exe).
+option(SNES_COSIM "Build the differential co-simulation engine (DEV ONLY)" OFF)
+if(SNES_COSIM)
+    list(APPEND SNESRECOMP_RUNNER_SOURCES
+        ${SNESRECOMP_RUNNER_ROOT}/src/cosim.c
+        ${SNESRECOMP_RUNNER_ROOT}/src/cosim_state.c
+    )
+    add_compile_definitions(SNES_COSIM)
+    if(WIN32)
+        list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
+    endif()
+    message(STATUS "SNES_COSIM enabled — DEV co-simulation build (not for release)")
+endif()
+
 set(SNESRECOMP_RUNNER_INCLUDE_DIRS
     ${SNESRECOMP_RUNNER_ROOT}/src
     ${SNESRECOMP_RUNNER_ROOT}/src/snes

@@ -29,7 +29,10 @@ static const int transferLength[8] = {
 static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bool fromB);
 
 Dma* dma_init(Snes* snes) {
-  Dma* dma = malloc(sizeof(Dma));
+  /* calloc (not malloc): dma_saveload hashes the raw struct region incl.
+   * DmaChannel padding bytes; leaving them uninitialized makes save-states
+   * (and the co-sim state hash) nondeterministic run-to-run. */
+  Dma* dma = calloc(1, sizeof(Dma));
   dma->snes = snes;
   return dma;
 }

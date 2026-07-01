@@ -16,6 +16,7 @@
 #include "debug_server.h"
 #include "audio_trace.h"
 #include "ppu_dma_trace.h"
+#include "cosim.h"
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -158,6 +159,13 @@ static void recomp_wram_trace_tick(void) {
 }
 
 bool RtlRunFrame(uint32 inputs) {
+#ifdef SNES_COSIM
+  /* Co-sim (dev/diagnostics only): connect the coordinator once, before the
+   * first frame executes. Boot ran deterministically already; the co-sim
+   * compares from frame 1 onward. */
+  { static int s_cosim_started = 0;
+    if (!s_cosim_started) { s_cosim_started = 1; cosim_init(); } }
+#endif
   // Avoid up/down and left/right from being pressed at the same time
   if ((inputs & 0x30) == 0x30) inputs ^= 0x30;
   if ((inputs & 0xc0) == 0xc0) inputs ^= 0xc0;
@@ -196,6 +204,11 @@ bool RtlRunFrame(uint32 inputs) {
   g_fp_max_frame = (uint64_t)snes_frame_counter;
 
   snes_frame_counter++;
+
+#ifdef SNES_COSIM
+  /* Frame-keyed checkpoint: snapshot full state + park for the coordinator. */
+  cosim_frame();
+#endif
 
   /* Axis-2 soak instrumentation: env-gated FPS heartbeat to stderr. Counts
    * frames completed per wall-clock second (the frame loop caps at ~60 fps, so
@@ -457,6 +470,26 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 // Public so snes.c's snes_readBBus (the APU read path) can use the same
 // pacing -- both reads and writes need to advance APU.
 void rtl_accumulate_apu_catchup(void) {
+#ifdef SNES_COSIM
+  /* Co-sim A-vs-B variable-under-test (SNES_COSIM.md task 9): with
+   * SNES_COSIM_ACCURATE_APU=1, pace the SPC from the region-weighted master
+   * clock at the true SPC:master ratio (exactly like the interp816 ref),
+   * instead of the +256/APU-touch synthetic estimate. Two recomp instances
+   * that boot IDENTICALLY and differ ONLY in this pacing choice stay
+   * bit-identical until synthetic pacing first yields a different APU value —
+   * the off-cue's first observable effect, cleanly localized. Cached once. */
+  static int s_accurate = -1;
+  if (s_accurate < 0) { const char *e = getenv("SNES_COSIM_ACCURATE_APU");
+                        s_accurate = (e && e[0] && e[0] != '0') ? 1 : 0; }
+  if (s_accurate) {
+    static const double kApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 60.0);
+    uint64_t md = g_cpu.master_cycles - g_apu_last_sync_master;
+    g_apu_last_sync_master = g_cpu.master_cycles;
+    g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;   /* keep sync ptr current */
+    g_snes->apuCatchupCycles += (double)md * kApuPerMaster;
+    return;
+  }
+#endif
   // NOTE (Axis-5 off-cue experiment, 2026-06-28): pacing the SPC from the
   // recompiler's region-weighted MASTER-clock accumulator (g_cpu.master_cycles,
   // = sum of CPU cycles x code-region speed) was tried here in place of the
@@ -494,6 +527,9 @@ void rtl_accumulate_apu_catchup(void) {
     static uint32_t last_sample_read;
     static uint64_t consume_seen_ms, wall_last_ms;
     Dsp *dsp = g_snes->apu->dsp;
+    /* audio_trace_wall_ms() is a deterministic virtual clock under SNES_COSIM
+     * (see audio_trace.c) — routes this baseline through the same source as the
+     * port-write scheduler, so the whole APU-pacing path is deterministic. */
     uint64_t now_ms = audio_trace_wall_ms();
     uint32_t rd = dsp->sampleRead;
     if (rd != last_sample_read) {
