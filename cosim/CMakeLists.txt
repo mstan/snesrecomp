@@ -15,6 +15,7 @@ set(CMAKE_C_STANDARD 11)
 # The worktree engine (this file lives in <worktree>/cosim) and the SMW game repo.
 get_filename_component(SNESRECOMP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/.. ABSOLUTE)
 set(SMW_ROOT "${SNESRECOMP_ROOT}/../SuperMarioWorldRecomp" CACHE PATH "SMW game repo")
+set(MMX_ROOT "${SNESRECOMP_ROOT}/../MegamanXRecomp" CACHE PATH "MMX game repo")
 
 set(SNES_COSIM ON CACHE BOOL "" FORCE)          # pull cosim.c/cosim_state.c + ws2_32
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
@@ -109,4 +110,51 @@ endif()
 target_link_libraries(smw_cosim_ref PRIVATE m)
 if(WIN32)
     target_link_libraries(smw_cosim_ref PRIVATE ws2_32)
+endif()
+
+# ── MMX co-simulation A-side (mmx_cosim) ────────────────────────────────────
+# MMX is the actual issue-#4 audio target. Mirrors smw_cosim: the MMX recomp
+# runtime with NO SDL/GL/host-audio (reuses the game-neutral harness_smw.c,
+# which references the shared kSmwGameInfo / SmwSpcPlayer_Create symbols that the
+# MMX repo also defines) + the cosim engine. DEV/DIAGNOSTICS ONLY.
+file(GLOB MMX_GEN CONFIGURE_DEPENDS ${MMX_ROOT}/src/gen/*.c)
+if(NOT MMX_GEN)
+    message(FATAL_ERROR "no generated banks at ${MMX_ROOT}/src/gen — regen MMX first")
+endif()
+add_executable(mmx_cosim
+    ${SNESRECOMP_RUNNER_SOURCES}
+    harness_smw.c             # game-neutral (kSmwGameInfo / SmwSpcPlayer_Create)
+    harness_glue.c
+    ${MMX_ROOT}/src/config.c
+    ${MMX_ROOT}/src/mmx_00.c
+    ${MMX_ROOT}/src/gen_stubs.c
+    ${MMX_ROOT}/src/mmx_cpu_infra.c
+    ${MMX_ROOT}/src/mmx_rtl.c
+    ${MMX_ROOT}/src/mmx_spc_player.c
+    ${MMX_ROOT}/src/fiber_compat.c   # MMX scheduler uses fibers
+    ${MMX_GEN}
+)
+target_include_directories(mmx_cosim PRIVATE
+    ${MMX_ROOT} ${MMX_ROOT}/src ${MMX_ROOT}/recomp
+    ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
+)
+target_compile_definitions(mmx_cosim PRIVATE
+    SMW_DISABLE_LM=1
+    SYSTEM_VOLUME_MIXER_AVAILABLE=0
+    SNESRECOMP_TRACE=0
+    SDL_MAIN_HANDLED
+)
+find_package(SDL2 QUIET)
+if(SDL2_INCLUDE_DIRS)
+    target_include_directories(mmx_cosim PRIVATE ${SDL2_INCLUDE_DIRS})
+endif()
+target_include_directories(mmx_cosim PRIVATE C:/msys64/mingw64/include/SDL2)
+target_link_libraries(mmx_cosim PRIVATE C:/msys64/mingw64/lib/libSDL2.dll.a)
+if(NOT MSVC)
+    target_compile_options(mmx_cosim PRIVATE
+        -w -Wno-implicit-function-declaration -Wno-error=implicit-function-declaration)
+endif()
+target_link_libraries(mmx_cosim PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES} m)
+if(WIN32)
+    target_link_libraries(mmx_cosim PRIVATE ws2_32)
 endif()
