@@ -58,6 +58,17 @@ static long     s_budget  = 0;             /* checkpoints left to run before par
 static int      s_pending_reply = 0;       /* a `step` is awaiting its parked reply */
 static int      s_audit_period  = 0;       /* hash-vs-byte audit cadence (gate 4) */
 
+/* Instruction-granular lockstep (SNES_COSIM_SYNC_PC): frame-model + cycle-model
+ * differences between the recomp A-side (compiled prefix + interp) and the
+ * pure-interp B-side make frame/master-cycle strides misalign. When a sync PC
+ * (low-16) is set, checkpointing switches to per-interpreted-opcode: both sides
+ * reach the sync PC in identical guest state, then interpret the SAME opcodes,
+ * so a per-opcode cpu/ram compare pinpoints the exact divergence. */
+static uint32_t s_sync_pc16   = 0xFFFFFFFFu;  /* disabled sentinel */
+static uint64_t s_istride     = 1;            /* checkpoint every N interpreted opcodes */
+static int      s_insn_armed  = 0;            /* sync PC reached */
+static uint64_t s_insn        = 0;            /* interpreted opcodes since arm */
+
 static sock_t s_listen = BADSOCK, s_client = BADSOCK;
 static int    s_inited = 0;
 static CosimSnapshot s_last;               /* snapshot at the current park point */
@@ -94,6 +105,10 @@ void cosim_init(void) {
     const char *ap = getenv("SNES_COSIM_AUDIT");
     if (sp && atoi(sp) > 0) s_stride = (uint64_t)atoll(sp);
     if (ap && atoi(ap) > 0) s_audit_period = atoi(ap);
+    const char *syp = getenv("SNES_COSIM_SYNC_PC");
+    const char *isp = getenv("SNES_COSIM_ISTRIDE");
+    if (syp && syp[0]) s_sync_pc16 = (uint32_t)(strtoul(syp, NULL, 0) & 0xFFFFu);
+    if (isp && atoi(isp) > 0) s_istride = (uint64_t)atoll(isp);
     int port = (pp && atoi(pp) > 0) ? atoi(pp) : 4500;
 
 #ifdef _WIN32
@@ -219,8 +234,23 @@ static void checkpoint(void) {
 /* Called by both builds at every completed guest frame. */
 void cosim_frame(void) {
     if (!s_inited) return;
+    if (s_sync_pc16 != 0xFFFFFFFFu) return;   /* instruction mode: frames don't checkpoint */
     s_frame++;
     if (s_frame % s_stride) return;   /* only checkpoint every `stride` frames */
+    checkpoint();
+}
+
+/* Called by both builds per interpreted opcode (interp_bridge / ref_driver).
+ * Once the guest reaches the sync PC (low-16), checkpoint every s_istride
+ * opcodes — instruction-granular lockstep. No-op until sync PC is set + hit. */
+void cosim_insn(uint32_t pc24) {
+    if (!s_inited || s_sync_pc16 == 0xFFFFFFFFu) return;
+    if (!s_insn_armed) {
+        if ((pc24 & 0xFFFFu) != s_sync_pc16) return;  /* bank-agnostic (LoROM $00/$80 mirror) */
+        s_insn_armed = 1;
+    }
+    s_insn++;
+    if (s_insn % s_istride) return;
     checkpoint();
 }
 

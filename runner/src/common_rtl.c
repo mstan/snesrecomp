@@ -50,6 +50,13 @@ uint64_t g_main_cpu_cycles_estimate = 0;
 uint64_t g_apu_pace_cycles_estimate = 0;
 uint64_t g_apu_last_sync_cycles = 0;
 
+// Set while the interp816 bridge (interp tier / LLE task scheduler) is driving:
+// the bridge advances the SPC itself, per interpreted opcode, by guest master
+// cycles (like the faithful oracle) — so the per-touch synthetic catch-up must
+// NOT also fire (double-count). Guards rtl_accumulate_apu_catchup below. Only
+// the interp path sets it; the compiled steady-state path is unaffected.
+int g_interp_apu_driving = 0;
+
 // Axis-5 off-cue: APU pacing now derives from the recompiler's region-weighted
 // MASTER-clock accumulator (g_cpu.master_cycles) instead of the +256-per-touch
 // synthetic estimate. g_apu_last_sync_master is the master-clock count at the
@@ -659,6 +666,10 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 // Public so snes.c's snes_readBBus (the APU read path) can use the same
 // pacing -- both reads and writes need to advance APU.
 void rtl_accumulate_apu_catchup(void) {
+  /* The interp816 bridge advances the SPC per-opcode by guest master cycles
+   * (guest-time-anchored, like the ref oracle). Skip the per-touch estimate so
+   * an APU-port access inside interpreted code doesn't double-count. */
+  if (g_interp_apu_driving) return;
 #ifdef SNES_COSIM
   /* Co-sim A-vs-B variable-under-test (SNES_COSIM.md task 9): with
    * SNES_COSIM_ACCURATE_APU=1, pace the SPC from the region-weighted master

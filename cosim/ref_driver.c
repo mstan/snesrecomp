@@ -142,6 +142,10 @@ static void run_one_frame(void) {
     /* Guard against a runaway (spin with no vPos progress): cap opcodes/frame. */
     long guard = 20000000;
     while (s_frames < target && guard-- > 0) {
+        /* Instruction-granular co-sim checkpoint (SNES_COSIM_SYNC_PC): the ref's
+         * live interp IS g_ref_cpu, which cosim_state snapshots directly, so no
+         * sync needed. Offer this opcode boundary before executing it. */
+        cosim_insn(((uint32_t)cpu->k << 16) | (uint32_t)cpu->pc);
         int cyc = interp816_runOpcode(cpu);         /* CPU bus cycles */
         if (cyc <= 0) cyc = 1;
         int master = cyc * 8;                        /* slowROM approx (6/8/12); */

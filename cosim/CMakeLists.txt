@@ -161,3 +161,53 @@ target_link_libraries(mmx_cosim PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES} m)
 if(WIN32)
     target_link_libraries(mmx_cosim PRIVATE ws2_32)
 endif()
+
+# ── Rockman X (Japan) co-sim A-side (rmx_cosim) ─────────────────────────────
+# The JP variant of MegamanXRecomp (feat/rockman-x-jp): gen from variants/jp/gen,
+# MMX_VARIANT_JP + LLE scheduler default. Used to diff the gate-#3 APU handshake
+# divergence against smw_cosim_ref (faithful interp816). DEV/DIAGNOSTICS ONLY.
+set(RMX_ROOT "${SNESRECOMP_ROOT}/../MegamanXRecomp" CACHE PATH "MegamanXRecomp checkout (JP variant)")
+file(GLOB RMX_GEN CONFIGURE_DEPENDS ${RMX_ROOT}/variants/jp/gen/*.c)
+if(NOT RMX_GEN)
+    message(FATAL_ERROR "no JP gen at ${RMX_ROOT}/variants/jp/gen — regen JP first")
+endif()
+add_executable(rmx_cosim
+    ${SNESRECOMP_RUNNER_SOURCES}
+    harness_smw.c             # game-neutral (kSmwGameInfo / SmwSpcPlayer_Create)
+    harness_glue.c
+    ${RMX_ROOT}/src/config.c
+    ${RMX_ROOT}/src/mmx_00.c
+    ${RMX_ROOT}/src/gen_stubs.c
+    ${RMX_ROOT}/src/mmx_cpu_infra.c
+    ${RMX_ROOT}/src/mmx_rtl.c
+    ${RMX_ROOT}/src/mmx_spc_player.c
+    ${RMX_ROOT}/src/fiber_compat.c
+    ${RMX_GEN}
+)
+target_include_directories(rmx_cosim PRIVATE
+    ${RMX_ROOT}/variants/jp/config   # JP funcs.h must precede recomp/
+    ${RMX_ROOT} ${RMX_ROOT}/src ${RMX_ROOT}/recomp
+    ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
+)
+target_compile_definitions(rmx_cosim PRIVATE
+    SMW_DISABLE_LM=1
+    SYSTEM_VOLUME_MIXER_AVAILABLE=0
+    SNESRECOMP_TRACE=0
+    SDL_MAIN_HANDLED
+    MMX_VARIANT_JP=1
+    MMX_SCHED_LLE_DEFAULT=1
+)
+find_package(SDL2 QUIET)
+if(SDL2_INCLUDE_DIRS)
+    target_include_directories(rmx_cosim PRIVATE ${SDL2_INCLUDE_DIRS})
+endif()
+target_include_directories(rmx_cosim PRIVATE C:/msys64/mingw64/include/SDL2)
+target_link_libraries(rmx_cosim PRIVATE C:/msys64/mingw64/lib/libSDL2.dll.a)
+if(NOT MSVC)
+    target_compile_options(rmx_cosim PRIVATE
+        -w -Wno-implicit-function-declaration -Wno-error=implicit-function-declaration)
+endif()
+target_link_libraries(rmx_cosim PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES} m)
+if(WIN32)
+    target_link_libraries(rmx_cosim PRIVATE ws2_32)
+endif()

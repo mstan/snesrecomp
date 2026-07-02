@@ -7,6 +7,23 @@
 #include <string.h>
 #include "interp_bridge.h"
 #include "interp816.h"
+#include "snes.h"   /* Snes, apuCatchupCycles, snes_catchupApu */
+#include "cosim.h"  /* cosim_insn — instruction-granular lockstep (no-op unless SNES_COSIM) */
+
+/* Guest-time-anchored APU (Rockman X JP gate #3 / audio pacing): the interp
+ * tier advances the SPC per interpreted opcode by guest master cycles, exactly
+ * like the faithful reference (cosim/ref_driver.c). Cold-boot handshakes that
+ * poll an APU port ($2140 == $AABB) can only complete once the SPC has actually
+ * run; the recomp's compiled steady-state paces the SPC on APU-port touches +
+ * the wall-clock audio thread, but interpreted boot code hits neither before the
+ * poll, so the SPC stayed frozen (co-sim: A outPorts=0000 vs B outPorts=AABB).
+ * Scoped to the interp tier — the compiled path never enters here. */
+extern Snes *g_snes;
+extern uint64_t g_apu_last_sync_master;   /* common_rtl.c — keep synced so a bounce's accurate-mode delta excludes interp opcodes */
+extern int g_interp_apu_driving;          /* common_rtl.c — suppresses the per-touch synthetic catch-up while set */
+void RtlApuLock(void);                    /* real mutex in the windowed runner (audio thread also cycles the SPC); no-op in headless/cosim */
+void RtlApuUnlock(void);
+static const double kInterpApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 60.0);
 
 /* ── memory bus shim ───────────────────────────────────────────────────────
  * The interpreter's `mem` is the CpuState*; route every access through the
@@ -102,7 +119,7 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
  * the return-past-entry watermark exit is DISABLED, because such loops reset
  * their own stack (MMX: LDX #$02FF; TXS at $8099), which would otherwise trip
  * the is_ret watermark on the first task RTS. */
-static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
+static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  uint16_t s_exit, uint32_t *out_landing,
                                  uint32_t yield_pc, uint16_t yield_flag_addr,
                                  int reset_cap_on_bounce,
@@ -147,6 +164,13 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     long steps = 0;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+#ifdef SNES_COSIM
+        /* Instruction-granular co-sim checkpoint: sync the live interp state into
+         * g_cpu (what cosim_state snapshots on the recomp A-side) and offer this
+         * opcode boundary. No-op unless SNES_COSIM_SYNC_PC is armed. */
+        sync_interp_to_cpu(&in, cpu);
+        cosim_insn(pc_before);
+#endif
         /* Cooperative-loop yield: stop when the loop reaches its wait point with
          * the vblank flag cleared (one frame's dispatch complete). Checked BEFORE
          * executing so we don't re-enter the spin.
@@ -192,7 +216,28 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
         const int call_len = (op == 0x22) ? 4 : 3;
         const int is_ret   = (op == 0x60 || op == 0x6B);
 
-        interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
+        int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
+
+        /* Guest-time-anchored APU: advance the guest clock + SPC by this opcode's
+         * cycles, so the SPC runs continuously during interpreted code (its IPL
+         * reaches the $AABB handshake write before the CPU polls it). Mirrors the
+         * ref oracle (master = cyc*8 slowROM approx, SPC at the true ratio). Keep
+         * g_apu_last_sync_master current so a later AOT bounce's accurate-mode
+         * catch-up delta excludes what we already advanced here. */
+        if (_cyc <= 0) _cyc = 1;
+        {
+            uint64_t _master = (uint64_t)_cyc * 8u;
+            cpu->cycles        += (uint64_t)_cyc;
+            cpu->master_cycles += _master;
+            /* Serialise with the audio thread's bulk SPC render (windowed build);
+             * no-op lock in headless/cosim. The opcode's own port access (if any)
+             * already locked+unlocked inside interp816_runOpcode, so no nesting. */
+            RtlApuLock();
+            g_snes->apuCatchupCycles += (double)_master * kInterpApuPerMaster;
+            g_apu_last_sync_master = cpu->master_cycles;
+            snes_catchupApu(g_snes);
+            RtlApuUnlock();
+        }
 
         /* Resolved-landing capture (Phase 2 manifest): the PC reached after
          * the FIRST opcode. When entered at an indirect JMP/JML (the
@@ -227,7 +272,11 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
                  * +2 leak. frame: JSL(0x22)=3, JSR/JSR(abs,X)=2. */
                 const uint8_t _fs = (op == 0x22) ? 3 : 2;
                 uint16_t _sp_pre = in.sp;
+                /* Compiled body paces its own APU (RtlApuRead/Write); un-suppress
+                 * the per-touch catch-up for its duration, then restore. */
+                g_interp_apu_driving = 0;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
+                g_interp_apu_driving = 1;
                 sync_cpu_to_interp(cpu, &in);
                 if (_ibrw)
                     fprintf(stderr, "[ibr] call op=$%02X pc=$%06X -> $%06X "
@@ -279,6 +328,22 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     if (trace) itrace_dump(entry_pc24, head, (int)(itn < 8 ? itn : 8), ring, itn);
     sync_interp_to_cpu(&in, cpu);
     return 0;
+}
+
+/* Wrapper: mark the interp tier as APU-driving for the whole run (nesting-safe
+ * save/restore) so rtl_accumulate_apu_catchup skips the per-touch synthetic
+ * estimate — the core advances the SPC per opcode instead. */
+static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
+                                 uint16_t s_exit, uint32_t *out_landing,
+                                 uint32_t yield_pc, uint16_t yield_flag_addr,
+                                 int reset_cap_on_bounce,
+                                 const uint32_t *stop_pcs, int n_stop) {
+    int _saved = g_interp_apu_driving;
+    g_interp_apu_driving = 1;
+    int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing, yield_pc,
+                              yield_flag_addr, reset_cap_on_bounce, stop_pcs, n_stop);
+    g_interp_apu_driving = _saved;
+    return _r;
 }
 
 /* Public entry: exit watermark = the current stack depth (the routine is
