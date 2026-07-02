@@ -15,7 +15,10 @@ set(CMAKE_C_STANDARD 11)
 # The worktree engine (this file lives in <worktree>/cosim) and the SMW game repo.
 get_filename_component(SNESRECOMP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/.. ABSOLUTE)
 set(SMW_ROOT "${SNESRECOMP_ROOT}/../SuperMarioWorldRecomp" CACHE PATH "SMW game repo")
-set(MMX_ROOT "${SNESRECOMP_ROOT}/../MegamanXRecomp" CACHE PATH "MMX game repo")
+# MMX co-sim builds from the LLE worktree (feat/scheduler-lle-tier), which carries
+# the swappable HLE/LLE scheduler toggle (SNESRECOMP_MMX_SCHED_LLE); its gen banks
+# are junctioned from the canonical MegamanXRecomp checkout (which stays on main).
+set(MMX_ROOT "${SNESRECOMP_ROOT}/../_wt_mmx_lle" CACHE PATH "MMX game repo (LLE worktree)")
 
 set(SNES_COSIM ON CACHE BOOL "" FORCE)          # pull cosim.c/cosim_state.c + ws2_32
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
