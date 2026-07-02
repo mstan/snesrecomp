@@ -80,7 +80,13 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
 #define RTL_SAV_MAGIC   0x52544c53u  /* "RTLS" */
-#define RTL_SAV_VERSION 4u  /* v4: dropped Dma.pad[7] blob tail */
+/* v4: dropped Dma.pad[7] blob tail.
+ * v5: optional game-specific chunk appended after the snes_saveload blob
+ *     (RtlGameInfo.state_save_extra/state_load_extra) — e.g. MMX task-slot
+ *     resume contexts so a load can rebuild its scheduler fibers from any
+ *     game mode or a fresh process. v4 files still load (no chunk). */
+#define RTL_SAV_VERSION 5u
+#define RTL_SAV_VERSION_MIN 4u
 
 typedef struct FileSli {
   SaveLoadInfo base;
@@ -410,6 +416,10 @@ void RtlSaveSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, true, false };
   snes_saveload(g_snes, &fs.base);
+  /* v5: game-specific chunk (task-slot resume contexts etc.). Streamed
+   * through the same FileSli so the format stays one linear blob. */
+  if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
+    g_rtl_game_info->state_save_extra(&fs.base);
   RtlApuUnlock();
   if (fs.error) printf("Save write error: %s\n", filename);
   fclose(f);
@@ -421,7 +431,8 @@ bool RtlLoadSnapshot(const char *filename) {
     return false;
   uint32 hdr[2];
   if (fread(hdr, sizeof(hdr), 1, f) != 1
-      || hdr[0] != RTL_SAV_MAGIC || hdr[1] != RTL_SAV_VERSION) {
+      || hdr[0] != RTL_SAV_MAGIC
+      || hdr[1] < RTL_SAV_VERSION_MIN || hdr[1] > RTL_SAV_VERSION) {
     printf("Save file %s: bad magic/version (legacy StateRecorder format no longer supported)\n", filename);
     fclose(f);
     return false;
@@ -429,12 +440,22 @@ bool RtlLoadSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, false, false };
   snes_saveload(g_snes, &fs.base);
+  /* v5+: game-specific chunk follows the guest blob. v4 files have none —
+   * the game's on_state_loaded hook (below) is told the version so it can
+   * fall back to legacy same-mode behavior. */
+  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra)
+    g_rtl_game_info->state_load_extra(&fs.base, hdr[1]);
   RtlApuUnlock();
   fclose(f);
   if (fs.error) {
     printf("Save read error: %s\n", filename);
     return false;
   }
+  /* Post-load reconciliation: host-side execution state (fibers, HLE
+   * scheduler bookkeeping) cannot live in the guest snapshot; give the
+   * game one hook to rebuild it against the freshly restored WRAM. */
+  if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
+    g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
 }
 
@@ -675,6 +696,21 @@ void rtl_accumulate_apu_catchup(void) {
   // 2/7 is about 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
   // (back-to-back APU touches with no block hooks between them) just don't
   // advance APU on this pass; cycles accumulate for the next touch.
+  /* DIAGNOSTIC OVERRIDE (audio hunt, env-gated): rescale the per-touch credit.
+   * The estimate charges 256 master cycles per HW touch, but a tight APU poll
+   * loop's real period is ~15-25 cycles — an over-credit of >10x that balloons
+   * SPC time during port-heavy phases (boot/stage-load uploads measured 17-45x
+   * realtime, 220s of APU audio discarded at the output ring). Set
+   * SNESRECOMP_APU_TOUCH_CYCLES=20 to charge ~20 master cycles per touch. */
+  {
+    static double s_touch_scale = -1.0;
+    if (s_touch_scale < 0.0) {
+      const char *e = getenv("SNESRECOMP_APU_TOUCH_CYCLES");
+      s_touch_scale = (e && e[0]) ? (atof(e) / 256.0) : 1.0;
+      if (s_touch_scale <= 0.0) s_touch_scale = 1.0;
+    }
+    delta = (uint64_t)((double)delta * s_touch_scale);
+  }
   g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
   // Keep the master sync pointer current so the (now inert) accumulator's delta
   // never balloons if a future change re-enables master-clock pacing.
@@ -770,6 +806,23 @@ void RtlApuWrite(uint16 adr, uint8 val) {
     static uint64_t s_port_last_target[4];
     static uint8_t  s_port_last_val[4];
     static uint8_t  s_port_last_valid[4];
+    /* DIAGNOSTIC OVERRIDE (audio hunt, env-gated): apply port writes at the
+     * produced clock immediately — hardware-like microsecond visibility —
+     * bypassing the wall-ns spacing and the min-dwell floor. For A/B-ing
+     * whether the ~1-frame scheduled apply latency is what corrupts
+     * handshake-protocol drivers (MMX ack round-trips). Off = shipping path. */
+    static int s_immediate = -1;
+    if (s_immediate < 0) {
+      const char *e = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
+      s_immediate = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (s_immediate) {
+      uint64_t produced_now, consumed_now;
+      audio_trace_sample_clocks(&produced_now, &consumed_now);
+      apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
+      RtlApuUnlock();
+      return;
+    }
     uint64_t quantum = audio_trace_consume_quantum();
     uint64_t now_ns = audio_trace_wall_ns();
     uint64_t produced, consumed;

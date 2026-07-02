@@ -48,6 +48,19 @@ int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24);
 int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
                                 uint32_t yield_pc, uint16_t flag_addr);
 
+/* Save-state task resume: interpret a suspended cooperative task from its
+ * recorded yield return address (an arbitrary mid-function guest PC; the
+ * caller restores the task's CpuState first). Calls bounce to compiled bodies
+ * via the paired ABI — including yield HLEs, which suspend the hosting fiber
+ * exactly like the compiled path — so after one interpreted function frame the
+ * task runs mostly compiled again. Returns 1 when the task's top-level RTS
+ * unwinds past task_base_s (task finished), 0 on a step-cap wedge bail. The
+ * step cap resets on every successful bounce (it bounds interp-side wedges,
+ * not the resumed task's lifetime). */
+int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
+                              uint16_t task_base_s,
+                              const uint32_t *stop_pcs, int n_stop);
+
 /* Production tier-down entry, called from generated indirect-dispatch defaults
  * (an absolute-indirect JMP/JML whose loaded target isn't in the static case
  * list). Interprets the target instead of silently dropping the transfer;
