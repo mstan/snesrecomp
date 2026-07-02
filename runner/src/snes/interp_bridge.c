@@ -149,8 +149,15 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
         /* Cooperative-loop yield: stop when the loop reaches its wait point with
          * the vblank flag cleared (one frame's dispatch complete). Checked BEFORE
-         * executing so we don't re-enter the spin. */
-        if (yield_pc && pc_before == yield_pc &&
+         * executing so we don't re-enter the spin.
+         *
+         * Compared bank-mirrored (& 0x7FFFFF), like the stop-PC intercept below:
+         * a LoROM scheduler loop re-enters $8099 in whichever of the $00/$80
+         * mirror banks the last transfer left in K. MMX's boot walk lands the
+         * loop back in bank $00 while yield_pc is given as $80:80A1, so an exact
+         * compare never matches — the interp spins the vblank wait to the step
+         * cap and bails (JP boot froze here at Task0 state=3). */
+        if (yield_pc && (pc_before & 0x7FFFFF) == (yield_pc & 0x7FFFFF) &&
             bridge_bus_read(cpu, yield_flag_addr) == 0) {
             sync_interp_to_cpu(&in, cpu);
             return 1;
