@@ -6385,7 +6385,7 @@ static void cmd_audio_stats(const char *args) {
     static char buf[65536];
     int pos = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"produced\":%llu,\"produced_cpu\":%llu,\"produced_audio\":%llu,"
-        "\"dropped\":%llu,\"drop_runs\":%llu,\"consumed\":%llu,\"consume_calls\":%llu,"
+        "\"dropped\":%llu,\"dropped_audible\":%llu,\"drop_runs\":%llu,\"consumed\":%llu,\"consume_calls\":%llu,"
         "\"reg_writes\":%llu,\"kon_writes\":%llu,\"occupancy_highwater\":%u,"
         "\"pace_baseline_cycles\":%llu,\"pace_accumulate_calls\":%llu,"
         "\"pace_consumer_active\":%u,"
@@ -6396,6 +6396,7 @@ static void cmd_audio_stats(const char *args) {
         "\"event_count\":%llu,\"snap_count\":%llu,\"snaps\":[",
         (unsigned long long)st.produced, (unsigned long long)st.produced_cpu,
         (unsigned long long)st.produced_audio, (unsigned long long)st.dropped,
+        (unsigned long long)st.dropped_audible,
         (unsigned long long)st.drop_runs, (unsigned long long)st.consumed,
         (unsigned long long)st.consume_calls, (unsigned long long)st.reg_writes,
         (unsigned long long)st.kon_writes, st.occupancy_highwater,

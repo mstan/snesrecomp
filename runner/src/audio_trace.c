@@ -106,6 +106,12 @@ void audio_trace_on_sample(int16_t l, int16_t r, int dropped, uint32_t ring_fill
       s_stats.drop_runs++;
     }
     s_stats.dropped++;
+    /* Silent-vs-audible attribution: ring-overflow drops during SPC upload
+     * phases discard digital silence (measured -84 dBFS across a stage
+     * load) — harmless. A drop carrying real signal is the regression that
+     * matters. Threshold 256/32768 ~= -42 dBFS, well above idle noise. */
+    if (l > 256 || l < -256 || r > 256 || r < -256)
+      s_stats.dropped_audible++;
   } else {
     s_open_drop_event = UINT64_MAX;
   }

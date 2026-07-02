@@ -92,6 +92,11 @@ typedef struct AudioTraceStats {
   uint64_t produced_audio;    /* ... by audio-thread top-up             */
   uint64_t dropped;           /* total samples lost to ring overflow    */
   uint64_t drop_runs;         /* number of distinct drop bursts         */
+  uint64_t dropped_audible;   /* dropped samples carrying real signal
+                               * (|l| or |r| > 256 ~= -42 dBFS). Upload-
+                               * phase drops are silence and land only in
+                               * `dropped`; THIS counter going nonzero
+                               * means audible music was discarded.      */
   uint64_t consumed;          /* total native samples read for output   */
   uint64_t consume_calls;     /* dsp_getSamples calls (audio callbacks) */
   uint64_t reg_writes;        /* DSP register writes                    */
