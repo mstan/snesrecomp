@@ -63,6 +63,8 @@ void cpu_tailcall_context_restore(const CpuTailcallContextSave *in);
 extern jmp_buf g_watchdog_jmp;
 extern int g_watchdog_tripped;
 
+struct SaveLoadInfo;
+
 typedef struct RtlGameInfo {
   const char *title;
   CpuInfraInitializeFunc *initialize;
@@ -71,6 +73,16 @@ typedef struct RtlGameInfo {
   // Filename prefix used by RtlSaveLoad, e.g. "save" produces
   // "saves/save%d.sav". If NULL, framework uses "%s_save" with title.
   const char *save_name_prefix;
+  /* Optional save-state extension hooks — all NULL-safe (SMW/Zelda leave
+   * them unset). state_save_extra streams a game-specific chunk appended
+   * after the snes_saveload blob (format v5+); state_load_extra reads it
+   * back (only called when the file carries one). on_state_loaded fires
+   * after EVERY successful load, with the file's format version, so the
+   * game can reconcile host-side execution state that the guest snapshot
+   * cannot capture (e.g. MMX tears down and rebuilds its task fibers). */
+  void (*state_save_extra)(struct SaveLoadInfo *sli);
+  void (*state_load_extra)(struct SaveLoadInfo *sli, uint32_t version);
+  void (*on_state_loaded)(uint32_t version);
 } RtlGameInfo;
 
 extern const RtlGameInfo *g_rtl_game_info;

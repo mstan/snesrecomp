@@ -88,6 +88,7 @@ static int cpu_sram_offset(uint8 bank, uint16 addr) {
  * doesn't care about precise timing — it just needs *some* cycles to
  * elapse so the IPL ROM runs to the point of writing $BBAA. */
 #include <stdio.h>
+#include <stdlib.h>   /* getenv/strtol for the SNES_COSIM write watchpoint */
 /* APU pacing: every HW-register touch advances the main-CPU cycle
  * estimate. v1 did this in `debug_on_block_enter`; v2 doesn't emit
  * those, so without this bump the SPC never advances and SMW's
@@ -186,6 +187,28 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     if (off >= 0) {
         uint8 old = cpu->ram[off];
         cpu->ram[off] = v;
+#ifdef SNES_COSIM
+        /* Exact per-write WRAM watchpoint (dev, env-gated): names the recompiled
+         * function performing the store (not block-poll approximate). Set
+         * SNESRECOMP_WRITE_WATCH=0xADDR. Zero cost when unset. */
+        {
+            extern const char *g_last_recomp_func;
+            static long wa = -2; static FILE *wf = NULL; static int hits = 0;
+            if (wa == -2) {
+                const char *e = getenv("SNESRECOMP_WRITE_WATCH");
+                wa = (e && e[0]) ? strtol(e, NULL, 0) : -1;
+                if (wa >= 0) { const char *lp = getenv("SNESRECOMP_WRITE_WATCH_LOG");
+                               wf = fopen(lp && lp[0] ? lp : "writewatch.log", "w"); }
+            }
+            if (wa >= 0 && wf && off == (int)wa && hits < 400) {
+                fprintf(wf, "[writewatch] $%04x = %02x (was %02x) bank=%02x addr=%04x "
+                            "by %s (m=%d x=%d)\n",
+                        off, v, old, bank, addr, g_last_recomp_func,
+                        cpu->m_flag & 1, cpu->x_flag & 1);
+                fflush(wf); hits++;
+            }
+        }
+#endif
         cpu_trace_wram_write_check(cpu, bank, addr, off,
                                    (uint16)old, (uint16)v, 1);
         /* Also route through the dedicated 1M-entry WRAM-only ring so
@@ -213,6 +236,25 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
                    | ((uint16)cpu->ram[off + 1] << 8);
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
+#ifdef SNES_COSIM
+        {
+            extern const char *g_last_recomp_func;
+            static long wa = -2; static FILE *wf = NULL; static int hits = 0;
+            if (wa == -2) {
+                const char *e = getenv("SNESRECOMP_WRITE_WATCH");
+                wa = (e && e[0]) ? strtol(e, NULL, 0) : -1;
+                if (wa >= 0) { const char *lp = getenv("SNESRECOMP_WRITE_WATCH_LOG16");
+                               wf = fopen(lp && lp[0] ? lp : "writewatch16.log", "w"); }
+            }
+            if (wa >= 0 && wf && (off == (int)wa || off + 1 == (int)wa) && hits < 400) {
+                fprintf(wf, "[writewatch16] $%04x=%04x @off%04x (byte $%04lx now %02x, was %02x) "
+                            "bank=%02x addr=%04x by %s (m=%d x=%d)\n",
+                        off, v, off, wa, cpu->ram[wa], (uint8)(old >> ((wa-off)*8)),
+                        bank, addr, g_last_recomp_func, cpu->m_flag & 1, cpu->x_flag & 1);
+                fflush(wf); hits++;
+            }
+        }
+#endif
         cpu_trace_wram_write_check(cpu, bank, addr, off, old, v, 2);
 #if SNESRECOMP_REVERSE_DEBUG
         extern void debug_on_wram_write_word(uint32_t, uint16_t, uint16_t);

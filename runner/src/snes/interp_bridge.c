@@ -95,8 +95,18 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
  * BASE to unwind to — for a tail-dispatch / PEA+JMP re-interpret it is the
  * enclosing function's _entry_s, NOT the current cpu->S (a PEA may have pushed
  * a return below entry, and the target's RTS-to-PEA must NOT end the bridge). */
-static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
-                                uint16_t s_exit, uint32_t *out_landing) {
+/* yield_pc != 0 selects "cooperative-loop" mode: the interpreted routine is an
+ * infinite loop (e.g. MMX's $8099 task scheduler) that never returns — it only
+ * yields when it reaches yield_pc with the vblank flag at yield_flag_addr
+ * cleared (0), i.e. it is about to block waiting for the next NMI. In this mode
+ * the return-past-entry watermark exit is DISABLED, because such loops reset
+ * their own stack (MMX: LDX #$02FF; TXS at $8099), which would otherwise trip
+ * the is_ret watermark on the first task RTS. */
+static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
+                                 uint16_t s_exit, uint32_t *out_landing,
+                                 uint32_t yield_pc, uint16_t yield_flag_addr,
+                                 int reset_cap_on_bounce,
+                                 const uint32_t *stop_pcs, int n_stop) {
     /* Local interpreter context → nesting (an AOT bounce that itself traps and
      * re-enters the bridge) gets its own frame; no shared mutable interp. */
     Interp816 in;
@@ -134,8 +144,33 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
     long itn = 0;
 
     const long step_cap = interp_step_cap();
-    for (long steps = 0; steps < step_cap; steps++) {
+    long steps = 0;
+    for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        /* Cooperative-loop yield: stop when the loop reaches its wait point with
+         * the vblank flag cleared (one frame's dispatch complete). Checked BEFORE
+         * executing so we don't re-enter the spin. */
+        if (yield_pc && pc_before == yield_pc &&
+            bridge_bus_read(cpu, yield_flag_addr) == 0) {
+            sync_interp_to_cpu(&in, cpu);
+            return 1;
+        }
+        /* Stop-PC intercept (task-resume mode): JMP/BRA arrival at a PC whose
+         * real asm is incompatible with interpretation (fiber-HLE'd machinery
+         * like MMX's task-die $80F8). Run its registered HLE body instead and
+         * treat the task frame as ended. JSR arrivals never get here — they
+         * bounce via the paired-call path below. Compared bank-mirrored. */
+        if (n_stop) {
+            const uint32_t pc_norm = pc_before & 0x7FFFFF;
+            for (int si = 0; si < n_stop; si++) {
+                if ((stop_pcs[si] & 0x7FFFFF) == pc_norm) {
+                    sync_interp_to_cpu(&in, cpu);
+                    if (cpu_dispatch_has_entry(cpu, pc_before))
+                        cpu_dispatch_pc_paired(cpu, pc_before, 0);
+                    return 1;
+                }
+            }
+        }
         const uint8_t  op = bridge_bus_read(cpu, pc_before);
         if (trace) {
             ITraceEnt _e = { pc_before, op };
@@ -166,7 +201,14 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
              * the current (m,x), run it compiled. */
             sync_interp_to_cpu(&in, cpu);          /* expose (m,x) + frame to AOT */
             const uint32_t target = ((uint32_t)in.k << 16) | in.pc;
-            if (cpu_dispatch_has_entry(cpu, target)) {
+            /* Cooperative-scheduler (yield_pc) mode: NEVER bounce to a compiled
+             * body — interpret everything. The scheduler's yield primitive
+             * ($808100) is a coroutine switch that saves S and BRAs back into the
+             * loop WITHOUT returning to its caller; bouncing it as a normal
+             * paired-ABI call (which assumes the callee returns) corrupts the
+             * stack / crashes. Pure interpretation follows the BRA and the later
+             * TCS-to-saved-S resume faithfully. */
+            if (!yield_pc && cpu_dispatch_has_entry(cpu, target)) {
                 /* Paired-call ABI: the interp already pushed the return frame, so
                  * run the target with hrv=frame_size and let its RTS/RTL
                  * HOST-RETURN to us (frame popped, S restored to pre-call). We
@@ -196,6 +238,11 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
                 const uint32_t ret = (pc_before + (uint32_t)call_len) & 0xFFFFFF;
                 in.k  = (uint8)((ret >> 16) & 0xFF);
                 in.pc = (uint16)(ret & 0xFFFF);
+                /* Resume-task mode: a successful bounce is forward progress
+                 * (incl. a bounced yield that just slept a frame on its fiber);
+                 * the cap should only catch interp-side wedges, not bound the
+                 * resumed task's lifetime. */
+                if (reset_cap_on_bounce) steps = 0;
             } else if (_ibrw) {
                 fprintf(stderr, "[ibr] call op=$%02X pc=$%06X -> $%06X "
                         "(interp into target) sp=$%04X\n",
@@ -206,7 +253,7 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
             continue;
         }
 
-        if (is_ret) {
+        if (is_ret && !yield_pc) {
             if (_ibrw)
                 fprintf(stderr, "[ibr] ret  op=$%02X pc=$%06X sp=$%04X "
                         "(s_enter=$%04X exit=%d)\n",
@@ -230,7 +277,31 @@ static int interp_bridge_run_ex(CpuState *cpu, uint32_t entry_pc24,
 /* Public entry: exit watermark = the current stack depth (the routine is
  * entered balanced at cpu->S). */
 int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24) {
-    return interp_bridge_run_ex(cpu, entry_pc24, cpu->S, NULL);
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, 0, 0, 0, NULL, 0);
+}
+
+/* Save-state task resume: interpret a suspended task from its recorded yield
+ * return address (an arbitrary mid-function guest PC) with a caller-supplied
+ * base-stack watermark. Calls bounce to compiled bodies via the paired ABI —
+ * including the yield HLEs, which suspend the hosting fiber exactly like the
+ * compiled path. Returns 1 when the task's top-level RTS unwinds past
+ * task_base_s (task finished), 0 on a step-cap wedge bail. The cap resets on
+ * every successful bounce, so it bounds interp-side wedges, not task life. */
+int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
+                              uint16_t task_base_s,
+                              const uint32_t *stop_pcs, int n_stop) {
+    return interp_bridge_run_ex2(cpu, resume_pc24, task_base_s, NULL, 0, 0, 1, stop_pcs, n_stop);
+}
+
+/* Faithful LLE of an infinite cooperative-scheduler loop: run the real guest
+ * scheduler under interp816 from entry_pc24, dispatching its tasks (which bounce
+ * to compiled bodies via the paired ABI), and yield after one frame's slot walk
+ * — when the loop reaches yield_pc (its vblank-wait spin) with the flag at
+ * flag_addr cleared. Replaces a hand-written C scheduler HLE with the actual
+ * ROM code. Returns 1 on clean yield, 0 on step-cap bail. */
+int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
+                                uint32_t yield_pc, uint16_t flag_addr) {
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, yield_pc, flag_addr, 0, NULL, 0);
 }
 
 /* ── tier-down entry (called from generated indirect-dispatch defaults) ───── */
@@ -339,7 +410,7 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
-    int ok = interp_bridge_run_ex(cpu, target_pc24 & 0xFFFFFF, entry_s, &landing);
+    int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s, &landing, 0, 0, 0, NULL, 0);
     /* For an indirect goto the recorded target is where the JMP actually
      * resolved (the dynamically computed entry); for a dispatch default the
      * passed target already IS the entry. */
@@ -371,7 +442,7 @@ RecompReturn interp_tier_run_call(CpuState *cpu, uint32_t target_pc24,
     const uint16_t watermark = cpu->S;
     const uint16_t post_call = (uint16_t)(cpu->S + 2);
     uint32_t landing = target_pc24;
-    int ok = interp_bridge_run_ex(cpu, target_pc24, watermark, &landing);
+    int ok = interp_bridge_run_ex2(cpu, target_pc24, watermark, &landing, 0, 0, 0, NULL, 0);
     tier2_record(source_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
     if (!ok)
         cpu->S = post_call;  /* bail: discard the unconsumed JSR frame */
@@ -389,7 +460,7 @@ RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32_t addr_pc24,
     interp_tier_note(addr_pc24);
     const uint8_t mx = tier2_entry_mx(cpu);
     uint32_t landing = addr_pc24;
-    int ok = interp_bridge_run_ex(cpu, addr_pc24, entry_s, &landing);
+    int ok = interp_bridge_run_ex2(cpu, addr_pc24, entry_s, &landing, 0, 0, 0, NULL, 0);
     tier2_record(addr_pc24, addr_pc24, mx, TIER2_KIND_BANK_MISS, ok);
     if (ok)
         return RECOMP_RETURN_NORMAL;

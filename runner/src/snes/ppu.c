@@ -21,7 +21,7 @@ static uint16_t ppu_getVramRemap(Ppu* ppu);
 
 
 Ppu* ppu_init(void) {
-  Ppu* ppu = malloc(sizeof(Ppu));
+  Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
   return ppu;
 }
 

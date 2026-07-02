@@ -108,6 +108,82 @@ static void clear_trace() {
     printf("[trace cleared]\n"); fflush(stdout);
 }
 
+// ---- APU/SPC-RAM trace (co-sim step 1: audio hunt) ----
+// bsnes exposes the 64K SPC RAM (dsp.apuram) via the custom retro memory id
+// 0x100 (see target-libretro/libretro.cpp COSIM_MEMORY_APURAM). Per-frame
+// changed-byte trace in the SAME jsonl shape as WRAM, so it aligns 1:1 against
+// the recomp's SNESRECOMP_APURAM_TRACE_FILE via align_diff.py --size 0x10000.
+// Env-gated by SNESREF_APURAM_TRACE_FILE (off => zero cost).
+#define COSIM_MEMORY_APURAM 0x100
+#define APURAM_HI 0x0ffff
+static FILE* g_apu_log;
+static uint8_t g_apu_prev[APURAM_HI + 1];
+static bool    g_apu_primed = false;
+static int     g_apu_enabled = -1;
+
+static void apuram_trace_tick() {
+    if (g_apu_enabled < 0) {
+        const char* p = getenv("SNESREF_APURAM_TRACE_FILE");
+        g_apu_enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!g_apu_enabled) return;
+    uint8_t* ram = (uint8_t*)p_retro_get_memory_data(COSIM_MEMORY_APURAM);
+    size_t sz = p_retro_get_memory_size(COSIM_MEMORY_APURAM);
+    if (!ram || sz <= APURAM_HI) return;
+    if (!g_apu_log) {
+        g_apu_log = fopen(getenv("SNESREF_APURAM_TRACE_FILE"), "a");
+        if (!g_apu_log) { g_apu_enabled = 0; return; }
+    }
+    if (!g_apu_primed) {
+        for (int a=0;a<=APURAM_HI;a++){ g_apu_prev[a]=ram[a];
+            fprintf(g_apu_log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    g_frame, a, ram[a]); }
+        g_apu_primed=true; return;
+    }
+    for (int a=0;a<=APURAM_HI;a++){ uint8_t v=ram[a]; if(v!=g_apu_prev[a]){
+        fprintf(g_apu_log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                g_frame, a, g_apu_prev[a], v); g_apu_prev[a]=v; } }
+    if (g_apu_log && (g_frame % 30)==0) fflush(g_apu_log);
+}
+
+// ---- S-DSP register-file trace (co-sim audio hunt) ----
+// bsnes exposes the live 128-byte DSP register file (VxPITCH etc.) via the
+// custom retro memory id 0x101 (COSIM_MEMORY_DSPREGS). Per-frame changed-byte
+// trace in the SAME jsonl shape => aligns against the recomp's
+// SNESRECOMP_DSPREG_TRACE_FILE via align_diff.py --size 0x80.
+// Env-gated by SNESREF_DSPREG_TRACE_FILE.
+#define COSIM_MEMORY_DSPREGS 0x101
+#define DSPREG_HI 0x7f
+static FILE* g_dsp_log;
+static uint8_t g_dsp_prev[DSPREG_HI + 1];
+static bool    g_dsp_primed = false;
+static int     g_dsp_enabled = -1;
+
+static void dspreg_trace_tick() {
+    if (g_dsp_enabled < 0) {
+        const char* p = getenv("SNESREF_DSPREG_TRACE_FILE");
+        g_dsp_enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!g_dsp_enabled) return;
+    uint8_t* regs = (uint8_t*)p_retro_get_memory_data(COSIM_MEMORY_DSPREGS);
+    size_t sz = p_retro_get_memory_size(COSIM_MEMORY_DSPREGS);
+    if (!regs || sz <= DSPREG_HI) return;
+    if (!g_dsp_log) {
+        g_dsp_log = fopen(getenv("SNESREF_DSPREG_TRACE_FILE"), "a");
+        if (!g_dsp_log) { g_dsp_enabled = 0; return; }
+    }
+    if (!g_dsp_primed) {
+        for (int a=0;a<=DSPREG_HI;a++){ g_dsp_prev[a]=regs[a];
+            fprintf(g_dsp_log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    g_frame, a, regs[a]); }
+        g_dsp_primed=true; return;
+    }
+    for (int a=0;a<=DSPREG_HI;a++){ uint8_t v=regs[a]; if(v!=g_dsp_prev[a]){
+        fprintf(g_dsp_log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                g_frame, a, g_dsp_prev[a], v); g_dsp_prev[a]=v; } }
+    if (g_dsp_log && (g_frame % 30)==0) fflush(g_dsp_log);
+}
+
 // ---- libretro callbacks ----
 static bool cb_environment(unsigned cmd, void* data) {
     switch (cmd) {
@@ -388,6 +464,8 @@ int main(int argc, char** argv) {
         p_retro_run();
         g_frame++;
         trace_tick();
+        apuram_trace_tick();
+        dspreg_trace_tick();
         if (quit_frames > 0 && g_frame >= (uint32_t)quit_frames) running = false;
         // headless self-test: MMX_SELFTEST=1 -> save@200, load@400, quit@600
         { static int st=-1; if(st<0){const char*v=getenv("MMX_SELFTEST"); st=(v&&v[0]&&v[0]!='0')?1:0;}

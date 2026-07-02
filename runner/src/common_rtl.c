@@ -16,6 +16,7 @@
 #include "debug_server.h"
 #include "audio_trace.h"
 #include "ppu_dma_trace.h"
+#include "cosim.h"
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -79,7 +80,13 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
 // header lets future format changes be detected.
 #define RTL_SAV_MAGIC   0x52544c53u  /* "RTLS" */
-#define RTL_SAV_VERSION 4u  /* v4: dropped Dma.pad[7] blob tail */
+/* v4: dropped Dma.pad[7] blob tail.
+ * v5: optional game-specific chunk appended after the snes_saveload blob
+ *     (RtlGameInfo.state_save_extra/state_load_extra) — e.g. MMX task-slot
+ *     resume contexts so a load can rebuild its scheduler fibers from any
+ *     game mode or a fresh process. v4 files still load (no chunk). */
+#define RTL_SAV_VERSION 5u
+#define RTL_SAV_VERSION_MIN 4u
 
 typedef struct FileSli {
   SaveLoadInfo base;
@@ -157,7 +164,136 @@ static void recomp_wram_trace_tick(void) {
     if ((frame % 30) == 0) fflush(log);
 }
 
+/* APU/SPC-RAM variant of the differential trace (co-sim step 1: audio hunt).
+ * Emits per-frame changed bytes of the full 64K SPC RAM (g_snes->apu->ram) in
+ * the SAME jsonl shape as the WRAM trace, so it aligns 1:1 against snesref's
+ * bsnes SPC-RAM trace (retro memory id 0x100) via align_diff.py --size 0x10000.
+ * The recomp runs a real SPC700 core (LakeSnes-derived apu/spc/dsp); only the
+ * IPL upload handshake is HLE'd, so apu->ram reflects the real uploaded SPC
+ * program plus the SPC700's runtime writes -- directly comparable to bsnes's
+ * dsp.apuram. Env-gated (SNESRECOMP_APURAM_TRACE_FILE), zero cost when off. */
+static void recomp_apuram_trace_tick(void) {
+    static int enabled = -1;
+    static FILE *log = NULL;
+    static unsigned char prev[0x10000];
+    static int primed = 0;
+    static unsigned frame = 0;
+    extern Snes *g_snes;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_APURAM_TRACE_FILE");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!g_snes || !g_snes->apu) return;
+    if (!log) {
+        log = fopen(getenv("SNESRECOMP_APURAM_TRACE_FILE"), "a");
+        if (!log) { enabled = 0; return; }
+    }
+    const unsigned char *ram = g_snes->apu->ram;
+    frame++;
+    if (!primed) {
+        for (int a = 0; a <= 0xffff; a++) {
+            prev[a] = ram[a];
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    frame, a, ram[a]);
+        }
+        primed = 1; return;
+    }
+    for (int a = 0; a <= 0xffff; a++) {
+        unsigned char v = ram[a];
+        if (v != prev[a]) {
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                    frame, a, prev[a], v);
+            prev[a] = v;
+        }
+    }
+    if ((frame % 30) == 0) fflush(log);
+}
+
+/* S-DSP register-file variant of the differential trace (co-sim audio hunt).
+ * Emits per-frame changed bytes of the 128-byte DSP register file
+ * (g_snes->apu->dsp->ram, the $00-$7F mirror incl. VxPITCHL/H, KON/KOFF, ADSR,
+ * echo). Same jsonl shape as the WRAM/APU-RAM traces => aligns 1:1 against
+ * snesref's bsnes DSP-reg trace (retro memory id 0x101) via align_diff.py
+ * --size 0x80. This is the state where "pitch" literally lives, so a persistent
+ * divergence here (esp. VxPITCH) localizes an off-pitch bug to driver-writes vs
+ * DSP synthesis. Env-gated (SNESRECOMP_DSPREG_TRACE_FILE). */
+static void recomp_dspreg_trace_tick(void) {
+    static int enabled = -1;
+    static FILE *log = NULL;
+    static unsigned char prev[0x80];
+    static int primed = 0;
+    static unsigned frame = 0;
+    extern Snes *g_snes;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_DSPREG_TRACE_FILE");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!g_snes || !g_snes->apu || !g_snes->apu->dsp) return;
+    if (!log) {
+        log = fopen(getenv("SNESRECOMP_DSPREG_TRACE_FILE"), "a");
+        if (!log) { enabled = 0; return; }
+    }
+    const unsigned char *r = g_snes->apu->dsp->ram;
+    frame++;
+    if (!primed) {
+        for (int a = 0; a < 0x80; a++) {
+            prev[a] = r[a];
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x00\",\"val\":\"0x%02x\"}\n",
+                    frame, a, r[a]);
+        }
+        primed = 1; return;
+    }
+    for (int a = 0; a < 0x80; a++) {
+        unsigned char v = r[a];
+        if (v != prev[a]) {
+            fprintf(log, "{\"f\":%u,\"adr\":\"0x%05x\",\"old\":\"0x%02x\",\"val\":\"0x%02x\"}\n",
+                    frame, a, prev[a], v);
+            prev[a] = v;
+        }
+    }
+    if ((frame % 30) == 0) fflush(log);
+}
+
+/* Native DSP output-stream capture (co-sim audio hunt). Reads the samples the
+ * S-DSP PRODUCED this frame straight from dsp->sampleBuffer (the always-on ring,
+ * per CLAUDE.md ring-buffer rule) using the monotonic sampleWrite counter, and
+ * appends them as raw s16 stereo PCM (~32040 Hz, pre-host-resample) — the exact
+ * game-agnostic audio the recomp generates, to align against bsnes's
+ * BSNES_COSIM_DSPOUT stream. Env-gated (SNESRECOMP_DSPOUT). */
+static void recomp_dspout_capture(void) {
+    static int enabled = -1;
+    static FILE *f = NULL;
+    static uint32_t prev_write = 0;
+    static int primed = 0;
+    extern Snes *g_snes;
+    if (enabled < 0) {
+        const char *p = getenv("SNESRECOMP_DSPOUT");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return;
+    if (!g_snes || !g_snes->apu || !g_snes->apu->dsp) return;
+    if (!f) { f = fopen(getenv("SNESRECOMP_DSPOUT"), "wb"); if (!f) { enabled = 0; return; } }
+    Dsp *dsp = g_snes->apu->dsp;
+    uint32_t w = dsp->sampleWrite;
+    if (!primed) { prev_write = w; primed = 1; return; }
+    for (uint32_t s = prev_write; s != w; s++) {
+        uint32_t idx = (s & (DSP_SAMPLE_RING - 1)) * 2;
+        int16 pair[2] = { dsp->sampleBuffer[idx], dsp->sampleBuffer[idx + 1] };
+        fwrite(pair, sizeof(int16), 2, f);
+    }
+    prev_write = w;
+}
+
 bool RtlRunFrame(uint32 inputs) {
+#ifdef SNES_COSIM
+  /* Co-sim (dev/diagnostics only): connect the coordinator once, before the
+   * first frame executes. Boot ran deterministically already; the co-sim
+   * compares from frame 1 onward. */
+  { static int s_cosim_started = 0;
+    if (!s_cosim_started) { s_cosim_started = 1; cosim_init(); } }
+#endif
   // Avoid up/down and left/right from being pressed at the same time
   if ((inputs & 0x30) == 0x30) inputs ^= 0x30;
   if ((inputs & 0xc0) == 0xc0) inputs ^= 0xc0;
@@ -176,6 +312,49 @@ bool RtlRunFrame(uint32 inputs) {
   if (setjmp(g_watchdog_jmp) == 0) {
     g_rtl_game_info->run_frame();
   }
+#ifdef SNES_COSIM
+  /* DETERMINISTIC AUDIO CONSUMER (SNES_COSIM_AUDIO=1). Production pins SPC tempo
+   * to the audio device's consumption rate: RtlRenderAudio cycles the SPC only
+   * for the shortfall, then drains a block — so the *consumer* sets the rate.
+   * Headless has no audio thread, so the SPC starves (~40x slow). Here we MODEL
+   * the consumer deterministically: drain one frame of samples at the exact SNES
+   * rate (32040 / 60.0988 = 533.12 samples/frame). This paces the SPC to the
+   * correct tempo, reproduces the producer(CPU-catchup)/consumer(this) dynamics
+   * incl. any ring drops, and stays fully deterministic (no host thread). The
+   * dev dump's samples= then reflects real production audio behaviour. */
+  {
+    static int s_audio = -1;
+    if (s_audio < 0) { const char *e = getenv("SNES_COSIM_AUDIO");
+                       s_audio = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    if (s_audio) {
+      static double s_acc = 0.0;
+      static int16 s_buf[1024 * 2];
+      s_acc += 32040.0 / 60.0988;           /* SNES native audio samples per frame */
+      int want = (int)s_acc; s_acc -= (double)want;
+      while (want > 0) {
+        int chunk = want > 1024 ? 1024 : want;
+        RtlRenderAudio(s_buf, chunk, 2);     /* self-balances SPC production to demand */
+        want -= chunk;
+      }
+    }
+  }
+#endif
+#ifdef SNES_COSIM
+  /* Co-sim fidelity (env-gated for A/B): production's main loop calls
+   * draw_ppu_frame() AFTER run_frame() every frame — PPU line render + HDMA +
+   * raster-IRQ simulation. The headless harness omits it, so the raster IRQ
+   * never fires and IRQ-managed guest state diverges from the oracle (e.g. MMX's
+   * $0BA0 raster-ack flag stays governed only by the bootstrap clear). Running it
+   * here makes the co-sim model the full production frame; the per-frame trace/
+   * hash below then capture post-IRQ state, matching bsnes's frame boundary. */
+  { static int s_draw = -1;
+    if (s_draw < 0) { const char *e = getenv("SNES_COSIM_DRAW_PPU");
+                      /* Default ON (faithful full production frame); opt-out with =0. */
+                      s_draw = (e && e[0] == '0') ? 0 : 1; }
+    if (s_draw && g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+      g_rtl_game_info->draw_ppu_frame();
+  }
+#endif
   // If g_watchdog_tripped is set, frame was abandoned mid-execution;
   // continue to the next frame so the user can interrupt cleanly.
   if (g_framedump_callback)
@@ -190,12 +369,20 @@ bool RtlRunFrame(uint32 inputs) {
   ppudma_frame_snapshot(snes_frame_counter);
 
   recomp_wram_trace_tick();   /* differential first-divergence trace (env-gated) */
+  recomp_apuram_trace_tick(); /* APU/SPC-RAM differential trace (audio hunt, env-gated) */
+  recomp_dspreg_trace_tick(); /* S-DSP register-file differential trace (env-gated) */
+  recomp_dspout_capture();    /* native DSP output-stream capture (env-gated) */
 
   /* Axis-7 determinism fingerprint: hash the full WRAM for this frame. */
   g_fp_ring[snes_frame_counter & (FP_RING - 1)] = fp_fnv1a(g_ram, sizeof(g_ram));
   g_fp_max_frame = (uint64_t)snes_frame_counter;
 
   snes_frame_counter++;
+
+#ifdef SNES_COSIM
+  /* Frame-keyed checkpoint: snapshot full state + park for the coordinator. */
+  cosim_frame();
+#endif
 
   /* Axis-2 soak instrumentation: env-gated FPS heartbeat to stderr. Counts
    * frames completed per wall-clock second (the frame loop caps at ~60 fps, so
@@ -229,6 +416,10 @@ void RtlSaveSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, true, false };
   snes_saveload(g_snes, &fs.base);
+  /* v5: game-specific chunk (task-slot resume contexts etc.). Streamed
+   * through the same FileSli so the format stays one linear blob. */
+  if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
+    g_rtl_game_info->state_save_extra(&fs.base);
   RtlApuUnlock();
   if (fs.error) printf("Save write error: %s\n", filename);
   fclose(f);
@@ -240,7 +431,8 @@ bool RtlLoadSnapshot(const char *filename) {
     return false;
   uint32 hdr[2];
   if (fread(hdr, sizeof(hdr), 1, f) != 1
-      || hdr[0] != RTL_SAV_MAGIC || hdr[1] != RTL_SAV_VERSION) {
+      || hdr[0] != RTL_SAV_MAGIC
+      || hdr[1] < RTL_SAV_VERSION_MIN || hdr[1] > RTL_SAV_VERSION) {
     printf("Save file %s: bad magic/version (legacy StateRecorder format no longer supported)\n", filename);
     fclose(f);
     return false;
@@ -248,12 +440,22 @@ bool RtlLoadSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, false, false };
   snes_saveload(g_snes, &fs.base);
+  /* v5+: game-specific chunk follows the guest blob. v4 files have none —
+   * the game's on_state_loaded hook (below) is told the version so it can
+   * fall back to legacy same-mode behavior. */
+  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra)
+    g_rtl_game_info->state_load_extra(&fs.base, hdr[1]);
   RtlApuUnlock();
   fclose(f);
   if (fs.error) {
     printf("Save read error: %s\n", filename);
     return false;
   }
+  /* Post-load reconciliation: host-side execution state (fibers, HLE
+   * scheduler bookkeeping) cannot live in the guest snapshot; give the
+   * game one hook to rebuild it against the freshly restored WRAM. */
+  if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
+    g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
 }
 
@@ -457,6 +659,26 @@ uint8 *IndirPtr_Slow(LongPtr ptr, uint16 offs) {
 // Public so snes.c's snes_readBBus (the APU read path) can use the same
 // pacing -- both reads and writes need to advance APU.
 void rtl_accumulate_apu_catchup(void) {
+#ifdef SNES_COSIM
+  /* Co-sim A-vs-B variable-under-test (SNES_COSIM.md task 9): with
+   * SNES_COSIM_ACCURATE_APU=1, pace the SPC from the region-weighted master
+   * clock at the true SPC:master ratio (exactly like the interp816 ref),
+   * instead of the +256/APU-touch synthetic estimate. Two recomp instances
+   * that boot IDENTICALLY and differ ONLY in this pacing choice stay
+   * bit-identical until synthetic pacing first yields a different APU value —
+   * the off-cue's first observable effect, cleanly localized. Cached once. */
+  static int s_accurate = -1;
+  if (s_accurate < 0) { const char *e = getenv("SNES_COSIM_ACCURATE_APU");
+                        s_accurate = (e && e[0] && e[0] != '0') ? 1 : 0; }
+  if (s_accurate) {
+    static const double kApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 60.0);
+    uint64_t md = g_cpu.master_cycles - g_apu_last_sync_master;
+    g_apu_last_sync_master = g_cpu.master_cycles;
+    g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;   /* keep sync ptr current */
+    g_snes->apuCatchupCycles += (double)md * kApuPerMaster;
+    return;
+  }
+#endif
   // NOTE (Axis-5 off-cue experiment, 2026-06-28): pacing the SPC from the
   // recompiler's region-weighted MASTER-clock accumulator (g_cpu.master_cycles,
   // = sum of CPU cycles x code-region speed) was tried here in place of the
@@ -474,6 +696,21 @@ void rtl_accumulate_apu_catchup(void) {
   // 2/7 is about 1/3.5 (main MHz / APU MHz). Floor of zero is fine -- short deltas
   // (back-to-back APU touches with no block hooks between them) just don't
   // advance APU on this pass; cycles accumulate for the next touch.
+  /* DIAGNOSTIC OVERRIDE (audio hunt, env-gated): rescale the per-touch credit.
+   * The estimate charges 256 master cycles per HW touch, but a tight APU poll
+   * loop's real period is ~15-25 cycles — an over-credit of >10x that balloons
+   * SPC time during port-heavy phases (boot/stage-load uploads measured 17-45x
+   * realtime, 220s of APU audio discarded at the output ring). Set
+   * SNESRECOMP_APU_TOUCH_CYCLES=20 to charge ~20 master cycles per touch. */
+  {
+    static double s_touch_scale = -1.0;
+    if (s_touch_scale < 0.0) {
+      const char *e = getenv("SNESRECOMP_APU_TOUCH_CYCLES");
+      s_touch_scale = (e && e[0]) ? (atof(e) / 256.0) : 1.0;
+      if (s_touch_scale <= 0.0) s_touch_scale = 1.0;
+    }
+    delta = (uint64_t)((double)delta * s_touch_scale);
+  }
   g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
   // Keep the master sync pointer current so the (now inert) accumulator's delta
   // never balloons if a future change re-enables master-clock pacing.
@@ -494,6 +731,9 @@ void rtl_accumulate_apu_catchup(void) {
     static uint32_t last_sample_read;
     static uint64_t consume_seen_ms, wall_last_ms;
     Dsp *dsp = g_snes->apu->dsp;
+    /* audio_trace_wall_ms() is a deterministic virtual clock under SNES_COSIM
+     * (see audio_trace.c) — routes this baseline through the same source as the
+     * port-write scheduler, so the whole APU-pacing path is deterministic. */
     uint64_t now_ms = audio_trace_wall_ms();
     uint32_t rd = dsp->sampleRead;
     if (rd != last_sample_read) {
@@ -566,6 +806,23 @@ void RtlApuWrite(uint16 adr, uint8 val) {
     static uint64_t s_port_last_target[4];
     static uint8_t  s_port_last_val[4];
     static uint8_t  s_port_last_valid[4];
+    /* DIAGNOSTIC OVERRIDE (audio hunt, env-gated): apply port writes at the
+     * produced clock immediately — hardware-like microsecond visibility —
+     * bypassing the wall-ns spacing and the min-dwell floor. For A/B-ing
+     * whether the ~1-frame scheduled apply latency is what corrupts
+     * handshake-protocol drivers (MMX ack round-trips). Off = shipping path. */
+    static int s_immediate = -1;
+    if (s_immediate < 0) {
+      const char *e = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
+      s_immediate = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (s_immediate) {
+      uint64_t produced_now, consumed_now;
+      audio_trace_sample_clocks(&produced_now, &consumed_now);
+      apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
+      RtlApuUnlock();
+      return;
+    }
     uint64_t quantum = audio_trace_consume_quantum();
     uint64_t now_ns = audio_trace_wall_ns();
     uint64_t produced, consumed;

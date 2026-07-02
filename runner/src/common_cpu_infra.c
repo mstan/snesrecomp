@@ -400,6 +400,43 @@ void WatchdogFrameStart(void) {
 
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
+#ifdef SNES_COSIM
+  /* Co-sim WRAM watchpoint (dev, env-gated): name the recompiled function that
+   * writes a given low-WRAM address. WatchdogCheck runs per-block with
+   * g_last_recomp_func = the live current function, so a change first observed
+   * here is attributed to the function whose block just ran. Set
+   * SNESRECOMP_WRAM_WATCH=0xADDR (e.g. 0x02fa). Zero cost when unset. */
+  {
+    static int watch = -2;          /* -2 unresolved, -1 off, else addr */
+    static uint8_t last; static int primed = 0; static int hits = 0;
+    static FILE *wlog = NULL;
+    if (watch == -2) {
+      const char *e = getenv("SNESRECOMP_WRAM_WATCH");
+      watch = (e && e[0]) ? (int)strtol(e, NULL, 0) : -1;
+      if (watch >= 0) {
+        const char *lp = getenv("SNESRECOMP_WRAM_WATCH_LOG");
+        wlog = fopen(lp && lp[0] ? lp : "wramwatch.log", "w");
+        if (wlog) { fprintf(wlog, "[wramwatch] armed on $%04x\n", watch); fflush(wlog); }
+      }
+    }
+    if (watch >= 0 && wlog) {
+      uint8_t v = g_ram[watch];
+      if (!primed) {
+        last = v; primed = 1;
+        fprintf(wlog, "[wramwatch] primed f%d $%04x = %02x  (at %s)\n",
+                snes_frame_counter, watch, v, g_last_recomp_func); fflush(wlog);
+      } else if (v != last) {
+        if (hits < 300) {
+          fprintf(wlog, "[wramwatch] f%d $%04x: %02x -> %02x  by %s  (m=%d x=%d)\n",
+                  snes_frame_counter, watch, last, v, g_last_recomp_func,
+                  g_cpu.m_flag & 1, g_cpu.x_flag & 1);
+          fflush(wlog);
+        }
+        hits++; last = v;
+      }
+    }
+  }
+#endif
   /* Boot-spin observability. During boot (frame 0) the normal frame
    * watchdog is disabled below (the SPC IPL upload is legitimately slow,
    * real-time paced by the audio thread). But a genuine boot spin

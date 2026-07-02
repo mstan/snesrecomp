@@ -3523,6 +3523,21 @@ static void cmd_loadstate(const char *args) {
     send_fmt("{\"ok\":true,\"loading_slot\":%d}", slot);
 }
 
+/* savestate <slot> — snapshot the RtlSaveLoad slot from the main thread on
+ * the next frame boundary (same handoff pattern as loadstate; the network
+ * thread must never walk live state itself). */
+static volatile int s_pending_savestate = -1;
+static void cmd_savestate(const char *args) {
+    int slot = 0;
+    if (args[0]) sscanf(args, "%d", &slot);
+    if (slot < 0 || slot > 9) {
+        send_fmt("{\"error\":\"slot must be 0-9\"}");
+        return;
+    }
+    s_pending_savestate = slot;
+    send_fmt("{\"ok\":true,\"saving_slot\":%d}", slot);
+}
+
 // ---- L3 harness: synchronous save_state / load_state ----
 // Minimal snapshot — serializes full SNES state (CPU/PPU/DMA/APU/cart/WRAM)
 // via snes_saveload to a raw binary file. No replay log, no state-recorder
@@ -6727,6 +6742,82 @@ static void cmd_cyc_ring(const char *args) {
              (unsigned long long)total);
 }
 
+/* spc_dump <path> — snapshot the live APU as a standard .spc file (64K ARAM +
+ * 128 DSP regs + SPC700 regs + synthesized $F0-$FF IO region). The snapshot is
+ * an independent-oracle handoff: render it offline with a known-good SPC+DSP
+ * core (blargg snes_spc / bsnes) and diff that audio against the recomp's own
+ * DSP output over the same window — divergence localizes a synthesis bug,
+ * agreement pushes the hunt to CPU->APU command traffic / host output. */
+static void cmd_spc_dump(const char *args) {
+    char path[512] = {0};
+    if (sscanf(args, "%511s", path) < 1 || !path[0]) {
+        send_fmt("{\"error\":\"usage: spc_dump <path>\"}");
+        return;
+    }
+    if (!g_snes || !g_snes->apu || !g_snes->apu->spc || !g_snes->apu->dsp) {
+        send_fmt("{\"error\":\"apu not initialized\"}");
+        return;
+    }
+    static uint8_t img[0x10200];
+    void RtlApuLock(void); void RtlApuUnlock(void);
+    RtlApuLock();
+    Apu *apu = g_snes->apu;
+    Spc *spc = apu->spc;
+    memset(img, 0, sizeof(img));
+    memcpy(img, "SNES-SPC700 Sound File Data v0.30", 33);
+    img[0x21] = 26; img[0x22] = 26;
+    img[0x23] = 27;              /* no ID666 tags */
+    img[0x24] = 30;              /* minor version */
+    img[0x25] = (uint8_t)(spc->pc & 0xff);
+    img[0x26] = (uint8_t)(spc->pc >> 8);
+    img[0x27] = spc->a;
+    img[0x28] = spc->x;
+    img[0x29] = spc->y;
+    img[0x2a] = (uint8_t)((spc->n << 7) | (spc->v << 6) | (spc->p << 5) |
+                          (spc->b << 4) | (spc->h << 3) | (spc->i << 2) |
+                          (spc->z << 1) | (spc->c << 0));
+    img[0x2b] = spc->sp;
+    memcpy(img + 0x100, apu->ram, 0x10000);
+    /* $F0-$FF: LakeSnes keeps IO state in struct fields, not ram[] — the ram
+     * bytes there are stale. Synthesize the region a reference player reads. */
+    uint8_t *io = img + 0x100 + 0xf0;
+    io[0x0] = 0x0a;                      /* TEST: power-on default */
+    io[0x1] = (uint8_t)((apu->timer[0].enabled ? 0x01 : 0) |
+                        (apu->timer[1].enabled ? 0x02 : 0) |
+                        (apu->timer[2].enabled ? 0x04 : 0) |
+                        (apu->romReadable ? 0x80 : 0));
+    io[0x2] = apu->dspAdr;
+    io[0x3] = apu->dsp->ram[apu->dspAdr & 0x7f];
+    io[0x4] = apu->inPorts[0];           /* CPUIO as the SPC sees them */
+    io[0x5] = apu->inPorts[1];
+    io[0x6] = apu->inPorts[2];
+    io[0x7] = apu->inPorts[3];
+    io[0x8] = apu->inPorts[4];           /* $F8/$F9 plain RAM */
+    io[0x9] = apu->inPorts[5];
+    io[0xa] = apu->timer[0].target;
+    io[0xb] = apu->timer[1].target;
+    io[0xc] = apu->timer[2].target;
+    io[0xd] = (uint8_t)(apu->timer[0].counter & 0xf);
+    io[0xe] = (uint8_t)(apu->timer[1].counter & 0xf);
+    io[0xf] = (uint8_t)(apu->timer[2].counter & 0xf);
+    memcpy(img + 0x10100, apu->dsp->ram, 0x80);
+    uint64_t produced, consumed;
+    audio_trace_sample_clocks(&produced, &consumed);
+    RtlApuUnlock();
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_fmt("{\"error\":\"cannot write %s\"}", path); return; }
+    size_t wr = fwrite(img, 1, sizeof(img), f);
+    fclose(f);
+    if (wr != sizeof(img)) {
+        send_fmt("{\"error\":\"short write %s\"}", path);
+        return;
+    }
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"pc\":\"0x%04x\","
+             "\"produced\":%llu,\"consumed\":%llu}",
+             path, spc->pc, (unsigned long long)produced,
+             (unsigned long long)consumed);
+}
+
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
     {"cyc_anchor",       cmd_cyc_anchor},
@@ -6736,6 +6827,7 @@ static const CmdEntry s_commands[] = {
     {"audio_stats",   cmd_audio_stats},
     {"audio_events",  cmd_audio_events},
     {"audio_wav",     cmd_audio_wav},
+    {"spc_dump",      cmd_spc_dump},
     {"audio_shadow_div", cmd_audio_shadow_div},
     {"ping",          cmd_ping},
     {"oam_state",      cmd_oam_state},
@@ -6823,6 +6915,7 @@ static const CmdEntry s_commands[] = {
     {"func_snap_get_n", cmd_func_snap_get_n},
     {"run_to_frame",  cmd_run_to_frame},
     {"loadstate",     cmd_loadstate},
+    {"savestate",     cmd_savestate},
     {"save_state",    cmd_save_state},
     {"load_state",    cmd_load_state},
     {"invoke_recomp", cmd_invoke_recomp},
@@ -7271,6 +7364,13 @@ int debug_server_consume_loadstate(void) {
     int slot = s_pending_loadstate;
     if (slot >= 0)
         s_pending_loadstate = -1;
+    return slot;
+}
+
+int debug_server_consume_savestate(void) {
+    int slot = s_pending_savestate;
+    if (slot >= 0)
+        s_pending_savestate = -1;
     return slot;
 }
 

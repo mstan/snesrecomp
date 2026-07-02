@@ -58,6 +58,9 @@ void debug_server_on_trace_block(CpuState *cpu, uint32_t pc24);
 // Consumes the request (only returns it once).
 int debug_server_consume_loadstate(void);
 
+// Same handoff for a TCP-requested savestate (savestate <slot> command).
+int debug_server_consume_savestate(void);
+
 // TCP controller override. The returned input mask uses the runner's
 // controller layout: player 1 in bits 0..11, player 2 in bits 12..23.
 // The active mask is already shifted into the high controller-present bits.
@@ -119,6 +122,7 @@ static inline void debug_server_start_paused(void) { }
 static inline void debug_server_wait_if_paused(void) { }
 static inline void debug_server_on_trace_block(void *cpu, uint32_t pc24) { (void)cpu; (void)pc24; }
 static inline int debug_server_consume_loadstate(void) { return -1; }
+static inline int debug_server_consume_savestate(void) { return -1; }
 static inline uint32_t debug_server_get_controller_inputs(void) { return 0; }
 static inline uint32_t debug_server_get_controller_active_mask(void) { return 0; }
 static inline void debug_server_record_frame(int frame) { (void)frame; }
