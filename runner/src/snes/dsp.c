@@ -59,7 +59,7 @@ const uint16_t gaussValues[512] = {
 
 static void dsp_cycleChannel(Dsp* dsp, int ch);
 static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR);
-static void dsp_handleGain(Dsp* dsp, int ch);
+static void dsp_handleGain(Dsp* dsp, int ch, bool liveGain);
 static void dsp_decodeBrr(Dsp* dsp, int ch);
 /* dsp_getSample is declared non-static in dsp.h (dev faithful reference uses it). */
 static void dsp_handleNoise(Dsp* dsp);
@@ -294,7 +294,10 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
       dsp->channel[ch].decodeOffset |= dsp->apu_ram[(samplePointer + 1) & 0xffff] << 8;
       memset(dsp->channel[ch].decodeBuffer, 0, sizeof(dsp->channel[ch].decodeBuffer));
       dsp->channel[ch].gain = 0;
-      dsp->channel[ch].adsrState = dsp->channel[ch].useGain ? 3 : 0;
+      // Key-on always enters the ATTACK stage; whether the envelope VALUE
+      // follows ADSR or the GAIN program is decided live per tick (the
+      // stage machine is source-independent — see dsp_handleGain).
+      dsp->channel[ch].adsrState = 0;
     }
   }
   // handle reset
@@ -302,15 +305,37 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
     dsp->channel[ch].adsrState = 4;
     dsp->channel[ch].gain = 0;
   }
-  // handle envelope/adsr
-  bool doingDirectGain = dsp->channel[ch].adsrState != 4 && dsp->channel[ch].useGain && dsp->channel[ch].directGain;
-  uint16_t rate = dsp->channel[ch].adsrState == 4 ? 0 : dsp->channel[ch].adsrRates[dsp->channel[ch].adsrState];
-  if(dsp->channel[ch].adsrState != 4 && !doingDirectGain && rate != 0) {
+  // Envelope. The SOURCE (ADSR vs GAIN) is re-read from the live register
+  // state on EVERY tick — hardware behavior (bsnes/blargg run_envelope).
+  // The Capcom driver's standard note-off is a mid-note source switch:
+  // clear ADSR1.7 with GAIN preloaded to an exponential decrease, letting
+  // the note fade on the GAIN program. The previous code latched the
+  // source into adsrState at key-on only, so such voices stayed in
+  // ADSR-sustain (often rate 0 = frozen envelope) and sustained FOREVER —
+  // MMX issue #4's "stuck note". The adsrState value now tracks only the
+  // ADSR STAGE (0 attack / 1 decay / 2 sustain / 4 release); stage
+  // transitions keep running under GAIN so a switch back to ADSR resumes
+  // in the right stage. (Legacy state 3 from old savestates is treated
+  // as sustain; its voices necessarily have useGain set.)
+  bool releasing = dsp->channel[ch].adsrState == 4;
+  bool liveGain = !releasing && dsp->channel[ch].useGain;
+  bool doingDirectGain = liveGain && dsp->channel[ch].directGain;
+  uint16_t rate;
+  if(releasing) {
+    rate = 0;
+  } else if(liveGain) {
+    rate = doingDirectGain ? 0 : dsp->channel[ch].adsrRates[3];
+  } else {
+    int stage = dsp->channel[ch].adsrState;
+    if(stage > 2) stage = 2;
+    rate = dsp->channel[ch].adsrRates[stage];
+  }
+  if(!releasing && !doingDirectGain && rate != 0) {
     dsp->channel[ch].rateCounter++;
   }
-  if(dsp->channel[ch].adsrState == 4 || (!doingDirectGain && dsp->channel[ch].rateCounter >= rate && rate != 0)) {
-    if(dsp->channel[ch].adsrState != 4) dsp->channel[ch].rateCounter = 0;
-    dsp_handleGain(dsp, ch);
+  if(releasing || (!doingDirectGain && dsp->channel[ch].rateCounter >= rate && rate != 0)) {
+    if(!releasing) dsp->channel[ch].rateCounter = 0;
+    dsp_handleGain(dsp, ch, liveGain);
   }
   if(doingDirectGain) dsp->channel[ch].gain = dsp->channel[ch].gainValue;
   // set outputs
@@ -320,55 +345,64 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   dsp->channel[ch].sampleOut = sample;
 }
 
-static void dsp_handleGain(Dsp* dsp, int ch) {
-  switch(dsp->channel[ch].adsrState) {
-    case 0: { // attack
-      uint16_t rate = dsp->channel[ch].adsrRates[dsp->channel[ch].adsrState];
-      dsp->channel[ch].gain += rate == 1 ? 1024 : 32;
-      if(dsp->channel[ch].gain >= 0x7e0) dsp->channel[ch].adsrState = 1;
-      if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
-      break;
-    }
-    case 1: { // decay
-      dsp->channel[ch].gain -= ((dsp->channel[ch].gain - 1) >> 8) + 1;
-      if(dsp->channel[ch].gain < dsp->channel[ch].sustainLevel) dsp->channel[ch].adsrState = 2;
-      break;
-    }
-    case 2: { // sustain
-      dsp->channel[ch].gain -= ((dsp->channel[ch].gain - 1) >> 8) + 1;
-      break;
-    }
-    case 3: { // gain
-      switch(dsp->channel[ch].gainMode) {
-        case 0: { // linear decrease
-          dsp->channel[ch].gain -= 32;
-          // decreasing below 0 will underflow to above 0x7ff
-          if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0;
-          break;
-        }
-        case 1: { // exponential decrease
-          dsp->channel[ch].gain -= ((dsp->channel[ch].gain - 1) >> 8) + 1;
-          break;
-        }
-        case 2: { // linear increase
-          dsp->channel[ch].gain += 32;
-          if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
-          break;
-        }
-        case 3: { // bent increase
-          dsp->channel[ch].gain += dsp->channel[ch].gain < 0x600 ? 32 : 8;
-          if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
-          break;
-        }
+static void dsp_handleGain(Dsp* dsp, int ch, bool liveGain) {
+  if(dsp->channel[ch].adsrState == 4) { // release
+    dsp->channel[ch].gain -= 8;
+    // decreasing below 0 will underflow to above 0x7ff
+    if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0;
+    return;
+  }
+  if(liveGain) {
+    // GAIN custom program (ADSR1.7 clear, GAIN.7 set) — read live each tick.
+    switch(dsp->channel[ch].gainMode) {
+      case 0: { // linear decrease
+        dsp->channel[ch].gain -= 32;
+        // decreasing below 0 will underflow to above 0x7ff
+        if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0;
+        break;
       }
-      break;
+      case 1: { // exponential decrease
+        dsp->channel[ch].gain -= ((dsp->channel[ch].gain - 1) >> 8) + 1;
+        break;
+      }
+      case 2: { // linear increase
+        dsp->channel[ch].gain += 32;
+        if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
+        break;
+      }
+      case 3: { // bent increase
+        dsp->channel[ch].gain += dsp->channel[ch].gain < 0x600 ? 32 : 8;
+        if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
+        break;
+      }
     }
-    case 4: { // release
-      dsp->channel[ch].gain -= 8;
-      // decreasing below 0 will underflow to above 0x7ff
-      if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0;
-      break;
+  } else {
+    switch(dsp->channel[ch].adsrState) {
+      case 0: { // attack
+        uint16_t rate = dsp->channel[ch].adsrRates[0];
+        dsp->channel[ch].gain += rate == 1 ? 1024 : 32;
+        if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
+        break;
+      }
+      case 1: { // decay
+        dsp->channel[ch].gain -= ((dsp->channel[ch].gain - 1) >> 8) + 1;
+        break;
+      }
+      default: { // sustain (incl. legacy state 3 from old savestates)
+        dsp->channel[ch].gain -= ((dsp->channel[ch].gain - 1) >> 8) + 1;
+        break;
+      }
     }
+  }
+  // ADSR STAGE transitions run under BOTH sources (hardware: the stage
+  // machine keeps tracking the envelope level even while GAIN drives it,
+  // so flipping back to ADSR mid-note resumes in the right stage).
+  if(dsp->channel[ch].adsrState == 0 && dsp->channel[ch].gain >= 0x7e0) {
+    dsp->channel[ch].adsrState = 1;
+    if(dsp->channel[ch].gain > 0x7ff) dsp->channel[ch].gain = 0x7ff;
+  } else if(dsp->channel[ch].adsrState == 1 &&
+            dsp->channel[ch].gain < dsp->channel[ch].sustainLevel) {
+    dsp->channel[ch].adsrState = 2;
   }
 }
 
