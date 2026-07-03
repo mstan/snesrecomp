@@ -42,6 +42,20 @@ static const double kInterpApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 6
  * AOT bounce. Game-thread only (like the interp itself); nesting shares the
  * accumulator safely because flushing early is always correct. */
 static uint64_t s_apu_pending_master = 0;
+/* Master-cycle threshold below which the pre-AOT-bounce flush is skipped (see
+ * the bounce site). 4096 (~1 output sample of SPC time) matches the periodic
+ * batch-flush threshold. Env override SNESRECOMP_LLE_APU_FLUSH_THRESH is a
+ * diagnostic lever: 0 restores the old flush-EVERY-bounce behavior. Cached
+ * once. */
+static uint64_t bridge_bounce_flush_thresh(void) {
+    static int64_t s_t = -1;
+    if (s_t < 0) {
+        const char *e = getenv("SNESRECOMP_LLE_APU_FLUSH_THRESH");
+        s_t = (e && e[0]) ? (int64_t)strtoll(e, NULL, 0) : 4096;
+        if (s_t < 0) s_t = 0;
+    }
+    return (uint64_t)s_t;
+}
 static void bridge_apu_flush(CpuState *cpu) {
     if (!s_apu_pending_master) return;
     RtlApuLock();
@@ -464,7 +478,27 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                  * the per-touch catch-up for its duration, then restore the
                  * PRE-CALL value (not literal 1 — under the co-sim shared APU
                  * clock the flag is 0 for the whole bridge run and must stay 0). */
-                bridge_apu_flush(cpu);   /* compiled body must see a current SPC */
+                /* Optimization (NOT the turbo-wedge fix — that is the raster-IRQ
+                 * decoupling in the game main loop): bring the SPC roughly current
+                 * for the compiled body without taking the APU lock on every
+                 * bounce. Yield-mode rich-LLE bounces fire thousands of times per
+                 * frame (scheduler tick → compiled task body → yield → repeat); an
+                 * unconditional flush here is RtlApuLock + a real snes_catchupApu
+                 * against the audio thread EVERY bounce — redundant lock traffic in
+                 * the same contention class as the fixed per-opcode-lock crawl.
+                 * Flush only once the interp has banked ~one output sample of
+                 * pending SPC time (>= 4096 master, the same threshold the periodic
+                 * batch flush at the accumulate site uses); below that the
+                 * staleness the body sees is < 1 sample and its own first port
+                 * touch (rtl_accumulate_apu_catchup) closes it. Interp APU-port
+                 * accesses still flush unconditionally (bridge_bus_*), so the
+                 * correctness-critical upload/handshake reads stay exact. The
+                 * pending is a static that persists across the bounce, so no SPC
+                 * time is dropped — only deferred to the next real flush. (No-op
+                 * under SNES_COSIM_APU_SHARED: pending never accumulates there, so
+                 * the co-sim gates are unaffected.) */
+                if (s_apu_pending_master >= bridge_bounce_flush_thresh())
+                    bridge_apu_flush(cpu);
                 int _apu_drv = g_interp_apu_driving;
                 g_interp_apu_driving = 0;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
