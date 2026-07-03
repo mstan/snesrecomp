@@ -18,7 +18,7 @@ set(SMW_ROOT "${SNESRECOMP_ROOT}/../SuperMarioWorldRecomp" CACHE PATH "SMW game 
 # MMX co-sim builds from the LLE worktree (feat/scheduler-lle-tier), which carries
 # the swappable HLE/LLE scheduler toggle (SNESRECOMP_MMX_SCHED_LLE); its gen banks
 # are junctioned from the canonical MegamanXRecomp checkout (which stays on main).
-set(MMX_ROOT "${SNESRECOMP_ROOT}/../_wt_mmx_lle" CACHE PATH "MMX game repo (LLE worktree)")
+set(MMX_ROOT "${SNESRECOMP_ROOT}/../MegamanXRecomp" CACHE PATH "MMX game repo (canonical checkout)")
 
 set(SNES_COSIM ON CACHE BOOL "" FORCE)          # pull cosim.c/cosim_state.c + ws2_32
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
@@ -196,6 +196,7 @@ target_compile_definitions(rmx_cosim PRIVATE
     SDL_MAIN_HANDLED
     MMX_VARIANT_JP=1
     MMX_SCHED_LLE_DEFAULT=1
+    SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT=1
 )
 find_package(SDL2 QUIET)
 if(SDL2_INCLUDE_DIRS)
