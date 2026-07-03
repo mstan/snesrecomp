@@ -76,6 +76,8 @@ void cosim_state_dump_dev(char *buf, size_t n);
  * 24-bit BMP. Read-only (no re-render) so parked state stays unperturbed.
  * Returns 0 on success. */
 int cosim_state_dump_fb(const char *path);
+/* Raw 128 KiB WRAM image (dumpram <path>); read-only, parked-safe. */
+int cosim_state_dump_ram(const char *path);
 
 #endif /* SNES_COSIM */
 #endif /* COSIM_STATE_H */

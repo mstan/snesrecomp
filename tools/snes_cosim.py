@@ -138,6 +138,51 @@ def step_subset(side, keys):
     return int(d["cp"]), sig
 
 
+def _host_path(p):
+    """MSYS python cwd is POSIX (/f/...); the guest exe's fopen needs F:/..."""
+    p = os.path.abspath(p).replace("\\", "/")
+    parts = p.split("/")
+    if p.startswith("/") and len(parts) > 2 and len(parts[1]) == 1:
+        return parts[1].upper() + ":/" + "/".join(parts[2:])
+    return p
+
+
+def parse_ram_mask(spec):
+    """'0x02FF,0x1F00-0x1F0F' -> set of WRAM offsets."""
+    mask = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            lo, hi = tok.split("-", 1)
+            mask.update(range(int(lo, 0), int(hi, 0) + 1))
+        else:
+            mask.add(int(tok, 0))
+    return mask
+
+
+def ram_divergence_masked(a, b, keys, siga, sigb, mask):
+    """True iff the divergence is confined to `ram` AND a byte-level dumpram
+    diff shows every differing WRAM offset inside `mask`. Never a blind
+    waiver: the byte diff is re-verified on every occurrence. Returns
+    (masked: bool, diff_offsets: list)."""
+    split = [k for k, va, vb in zip(keys, siga.split("|"), sigb.split("|"))
+             if va != vb]
+    if split != ["ram"]:
+        return False, []
+    pa = _host_path("cosim_maskchk_A.bin")
+    pb = _host_path("cosim_maskchk_B.bin")
+    ra = a.cmd(f"dumpram {pa}")
+    rb = b.cmd(f"dumpram {pb}")
+    if not (ra.startswith("ok") and rb.startswith("ok")):
+        return False, []
+    da = open("cosim_maskchk_A.bin", "rb").read()
+    db = open("cosim_maskchk_B.bin", "rb").read()
+    diffs = [i for i in range(min(len(da), len(db))) if da[i] != db[i]]
+    return (len(diffs) > 0 and all(i in mask for i in diffs)), diffs
+
+
 def report_divergence(a, b, cp):
     print(f"\n=== FIRST DIVERGENCE at checkpoint {cp} ===")
     sa, sb = kv(a.cmd("sub")), kv(b.cmd("sub"))
@@ -182,6 +227,27 @@ def main():
     ap.add_argument("--compare", help="comma list of subsystems to compare (default: full chain). "
                     "e.g. --compare cpu,ram,ppu,dma,cart ignores apu/dsp/spc/sio "
                     "(the known variable-under-test) and halts when it reaches game state")
+    ap.add_argument("--transient-grace", type=int, default=0,
+                    help="on a divergence, step up to K more checkpoints; if the "
+                    "per-checkpoint hashes match again, log it as TRANSIENT and "
+                    "continue instead of halting. For cross-execution-model gates "
+                    "(bounced vs interpreted) where cycle-model skew can shift a "
+                    "boot poll by one frame and leave dead-state residue (stack "
+                    "bytes above S) that reconverges. Only meaningful with "
+                    "--compare (per-checkpoint subset hashes; the full chain "
+                    "accumulates history and never reconverges). Localize any "
+                    "reported transient once with the dumpram command before "
+                    "trusting it. 0 = halt on first divergence (default).")
+    ap.add_argument("--ram-mask",
+                    help="comma list of WRAM offsets/ranges (hex ok: 0x02FF, "
+                    "0x1F00-0x1F0F) asserted DEAD (e.g. interrupt-push residue "
+                    "above a returned stack pointer, whose PB byte differs "
+                    "between execution models with coarse PB currency). When a "
+                    "divergence's split is EXACTLY {ram}, both sides are "
+                    "dumpram'd and byte-diffed; only if EVERY differing offset "
+                    "is inside the mask is it logged MASKED and the run "
+                    "continues — verified per occurrence, never a blind "
+                    "waiver. Requires --compare (needs per-key sigs).")
     args = ap.parse_args()
     keys = args.compare.split(",") if args.compare else None
 
@@ -193,8 +259,15 @@ def main():
     if keys:
         print(f"comparing ONLY subsystems: {keys}")
     injected = args.inject is None
+    transients = []
+    masked_cps = []
+    ram_mask = parse_ram_mask(args.ram_mask) if args.ram_mask else None
+    if ram_mask and not keys:
+        die("--ram-mask requires --compare (per-key signatures)")
     t0 = time.time()
-    for i in range(1, args.max + 1):
+    i = 0
+    while i < args.max:
+        i += 1
         if keys:
             cpa, cha = step_subset(a, keys); cpb, chb = step_subset(b, keys)
         else:
@@ -207,14 +280,52 @@ def main():
             print(f"injected {args.inject} into B at cp {cpa}: {r}")
             injected = True
         if cha != chb:
-            report_divergence(a, b, cpa)
-            print(f"\nhalted at cp {cpa} after {time.time()-t0:.1f}s")
-            a.close(); b.close()
-            return 1
+            if ram_mask:
+                ok_mask, offs = ram_divergence_masked(a, b, keys, cha, chb, ram_mask)
+                if ok_mask:
+                    masked_cps.append(cpa)
+                    if len(masked_cps) <= 8 or len(masked_cps) % 500 == 0:
+                        print(f"  MASKED ram divergence at cp {cpa} "
+                              f"(bytes: {['0x%04X' % o for o in offs]}, "
+                              f"occurrence #{len(masked_cps)})")
+                    continue
+            first_cp, reconverged = cpa, False
+            for g in range(1, args.transient_grace + 1):
+                if i >= args.max:
+                    break
+                i += 1
+                if keys:
+                    cpa, cha = step_subset(a, keys); cpb, chb = step_subset(b, keys)
+                else:
+                    cpa, cha = step_chain(a); cpb, chb = step_chain(b)
+                if cha == chb:
+                    transients.append((first_cp, g))
+                    print(f"  TRANSIENT divergence at cp {first_cp} — "
+                          f"reconverged after {g} checkpoint(s)")
+                    reconverged = True
+                    break
+            if not reconverged:
+                report_divergence(a, b, cpa)
+                print(f"\nhalted at cp {cpa} after {time.time()-t0:.1f}s"
+                      + (f" (first divergence at cp {first_cp}, no reconvergence "
+                         f"within grace {args.transient_grace})"
+                         if args.transient_grace else ""))
+                a.close(); b.close()
+                return 1
         if i % 200 == 0:
             print(f"  cp {cpa} chain match ({time.time()-t0:.0f}s)")
-    print(f"no divergence in {args.max} checkpoints ({time.time()-t0:.0f}s) — "
-          f"{'GATE PASS' if a.name==b.name or True else ''}")
+    notes = []
+    if transients:
+        notes.append(f"{len(transients)} transient(s) at {[cp for cp, _ in transients]}"
+                     f" (localize once via dumpram)")
+    if masked_cps:
+        notes.append(f"{len(masked_cps)} MASKED ram divergence(s) "
+                     f"(byte-verified within --ram-mask each time)")
+    if notes:
+        print(f"no UNMASKED PERSISTENT divergence in {args.max} checkpoints "
+              f"({time.time()-t0:.0f}s); " + "; ".join(notes) + " — GATE PASS")
+    else:
+        print(f"no divergence in {args.max} checkpoints ({time.time()-t0:.0f}s) — GATE PASS")
     a.close(); b.close()
     return 0
 

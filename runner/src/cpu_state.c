@@ -203,17 +203,21 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
         {
             extern const char *g_last_recomp_func;
             static long wa = -2; static FILE *wf = NULL; static int hits = 0;
+            static long wmax = 400;
             if (wa == -2) {
                 const char *e = getenv("SNESRECOMP_WRITE_WATCH");
                 wa = (e && e[0]) ? strtol(e, NULL, 0) : -1;
                 if (wa >= 0) { const char *lp = getenv("SNESRECOMP_WRITE_WATCH_LOG");
-                               wf = fopen(lp && lp[0] ? lp : "writewatch.log", "w"); }
+                               wf = fopen(lp && lp[0] ? lp : "writewatch.log", "w");
+                               const char *mx = getenv("SNESRECOMP_WRITE_WATCH_MAX");
+                               if (mx && mx[0]) wmax = strtol(mx, NULL, 0); }
             }
-            if (wa >= 0 && wf && off == (int)wa && hits < 400) {
-                fprintf(wf, "[writewatch] $%04x = %02x (was %02x) bank=%02x addr=%04x "
-                            "by %s (m=%d x=%d)\n",
-                        off, v, old, bank, addr, g_last_recomp_func,
-                        cpu->m_flag & 1, cpu->x_flag & 1);
+            if (wa >= 0 && wf && off == (int)wa && hits < wmax) {
+                extern int snes_frame_counter;
+                fprintf(wf, "[writewatch] f=%d $%04x = %02x (was %02x) bank=%02x addr=%04x "
+                            "by %s (m=%d x=%d) S=%04x\n",
+                        snes_frame_counter, off, v, old, bank, addr, g_last_recomp_func,
+                        cpu->m_flag & 1, cpu->x_flag & 1, cpu->S);
                 fflush(wf); hits++;
             }
         }

@@ -30,6 +30,16 @@ Discoveries split into two buckets:
                These are BUG LEADS, never promotion candidates. Ranked by bail
                count, then earliest frame.
 
+Site kinds (2026-07-02 additions): besides the tier-down kinds
+(indirect_dispatch / indirect_goto / bank_miss), the bridge now records
+in-bridge sightings -- `call_gap` (an interpreted JSR/JSL whose target has no
+compiled variant) and `goto_gap` (an indirect JMP/JML landing with none).
+Both are always clean (observations, not bounded runs) and flow through the
+PROMOTE bucket. Caveat for goto_gap: a landing can be a mid-function label
+(intra-function jump table) rather than a subroutine entry -- eyeball the
+disassembly before pasting, as always. Addresses are LoROM-canonicalized
+(exec mirrors $80-$BF recorded as $00-$3F).
+
 Usage:
   python tools/tier2_ingest.py [manifest.json] [--cfg-dir recomp]
 """

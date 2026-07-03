@@ -152,6 +152,18 @@ uint64_t cosim_state_ruler(void) {
 #endif
 }
 
+/* ── raw WRAM dump (byte-level localization of a `ram` hash split) ─────────
+ * Writes the full 128 KiB g_ram image. Read-only => safe while parked. Diff
+ * two parked sides' dumps with `cmp -l a.bin b.bin` to name the exact bytes
+ * behind a frame-hash divergence that names only `ram`. */
+int cosim_state_dump_ram(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 3;
+    size_t n = fwrite(g_ram, 1, 0x20000, f);
+    fclose(f);
+    return n == 0x20000 ? 0 : 4;
+}
+
 /* ── framebuffer dump (visual repro of a rendering divergence, headless) ──
  * Writes the CURRENT contents of the PPU render buffer (filled by the last
  * draw_ppu_frame; BGRA) as a 24-bit BMP. Deliberately does NOT re-render:

@@ -37,6 +37,14 @@
 
 #define FNV_OFF 1469598103934665603ULL
 #define FNV_PRM 1099511628211ULL
+
+/* Tier-2 gap manifest writer (interp_bridge.c) — local prototype instead of
+ * interp_bridge.h: that header pulls cpu_state.h/windows.h ahead of the
+ * winsock2.h block above, which trips mingw's GetCurrentFiber multiple-
+ * definition trap. Not linked in the REF build (call is #ifdef'd out). */
+#ifndef SNES_COSIM_REF
+void Tier2CoverageWriteManifest(const char *path, const char *rom_title);
+#endif
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const uint8_t *b = (const uint8_t *)p;
     for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= FNV_PRM; }
@@ -197,6 +205,25 @@ static void serve_until_step(void) {
             if (sscanf(line + 10, "%7s %x", reg, &val) == 2 &&
                 cosim_state_inject_reg(reg, val) == 0) sendf("ok\n");
             else sendf("err\n");
+        } else if (!strncmp(line, "manifest", 8)) {
+            /* Tier-2 gap manifest on demand (cfg-enrichment harvest: free-run
+             * N frames, then dump the worklist without needing the windowed
+             * runner's atexit post-mortem). Recomp side only — the pure-interp
+             * REF build has no tier-2 table (no bridge linked). */
+#ifdef SNES_COSIM_REF
+            sendf("err manifest: ref build has no tier-2 table\n");
+#else
+            const char *p = line + 8;
+            while (*p == ' ') p++;
+            if (*p) { Tier2CoverageWriteManifest(p, "cosim"); sendf("ok %s\n", p); }
+            else sendf("err manifest needs a path\n");
+#endif
+        } else if (!strncmp(line, "dumpram", 7)) {
+            const char *p = line + 7;
+            while (*p == ' ') p++;
+            int rc = *p ? cosim_state_dump_ram(p) : 1;
+            if (rc == 0) sendf("ok %s\n", p);
+            else sendf("err dumpram rc=%d\n", rc);
         } else if (!strncmp(line, "dumpfb", 6)) {
             const char *p = line + 6;
             while (*p == ' ') p++;

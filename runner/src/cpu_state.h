@@ -538,6 +538,31 @@ RecompReturn interp_tier_run_call(CpuState *cpu, uint32 target_pc24,
 RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32 addr_pc24,
                                             uint16 entry_s, uint8 hrv);
 
+/* ── Fiber-free LLE yield unwind (interp_bridge.c; docs/LLE_SCHEDULER.md) ──
+ * Under the interpreted cooperative scheduler (interp_bridge_run_scheduler),
+ * task bodies bounce to compiled code, but the guest yield primitives are
+ * coroutine switches that never return to their caller — a compiled body
+ * reaching one cannot host-return normally. The game's yield hle_func stubs
+ * call interp_bridge_lle_yield_unwind(resume_pc24) instead: it arms a pending
+ * unwind and returns a huge RecompReturn sentinel that every emitted callsite
+ * propagates (`return _r - 1`), unwinding the host C stack from arbitrary
+ * depth back to the scheduler frame's bounce site. That site consumes the
+ * request and CONTINUES INTERPRETING at resume_pc24 — the primitive's REAL
+ * ROM entry, with cpu exactly as the compiled callsite left it (JSR frame
+ * already pushed for JSR-reached primitives). The interpreter then performs
+ * the actual coroutine switch (state/countdown -> $30/$31,X, TSC -> saved-S
+ * slot, re-enter the slot walk) byte-exact by construction — no hand-written
+ * effect duplication, no fibers.
+ *
+ * interp_bridge_in_lle_scheduler() tells a stub whether a scheduler frame is
+ * beneath it on the host stack (0 => use the fiber/HLE path). The sentinel
+ * base is far above any genuine SKIP_N, so per-level decrements can never
+ * decay it into a value mistaken for a local NLR before the (bounded ≪ 2^30)
+ * host stack unwinds. */
+#define RECOMP_RETURN_LLE_UNWIND_BASE 0x40000000
+int interp_bridge_in_lle_scheduler(void);
+RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24);
+
 /* Focused OAM-overflow observability recorders (debug_server.c).
  * dbg_rts_trace is emitted by the RTS/RTL lowering; dbg_oam_block_trace
  * is called from cpu_trace_block. Both are PC-range-filtered and frozen

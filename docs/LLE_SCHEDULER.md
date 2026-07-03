@@ -10,9 +10,9 @@ don't yet run under LLE, and the fiber-free design that closes the gap.
 | game | cfg | scheduler | tasks run as | state |
 |------|-----|-----------|--------------|-------|
 | MMX USA | rich | HLE (default) | compiled (fibers) | shipped, validated |
-| MMX USA | rich | LLE (`SNESRECOMP_MMX_SCHED_LLE=1` + immediate ports) | **interpreted** | clean + full speed as of engine `22734b2` |
-| Rockman X JP | minimal | LLE (default) | interpreted | shipped (experimental) |
-| target | rich | LLE | **compiled via bounce** | NOT YET — this doc |
+| MMX USA | rich | LLE (`SNESRECOMP_MMX_SCHED_LLE=1` + immediate ports) | **compiled via bounce** (fiber-free) | **DONE 2026-07-03**: gates 1-3 green (A-vs-A 0/400; bounced-vs-interp 0/4000 modulo the masked `$02FF` residue byte; LLE-vs-HLE ppu/dma 0/4000); live 3×60.2 fps clean |
+| Rockman X JP | enriched (134 funcs, tier-2 round 1) | LLE (default) | interpreted (bounce opt-in: `SNESRECOMP_LLE_BOUNCE=1`) | bounced-vs-interp + A-vs-A(bounce) green 2026-07-03; default flip awaits gameplay coverage + sign-off |
+| next | — | LLE default everywhere, HLE removal | — | needs owner sign-off |
 
 The 2026-07-02 campaign proved the LLE tier itself is sound: LLE-vs-HLE guest video
 state is bit-identical for 4000 frames headless, and the live wedge/garble/chug was
@@ -40,45 +40,65 @@ So today the whole scheduler frame interprets. Correct, but it ships an interpre
 the game's entire per-frame logic — explicitly rejected for production. Compiled bodies
 are the point of the recompiler.
 
-## Design: fiber-free yield via guest-state effect + host NLR unwind
+## Design: fiber-free yield via NLR unwind + interpret-the-real-primitive
 
-The scheduler's own WRAM state machine already contains everything a suspended task
-needs (`$30+X` state, `$31+X` countdown, `$32/$33+X` resume PC, `$36/$37+X` saved S).
-The real loop rebuilds task execution from WRAM alone every frame. Exploit that:
+**IMPLEMENTED 2026-07-02** (engine `interp_bridge.c`/`cpu_state.h` + MMX
+`gen_stubs.c`). The build refines the original sketch in one important way: the
+LLE-aware stubs do NOT hand-replicate the primitives' guest-state effects — they hand
+control back to the interpreter *at the primitive's real ROM entry*, so the actual
+coroutine switch executes byte-exact by construction. Zero effect-duplication to keep
+in sync with the ROM.
 
-**1. LLE-aware yield stubs.** The yield `hle_func` stubs detect LLE context (no fiber /
-a runtime flag set by `interp_bridge_run_scheduler`) and, instead of `SwitchToFiber`,
-perform the *guest-state effects of the real ROM routine, byte-exact* (derive from the
-disassembly of `$8100/$810C/$8121/$80F8`, NOT from the current HLE approximations):
+Ground truth from the `$8099` disassembly (USA; JP byte-identical): the loop resets S
+to `$02FF` each pass (`$8099`), spins on `$0B9D` (`$80A1`), walks slots at `$80AB`;
+state-1 fresh-dispatches via `LDA $37,X ; XBA ; LDA $36,X ; TCS ; JMP ($0032,X)`
+(`$80DA`); state-2 resumes via `REP #$30 ; LDA $34,X ; TCS ; PLP ; PLY ; PLX ; RTS`
+(`$80E9`). The yields (`$8100` one-frame, `$810C` N-frames, `$8127` vblank-yield tail)
+all do `PHX ; PHY ; PHP`, reload X from `$A0`, store state+countdown 16-bit into
+`$30/$31,X`, save S via `TSC → $34/$35,X`, and re-enter the walk. (`$34/$35` is the
+yield-time saved S; `$36/$37` is only the *fresh-install* entry-S — the original sketch
+had this wrong.) `$80F8` task-die is `SEP #$30 ; LDX $A0 ; STZ $30,X ; BRA $80B9`.
 
-- pop the caller's return frame from the guest stack (resume PC = frame + 1, exactly
-  as `mmx_host_yield`'s `MmxSlotResume` capture computes it today);
-- write slot state/countdown and the resume PC into the slot's WRAM record;
-- save/restore S exactly as the coroutine switch does (task S → `$36/$37`+X analog,
-  scheduler S restored).
+**1. LLE-aware yield stubs** (`gen_stubs.c`). Each stub tests
+`interp_bridge_in_lle_scheduler()` (a scheduler-frame depth counter maintained by
+`interp_bridge_run_ex2` for `yield_pc != 0` frames — visible through nested tier-2
+frames). In LLE context it calls `interp_bridge_lle_yield_unwind(cpu, PB:realEntry)`
+instead of `SwitchToFiber`; cpu is left exactly as the compiled callsite made it (JSR
+frame already pushed for JSR-reached primitives, live A for `$810C`, live X for the
+`$80E6` dispatch). One optimization keeps the hot path compiled: `$8121`'s NO-YIELD
+case (`BIT $0B9D ; RTS`, the decompressor's every-32-units check) is modeled in the
+stub byte-exact (BIT N/V/Z at live M width + frame pop) so only the actual yield
+unwinds.
 
-**2. NLR unwind back to the bridge.** The stub then unwinds the host C stack from
-however deep the compiled body is, back to the interp bounce site, using the existing
-non-local-return machinery (`RecompReturn` SKIP propagation — the same path
-`cpu_unresolved_abandon_balanced` and the save-state resume stop-PC intercepts use).
-The bounce site already handles `_air != RECOMP_RETURN_NORMAL` by ending the interp
-frame cleanly. The interpreted loop then continues its slot walk natively — the guest
-scheduler is none the wiser: from WRAM it looks exactly like the real coroutine ran.
+**2. NLR unwind back to the bridge.** `interp_bridge_lle_yield_unwind` arms a pending
+unwind (+ resume PC) and returns `RECOMP_RETURN_LLE_UNWIND_BASE` (0x40000000). Every
+emitted callsite already propagates non-NORMAL returns (`return _r - 1`); the sentinel
+is so far above any genuine SKIP_N that per-level decrements can't decay it. Nested
+non-scheduler bridge frames (tier-2 gap runs) end on the unwind and their
+`interp_tier_*` helpers re-emit the sentinel, so the unwind crosses interleaved
+compiled/interpreted frames of any depth. The scheduler frame's bounce site consumes
+the request and CONTINUES INTERPRETING at the primitive's real entry — the interpreter
+performs the real coroutine switch and walks on. (The unwind also swallows any
+tail-armed `cpu_tailcall_inherit_return_context` the hle wrapper never took, so the
+next bounce can't adopt a stale `_entry_s`/`_hrv`.)
 
-**3. Resume next frame is already native.** The interpreted loop's own dispatch
-(`JMP ($0032,X)`) lands mid-task at the recorded resume PC next frame; the interp
-executes from there and bounces subsequent calls. Mid-function entry under interp with
-scheduler-restored S is proven machinery — it is exactly what
-`interp_bridge_resume_task` does for save-state resume today.
+**3. Resume next frame is already native.** The interpreted loop's own resume
+(`LDA $34,X ; TCS ; PLP ; PLY ; PLX ; RTS`) pops the compiled callsite's pushed frame
+and lands at the post-JSR guest PC; the interp executes the task's tail from there and
+bounces subsequent calls back into compiled bodies. Mid-function entry under interp is
+proven machinery (`interp_bridge_resume_task`).
 
-**4. Lift the blanket bounce suppression.** With yield sites resolving (via
-`cpu_dispatch`) to LLE-aware stubs, yield-mode bounce can be enabled for ordinary
-targets. Keep a small cfg-derived denylist for any *other* non-returning coroutine
-machinery (the existing `hle_dispatch`/stop-PC set) instead of suppressing everything.
+**4. Bounce suppression lifted.** Yield-mode bounces are now enabled by default;
+`SNESRECOMP_LLE_BOUNCE=0` restores interpret-everything (the A/B differential lever —
+bounced vs interpreted must be guest-state bit-exact). No denylist proved necessary:
+all non-returning machinery is JMP-reached (never bounced — the interp only intercepts
+JSR/JSL/JSR(abs,X)) or hle_func'd (handles itself via the unwind). A JSR arrival at a
+yield primitive from *interpreted* code simply round-trips through the stub and
+resumes interpreting at the same PC — correct, one redundant hop.
 
 **No fibers. No per-game task table.** The only per-game knowledge is what the rich cfg
 already encodes: which PCs are the yield/die primitives (`hle_func` directives that
-minimal cfgs need anyway).
+minimal cfgs need anyway) — and those stubs name their own real ROM entries.
 
 ## Validation plan (the differential bonus)
 
