@@ -214,3 +214,51 @@ target_link_libraries(rmx_cosim PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES} m)
 if(WIN32)
     target_link_libraries(rmx_cosim PRIVATE ws2_32)
 endif()
+
+# ── Zelda (ALttP) co-simulation A-side (zelda_cosim) ────────────────────────
+# Mirrors smw_cosim/mmx_cosim: the ALttP recomp runtime headless (game-neutral
+# harness_smw.c references the shared kSmwGameInfo / SmwSpcPlayer_Create symbols
+# the Zelda repo also defines) + the cosim engine. Validates the ALttP LLE
+# scheduler tier (SNESRECOMP_ZELDA_SCHED_LLE) bounce-vs-interpret / LLE-vs-HLE.
+# No fiber_compat (ALttP has no cooperative task scheduler). DEV/DIAGNOSTICS ONLY.
+set(ZELDA_ROOT "${SNESRECOMP_ROOT}/../LegendofZeldaAlttpRecomp" CACHE PATH "ALttP game repo")
+file(GLOB ZELDA_GEN CONFIGURE_DEPENDS ${ZELDA_ROOT}/src/gen/*.c)
+if(NOT ZELDA_GEN)
+    message(FATAL_ERROR "no generated banks at ${ZELDA_ROOT}/src/gen — regen Zelda first")
+endif()
+add_executable(zelda_cosim
+    ${SNESRECOMP_RUNNER_SOURCES}
+    harness_smw.c             # game-neutral (kSmwGameInfo / SmwSpcPlayer_Create)
+    harness_glue.c
+    ${ZELDA_ROOT}/src/config.c
+    ${ZELDA_ROOT}/src/zelda_00.c
+    ${ZELDA_ROOT}/src/gen_stubs.c
+    ${ZELDA_ROOT}/src/zelda_cpu_infra.c
+    ${ZELDA_ROOT}/src/zelda_rtl.c
+    ${ZELDA_ROOT}/src/zelda_spc_player.c
+    ${ZELDA_GEN}
+)
+target_include_directories(zelda_cosim PRIVATE
+    ${ZELDA_ROOT} ${ZELDA_ROOT}/src ${ZELDA_ROOT}/recomp
+    ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
+)
+target_compile_definitions(zelda_cosim PRIVATE
+    SMW_DISABLE_LM=1
+    SYSTEM_VOLUME_MIXER_AVAILABLE=0
+    SNESRECOMP_TRACE=0
+    SDL_MAIN_HANDLED
+)
+find_package(SDL2 QUIET)
+if(SDL2_INCLUDE_DIRS)
+    target_include_directories(zelda_cosim PRIVATE ${SDL2_INCLUDE_DIRS})
+endif()
+target_include_directories(zelda_cosim PRIVATE C:/msys64/mingw64/include/SDL2)
+target_link_libraries(zelda_cosim PRIVATE C:/msys64/mingw64/lib/libSDL2.dll.a)
+if(NOT MSVC)
+    target_compile_options(zelda_cosim PRIVATE
+        -w -Wno-implicit-function-declaration -Wno-error=implicit-function-declaration)
+endif()
+target_link_libraries(zelda_cosim PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES} m)
+if(WIN32)
+    target_link_libraries(zelda_cosim PRIVATE ws2_32)
+endif()
