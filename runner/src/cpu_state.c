@@ -112,6 +112,15 @@ static inline void cpu_pace_cycles(uint16 addr) {
         g_apu_pace_cycles_estimate += 256;
 }
 
+/* Word-access HW touch: ONE credit per 16-bit access, same as a byte access.
+ * Touch parity across execution tiers holds because the interp tier routes
+ * HW word accesses through cpu_read16/cpu_write16 too (interp_bridge word-bus
+ * hooks), so both models see the identical credit sequence — the property the
+ * co-sim shared APU clock (SNES_COSIM_APU_SHARED) relies on. */
+static inline void cpu_pace_cycles_word(uint16 addr) {
+    cpu_pace_cycles(addr);
+}
+
 /* Optional debug — disabled in release. Set BUILD_CPU_HW_LOG=1 in the
  * build to enable verbose per-touch logging. */
 #define BUILD_CPU_HW_LOG 0
@@ -164,7 +173,7 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0 && off + 1 < 0x20000)
         return (uint16)cpu->ram[off] | ((uint16)cpu->ram[off + 1] << 8);
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 1, 0); return ReadRegWord(addr); }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles_word(addr); cpu_hw_log(addr, 1, 0); return ReadRegWord(addr); }
     int sram_lo = cpu_sram_offset(bank, addr);
     if (sram_lo >= 0) {
         /* Compose word from two byte fetches. If the high byte crosses
@@ -262,7 +271,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
 #endif
         return;
     }
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles_word(addr); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
     int sram_lo = cpu_sram_offset(bank, addr);
     if (sram_lo >= 0) {
         g_sram[sram_lo] = (uint8)(v & 0xFF);

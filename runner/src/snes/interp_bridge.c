@@ -21,9 +21,40 @@
 extern Snes *g_snes;
 extern uint64_t g_apu_last_sync_master;   /* common_rtl.c — keep synced so a bounce's accurate-mode delta excludes interp opcodes */
 extern int g_interp_apu_driving;          /* common_rtl.c — suppresses the per-touch synthetic catch-up while set */
+#ifdef SNES_COSIM
+extern int cosim_apu_shared_clock(void);  /* common_rtl.c — SNES_COSIM_APU_SHARED touch-only APU pacing */
+#endif
 void RtlApuLock(void);                    /* real mutex in the windowed runner (audio thread also cycles the SPC); no-op in headless/cosim */
 void RtlApuUnlock(void);
 static const double kInterpApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 60.0);
+
+/* Batched guest-time APU advance. v1 advanced the SPC per interpreted opcode:
+ * RtlApuLock + snes_catchupApu once per opcode. In the windowed build that
+ * mutex is contended by the audio thread's bulk SPC bursts, and the per-opcode
+ * acquire/catchup collapsed interp-heavy frames ~250x (USA rich-cfg LLE live:
+ * 0.25 fps vs 63 fps with audio off — the "chug"). Batch instead: accumulate
+ * master cycles locally and convert at (a) any APU-port bus access — BEFORE
+ * the access, so every port read/write still sees the SPC exactly as current
+ * as the per-opcode scheme gave it, (b) every ~4096 master cycles (~190 SPC
+ * cycles, well under one output sample quantum), (c) every bridge exit and
+ * AOT bounce. Game-thread only (like the interp itself); nesting shares the
+ * accumulator safely because flushing early is always correct. */
+static uint64_t s_apu_pending_master = 0;
+static void bridge_apu_flush(CpuState *cpu) {
+    if (!s_apu_pending_master) return;
+    RtlApuLock();
+    g_snes->apuCatchupCycles += (double)s_apu_pending_master * kInterpApuPerMaster;
+    g_apu_last_sync_master = cpu->master_cycles;
+    snes_catchupApu(g_snes);
+    RtlApuUnlock();
+    s_apu_pending_master = 0;
+}
+static int bridge_is_apu_port(uint32_t adr) {
+    uint16_t a = (uint16_t)(adr & 0xFFFF);
+    if (a < 0x2140 || a > 0x217F) return 0;
+    uint8_t bank = (uint8_t)((adr >> 16) & 0xFF);
+    return bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF);
+}
 
 /* ── memory bus shim ───────────────────────────────────────────────────────
  * The interpreter's `mem` is the CpuState*; route every access through the
@@ -31,11 +62,52 @@ static const double kInterpApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 6
  * WRAM / MMIO / SRAM / ROM. One memory map, zero divergence. */
 static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     CpuState *cpu = (CpuState *)mem;
+    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
     return cpu_read8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF));
 }
 static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
     CpuState *cpu = (CpuState *)mem;
+    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
+}
+
+/* Word bus (interp816 read_word/write_word): claim a CONTIGUOUS pair that
+ * lands in the HW-register window and perform it through the same
+ * width-preserving AOT bus the compiled code uses (cpu_read16/cpu_write16 →
+ * ReadRegWord/WriteRegWord). Root cause this closes: a guest 16-bit store to
+ * $2140 (kick lo, data hi) executed as two byte writes releases the APU lock
+ * between the bytes, so the audio thread can run the SPC hundreds of samples
+ * with the kick applied but the data stale — the driver latches garbage and
+ * the upload/command handshake wedges (the USA rich-cfg LLE live wedge/garble;
+ * nondeterministic because it races the callback). On silicon the two bus
+ * cycles sit inside one SPC cycle — atomic. WriteRegWord's hi-then-lo APU
+ * order restores that atomicity; ReadRegWord's snapshot likewise fixes torn
+ * 16-bit $2140 polls. Non-HW / wrapping / RMW-reversed pairs fall back to the
+ * exact byte-pair behavior. */
+static int bridge_hw_word(uint32_t adrl, uint32_t adrh) {
+    if (adrh != adrl + 1) return 0;               /* contiguous, no wrap */
+    uint16_t a = (uint16_t)(adrl & 0xFFFF);
+    if (a < 0x2000 || a + 1 >= 0x6000) return 0;  /* both bytes in HW window */
+    uint8_t bank = (uint8_t)((adrl >> 16) & 0xFF);
+    return bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF);
+}
+static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
+                                 uint16_t *out) {
+    if (!bridge_hw_word(adrl, adrh)) return false;
+    CpuState *cpu = (CpuState *)mem;
+    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
+    return true;
+}
+static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
+                                  uint16_t val, bool reversed) {
+    /* reversed = RMW write-back (high byte first on hardware); keep those on
+     * the faithful byte path — WriteRegWord would flip non-APU order. */
+    if (reversed || !bridge_hw_word(adrl, adrh)) return false;
+    CpuState *cpu = (CpuState *)mem;
+    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    cpu_write16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF), val);
+    return true;
 }
 
 /* ── register/flag sync ────────────────────────────────────────────────────
@@ -131,6 +203,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     in.mem = cpu;
     in.read = bridge_bus_read;
     in.write = bridge_bus_write;
+    in.read_word = bridge_bus_read_word;
+    in.write_word = bridge_bus_write_word;
 
     sync_cpu_to_interp(cpu, &in);
     in.k  = (uint8)((entry_pc24 >> 16) & 0xFF);
@@ -184,6 +258,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         if (yield_pc && (pc_before & 0x7FFFFF) == (yield_pc & 0x7FFFFF) &&
             bridge_bus_read(cpu, yield_flag_addr) == 0) {
             sync_interp_to_cpu(&in, cpu);
+            bridge_apu_flush(cpu);
             return 1;
         }
         /* Stop-PC intercept (task-resume mode): JMP/BRA arrival at a PC whose
@@ -196,6 +271,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             for (int si = 0; si < n_stop; si++) {
                 if ((stop_pcs[si] & 0x7FFFFF) == pc_norm) {
                     sync_interp_to_cpu(&in, cpu);
+                    bridge_apu_flush(cpu);
                     if (cpu_dispatch_has_entry(cpu, pc_before))
                         cpu_dispatch_pc_paired(cpu, pc_before, 0);
                     return 1;
@@ -229,14 +305,21 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             uint64_t _master = (uint64_t)_cyc * 8u;
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
-            /* Serialise with the audio thread's bulk SPC render (windowed build);
-             * no-op lock in headless/cosim. The opcode's own port access (if any)
-             * already locked+unlocked inside interp816_runOpcode, so no nesting. */
-            RtlApuLock();
-            g_snes->apuCatchupCycles += (double)_master * kInterpApuPerMaster;
-            g_apu_last_sync_master = cpu->master_cycles;
-            snes_catchupApu(g_snes);
-            RtlApuUnlock();
+#ifdef SNES_COSIM
+            /* Shared APU clock (common_rtl.h): the guest-time advance is a
+             * per-side clock (master-cycle accounting differs between the
+             * interp and compiled models), so under SNES_COSIM_APU_SHARED the
+             * SPC is paced ONLY by the HW-touch estimate — identical on both
+             * sides of an A/B pair. The opcode's own port access (if any)
+             * paces via rtl_accumulate_apu_catchup like compiled code. */
+            if (!cosim_apu_shared_clock())
+#endif
+            {
+                /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
+                 * convert on APU-port access / ~4096 master / exits. */
+                s_apu_pending_master += _master;
+                if (s_apu_pending_master >= 4096) bridge_apu_flush(cpu);
+            }
         }
 
         /* Resolved-landing capture (Phase 2 manifest): the PC reached after
@@ -273,10 +356,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 const uint8_t _fs = (op == 0x22) ? 3 : 2;
                 uint16_t _sp_pre = in.sp;
                 /* Compiled body paces its own APU (RtlApuRead/Write); un-suppress
-                 * the per-touch catch-up for its duration, then restore. */
+                 * the per-touch catch-up for its duration, then restore the
+                 * PRE-CALL value (not literal 1 — under the co-sim shared APU
+                 * clock the flag is 0 for the whole bridge run and must stay 0). */
+                bridge_apu_flush(cpu);   /* compiled body must see a current SPC */
+                int _apu_drv = g_interp_apu_driving;
                 g_interp_apu_driving = 0;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
-                g_interp_apu_driving = 1;
+                g_interp_apu_driving = _apu_drv;
                 sync_cpu_to_interp(cpu, &in);
                 if (_ibrw)
                     fprintf(stderr, "[ibr] call op=$%02X pc=$%06X -> $%06X "
@@ -318,6 +405,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             if ((uint16_t)in.sp > s_enter) {
                 /* The interpreted routine returned past its entry depth. */
                 sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
                 return 1;
             }
         }
@@ -327,6 +415,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
      * the caller treats a 0 return as "gap not cleanly resolved". */
     if (trace) itrace_dump(entry_pc24, head, (int)(itn < 8 ? itn : 8), ring, itn);
     sync_interp_to_cpu(&in, cpu);
+    bridge_apu_flush(cpu);
     return 0;
 }
 
@@ -339,6 +428,11 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
                                  int reset_cap_on_bounce,
                                  const uint32_t *stop_pcs, int n_stop) {
     int _saved = g_interp_apu_driving;
+#ifdef SNES_COSIM
+    /* Shared APU clock: leave the flag clear so interpreted HW touches pace
+     * the SPC through the same per-touch path compiled code uses. */
+    if (!cosim_apu_shared_clock())
+#endif
     g_interp_apu_driving = 1;
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing, yield_pc,
                               yield_flag_addr, reset_cap_on_bounce, stop_pcs, n_stop);

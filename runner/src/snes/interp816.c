@@ -207,11 +207,17 @@ static void interp816_pushWord(Interp816* cpu, uint16_t value) {
 }
 
 static uint16_t interp816_readWord(Interp816* cpu, uint32_t adrl, uint32_t adrh) {
+  if(cpu->read_word) {
+    uint16_t v;
+    if(cpu->read_word(cpu->mem, adrl, adrh, &v)) return v;
+  }
   uint8_t value = interp816_read(cpu, adrl);
   return value | (interp816_read(cpu, adrh) << 8);
 }
 
 static void interp816_writeWord(Interp816* cpu, uint32_t adrl, uint32_t adrh, uint16_t value, bool reversed) {
+  if(cpu->write_word && cpu->write_word(cpu->mem, adrl, adrh, value, reversed))
+    return;
   if(reversed) {
     interp816_write(cpu, adrh, value >> 8);
     interp816_write(cpu, adrl, value & 0xff);

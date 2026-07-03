@@ -30,11 +30,29 @@ typedef struct Interp816 Interp816;
 typedef uint8_t (*Interp816ReadHandler)(void *mem, uint32_t adr);
 typedef void    (*Interp816WriteHandler)(void *mem, uint32_t adr, uint8_t val);
 
+/* Optional word-width bus hooks. The core's word accesses are two byte
+ * accesses (hardware bus order); a 16-bit access to a HW register then
+ * releases the bus between the bytes, which a concurrently-cycled APU (the
+ * runner's audio thread) can observe — on silicon the two bus cycles are
+ * 6-8 master clocks apart, inside ONE SPC cycle, i.e. atomic. A handler may
+ * claim a (adrl, adrh) pair and perform it through a width-preserving path
+ * (the AOT bus's ReadRegWord/WriteRegWord protections); return false to fall
+ * back to the two byte accesses (the handler MUST NOT have performed any
+ * access in that case). `reversed` mirrors interp816_writeWord (RMW
+ * write-back order, high byte first). */
+typedef bool (*Interp816ReadWordHandler)(void *mem, uint32_t adrl, uint32_t adrh,
+                                         uint16_t *out);
+typedef bool (*Interp816WriteWordHandler)(void *mem, uint32_t adrl, uint32_t adrh,
+                                          uint16_t val, bool reversed);
+
 struct Interp816 {
   /* memory bus */
   void *mem;
   Interp816ReadHandler  read;
   Interp816WriteHandler write;
+  /* optional word bus (NULL => byte-pair behavior, bit-for-bit as before) */
+  Interp816ReadWordHandler  read_word;
+  Interp816WriteWordHandler write_word;
   /* registers (saved block begins at `a`) */
   uint16_t a;
   uint16_t x;
