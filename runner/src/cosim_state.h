@@ -72,5 +72,10 @@ int cosim_state_inject_reg(const char *reg, uint32_t val);
 void cosim_state_dump_cpu(char *buf, size_t n);
 void cosim_state_dump_dev(char *buf, size_t n);
 
+/* Write the current PPU render-buffer contents (last draw_ppu_frame) as a
+ * 24-bit BMP. Read-only (no re-render) so parked state stays unperturbed.
+ * Returns 0 on success. */
+int cosim_state_dump_fb(const char *path);
+
 #endif /* SNES_COSIM */
 #endif /* COSIM_STATE_H */

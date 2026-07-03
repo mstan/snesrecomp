@@ -57,6 +57,19 @@ uint64_t g_apu_last_sync_cycles = 0;
 // the interp path sets it; the compiled steady-state path is unaffected.
 int g_interp_apu_driving = 0;
 
+#ifdef SNES_COSIM
+/* Shared APU clock knob (common_rtl.h). Cached once; both A/B processes of a
+ * same-binary pair must be launched with the same value. */
+int cosim_apu_shared_clock(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("SNES_COSIM_APU_SHARED");
+    v = (e && e[0] && e[0] != '0') ? 1 : 0;
+  }
+  return v;
+}
+#endif
+
 // Axis-5 off-cue: APU pacing now derives from the recompiler's region-weighted
 // MASTER-clock accumulator (g_cpu.master_cycles) instead of the +256-per-touch
 // synthetic estimate. g_apu_last_sync_master is the master-clock count at the
@@ -671,6 +684,22 @@ void rtl_accumulate_apu_catchup(void) {
    * an APU-port access inside interpreted code doesn't double-count. */
   if (g_interp_apu_driving) return;
 #ifdef SNES_COSIM
+  /* Shared APU clock (see common_rtl.h): pure touch-delta pacing, NO wall
+   * baseline. The baseline reads the co-sim virtual wall clock, which derives
+   * from master_cycles — a per-execution-model quantity (interp charges
+   * cyc*8, compiled blocks charge region-weighted static costs), so it would
+   * re-introduce the per-side skew this mode exists to remove. Touch credit is
+   * deliberately unscaled 256/touch (SNESRECOMP_APU_TOUCH_CYCLES ignored):
+   * both sides must use the identical constant. */
+  if (cosim_apu_shared_clock()) {
+    uint64_t delta = g_apu_pace_cycles_estimate - g_apu_last_sync_cycles;
+    g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
+    g_snes->apuCatchupCycles += (double)delta * 2.0 / 7.0;
+    g_apu_last_sync_master = g_cpu.master_cycles;
+    return;
+  }
+#endif
+#ifdef SNES_COSIM
   /* Co-sim A-vs-B variable-under-test (SNES_COSIM.md task 9): with
    * SNES_COSIM_ACCURATE_APU=1, pace the SPC from the region-weighted master
    * clock at the true SPC:master ratio (exactly like the interp816 ref),
@@ -767,6 +796,28 @@ void rtl_accumulate_apu_catchup(void) {
 
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
+#ifdef SNES_COSIM
+  /* Shared APU clock (common_rtl.h): do NOT convert pending touch credit on a
+   * port WRITE — schedule the byte at the current produced clock and leave the
+   * credit for the next port READ. Rationale: the interp tier executes a guest
+   * word store to $2140/$2141 as two byte writes; converting credit between
+   * them runs the SPC ~73 cycles with the kick byte applied but the data byte
+   * not yet — the IPL latches stale data and the upload handshake wedges
+   * (measured: LLE-shared stuck at outPorts=AABB to frame 360+). On hardware
+   * the two bytes land ~2 SPC cycles apart — effectively atomic. Deferring
+   * write-side conversion makes byte pairs land at the SAME produced tick, in
+   * program order, for BOTH the interp (lo,hi) and compiled (hi,lo) models —
+   * which also makes word-write APU evolution identical across tiers. */
+  if (cosim_apu_shared_clock()) {
+    RtlApuLock();
+    audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
+    uint64_t produced_now, consumed_now;
+    audio_trace_sample_clocks(&produced_now, &consumed_now);
+    apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
+    RtlApuUnlock();
+    return;
+  }
+#endif
   // Catch the APU up to the current cycle, then SCHEDULE the port write
   // in APU-sample time rather than mutating inPorts at wall time.
   //
@@ -838,6 +889,13 @@ void RtlApuWrite(uint16 adr, uint8 val) {
       const char *e = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
       s_immediate = (e && e[0]) ? (e[0] != '0')
                                 : SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT;
+#ifdef SNES_COSIM
+      /* Shared APU clock implies immediate ports: the deferred scheduler
+       * anchors targets to the co-sim virtual wall clock, which derives from
+       * master_cycles — a per-execution-model clock that would re-skew the
+       * A/B pair this mode aligns. */
+      if (cosim_apu_shared_clock()) s_immediate = 1;
+#endif
     }
     if (s_immediate) {
       uint64_t produced_now, consumed_now;

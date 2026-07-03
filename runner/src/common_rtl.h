@@ -45,6 +45,19 @@ extern uint64_t g_apu_last_sync_cycles;
 extern uint64_t g_apu_last_sync_master;
 void rtl_accumulate_apu_catchup(void);
 
+#ifdef SNES_COSIM
+// Co-sim shared APU clock (SNES_COSIM_APU_SHARED=1, dev-only): pace the SPC
+// purely from the HW-touch synthetic estimate on BOTH sides of a same-binary
+// A/B pair. The touch sequence is the only clock the compiled and interpreted
+// execution models advance identically (same guest instructions => same HW
+// touches until a true divergence), so under it the whole APU/DSP/SPC state
+// becomes a pure function of shared history and stops false-diverging.
+// Disables: the interp tier's per-opcode SPC advance, and the wall-clock
+// baseline in rtl_accumulate_apu_catchup (both are per-side clocks —
+// master_cycles accumulates differently per execution model).
+int cosim_apu_shared_clock(void);
+#endif
+
 // Axis-7 determinism per-frame WRAM fingerprint ring (common_rtl.c).
 #define FP_RING 8192
 extern uint64_t g_fp_ring[FP_RING];

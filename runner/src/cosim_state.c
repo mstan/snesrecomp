@@ -152,6 +152,44 @@ uint64_t cosim_state_ruler(void) {
 #endif
 }
 
+/* ── framebuffer dump (visual repro of a rendering divergence, headless) ──
+ * Writes the CURRENT contents of the PPU render buffer (filled by the last
+ * draw_ppu_frame; BGRA) as a 24-bit BMP. Deliberately does NOT re-render:
+ * ppu_runLine mutates hashed PPU state, which would perturb the compared
+ * hash on whichever side dumped. Read-only => safe while parked. */
+int cosim_state_dump_fb(const char *path) {
+    Ppu *p = g_snes->ppu;
+    if (!p || !p->renderBuffer) return 2;   /* no render binding */
+    FILE *f = fopen(path, "wb");
+    if (!f) return 3;                       /* path unwritable */
+    int w = 256, h = 224;
+    int row_bytes = w * 3, pad = (4 - (row_bytes % 4)) % 4;
+    int stride = row_bytes + pad, img_size = stride * h, file_size = 54 + img_size;
+    uint8_t hdr[54]; memset(hdr, 0, sizeof hdr);
+    hdr[0]='B'; hdr[1]='M';
+    hdr[2]=(uint8_t)file_size; hdr[3]=(uint8_t)(file_size>>8);
+    hdr[4]=(uint8_t)(file_size>>16); hdr[5]=(uint8_t)(file_size>>24);
+    hdr[10]=54; hdr[14]=40;
+    hdr[18]=(uint8_t)w; hdr[19]=(uint8_t)(w>>8);
+    int neg_h = -h; memcpy(&hdr[22], &neg_h, 4);
+    hdr[26]=1; hdr[28]=24;
+    hdr[34]=(uint8_t)img_size; hdr[35]=(uint8_t)(img_size>>8);
+    hdr[36]=(uint8_t)(img_size>>16); hdr[37]=(uint8_t)(img_size>>24);
+    fwrite(hdr, 1, 54, f);
+    uint8_t row[256 * 3 + 4]; memset(row, 0, sizeof row);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *src = p->renderBuffer + (size_t)y * p->renderPitch;
+        for (int x = 0; x < w; x++) {
+            row[x*3+0] = src[x*4+0];
+            row[x*3+1] = src[x*4+1];
+            row[x*3+2] = src[x*4+2];
+        }
+        fwrite(row, 1, (size_t)stride, f);
+    }
+    fclose(f);
+    return 0;
+}
+
 /* ── gate-3 fault injection ─────────────────────────────────────────────── */
 int cosim_state_inject_ram(uint32_t addr, uint8_t val) {
     if (addr >= 0x20000) return 1;

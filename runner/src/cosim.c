@@ -197,6 +197,12 @@ static void serve_until_step(void) {
             if (sscanf(line + 10, "%7s %x", reg, &val) == 2 &&
                 cosim_state_inject_reg(reg, val) == 0) sendf("ok\n");
             else sendf("err\n");
+        } else if (!strncmp(line, "dumpfb", 6)) {
+            const char *p = line + 6;
+            while (*p == ' ') p++;
+            int rc = *p ? cosim_state_dump_fb(p) : 1;
+            if (rc == 0) sendf("ok %s\n", p);
+            else sendf("err dumpfb rc=%d\n", rc);
         } else if (!strcmp(line, "reset")) {
             s_cp = 0; s_frame = 0; s_chain = FNV_OFF; s_budget = 0;
             memset(s_ring, 0, sizeof s_ring);
