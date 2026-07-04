@@ -16,6 +16,7 @@
 #include "debug_server.h"
 #include "audio_trace.h"
 #include "ppu_dma_trace.h"
+#include "host_report.h"
 #include "cosim.h"
 
 uint8 g_ram[0x20000];
@@ -488,6 +489,11 @@ void RtlSaveLoad(int cmd, int slot) {
     sprintf(name, "saves/%s_save%d.sav", g_rtl_game_info->title, slot);
   printf("*** %s slot %d: %s\n",
     cmd == kSaveLoad_Save ? "Saving" : "Loading", slot, name);
+  /* Breadcrumb the operation: a crash shortly after a state load is a
+   * different bug class than a cold-boot crash, and the field report
+   * needs to distinguish them without the user remembering. */
+  host_report_breadcrumb("savestate %s: %s",
+      cmd == kSaveLoad_Save ? "save" : "load", name);
   if (cmd == kSaveLoad_Save)
     RtlSaveSnapshot(name);
   else
