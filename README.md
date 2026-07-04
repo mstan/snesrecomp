@@ -160,3 +160,13 @@ emulator source or binary is vendored in this repo, so it carries none of
 a core's licensing terms; supply a core yourself. The `runner/src/snes/`
 hardware core derives from LakeSnes (and, transitively, snes9x); their
 respective terms apply to that code.
+
+---
+
+<p align="center">
+  <sub><b>R.A.I.D. — Retro AI Development</b> · a Discord for AI-assisted retro reverse-engineering, decomp &amp; recomp</sub>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/Ad9BwSzctP"><img src=".github/raid-discord.png" alt="Join the Retro AI Development (R.A.I.D.) Discord" width="200"></a>
+</p>
