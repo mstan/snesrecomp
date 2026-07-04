@@ -224,6 +224,19 @@ static void serve_until_step(void) {
             int rc = *p ? cosim_state_dump_ram(p) : 1;
             if (rc == 0) sendf("ok %s\n", p);
             else sendf("err dumpram rc=%d\n", rc);
+        } else if (!strncmp(line, "itrace", 6)) {
+            /* Dump the interp816 per-instruction ring (dev diagnostic): the last
+             * N (pc,op,A-in/out,M) entries, to localize a codegen-vs-interp
+             * A-register divergence. `itrace <path> [n]`. */
+            const char *p = line + 6;
+            while (*p == ' ') p++;
+            char path[220]; long n = 0;
+            int k = sscanf(p, "%219s %ld", path, &n);
+            if (k >= 1) {
+                extern void interp816_dump_ring(const char *, long);
+                interp816_dump_ring(path, n);
+                sendf("ok %s\n", path);
+            } else sendf("err itrace needs a path\n");
         } else if (!strncmp(line, "dumpfb", 6)) {
             const char *p = line + 6;
             while (*p == ' ') p++;

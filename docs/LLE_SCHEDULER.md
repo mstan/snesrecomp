@@ -127,3 +127,84 @@ drillable to the exact opcode with `SNES_COSIM_SYNC_PC`. Gates:
 - **Audio validation** (issue #4 lineage) is still the open acceptance bar per variant.
 - SMW / Zelda / SM adopt the same pattern when their scheduler idioms are LLE'd
   (SM's single-fiber WaitForNMI HLE is the analogous seam).
+
+---
+
+## SMW interpret-EVERYTHING floor: the dead-scratch dispatcher gap (2026-07-04)
+
+Gate 2 above ("bounced vs interpreted — cpu/ram/ppu bit-exact") holds for SMW **only
+after** you account for one structural, benign gap. The `smw_cosim` LLE bounce-vs-
+interpret gate (A = `SNESRECOMP_SMW_SCHED_LLE=1`; B = same + `SNESRECOMP_LLE_BOUNCE=0`,
+both `SNES_COSIM_APU_SHARED=1`) forks at **frame 2** and never re-converges on the raw
+`cpu`/`ram`/`ppu` hashes. This was drilled to root cause and proven benign — it is **not**
+a codegen semantic bug.
+
+### Root cause — the `$0086DF` static-dispatch optimization elides dead scratch
+
+SMW's `$00:86DF` is a **stack-based jump-table dispatcher**: `JSL $0086DF` is followed by
+an inline `.dw` target table, and the routine `PLA`/`PLY`s its own return address off the
+guest stack, indexes the table by the game-mode value in A, loads the target into A, writes
+direct-page scratch `$00–$03`, and `JML`s to it.
+
+The recompiler registers `$0086DF` as a **dispatch helper** (see `bankNN.cfg`
+`# JSL inline dispatch trampolines` blocks; e.g. `bank03.cfg`). The decoder reads the
+inline table at compile time (`decoder.py` `dispatch_helpers`, stamps
+`insn.dispatch_entries`) and codegen emits a **direct static dispatch to the target**,
+marking the JSL a terminator. The dispatcher body therefore **never runs on the compiled
+side** — so its transient register/scratch side effects (`A` ends holding the jump-target
+address, `$00–$03` scratch) are **elided**. The interpreter runs the real routine, so it
+reproduces those values faithfully (matching hardware).
+
+Net: codegen is **control-flow-faithful and live-state-faithful, but not dead-scratch-
+faithful** at every `dispatch_helper` site. The interpret-floor is *more literal* than the
+optimized codegen; it surfaces the optimization, not a bug.
+
+### Proof it is dead / bounded (300-frame attract sweep)
+
+Compiled (bounce) vs interpret-everything, per-frame full-WRAM byte diff + framebuffer
+byte diff (`dumpram` + `dumpfb` at each checkpoint):
+
+- **Live WRAM: bit-exact** — 0 diffs outside the two dead zones, every frame.
+- **Framebuffer: bit-exact** — 0 / 172086 bytes, every frame.
+- The only persistent WRAM diffs are **dead dispatcher scratch `$0000–$0003`** and **dead
+  stack residue** (bytes below `S`, e.g. `$01F8–$01FF`), never read before being
+  overwritten.
+- One transient live byte, `$1DFF LastUsedMusic` (sound-engine bookkeeping; already a
+  known recomp-vs-oracle difference, `KOOPA_INVESTIGATION_NOTES.md`), flips by a frame due
+  to APU touch-pacing and **reconverges** — not a codegen effect.
+- The `ppu` sub-hash differs only because it is `ppu_saveload` of cycle-timing-derived
+  internal latches (the interp is not cycle-accurate → the known `pace` divergence);
+  **rendered pixels are identical**.
+
+Conclusion: the SMW codegen is **faithful for all live guest state and all rendered
+output**. The floor "divergence" is the static-dispatch optimization's dead-scratch gap
+plus the interp's non-cycle-accurate pacing — neither a correctness bug.
+
+### How to run the floor gate (mask the known-dead bytes)
+
+Compare live subsystems with the dead zones masked; expect a clean track (live WRAM +
+framebuffer bit-exact):
+
+```
+--compare ram,ppu,dma --ram-mask "0x0000-0x000F,0x0100-0x01FF"
+```
+
+Byte-level / framebuffer proof (more direct than the hash gate, and pace-immune) is the
+per-checkpoint `dumpram`+`dumpfb` diff, classifying diffs as live vs dead (`$00–$03` +
+stack page). That is the airtight faithfulness check for any game that uses the
+`$0086DF`-style dispatch-helper optimization.
+
+### Reproducing the dead scratch in codegen (NOT done — needs sign-off)
+
+Making the synthesized dispatch replay the dispatcher's `A`/`$00–$03` writes would make the
+floor literally bit-exact, but it **changes shipped SMW/HLE codegen** (the optimization is
+shared with the default HLE build), re-adds dead computation the optimization deliberately
+removed, is per-dispatcher-site work, and yields **zero live/visible benefit**. Deferred
+pending explicit sign-off; the documented mask is the accepted resolution.
+
+### Dev tooling added for this drill (dev-only, `#ifdef SNES_COSIM`)
+
+- `interp816.c`: always-on per-instruction ring (`pc, op, A-in/out, m/x`), dumped via the
+  new cosim server command `itrace <path> [n]`; plus `g_interp816_cur_pc` for the
+  `cpu_state.c` write-watch to name an interpreted store. Zero cost in shipped builds
+  (`SNES_COSIM` undefined).
