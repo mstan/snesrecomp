@@ -134,6 +134,17 @@ button.dim:hover { background-color: #141a24; border-color: #222a38; }
 .knob { display: block; width: 18dp; height: 18dp; border-radius: 9dp; background-color: #e6e9ef; margin: 3dp 0dp 0dp 3dp; }
 .switch.on .knob { margin-left: 23dp; }
 
+/* ---- rebind chips (keyboard bindings + hotkeys) ---- */
+.rb-row { display: flex; flex-direction: row; align-items: center; height: 30dp; margin-bottom: 4dp; }
+.rb-label { width: 92dp; flex: 0 0 92dp; color: #adbac7; font-size: 13dp; }
+.rb-label--wide { width: 200dp; flex: 0 0 200dp; }
+button.rb-chip { flex: 0 0 170dp; width: 170dp; padding: 5dp 8dp; font-size: 13dp;
+	text-align: center; margin-right: 18dp; }
+button.rb-chip.rb-chip--scan { border-color: #a78bfa; background-color: #2a2350; color: #a78bfa; }
+button.rb-x { flex: 0 0 28dp; width: 28dp; padding: 5dp 0dp; font-size: 12dp;
+	color: #6e7781; text-align: center; margin-right: 0dp; }
+button.rb-x:hover { color: #f85149; border-color: #5a2a2a; }
+
 /* focus ring — drawn for whichever control the gamepad/keyboard has focused */
 button:focus { border-color: #a78bfa; background-color: #222b3b; }
 .ddsel:focus { border-color: #a78bfa; }
@@ -231,7 +242,7 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 				</div>
 			</div>
 
-			<div class="panel">
+			<div class="panel" data-if="saves_supported">
 				<div class="eyebrow">SAVES</div>
 				<div class="rowline">
 					<div class="icon"></div>
@@ -276,6 +287,11 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 				<span class="help" data-if="msu1_note">{{msu1_note}}</span>
 			</div>
 		</div>
+		<div class="panel">
+			<div class="eyebrow">HOTKEYS</div>
+			<div id="hotkey-list"></div>
+			<span class="help">System shortcuts. Click a binding, then press the new key &#8212; hold Ctrl/Alt/Shift to include them (Esc cancels). &#10005; unbinds. Saved to config.ini's [KeyMap]. Save/load-state slots stay on F1&#8211;F10 / Shift+F1&#8211;F10.</span>
+		</div>
 	</div>
 
 	<!-- ================= CONTROLLER CONFIG ================= -->
@@ -284,7 +300,13 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 			<div class="eyebrow">CONTROLLER &#8212; PLAYER {{cfg_player_label}}</div>
 			<div class="set-row"><span class="set-lbl">Input source</span><button class="toggle" data-event-click="cfg_cycle_src"><span class="value">{{cfg_src_label}}</span></button></div>
 			<div class="set-row"><span class="set-lbl">Stick / d-pad deadzone</span><button data-event-click="cfg_dz_down">&#8722;</button><span class="value" style="margin: 0dp 12dp;">{{cfg_deadzone}}%</span><button data-event-click="cfg_dz_up">+</button></div>
-			<span class="help">Keyboard rebinding writes keybinds.ini. Deadzone applies to SDL gamepad sticks mapped to the d-pad.</span>
+			<span class="help">Deadzone applies to SDL gamepad sticks mapped to the d-pad.</span>
+		</div>
+		<div class="panel">
+			<div class="eyebrow">KEYBOARD BINDINGS &#8212; PLAYER {{cfg_player_label}}</div>
+			<div id="rebind-list"></div>
+			<div class="btn-row"><button data-event-click="rebind_reset">Reset to Defaults</button></div>
+			<span class="help">Click a binding, then press the new key (Esc cancels). Saved to keybinds.ini immediately; each player has its own set. Player 2 defaults to unbound.</span>
 		</div>
 	</div>
 

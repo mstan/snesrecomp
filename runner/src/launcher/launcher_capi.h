@@ -46,6 +46,10 @@ typedef struct SnesLauncherCGameInfo {
     const char*    msu1_note;          /* shown under MSU-1 settings (which patch) */
     const char*    msu1_patch_path;
     const char*    sram_path;          /* "saves/<title>.srm" (exe-anchored) for SAVES panel */
+    /* config.ini path the hotkey editor reads/writes ([KeyMap] section only,
+     * surgical edits). NULL => "config.ini" in cwd (exe-anchored by main).
+     * Games pass their --config override here so hotkey edits follow it. */
+    const char*    config_path;
 } SnesLauncherCGameInfo;
 
 // Returns: 0 = LAUNCH (boot out_rom_path with the edited *io),

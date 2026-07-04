@@ -103,6 +103,10 @@ struct GameInfo {
     bool        msu1_supported   = false;
     const char* msu1_note        = nullptr;  // e.g. "Audio-only 'SMW MSU-1' (t1436)"
     const char* msu1_patch_path  = nullptr;  // bundled .ips (null = no runtime patch)
+
+    // config.ini path for the Settings → Hotkeys editor ([KeyMap] section,
+    // surgical read-modify-write). Null => "config.ini" in cwd (exe-anchored).
+    const char* config_path      = nullptr;
 };
 
 // Run the launcher loop to completion. `gl_context` is an SDL_GLContext (void*)

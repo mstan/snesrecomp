@@ -16,6 +16,7 @@
 
 #include <SDL.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 extern "C" {
 #include "crc32.h"
 #include "sha256.h"
+#include "keybinds.h"
 }
 
 #ifdef _WIN32
@@ -206,6 +208,185 @@ bool msu_pack_present(const std::string& dir) {
 struct SrcOption { Rml::String value; Rml::String label; };
 
 // ----------------------------------------------------------------------------
+// Hotkey ([KeyMap]) model — the Settings → Hotkeys rebind editor.
+//
+// The system hotkeys live in config.ini's [KeyMap] section and are parsed by
+// each game's config.c with SDL *keycode* names ("Ctrl+r", "Tab"); the player
+// buttons live in keybinds.ini with SDL *scancode* names. The two capture
+// paths below must not be mixed up. The kKeyNameId hotkey set and the code
+// defaults are identical across all snesrecomp games, so this table is
+// engine-owned; `def` mirrors each game's kDefaultKbdControls entry (shown
+// when config.ini has no line for the key; empty = unbound).
+// ----------------------------------------------------------------------------
+
+struct HotkeyDef { const char* key; const char* label; const char* def; };
+const HotkeyDef kHotkeys[] = {
+    { "Fullscreen",     "Toggle fullscreen",       "Alt+Return" },
+    { "Reset",          "Reset game",              "Ctrl+R"     },
+    { "Pause",          "Pause",                   "Shift+P"    },
+    { "PauseDimmed",    "Pause (dimmed)",          "P"          },
+    { "Turbo",          "Turbo (fast-forward)",    "Tab"        },
+    { "WindowBigger",   "Window bigger",           ""           },
+    { "WindowSmaller",  "Window smaller",          ""           },
+    { "VolumeUp",       "Volume up",               ""           },
+    { "VolumeDown",     "Volume down",             ""           },
+    { "DisplayPerf",    "FPS / perf readout",      "F"          },
+    { "ToggleRenderer", "Toggle PPU renderer",     "R"          },
+};
+constexpr int kHotkeyCount = (int)(sizeof(kHotkeys) / sizeof(kHotkeys[0]));
+
+bool ieq(const std::string& a, const char* b) {
+    if (a.size() != std::strlen(b)) return false;
+    for (size_t i = 0; i < a.size(); i++)
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+// Does this line assign `key` (optionally commented out)? Mirrors config.c's
+// CfgLineIsKey so the editor replaces the same lines WriteConfigFile would.
+bool line_is_key(const std::string& line, const char* key) {
+    size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+    if (i < line.size() && line[i] == '#') {
+        i++;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+    }
+    size_t klen = std::strlen(key);
+    if (line.size() - i < klen) return false;
+    for (size_t k = 0; k < klen; k++)
+        if (tolower((unsigned char)line[i + k]) != tolower((unsigned char)key[k])) return false;
+    i += klen;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+    return i < line.size() && line[i] == '=';
+}
+
+std::vector<std::string> split_lines(const std::string& text) {
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t nl = text.find('\n', start);
+        if (nl == std::string::npos) {
+            if (start < text.size()) lines.push_back(text.substr(start));
+            break;
+        }
+        std::string l = text.substr(start, nl - start);
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        lines.push_back(l);
+        start = nl + 1;
+    }
+    return lines;
+}
+
+// Read the current [KeyMap] binding strings for every kHotkeys entry from
+// `path`. A key with no (uncommented) line keeps its built-in default.
+std::vector<std::string> hotkeys_read(const std::string& path) {
+    std::vector<std::string> vals;
+    for (int i = 0; i < kHotkeyCount; i++) vals.emplace_back(kHotkeys[i].def);
+
+    std::vector<uint8_t> raw = read_file(path);
+    if (raw.empty()) return vals;
+    std::string text((const char*)raw.data(), raw.size());
+
+    bool in_keymap = false;
+    for (const std::string& line : split_lines(text)) {
+        size_t i = line.find_first_not_of(" \t");
+        if (i == std::string::npos) continue;
+        if (line[i] == '#') continue;
+        if (line[i] == '[') {
+            size_t close = line.find(']', i);
+            std::string sec = line.substr(i + 1, close == std::string::npos ? std::string::npos : close - i - 1);
+            in_keymap = ieq(sec, "KeyMap");
+            continue;
+        }
+        if (!in_keymap) continue;
+        size_t eq = line.find('=', i);
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(i, eq - i);
+        while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
+        std::string v = line.substr(eq + 1);
+        size_t vs = v.find_first_not_of(" \t");
+        v = (vs == std::string::npos) ? "" : v.substr(vs);
+        size_t ce = v.find('#');                       // strip trailing comment
+        if (ce != std::string::npos) v = v.substr(0, ce);
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+        for (int h = 0; h < kHotkeyCount; h++)
+            if (ieq(k, kHotkeys[h].key)) { vals[h] = v; break; }
+    }
+    return vals;
+}
+
+// Surgically set `Key = value` inside [KeyMap] in `path`, preserving every
+// other line byte-for-byte. Replaces an existing (possibly commented) line for
+// the key, else inserts at the end of the section, else appends a new section.
+// An empty value writes "Key = " which config.c parses as "unbound" (and
+// suppresses the built-in default for that key).
+void hotkeys_write(const std::string& path, const char* key, const std::string& value) {
+    std::vector<uint8_t> raw = read_file(path);
+    std::string text((const char*)raw.data(), raw.size());
+    std::vector<std::string> lines = split_lines(text);
+
+    std::string assign = std::string(key) + " = " + value;
+
+    int keymap_start = -1, keymap_end = -1;   // [start, end) line range of the section body
+    for (int i = 0; i < (int)lines.size(); i++) {
+        size_t s = lines[i].find_first_not_of(" \t");
+        if (s == std::string::npos || lines[i][s] != '[') continue;
+        size_t close = lines[i].find(']', s);
+        std::string sec = lines[i].substr(s + 1, close == std::string::npos ? std::string::npos : close - s - 1);
+        if (keymap_start >= 0) { keymap_end = i; break; }
+        if (ieq(sec, "KeyMap")) keymap_start = i + 1;
+    }
+    if (keymap_start >= 0 && keymap_end < 0) keymap_end = (int)lines.size();
+
+    if (keymap_start < 0) {
+        if (!lines.empty() && !lines.back().empty()) lines.push_back("");
+        lines.push_back("[KeyMap]");
+        lines.push_back(assign);
+    } else {
+        int hit = -1;
+        for (int i = keymap_start; i < keymap_end; i++)
+            if (line_is_key(lines[i], key)) { hit = i; break; }
+        if (hit >= 0) {
+            lines[hit] = assign;
+        } else {
+            // Insert before the trailing blank lines of the section so the
+            // separation from the next [section] stays intact.
+            int at = keymap_end;
+            while (at > keymap_start && lines[at - 1].find_first_not_of(" \t") == std::string::npos)
+                at--;
+            lines.insert(lines.begin() + at, assign);
+        }
+    }
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "launcher: cannot write %s\n", path.c_str()); return; }
+    for (const std::string& l : lines) { std::fwrite(l.data(), 1, l.size(), f); std::fputc('\n', f); }
+    std::fclose(f);
+}
+
+// Format the SDL modifier state + keycode the way config.c's ParseKeyArray
+// reads it back ("Ctrl+Shift+F1"). Keycode names round-trip through
+// SDL_GetKeyFromName. Returns "" for a bare modifier press (keep scanning).
+std::string hotkey_capture_string(const SDL_Keysym& ks) {
+    switch (ks.sym) {
+        case SDLK_LSHIFT: case SDLK_RSHIFT:
+        case SDLK_LCTRL:  case SDLK_RCTRL:
+        case SDLK_LALT:   case SDLK_RALT:
+        case SDLK_LGUI:   case SDLK_RGUI:
+            return "";
+        default: break;
+    }
+    std::string s;
+    if (ks.mod & KMOD_CTRL)  s += "Ctrl+";
+    if (ks.mod & KMOD_ALT)   s += "Alt+";
+    if (ks.mod & KMOD_SHIFT) s += "Shift+";
+    const char* name = SDL_GetKeyName(ks.sym);
+    if (!name || !name[0]) return "";
+    s += name;
+    return s;
+}
+
+// ----------------------------------------------------------------------------
 // View model — every variable bound to the RML data model.
 // ----------------------------------------------------------------------------
 
@@ -239,6 +420,9 @@ struct Model {
     std::vector<SrcOption> p1_options, p2_options;
     Rml::String p1_src_value = "kbd", p2_src_value = "none";
 
+    // SAVES panel is hidden entirely for games with no battery SRAM
+    // (gi.sram_path == NULL, e.g. MMX — a password game).
+    bool saves_supported = false;
     bool save_found = false;
     Rml::String save_file = "(none)", save_size = "0 KB";
 
@@ -507,6 +691,7 @@ Result run(SDL_Window* window, void* /*gl_context*/,
 
     // SAVES panel + skip-launcher toggle (issues #3a / #5).
     std::string sram_path = game.sram_path ? game.sram_path : "";
+    m.saves_supported = !sram_path.empty();
     refresh_save_info(m, sram_path);
     m.skip_launcher = io.skip_launcher;
 
@@ -553,6 +738,7 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     c.Bind("p2_status", &m.p2_status);
     c.Bind("p1_enabled", &m.p1_enabled);
     c.Bind("p2_enabled", &m.p2_enabled);
+    c.Bind("saves_supported", &m.saves_supported);
     c.Bind("save_found", &m.save_found);
     c.Bind("save_file", &m.save_file);
     c.Bind("save_size", &m.save_size);
@@ -580,25 +766,131 @@ Result run(SDL_Window* window, void* /*gl_context*/,
 
     auto dirty_all = [&]() { handle.DirtyAllVariables(); };
 
+    // ---- keybind rebinding (player buttons + hotkeys) ----
+    // Player buttons edit keybinds.ini through the engine's keybinds module
+    // (scancodes; saved immediately on capture — the game reloads the file via
+    // keybinds_init after the launcher returns). Hotkeys surgically edit
+    // config.ini's [KeyMap] (keycode names; the game re-applies via
+    // ConfigReloadKeyMap after the launcher returns).
+    keybinds_init(NULL);   // cwd is exe-anchored; load current bindings now
+    const std::string config_path =
+        (game.config_path && game.config_path[0]) ? game.config_path : "config.ini";
+    std::vector<std::string> hotkey_vals = hotkeys_read(config_path);
+
+    enum class ScanKind { None, PlayerKey, Hotkey };
+    ScanKind    scan_kind = ScanKind::None;
+    int         scan_index = 0;          // button index (PlayerKey) or hotkey index
+    std::string scan_chip_id;
+
+    Rml::ElementDocument* doc = nullptr;             // assigned after LoadDocument
+    std::function<void()> build_player_list;         // assigned after doc loads
+    std::function<void()> build_hotkey_list;
+    // Chip click handlers must never rebuild the list they live in from inside
+    // their own dispatch (SetInnerRML would destroy the running listener), so
+    // rebuilds are deferred to the main loop via these flags.
+    bool rebuild_players_pending = false, rebuild_hotkeys_pending = false;
+
+    auto player_chip_label = [&](int button) -> std::string {
+        SDL_Scancode sc = keybinds_get_button(m.cfg_player + 1, button);
+        const char* n = (sc != SDL_SCANCODE_UNKNOWN) ? SDL_GetScancodeName(sc) : "";
+        return (n && n[0]) ? std::string(n) : std::string("None");
+    };
+    auto hotkey_chip_label = [&](int h) -> std::string {
+        return hotkey_vals[h].empty() ? std::string("None") : hotkey_vals[h];
+    };
+
+    // Restore the armed chip's label and disarm. Safe to call when idle.
+    auto end_scan = [&]() {
+        if (scan_kind == ScanKind::None) return;
+        if (doc) {
+            if (Rml::Element* e = doc->GetElementById(scan_chip_id)) {
+                e->SetInnerRML(scan_kind == ScanKind::PlayerKey
+                                   ? player_chip_label(scan_index)
+                                   : hotkey_chip_label(scan_index));
+                e->SetClass("rb-chip--scan", false);
+            }
+        }
+        scan_kind = ScanKind::None;
+        scan_chip_id.clear();
+    };
+
+    auto begin_scan = [&](ScanKind kind, int index, const std::string& chip_id) {
+        end_scan();   // one scan at a time
+        scan_kind = kind;
+        scan_index = index;
+        scan_chip_id = chip_id;
+        if (doc) {
+            if (Rml::Element* e = doc->GetElementById(chip_id)) {
+                e->SetInnerRML("Press a key...");
+                e->SetClass("rb-chip--scan", true);
+            }
+        }
+    };
+
+    // Resolve an armed scan against a keydown (called from the SDL loop, which
+    // swallows keyboard events while scanning; Esc cancels).
+    auto handle_scan_key = [&](const SDL_KeyboardEvent& ke) {
+        if (ke.keysym.sym == SDLK_ESCAPE) { end_scan(); return; }
+        if (scan_kind == ScanKind::PlayerKey) {
+            SDL_Scancode sc = ke.keysym.scancode;
+            // Steal: a key already bound to another button (either player)
+            // moves here instead of silently double-firing.
+            for (int p = 1; p <= 2; p++)
+                for (int b = 0; b < keybinds_button_count(); b++)
+                    if (keybinds_get_button(p, b) == sc &&
+                        !(p == m.cfg_player + 1 && b == scan_index))
+                        keybinds_set_button(p, b, SDL_SCANCODE_UNKNOWN);
+            keybinds_set_button(m.cfg_player + 1, scan_index, sc);
+            keybinds_save();
+            end_scan();
+            rebuild_players_pending = true;   // stolen chips refresh too
+        } else if (scan_kind == ScanKind::Hotkey) {
+            std::string s = hotkey_capture_string(ke.keysym);
+            if (s.empty()) return;   // bare modifier — keep scanning
+            for (int h = 0; h < kHotkeyCount; h++)   // steal duplicates
+                if (h != scan_index && ieq(hotkey_vals[h], s.c_str())) {
+                    hotkey_vals[h].clear();
+                    hotkeys_write(config_path, kHotkeys[h].key, "");
+                }
+            hotkey_vals[scan_index] = s;
+            hotkeys_write(config_path, kHotkeys[scan_index].key, s);
+            end_scan();
+            rebuild_hotkeys_pending = true;
+        }
+    };
+
     // ---- navigation ----
     c.BindEventCallback("show_dashboard", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+        end_scan();
         m.view = "dashboard"; dirty_all();
     });
     c.BindEventCallback("show_settings", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+        end_scan();
         m.view = "settings"; dirty_all();
     });
     c.BindEventCallback("msu1_settings", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+        end_scan();
         m.view = "settings"; dirty_all();
     });
     auto open_cfg = [&](int p) {
+        end_scan();
         m.cfg_player = p;
         m.cfg_player_label = p == 0 ? "1" : "2";
         m.cfg_src_label = src_label(io.player_src[p], p, m.pad_names);
         m.cfg_deadzone = io.deadzone[p];
+        rebuild_players_pending = true;   // chips show this player's bindings
         m.view = "controller"; dirty_all();
     };
     c.BindEventCallback("config_p1", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { open_cfg(0); });
     c.BindEventCallback("config_p2", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { open_cfg(1); });
+    // Reset the shown player's keyboard bindings to the built-in defaults
+    // (Player 2's default is all-unbound) and persist.
+    c.BindEventCallback("rebind_reset", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+        end_scan();
+        keybinds_reset_player(m.cfg_player + 1);
+        keybinds_save();
+        rebuild_players_pending = true;
+    });
 
     // ---- ROM ----
     c.BindEventCallback("change_rom", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
@@ -791,7 +1083,7 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         running = false;
     });
 
-    Rml::ElementDocument* doc = context->LoadDocument((assets / "launcher.rml").generic_string());
+    doc = context->LoadDocument((assets / "launcher.rml").generic_string());
     if (!doc) {
         std::fprintf(stderr, "launcher: failed to load launcher.rml — booting without launcher\n");
         Rml::Shutdown();
@@ -799,6 +1091,91 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         return Result::Unavailable;
     }
     doc->Show();
+
+    // ---- rebind chip lists (built programmatically, PSR-style) ----
+    // data-if only hides views, so the list containers exist from load; chips
+    // are (re)generated with SetInnerRML and re-wired each rebuild.
+    struct ClickListener : Rml::EventListener {
+        std::function<void()> on_click;
+        void ProcessEvent(Rml::Event&) override { if (on_click) on_click(); }
+    };
+    std::vector<std::unique_ptr<ClickListener>> player_chip_listeners;
+    std::vector<std::unique_ptr<ClickListener>> hotkey_chip_listeners;
+
+    build_player_list = [&]() {
+        Rml::Element* list = doc->GetElementById("rebind-list");
+        if (!list) return;
+        const int n = keybinds_button_count();
+        std::string rml;
+        for (int b = 0; b < n; b += 2) {   // two (label, chip) pairs per row
+            rml += "<div class=\"rb-row\">";
+            for (int k = b; k < b + 2 && k < n; k++) {
+                std::string pretty = keybinds_button_name(k);
+                if (!pretty.empty()) pretty[0] = (char)toupper((unsigned char)pretty[0]);
+                rml += "<span class=\"rb-label\">" + pretty + "</span>";
+                rml += "<button class=\"rb-chip\" id=\"kb-";
+                rml += keybinds_button_name(k);
+                rml += "\">" + player_chip_label(k) + "</button>";
+            }
+            rml += "</div>";
+        }
+        list->SetInnerRML(rml);   // destroys any previous chips first...
+        player_chip_listeners.clear();   // ...so dropping their listeners is safe
+        for (int k = 0; k < n; k++) {
+            const std::string id = std::string("kb-") + keybinds_button_name(k);
+            if (Rml::Element* e = doc->GetElementById(id)) {
+                auto lis = std::make_unique<ClickListener>();
+                lis->on_click = [&, k, id]() { begin_scan(ScanKind::PlayerKey, k, id); };
+                e->AddEventListener(Rml::EventId::Click, lis.get());
+                player_chip_listeners.push_back(std::move(lis));
+            }
+        }
+    };
+
+    build_hotkey_list = [&]() {
+        Rml::Element* list = doc->GetElementById("hotkey-list");
+        if (!list) return;
+        std::string rml;
+        for (int h = 0; h < kHotkeyCount; h++) {
+            rml += "<div class=\"rb-row\">";
+            rml += "<span class=\"rb-label rb-label--wide\">";
+            rml += kHotkeys[h].label;
+            rml += "</span>";
+            rml += "<button class=\"rb-chip\" id=\"hk-";
+            rml += kHotkeys[h].key;
+            rml += "\">" + hotkey_chip_label(h) + "</button>";
+            rml += "<button class=\"rb-x\" id=\"hkx-";
+            rml += kHotkeys[h].key;
+            rml += "\">&#10005;</button>";
+            rml += "</div>";
+        }
+        list->SetInnerRML(rml);
+        hotkey_chip_listeners.clear();
+        for (int h = 0; h < kHotkeyCount; h++) {
+            const std::string cid = std::string("hk-") + kHotkeys[h].key;
+            const std::string xid = std::string("hkx-") + kHotkeys[h].key;
+            if (Rml::Element* e = doc->GetElementById(cid)) {
+                auto lis = std::make_unique<ClickListener>();
+                lis->on_click = [&, h, cid]() { begin_scan(ScanKind::Hotkey, h, cid); };
+                e->AddEventListener(Rml::EventId::Click, lis.get());
+                hotkey_chip_listeners.push_back(std::move(lis));
+            }
+            if (Rml::Element* e = doc->GetElementById(xid)) {
+                auto lis = std::make_unique<ClickListener>();
+                lis->on_click = [&, h]() {
+                    end_scan();
+                    hotkey_vals[h].clear();
+                    hotkeys_write(config_path, kHotkeys[h].key, "");
+                    rebuild_hotkeys_pending = true;   // deferred: we're inside a chip's dispatch
+                };
+                e->AddEventListener(Rml::EventId::Click, lis.get());
+                hotkey_chip_listeners.push_back(std::move(lis));
+            }
+        }
+    };
+
+    build_player_list();
+    build_hotkey_list();
 
     // ---- populate the controller <select> dropdowns programmatically ----
     // RmlUi builds a select's options at parse time, so data-for can't generate
@@ -878,6 +1255,17 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) { result = Result::Quit; running = false; }
+            else if (scan_kind != ScanKind::None &&
+                     (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP ||
+                      ev.type == SDL_TEXTINPUT ||
+                      ev.type == SDL_CONTROLLERBUTTONDOWN ||
+                      ev.type == SDL_CONTROLLERAXISMOTION)) {
+                // A rebind scan is armed: swallow keyboard input (the next
+                // keydown resolves it; Esc cancels) and park controller nav so
+                // a pad press can't activate other controls mid-scan. Mouse
+                // stays live (clicking another chip re-arms cleanly).
+                if (ev.type == SDL_KEYDOWN) handle_scan_key(ev.key);
+            }
             else if (ev.type == SDL_WINDOWEVENT &&
                      (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                       ev.window.event == SDL_WINDOWEVENT_RESIZED)) {
@@ -895,6 +1283,10 @@ Result run(SDL_Window* window, void* /*gl_context*/,
                 RmlSDL::InputEventHandler(context, ev);
             }
         }
+
+        // Deferred chip-list rebuilds (set from chip handlers / scan capture).
+        if (rebuild_players_pending) { rebuild_players_pending = false; build_player_list(); }
+        if (rebuild_hotkeys_pending) { rebuild_hotkeys_pending = false; build_hotkey_list(); }
 
         context->Update();
 
@@ -990,6 +1382,7 @@ extern "C" int snes_launcher_run_window(const char* window_title,
     g.msu1_note = game->msu1_note;
     g.msu1_patch_path = game->msu1_patch_path;
     g.sram_path = game->sram_path;
+    g.config_path = game->config_path;
 
     Result r = run(win, ctx, s, g, assets_dir, initial_rom,
                    out_rom_path, out_rom_path_len);

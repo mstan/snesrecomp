@@ -22,31 +22,36 @@
  *   L/R (shoulders):   C / V
  */
 
-static KeyBinds s_binds = {
-    .p1 = {
-        .a      = SDL_SCANCODE_X,
-        .b      = SDL_SCANCODE_Z,
-        .x      = SDL_SCANCODE_S,
-        .y      = SDL_SCANCODE_A,
-        .l      = SDL_SCANCODE_C,
-        .r      = SDL_SCANCODE_V,
-        .start  = SDL_SCANCODE_RETURN,
-        .select = SDL_SCANCODE_RSHIFT,
-        .up     = SDL_SCANCODE_UP,
-        .down   = SDL_SCANCODE_DOWN,
-        .left   = SDL_SCANCODE_LEFT,
-        .right  = SDL_SCANCODE_RIGHT,
-    },
-    /* Player 2 unbound by default. Add bindings in the INI to enable. */
-    .p2 = {
-        .a = SDL_SCANCODE_UNKNOWN, .b = SDL_SCANCODE_UNKNOWN,
-        .x = SDL_SCANCODE_UNKNOWN, .y = SDL_SCANCODE_UNKNOWN,
-        .l = SDL_SCANCODE_UNKNOWN, .r = SDL_SCANCODE_UNKNOWN,
-        .start = SDL_SCANCODE_UNKNOWN, .select = SDL_SCANCODE_UNKNOWN,
-        .up    = SDL_SCANCODE_UNKNOWN, .down  = SDL_SCANCODE_UNKNOWN,
-        .left  = SDL_SCANCODE_UNKNOWN, .right = SDL_SCANCODE_UNKNOWN,
-    },
-};
+/* One literal for the default layout, shared by the boot state and the
+ * launcher's Reset-to-Defaults (keybinds_reset_player). */
+#define KEYBINDS_DEFAULTS { \
+    .p1 = { \
+        .a      = SDL_SCANCODE_X, \
+        .b      = SDL_SCANCODE_Z, \
+        .x      = SDL_SCANCODE_S, \
+        .y      = SDL_SCANCODE_A, \
+        .l      = SDL_SCANCODE_C, \
+        .r      = SDL_SCANCODE_V, \
+        .start  = SDL_SCANCODE_RETURN, \
+        .select = SDL_SCANCODE_RSHIFT, \
+        .up     = SDL_SCANCODE_UP, \
+        .down   = SDL_SCANCODE_DOWN, \
+        .left   = SDL_SCANCODE_LEFT, \
+        .right  = SDL_SCANCODE_RIGHT, \
+    }, \
+    /* Player 2 unbound by default. Add bindings in the INI to enable. */ \
+    .p2 = { \
+        .a = SDL_SCANCODE_UNKNOWN, .b = SDL_SCANCODE_UNKNOWN, \
+        .x = SDL_SCANCODE_UNKNOWN, .y = SDL_SCANCODE_UNKNOWN, \
+        .l = SDL_SCANCODE_UNKNOWN, .r = SDL_SCANCODE_UNKNOWN, \
+        .start = SDL_SCANCODE_UNKNOWN, .select = SDL_SCANCODE_UNKNOWN, \
+        .up    = SDL_SCANCODE_UNKNOWN, .down  = SDL_SCANCODE_UNKNOWN, \
+        .left  = SDL_SCANCODE_UNKNOWN, .right = SDL_SCANCODE_UNKNOWN, \
+    }, \
+}
+
+static KeyBinds s_binds = KEYBINDS_DEFAULTS;
+static const KeyBinds s_default_binds = KEYBINDS_DEFAULTS;
 
 typedef struct {
     const char *name;
@@ -156,7 +161,7 @@ static void write_defaults(const char *path) {
     write_player_section(f, "player1", &s_binds.p1);
     write_player_section(f, "player2", &s_binds.p2);
     fclose(f);
-    printf("[Keybinds] Generated %s\n", path);
+    printf("[Keybinds] Wrote %s\n", path);
 }
 
 static void load_ini(const char *path) {
@@ -215,6 +220,41 @@ void keybinds_init(const char *exe_path) {
 
 const KeyBinds *keybinds_get(void) {
     return &s_binds;
+}
+
+/* ── Rebind API (launcher Configure view) ────────────────────────────────── */
+
+int keybinds_button_count(void) {
+    return (int)(sizeof(s_buttons) / sizeof(s_buttons[0])) - 1;  /* minus NULL terminator */
+}
+
+const char *keybinds_button_name(int button) {
+    if (button < 0 || button >= keybinds_button_count()) return "?";
+    return s_buttons[button].name;
+}
+
+static PlayerBinds *player_binds(int player) {
+    return (player == 2) ? &s_binds.p2 : &s_binds.p1;
+}
+
+SDL_Scancode keybinds_get_button(int player, int button) {
+    if (button < 0 || button >= keybinds_button_count()) return SDL_SCANCODE_UNKNOWN;
+    return *(SDL_Scancode *)((char *)player_binds(player) + s_buttons[button].offset);
+}
+
+void keybinds_set_button(int player, int button, SDL_Scancode sc) {
+    if (button < 0 || button >= keybinds_button_count()) return;
+    *(SDL_Scancode *)((char *)player_binds(player) + s_buttons[button].offset) = sc;
+}
+
+void keybinds_reset_player(int player) {
+    *player_binds(player) = (player == 2) ? s_default_binds.p2 : s_default_binds.p1;
+}
+
+void keybinds_save(void) {
+    if (!s_ini_path[0])
+        strcpy(s_ini_path, "keybinds.ini");
+    write_defaults(s_ini_path);   /* writes the CURRENT s_binds, header included */
 }
 
 /* SNES joypad bitmask layout — matches $4218/$4219 (low/high byte) packing.

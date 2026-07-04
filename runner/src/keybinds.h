@@ -56,6 +56,21 @@ const KeyBinds *keybinds_get(void);
  * from the SDL keyboard state. See header docstring for bit layout. */
 uint16_t keybinds_read_player(const uint8_t *keys, int player);
 
+/* ── Rebind API (used by the launcher's Configure view) ──────────────────
+ * Buttons are indexed 0..keybinds_button_count()-1 in the fixed order
+ * a, b, x, y, l, r, start, select, up, down, left, right — the same order
+ * keybinds.ini writes them. Scancodes, NOT keycodes (keybinds.ini stores
+ * SDL scancode names; config.ini's [KeyMap] hotkeys use keycode names). */
+int          keybinds_button_count(void);
+const char  *keybinds_button_name(int button);              /* "a".."right" */
+SDL_Scancode keybinds_get_button(int player, int button);   /* player 1|2 */
+void         keybinds_set_button(int player, int button, SDL_Scancode sc);
+/* Reset one player's bindings to the built-in defaults (P2 = all unbound). */
+void         keybinds_reset_player(int player);
+/* Persist the current bindings to keybinds.ini (same path keybinds_init
+ * resolved; call keybinds_init first). */
+void         keybinds_save(void);
+
 #ifdef __cplusplus
 }
 #endif
