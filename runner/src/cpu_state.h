@@ -443,10 +443,16 @@ typedef struct DispatchEntry {
      *   0 = M0X0, 1 = M0X1, 2 = M1X0, 3 = M1X1.
      * NULL = variant not emitted; cpu_dispatch_pc returns NORMAL. */
     RecompReturn (*variant[4])(CpuState *);
+    /* Bytes embedded after a JSR/JSL and consumed by this callee.  The
+     * interpreter bridge uses this to resume a bounced call at the same
+     * continuation the decoder selected for compiled callers. */
+    uint8 inline_arg_bytes;
 } DispatchEntry;
 
 extern const DispatchEntry g_dispatch_table[];
 extern const unsigned       g_dispatch_table_count;
+
+uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24);
 
 /* Dispatch on a popped trampoline target.
  * `entry_s_for_miss_restore`: on lookup MISS, cpu->S is set to this
@@ -473,6 +479,14 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
  * in g_dispatch_log. Emitted by codegen _emit_runtime_dispatch. */
 RecompReturn cpu_dispatch_call_pc(CpuState *cpu, uint32 pc24,
                                   uint32 source_pc24);
+/* Paired runtime-pointer call whose 2/3-byte hardware return frame is already
+ * on cpu->S (e.g. PHK; PEA <ret-1>; JML [ptr]). Runs an AOT target when
+ * available, otherwise interprets only the callee until it consumes that
+ * frame. The generated caller then resumes its compiled continuation. */
+RecompReturn cpu_dispatch_call_pc_pushed(CpuState *cpu, uint32 pc24,
+                                         uint32 source_pc24,
+                                         uint8 frame_size,
+                                         uint32 *return_pc24);
 
 /* Paired-call dispatch for the interpreter bridge AOT-bounce (cpu_state.c): the
  * interp already pushed the frame_size-byte return frame; run the target's live
@@ -530,6 +544,10 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
  * tier-2 gap manifest (kind=dispatch). */
 RecompReturn interp_tier_run_call(CpuState *cpu, uint32 target_pc24,
                                   uint32 source_pc24);
+RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32 target_pc24,
+                                        uint32 source_pc24,
+                                        uint8 frame_size,
+                                        uint32 *return_pc24);
 /* Phase-4 (opt-in) bank-miss tier-down: the body emitted for a cross-ROM-bank
  * function the static pass couldn't translate (unresolved_stubs_v2.c). Runs
  * the real ROM bytes at addr_pc24 instead of the no-op trap; bail -> the same
@@ -562,6 +580,7 @@ RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32 addr_pc24,
 #define RECOMP_RETURN_LLE_UNWIND_BASE 0x40000000
 int interp_bridge_in_lle_scheduler(void);
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24);
+uint32 interp_bridge_lle_resume_pc(void);
 
 /* Focused OAM-overflow observability recorders (debug_server.c).
  * dbg_rts_trace is emitted by the RTS/RTL lowering; dbg_oam_block_trace

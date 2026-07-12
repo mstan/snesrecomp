@@ -48,6 +48,13 @@ int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24);
 int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
                                 uint32_t yield_pc, uint16_t flag_addr);
 
+/* General infinite-loop driver.  This is the scheduler helper with an
+ * explicit byte value for games whose vblank wait flag is asserted while
+ * waiting (Super Metroid), rather than cleared after a slot walk (MMX). */
+int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
+                           uint32_t yield_pc, uint16_t flag_addr,
+                           uint8_t flag_value);
+
 /* Save-state task resume: interpret a suspended cooperative task from its
  * recorded yield return address (an arbitrary mid-function guest PC; the
  * caller restores the task's CpuState first). Calls bounce to compiled bodies

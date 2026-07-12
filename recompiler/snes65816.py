@@ -48,7 +48,10 @@ class Insn:
     __slots__ = ('addr', 'opcode', 'mnem', 'mode', 'operand', 'length',
                  'dispatch_entries', 'dispatch_kind', 'dispatch_idx_reg',
                  'dispatch_table_bases', 'm_flag', 'x_flag', 'dispatch_terminal',
-                 'dispatch_call', 'dispatch_local_goto', 'dispatch_runtime',
+                 'dispatch_call', 'dispatch_pushed_call',
+                 'dispatch_pushed_call_frame_size',
+                 'dispatch_return_pc', 'dispatch_return_m', 'dispatch_return_x',
+                 'dispatch_local_goto', 'dispatch_runtime',
                  'const_z_fold_unconditional', 'const_z_fold_dead_pc24')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
@@ -73,6 +76,14 @@ class Insn:
         # indirect call that falls through to the next block. See cfg_loader
         # `ptrcall` + codegen _emit_indirect_dispatch.
         self.dispatch_call = False
+        # PHK; PEA <ret-1>; JML [ptr] variant: a 3-byte return frame is
+        # already on the guest stack and dispatch_return_pc names the compiled
+        # continuation to resume after the dynamic callee consumes it.
+        self.dispatch_pushed_call = False
+        self.dispatch_pushed_call_frame_size = 0
+        self.dispatch_return_pc = None
+        self.dispatch_return_m = None
+        self.dispatch_return_x = None
         # Absolute-indirect dispatch that jumps to labels inside the current
         # decoded function, not to standalone handler functions.
         self.dispatch_local_goto = False

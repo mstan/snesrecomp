@@ -498,6 +498,32 @@ RecompReturn cpu_dispatch_call_pc(CpuState *cpu, uint32 pc24,
     return interp_tier_run_call(cpu, pc24, source_pc24);
 }
 
+RecompReturn cpu_dispatch_call_pc_pushed(CpuState *cpu, uint32 pc24,
+                                         uint32 source_pc24,
+                                         uint8 frame_size,
+                                         uint32 *return_pc24) {
+    pc24 &= 0xFFFFFFu;
+    source_pc24 &= 0xFFFFFFu;
+    unsigned mx_idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+    int via_mirror = 0;
+    RecompReturn (*fp)(CpuState *) = _cpu_dispatch_lookup(cpu, pc24);
+    if (fp == NULL) {
+        uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+        if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
+            fp = _cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u);
+            if (fp != NULL) via_mirror = 1;
+        }
+    }
+    _dispatch_log_record(pc24, source_pc24, mx_idx, fp != NULL, via_mirror);
+    if (fp != NULL) {
+        cpu->host_return_valid = frame_size;
+        RecompReturn r = fp(cpu);
+        return r;
+    }
+    return interp_tier_run_call_frame(cpu, pc24, source_pc24, frame_size,
+                                      return_pc24);
+}
+
 /* Paired-call dispatch for the interpreter bridge's AOT-bounce (interp_bridge.c).
  * The interpreter has ALREADY pushed the call's return frame (frame_size bytes:
  * JSR/JSR(abs,X)=2, JSL=3) onto cpu->S and set in.pc to the target. Run the
@@ -542,6 +568,25 @@ int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24) {
     uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
     if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0))
         if (_cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u) != NULL) return 1;
+    return 0;
+}
+
+uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24) {
+    pc24 &= 0xFFFFFFu;
+    for (int pass = 0; pass < 2; pass++) {
+        unsigned lo = 0, hi = g_dispatch_table_count;
+        while (lo < hi) {
+            unsigned mid = lo + (hi - lo) / 2;
+            uint32 mid_pc = g_dispatch_table[mid].pc24;
+            if (mid_pc < pc24) lo = mid + 1;
+            else if (mid_pc > pc24) hi = mid;
+            else return g_dispatch_table[mid].inline_arg_bytes;
+        }
+        uint8 bank = (uint8)(pc24 >> 16);
+        if (pass || !((bank < 0x40) || (bank >= 0x80 && bank < 0xC0)))
+            break;
+        pc24 ^= 0x800000u;
+    }
     return 0;
 }
 

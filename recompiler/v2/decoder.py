@@ -1938,9 +1938,48 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
         # that inlined this dispatch.
         if (insn.mnem in ('JMP', 'JML')
                 and insn.mode in (INDIR, INDIR_X)):
-            graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
             if hle_dispatch and (pc & 0xFFFF) in hle_dispatch:
+                helper = hle_dispatch[pc & 0xFFFF]
+                # Reserved balanced-interpreter sites may use either hardware
+                # dynamic-call idiom:
+                #   PEA <ret-1>; JMP (ptr)       (2-byte RTS frame)
+                #   PHK; PEA <ret-1>; JML [ptr] (3-byte RTL frame)
+                # The dynamic callee consumes the already-pushed frame and
+                # compiled execution resumes at the PEA destination.
+                pushed_call_size = 0
+                if helper == '__balanced_interp__' and rom is not None:
+                    try:
+                        pea = lorom_offset(bank, (pc - 3) & 0xFFFF)
+                        if (pea + 2 < len(rom) and rom[pea] == 0xF4):
+                            pushed_call_size = 2
+                            try:
+                                phk = lorom_offset(bank, (pc - 4) & 0xFFFF)
+                                if phk < len(rom) and rom[phk] == 0x4B:
+                                    pushed_call_size = 3
+                            except AssertionError:
+                                pass
+                    except AssertionError:
+                        pushed_call_size = 0
+                if pushed_call_size:
+                    site_m = insn.m_flag & 1
+                    site_x = insn.x_flag & 1
+                    nxt = _pea_ptrcall_return_pc(
+                        rom, bank, pc, (pc + insn.length) & 0xFFFF)
+                    nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
+                    insn.dispatch_pushed_call = True
+                    insn.dispatch_pushed_call_frame_size = pushed_call_size
+                    insn.dispatch_return_pc = nxt
+                    insn.dispatch_return_m = site_m
+                    insn.dispatch_return_x = site_x
+                    graph.insns[key] = DecodedInsn(
+                        key=key, insn=insn, successors=[nxt_key])
+                    if nxt_key not in graph.insns:
+                        worklist.append((nxt_key, 'fall', pc))
+                else:
+                    graph.insns[key] = DecodedInsn(
+                        key=key, insn=insn, successors=[])
                 continue
+            graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=[])
             graph.unresolved_indirects.append(UnresolvedIndirect(
                 site_pc24=(bank << 16) | pc,
                 mnem=insn.mnem,

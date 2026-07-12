@@ -517,6 +517,13 @@ def emit_function(rom: bytes, bank: int, start: int,
             f"  cpu_trace_func_entry(cpu, 0x{pc24:06X}, \"{variant_name}\");",
             "  uint16 _entry_s = cpu->S;",
             "  uint8 _hrv = cpu->host_return_valid;",
+            "  uint32 _host_return_pc24 = 0xFFFFFFFFu;",
+            "  if (_hrv == 2) {",
+            "    uint16 _host_rpcl = cpu_read8(cpu, 0x00, (uint16)(_entry_s + 1u));",
+            "    uint16 _host_rpch = cpu_read8(cpu, 0x00, (uint16)(_entry_s + 2u));",
+            "    _host_return_pc24 = ((uint32)cpu->PB << 16) |",
+            "        (uint16)((((_host_rpch << 8) | _host_rpcl) + 1u) & 0xFFFFu);",
+            "  }",
             f"  cpu_trace_block(cpu, 0x{pc24:06X});",
             "  WatchdogCheck();",
             "  if (!RtlUploadSpcImageFromDp(cpu)) {",
@@ -533,7 +540,7 @@ def emit_function(rom: bytes, bank: int, start: int,
             "#if SNESRECOMP_TRACE",
             f"    dbg_rts_trace(cpu, 0x{pc24:06x}u, _entry_s, _ret_s, _rpc24, (uint8)_hrv);",
             "#endif",
-            "    if (_hrv && _ret_s == _entry_s) {",
+            "    if (_hrv == 2 && _ret_s == _entry_s && _rpc24 == _host_return_pc24) {",
             "      RecompStackPop();",
             "      return RECOMP_RETURN_NORMAL;  /* HLE RTS host return */ }",
             "    if (_ret_s != _entry_s && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
@@ -1654,13 +1661,91 @@ def emit_function(rom: bytes, bank: int, start: int,
                         site_pc16 = site_pc24 & 0xFFFF
                         if hle_dispatch and site_pc16 in hle_dispatch:
                             c_helper = hle_dispatch[site_pc16]
-                            lines.append(
-                                f"{{ extern RecompReturn {c_helper}(CpuState *cpu); "
-                                f"RecompReturn _r = {c_helper}(cpu); "
-                                f"RecompStackPop(); return _r; }} "
-                                f"/* hle_dispatch ${site_pc24:06X} — "
-                                f"host-side dispatcher */"
-                            )
+                            if c_helper == '__balanced_interp__':
+                                if getattr(insn, 'dispatch_pushed_call', False):
+                                    ptr = insn.operand & 0xFFFF
+                                    ret_pc = insn.dispatch_return_pc & 0xFFFF
+                                    frame_size = getattr(
+                                        insn, 'dispatch_pushed_call_frame_size', 3)
+                                    return_m = getattr(
+                                        insn, 'dispatch_return_m', key.m)
+                                    return_x = getattr(
+                                        insn, 'dispatch_return_x', key.x)
+                                    ret_key = DecodeKey(
+                                        (bank << 16) | ret_pc,
+                                        return_m, return_x, ())
+                                    lines.append(
+                                        f"{{ /* balanced pushed indirect "
+                                        f"{'long' if frame_size == 3 else 'near'} call */")
+                                    lines.append(
+                                        f"  uint16 _disp_lo = cpu_read16(cpu, 0x00, 0x{ptr:04x});")
+                                    if frame_size == 3:
+                                        lines.append(
+                                            f"  uint8 _disp_bank = cpu_read8(cpu, 0x00, 0x{(ptr + 2) & 0xFFFF:04x});")
+                                        target_expr = "((uint32)_disp_bank << 16) | _disp_lo"
+                                    else:
+                                        target_expr = "((uint32)cpu->PB << 16) | _disp_lo"
+                                    lines.append(
+                                        f"  uint32 _disp_ret = 0x{((bank << 16) | ret_pc):06x}u;")
+                                    lines.append(
+                                        f"  RecompReturn _disp_r = cpu_dispatch_call_pc_pushed(cpu, "
+                                        f"{target_expr}, "
+                                        f"0x{site_pc24:06x}u, {frame_size}, &_disp_ret);")
+                                    lines.append("  if (_disp_r != RECOMP_RETURN_NORMAL) {")
+                                    lines.append(
+                                        "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_disp_r, 0);")
+                                    lines.append(
+                                        "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
+                                    lines.append(
+                                        "    RecompStackPop(); return (RecompReturn)((int)_disp_r - 1);")
+                                    lines.append("  }")
+                                    # The live PB may be a LoROM mirror of the
+                                    # generated physical bank (e.g. A3 vs 23).
+                                    # Continuations are labels in this function,
+                                    # so select by PC16 after the callee returns.
+                                    lines.append("  switch (_disp_ret & 0xFFFFu) {")
+                                    return_labels = {}
+                                    for dest in block_order:
+                                        if (dest.m == return_m and
+                                                dest.x == return_x):
+                                            return_labels.setdefault(
+                                                dest.pc & 0xFFFFFF, _label_for(dest))
+                                    for ret_addr, ret_label in sorted(return_labels.items()):
+                                        lines.append(
+                                            f"    case 0x{ret_addr & 0xFFFF:04x}u: goto {ret_label};")
+                                    lines.append("    default:")
+                                    lines.append(
+                                        f"      (void)cpu_trace_dispatch_oob(cpu, "
+                                        f"0x{site_pc24:06x}u, _disp_ret);")
+                                    lines.append(
+                                        f"      RecompStackPop(); return "
+                                        f"cpu_unresolved_abandon_balanced(cpu, "
+                                        f"0x{site_pc24:06x}u, _entry_s, _hrv);")
+                                    lines.append("  }")
+                                    lines.append("}")
+                                    lines.append(
+                                        f"goto {_label_for(ret_key)}; "
+                                        f"/* unreachable fallback for C compiler */")
+                                else:
+                                    # Generic terminal form: interpret the
+                                    # target and enclosing continuation until
+                                    # this function returns past _entry_s.
+                                    lines.append(
+                                        f"(void)cpu_trace_dispatch_oob(cpu, "
+                                        f"0x{site_pc24:06x}, 0xFFFF);")
+                                    lines.append(
+                                        f"{{ RecompReturn _r = interp_tier_dispatch_balanced(cpu, "
+                                        f"0x{site_pc24:06x}u, 0x{site_pc24:06x}u, "
+                                        f"_entry_s, _hrv); RecompStackPop(); return _r; }} "
+                                        f"/* balanced_interp_dispatch */")
+                            else:
+                                lines.append(
+                                    f"{{ extern RecompReturn {c_helper}(CpuState *cpu); "
+                                    f"RecompReturn _r = {c_helper}(cpu); "
+                                    f"RecompStackPop(); return _r; }} "
+                                    f"/* hle_dispatch ${site_pc24:06X} — "
+                                    f"host-side dispatcher */"
+                                )
                         else:
                             # Account the hit, then abandon this invocation
                             # balanced (discard locals below _entry_s, pop
@@ -1853,8 +1938,17 @@ def emit_function(rom: bytes, bank: int, start: int,
     src.append(f'  if (cpu_take_tailcall_return_context(&_entry_s, &_hrv)) {{')
     src.append(f'    cpu->host_return_valid = _hrv;')
     src.append(f'  }}')
+    src.append(f'  uint32 _host_return_pc24 = 0xFFFFFFFFu;')
+    src.append(f'  if (_hrv == 2 || _hrv == 3) {{')
+    src.append(f'    uint16 _host_rpcl = cpu_read8(cpu, 0x00, (uint16)(_entry_s + 1u));')
+    src.append(f'    uint16 _host_rpch = cpu_read8(cpu, 0x00, (uint16)(_entry_s + 2u));')
+    src.append(f'    uint8 _host_rpb = (_hrv == 3) ? cpu_read8(cpu, 0x00, (uint16)(_entry_s + 3u)) : cpu->PB;')
+    src.append(f'    _host_return_pc24 = ((uint32)_host_rpb << 16) |')
+    src.append(f'        (uint16)((((_host_rpch << 8) | _host_rpcl) + 1u) & 0xFFFFu);')
+    src.append(f'  }}')
     src.append(f'  (void)_entry_s;  /* used by trampoline balance check */')
     src.append(f'  (void)_hrv;')
+    src.append(f'  (void)_host_return_pc24;')
     # Record this frame's entry-S parallel to the recomp call stack so a
     # return-to-ancestor RTS (manual PLA/PLX/PLB rebalance + RTS) can be
     # resolved to a SKIP_N non-local return (cpu_resolve_ancestor_skip).

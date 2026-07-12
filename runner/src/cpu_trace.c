@@ -1685,9 +1685,14 @@ RecompReturn cpu_trace_unresolved_stub_trap(
     if (g_unresolved_stub_hit_count < UNRESOLVED_STUB_TRAP_MAX) {
         hit_idx = g_unresolved_stub_hit_count++;
     } else {
-        fprintf(stderr,
-                "[UNRESOLVED-STUB TRAP - slots full] target=$%06X func='%s'\n",
-                target_pc24, func_name ? func_name : "?");
+        static int s_slots_full_reported;
+        if (!s_slots_full_reported) {
+            s_slots_full_reported = 1;
+            fprintf(stderr,
+                    "[UNRESOLVED-STUB TRAP - slots full; further hits suppressed] "
+                    "target=$%06X func='%s'\n",
+                    target_pc24, func_name ? func_name : "?");
+        }
         return RECOMP_RETURN_NORMAL;
     }
     UnresolvedStubHit *h = &g_unresolved_stub_hits[hit_idx];

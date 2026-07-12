@@ -171,8 +171,10 @@ int interp816_opcode_hook(uint32_t addr) { (void)addr; return 0; }
 static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
+static uint32_t s_lle_resume_pc24   = 0;
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
+uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     (void)cpu;
@@ -206,6 +208,22 @@ static int lle_yield_bounce_enabled(void) {
         v = (e && e[0]) ? (e[0] != '0') : SNESRECOMP_LLE_BOUNCE_DEFAULT;
     }
     return v;
+}
+
+/* Target-scoped LLE differential: keep the rich scheduler/AOT bounce enabled
+ * globally while forcing one suspect call through the byte interpreter.
+ * Value is a hex PC24 (LoROM mirrors compare equal). */
+static int lle_bounce_target_excluded(uint32_t target_pc24) {
+    static int s_init;
+    static uint32_t s_target = 0xFFFFFFFFu;
+    if (!s_init) {
+        const char *v = getenv("SNESRECOMP_LLE_INTERP_TARGET");
+        if (v && *v)
+            s_target = (uint32_t)strtoul(v, NULL, 16) & 0xFFFFFFu;
+        s_init = 1;
+    }
+    return s_target != 0xFFFFFFFFu &&
+           (target_pc24 & 0x7FFFFFu) == (s_target & 0x7FFFFFu);
 }
 
 /* Safety cap: a coverage gap must never wedge the host in an unbounded loop.
@@ -282,7 +300,9 @@ static uint8_t tier2_entry_mx(const CpuState *cpu);
  * the is_ret watermark on the first task RTS. */
 static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  uint16_t s_exit, uint32_t *out_landing,
+                                 uint32_t *out_return_pc,
                                  uint32_t yield_pc, uint16_t yield_flag_addr,
+                                 uint8_t yield_flag_value,
                                  int reset_cap_on_bounce,
                                  const uint32_t *stop_pcs, int n_stop) {
     /* Local interpreter context → nesting (an AOT bounce that itself traps and
@@ -320,6 +340,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     }
 
     const int trace = itrace_enabled();
+    static int dtrace = -1;
+    if (dtrace < 0)
+        dtrace = getenv("SNESRECOMP_INTERP_DTRACE") ? 1 : 0;
     ITraceEnt head[8], ring[256];
     long itn = 0;
 
@@ -344,11 +367,85 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * loop back in bank $00 while yield_pc is given as $80:80A1, so an exact
          * compare never matches — the interp spins the vblank wait to the step
          * cap and bails (JP boot froze here at Task0 state=3). */
-        if (yield_pc && (pc_before & 0x7FFFFF) == (yield_pc & 0x7FFFFF) &&
-            bridge_bus_read(cpu, yield_flag_addr) == 0) {
-            sync_interp_to_cpu(&in, cpu);
-            bridge_apu_flush(cpu);
-            return 1;
+        /* Secondary cooperative hardware polls.  SM uses both
+         *   LDA abs; BMI/BPL -5
+         *   BIT abs; BMI/BPL -5
+         * while NMI/IRQ asynchronously changes bit 15. */
+        const uint8_t _poll_op = bridge_bus_read(cpu, pc_before);
+        const uint8_t _poll_branch = bridge_bus_read(cpu, pc_before + 3);
+        const uint16_t _poll_pc16 = (uint16_t)pc_before;
+        const int _secondary_poll_pc =
+            _poll_pc16 == 0xE06B || _poll_pc16 == 0xE50D ||
+            _poll_pc16 == 0xE526;
+        if (yield_pc && _secondary_poll_pc &&
+            (_poll_op == 0xAD || _poll_op == 0x2C) &&
+            (_poll_branch == 0x30 || _poll_branch == 0x10) &&
+            bridge_bus_read(cpu, pc_before + 4) == 0xFB) {
+            const uint16_t _wait_addr = (uint16_t)(
+                bridge_bus_read(cpu, pc_before + 1) |
+                (bridge_bus_read(cpu, pc_before + 2) << 8));
+            const int _negative =
+                (cpu_read16(cpu, in.db, _wait_addr) & 0x8000u) != 0;
+            const int _branch_taken =
+                _poll_branch == 0x30 ? _negative : !_negative;
+            if (_branch_taken) {
+                s_lle_resume_pc24 = pc_before;
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+        }
+        if (yield_pc && (pc_before & 0x7FFFFF) == (yield_pc & 0x7FFFFF)) {
+            const uint8_t _yield_flag = bridge_bus_read(cpu, yield_flag_addr);
+            /* Canonical byte wait loop: LDA <flag>; BNE -5.  A synthetic
+             * scheduler resume can arrive with DB/M inherited from a compiled
+             * coroutine rather than the PHK/PLB + SEP prologue that precedes
+             * this loop in ROM.  When the real low flag is clear, repair the
+             * instruction-local state before executing LDA; otherwise a
+             * 16-bit or foreign-bank read can see an adjacent nonzero byte and
+             * spin to the step cap.  Match the bytes and operand so this is a
+             * reusable loop contract, not a game/address special case. */
+            const int _canonical_wait_loop =
+                bridge_bus_read(cpu, pc_before) == 0xAD &&
+                bridge_bus_read(cpu, pc_before + 1) ==
+                    (uint8_t)yield_flag_addr &&
+                bridge_bus_read(cpu, pc_before + 2) ==
+                    (uint8_t)(yield_flag_addr >> 8) &&
+                bridge_bus_read(cpu, pc_before + 3) == 0xD0 &&
+                bridge_bus_read(cpu, pc_before + 4) == 0xFB;
+            if (_yield_flag != yield_flag_value && _canonical_wait_loop) {
+                in.mf = 1;
+                in.db = in.k;
+            }
+            if (getenv("SNESRECOMP_YIELD_DIAG") &&
+                _yield_flag != yield_flag_value && steps > 16) {
+                static int _yield_diag_n;
+                if (_yield_diag_n < 64) {
+                    _yield_diag_n++;
+                    fprintf(stderr,
+                            "[yield_diag] pc=$%06X flag=$%02X want=$%02X "
+                            "m=%u x=%u db=$%02X sp=$%04X a=$%04X z=%u\n",
+                            (unsigned)pc_before, _yield_flag,
+                            yield_flag_value, in.mf, in.xf, in.db, in.sp,
+                            in.a, in.z);
+                }
+            }
+            if (_yield_flag == yield_flag_value) {
+                s_lle_resume_pc24 = pc_before;
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+            /* If the validated wait loop recurs after normal execution had a
+             * chance to leave it, treat that recurrence as the cooperative
+             * block point.  This contains a stale/corrupt flag without a
+             * multi-million-instruction spin; the next host frame injects NMI
+             * and resumes through the same architectural contract. */
+            if (_canonical_wait_loop && steps > 16) {
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
         }
         /* Stop-PC intercept (task-resume mode): JMP/BRA arrival at a PC whose
          * real asm is incompatible with interpretation (fiber-HLE'd machinery
@@ -382,10 +479,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         (int)in.e, (int)in.c, (unsigned)in.sp);
             }
         }
-        if (trace) {
+        {
             ITraceEnt _e = { pc_before, op };
             if (itn < 8) head[itn] = _e;
-            ring[itn & 255] = _e;
+            if (trace) ring[itn & 255] = _e;
             itn++;
         }
 
@@ -395,7 +492,18 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         const int call_len = (op == 0x22) ? 4 : 3;
         const int is_ret   = (op == 0x60 || op == 0x6B);
 
+        const uint16_t dp_before = in.dp;
+        const uint16_t sp_before = in.sp;
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
+        if (dtrace && in.dp != dp_before) {
+            extern int snes_frame_counter;
+            fprintf(stderr,
+                    "[interp_d] f=%d pc=$%06X op=$%02X D=$%04X->$%04X "
+                    "S=$%04X->$%04X\n",
+                    snes_frame_counter, (unsigned)pc_before, (unsigned)op,
+                    (unsigned)dp_before, (unsigned)in.dp,
+                    (unsigned)sp_before, (unsigned)in.sp);
+        }
 
         /* Guest-time-anchored APU: advance the guest clock + SPC by this opcode's
          * cycles, so the SPC runs continuously during interpreted code (its IPL
@@ -460,7 +568,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
              * brings control back here, where we resume interpreting the real
              * coroutine switch. SNESRECOMP_LLE_BOUNCE=0 restores the
              * interpret-everything behavior (A/B differential lever). */
-            const int bounce_ok = (!yield_pc || lle_yield_bounce_enabled());
+            const int bounce_ok =
+                (!yield_pc || lle_yield_bounce_enabled()) &&
+                !lle_bounce_target_excluded(target);
             const int has_body  = cpu_dispatch_has_entry(cpu, target);
             if (bounce_ok && has_body) {
                 /* Paired-call ABI: the interp already pushed the return frame, so
@@ -512,6 +622,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 if (_air != RECOMP_RETURN_NORMAL) {
                     if (s_lle_unwind_active) {
                         if (yield_pc) {
+                            if (getenv("SNESRECOMP_YIELD_STACK_DIAG") &&
+                                snes_frame_counter >= 5390) {
+                                fprintf(stderr,
+                                        "[yield_stack] frame=%d bounce=$%06X "
+                                        "sp_pre=$%04X sp_unwind=$%04X "
+                                        "resume=$%06X\n",
+                                        snes_frame_counter, (unsigned)target,
+                                        (unsigned)_sp_pre, (unsigned)in.sp,
+                                        (unsigned)s_lle_unwind_pc24);
+                            }
                             /* Fiber-free yield: the bounced body reached a
                              * yield primitive; its stub unwound the host
                              * stack to here. Consume the request and resume
@@ -558,7 +678,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     sync_interp_to_cpu(&in, cpu);
                     return 1;
                 }
-                const uint32_t ret = (pc_before + (uint32_t)call_len) & 0xFFFFFF;
+                const uint32_t ret =
+                    (pc_before + (uint32_t)call_len +
+                     (uint32_t)cpu_dispatch_inline_arg_bytes(target)) & 0xFFFFFF;
                 in.k  = (uint8)((ret >> 16) & 0xFF);
                 in.pc = (uint16)(ret & 0xFFFF);
                 /* Resume-task mode: a successful bounce is forward progress
@@ -591,6 +713,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         (unsigned)s_enter, (int)((uint16_t)in.sp > s_enter));
             if ((uint16_t)in.sp > s_enter) {
                 /* The interpreted routine returned past its entry depth. */
+                if (out_return_pc)
+                    *out_return_pc = ((uint32_t)in.k << 16) | in.pc;
                 sync_interp_to_cpu(&in, cpu);
                 bridge_apu_flush(cpu);
                 return 1;
@@ -600,6 +724,25 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
 
     /* Step cap hit — contained bail. Sync so observable state is consistent;
      * the caller treats a 0 return as "gap not cleanly resolved". */
+    {
+        static int s_cap_reports;
+        if (s_cap_reports < 32) {
+            const uint32_t last_pc = ((uint32_t)in.k << 16) | in.pc;
+            s_cap_reports++;
+            fprintf(stderr,
+                    "[interp_cap] entry=$%06X last=$%06X op=$%02X "
+                    "m=%u x=%u db=$%02X sp=$%04X a=$%04X flag=$%02X\n",
+                    (unsigned)entry_pc24, (unsigned)last_pc,
+                    bridge_bus_read(cpu, last_pc), in.mf, in.xf, in.db,
+                    in.sp, in.a,
+                    yield_pc ? bridge_bus_read(cpu, yield_flag_addr) : 0);
+            fprintf(stderr, "[interp_cap] head:");
+            for (int hi = 0; hi < 8 && hi < itn; hi++)
+                fprintf(stderr, " $%06X/%02X", (unsigned)head[hi].pc,
+                        head[hi].op);
+            fputc('\n', stderr);
+        }
+    }
     if (trace) itrace_dump(entry_pc24, head, (int)(itn < 8 ? itn : 8), ring, itn);
     sync_interp_to_cpu(&in, cpu);
     bridge_apu_flush(cpu);
@@ -611,7 +754,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
  * estimate — the core advances the SPC per opcode instead. */
 static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
                                  uint16_t s_exit, uint32_t *out_landing,
+                                 uint32_t *out_return_pc,
                                  uint32_t yield_pc, uint16_t yield_flag_addr,
+                                 uint8_t yield_flag_value,
                                  int reset_cap_on_bounce,
                                  const uint32_t *stop_pcs, int n_stop) {
     int _saved = g_interp_apu_driving;
@@ -622,8 +767,10 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
 #endif
     g_interp_apu_driving = 1;
     if (yield_pc) s_lle_sched_depth++;
-    int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing, yield_pc,
-                              yield_flag_addr, reset_cap_on_bounce, stop_pcs, n_stop);
+    int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
+                              out_return_pc, yield_pc,
+                              yield_flag_addr, yield_flag_value,
+                              reset_cap_on_bounce, stop_pcs, n_stop);
     if (yield_pc) {
         s_lle_sched_depth--;
         /* A pending yield unwind must have been consumed by this frame's
@@ -643,7 +790,7 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
 /* Public entry: exit watermark = the current stack depth (the routine is
  * entered balanced at cpu->S). */
 int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24) {
-    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, 0, 0, 0, NULL, 0);
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL, 0, 0, 0, 0, NULL, 0);
 }
 
 /* Save-state task resume: interpret a suspended task from its recorded yield
@@ -656,7 +803,7 @@ int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24) {
 int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
                               uint16_t task_base_s,
                               const uint32_t *stop_pcs, int n_stop) {
-    return interp_bridge_run_ex2(cpu, resume_pc24, task_base_s, NULL, 0, 0, 1, stop_pcs, n_stop);
+    return interp_bridge_run_ex2(cpu, resume_pc24, task_base_s, NULL, NULL, 0, 0, 0, 1, stop_pcs, n_stop);
 }
 
 /* Faithful LLE of an infinite cooperative-scheduler loop: run the real guest
@@ -667,7 +814,14 @@ int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
  * ROM code. Returns 1 on clean yield, 0 on step-cap bail. */
 int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
                                 uint32_t yield_pc, uint16_t flag_addr) {
-    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, yield_pc, flag_addr, 0, NULL, 0);
+    return interp_bridge_run_loop(cpu, entry_pc24, yield_pc, flag_addr, 0);
+}
+
+int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
+                           uint32_t yield_pc, uint16_t flag_addr,
+                           uint8_t flag_value) {
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL, yield_pc,
+                                 flag_addr, flag_value, 0, NULL, 0);
 }
 
 /* ── tier-down entry (called from generated indirect-dispatch defaults) ───── */
@@ -803,7 +957,7 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
-    int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s, &landing, 0, 0, 0, NULL, 0);
+    int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s, &landing, NULL, 0, 0, 0, 0, NULL, 0);
     /* For an indirect goto the recorded target is where the JMP actually
      * resolved (the dynamically computed entry); for a dispatch default the
      * passed target already IS the entry. */
@@ -828,22 +982,30 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
  * the caller still falls through balanced. Either way return NORMAL — this
  * is a CALL, not a tail dispatch, so it never abandons the caller. Recorded
  * in the tier-2 gap manifest (kind=dispatch) for the worklist. */
-RecompReturn interp_tier_run_call(CpuState *cpu, uint32_t target_pc24,
-                                  uint32_t source_pc24) {
+RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
+                                        uint32_t source_pc24,
+                                        uint8_t frame_size,
+                                        uint32_t *return_pc24) {
     target_pc24 &= 0xFFFFFF;
     source_pc24 &= 0xFFFFFF;
     interp_tier_note(target_pc24);
     const uint8_t mx = tier2_entry_mx(cpu);
     const uint16_t watermark = cpu->S;
-    const uint16_t post_call = (uint16_t)(cpu->S + 2);
+    const uint16_t post_call = (uint16_t)(cpu->S + frame_size);
     uint32_t landing = target_pc24;
-    int ok = interp_bridge_run_ex2(cpu, target_pc24, watermark, &landing, 0, 0, 0, NULL, 0);
+    int ok = interp_bridge_run_ex2(cpu, target_pc24, watermark, &landing,
+                                   return_pc24, 0, 0, 0, 0, NULL, 0);
     tier2_record(source_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
     if (s_lle_unwind_active)   /* yield unwound through this nested frame */
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
     if (!ok)
         cpu->S = post_call;  /* bail: discard the unconsumed JSR frame */
     return RECOMP_RETURN_NORMAL;
+}
+
+RecompReturn interp_tier_run_call(CpuState *cpu, uint32_t target_pc24,
+                                  uint32_t source_pc24) {
+    return interp_tier_run_call_frame(cpu, target_pc24, source_pc24, 2, NULL);
 }
 
 /* Phase-4 bank-miss tier-down (opt-in). The generated stub for an untranslated
@@ -857,7 +1019,7 @@ RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32_t addr_pc24,
     interp_tier_note(addr_pc24);
     const uint8_t mx = tier2_entry_mx(cpu);
     uint32_t landing = addr_pc24;
-    int ok = interp_bridge_run_ex2(cpu, addr_pc24, entry_s, &landing, 0, 0, 0, NULL, 0);
+    int ok = interp_bridge_run_ex2(cpu, addr_pc24, entry_s, &landing, NULL, 0, 0, 0, 0, NULL, 0);
     tier2_record(addr_pc24, addr_pc24, mx, TIER2_KIND_BANK_MISS, ok);
     if (s_lle_unwind_active)   /* yield unwound through this nested frame */
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
