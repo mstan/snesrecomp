@@ -111,16 +111,17 @@ drillable to the exact opcode with `SNES_COSIM_SYNC_PC`. Gates:
 1. A-vs-A determinism (bounced) — 0 divergence.
 2. Bounced vs interpreted — cpu/ram/ppu bit-exact over title + attract + demo.
 3. Live: full-speed, clean render, multiple restarts (the wall-time race class).
-4. Then flip defaults per variant (`MMX_SCHED_LLE_DEFAULT=1` + immediate ports
-   becomes the build default) — USER SIGN-OFF required before changing USA's shipped
-   default; HLE stays available via env until removal is approved.
+4. Then flip the shared execution-mode default per game. HLE stays available
+   through the shared override only as an optimization of the same LLE machine
+   semantics until removal is approved.
 
 ## Also required for "LLE everywhere"
 
-- **Immediate APU ports under LLE** (deferred scheduling stalls interp'd handshakes —
-  the JP gate-#3 / USA copyright-freeze class). When LLE becomes a build's default,
-  `SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT=1` goes with it. The SMW missed-SFX deferred
-  path remains the default for HLE builds only.
+- **Immediate APU ports** are shared hardware semantics, not a scheduler-tier
+  or region hint. Deferred wall-time scheduling stalls interpreted and compiled
+  handshakes (the JP gate-#3 / USA runtime-upload class), so immediate visibility
+  is the engine default. `SNESRECOMP_APU_IMMEDIATE_PORTS=0` retains the old
+  scheduler solely as an explicit legacy/audio experiment.
 - **JP cfg enrichment**: JP is minimal; grow it toward rich with the tier-2 gap
   manifest + `tools/tier2_ingest.py` worklist once bounce is enabled (bounce is what
   makes the manifest see un-compiled task callees as tier-downs).

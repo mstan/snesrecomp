@@ -22,20 +22,14 @@ typedef struct Timer {
   bool enabled;
 } Timer;
 
-/* CPU->APU port write, scheduled in APU-sample time.
+/* CPU->APU port write, ordered in APU-sample time.
  *
- * Why a queue: the audio thread advances the SPC in whole-callback
- * bursts (~534 samples at a time) while the CPU writes ports at wall
- * time. Mutating inPorts at wall time compresses each value's lifetime
- * to however many samples happen to be produced between two writes —
- * measured at ~9 samples for SMW's one-frame sound commands whenever
- * the NMI (60.0988 Hz) and audio-callback (60.00 Hz) phases cross,
- * which is less than one engine poll period (64 samples): the engine
- * provably never sees the command and the sound is silently dropped,
- * in beating ~10 s runs. Scheduling each write at a fixed horizon on
- * the consumption clock restores the hardware-faithful timeline: in
- * the SPC's own execution time, consecutive frame writes stay a full
- * frame (~534 samples) apart regardless of burst alignment. */
+ * The queue serializes CPU writes with the audio thread, which advances the
+ * SPC in callback-sized bursts. The correctness path targets the current
+ * produced-sample clock, making writes visible at the APU's present execution
+ * point just as the hardware bus does. A legacy diagnostic path may assign
+ * later targets to study host/audio pacing, but delayed wall-time scheduling
+ * is not part of the guest machine model. */
 /* Power of 2. SMW peaks at ~4 writes/frame at 1x, but under turbo the
  * uncapped game thread schedules many frames of writes into the bounded
  * latency window faster than the 1x SPC drains them, and the per-port

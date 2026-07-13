@@ -874,27 +874,18 @@ void RtlApuWrite(uint16 adr, uint8 val) {
     static uint64_t s_port_last_target[4];
     static uint8_t  s_port_last_val[4];
     static uint8_t  s_port_last_valid[4];
-    /* DIAGNOSTIC OVERRIDE (audio hunt, env-gated): apply port writes at the
-     * produced clock immediately — hardware-like microsecond visibility —
-     * bypassing the wall-ns spacing and the min-dwell floor. For A/B-ing
-     * whether the ~1-frame scheduled apply latency is what corrupts
-     * handshake-protocol drivers (MMX ack round-trips). Off = shipping path. */
-    /* Default off (shipping path = deferred, the SMW/MMX missed-SFX fix).
-     * A build may default it ON via SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT:
-     * the Rockman X JP variant does, because its boot runs under the interp
-     * tier and the IPL upload is a tight CPU-write -> SPC-echo -> CPU-poll
-     * handshake that the ~1-frame deferred apply latency stalls (co-sim +
-     * live: JP hung at $78bb until immediate ports let the upload complete
-     * -> title screen). USA keeps the deferred default (audio unchanged).
-     * The env var still overrides either way. */
-#ifndef SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT
-#define SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT 0
-#endif
+    /* Hardware visibility is the correctness default: a CPU port write lands
+     * at the APU's current execution point. Delaying it according to host wall
+     * time is not an LLE property and breaks real write -> echo -> poll
+     * protocols (MMX's runtime SPC upload used to spend >5 seconds in one
+     * faithfully recompiled polling loop). Keep the deferred scheduler below
+     * only as an explicit legacy/audio experiment selected with
+     * SNESRECOMP_APU_IMMEDIATE_PORTS=0; it must not be a per-game or per-region
+     * compile-time correctness hint. */
     static int s_immediate = -1;
     if (s_immediate < 0) {
       const char *e = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
-      s_immediate = (e && e[0]) ? (e[0] != '0')
-                                : SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT;
+      s_immediate = (e && e[0]) ? (e[0] != '0') : 1;
 #ifdef SNES_COSIM
       /* Shared APU clock implies immediate ports: the deferred scheduler
        * anchors targets to the co-sim virtual wall clock, which derives from

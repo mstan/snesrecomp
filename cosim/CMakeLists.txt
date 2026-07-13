@@ -196,7 +196,6 @@ target_compile_definitions(rmx_cosim PRIVATE
     SDL_MAIN_HANDLED
     MMX_VARIANT_JP=1
     MMX_SCHED_LLE_DEFAULT=1
-    SNESRECOMP_APU_IMMEDIATE_PORTS_DEFAULT=1
     SNESRECOMP_LLE_BOUNCE_DEFAULT=0   # match shipping JP: interpret-everything
                                       # until the cfg matures (see game CMake)
 )
