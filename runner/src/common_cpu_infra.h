@@ -30,8 +30,8 @@ void WatchdogCheck(void);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
-/* Always-on stack-balance auditor (see common_cpu_infra.c): reports
- * functions that return with cpu->S != their entry S (unbalanced push/pull). */
+/* Always-on stack-balance auditor (see common_cpu_infra.c): reports stack
+ * movement beyond consumption of the caller's materialized JSR/JSL frame. */
 void RecompStackBalDumpStderr(int topn);
 void RecompStackBalDumpJson(FILE *f);
 /* Always-on unresolved-abandon hit table (see cpu_unresolved_abandon_balanced

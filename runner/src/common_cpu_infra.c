@@ -77,6 +77,9 @@ int g_recomp_stack_top = 0;
  * decrement contract. See ISSUES.md "shared-tail multi-level non-local
  * return" (the fish-explosion OAM wipe). */
 uint16_t g_cpu_entry_s[RECOMP_STACK_DEPTH];
+/* Expected positive S delta when a generated callee consumes the hardware
+ * return frame that its generated caller pushed. */
+static uint8_t g_cpu_entry_return_frame[RECOMP_STACK_DEPTH];
 static uint8_t g_tailcall_context_valid;
 static uint16_t g_tailcall_entry_s;
 static uint8_t g_tailcall_hrv;
@@ -254,8 +257,14 @@ const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
 }
 
 void RecompStackPush(const char *name) {
-  if (g_recomp_stack_top < RECOMP_STACK_DEPTH)
-    g_recomp_stack[g_recomp_stack_top++] = name;
+  if (g_recomp_stack_top < RECOMP_STACK_DEPTH) {
+    int slot = g_recomp_stack_top++;
+    g_recomp_stack[slot] = name;
+    g_cpu_entry_return_frame[slot] =
+        (g_cpu.host_return_valid == 2 || g_cpu.host_return_valid == 3)
+            ? g_cpu.host_return_valid
+            : 0;
+  }
   g_last_recomp_func = name;
   debug_server_profile_push(name);
   // Boundary auditor (always-on; no-op when SNESRECOMP_TRACE=0).
@@ -369,7 +378,9 @@ void RecompStackPop(void) {
   // empty stack: the auditor must NOT consume an entry_seq it didn't push.
   if (g_recomp_stack_top > 0) {
     const char *fn = g_recomp_stack[g_recomp_stack_top - 1];
-    int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[g_recomp_stack_top - 1]);
+    int slot = g_recomp_stack_top - 1;
+    int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
+                (int)g_cpu_entry_return_frame[slot];
     StackBalEntry *e = stackbal_find(fn);
     if (e) {
       e->calls++;
