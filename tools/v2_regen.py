@@ -2021,12 +2021,12 @@ def main() -> int:
     cumulative_trampoline_returns: set = set()
     cumulative_rejected_calls: set = set()
 
-    # Emit-truth variant prune state. `valid_variants_map` is the
-    # per-target survivor set fed to codegen (empty on full-regeneration
-    # pass 0 => emit all four). With --banks partial regen, seed it from
-    # generated definitions for skipped banks so regenerated callers do
-    # not reference variant symbols that the preserved sources do not
-    # actually define.
+    # Variant-demand state. `valid_variants_map` is the per-target set fed to
+    # codegen. Seed it from the analysis-discovered cfg entries BEFORE first
+    # emission; an empty map historically meant "emit all four", causing each
+    # ordinary M1X1 call to manufacture three unresolved demands that were then
+    # auto-promoted as dead M/X bodies. Preserved partial-build definitions are
+    # immutable roots and override entries at the same address.
     preserved_valid_variants = _scan_skipped_bank_valid_variants(
         out_dir, parsed, only_banks)
     if preserved_valid_variants:
@@ -2059,8 +2059,8 @@ def main() -> int:
                   f"{len(partial_link_demands)} variant demand(s) from "
                   f"skipped source link refs "
                   f"({len(promoted)} promoted)")
-    valid_variants_map: dict = dict(preserved_valid_variants)
-    set_valid_variants(valid_variants_map)
+    valid_variants_map = _apply_variant_prune(
+        parsed, set(), preserved_valid_variants)
     # `cumulative_dirty_variants` accumulates every variant whose body
     # emitted a stub marker; `cumulative_pruned` is the set actually
     # dropped (dirty non-canonical clones with a clean canonical sibling).

@@ -54,6 +54,7 @@ TEST_MODULES = [
     'test_exit_mx_autoroute',
     'test_prune_unresolved_indirect_goto',
     'test_atomic_output',
+    'test_variant_demand',
 ]
 
 
