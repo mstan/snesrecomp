@@ -172,6 +172,8 @@ static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+static uint32_t s_lle_bounce_exclusions[16];
+static size_t   s_lle_bounce_exclusion_count;
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
@@ -187,6 +189,17 @@ RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     s_lle_unwind_active = 1;
     s_lle_unwind_pc24   = resume_pc24 & 0xFFFFFFu;
     return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
+}
+
+void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
+                                              size_t count) {
+    if (count > sizeof(s_lle_bounce_exclusions) /
+                    sizeof(s_lle_bounce_exclusions[0]))
+        count = sizeof(s_lle_bounce_exclusions) /
+                sizeof(s_lle_bounce_exclusions[0]);
+    s_lle_bounce_exclusion_count = count;
+    for (size_t i = 0; i < count; i++)
+        s_lle_bounce_exclusions[i] = targets[i] & 0xFFFFFFu;
 }
 
 /* Yield-mode bounce switch. Env SNESRECOMP_LLE_BOUNCE overrides; the build
@@ -222,8 +235,15 @@ static int lle_bounce_target_excluded(uint32_t target_pc24) {
             s_target = (uint32_t)strtoul(v, NULL, 16) & 0xFFFFFFu;
         s_init = 1;
     }
-    return s_target != 0xFFFFFFFFu &&
-           (target_pc24 & 0x7FFFFFu) == (s_target & 0x7FFFFFu);
+    if (s_target != 0xFFFFFFFFu &&
+        (target_pc24 & 0x7FFFFFu) == (s_target & 0x7FFFFFu))
+        return 1;
+    for (size_t i = 0; i < s_lle_bounce_exclusion_count; i++) {
+        if ((target_pc24 & 0x7FFFFFu) ==
+            (s_lle_bounce_exclusions[i] & 0x7FFFFFu))
+            return 1;
+    }
+    return 0;
 }
 
 /* Safety cap: a coverage gap must never wedge the host in an unbounded loop.
@@ -375,7 +395,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         const uint8_t _poll_branch = bridge_bus_read(cpu, pc_before + 3);
         const uint16_t _poll_pc16 = (uint16_t)pc_before;
         const int _secondary_poll_pc =
-            _poll_pc16 == 0xE06B || _poll_pc16 == 0xE50D ||
+            _poll_pc16 == 0xE02C || _poll_pc16 == 0xE06B ||
+            _poll_pc16 == 0xE50D || _poll_pc16 == 0xE609 ||
             _poll_pc16 == 0xE526;
         if (yield_pc && _secondary_poll_pc &&
             (_poll_op == 0xAD || _poll_op == 0x2C) &&

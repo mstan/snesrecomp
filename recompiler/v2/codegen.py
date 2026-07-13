@@ -2187,11 +2187,7 @@ def _emit_return(op: Return) -> List[str]:
         "#if SNESRECOMP_TRACE",
         f"  dbg_rts_trace(cpu, 0x{src24:06x}u, _entry_s, _ret_s, _rpc24, (uint8)_hrv);",
         "#endif",
-        f"  if (_hrv == {frame_sz} && _ret_s == _entry_s &&",
-        "      _rpc24 != _host_return_pc24 && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
-        f"    return interp_tier_dispatch_balanced(cpu, _rpc24, 0x{src24:06x}u, cpu->S, 0);",
-        "  }",
-        f"  if (_hrv == {frame_sz} && _ret_s == _entry_s && _rpc24 == _host_return_pc24) {{",
+        f"  if (_hrv == {frame_sz} && _ret_s == _entry_s) {{",
         f"    return RECOMP_RETURN_NORMAL;  /* {label_inner} host return */ }}",
         # Return-to-ancestor (multi-level non-local return). When the stack
         # was manually rebalanced shallower than this frame's entry
