@@ -474,6 +474,7 @@ def _compute_prunable(dirty_variants: set, emitted_variants: set,
 # keeps defs from matching. Intra-function labels are `goto L_..._MmXx;`
 # (no `(cpu)`) and carry no cross-variant link dependency.
 _VARIANT_CALL_RE = re.compile(r'([A-Za-z_]\w*)_M([01])X([01])\(cpu\)')
+_VARIANT_SYMBOL_RE = re.compile(r'\b([A-Za-z_]\w*)_M([01])X([01])\b')
 _SYNTHETIC_NAME_RE = re.compile(r'^bank_([0-9A-Fa-f]{2})_([0-9A-Fa-f]{4})$')
 # The runtime-(m,x) dispatch switch — `switch (((cpu->m_flag & 1) << 1)
 # | (cpu->x_flag & 1)) { case 0: _r = Foo_M0X0(cpu); ... }` — references
@@ -587,6 +588,58 @@ def _variant_ref_targets(refs: dict) -> set:
     targets: set = set()
     for ts in refs.values():
         targets |= ts
+    return targets
+
+
+def _variant_id(variant) -> str:
+    addr, em, ex = variant
+    return f"${addr:06X}/M{em}X{ex}"
+
+
+def _reject_partial_root_prune(candidates: set, link_roots: set,
+                               phase: str) -> None:
+    """Enforce the preserved-source link contract during partial regen."""
+    conflicts = candidates & link_roots
+    if not conflicts:
+        return
+    names = sorted(_variant_id(v) for v in conflicts)
+    raise RuntimeError(
+        f"partial regeneration attempted to {phase} preserved-bank "
+        f"link root(s): {names}")
+
+
+def _scan_link_variant_targets(results, parsed) -> set:
+    """Return every generated variant symbol referenced by ``results``.
+
+    This is deliberately broader than :func:`_scan_variant_refs`.  The
+    reference-taint graph needs an owning, decoded function body and excludes
+    alias wrappers and runtime dispatch cases for semantic reasons.  A partial
+    regeneration has a simpler link-time contract: *every* call expression in
+    a preserved source file must still resolve after the selected banks are
+    regenerated.  That includes calls made by alias wrappers, synthetic
+    callers absent from the cfg, and runtime M/X dispatch cases.
+
+    The broad symbol match also covers function-pointer initializers and
+    declarations. Definitions in a preserved bank resolve back to that same
+    preserved bank and are harmless; the caller later filters roots to the
+    bank or banks selected for regeneration.
+    """
+    name_to_addr = _build_name_to_pc24(parsed)
+    targets: set = set()
+    for result in results:
+        if result.get('status') != 'ok':
+            continue
+        for match in _VARIANT_SYMBOL_RE.finditer(result.get('src', '')):
+            base = match.group(1)
+            synthetic = _SYNTHETIC_NAME_RE.match(base)
+            if synthetic:
+                addr = ((int(synthetic.group(1), 16) << 16)
+                        | int(synthetic.group(2), 16))
+            else:
+                addr = name_to_addr.get(base)
+            if addr is None:
+                continue
+            targets.add((addr, int(match.group(2)), int(match.group(3))))
     return targets
 
 
@@ -1870,17 +1923,15 @@ def main() -> int:
               f"definition(s) from skipped bank sources")
     skipped_bank_results = _read_skipped_bank_results(out_dir, only_banks)
     skipped_ref_graph = _scan_variant_refs(skipped_bank_results, parsed)
-    skipped_link_ref_graph = _scan_variant_refs(
-        skipped_bank_results, parsed, include_dispatch_cases=True)
-    skipped_link_targets = _variant_ref_targets(skipped_link_ref_graph)
+    skipped_link_targets = _scan_link_variant_targets(
+        skipped_bank_results, parsed)
     skipped_dirty_variants, skipped_emitted_variants = _scan_dirty_variants(
         skipped_bank_results, parsed)
     if skipped_bank_results:
         ref_count = sum(len(v) for v in skipped_ref_graph.values())
-        link_ref_count = sum(len(v) for v in skipped_link_ref_graph.values())
         print(f"  --banks filter active; scanned {len(skipped_bank_results)} "
               f"skipped bank source(s), {ref_count} direct ref(s), "
-              f"{link_ref_count} link ref(s), "
+              f"{len(skipped_link_targets)} link target(s), "
               f"{len(skipped_dirty_variants)} dirty variant marker(s)")
     if only_banks is not None and skipped_link_targets:
         partial_link_demands = {
@@ -2104,6 +2155,8 @@ def main() -> int:
             canonical_variants, protected_variants)
         newly_pruned = prunable - cumulative_pruned
         if newly_pruned:
+            _reject_partial_root_prune(
+                newly_pruned, skipped_link_targets, "prune")
             cumulative_pruned |= newly_pruned
             valid_variants_map = _apply_variant_prune(
                 parsed, cumulative_pruned, preserved_valid_variants)
@@ -2174,6 +2227,8 @@ def main() -> int:
                 ref_prunable |= next_ref_prunable
             if not ref_prunable:
                 break
+            _reject_partial_root_prune(
+                ref_prunable, skipped_link_targets, "reference-prune")
             # ── Rolling fixpoint snapshot (offline-replay / fast test loop) ──
             # Dump THIS pass's exact prune inputs before applying the drop,
             # keeping only the last RT_SNAP_WINDOW. Each file is a resumable

@@ -1201,10 +1201,15 @@ def emit_function(rom: bytes, bank: int, start: int,
             tail_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
             from v2.codegen import (register_call_demand,
                                      resolve_variant_for_target)
+            # Record the architectural boundary state before routing this
+            # pass to a currently available survivor.  Registering only the
+            # survivor makes variant discovery circular: a missing live
+            # variant can never be promoted because every request for it is
+            # rewritten to the already-emitted fallback first.
+            register_call_demand(tail_pc24, target.m, target.x)
             sib_m, sib_x = resolve_variant_for_target(
                 tail_pc24, target.m, target.x)
             sib_suffix = _variant_suffix(sib_m, sib_x)
-            register_call_demand(tail_pc24, sib_m, sib_x)
             return _tail_call_stmt(
                 f"{tail_call_target_name}{sib_suffix}(cpu)",
                 f"/* tail_call into sibling fn at ${target.pc & 0xFFFF:04X} "
@@ -1240,10 +1245,10 @@ def emit_function(rom: bytes, bank: int, start: int,
                                  resolve_variant_for_target)
         sibling_name = get_name_for_pc(target_pc24)
         if sibling_name is not None:
+            register_call_demand(target_pc24, target.m, target.x)
             sib_m, sib_x = resolve_variant_for_target(
                 target_pc24, target.m, target.x)
             sib_suffix = _variant_suffix(sib_m, sib_x)
-            register_call_demand(target_pc24, sib_m, sib_x)
             return _tail_call_stmt(
                 f"{sibling_name}{sib_suffix}(cpu)",
                 f"/* tail-call past end: into {sibling_name}{sib_suffix} "
@@ -1532,11 +1537,11 @@ def emit_function(rom: bytes, bank: int, start: int,
                                     resolve_variant_for_target)
                                 tgt_name = get_name_for_pc(target_pc24)
                                 if tgt_name is not None:
+                                    register_call_demand(target_pc24,
+                                                         jml_m, jml_x)
                                     sib_m, sib_x = resolve_variant_for_target(
                                         target_pc24, jml_m, jml_x)
                                     sib_suffix = _variant_suffix(sib_m, sib_x)
-                                    register_call_demand(target_pc24,
-                                                          sib_m, sib_x)
                                     tgt_bank = (target_pc24 >> 16) & 0xFF
                                     # JML changes PB on real hardware
                                     # (the destination bank byte becomes
@@ -1620,10 +1625,10 @@ def emit_function(rom: bytes, bank: int, start: int,
                                         f"followed garbage operand past an "
                                         f"RTS) */")
                                 else:
+                                    register_call_demand(target_pc24,
+                                                         jml_m, jml_x)
                                     sib_m, sib_x = resolve_variant_for_target(
                                         target_pc24, jml_m, jml_x)
-                                    register_call_demand(target_pc24,
-                                                          sib_m, sib_x)
                                     sib_suffix = _variant_suffix(sib_m, sib_x)
                                     tgt_bank = (target_pc24 >> 16) & 0xFF
                                     tgt16 = target_pc24 & 0xFFFF

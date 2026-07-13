@@ -494,6 +494,43 @@ def test_dirty_noncanonical_direct_ref_does_not_protect_target_variant():
     assert (target, 0, 0) in prunable
 
 
+def test_partial_link_scan_includes_alias_and_unknown_synthetic_callers():
+    """Preserved sources are link inputs, not merely decoded CFG bodies.
+
+    Alias wrappers and synthetic callers missing from the current cfg are
+    intentionally absent from the semantic reference-taint graph, but their
+    calls still become linker relocations and must root regenerated variants.
+    """
+    parsed = _make_parsed()
+    src = "\n".join([
+        "void PreservedAlias(CpuState *cpu) {",
+        "  Dungeon_TryScreenEdgeTransition_M0X0(cpu);",
+        "}",
+        "RecompReturn bank_00_9000_M1X1(CpuState *cpu) {",
+        "  bank_02_A2A9_M1X1(cpu);",
+        "}",
+        "static RecompFunc preserved_ptr = bank_02_B2D4_M0X1;",
+    ])
+    results = [{'status': 'ok', 'bank': 0x00, 'src': src}]
+    targets = v2_regen._scan_link_variant_targets(results, parsed)
+    assert ((0x02 << 16) | 0x885E, 0, 0) in targets
+    assert ((0x02 << 16) | 0xA2A9, 1, 1) in targets
+    assert ((0x02 << 16) | 0xB2D4, 0, 1) in targets
+
+
+def test_partial_link_root_prune_fails_immediately():
+    root = ((0x02 << 16) | 0xA2A9, 1, 1)
+    try:
+        v2_regen._reject_partial_root_prune(
+            {root}, {root}, "prune")
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "$02A2A9/M1X1" in message
+        assert "preserved-bank link root" in message
+    else:
+        raise AssertionError("pruning a preserved-bank link root must fail")
+
+
 def test_resolved_dispatch_default_is_not_a_false_positive():
     """A genuinely resolved indirect dispatch ends its switch with a
     `cpu_trace_dispatch_oob(..., _target)` default that has NO

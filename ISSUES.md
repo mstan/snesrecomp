@@ -3,6 +3,67 @@
 Game-specific issues live in each game repo's ISSUES.md; this file tracks
 issues in the shared runner and recompiler that affect every port.
 
+## OPEN: v2 regeneration mixes fixed-point analysis with full C emission
+
+**Status:** OPEN 2026-07-13. Immediate partial-regeneration link-root fix is
+implemented locally and pending cross-game validation. The architectural
+redesign below remains future work.
+
+**Observed on ALttP:** a one-bank regeneration repeatedly emitted a roughly
+200 MB generated-C program while variant discovery, emit-truth pruning,
+reference-taint pruning, and exit-M/X propagation peeled invalid variants one
+caller layer at a time. A focused bank-02 run reached seven serial passes at
+roughly four minutes per pass. Stopping between passes left bank 02 without
+variants still referenced by preserved banks 00 and 1E, producing linker
+failures.
+
+**Immediate correctness defect:** partial regeneration used the semantic
+reference-taint graph as its link contract. That graph intentionally excludes
+alias wrappers, unknown synthetic callers, and runtime M/X dispatch cases,
+because those edges must not propagate semantic taint. They are nevertheless
+real C linker relocations. Consequently, a variant needed by a preserved bank
+could be absent from `skipped_link_targets` and then be pruned from the
+regenerated bank. Partial regeneration must scan every generated variant call
+in preserved source files, treat those targets as immutable roots, and fail
+immediately if a prune intersects that root set.
+
+**Why the current design is slow:** analysis and materialization are coupled.
+Any newly discovered or newly pruned variant causes complete bank emission,
+then exit-M/X summaries and call routing are recomputed globally. Reference
+taint can expose the next invalid caller only after the previous layer has
+been removed and re-emitted. The convergence guards measure pass counts, but
+alternating prune kinds can reset their streaks and allow pathological runs.
+
+**Required redesign:** make LLE architectural state the analysis ground truth
+and make generated AOT/HLE bodies a materialized optimization after that
+analysis has stabilized.
+
+1. Build a whole-program variant-demand graph in memory. Preserved-bank link
+   targets, vectors, cfg entries, and explicit exports are roots.
+2. Propagate entry M/X and callee exit-M/X with a work queue. Revisit only
+   functions whose input facts changed.
+3. Solve recursive call relationships as strongly connected components so
+   recursive width facts converge together instead of peeling one emitted
+   caller layer per pass.
+4. Run wrong-width and reference-taint pruning on the stabilized graph, not on
+   generated C text. A pruned node must never be a root or a dependency of a
+   surviving node.
+5. Cache decoded functions and exit summaries by ROM/config/compiler-content
+   hash. A one-bank change should not re-decode unrelated banks.
+6. Emit each affected bank once after analysis reaches a fixed point. Validate
+   its exported symbol manifest against all preserved-bank imports before
+   invoking the native compiler.
+7. Generate into a staging directory and atomically publish only a complete,
+   link-contract-valid set. Interrupted regeneration must leave the previous
+   generated program usable.
+8. Keep an LLE tier-down for any runtime AOT entry whose live architectural
+   M/X state has no proven matching body. That is a correctness backstop and
+   worklist signal; it must not silently execute a wrong-width AOT variant.
+
+**Success criteria:** focused regeneration has bounded work proportional to
+the affected graph, never publishes a cross-bank symbol mismatch, and produces
+the same reachable variant set as a clean full regeneration.
+
 ## FIX IMPLEMENTED (pending playtest): Music/SFX command can drop under turbo (APU port-write scheduler vs uncapped game clock)
 
 **Status:** FIX IMPLEMENTED 2026-06-17 (pending user playtest). Previously

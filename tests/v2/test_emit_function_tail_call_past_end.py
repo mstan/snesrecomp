@@ -161,6 +161,40 @@ def test_jump_past_end_into_sibling_emits_tail_call_not_inline_import():
     assert 'cpu_tailcall_inherit_return_context(_entry_s, _hrv);' in src_tail, src_tail
 
 
+def test_branch_past_end_uses_mx_after_rep_for_sibling_variant():
+    """A taken branch across an ``end:`` boundary keeps the branch-site M/X.
+
+    Zelda's overlay converter enters a small setup helper in M1X1, executes
+    ``REP #$30``, then branches into a separately declared shared body.  The
+    sibling must therefore be demanded and called as M0X0; using the helper's
+    entry state decodes the body's 16-bit immediates as bytes.
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30 -> M0X0
+            0xA9, 0x7E, 0x00,  # LDA #$007E
+            0x80, 0x01,        # BRA $8008 (past end:)
+            0xEA,              # unreachable padding
+        ]),
+        0x8008: bytes([0x85, 0x06, 0x60]),  # STA $06; RTS
+    })
+    target = 0x008008
+    name_map = {target: 'SharedBody'}
+
+    v2_codegen.take_unresolved_call_targets()
+    with _with_name_resolver(name_map):
+        src = emit_function(rom, bank=0, start=0x8000,
+                            entry_m=1, entry_x=1,
+                            end=0x8008,
+                            func_name='SetupHelper',
+                            sibling_entry_pcs={0x8008})
+    demand = v2_codegen.take_unresolved_call_targets()
+
+    assert 'SharedBody_M0X0(cpu)' in src, src
+    assert 'SharedBody_M1X1(cpu)' not in src, src
+    assert (target, 0, 0) in demand, demand
+
+
 def test_unknown_target_still_traps():
     """Negative case: if the boundary's target has NO registered name,
     fall back to the unresolved-goto trap. (The class fix only fires
@@ -243,9 +277,45 @@ def test_tail_call_past_end_routes_pruned_variant_to_survivor():
 
     assert 'NextSibling_M0X0(cpu)' in src, src
     assert 'NextSibling_M0X1(cpu)' not in src, src
-    assert (target, 0, 0) in demand, demand
-    assert (target, 0, 1) not in demand, demand
+    # Emission uses the current survivor, but discovery must retain the live
+    # architectural demand.  v2_regen subtracts variants already present in
+    # cumulative_pruned, preventing an intentionally pruned body from being
+    # resurrected while still allowing a merely undiscovered body to appear
+    # on the next pass.
+    assert (target, 0, 1) in demand, demand
+    assert (target, 0, 0) not in demand, demand
     assert 'tail-call past end:' in src, src
+
+
+def test_tail_call_demands_missing_live_variant_before_survivor_routing():
+    """An existing fallback must not hide a newly observed live M/X mode."""
+    target = 0x008008
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30 -> M0X0
+            0xA9, 0x7E, 0x00,  # LDA #$007E
+            0x80, 0x01,        # BRA $8008
+            0xEA,
+        ]),
+        0x8008: bytes([0x85, 0x06, 0x60]),
+    })
+    name_map = {target: 'SharedBody'}
+    # Model pass N before M0X0 has been discovered: only the cfg-default
+    # M1X1 body is currently callable.
+    valid_map = {target: frozenset({(1, 1)})}
+
+    v2_codegen.take_unresolved_call_targets()
+    with _with_name_resolver(name_map), _with_valid_variants(valid_map):
+        src = emit_function(rom, bank=0, start=0x8000,
+                            entry_m=1, entry_x=1,
+                            end=0x8008,
+                            func_name='SetupHelper',
+                            sibling_entry_pcs={0x8008})
+    demand = v2_codegen.take_unresolved_call_targets()
+
+    assert 'SharedBody_M1X1(cpu)' in src, src
+    assert (target, 0, 0) in demand, demand
+    assert (target, 1, 1) not in demand, demand
 
 
 def test_cross_bank_tail_call_keeps_positional_nlr_argument_out_of_prefix():
