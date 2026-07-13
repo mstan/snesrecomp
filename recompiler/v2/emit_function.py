@@ -37,7 +37,9 @@ from v2.codegen import emit_op  # noqa: E402
 from snes_cycles import (  # noqa: E402
     block_static_cycles, instr_runtime_charges, region_speed,
 )
-from snes65816 import ABS_X as _MODE_ABS_X, ABS_Y as _MODE_ABS_Y  # noqa: E402
+from snes65816 import (  # noqa: E402
+    ABS_X as _MODE_ABS_X, ABS_Y as _MODE_ABS_Y, IMM as _MODE_IMM,
+)
 from v2.ir import (  # noqa: E402
     IROp, IRBlock, Value,
     CondBranch, Goto, IndirectGoto, Call, Return,
@@ -608,6 +610,38 @@ def emit_function(rom: bytes, bank: int, start: int,
     if unresolved_indirect_collector is not None:
         unresolved_indirect_collector.extend(graph.unresolved_indirects)
     cfg = build_cfg(graph)
+
+    # A tight, side-effect-free memory poll cannot execute atomically under
+    # the LLE frame scheduler: the value it observes is commonly changed by
+    # NMI/IRQ, and a compiled self-loop prevents that interrupt from ever
+    # being injected.  Recognise the canonical shape directly from the CFG:
+    #
+    #     LDA/BIT/CMP/CPX/CPY <memory>
+    #     Bcc <same block>
+    #
+    # The block must contain only memory-reading flag producers followed by a
+    # conditional back-edge.  Counter loops (DEX/BNE, ADC/CMP, stores, calls,
+    # etc.) therefore remain compiled.  Poll functions automatically unwind
+    # to the authoritative byte interpreter only while an LLE scheduler is
+    # active; ordinary HLE/fiber execution is unchanged.
+    _poll_reads = {'LDA', 'LDX', 'LDY', 'BIT', 'CMP', 'CPX', 'CPY'}
+    _cond_branches = {
+        'BCC', 'BCS', 'BEQ', 'BNE', 'BMI', 'BPL', 'BVC', 'BVS',
+    }
+    has_lle_memory_poll = False
+    for poll_key, poll_blk in cfg.blocks.items():
+        if poll_key not in poll_blk.successors or not poll_blk.insns:
+            continue
+        poll_insns = [di.insn for di in poll_blk.insns]
+        if poll_insns[-1].mnem not in _cond_branches:
+            continue
+        poll_body = poll_insns[:-1]
+        if not poll_body or len(poll_body) > 2:
+            continue
+        if all(insn.mnem in _poll_reads and insn.mode != _MODE_IMM
+               for insn in poll_body):
+            has_lle_memory_poll = True
+            break
 
     # ── PEI-trampoline detector (2026-05-24, narrow variant) ──────────
     #
@@ -1897,6 +1931,13 @@ def emit_function(rom: bytes, bank: int, start: int,
     # Trace ring: function entry (carries name hash) — first entry per call.
     fn_entry_pc = (bank << 16) | (start & 0xFFFF)
     src.append(f'  cpu_trace_func_entry(cpu, 0x{fn_entry_pc:06X}, "{func_name}");')
+    if has_lle_memory_poll:
+        src.append('  if (interp_bridge_in_lle_scheduler()) {')
+        src.append('    RecompStackPop();')
+        src.append(
+            f'    return interp_bridge_lle_yield_unwind(cpu, 0x{fn_entry_pc:06X}u);'
+        )
+        src.append('  }')
     # Function-local NLR pending-skip — NOT cpu state. NLR-pattern blocks
     # set this before fall-through to the Return-terminated successor;
     # the Return op reads + clears it. Local-scoped so:

@@ -534,6 +534,9 @@ RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
 RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
                                            uint32 site_pc24, uint16 entry_s,
                                            uint8 hrv);
+RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
+                                                    uint32 target_pc24,
+                                                    uint32 site_pc24);
 
 /* Interpreter-tier fallback for a runtime-pointer JSR (abs,X) whose loaded
  * target has no AOT body for the live (m,x). Called by cpu_dispatch_call_pc

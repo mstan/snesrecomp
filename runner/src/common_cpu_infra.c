@@ -220,6 +220,22 @@ int cpu_resolve_ancestor_skip(uint16_t ret_s) {
   return -1;
 }
 
+int cpu_resolve_post_return_skip(uint16_t post_s) {
+  /* An interpreter tier-down entered at a rewritten return PC inside a
+   * compiled caller can execute that caller's RTS before returning to its
+   * generated callee.  Match the resulting S-after-return against strict
+   * host ancestors so the generated call chain skips every guest frame the
+   * interpreter already consumed. */
+  int top = g_recomp_stack_top;
+  if (top < 2 || top > RECOMP_STACK_DEPTH) return -1;
+  for (int i = top - 2; i >= 0; i--) {
+    uint16_t expected = (uint16_t)(g_cpu_entry_s[i] +
+                                   g_cpu_entry_return_frame[i]);
+    if (expected == post_s) return (top - 1) - i;
+  }
+  return -1;
+}
+
 // Function-boundary WRAM snapshot history (Phase B koopa-stomp).
 // When a TCP client sets g_recomp_snap_on_func to a non-NULL name,
 // every RecompStackPush whose name matches captures the LOW 8KB of

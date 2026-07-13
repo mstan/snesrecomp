@@ -172,6 +172,12 @@ static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+/* Recomp-stack depth immediately before the scheduler interpreter bounces
+ * into a paired AOT root.  A rewritten return in that root belongs directly
+ * to the interpreter; one reached below that root belongs to a compiled
+ * ancestor and must first finish/skip that ancestor in the ordinary nested
+ * tier path.  Saved/restored around each bounce because bridge runs nest. */
+static int      s_lle_bounce_recomp_base = -1;
 static uint32_t s_lle_bounce_exclusions[16];
 static size_t   s_lle_bounce_exclusion_count;
 
@@ -370,6 +376,33 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     long steps = 0;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        /* Opt-in control-flow tripwire: game code normally executes from the
+         * LoROM $8000-$FFFF half of a bank.  If a return/jump crosses from ROM
+         * into the low I/O/RAM half, capture the transition and a substantial
+         * predecessor window immediately; continuing through zero-filled I/O
+         * space would otherwise erase the causal tail before a later COP/cap. */
+        if (trace && itn > 0 && (pc_before & 0xFFFFu) < 0x8000u) {
+            const ITraceEnt *_prev = &ring[(itn - 1) & 255];
+            if ((_prev->pc & 0xFFFFu) >= 0x8000u) {
+                static int s_low_exec_reports;
+                if (s_low_exec_reports < 8) {
+                    s_low_exec_reports++;
+                    fprintf(stderr,
+                            "[interp_low_exec] from=$%06X/%02X to=$%06X "
+                            "m=%u x=%u db=$%02X sp=$%04X a=$%04X prior:",
+                            (unsigned)_prev->pc, _prev->op,
+                            (unsigned)pc_before, in.mf, in.xf, in.db,
+                            in.sp, in.a);
+                    long _low_start = itn > 64 ? itn - 64 : 0;
+                    for (long _li = _low_start; _li < itn; _li++) {
+                        const ITraceEnt *_le = &ring[_li & 255];
+                        fprintf(stderr, " $%06X/%02X",
+                                (unsigned)_le->pc, _le->op);
+                    }
+                    fputc('\n', stderr);
+                }
+            }
+        }
 #ifdef SNES_COSIM
         /* Instruction-granular co-sim checkpoint: sync the live interp state into
          * g_cpu (what cosim_state snapshots on the recomp A-side) and offer this
@@ -411,6 +444,74 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 _poll_branch == 0x30 ? _negative : !_negative;
             if (_branch_taken) {
                 s_lle_resume_pc24 = pc_before;
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+        }
+        /* Canonical stable-value poll:
+         *
+         *     LDA value       ; save the current value in A
+         * loop:
+         *     CMP value
+         *     BEQ loop
+         *
+         * This is another cooperative interrupt boundary, not an ordinary
+         * CPU loop: forward progress requires NMI/IRQ to change memory.  The
+         * v2 emitter automatically sends functions containing a pure-memory
+         * self-poll through this interpreter path while an LLE scheduler is
+         * active.  Match the instruction bytes and the exact self-branch so
+         * no game/function address hint is needed.  If the comparison still
+         * matches, yield before executing it; the next frame's interrupt can
+         * update memory and the resumed CMP then exits naturally.
+         *
+         * M controls both A and the memory operand width.  Direct-page and
+         * indexed variants can be added when observed; absolute CMP is the
+         * canonical 65816 form used for interrupt-owned WRAM counters. */
+        if (yield_pc && _poll_op == 0xCD &&
+            bridge_bus_read(cpu, pc_before + 3) == 0xF0 &&
+            bridge_bus_read(cpu, pc_before + 4) == 0xFB) {
+            const uint16_t _wait_addr = (uint16_t)(
+                bridge_bus_read(cpu, pc_before + 1) |
+                (bridge_bus_read(cpu, pc_before + 2) << 8));
+            const int _equal = in.mf
+                ? ((uint8_t)in.a == cpu_read8(cpu, in.db, _wait_addr))
+                : (in.a == cpu_read16(cpu, in.db, _wait_addr));
+            if (_equal) {
+                s_lle_resume_pc24 = pc_before;
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+        }
+        /* Canonical automatic-joypad wait used by synchronous message boxes:
+         *
+         *   loop: LDA $4212      ; wait for auto-read to finish
+         *         BIT #$01
+         *         BNE loop
+         *         LDA $4218      ; controller 1 low byte/word
+         *         BNE done
+         *         LDA $4219
+         *         BEQ loop
+         *
+         * With no button held this is intentionally an input-owned blocking
+         * loop.  A single-threaded scheduler cannot let it spin atomically:
+         * the host must process input and advance a frame before the register
+         * can change.  Recognise the register/opcode shape (not a game PC) at
+         * the final taken BEQ, yield to the owning LLE scheduler, and resume at
+         * the backward target so $4212/$4218/$4219 are sampled again. */
+        if (yield_pc && _poll_op == 0xF0 && in.z &&
+            bridge_bus_read(cpu, pc_before - 8) == 0xAD &&
+            bridge_bus_read(cpu, pc_before - 7) == 0x18 &&
+            bridge_bus_read(cpu, pc_before - 6) == 0x42 &&
+            bridge_bus_read(cpu, pc_before - 5) == 0xD0 &&
+            bridge_bus_read(cpu, pc_before - 4) == 0x05 &&
+            bridge_bus_read(cpu, pc_before - 3) == 0xAD &&
+            bridge_bus_read(cpu, pc_before - 2) == 0x19 &&
+            bridge_bus_read(cpu, pc_before - 1) == 0x42) {
+            const int8_t _rel = (int8_t)bridge_bus_read(cpu, pc_before + 1);
+            if (_rel < 0) {
+                s_lle_resume_pc24 = (pc_before + 2 + _rel) & 0xFFFFFFu;
                 sync_interp_to_cpu(&in, cpu);
                 bridge_apu_flush(cpu);
                 return 1;
@@ -486,6 +587,28 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
         }
         const uint8_t  op = bridge_bus_read(cpu, pc_before);
+        /* A COP reached by interpreted game code vectors to the ROM's invalid-
+         * interrupt crash loop.  When the opt-in instruction trace is active,
+         * report the first few COP arrivals with their immediate predecessor
+         * path before that crash loop erases the useful tail of the ring. */
+        if (trace && op == 0x02) {
+            static int s_cop_reports;
+            if (s_cop_reports < 8) {
+                s_cop_reports++;
+                fprintf(stderr,
+                        "[interp_cop] pc=$%06X m=%u x=%u db=$%02X "
+                        "sp=$%04X a=$%04X prior:",
+                        (unsigned)pc_before, in.mf, in.xf, in.db,
+                        in.sp, in.a);
+                long _cop_start = itn > 16 ? itn - 16 : 0;
+                for (long _ci = _cop_start; _ci < itn; _ci++) {
+                    const ITraceEnt *_ce = &ring[_ci & 255];
+                    fprintf(stderr, " $%06X/%02X",
+                            (unsigned)_ce->pc, _ce->op);
+                }
+                fputc('\n', stderr);
+            }
+        }
         /* Focused mode-switch trace (SNESRECOMP_XCE_TRACE=1): every interpreted
          * XCE with pc/frame/e-before — localizes which guest routine leaves the
          * frame in emulation mode when an A/B run splits on the E flag. */
@@ -632,7 +755,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     bridge_apu_flush(cpu);
                 int _apu_drv = g_interp_apu_driving;
                 g_interp_apu_driving = 0;
+                int _saved_bounce_base = s_lle_bounce_recomp_base;
+                if (yield_pc)
+                    s_lle_bounce_recomp_base = g_recomp_stack_top;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
+                s_lle_bounce_recomp_base = _saved_bounce_base;
                 g_interp_apu_driving = _apu_drv;
                 sync_cpu_to_interp(cpu, &in);
                 if (_ibrw)
@@ -990,6 +1117,59 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     if (ok)
         return RECOMP_RETURN_NORMAL;
     return cpu_unresolved_abandon_balanced(cpu, site_pc24, entry_s, hrv);
+}
+
+RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
+                                                    uint32_t target_pc24,
+                                                    uint32_t site_pc24) {
+    target_pc24 &= 0xFFFFFFu;
+    site_pc24 &= 0xFFFFFFu;
+
+    /* A paired AOT body bounced from an LLE interpreter frame has no compiled
+     * guest caller to skip.  If that body deliberately rewrites and pops its
+     * return frame (inline arguments are the common case), hand the rewritten
+     * continuation back to the already-active interpreter.  The existing LLE
+     * unwind sentinel crosses any compiled frames nested inside the bounce;
+     * the owning scheduler bridge consumes it and resumes byte interpretation
+     * at target_pc24 with the post-return S/register state intact.
+     *
+     * Interpreting the continuation in a new nested tier frame would run until
+     * the interpreted caller itself returned, then manufacture SKIP_N for a
+     * host caller that does not exist.  In Super Metroid that abandoned the
+     * live scheduler after SpawnHardcodedPlm skipped its four inline bytes and
+     * immediately corrupted S.  This branch is context/ABI based, not tied to
+     * that function or address. */
+    const int _direct_lle_bounce =
+        s_lle_sched_depth > 0 &&
+        (s_lle_bounce_recomp_base < 0 ||
+         g_recomp_stack_top <= s_lle_bounce_recomp_base + 1);
+    if (_direct_lle_bounce)
+        return interp_bridge_lle_yield_unwind(cpu, target_pc24);
+
+    interp_tier_note(target_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
+    const uint16_t post_pop_s = cpu->S;
+    uint32_t landing = target_pc24;
+    int ok = interp_bridge_run_ex2(cpu, target_pc24, post_pop_s, &landing,
+                                   NULL, 0, 0, 0, 0, NULL, 0);
+    tier2_record(site_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
+    if (s_lle_unwind_active)
+        return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
+    if (!ok) {
+        cpu->S = post_pop_s;
+        return RECOMP_RETURN_NORMAL;
+    }
+
+    /* Starting at an internal return PC means the interpreter ran inside the
+     * paired host caller.  It exits only after an RTS/RTL moves S above the
+     * entry watermark, so at least that immediate caller has already returned
+     * in guest control flow.  Propagate SKIP_N instead of resuming its C body
+     * and executing the epilogue twice.  The stack model normally identifies
+     * the exact (possibly deeper) ancestor; SKIP_1 is the conservative minimum
+     * for this dedicated rewritten-return path. */
+    int skip = cpu_resolve_post_return_skip(cpu->S);
+    if (skip < 1) skip = 1;
+    return (RecompReturn)skip;
 }
 
 /* Interpreter-tier fallback for a runtime-pointer JSR (abs,X) call whose

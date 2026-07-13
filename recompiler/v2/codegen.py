@@ -2149,9 +2149,11 @@ def _emit_return(op: Return) -> List[str]:
     # (RTS = 2 bytes, RTL = 3 bytes; pop adds 1 to the 16-bit part, matching
     # 65816 semantics + the _emit_return_frame_push value of return-1). Then:
     #   - host-return (RECOMP_RETURN_NORMAL) ONLY when a paired host-C caller
-    #     exists (_hrv) AND the stack was balanced at entry (cpu->S ==
-    #     _entry_s before the pop): the popped frame IS that caller's pushed
-    #     return and the host C stack carries control back.
+    #     exists (_hrv), the stack was balanced at entry (cpu->S == _entry_s
+    #     before the pop), AND the popped return PC still matches the caller's
+    #     frame.  Some games deliberately rewrite a JSR return address on the
+    #     stack (for example Super Metroid's extension-block collision
+    #     handlers); equal S alone must not discard that control-flow change.
     #   - otherwise (dispatched entry _hrv==0, OR a trampoline/NLR that
     #     changed the net stack so _ret_s != _entry_s) dispatch on the popped
     #     PC24. The chain unwinds when a dispatch misses (cpu_dispatch_pc_from
@@ -2187,7 +2189,11 @@ def _emit_return(op: Return) -> List[str]:
         "#if SNESRECOMP_TRACE",
         f"  dbg_rts_trace(cpu, 0x{src24:06x}u, _entry_s, _ret_s, _rpc24, (uint8)_hrv);",
         "#endif",
-        f"  if (_hrv == {frame_sz} && _ret_s == _entry_s) {{",
+        f"  if (_hrv == {frame_sz} && _ret_s == _entry_s &&",
+        "      _rpc24 != _host_return_pc24 && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
+        f"    return interp_tier_dispatch_rewritten_return(cpu, _rpc24, 0x{src24:06x}u);",
+        "  }",
+        f"  if (_hrv == {frame_sz} && _ret_s == _entry_s && _rpc24 == _host_return_pc24) {{",
         f"    return RECOMP_RETURN_NORMAL;  /* {label_inner} host return */ }}",
         # Return-to-ancestor (multi-level non-local return). When the stack
         # was manually rebalanced shallower than this frame's entry

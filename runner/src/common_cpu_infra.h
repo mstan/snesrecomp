@@ -50,6 +50,7 @@ void CpuDispatchLogDumpJson(FILE *f);
 extern int g_recomp_stack_top;
 extern uint16_t g_cpu_entry_s[];
 int cpu_resolve_ancestor_skip(uint16_t ret_s);
+int cpu_resolve_post_return_skip(uint16_t post_s);
 typedef struct CpuTailcallContextSave {
   uint8_t valid;
   uint16_t entry_s;
