@@ -29,6 +29,7 @@ TEST_MODULES = [
     'test_decoder_callee_exit_mx',
     'test_decoder_ambiguous_call_modes',
     'test_decoder_php_plp_tracking',
+    'test_decoder_cache',
     'test_inline_arg_detector',
     'test_cfg_mode_split_blocks',
     'test_lowering_coverage',

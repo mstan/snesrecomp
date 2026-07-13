@@ -1319,27 +1319,22 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
 # poisons the cached entry for every subsequent caller with the same
 # key.
 #
-# Key composition: hash(rom) + primitive args + id(kwarg_obj) for
-# every Optional dict/list/set.
+# Key composition: immutable ROM bytes + primitive args + a strong-reference
+# identity token for every Optional dict/list/set.
 #
 # Why hash(rom): rom bytes are immutable; CPython caches the hash on
 # the bytes object after first compute (O(n) once, O(1) thereafter).
 # id(rom) would NOT be safe across multiple bytes objects in one
 # process — Python may reuse the address of a GC'd object.
 #
-# Why id() for dict/list/set kwargs (NOT _freeze): freezing big dicts
+# Why identity for dict/list/set kwargs (NOT _freeze): freezing big dicts
 # (callee_exit_mx in a late auto-promote pass has thousands of items)
 # is O(N) per decode call. With ~30k decode calls per pass × full
 # freeze of a 10k-item dict per call, the freeze dominates wall-clock
 # and makes A1 a regression vs the pre-cache pipeline. id() is O(1).
-# The id-reuse trap that affects rom (long-lived process, multiple
-# bytes objects) does NOT affect these kwargs:
-#   1. clear_decode_cache() runs at every phase boundary, so stale
-#      ids from a dropped kwarg cannot collide with a fresh kwarg's
-#      id in the SAME cache state.
-#   2. Within a phase, callers hold the kwarg dict alive (it's a
-#      local in v2_regen.main()), so its id is stable for the life
-#      of the phase.
+# A bare id() still permits address reuse because the integer does not retain
+# the object. _ObjectIdentity below owns a strong reference and compares by
+# identity, closing that collision without an O(N) semantic freeze.
 # Callers must not mutate a kwarg dict while passing it to
 # decode_function — that would poison the cache silently.
 #
@@ -1351,7 +1346,7 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
 _DECODE_CACHE: Dict[tuple, "FunctionDecodeGraph"] = {}
 _DECODE_CACHE_HITS = 0
 _DECODE_CACHE_MISSES = 0
-_DECODE_CACHE_ENABLED = False  # off by default (cache key bug)
+_DECODE_CACHE_ENABLED = False  # v2_regen enables unless --no-decode-cache
 
 # Process-wide default inline-argument map (see detect_inline_arg_bytes /
 # _labeled_successors). v2_regen builds it once per regen and installs it
@@ -1423,6 +1418,33 @@ def _freeze(obj):
     return obj
 
 
+class _ObjectIdentity:
+    """Hashable, strong-reference identity token for context objects.
+
+    A bare ``id(obj)`` cache key does not retain ``obj``, allowing Python to
+    reuse that address after a pipeline phase replaces a mapping.  This token
+    makes address reuse impossible without paying an O(N) content-freeze on
+    every decode.  Context mappings are immutable snapshots within a cache
+    phase; callers replace the snapshot or clear the cache when facts change.
+    """
+
+    __slots__ = ('obj', '_hash')
+
+    def __init__(self, obj):
+        self.obj = obj
+        self._hash = id(obj)
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        return isinstance(other, _ObjectIdentity) and self.obj is other.obj
+
+
+def _identity(obj):
+    return _ObjectIdentity(obj) if obj is not None else None
+
+
 def decode_function(rom: bytes, bank: int, start: int,
                     entry_m: int, entry_x: int,
                     *, end: Optional[int] = None,
@@ -1461,16 +1483,16 @@ def decode_function(rom: bytes, bank: int, start: int,
         )
 
     cache_key = (
-        hash(rom), bank, start, entry_m & 1, entry_x & 1, end, max_insns,
-        id(dispatch_helpers) if dispatch_helpers is not None else 0,
-        id(indirect_call_tables) if indirect_call_tables is not None else 0,
-        id(indirect_dispatch) if indirect_dispatch is not None else 0,
-        id(hle_dispatch) if hle_dispatch is not None else 0,
-        id(data_regions) if data_regions is not None else 0,
-        id(callee_exit_mx) if callee_exit_mx is not None else 0,
-        id(callee_exit_mx_modes) if callee_exit_mx_modes is not None else 0,
-        id(sibling_entry_pcs) if sibling_entry_pcs is not None else 0,
-        id(inline_arg_map) if inline_arg_map is not None else 0,
+        rom, bank, start, entry_m & 1, entry_x & 1, end, max_insns,
+        _identity(dispatch_helpers),
+        _identity(indirect_call_tables),
+        _identity(indirect_dispatch),
+        _identity(hle_dispatch),
+        _identity(data_regions),
+        _identity(callee_exit_mx),
+        _identity(callee_exit_mx_modes),
+        _identity(sibling_entry_pcs),
+        _identity(inline_arg_map),
     )
     cached = _DECODE_CACHE.get(cache_key)
     if cached is not None:

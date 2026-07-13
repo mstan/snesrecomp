@@ -76,7 +76,9 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from v2.decoder import decode_function, analyze_function_exit_mx  # noqa: E402
+from v2.decoder import (  # noqa: E402
+    decode_function, analyze_function_exit_mx, clear_decode_cache,
+)
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,12 @@ def detect_and_route(parsed, rom: bytes,
     # from what's stored. Stops when no entries change.
     _MAX_ITERS = 12
     for iter_n in range(_MAX_ITERS):
+        # Treat each fixed-point iteration as an immutable semantic snapshot.
+        # Decoder cache keys use strong object identity so lookup remains O(1);
+        # never mutate a mapping that has already participated in a decode.
+        clear_decode_cache()
+        analysis_snapshot = dict(callee_exit_mx)
+        next_callee_exit_mx = dict(callee_exit_mx)
         dirty = False
         for bank, _cfg_path, cfg in parsed:
             for entry in cfg.entries:
@@ -251,7 +259,7 @@ def detect_and_route(parsed, rom: bytes,
 
                     exit_pair = _decode_variant_exit(
                         rom, bank, addr16, em, ex, entry.end,
-                        callee_exit_mx,
+                        analysis_snapshot,
                         dispatch_helpers=dispatch_helpers)
                     if exit_pair is None:
                         # Body decoded but exit is ambiguous, or
@@ -262,16 +270,17 @@ def detect_and_route(parsed, rom: bytes,
                         # deterministic given inputs, so this only
                         # fires when an upstream change introduces
                         # ambiguity.)
-                        if key in callee_exit_mx:
-                            del callee_exit_mx[key]
+                        if key in next_callee_exit_mx:
+                            del next_callee_exit_mx[key]
                             dirty = True
                         continue
 
-                    prev = callee_exit_mx.get(key)
+                    prev = next_callee_exit_mx.get(key)
                     if prev != exit_pair:
-                        callee_exit_mx[key] = exit_pair
+                        next_callee_exit_mx[key] = exit_pair
                         dirty = True
 
+        callee_exit_mx = next_callee_exit_mx
         if not dirty:
             break
 

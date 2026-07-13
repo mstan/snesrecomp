@@ -965,6 +965,12 @@ def _emit_bank_one(args_dict: dict) -> dict:
     every per-bank collector list plus drained codegen globals
     (`take_*` results). Main merges these into the global accumulators
     after the pass."""
+    # Spawned workers persist across banks and passes, but each work item owns
+    # a distinct pickled analysis snapshot.  Bound the cache to one bank task:
+    # this retains useful repeated decodes inside emit_bank without retaining
+    # graphs that cannot hit in the next task.
+    clear_decode_cache()
+    set_decode_cache_enabled(args_dict.get('decode_cache_enabled', True))
     set_rom_size(args_dict['rom_size'])
     set_name_resolver(args_dict['name_map'])
     set_force_variant_at(args_dict['force_variant_at'])
@@ -1144,7 +1150,7 @@ def main() -> int:
     watchdog.daemon = True
     watchdog.start()
 
-    set_decode_cache_enabled(False)  # hardcode off (cache key bug)
+    set_decode_cache_enabled(not args.no_decode_cache)
     only_banks: set | None = None
     if args.banks:
         only_banks = set()
@@ -2069,6 +2075,7 @@ def main() -> int:
                 'callee_exit_mx': callee_exit_mx,
                 'callee_exit_mx_modes': callee_exit_mx_modes,
                 'inline_arg_map': inline_arg_map,
+                'decode_cache_enabled': not args.no_decode_cache,
             })
 
         # Run emit. Pool path used when --jobs > 1 and there's more
