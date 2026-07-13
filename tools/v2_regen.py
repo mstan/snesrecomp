@@ -20,10 +20,13 @@ the rest of the integration run.
 """
 
 import argparse
+import atexit
 import os
 import pathlib
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -68,6 +71,85 @@ from v2.pha_rts_autoroute import (  # noqa: E402
 _BANK_CFG_RE = re.compile(r'bank([0-9a-fA-F]+)\.cfg$')
 
 
+class _AtomicOutputDir:
+    """Transactional generated-output directory on the target filesystem.
+
+    Existing files are hard-linked into a sibling staging directory (copy2 is
+    the fallback). ``write_if_changed`` replaces changed staging files, so a
+    hard link is never modified in place. The live output remains untouched
+    throughout analysis and convergence.
+
+    Publish swaps whole directories. A deterministic previous-directory name
+    makes an interruption recoverable on the next invocation.
+    """
+
+    def __init__(self, target: pathlib.Path):
+        self.target = target.resolve()
+        self.parent = self.target.parent
+        self.parent.mkdir(parents=True, exist_ok=True)
+        self.previous = self.parent / f'.{self.target.name}.snesrecomp-previous'
+        self.staging: pathlib.Path | None = None
+        self.published = False
+
+        self._recover_interrupted_publish()
+        raw = tempfile.mkdtemp(
+            prefix=f'.{self.target.name}.snesrecomp-staging-',
+            dir=str(self.parent))
+        self.staging = pathlib.Path(raw)
+        if self.target.exists():
+            self._link_existing_tree(self.target, self.staging)
+        atexit.register(self.cleanup)
+
+    def _recover_interrupted_publish(self) -> None:
+        if self.previous.exists() and not self.target.exists():
+            os.replace(self.previous, self.target)
+        elif self.previous.exists() and self.target.exists():
+            shutil.rmtree(self.previous)
+
+    @staticmethod
+    def _link_existing_tree(source: pathlib.Path,
+                            destination: pathlib.Path) -> None:
+        for root, dirnames, filenames in os.walk(source):
+            root_path = pathlib.Path(root)
+            relative = root_path.relative_to(source)
+            dest_root = destination / relative
+            dest_root.mkdir(parents=True, exist_ok=True)
+            for dirname in dirnames:
+                (dest_root / dirname).mkdir(exist_ok=True)
+            for filename in filenames:
+                src = root_path / filename
+                dst = dest_root / filename
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    shutil.copy2(src, dst)
+
+    def publish(self) -> None:
+        if self.staging is None or self.published:
+            raise RuntimeError('generated-output workspace is not publishable')
+        if self.previous.exists():
+            shutil.rmtree(self.previous)
+        moved_live = False
+        try:
+            if self.target.exists():
+                os.replace(self.target, self.previous)
+                moved_live = True
+            os.replace(self.staging, self.target)
+            self.staging = None
+            self.published = True
+        except BaseException:
+            if moved_live and not self.target.exists() and self.previous.exists():
+                os.replace(self.previous, self.target)
+            raise
+        if self.previous.exists():
+            shutil.rmtree(self.previous)
+
+    def cleanup(self) -> None:
+        if self.staging is not None and self.staging.exists():
+            shutil.rmtree(self.staging, ignore_errors=True)
+        self.staging = None
+
+
 def write_if_changed(path, content: str) -> bool:
     """Write `content` to `path` only if it differs from what's already
     on disk. Returns True if a write happened, False if skipped.
@@ -89,7 +171,27 @@ def write_if_changed(path, content: str) -> bool:
             return False
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         pass
-    path.write_text(content, encoding='utf-8', newline='\n')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Staging initially hard-links unchanged live files. Replace changed files
+    # rather than truncating them, which would mutate the live inode too.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f'.{path.name}.tmp-', dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(content)
+        fd = -1
+        os.replace(tmp_name, path)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return True
 
 
@@ -1163,13 +1265,17 @@ def main() -> int:
     rom = load_rom(args.rom)
     set_rom_size(len(rom))
     cfg_dir = pathlib.Path(args.cfg_dir)
-    out_dir = pathlib.Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    target_out_dir = pathlib.Path(args.out_dir)
 
     cfgs = sorted(cfg_dir.glob('bank*.cfg'))
     if not cfgs:
         print(f"v2_regen: no bank*.cfg under {cfg_dir}", file=sys.stderr)
         return 2
+
+    output_workspace = _AtomicOutputDir(target_out_dir)
+    out_dir = output_workspace.staging
+    assert out_dir is not None
+    print(f"  staging generated output in {out_dir}")
 
     # First pass: load every cfg and build a global name resolver. This
     # lets cross-bank Call ops in the per-bank emit (second pass) resolve
@@ -2440,7 +2546,12 @@ def main() -> int:
         # Skip the stub rewrite entirely, but keep dispatch_v2.c in sync
         # with the generated sources that are actually on disk.
         _emit_dispatch_table(out_dir, parsed, cumulative_pruned, inline_arg_map)
-        return 0 if not failed else 1
+        if failed:
+            return 1
+        output_workspace.publish()
+        print(f"  atomically published generated output -> "
+              f"{output_workspace.target}")
+        return 0
     lines = [
         '/* Auto-generated by snesrecomp v2 v2_regen. Do NOT hand-edit.',
         ' *',
@@ -2775,6 +2886,9 @@ def main() -> int:
         print("Stubs are a hard build error. Close the recompiler-level "
               "gap that produced each marker; do NOT add an allowlist.")
         return 1
+    output_workspace.publish()
+    print(f"  atomically published generated output -> "
+          f"{output_workspace.target}")
     return 0
 
 
