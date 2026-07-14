@@ -11,6 +11,7 @@ if str(REPO / "tools") not in sys.path:
     sys.path.insert(0, str(REPO / "tools"))
 
 from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
+from v2.program_analysis import NodeDisposition  # noqa: E402
 
 
 def test_manifest_from_cfg_roots_is_stable_and_follows_calls():
@@ -95,3 +96,113 @@ def test_reachable_exit_mx_fixed_point_redecodes_caller_continuation():
                 if key.pc24 == 0x008000 and (key.m, key.x) == (1, 1))
     assert root.max_pc24 == 0x008006
     assert all("brk_at" not in reason for reason in root.reasons)
+    assert root.disposition == NodeDisposition.AOT_ELIGIBLE
+
+
+def test_recursive_unknown_exit_component_converges_to_lle():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x20, 0x00, 0x90,       # JSR $9000
+            0x60,                   # RTS
+        ]),
+        0x9000: bytes([
+            0x20, 0x00, 0x80,       # JSR $8000
+            0xC2, 0x20,             # REP #$20
+            0x60,                   # RTS
+        ]),
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func RecursiveA 8000 end:8004 entry_mx:1,1\n"
+            "func RecursiveB 9000 end:9006 entry_mx:1,1\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            all_cfg_roots=True)
+
+    assert not manifest.exit_modes
+    assert len(manifest.nodes) == 2
+    assert all(node.disposition == NodeDisposition.LLE_ONLY
+               for node in manifest.nodes.values())
+    assert all("unproven_callee_exit" in node.reasons
+               for node in manifest.nodes.values())
+
+
+def test_lorom_mirror_uses_declared_function_boundaries():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x5C, 0x00, 0x81, 0x80]),  # JML $80:8100
+        0x8100: bytes([0x4C, 0x00, 0x82]),        # JMP $8200
+        0x8200: bytes([0x60]),                    # RTS
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func Root 8000 end:8004 entry_mx:1,1\n"
+            "func MirroredTarget 8100 end:8103 entry_mx:1,1\n"
+            "func MirroredSibling 8200 end:8201 entry_mx:1,1\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            all_cfg_roots=True)
+
+    mirrored = manifest.nodes[next(
+        key for key in manifest.nodes
+        if key.pc24 == 0x808100 and (key.m, key.x) == (1, 1))]
+    assert mirrored.instruction_count == 1
+    assert any(edge.target is not None
+               and edge.target.pc24 == 0x808200
+               for edge in mirrored.demands)
+
+
+def test_hle_overlay_preserves_entry_mx_for_caller_analysis():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x20, 0x00, 0x90, 0x60]),  # JSR $9000; RTS
+        # The ROM body is a non-returning scheduler transfer. The HLE overlay
+        # is the callable boundary and therefore uses the preserve-M/X ABI.
+        0x9000: bytes([0x80, 0xFE]),              # BRA $9000
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func Root 8000 end:8004 entry_mx:1,1\n"
+            "func YieldOverlay 9000 end:9002 entry_mx:1,1\n"
+            "hle_func 9000 HleYieldOverlay\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            all_cfg_roots=True)
+
+    root_key = next(key for key in manifest.nodes
+                    if key.pc24 == 0x008000 and (key.m, key.x) == (1, 1))
+    assert manifest.nodes[root_key].disposition == NodeDisposition.AOT_ELIGIBLE
+    assert manifest.exit_modes[root_key] == (1, 1)
+
+
+def test_hle_overlay_contract_applies_to_lorom_execution_mirror():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x5C, 0x00, 0x81, 0x80]),  # JML $80:8100
+        0x8100: bytes([0x20, 0x00, 0x90, 0x60]),  # JSR $9000; RTS
+        0x9000: bytes([0x80, 0xFE]),              # BRA $9000
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func Root 8000 end:8004 entry_mx:1,1\n"
+            "func MirroredCaller 8100 end:8104 entry_mx:1,1\n"
+            "func YieldOverlay 9000 end:9002 entry_mx:1,1\n"
+            "hle_func 9000 HleYieldOverlay\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            all_cfg_roots=True)
+
+    caller_key = next(key for key in manifest.nodes
+                      if key.pc24 == 0x808100
+                      and (key.m, key.x) == (1, 1))
+    assert manifest.nodes[caller_key].disposition == NodeDisposition.AOT_ELIGIBLE
+    assert manifest.exit_modes[caller_key] == (1, 1)

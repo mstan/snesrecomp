@@ -40,9 +40,29 @@ from .program_analysis import NodeDisposition, ProgramManifest, VariantKey
 CACHE_FORMAT_VERSION = 1
 _HOST_CALL_RE = re.compile(r"\b([A-Za-z_]\w*(?:_M[01]X[01])?)\s*\(")
 _SUFFIX_RE = re.compile(r"^(.*)_M([01])X([01])$")
+_HOST_RUNTIME_DISPATCH_RE = re.compile(
+    r"\bcpu_dispatch_(?:call_pc(?:_pushed)?|pc(?:_from|_paired)?)\s*"
+    r"\(\s*[^,]+,\s*(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*")
 _HOST_ALIAS_RE = re.compile(
     r"\bvoid\s+([A-Za-z_]\w*)\s*\(CpuState\s*\*cpu\)\s*;"
     r"[^\n]*?/\*\s*\$([0-9A-Fa-f]{2}):([0-9A-Fa-f]{4})\s+alias\s*\*/")
+
+
+def _lorom_mirror_pc24(pc24: int):
+    bank = (pc24 >> 16) & 0xFF
+    if bank < 0x40 or 0x80 <= bank < 0xC0:
+        return ((bank ^ 0x80) << 16) | (pc24 & 0xFFFF)
+    return None
+
+
+def _cfg_for_bank(cfg_by_bank, bank: int):
+    cfg = cfg_by_bank.get(bank & 0xFF)
+    if cfg is not None:
+        return cfg
+    mirror = (bank & 0xFF) ^ 0x80
+    if (bank & 0xFF) < 0x40 or 0x80 <= (bank & 0xFF) < 0xC0:
+        return cfg_by_bank.get(mirror)
+    return None
 
 
 @dataclass(frozen=True)
@@ -145,6 +165,10 @@ def discover_host_roots(parsed, source_roots: Iterable[pathlib.Path],
                 source = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            for target_text in _HOST_RUNTIME_DISPATCH_RE.findall(source):
+                pc24 = int(target_text, 0) & 0xFFFFFF
+                roots.update(VariantKey(pc24, m, x)
+                             for m in (0, 1) for x in (0, 1))
             for called in _HOST_CALL_RE.findall(source):
                 suffix = _SUFFIX_RE.fullmatch(called)
                 base = suffix.group(1) if suffix else called
@@ -190,7 +214,7 @@ def build_emission_entries(manifest: ProgramManifest, parsed,
 
     for key, node in sorted(manifest.nodes.items()):
         bank = (key.pc24 >> 16) & 0xFF
-        cfg = cfg_by_bank.get(bank)
+        cfg = _cfg_for_bank(cfg_by_bank, bank)
         pc16 = key.pc24 & 0xFFFF
         has_hle = bool(enable_hle and cfg is not None and (
             pc16 in getattr(cfg, "hle_func", {}) or
@@ -199,6 +223,11 @@ def build_emission_entries(manifest: ProgramManifest, parsed,
             continue
         template = templates_exact.get(
             (key.pc24, key.m, key.x), templates_any.get(key.pc24))
+        mirror_pc24 = _lorom_mirror_pc24(key.pc24)
+        if template is None and mirror_pc24 is not None:
+            template = templates_exact.get(
+                (mirror_pc24, key.m, key.x),
+                templates_any.get(mirror_pc24))
         name = name_for_pc.get(
             key.pc24, f"bank_{bank:02X}_{pc16:04X}")
         entries_by_bank[bank].append(_copy_entry(
@@ -217,10 +246,14 @@ def build_emission_entries(manifest: ProgramManifest, parsed,
     # Keep each friendly alias bound to its cfg-canonical exact variant even
     # though other exact variants sort lexically before it.
     for bank, entries in entries_by_bank.items():
+        mirror_bank = bank ^ 0x80
         entries.sort(key=lambda entry: (
             entry.start & 0xFFFF,
             0 if (entry.entry_m & 1, entry.entry_x & 1) ==
-                 canonical_for_pc.get((bank << 16) | (entry.start & 0xFFFF))
+                 canonical_for_pc.get(
+                     (bank << 16) | (entry.start & 0xFFFF),
+                     canonical_for_pc.get(
+                         (mirror_bank << 16) | (entry.start & 0xFFFF)))
                  else 1,
             entry.entry_m & 1, entry.entry_x & 1))
     return entries_by_bank, {
@@ -347,20 +380,36 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                 reused_banks += 1
                 continue
 
-            cfg = cfg_by_bank.get(bank)
+            cfg = _cfg_for_bank(cfg_by_bank, bank)
             indirect_dispatch = {}
             if cfg is not None:
                 for directive in getattr(cfg, "indirect_dispatch", ()):
                     indirect_dispatch[(bank << 16) |
                                       (directive["site_pc16"] & 0xFFFF)] = directive
+            indirect_call_tables = (
+                getattr(cfg, "indirect_call_tables", None)
+                if cfg is not None else None)
+            if indirect_call_tables:
+                remapped_tables = dict(indirect_call_tables)
+                for site, value in indirect_call_tables.items():
+                    site_bank = (site >> 16) & 0xFF
+                    if site_bank != bank and site_bank == (bank ^ 0x80):
+                        remapped_tables[
+                            (bank << 16) | (site & 0xFFFF)] = value
+                indirect_call_tables = remapped_tables
+            data_regions = (
+                list(getattr(cfg, "data_regions", ()) or ())
+                if cfg is not None else None)
+            if data_regions:
+                for region_bank, start, end in tuple(data_regions):
+                    if region_bank != bank and region_bank == (bank ^ 0x80):
+                        data_regions.append((bank, start, end))
             source = emit_bank(
                 rom, bank, entries_by_bank.get(bank, []),
                 dispatch_helpers=dict(dispatch_helpers) or None,
-                indirect_call_tables=(getattr(cfg, "indirect_call_tables", None)
-                                      if cfg is not None else None),
+                indirect_call_tables=indirect_call_tables,
                 indirect_dispatch=indirect_dispatch or None,
-                data_regions=(getattr(cfg, "data_regions", None)
-                              if cfg is not None else None),
+                data_regions=data_regions,
                 exclude_ranges=(getattr(cfg, "exclude_ranges", None)
                                 if cfg is not None else None),
                 callee_exit_mx=dict(callee_exit_mx or {}),

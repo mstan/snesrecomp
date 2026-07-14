@@ -742,6 +742,12 @@ class FunctionDecodeGraph:
     # `indirect_dispatch` directive authorised them. v2_regen treats any
     # non-empty list as a hard build failure (no-stub policy).
     unresolved_indirects: List['UnresolvedIndirect'] = field(default_factory=list)
+    # Direct calls whose architectural return M/X state was not yet proven.
+    # LLE-first analysis asks the decoder to stop at these sites instead of
+    # guessing that the callee preserves the caller's widths.  Each tuple is
+    # (site_pc24, target_pc24, entry_m, entry_x).
+    unknown_callee_exit_sites: List[Tuple[int, int, int, int]] = field(
+        default_factory=list)
 
     def keys_at_pc(self, pc24: int) -> List[DecodeKey]:
         """Return all DecodeKeys with this 24-bit PC (across entry mode states)."""
@@ -926,7 +932,10 @@ def post_mx(insn: Insn, in_m: int, in_x: int) -> Tuple[int, int]:
 
 def _successors(insn: Insn, key: DecodeKey, bank: int,
                 callee_exit_mx: Optional[Dict] = None,
-                callee_exit_mx_modes: Optional[Dict] = None) -> List[DecodeKey]:
+                callee_exit_mx_modes: Optional[Dict] = None,
+                stop_on_unknown_callee_exit: bool = False,
+                unknown_callee_exit_sites: Optional[List] = None,
+                ) -> List[DecodeKey]:
     """Compute successor DecodeKeys for one decoded instruction.
 
     Returns plain DecodeKey list (kind-agnostic) for callers that only
@@ -936,14 +945,20 @@ def _successors(insn: Insn, key: DecodeKey, bank: int,
     return [k for (k, _kind) in
             _labeled_successors(insn, key, bank,
                                 callee_exit_mx=callee_exit_mx,
-                                callee_exit_mx_modes=callee_exit_mx_modes)]
+                                callee_exit_mx_modes=callee_exit_mx_modes,
+                                stop_on_unknown_callee_exit=(
+                                    stop_on_unknown_callee_exit),
+                                unknown_callee_exit_sites=(
+                                    unknown_callee_exit_sites))]
 
 
 def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                         callee_exit_mx: Optional[Dict] = None,
                         callee_exit_mx_modes: Optional[Dict] = None,
                         rom: Optional[bytes] = None,
-                        inline_arg_map: Optional[Dict[int, int]] = None):
+                        inline_arg_map: Optional[Dict[int, int]] = None,
+                        stop_on_unknown_callee_exit: bool = False,
+                        unknown_callee_exit_sites: Optional[List] = None):
     """Compute (DecodeKey, edge_kind) tuples for one decoded instruction.
 
     `edge_kind` is one of:
@@ -1018,7 +1033,7 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
     if mnem in ('JSR', 'JSL'):
         ret_m, ret_x = post_m, post_x
         target_pc24: Optional[int] = None
-        if mnem == 'JSR' and insn.length == 3:
+        if mnem == 'JSR' and insn.length == 3 and insn.mode != INDIR_X:
             target_pc24 = addr24(bank, insn.operand & 0xFFFF)
         elif mnem == 'JSL':
             target_pc24 = insn.operand & 0xFFFFFF
@@ -1042,12 +1057,8 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                     nskip = inline_arg_map.get(target_pc24 ^ 0x800000)
             if nskip:
                 next_pc = (next_pc + nskip) & 0xFFFF
+        callee_exit_known = False
         if callee_exit_mx is not None:
-            target_pc24: Optional[int] = None
-            if mnem == 'JSR' and insn.length == 3:
-                target_pc24 = addr24(bank, insn.operand & 0xFFFF)
-            elif mnem == 'JSL':
-                target_pc24 = insn.operand & 0xFFFFFF
             if target_pc24 is not None:
                 # Lookup keyed by (target_pc24, entry_m, entry_x) — same
                 # entry variant we're invoking. Different variants of
@@ -1064,6 +1075,15 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                     em, ex = hit
                     if em is not None and ex is not None:
                         ret_m, ret_x = em & 1, ex & 1
+                        callee_exit_known = True
+        if (stop_on_unknown_callee_exit and target_pc24 is not None
+                and not callee_exit_known):
+            if unknown_callee_exit_sites is not None:
+                item = (insn.addr & 0xFFFFFF, target_pc24,
+                        post_m & 1, post_x & 1)
+                if item not in unknown_callee_exit_sites:
+                    unknown_callee_exit_sites.append(item)
+            return []
         if (target_pc24 is not None and callee_exit_mx_modes is not None
                 and (ret_m, ret_x) == (post_m, post_x)):
             mode_set = callee_exit_mx_modes.get((target_pc24, post_m, post_x))
@@ -1458,6 +1478,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
                     inline_arg_map: Optional[Dict[int, int]] = None,
+                    stop_on_unknown_callee_exit: bool = False,
                     ) -> "FunctionDecodeGraph":
     """Public cached wrapper around `_decode_function_uncached`.
 
@@ -1480,6 +1501,7 @@ def decode_function(rom: bytes, bank: int, start: int,
             callee_exit_mx_modes=callee_exit_mx_modes,
             sibling_entry_pcs=sibling_entry_pcs,
             inline_arg_map=inline_arg_map,
+            stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
         )
 
     cache_key = (
@@ -1493,6 +1515,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         _identity(callee_exit_mx_modes),
         _identity(sibling_entry_pcs),
         _identity(inline_arg_map),
+        bool(stop_on_unknown_callee_exit),
     )
     cached = _DECODE_CACHE.get(cache_key)
     if cached is not None:
@@ -1514,6 +1537,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         callee_exit_mx_modes=callee_exit_mx_modes,
         sibling_entry_pcs=sibling_entry_pcs,
         inline_arg_map=inline_arg_map,
+        stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
     )
     _DECODE_CACHE[cache_key] = graph
     return graph
@@ -1532,6 +1556,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
                     inline_arg_map: Optional[Dict[int, int]] = None,
+                    stop_on_unknown_callee_exit: bool = False,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
 
@@ -2107,7 +2132,11 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         insn, key, bank,
                         callee_exit_mx=callee_exit_mx,
                         callee_exit_mx_modes=callee_exit_mx_modes,
-                        rom=rom, inline_arg_map=inline_arg_map)
+                        rom=rom, inline_arg_map=inline_arg_map,
+                        stop_on_unknown_callee_exit=(
+                            stop_on_unknown_callee_exit),
+                        unknown_callee_exit_sites=(
+                            graph.unknown_callee_exit_sites))
                     site_m = insn.m_flag & 1
                     site_x = insn.x_flag & 1
                     for e in entries:
@@ -2163,7 +2192,11 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn, key, bank,
                     callee_exit_mx=callee_exit_mx,
                     callee_exit_mx_modes=callee_exit_mx_modes,
-                    rom=rom, inline_arg_map=inline_arg_map)
+                    rom=rom, inline_arg_map=inline_arg_map,
+                    stop_on_unknown_callee_exit=(
+                        stop_on_unknown_callee_exit),
+                    unknown_callee_exit_sites=(
+                        graph.unknown_callee_exit_sites))
                 # Append jump-kind edges to the in-bank handlers. Each
                 # dispatch target enters as its own function — empty
                 # p_stack, not the caller's.
@@ -2208,7 +2241,11 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn, key, bank,
                     callee_exit_mx=callee_exit_mx,
                     callee_exit_mx_modes=callee_exit_mx_modes,
-                    rom=rom, inline_arg_map=inline_arg_map)
+                    rom=rom, inline_arg_map=inline_arg_map,
+                    stop_on_unknown_callee_exit=(
+                        stop_on_unknown_callee_exit),
+                    unknown_callee_exit_sites=(
+                        graph.unknown_callee_exit_sites))
                 succ = [k for (k, _) in labeled_succ]
                 graph.insns[key] = DecodedInsn(key=key, insn=insn,
                                                successors=succ)
@@ -2233,7 +2270,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             insn, key, bank,
             callee_exit_mx=callee_exit_mx,
             callee_exit_mx_modes=callee_exit_mx_modes,
-            rom=rom, inline_arg_map=inline_arg_map)
+            rom=rom, inline_arg_map=inline_arg_map,
+            stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
+            unknown_callee_exit_sites=graph.unknown_callee_exit_sites)
         succ = [k for (k, _) in labeled_succ]
         graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)
 
@@ -2329,6 +2368,44 @@ def _dedupe_by_pcmx(graph: 'FunctionDecodeGraph') -> None:
         graph.entry = remap[graph.entry]
 
 
+def _direct_tail_exit_keys(graph: 'FunctionDecodeGraph',
+                           decoded: 'DecodedInsn') -> List[Tuple[int, int, int]]:
+    """Return exact entry keys reached by a direct tail transfer.
+
+    A cfg sibling boundary deliberately leaves the successor outside this
+    graph. Its callee exit is therefore also this function's exit. Long JMP
+    has no decoder successor, so derive that target from its operand.
+    """
+    ins = decoded.insn
+    if ins.mnem not in ('JMP', 'BRA', 'BRL'):
+        return []
+    outside = [
+        (successor.pc & 0xFFFFFF, successor.m & 1, successor.x & 1)
+        for successor in decoded.successors
+        if successor not in graph.insns
+    ]
+    if outside:
+        return outside
+    if (ins.mnem == 'JMP' and ins.length == 4
+            and not getattr(ins, 'dispatch_entries', None)):
+        return [(ins.operand & 0xFFFFFF,
+                 ins.m_flag & 1, ins.x_flag & 1)]
+    return []
+
+
+def _lookup_exit_mx(callee_exit_mx: Optional[Dict],
+                    pc24: int, m: int, x: int):
+    if callee_exit_mx is None:
+        return None
+    hit = callee_exit_mx.get((pc24 & 0xFFFFFF, m & 1, x & 1))
+    if hit is None:
+        bank = (pc24 >> 16) & 0xFF
+        if bank < 0x40 or 0x80 <= bank < 0xC0:
+            hit = callee_exit_mx.get(
+                ((pc24 ^ 0x800000) & 0xFFFFFF, m & 1, x & 1))
+    return hit
+
+
 def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
                                    callee_exit_mx: Optional[Dict] = None,
                                    ) -> Optional[Set[Tuple[int, int]]]:
@@ -2345,6 +2422,15 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
             modes.add((ins.m_flag & 1, ins.x_flag & 1))
+            continue
+        tail_keys = _direct_tail_exit_keys(graph, di)
+        if tail_keys:
+            for target, site_m, site_x in tail_keys:
+                tail_exit = _lookup_exit_mx(
+                    callee_exit_mx, target, site_m, site_x)
+                if tail_exit is None:
+                    return None
+                modes.add((tail_exit[0] & 1, tail_exit[1] & 1))
             continue
         is_dispatch_term = (
             getattr(ins, 'dispatch_entries', None) is not None
@@ -2435,6 +2521,15 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
             _accumulate(ins.m_flag & 1, ins.x_flag & 1)
+            continue
+        tail_keys = _direct_tail_exit_keys(graph, di)
+        if tail_keys:
+            for target, site_m, site_x in tail_keys:
+                tail_exit = _lookup_exit_mx(
+                    callee_exit_mx, target, site_m, site_x)
+                if tail_exit is None:
+                    return (None, None)
+                _accumulate(tail_exit[0] & 1, tail_exit[1] & 1)
             continue
         # Dispatch terminator: JSL/JML with no successors and a
         # populated dispatch table. The function transfers control to

@@ -47,10 +47,15 @@ def test_manifest_emitter_keeps_structural_target_as_lle(tmp_path):
     manifest = json.loads(
         (out_dir / "program_manifest.json").read_text(encoding="utf-8"))
 
-    assert "I_RESET_M1X1" in source
+    # A call whose return M/X cannot be proven tiers the caller to LLE too;
+    # preserving the caller width would be a speculative AOT decode.
+    assert "I_RESET_M1X1" not in source
     assert "bank_00_8010_M1X1" not in source
-    assert "interp_tier_run_call_frame(cpu, 0x008010u" in source
+    assert "0x008000u, { NULL, NULL, NULL, NULL }" in dispatch
     assert "0x008010u, { NULL, NULL, NULL, NULL }" in dispatch
+    assert manifest["nodes"]["008000:M1X1"]["disposition"] == "lle_only"
+    assert "unproven_callee_exit" in \
+        manifest["nodes"]["008000:M1X1"]["reasons"]
     assert manifest["nodes"]["008010:M1X1"]["disposition"] == "lle_only"
 
 
@@ -124,6 +129,27 @@ def test_host_call_roots_are_inferred_from_handwritten_source(tmp_path):
     }.issubset(roots)
     assert VariantKey(0x008456, 0, 1) in roots
     assert VariantKey(0x008456, 1, 1) not in roots
+
+
+def test_constant_runtime_dispatch_targets_are_host_roots(tmp_path):
+    cfg = tmp_path / "bank00.cfg"
+    cfg.write_text(
+        "bank = 00\nfunc DynamicTarget 8123 entry_mx:1,1\n",
+        encoding="utf-8")
+    parsed = [(0, cfg, load_bank_cfg(str(cfg)))]
+    source = tmp_path / "host.c"
+    source.write_text(
+        "void f(CpuState *cpu) {\n"
+        "  cpu_dispatch_call_pc(cpu, 0x008123u, 0xFFFFFFu);\n"
+        "}\n",
+        encoding="utf-8")
+
+    roots = discover_host_roots(parsed, (source,))
+
+    assert {key for key in roots if key.pc24 == 0x008123} == {
+        VariantKey(0x008123, m, x)
+        for m in (0, 1) for x in (0, 1)
+    }
 
 
 def test_host_alias_dispatches_live_mx_and_missing_exact_slot_to_lle(tmp_path):

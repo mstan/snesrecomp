@@ -295,8 +295,20 @@ def summarize_decode_graph(
         reasons.add("has_lle_indirect_edge")
     if graph.suppressed_indirect_calls:
         reasons.add("has_lle_suppressed_call_edge")
+    unknown_exits = tuple(getattr(
+        graph, "unknown_callee_exit_sites", ()))
+    if unknown_exits:
+        reasons.add("unproven_callee_exit")
+        reasons.update(
+            f"unproven_call_at_{site:06X}_to_{target:06X}_m{m}x{x}"
+            for site, target, m, x in unknown_exits)
+    if getattr(graph, "unstable_exit_fact", False):
+        reasons.add("unstable_exit_fact")
 
-    disposition = (NodeDisposition.LLE_ONLY if "structural_poison" in reasons
+    disposition = (NodeDisposition.LLE_ONLY
+                   if ("structural_poison" in reasons
+                       or "unproven_callee_exit" in reasons
+                       or "unstable_exit_fact" in reasons)
                    else NodeDisposition.AOT_ELIGIBLE)
     demands = tuple(sorted(edges))
     if "structural_poison" in reasons:

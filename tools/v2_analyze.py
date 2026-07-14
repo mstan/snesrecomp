@@ -41,6 +41,20 @@ from v2.program_analysis import (  # noqa: E402
 _BANK_CFG_RE = re.compile(r"bank([0-9a-fA-F]+)\.cfg$")
 
 
+def _lorom_mirror_bank(bank: int):
+    bank &= 0xFF
+    if bank < 0x40 or 0x80 <= bank < 0xC0:
+        return bank ^ 0x80
+    return None
+
+
+def _lorom_mirror_pc24(pc24: int):
+    mirror = _lorom_mirror_bank((pc24 >> 16) & 0xFF)
+    if mirror is None:
+        return None
+    return (mirror << 16) | (pc24 & 0xFFFF)
+
+
 def _load_cfgs(cfg_dir: pathlib.Path):
     parsed = []
     for path in sorted(cfg_dir.glob("bank*.cfg")):
@@ -86,24 +100,52 @@ def _indirect_dispatch_map(parsed) -> dict:
                 key: value for key, value in directive.items()
                 if key != "site_pc16"
             }
+            mirror = _lorom_mirror_pc24(site)
+            if mirror is not None:
+                result.setdefault(mirror, result[site])
     return result
 
 
 def _declared_exit_modes(parsed) -> dict:
-    """Load only explicit facts; inferred exits belong in the solver later."""
+    """Load explicit facts and the generic HLE boundary contract.
+
+    An HLE overlay is a callable C replacement, unlike a ROM coroutine tail
+    that may never return lexically. Unless the cfg function boundary declares
+    another exit M/X, that overlay must preserve the entry widths. This is a
+    property of the optional HLE ABI, not a claim inferred from ROM bytes.
+    """
     result = {}
-    for _bank, _path, cfg in parsed:
+
+    def targets_with_mirror(target):
+        yield target
+        mirror = _lorom_mirror_pc24(target)
+        if mirror is not None:
+            yield mirror
+
+    for bank_id, _path, cfg in parsed:
         for bank, pc, exit_m, exit_x in cfg.exit_mx_at:
             target = ((bank & 0xFF) << 16) | (pc & 0xFFFF)
-            for entry_m in (0, 1):
-                for entry_x in (0, 1):
-                    result[(target, entry_m, entry_x)] = (
-                        exit_m & 1, exit_x & 1)
+            for resolved_target in targets_with_mirror(target):
+                for entry_m in (0, 1):
+                    for entry_x in (0, 1):
+                        result[(resolved_target, entry_m, entry_x)] = (
+                            exit_m & 1, exit_x & 1)
         for bank, pc, entry_m, entry_x, exit_m, exit_x in \
                 cfg.exit_mx_at_per_variant:
             target = ((bank & 0xFF) << 16) | (pc & 0xFFFF)
-            result[(target, entry_m & 1, entry_x & 1)] = (
-                exit_m & 1, exit_x & 1)
+            for resolved_target in targets_with_mirror(target):
+                result[(resolved_target, entry_m & 1, entry_x & 1)] = (
+                    exit_m & 1, exit_x & 1)
+        hle_entries = set(getattr(cfg, "hle_func", {}))
+        hle_entries.update(getattr(cfg, "hle_spc_upload", ()))
+        for pc in hle_entries:
+            target = ((bank_id & 0xFF) << 16) | (pc & 0xFFFF)
+            for resolved_target in targets_with_mirror(target):
+                for entry_m in (0, 1):
+                    for entry_x in (0, 1):
+                        result.setdefault(
+                            (resolved_target, entry_m, entry_x),
+                            (entry_m, entry_x))
     return result
 
 
@@ -162,8 +204,15 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
         cfg_by_bank[bank] = cfg
         sibling_entries[bank] = {
             entry.start & 0xFFFF for entry in cfg.entries}
-        all_data_regions.extend(cfg.data_regions)
+        for region_bank, start, end in cfg.data_regions:
+            all_data_regions.append((region_bank, start, end))
+            mirror = _lorom_mirror_bank(region_bank)
+            if mirror is not None:
+                all_data_regions.append((mirror, start, end))
         all_exclude_ranges[bank] = tuple(cfg.exclude_ranges)
+        mirror = _lorom_mirror_bank(bank)
+        if mirror is not None:
+            all_exclude_ranges.setdefault(mirror, tuple(cfg.exclude_ranges))
         for entry in cfg.entries:
             key = VariantKey(
                 (bank << 16) | (entry.start & 0xFFFF),
@@ -180,6 +229,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
     dispatch_map = _indirect_dispatch_map(parsed)
     declared_exit_modes = _declared_exit_modes(parsed)
     active_exit_modes = dict(declared_exit_modes)
+    unstable_exit_modes = set()
     round_exit_modes = {}
     dispatch_helpers = {}
     inline_arg_map = {}
@@ -207,22 +257,46 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
         nonlocal dispatch_helpers, inline_arg_map
         bank = (key.pc24 >> 16) & 0xFF
         pc = key.pc24 & 0xFFFF
+        mirror_bank = _lorom_mirror_bank(bank)
         cfg = cfg_by_bank.get(bank)
+        if cfg is None and mirror_bank is not None:
+            cfg = cfg_by_bank.get(mirror_bank)
         entry = entries_by_address.get(key.pc24)
+        if entry is None:
+            mirror_pc24 = _lorom_mirror_pc24(key.pc24)
+            if mirror_pc24 is not None:
+                entry = entries_by_address.get(mirror_pc24)
         end = entry.end if entry is not None else None
-        siblings = sibling_entries.get(bank, set()) - {pc}
+        siblings = sibling_entries.get(bank)
+        if siblings is None and mirror_bank is not None:
+            siblings = sibling_entries.get(mirror_bank)
+        siblings = set(siblings or ()) - {pc}
+
+        indirect_call_tables = (
+            getattr(cfg, "indirect_call_tables", None) if cfg else None)
+        if indirect_call_tables and mirror_bank is not None:
+            mirrored_tables = dict(indirect_call_tables)
+            for site, value in indirect_call_tables.items():
+                site_bank = (site >> 16) & 0xFF
+                if site_bank == mirror_bank:
+                    mirrored_tables[(bank << 16) | (site & 0xFFFF)] = value
+            indirect_call_tables = mirrored_tables
 
         kwargs = {
             "end": end,
             "max_insns": max_insns,
             "dispatch_helpers": dispatch_helpers or None,
-            "indirect_call_tables": (
-                getattr(cfg, "indirect_call_tables", None) if cfg else None),
+            "indirect_call_tables": indirect_call_tables,
             "indirect_dispatch": dispatch_map or None,
             "data_regions": data_regions or None,
             "callee_exit_mx": active_exit_modes or None,
             "sibling_entry_pcs": siblings or None,
             "inline_arg_map": inline_arg_map or None,
+            # An unknown callee return width is not evidence that M/X is
+            # preserved. Stop the speculative caller continuation at that
+            # call; once the callee is proven, a later immutable round
+            # decodes the continuation with the architectural exit state.
+            "stop_on_unknown_callee_exit": True,
         }
         graph = decode_function(rom, bank, pc, key.m, key.x, **kwargs)
 
@@ -274,9 +348,15 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             kwargs["dispatch_helpers"] = dispatch_helpers or None
             kwargs["inline_arg_map"] = inline_arg_map or None
             graph = decode_function(rom, bank, pc, key.m, key.x, **kwargs)
+        variant_tuple = (key.pc24, key.m, key.x)
+        if variant_tuple in unstable_exit_modes:
+            graph.unstable_exit_fact = True
         exit_m, exit_x = analyze_function_exit_mx(
             graph, active_exit_modes or None)
-        if exit_m is not None and exit_x is not None:
+        if (not graph.unknown_callee_exit_sites
+                and variant_tuple not in unstable_exit_modes
+                and variant_tuple not in declared_exit_modes
+                and exit_m is not None and exit_x is not None):
             round_exit_modes[key] = (exit_m & 1, exit_x & 1)
         return graph
 
@@ -292,7 +372,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
         # cfg-entry x four-width pre-pass: unreachable functions never enter
         # the solver, and no generated-C feedback participates.
         manifest = None
-        for _round in range(12):
+        while True:
             round_exit_modes = {}
             before_helpers = dict(dispatch_helpers)
             before_inline = dict(inline_arg_map)
@@ -301,11 +381,24 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 decode_variant, max_nodes=max_nodes,
                 target_is_code=target_is_code).analyze(roots)
 
-            next_exit_modes = dict(declared_exit_modes)
-            next_exit_modes.update({
-                (key.pc24, key.m, key.x): pair
-                for key, pair in round_exit_modes.items()
-            })
+            # Exact exit proofs only grow. A caller that lacked a callee fact
+            # was truncated at the call, so it could not publish a guess that
+            # later needs retracting. This is a finite monotone lattice and
+            # therefore converges without an arbitrary game-sized round cap.
+            next_exit_modes = dict(active_exit_modes)
+            for key, pair in sorted(round_exit_modes.items()):
+                fact_key = (key.pc24, key.m, key.x)
+                if fact_key in unstable_exit_modes:
+                    continue
+                previous = next_exit_modes.get(fact_key)
+                if previous is None:
+                    next_exit_modes[fact_key] = pair
+                elif previous != pair:
+                    # A supposedly proven fact changed. Remove it once and
+                    # permanently tier that entry to LLE; callers then stop at
+                    # the boundary instead of participating in oscillation.
+                    unstable_exit_modes.add(fact_key)
+                    next_exit_modes.pop(fact_key, None)
             facts_stable = (
                 next_exit_modes == active_exit_modes
                 and before_helpers == dispatch_helpers
@@ -313,9 +406,6 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             active_exit_modes = next_exit_modes
             if facts_stable:
                 break
-        else:
-            raise RuntimeError(
-                "reachable exit-M/X analysis did not converge in 12 rounds")
 
         assert manifest is not None
         manifest = replace(

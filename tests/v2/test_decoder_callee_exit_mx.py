@@ -76,6 +76,18 @@ def test_post_jsr_decode_uses_callers_mx_when_no_map():
     assert di.insn.length == 3      # 3-byte LDA #$8510 (BUG path)
 
 
+def test_lle_first_analysis_stops_when_callee_exit_is_unproven():
+    rom = _make_rom()
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=1, entry_x=1,
+        callee_exit_mx={}, stop_on_unknown_callee_exit=True)
+
+    assert not any(k.pc == addr24(0, 0x8005) for k in graph.insns)
+    assert graph.unknown_callee_exit_sites == [
+        (addr24(0, 0x8002), addr24(0, 0x9000), 0, 1)
+    ]
+
+
 def test_post_jsr_decode_uses_callee_exit_mx_when_provided():
     """With `callee_exit_mx={(callee_pc24, em, ex): (1, x_in)}`, the
     decoder resumes with the callee's exit (m, x) so LDA at $8005 is
@@ -104,6 +116,19 @@ def test_analyze_function_exit_mx_finds_uniform_exit():
     # SEP #$20 sets m=1 before RTS; x unchanged.
     assert em == 1
     assert ex == 1
+
+
+def test_analyze_function_exit_mx_inherits_direct_tail_exit():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x4C, 0x00, 0x90]),  # JMP $9000
+        0x9000: bytes([0x60]),              # RTS
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=1, entry_x=1,
+        end=0x8003, sibling_entry_pcs={0x9000})
+
+    assert analyze_function_exit_mx(
+        graph, {(addr24(0, 0x9000), 1, 1): (0, 1)}) == (0, 1)
 
 
 def test_analyze_function_exit_mx_returns_none_for_ambiguous():

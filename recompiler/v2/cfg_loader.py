@@ -135,6 +135,8 @@ class BankCfg:
     # requested variant: `RecompReturn NAME_MxXy(CpuState *cpu) {
     #   return <c_function_name>(cpu); }`. The C helper must be
     # provided by the per-game runner (typically in gen_stubs.c).
+    # HLE ABI: the helper preserves its entry M/X unless the associated
+    # `func ... exit_mx:M,X` boundary explicitly declares another exit.
     # Map: pc16 -> c_function_name. See emit_function.py for stub shape.
     hle_func: dict = field(default_factory=dict)
     # `hle_dispatch <site_pc16> <c_function_name>` — at the named indirect
