@@ -46,6 +46,7 @@ _HOST_RUNTIME_DISPATCH_RE = re.compile(
 _HOST_ALIAS_RE = re.compile(
     r"\bvoid\s+([A-Za-z_]\w*)\s*\(CpuState\s*\*cpu\)\s*;"
     r"[^\n]*?/\*\s*\$([0-9A-Fa-f]{2}):([0-9A-Fa-f]{4})\s+alias\s*\*/")
+_PROFILE_MX_RE = re.compile(r"M([01])X([01])$")
 
 
 def _lorom_mirror_pc24(pc24: int):
@@ -201,6 +202,56 @@ def discover_host_roots(parsed, source_roots: Iterable[pathlib.Path],
                         VariantKey(pc24, m, x)
                         for pc24, _canonical_m, _canonical_x in candidates
                         for m in (0, 1) for x in (0, 1))
+    return tuple(sorted(roots))
+
+
+def discover_profile_roots(manifest_paths: Iterable[pathlib.Path]) \
+        -> tuple[VariantKey, ...]:
+    """Load clean runtime-observed targets as optional AOT roots.
+
+    A coverage profile influences only materialization: it never authorizes
+    behavior, changes decoding semantics, or removes the LLE fallback. Bailed
+    observations are deliberately excluded because they are bug evidence, not
+    proof that a target is executable code.
+    """
+    roots = set()
+    for path in manifest_paths:
+        path = pathlib.Path(path)
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"cannot read profile manifest {path}: {exc}") \
+                from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid profile manifest {path}: {exc}") \
+                from exc
+        schema = str(manifest.get("schema", ""))
+        if not schema.startswith("snesrecomp tier2 coverage"):
+            raise ValueError(
+                f"unsupported profile manifest schema {schema!r} in {path}")
+        discoveries = manifest.get("discoveries", ())
+        if not isinstance(discoveries, list):
+            raise ValueError(
+                f"profile manifest discoveries must be a list in {path}")
+        for item in discoveries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                clean_hits = int(item.get("clean_hits", 0))
+                bail_hits = int(item.get("bail_hits", 0))
+            except (TypeError, ValueError):
+                continue
+            if clean_hits <= 0 or bail_hits != 0:
+                continue
+            match = _PROFILE_MX_RE.fullmatch(str(item.get("entry_mx", "")))
+            if match is None:
+                continue
+            try:
+                target = int(str(item["target_pc24"]), 0) & 0xFFFFFF
+            except (KeyError, TypeError, ValueError):
+                continue
+            roots.add(VariantKey(
+                target, int(match.group(1)), int(match.group(2))))
     return tuple(sorted(roots))
 
 

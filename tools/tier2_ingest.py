@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-tier2_ingest.py -- fold the interpreter-tier gap manifest back into the cfgs.
+tier2_ingest.py -- audit an interpreter-tier coverage manifest.
 
 Phase 3 of the interpreter-fallback tier (see docs/MULTI_TIER.md). Reads a
 Tier-2 coverage manifest (default: build/tier2_coverage.json, schema
-"snesrecomp tier2 coverage v1") that the runner writes on exit, and proposes
-cfg directives that turn runtime-discovered control-flow gaps into Tier-1 AOT
-on the next regen.
+"snesrecomp tier2 coverage v1") that the runner writes on exit. The
+manifest-driven emitter consumes clean targets directly with
+`v2_emit.py --profile-manifest`; profile roots select optional AOT work while
+LLE remains authoritative. This audit also proposes optional function
+boundaries for unnamed targets and flags sites that need human inspection.
 
 Human-in-the-loop BY DESIGN -- like the existing cfg_override_* proposers, it
 PRINTS paste-ready directives; it does not edit cfgs. A human stays between
@@ -15,10 +17,11 @@ PRINTS paste-ready directives; it does not edit cfgs. A human stays between
 
 Discoveries split into two buckets:
 
-  PROMOTE      The interpreter ran the gap and returned cleanly (clean_hits>0,
-               bail_hits==0): a genuine coverage gap, safe to fold in.
+  BOUNDARY     The interpreter ran the gap and returned cleanly (clean_hits>0,
+               bail_hits==0): a genuine coverage gap, safe to profile.
                  * target has no existing `func`  -> emit
-                   `func bank_BB_AAAA <addr16>` in bankBB.cfg.
+                   an optional `func bank_BB_AAAA <addr16>` boundary for
+                   naming/slicing. A `func` declaration is not an AOT root.
                  * target IS already a `func`     -> the gap is the dispatch
                    SITE; it needs an indirect_dispatch / indirect_call_table
                    authorization. Flagged (NOT auto-written -- the index
@@ -35,7 +38,7 @@ Site kinds (2026-07-02 additions): besides the tier-down kinds
 in-bridge sightings -- `call_gap` (an interpreted JSR/JSL whose target has no
 compiled variant) and `goto_gap` (an indirect JMP/JML landing with none).
 Both are always clean (observations, not bounded runs) and flow through the
-PROMOTE bucket. Caveat for goto_gap: a landing can be a mid-function label
+profile. Caveat for goto_gap: a landing can be a mid-function label
 (intra-function jump table) rather than a subroutine entry -- eyeball the
 disassembly before pasting, as always. Addresses are LoROM-canonicalized
 (exec mirrors $80-$BF recorded as $00-$3F).
@@ -156,10 +159,13 @@ def main():
             "(For a fully-covered game that's the expected dormant state.)\n")
         return 0
 
-    # PROMOTE: ready-to-paste func directives, grouped by bank cfg.
+    # Optional boundaries: func declarations name/slice code but do not root it.
     n_promote = sum(len(v) for v in promote_func.values())
-    out(f"-- PROMOTE: {n_promote} clean coverage gap(s) -> paste `func` "
-        f"directives --\n")
+    out("AOT optimization: pass this file to v2_emit.py with "
+        "`--profile-manifest`.\n"
+        "Clean target/MX observations become optional AOT roots; bails are "
+        "excluded.\n\n")
+    out(f"-- OPTIONAL BOUNDARIES: {n_promote} unnamed clean target(s) --\n")
     if not n_promote:
         out("  (none)\n")
     for bank in sorted(promote_func):
@@ -212,10 +218,10 @@ def main():
                d.get('first_frame', '?')))
 
     out("\n" + "=" * 72 + "\n")
-    out("Paste the PROMOTE directives into the named cfgs, then regen + build.\n"
-        "Each promoted func that no longer tiers down at runtime is a gap\n"
-        "retired (the live-bridge exposure shrinks monotonically -- see\n"
-        "MULTI_TIER.md sec 3a).\n")
+    out("Regenerate with `--profile-manifest` and rebuild. Add a printed func\n"
+        "only when its boundary improves naming/slicing; func is deliberately\n"
+        "not a reachability root. LLE remains the fallback for every absent or\n"
+        "rejected exact variant (see MULTI_TIER.md sec 3a).\n")
     return 0
 
 

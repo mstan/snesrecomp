@@ -18,6 +18,7 @@ from snes65816 import load_rom  # noqa: E402
 from v2.program_emit import (  # noqa: E402
     CACHE_FORMAT_VERSION,
     discover_host_roots,
+    discover_profile_roots,
     emit_program,
 )
 from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
@@ -57,7 +58,7 @@ def _config_digest(parsed) -> str:
 
 
 def _analysis_input_digest(*, rom: bytes, generator_digest: str,
-                           config_digest: str, host_roots,
+                           config_digest: str, additional_roots,
                            enable_hle: bool, max_insns: int,
                            max_nodes: int) -> str:
     value = {
@@ -65,8 +66,8 @@ def _analysis_input_digest(*, rom: bytes, generator_digest: str,
         "rom": hashlib.sha256(rom).hexdigest(),
         "generator": generator_digest,
         "config": config_digest,
-        "host_roots": [
-            (key.pc24, key.m, key.x) for key in sorted(host_roots)
+        "additional_roots": [
+            (key.pc24, key.m, key.x) for key in sorted(additional_roots)
         ],
         "hle": bool(enable_hle),
         "max_insns": int(max_insns),
@@ -116,6 +117,10 @@ def main() -> int:
     parser.add_argument("--cfg-dir", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--source-root", action="append", default=[])
+    parser.add_argument(
+        "--profile-manifest", action="append", default=[],
+        help="tier2 coverage manifest whose clean targets become optional "
+             "AOT roots (repeatable)")
     parser.add_argument("--no-host-root-scan", action="store_true")
     parser.add_argument("--no-hle", action="store_true")
     parser.add_argument("--max-insns", type=int, default=4096)
@@ -135,6 +140,11 @@ def main() -> int:
             source_roots.append(conventional)
     host_roots = () if args.no_host_root_scan else discover_host_roots(
         parsed, source_roots, excluded_roots=(out_dir,))
+    try:
+        profile_roots = discover_profile_roots(args.profile_manifest)
+    except ValueError as exc:
+        parser.error(str(exc))
+    additional_roots = tuple(sorted(set(host_roots) | set(profile_roots)))
 
     generator_digest = _tree_digest((
         REPO / "recompiler" / "v2", pathlib.Path(__file__).resolve(),
@@ -144,7 +154,7 @@ def main() -> int:
         rom=rom,
         generator_digest=generator_digest,
         config_digest=config_digest,
-        host_roots=host_roots,
+        additional_roots=additional_roots,
         enable_hle=not args.no_hle,
         max_insns=args.max_insns,
         max_nodes=args.max_nodes,
@@ -164,7 +174,7 @@ def main() -> int:
 
     manifest, helpers, inline_args = build_manifest(
         rom, parsed, max_insns=args.max_insns, max_nodes=args.max_nodes,
-        additional_roots=host_roots)
+        additional_roots=additional_roots)
     result = emit_program(
         rom=rom,
         parsed=parsed,

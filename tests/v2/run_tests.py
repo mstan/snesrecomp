@@ -15,6 +15,7 @@ THIS = pathlib.Path(__file__).resolve().parent
 REPO = THIS.parent.parent
 sys.path.insert(0, str(REPO / 'recompiler'))
 sys.path.insert(0, str(THIS))
+sys.path.append(str(THIS.parent))
 
 
 TEST_MODULES = [
@@ -58,6 +59,7 @@ TEST_MODULES = [
     'test_program_analysis',
     'test_analysis_tool',
     'test_variant_dispatch_lle_fallback',
+    'test_program_profile_roots',
 ]
 
 

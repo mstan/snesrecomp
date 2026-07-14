@@ -522,11 +522,16 @@ discoveries become cfg seeds, the next regen makes them Tier 1.
   normal exit, atexit, SEH crash, and on-demand TCP — not gated behind
   `SNESRECOMP_TRACE`). Recording adds no signature change → no regen, runtime
   rebuild only. Interp harness still 17/17 + 20/20.
-- **Phase 3 — offline ingest tool. ✅ DONE.** `tools/tier2_ingest.py` reads the
-  manifest and proposes cfg directives, human-in-the-loop (prints, never
-  edits), in three buckets:
-  - **PROMOTE** — clean-only discoveries whose target has no `func` yet →
-    paste-ready `func bank_BB_AAAA <addr16>` grouped by `bankBB.cfg`.
+- **Phase 3 — profile-guided AOT + offline audit. ✅ DONE.** The
+  manifest-driven emitter accepts repeatable `--profile-manifest` inputs.
+  Clean-only target/MX observations become optional AOT roots and participate
+  in deterministic cache hashing; bailed observations are excluded. A profile
+  can only select an optimization: missing or rejected variants still execute
+  through authoritative LLE. `tools/tier2_ingest.py` audits the same manifest,
+  human-in-the-loop (prints, never edits), in three buckets:
+  - **OPTIONAL BOUNDARY** — clean-only discoveries whose target has no `func`
+    yet → paste-ready `func bank_BB_AAAA <addr16>` grouped by `bankBB.cfg`.
+    These improve naming/slicing but are deliberately not reachability roots.
   - **SITE NEEDS AUTHORIZATION** — clean discoveries whose target is *already*
     a `func` → the SITE needs an `indirect_dispatch`/`indirect_call_table`
     directive (flagged, not fabricated — the index reg / table layout isn't in
@@ -534,7 +539,7 @@ discoveries become cfg seeds, the next regen makes them Tier 1.
   - **INVESTIGATE** — bailed discoveries → bug leads, *never* promoted (no
     laundering a mis-execution into trusted AOT).
   Validated on the real SM manifest + a synthetic 3-branch fixture.
-  Close the loop: discover → propose → paste → regen → Tier 1.
+  Close the loop: discover → profile → regen → validate exact behavior.
 - **Phase 4 — bank-miss tier-down (opt-in).** The build-error relaxation for
   bring-up, behind a regen flag; shipped titles stay strict.
 
