@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import pathlib
 import sys
 import time
@@ -14,7 +15,11 @@ sys.path.insert(0, str(REPO / "recompiler"))
 sys.path.insert(0, str(REPO / "tools"))
 
 from snes65816 import load_rom  # noqa: E402
-from v2.program_emit import discover_host_roots, emit_program  # noqa: E402
+from v2.program_emit import (  # noqa: E402
+    CACHE_FORMAT_VERSION,
+    discover_host_roots,
+    emit_program,
+)
 from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
 
 
@@ -51,6 +56,59 @@ def _config_digest(parsed) -> str:
     return digest.hexdigest()
 
 
+def _analysis_input_digest(*, rom: bytes, generator_digest: str,
+                           config_digest: str, host_roots,
+                           enable_hle: bool, max_insns: int,
+                           max_nodes: int) -> str:
+    value = {
+        "format": CACHE_FORMAT_VERSION,
+        "rom": hashlib.sha256(rom).hexdigest(),
+        "generator": generator_digest,
+        "config": config_digest,
+        "host_roots": [
+            (key.pc24, key.m, key.x) for key in sorted(host_roots)
+        ],
+        "hle": bool(enable_hle),
+        "max_insns": int(max_insns),
+        "max_nodes": int(max_nodes),
+    }
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _verified_cached_stats(out_dir: pathlib.Path,
+                           analysis_input_digest: str):
+    """Return published-generation stats only after verifying every output.
+
+    A matching input key alone is insufficient: a manually edited, truncated,
+    or partially copied generated tree must force normal atomic regeneration.
+    """
+    out_dir = out_dir.resolve()
+    try:
+        cache = json.loads(
+            (out_dir / ".snesrecomp-cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (cache.get("format_version") != CACHE_FORMAT_VERSION
+            or cache.get("analysis_input_digest") != analysis_input_digest):
+        return None
+    outputs = cache.get("outputs")
+    stats = cache.get("stats")
+    if not isinstance(outputs, dict) or not outputs or not isinstance(stats, dict):
+        return None
+    for name, expected in sorted(outputs.items()):
+        path = (out_dir / name).resolve()
+        if out_dir not in path.parents or not path.is_file():
+            return None
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            return None
+    required_stats = ("roots", "emitted_variants", "lle_variants", "banks")
+    if any(not isinstance(stats.get(name), int) for name in required_stats):
+        return None
+    return stats
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="manifest-driven LLE-first v2 generation")
@@ -78,6 +136,32 @@ def main() -> int:
     host_roots = () if args.no_host_root_scan else discover_host_roots(
         parsed, source_roots, excluded_roots=(out_dir,))
 
+    generator_digest = _tree_digest((
+        REPO / "recompiler" / "v2", pathlib.Path(__file__).resolve(),
+        REPO / "tools" / "v2_analyze.py"))
+    config_digest = _config_digest(parsed)
+    analysis_input_digest = _analysis_input_digest(
+        rom=rom,
+        generator_digest=generator_digest,
+        config_digest=config_digest,
+        host_roots=host_roots,
+        enable_hle=not args.no_hle,
+        max_insns=args.max_insns,
+        max_nodes=args.max_nodes,
+    )
+    cached = _verified_cached_stats(out_dir, analysis_input_digest)
+    if cached is not None:
+        elapsed = time.perf_counter() - started
+        print(
+            f"v2_emit: {cached['roots']} roots, "
+            f"{cached['emitted_variants']} exact AOT variants, "
+            f"{cached['lle_variants']} LLE variants")
+        print(
+            f"v2_emit: 0 bank(s) emitted, {cached['banks']} reused "
+            f"in {elapsed:.2f}s")
+        print(f"v2_emit: reused verified published output {out_dir}")
+        return 0
+
     manifest, helpers, inline_args = build_manifest(
         rom, parsed, max_insns=args.max_insns, max_nodes=args.max_nodes,
         additional_roots=host_roots)
@@ -89,10 +173,9 @@ def main() -> int:
         inline_arg_map=inline_args,
         out_dir=out_dir,
         manifest_text=manifest.to_json(),
-        generator_digest=_tree_digest((
-            REPO / "recompiler" / "v2", pathlib.Path(__file__).resolve(),
-            REPO / "tools" / "v2_analyze.py")),
-        config_digest=_config_digest(parsed),
+        generator_digest=generator_digest,
+        config_digest=config_digest,
+        analysis_input_digest=analysis_input_digest,
         callee_exit_mx={
             (key.pc24, key.m, key.x): pair
             for key, pair in manifest.exit_modes.items()

@@ -92,7 +92,37 @@ def test_identical_manifest_reuses_bank_without_changing_mtime(tmp_path):
     second = _run(rom_path, cfg_dir, out_dir)
     assert second.returncode == 0, second.stdout + second.stderr
     assert "0 bank(s) emitted, 1 reused" in second.stdout
+    assert "reused verified published output" in second.stdout
     assert bank_path.stat().st_mtime_ns == first_mtime
+
+
+def test_incremental_cache_rejects_modified_generated_output(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0xEA)
+    first = _run(rom_path, cfg_dir, out_dir)
+    assert first.returncode == 0, first.stdout + first.stderr
+    bank_path = out_dir / "bank00_v2.c"
+    original = bank_path.read_bytes()
+    bank_path.write_text("tampered\n", encoding="utf-8")
+
+    second = _run(rom_path, cfg_dir, out_dir)
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "reused verified published output" not in second.stdout
+    assert bank_path.read_bytes() == original
+
+
+def test_incremental_cache_rejects_changed_rom(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0xEA)
+    first = _run(rom_path, cfg_dir, out_dir)
+    assert first.returncode == 0, first.stdout + first.stderr
+    rom = bytearray(rom_path.read_bytes())
+    rom[0x10] = 0x18  # CLC instead of NOP; same boundaries, different output.
+    rom_path.write_bytes(rom)
+
+    second = _run(rom_path, cfg_dir, out_dir)
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "reused verified published output" not in second.stdout
 
 
 def test_atomic_publish_removes_legacy_prefixed_generated_units(tmp_path):

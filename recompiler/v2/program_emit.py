@@ -37,7 +37,7 @@ from .emit_bank import BankEntry, emit_bank
 from .program_analysis import NodeDisposition, ProgramManifest, VariantKey
 
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 _HOST_CALL_RE = re.compile(r"\b([A-Za-z_]\w*(?:_M[01]X[01])?)\s*\(")
 _SUFFIX_RE = re.compile(r"^(.*)_M([01])X([01])$")
 _HOST_RUNTIME_DISPATCH_RE = re.compile(
@@ -336,6 +336,7 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                  dispatch_helpers: Mapping, inline_arg_map: Mapping,
                  out_dir: pathlib.Path, manifest_text: str,
                  generator_digest: str, config_digest: str,
+                 analysis_input_digest: str,
                  callee_exit_mx: Mapping | None = None,
                  callee_exit_mx_modes: Mapping | None = None,
                  enable_hle: bool = True) -> EmissionResult:
@@ -349,6 +350,7 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
     except (OSError, ValueError):
         old_cache = {}
     old_bank_keys = old_cache.get("banks", {})
+    old_output_hashes = old_cache.get("outputs", {})
 
     workspace = AtomicOutputDir(pathlib.Path(out_dir))
     staging = workspace.staging
@@ -376,7 +378,13 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                 dispatch_helpers, inline_arg_map, enable_hle)
             new_bank_keys[f"{bank:02X}"] = cache_key
             path = staging / f"bank{bank:02x}_v2.c"
-            if old_bank_keys.get(f"{bank:02X}") == cache_key and path.exists():
+            expected_output_hash = old_output_hashes.get(path.name)
+            reusable_output = bool(
+                expected_output_hash and path.is_file()
+                and hashlib.sha256(path.read_bytes()).hexdigest()
+                == expected_output_hash)
+            if (old_bank_keys.get(f"{bank:02X}") == cache_key
+                    and reusable_output):
                 reused_banks += 1
                 continue
 
@@ -447,11 +455,25 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
             staging / "unresolved_stubs_v2.c",
             "/* Manifest-driven generation: unresolved execution remains LLE. */\n")
         write_if_changed(staging / "program_manifest.json", manifest_text)
+        emitted_count = sum(len(v) for v in emitted.values())
+        output_names = sorted(planned | {"program_manifest.json"})
+        output_hashes = {
+            name: hashlib.sha256((staging / name).read_bytes()).hexdigest()
+            for name in output_names
+        }
         cache = {
             "format_version": CACHE_FORMAT_VERSION,
             "generator_digest": generator_digest,
             "config_digest": config_digest,
+            "analysis_input_digest": analysis_input_digest,
             "banks": new_bank_keys,
+            "outputs": output_hashes,
+            "stats": {
+                "roots": len(manifest.roots),
+                "emitted_variants": emitted_count,
+                "lle_variants": len(manifest.nodes) - emitted_count,
+                "banks": len(all_banks),
+            },
         }
         write_if_changed(
             staging / ".snesrecomp-cache.json",
@@ -461,7 +483,6 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
         workspace.cleanup()
         clear_decode_cache()
 
-    emitted_count = sum(len(v) for v in emitted.values())
     return EmissionResult(
         emitted_banks=emitted_banks,
         reused_banks=reused_banks,
