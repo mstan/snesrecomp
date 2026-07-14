@@ -379,8 +379,15 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
             write_if_changed(path, source)
             emitted_banks += 1
 
-        planned = {f"bank{bank:02x}_v2.c" for bank in all_banks}
-        for stale in staging.glob("bank*_v2.c"):
+        planned = {
+            *(f"bank{bank:02x}_v2.c" for bank in all_banks),
+            "dispatch_v2.c",
+            "unresolved_stubs_v2.c",
+        }
+        # Older game integrations used title-specific generated names such as
+        # zelda_00_v2.c. Remove every obsolete generated-v2 translation unit
+        # inside the staging tree, never from the live directory in place.
+        for stale in staging.glob("*_v2.c"):
             if stale.name not in planned:
                 stale.unlink()
 

@@ -90,6 +90,19 @@ def test_identical_manifest_reuses_bank_without_changing_mtime(tmp_path):
     assert bank_path.stat().st_mtime_ns == first_mtime
 
 
+def test_atomic_publish_removes_legacy_prefixed_generated_units(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0xEA)
+    out_dir.mkdir()
+    legacy = out_dir / "zelda_00_v2.c"
+    legacy.write_text("legacy output\n", encoding="utf-8")
+
+    result = _run(rom_path, cfg_dir, out_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not legacy.exists()
+    assert (out_dir / "bank00_v2.c").exists()
+
+
 def test_host_call_roots_are_inferred_from_handwritten_source(tmp_path):
     cfg = tmp_path / "bank00.cfg"
     cfg.write_text(
