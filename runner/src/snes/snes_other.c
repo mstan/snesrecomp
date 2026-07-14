@@ -71,7 +71,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
     length -= 0x200; // and subtract from size
   }
   // check if we can load it
-  if(headers[used].cartType > 2) {
+  if (headers[used].coprocessor == 1)
+    headers[used].cartType = CART_SUPERFX;
+  if(headers[used].cartType > CART_SUPERFX) {
     printf("Failed to load rom: unsupported type (%d)\n", headers[used].cartType);
     return false;
   }
@@ -96,7 +98,10 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   // load it
   cart_load(
     snes->cart, headers[used].cartType,
-    newData, newLength, headers[used].chips > 0 ? headers[used].ramSize : 0
+    newData, newLength,
+    headers[used].cartType == CART_SUPERFX
+      ? (headers[used].ramSize > 1024 ? headers[used].ramSize : 64 * 1024)
+      : (headers[used].chips > 0 ? headers[used].ramSize : 0)
   );
   
   free(newData);

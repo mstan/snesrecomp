@@ -55,6 +55,24 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
                            uint32_t yield_pc, uint16_t flag_addr,
                            uint8_t flag_value);
 
+/* Run a whole-program LLE continuation until it reaches a deterministic
+ * read-only cycle: the complete architectural state repeats without any bus
+ * write.  Such a cycle can only make progress through asynchronous hardware
+ * (NMI/IRQ/coprocessor), so it is a general frame boundary rather than a
+ * game-address hint. */
+int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24);
+uint32_t interp_bridge_lle_resume_pc(void);
+
+/* Optional whole-program LLE deadline.  When nonzero, the auto-quiescent
+ * bridge yields at the first architectural instruction boundary whose master
+ * clock reaches this value.  Event-driven game schedulers use this to prevent
+ * a productive CPU/MMIO loop from running across multiple vblanks atomically. */
+void interp_bridge_set_master_deadline(uint64_t master_clock);
+
+/* Execute an architectural interrupt handler through its terminal RTI. The
+ * caller has already materialized the hardware interrupt frame. */
+int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24);
+
 /* Save-state task resume: interpret a suspended cooperative task from its
  * recorded yield return address (an arbitrary mid-function guest PC; the
  * caller restores the task's CpuState first). Calls bounce to compiled bodies

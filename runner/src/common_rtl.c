@@ -134,6 +134,7 @@ void RtlReset(int mode) {
   // catch-up sees a zero delta rather than the whole run's accumulated cycles.
   g_apu_last_sync_master = g_cpu.master_cycles;
   snes_reset(g_snes, true);
+  g_snes->beamMasterLast = g_cpu.master_cycles;
   SnesEnterNativeMode();
   ppu_reset(g_ppu);
   if (!(mode & 1))
@@ -562,7 +563,13 @@ void WriteReg(uint16 reg, uint8 value) {
     debug_server_on_reg_write(reg, value);
     return;
   }
-  if (reg >= 0x2100 && reg < 0x2140) {
+  if (reg >= 0x3000 && reg < 0x3300 && g_snes->cart->type == CART_SUPERFX) {
+    /* AOT code reaches the GSU through this direct-register fast path rather
+     * than the normal CPU bus.  Bring the coprocessor up to the CPU's current
+     * master clock before either side observes or changes its registers. */
+    cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+    cart_write(g_snes->cart, 0, reg, value);
+  } else if (reg >= 0x2100 && reg < 0x2140) {
     ppu_write(g_ppu, reg & 0xff, value);
   } else if (reg >= 0x2140 && reg < 0x2180) {
     RtlApuWrite(reg, value);
@@ -587,6 +594,12 @@ uint8 ReadReg(uint16 reg) {
   // matching the prior fall-through behaviour exactly.
   if (reg >= 0x2000 && reg < 0x2008) {
     return msu1_enabled() ? msu1_read(reg) : 0;
+  }
+  if (reg == 0x2137)
+    snes_sync_master_clock(g_snes, g_cpu.master_cycles);
+  if (reg >= 0x3000 && reg < 0x3300 && g_snes->cart->type == CART_SUPERFX) {
+    cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+    return cart_read(g_snes->cart, 0, reg);
   }
   if (reg >= 0x2100 && reg < 0x2140) {
     return ppu_read(g_ppu, reg & 0xff);

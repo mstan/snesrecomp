@@ -9,6 +9,7 @@
 #include <stdbool.h>
 
 typedef struct Cart Cart;
+typedef struct SuperFx SuperFx;
 
 #include "snes.h"
 
@@ -20,7 +21,12 @@ struct Cart {
   uint32_t romSize;
   uint8_t* ram;
   uint32_t ramSize;
+  SuperFx* superfx;
 };
+
+enum { CART_LOROM = 1, CART_HIROM = 2, CART_SUPERFX = 3 };
+
+void cart_sync_coprocessors(Cart *cart, uint64_t master_clock);
 
 // TODO: how to handle reset & load? (especially where to init ram)
 

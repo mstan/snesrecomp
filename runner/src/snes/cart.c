@@ -6,6 +6,7 @@
 #include "../types.h"
 #include "cart.h"
 #include "snes.h"
+#include "superfx.h"
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr);
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
@@ -24,11 +25,15 @@ Cart* cart_init(Snes* snes) {
 }
 
 void cart_free(Cart* cart) {
+  superfx_destroy(cart->superfx);
+  free(cart->rom);
+  free(cart->ram);
   free(cart);
 }
 
 void cart_reset(Cart* cart) {
   //if(cart->ramSize > 0 && cart->ram != NULL) memset(cart->ram, 0, cart->ramSize); // for now
+  if (cart->superfx) superfx_reset(cart->superfx);
 }
 
 void cart_saveload(Cart *cart, SaveLoadInfo *sli) {
@@ -36,6 +41,8 @@ void cart_saveload(Cart *cart, SaveLoadInfo *sli) {
 }
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
+  superfx_destroy(cart->superfx);
+  cart->superfx = NULL;
   cart->type = type;
   if(cart->rom != NULL) free(cart->rom);
   if(cart->ram != NULL) free(cart->ram);
@@ -49,6 +56,13 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   }
   cart->ramSize = ramSize;
   memcpy(cart->rom, rom, romSize);
+  if (type == CART_SUPERFX)
+    cart->superfx = superfx_create(cart->rom, cart->romSize,
+                                   cart->ram, cart->ramSize);
+}
+
+void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
+  if (cart && cart->superfx) superfx_sync(cart->superfx, master_clock);
 }
 
 uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
@@ -56,8 +70,24 @@ uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
     case 0: 
       assert(0);
       return 0;
-    case 1: return cart_readLorom(cart, bank, adr);
-    case 2: return cart_readHirom(cart, bank, adr);
+    case CART_LOROM: return cart_readLorom(cart, bank, adr);
+    case CART_HIROM: return cart_readHirom(cart, bank, adr);
+    case CART_SUPERFX:
+      if ((bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) &&
+          adr >= 0x3000 && adr <= 0x32ff)
+        return superfx_cpu_read_io(cart->superfx, adr);
+      if ((bank == 0x70 || bank == 0x71 || bank == 0xf0 || bank == 0xf1))
+        return superfx_cpu_read_ram(cart->superfx,
+                                    ((uint32_t)(bank & 1) << 16) | adr, 0);
+      /* CPU-visible ROM uses the GSU LoROM/linear mappings and observes the
+       * vector override while the coprocessor owns ROM. */
+      if (adr >= 0x8000 || (bank & 0x7f) >= 0x40) {
+        uint8_t b = bank & 0x7f;
+        uint32_t off = b < 0x40 ? ((uint32_t)b << 15) | (adr & 0x7fff)
+                                : ((uint32_t)(b - 0x40) << 16) | adr;
+        return superfx_cpu_read_rom(cart->superfx, off, 0);
+      }
+      return 0;
   }
   assert(0);
   return 0;
@@ -66,8 +96,16 @@ uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
 void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
   switch(cart->type) {
     case 0: break;
-    case 1: cart_writeLorom(cart, bank, adr, val); break;
-    case 2: cart_writeHirom(cart, bank, adr, val); break;
+    case CART_LOROM: cart_writeLorom(cart, bank, adr, val); break;
+    case CART_HIROM: cart_writeHirom(cart, bank, adr, val); break;
+    case CART_SUPERFX:
+      if ((bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) &&
+          adr >= 0x3000 && adr <= 0x32ff)
+        superfx_cpu_write_io(cart->superfx, adr, val);
+      else if (bank == 0x70 || bank == 0x71 || bank == 0xf0 || bank == 0xf1)
+        superfx_cpu_write_ram(cart->superfx,
+                              ((uint32_t)(bank & 1) << 16) | adr, val);
+      break;
   }
 }
 

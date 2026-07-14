@@ -577,6 +577,7 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     if (g_rtl_game_info->initialize)
       g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
+    g_snes->beamMasterLast = g_cpu.master_cycles;
     SnesEnterNativeMode();
   } else {
     g_snes->cart->ramSize = 2048;

@@ -30,6 +30,10 @@
 #include "cpu_state.h"
 #include "common_rtl.h"
 #include "cpu_trace.h"
+#include "snes/snes.h"
+#include "snes/cart.h"
+
+extern Snes *g_snes;
 
 CpuState g_cpu;
 
@@ -163,6 +167,8 @@ uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0) return cpu->ram[off];
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 1, 0); return ReadReg(addr); }
+    if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX)
+        return cart_read(g_snes->cart, bank, addr);
     int sram = cpu_sram_offset(bank, addr);
     if (sram >= 0) return g_sram[sram];
     /* ROM read. RomPtr requires the global g_rom pointer to be live. */
@@ -174,6 +180,9 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     if (off >= 0 && off + 1 < 0x20000)
         return (uint16)cpu->ram[off] | ((uint16)cpu->ram[off + 1] << 8);
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles_word(addr); cpu_hw_log(addr, 1, 0); return ReadRegWord(addr); }
+    if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX)
+        return (uint16)cart_read(g_snes->cart, bank, addr) |
+               ((uint16)cart_read(g_snes->cart, bank, (uint16)(addr + 1)) << 8);
     int sram_lo = cpu_sram_offset(bank, addr);
     if (sram_lo >= 0) {
         /* Compose word from two byte fetches. If the high byte crosses
@@ -237,6 +246,9 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
         return;
     }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
+    if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX) {
+        cart_write(g_snes->cart, bank, addr, v); return;
+    }
     int sram = cpu_sram_offset(bank, addr);
     if (sram >= 0) { g_sram[sram] = v; return; }
     /* ROM / unmapped write: drop. */
@@ -276,6 +288,11 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
         return;
     }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles_word(addr); cpu_hw_log(addr, 0, v); WriteRegWord(addr, v); return; }
+    if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX) {
+        cart_write(g_snes->cart, bank, addr, (uint8)v);
+        cart_write(g_snes->cart, bank, (uint16)(addr + 1), (uint8)(v >> 8));
+        return;
+    }
     int sram_lo = cpu_sram_offset(bank, addr);
     if (sram_lo >= 0) {
         g_sram[sram_lo] = (uint8)(v & 0xFF);

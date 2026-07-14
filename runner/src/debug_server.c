@@ -48,6 +48,9 @@ extern int snes_frame_counter;
 #include "snes/spc.h"
 #include "snes/snes.h"
 #include "snes/saveload.h"
+#include "snes/cart.h"
+#include "snes/superfx.h"
+#include "snes/interp_bridge.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
 extern Ppu *g_ppu;
@@ -4258,6 +4261,56 @@ static void cmd_get_interrupt_state(const char *args) {
              s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer);
 }
 
+static void cmd_get_superfx_state(const char *args) {
+    if (!g_snes || !g_snes->cart || !g_snes->cart->superfx) {
+        send_fmt("{\"error\":\"superfx not available\"}");
+        return;
+    }
+    SuperFx *f = g_snes->cart->superfx;
+    const uint64_t instruction_count = f->instruction_count;
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"sfr\":\"0x%04x\",\"pbr\":\"0x%02x\","
+        "\"rombr\":\"0x%02x\",\"rambr\":%u,\"cbr\":\"0x%04x\","
+        "\"scbr\":\"0x%02x\",\"scmr\":\"0x%02x\","
+        "\"colr\":\"0x%02x\",\"por\":\"0x%02x\","
+        "\"cfgr\":\"0x%02x\",\"clsr\":%u,\"pipeline\":\"0x%02x\","
+        "\"ramaddr\":\"0x%04x\",\"romcl\":%u,\"ramcl\":%u,"
+        "\"master_clock\":%llu,\"clock_credit\":%lld,"
+        "\"irq_pending\":%s,\"instruction_count\":%llu,\"r\":[",
+        f->sfr, f->pbr, f->rombr, f->rambr, f->cbr, f->scbr, f->scmr,
+        f->colr, f->por, f->cfgr, f->clsr, f->pipeline, f->ramaddr,
+        f->romcl, f->ramcl, (unsigned long long)f->master_clock,
+        (long long)f->clock_credit, f->irq_pending ? "true" : "false",
+        (unsigned long long)instruction_count);
+    for (int i = 0; i < 16 && pos > 0 && pos < (int)sizeof(buf); i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%04x\"",
+                        i ? "," : "", f->r[i].data);
+    if (pos > 0 && pos < (int)sizeof(buf))
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"trace\":[");
+    uint64_t first = instruction_count > 16 ? instruction_count - 15 : 1;
+    for (uint64_t sequence = first;
+         sequence <= instruction_count && pos > 0 && pos < (int)sizeof(buf);
+         sequence++) {
+        SuperFxTraceEntry *t = &f->trace[sequence & 255];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s{\"seq\":%llu,\"pbr\":\"0x%02x\","
+                        "\"r15\":\"0x%04x\",\"op\":\"0x%02x\","
+                        "\"sfr\":\"0x%04x\"}",
+                        sequence == first ? "" : ",",
+                        (unsigned long long)t->sequence, t->pbr, t->r15,
+                        t->opcode, t->sfr);
+    }
+    if (pos > 0 && pos < (int)sizeof(buf) - 2) {
+        buf[pos++] = ']';
+        buf[pos++] = '}';
+        buf[pos] = '\0';
+    } else {
+        snprintf(buf, sizeof(buf), "{\"error\":\"superfx state overflow\"}");
+    }
+    send_fmt("%s", buf);
+}
+
 extern void snes_catchup_stats(uint64_t *calls, uint64_t *cycles);
 extern uint64_t g_apu_timer0_total_ticks;
 static void cmd_get_v2_cpu(const char *args) {
@@ -4267,7 +4320,9 @@ static void cmd_get_v2_cpu(const char *args) {
              "\"S\":\"0x%04x\",\"D\":\"0x%04x\",\"DB\":\"0x%02x\",\"PB\":\"0x%02x\","
              "\"P\":\"0x%02x\",\"m\":%d,\"x\":%d,\"e\":%d,"
              "\"N\":%d,\"V\":%d,\"Z\":%d,\"C\":%d,\"I\":%d,\"D_flag\":%d,"
-             "\"main_cycles\":%llu,\"catchup_calls\":%llu,\"catchup_cycles\":%llu,"
+             "\"resume_pc\":\"0x%06x\",\"cpu_cycles\":%llu,"
+             "\"master_cycles\":%llu,\"main_cycles\":%llu,"
+             "\"catchup_calls\":%llu,\"catchup_cycles\":%llu,"
              "\"spc_pc\":\"0x%04x\",\"timer0_ticks\":%llu,"
              "\"timer0_target\":%d,\"timer0_div\":%d,\"timer0_cnt\":%d,\"timer0_en\":%d}",
              g_cpu.A, cpu_read_b(&g_cpu), g_cpu.X, g_cpu.Y,
@@ -4275,6 +4330,9 @@ static void cmd_get_v2_cpu(const char *args) {
              g_cpu.P, g_cpu.m_flag, g_cpu.x_flag, g_cpu.emulation,
              g_cpu._flag_N, g_cpu._flag_V, g_cpu._flag_Z, g_cpu._flag_C,
              g_cpu._flag_I, g_cpu._flag_D,
+             (unsigned)interp_bridge_lle_resume_pc(),
+             (unsigned long long)g_cpu.cycles,
+             (unsigned long long)g_cpu.master_cycles,
              (unsigned long long)g_main_cpu_cycles_estimate,
              (unsigned long long)cu_calls, (unsigned long long)cu_cycles,
              g_snes && g_snes->apu && g_snes->apu->spc ? g_snes->apu->spc->pc : 0,
@@ -6840,6 +6898,7 @@ static const CmdEntry s_commands[] = {
     {"get_rtstrace",  cmd_get_rtstrace},
     {"post_mortem_dump", cmd_post_mortem_dump},
     {"get_v2_cpu",    cmd_get_v2_cpu},
+    {"get_superfx_state", cmd_get_superfx_state},
     {"trace_dump",     cmd_trace_dump},
     {"trace_dbpb",     cmd_trace_dbpb},
     {"trace_clear",    cmd_trace_clear},

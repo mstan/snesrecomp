@@ -223,6 +223,70 @@ uint16_t SwapInputBits(uint16_t x) {
   return r;
 }
 
+static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
+  /* One NTSC scanline is 1364 master clocks, 262 scanlines per frame. Keep
+   * the live beam counters moving while LLE code executes so SLHV/OPHCT/OPVCT
+   * polling observes hardware time rather than a frame-frozen PPU.
+   *
+   * The CPU IRQ comparators run for the entire scanline/frame, including
+   * vblank.  Keeping this here (instead of in the visible-line renderer) is
+   * important for games such as Star Fox, which deliberately schedules an
+   * H+V IRQ on scanline 228 and blocks until that IRQ completes an NMI task. */
+  uint32_t h = snes->hPos;
+  uint32_t v = snes->vPos;
+  while (clocks) {
+    uint32_t span = 1364u - h;
+    if (span > clocks) span = clocks;
+
+    /* Automatic joypad polling begins at vblank and keeps HVBJOY.0 asserted
+     * for roughly 4224 master clocks.  The input registers are already backed
+     * by the current controller snapshot; this timer supplies the missing
+     * architectural start/busy/complete handshake. */
+    if (snes->autoJoyRead && v == 225u && h == 0u)
+      snes->autoJoyTimer = 4224;
+    if (snes->autoJoyTimer) {
+      snes->autoJoyTimer = span >= snes->autoJoyTimer
+                         ? 0 : (uint16_t)(snes->autoJoyTimer - span);
+    }
+
+    if (check_irq && (snes->hIrqEnabled || snes->vIrqEnabled)) {
+      bool line_matches = !snes->vIrqEnabled || v == snes->vTimer;
+      uint32_t target = snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
+      if (line_matches && target < 1364u && target >= h && target < h + span)
+        snes->inIrq = true;
+    }
+
+    h += span;
+    clocks -= span;
+    if (h >= 1364u) {
+      h = 0;
+      v++;
+      if (v >= 262u) v = 0;
+    }
+  }
+  snes->hPos = (uint16_t)h;
+  snes->vPos = (uint16_t)v;
+  snes->inVblank = v >= 225u;
+}
+
+void snes_advance_master_cycles(Snes *snes, uint32_t clocks) {
+  snes_advance_beam(snes, clocks, true);
+  snes->beamMasterLast += clocks;
+}
+
+void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
+  if (master_clock < snes->beamMasterLast) {
+    snes->beamMasterLast = master_clock;
+    return;
+  }
+  uint64_t delta=master_clock-snes->beamMasterLast;
+  while(delta) {
+    uint32_t chunk=delta>UINT32_MAX?UINT32_MAX:(uint32_t)delta;
+    snes_advance_master_cycles(snes,chunk);
+    delta-=chunk;
+  }
+}
+
 uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   switch(adr) {
     case 0x4210: {
@@ -248,8 +312,7 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       // hPos by a fixed step. Calibrated so a typical busy-wait crosses
       // both edges in ~10-20 reads. Bit 6 = hblank (dots ~1024..1364 of
       // a 1364-dot scanline). See docs/VIRTUAL_HW_CONTRACT.md.
-      uint32_t prev_h = snes->hPos;
-      snes->hPos = (snes->hPos + 64) % 1364;
+      snes_advance_beam(snes, 64, false);
       // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
       // inVblank (inVblank is never set true), so on the static-recomp
       // path bit 7 must be SYNTHESIZED the same way bit 6 is — otherwise a
@@ -257,10 +320,8 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       // (while the single host fiber is blocked in SwitchToFiber and real
       // frame timing is frozen) never sees the edge and spins forever
       // (Super Metroid I_RESET $00:843C: `LDA $4212 / BPL` x4 settle).
-      // Advance a synthetic scanline (vPos, 0..261 NTSC) each time the dot
-      // counter wraps; vblank is the post-render region (vPos >= 225). OR
-      // in the real inVblank so an authoritative vblank still reads true.
-      if (snes->hPos < prev_h) snes->vPos = (snes->vPos + 1) % 262;
+      // The synthetic advance shares the live beam helper, so IRQ and
+      // auto-joypad edges remain coherent with the reported counters.
       uint8_t val = (snes->autoJoyTimer > 0);
       val |= (snes->hPos >= 1024) << 6;
       val |= (snes->inVblank || snes->vPos >= 225) << 7;

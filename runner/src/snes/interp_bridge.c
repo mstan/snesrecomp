@@ -8,6 +8,7 @@
 #include "interp_bridge.h"
 #include "interp816.h"
 #include "snes.h"   /* Snes, apuCatchupCycles, snes_catchupApu */
+#include "superfx.h"
 #include "cosim.h"  /* cosim_insn — instruction-granular lockstep (no-op unless SNES_COSIM) */
 #include "common_cpu_infra.h"  /* cpu_take_tailcall_return_context — swallow a stale
                                 * tail-armed context on the LLE yield unwind */
@@ -76,13 +77,78 @@ static int bridge_is_apu_port(uint32_t adr) {
  * The interpreter's `mem` is the CpuState*; route every access through the
  * same AOT HLE bus the compiled code uses, so the interpreter sees identical
  * WRAM / MMIO / SRAM / ROM. One memory map, zero divergence. */
+uint64_t g_interp_bridge_write_epoch;
+static uint64_t s_interp_continuous_read_epoch;
+static uint64_t s_interp_dynamic_progress_epoch;
+static uint64_t s_interp_bus_master;
+static unsigned s_interp_bus_cycles;
+static int s_interp_bus_timing_active;
+typedef struct BridgeDynamicValue { uint32_t address; uint8_t value, valid; } BridgeDynamicValue;
+static BridgeDynamicValue s_bridge_dynamic_values[64];
+
+/* Match Recompiler/snes_cycles.py::region_speed. During an interpreted
+ * instruction the callbacks see every real bus transfer (opcode/operand
+ * fetches, data, stack and vectors), so charging those addresses directly and
+ * the remaining internal cycles at 6 master clocks is both more faithful and
+ * less tier-divergent than the old blanket `cpu_cycles * 8` estimate. */
+static unsigned bridge_region_speed(uint32_t adr) {
+    uint8_t bank=(uint8_t)(adr>>16); uint16_t a=(uint16_t)adr;
+    if (bank>=0x40 && bank<=0x7f) return 8;
+    if (bank>=0xc0) return g_memsel ? 6 : 8;
+    if (a>=0x8000) {
+        if (bank<=0x3f) return 8;
+        return g_memsel ? 6 : 8;
+    }
+    if (a<0x2000) return 8;
+    if (a<0x4000) return 6;
+    if (a<0x4200) return 12;
+    if (a<0x6000) return 6;
+    return 8;
+}
+
+static void bridge_timing_bus(uint32_t adr) {
+    if (!s_interp_bus_timing_active) return;
+    s_interp_bus_cycles++;
+    s_interp_bus_master+=bridge_region_speed(adr);
+}
+
+static int bridge_continuous_read(uint32_t adr) {
+    uint8_t bank=(uint8_t)(adr>>16); uint16_t a=(uint16_t)adr;
+    if (!(bank<=0x3f || (bank>=0x80 && bank<=0xbf))) return 0;
+    /* Devices in these windows advance from CPU/master time or from the read
+     * protocol itself. Repeating CPU registers around such a read is not a
+     * quiescent interrupt wait: keep executing so the device can answer. */
+    if (a>=0x2134 && a<0x2180) return 1;       /* PPU counters + APU ports */
+    if (a>=0x3000 && a<0x3300) return 1;       /* GSU registers/cache */
+    if (a==0x4016 || a==0x4017 || a==0x4212) return 1;
+    return 0;
+}
+
 static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     CpuState *cpu = (CpuState *)mem;
+    bridge_timing_bus(adr);
+    int continuous=bridge_continuous_read(adr);
+    if (continuous) s_interp_continuous_read_epoch++;
     if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
-    return cpu_read8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF));
+    uint8_t value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
+    if (continuous) {
+        BridgeDynamicValue *d=&s_bridge_dynamic_values[(adr^(adr>>8)^(adr>>16))&63];
+        if (!d->valid || d->address!=adr || d->value!=value) {
+            d->valid=1; d->address=adr; d->value=value;
+            s_interp_dynamic_progress_epoch++;
+        }
+    }
+    return value;
 }
 static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
+    bridge_timing_bus(adr);
+    g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
+    if (getenv("SNESRECOMP_APU_PORT_DIAG") && bridge_is_apu_port(adr)) {
+        static unsigned reports;
+        if(reports++<256) fprintf(stderr,"[apu_port] write $%04X=%02X master=%llu\n",
+          (unsigned)(uint16_t)adr,val,(unsigned long long)cpu->master_cycles);
+    }
     if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
 }
@@ -110,9 +176,31 @@ static int bridge_hw_word(uint32_t adrl, uint32_t adrh) {
 static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
                                  uint16_t *out) {
     if (!bridge_hw_word(adrl, adrh)) return false;
+    bridge_timing_bus(adrl);
+    bridge_timing_bus(adrh);
+    if (bridge_continuous_read(adrl) || bridge_continuous_read(adrh))
+        s_interp_continuous_read_epoch++;
     CpuState *cpu = (CpuState *)mem;
     if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
+    if (getenv("SNESRECOMP_APU_PORT_DIAG") && (uint16_t)adrl == 0x2140) {
+        static uint16_t last=0xffff; static unsigned reports;
+        if (*out!=last && reports++<256) {
+            fprintf(stderr,"[apu_port] read $2140=%04X pc-master=%llu pending=%llu\n",
+                    *out,(unsigned long long)cpu->master_cycles,
+                    (unsigned long long)s_apu_pending_master);
+            last=*out;
+        }
+    }
+    /* Byte callbacks are bypassed for a claimed word. Treat any changed byte
+     * as device progress so long productive transfers do not hit the wedge cap. */
+    if (bridge_continuous_read(adrl) || bridge_continuous_read(adrh)) {
+        uint8_t lo=(uint8_t)*out, hi=(uint8_t)(*out>>8);
+        BridgeDynamicValue *dl=&s_bridge_dynamic_values[(adrl^(adrl>>8)^(adrl>>16))&63];
+        BridgeDynamicValue *dh=&s_bridge_dynamic_values[(adrh^(adrh>>8)^(adrh>>16))&63];
+        if(!dl->valid||dl->address!=adrl||dl->value!=lo){dl->valid=1;dl->address=adrl;dl->value=lo;s_interp_dynamic_progress_epoch++;}
+        if(!dh->valid||dh->address!=adrh||dh->value!=hi){dh->valid=1;dh->address=adrh;dh->value=hi;s_interp_dynamic_progress_epoch++;}
+    }
     return true;
 }
 static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
@@ -120,7 +208,15 @@ static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
     /* reversed = RMW write-back (high byte first on hardware); keep those on
      * the faithful byte path — WriteRegWord would flip non-APU order. */
     if (reversed || !bridge_hw_word(adrl, adrh)) return false;
+    bridge_timing_bus(adrl);
+    bridge_timing_bus(adrh);
+    g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
+    if (getenv("SNESRECOMP_APU_PORT_DIAG") && bridge_is_apu_port(adrl)) {
+        static unsigned reports;
+        if(reports++<256) fprintf(stderr,"[apu_port] writew $%04X=%04X master=%llu\n",
+          (unsigned)(uint16_t)adrl,val,(unsigned long long)cpu->master_cycles);
+    }
     if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
     cpu_write16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF), val);
     return true;
@@ -173,6 +269,7 @@ static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static int      s_lle_unwind_owner_depth = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+static uint64_t s_lle_master_deadline = 0;
 /* Depth of nested interpreter runs and the run that owns the current paired
  * AOT bounce. A rewritten/non-local return from that AOT root must resume the
  * owning interpreter's guest call chain. */
@@ -189,6 +286,9 @@ static size_t   s_lle_bounce_exclusion_count;
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
+void interp_bridge_set_master_deadline(uint64_t master_clock) {
+    s_lle_master_deadline = master_clock;
+}
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     (void)cpu;
@@ -345,6 +445,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  int reset_cap_on_bounce,
                                  const uint32_t *stop_pcs, int n_stop,
                                  int stop_on_rti) {
+    const int auto_quiescent = yield_pc == 0xFFFFFFFEu;
     /* Local interpreter context → nesting (an AOT bounce that itself traps and
      * re-enters the bridge) gets its own frame; no shared mutable interp. */
     Interp816 in;
@@ -386,10 +487,86 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     ITraceEnt head[8], ring[256];
     long itn = 0;
 
+    typedef struct QuiescentState {
+        uint32_t pc;
+        uint16_t a, x, y, sp, dp;
+        uint8_t db, k, c, z, v, n, i, d, mf, xf, e;
+        uint64_t write_epoch;
+        uint64_t continuous_read_epoch;
+        long step;
+        unsigned repeats;
+    } QuiescentState;
+    QuiescentState qring[64];
+    memset(qring, 0, sizeof qring);
+
     const long step_cap = interp_step_cap();
     long steps = 0;
+    uint64_t progress_write_epoch=g_interp_bridge_write_epoch;
+    uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        /* IRQs are sampled between instructions.  An auto-quiescent whole-
+         * program run must return to its owning scheduler as soon as either
+         * the CPU H/V comparator or a coprocessor asserts IRQ; otherwise a
+         * perfectly live hardware-poll loop can monopolize the bridge and
+         * starve the handler forever. */
+        if (auto_quiescent && steps && !in.i && g_snes &&
+            (g_snes->inIrq ||
+             (g_snes->cart && g_snes->cart->superfx &&
+              g_snes->cart->superfx->irq_pending))) {
+            s_lle_resume_pc24=pc_before;
+            sync_interp_to_cpu(&in,cpu);
+            bridge_apu_flush(cpu);
+            return 1;
+        }
+        if (auto_quiescent && s_lle_master_deadline &&
+            cpu->master_cycles >= s_lle_master_deadline) {
+            s_lle_resume_pc24=pc_before;
+            sync_interp_to_cpu(&in,cpu);
+            bridge_apu_flush(cpu);
+            return 1;
+        }
+        if (auto_quiescent) {
+            QuiescentState now;
+            memset(&now, 0, sizeof now);
+            now.pc=pc_before; now.a=in.a; now.x=in.x; now.y=in.y;
+            now.sp=in.sp; now.dp=in.dp; now.db=in.db; now.k=in.k;
+            now.c=in.c; now.z=in.z; now.v=in.v; now.n=in.n; now.i=in.i;
+            now.d=in.d; now.mf=in.mf; now.xf=in.xf; now.e=in.e;
+            now.write_epoch=g_interp_bridge_write_epoch; now.step=steps;
+            now.continuous_read_epoch=s_interp_continuous_read_epoch;
+            for (unsigned qi=0; qi<64; qi++) {
+                QuiescentState *old=&qring[qi];
+                if (old->step && steps-old->step<=64 &&
+                    old->pc==now.pc && old->a==now.a && old->x==now.x &&
+                    old->y==now.y && old->sp==now.sp && old->dp==now.dp &&
+                    old->db==now.db && old->k==now.k && old->c==now.c &&
+                    old->z==now.z && old->v==now.v && old->n==now.n &&
+                    old->i==now.i && old->d==now.d && old->mf==now.mf &&
+                    old->xf==now.xf && old->e==now.e &&
+                    old->write_epoch==now.write_epoch &&
+                    old->continuous_read_epoch==now.continuous_read_epoch) {
+                    now.repeats=old->repeats+1;
+                    if (now.repeats>=2) {
+                        /* Stable CPU/memory state is a genuine cooperative
+                         * wait.  The owning scheduler advances idle hardware
+                         * to the next timer comparator or vblank and resumes
+                         * here after servicing that event.  Burning the poll
+                         * inside the interpreter until any enabled timer fired
+                         * made a single host frame consume many guest frames
+                         * and could starve rendering.  Live MMIO polls are not
+                         * mistaken for this path: continuous_read_epoch changes
+                         * on every such read. */
+                        s_lle_resume_pc24=pc_before;
+                        sync_interp_to_cpu(&in,cpu);
+                        bridge_apu_flush(cpu);
+                        return 1;
+                    }
+                    break;
+                }
+            }
+            qring[steps & 63]=now;
+        }
         /* Opt-in control-flow tripwire: game code normally executes from the
          * LoROM $8000-$FFFF half of a bank.  If a return/jump crosses from ROM
          * into the low I/O/RAM half, capture the transition and a substantial
@@ -445,7 +622,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             _poll_pc16 == 0xE02C || _poll_pc16 == 0xE06B ||
             _poll_pc16 == 0xE50D || _poll_pc16 == 0xE609 ||
             _poll_pc16 == 0xE526;
-        if (yield_pc && _secondary_poll_pc &&
+        if (yield_pc && !auto_quiescent && _secondary_poll_pc &&
             (_poll_op == 0xAD || _poll_op == 0x2C) &&
             (_poll_branch == 0x30 || _poll_branch == 0x10) &&
             bridge_bus_read(cpu, pc_before + 4) == 0xFB) {
@@ -482,7 +659,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * M controls both A and the memory operand width.  Direct-page and
          * indexed variants can be added when observed; absolute CMP is the
          * canonical 65816 form used for interrupt-owned WRAM counters. */
-        if (yield_pc && _poll_op == 0xCD &&
+        if (yield_pc && !auto_quiescent && _poll_op == 0xCD &&
             bridge_bus_read(cpu, pc_before + 3) == 0xF0 &&
             bridge_bus_read(cpu, pc_before + 4) == 0xFB) {
             const uint16_t _wait_addr = (uint16_t)(
@@ -514,7 +691,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * can change.  Recognise the register/opcode shape (not a game PC) at
          * the final taken BEQ, yield to the owning LLE scheduler, and resume at
          * the backward target so $4212/$4218/$4219 are sampled again. */
-        if (yield_pc && _poll_op == 0xF0 && in.z &&
+        if (yield_pc && !auto_quiescent && _poll_op == 0xF0 && in.z &&
             bridge_bus_read(cpu, pc_before - 8) == 0xAD &&
             bridge_bus_read(cpu, pc_before - 7) == 0x18 &&
             bridge_bus_read(cpu, pc_before - 6) == 0x42 &&
@@ -531,7 +708,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 return 1;
             }
         }
-        if (yield_pc && (pc_before & 0x7FFFFF) == (yield_pc & 0x7FFFFF)) {
+        if (yield_pc && !auto_quiescent &&
+            (pc_before & 0x7FFFFF) == (yield_pc & 0x7FFFFF)) {
             const uint8_t _yield_flag = bridge_bus_read(cpu, yield_flag_addr);
             /* Canonical byte wait loop: LDA <flag>; BNE -5.  A synthetic
              * scheduler resume can arrive with DB/M inherited from a compiled
@@ -652,7 +830,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
 
         const uint16_t dp_before = in.dp;
         const uint16_t sp_before = in.sp;
+        s_interp_bus_master=0;
+        s_interp_bus_cycles=0;
+        s_interp_bus_timing_active=1;
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
+        s_interp_bus_timing_active=0;
         if (dtrace && in.dp != dp_before) {
             extern int snes_frame_counter;
             fprintf(stderr,
@@ -671,9 +853,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * catch-up delta excludes what we already advanced here. */
         if (_cyc <= 0) _cyc = 1;
         {
-            uint64_t _master = (uint64_t)_cyc * 8u;
+            unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
+                               ? (unsigned)_cyc - s_interp_bus_cycles : 0;
+            uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
+            if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
+            if (g_snes && g_snes->cart)
+                cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
 #ifdef SNES_COSIM
             /* Shared APU clock (common_rtl.h): the guest-time advance is a
              * per-side clock (master-cycle accounting differs between the
@@ -689,6 +876,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 s_apu_pending_master += _master;
                 if (s_apu_pending_master >= 4096) bridge_apu_flush(cpu);
             }
+        }
+
+        if (auto_quiescent &&
+            (progress_write_epoch != g_interp_bridge_write_epoch ||
+             progress_dynamic_epoch != s_interp_dynamic_progress_epoch)) {
+            progress_write_epoch=g_interp_bridge_write_epoch;
+            progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
+            steps=0;
         }
 
         /* A host-invoked architectural interrupt handler is paired with the
@@ -1006,6 +1201,16 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
                            uint8_t flag_value) {
     return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL, yield_pc,
                                  flag_addr, flag_value, 0, NULL, 0, 0);
+}
+
+int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24) {
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
+                                 0xFFFFFFFEu, 0, 0, 0, NULL, 0, 0);
+}
+
+int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24) {
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
+                                 0, 0, 0, 0, NULL, 0, 1);
 }
 
 /* ── tier-down entry (called from generated indirect-dispatch defaults) ───── */

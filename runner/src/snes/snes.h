@@ -34,6 +34,7 @@ struct Snes {
   // --- saveload blob starts here (hPos .. divideResult) ---
   uint16_t hPos;
   uint16_t vPos;
+  uint64_t beamMasterLast;
   double apuCatchupCycles;
   // nmi / irq
   bool hIrqEnabled;
@@ -73,6 +74,8 @@ uint16_t SwapInputBits(uint16_t x);
 bool snes_loadRom(Snes* snes, const uint8_t* data, int length);
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
+void snes_advance_master_cycles(Snes *snes, uint32_t clocks);
+void snes_sync_master_clock(Snes *snes, uint64_t master_clock);
 
 extern int snes_frame_counter;
 #endif

@@ -13,6 +13,7 @@
 
 
 extern bool g_new_ppu;
+extern Snes *g_snes;
 void PpuDrawWholeLineOldPpu(Ppu *ppu, int line);
 static void PpuDrawWholeLine(Ppu *ppu, uint y);
 
@@ -355,6 +356,184 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #undef READ_BITS
 #undef DO_PIXEL
 #undef DO_PIXEL_HFLIP
+}
+
+/* Draw an 8bpp tiled background (mode 3/4 BG1).  The original renderer only
+ * implemented mode 1's 4bpp/2bpp layers and treated every other mode as mode
+ * 7.  Super FX games commonly DMA their planar framebuffer into a mode-3 BG1,
+ * so that fallback interpreted perfectly valid tile data as a mode-7 bitmap.
+ * Keep this scalar for clarity; 256 pixels per line is insignificant beside
+ * the coprocessor workload and gives us the complete 8x8/16x16 tile contract. */
+static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer,
+                                  PpuZbufType zhi, PpuZbufType zlo) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer)
+      ? PpuWindows_Calc(&win, ppu, layer, y)
+      : PpuWindows_Clear(&win, ppu, layer, y);
+
+  const bool big = PPU_bigTiles(ppu, layer) != 0;
+  const unsigned tile_shift = big ? 4 : 3;
+  const unsigned page_shift = tile_shift + 5;
+  const unsigned tile_mask = (1u << tile_shift) - 1u;
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const int mapadr = PPU_bgTilemapAdr(ppu, layer);
+  const int sy = (int)y + ppu->vScroll[layer];
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    PpuZbufType *dstz = ppu->bgBuffers[sub].data + left + kPpuExtraLeftRight;
+
+    for (int screen_x = left; screen_x < right; screen_x++, dstz++) {
+      const int sx = screen_x + ppu->hScroll[layer];
+      int sc = mapadr + (((sy >> tile_shift) & 31) << 5);
+      if (((sy >> page_shift) & 1) && PPU_bgTilemapHigher(ppu, layer))
+        sc += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
+      if (((sx >> page_shift) & 1) && PPU_bgTilemapWider(ppu, layer))
+        sc += 0x400;
+      sc += (sx >> tile_shift) & 31;
+
+      uint16 tile = ppu->vram[sc & 0x7fff];
+      unsigned px = (unsigned)sx & tile_mask;
+      unsigned py = (unsigned)sy & tile_mask;
+      if (tile & 0x4000) px = tile_mask - px;
+      if (tile & 0x8000) py = tile_mask - py;
+
+      unsigned character = tile & 0x3ff;
+      if (big)
+        character = (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned row = py & 7;
+      const unsigned bit = 7 - (px & 7);
+      const unsigned addr = (tileadr + character * 32 + row) & 0x7fff;
+      const uint16 p01 = ppu->vram[addr];
+      const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+      const uint16 p45 = ppu->vram[(addr + 16) & 0x7fff];
+      const uint16 p67 = ppu->vram[(addr + 24) & 0x7fff];
+      const unsigned pixel =
+          ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
+          (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3) |
+          (((p45 >> bit) & 1) << 4) | (((p45 >> (bit + 8)) & 1) << 5) |
+          (((p67 >> bit) & 1) << 6) | (((p67 >> (bit + 8)) & 1) << 7);
+      const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      if (pixel && z > *dstz)
+        *dstz = z + pixel;
+    }
+  }
+}
+
+static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
+  int addr = PPU_bgTilemapAdr(ppu, layer) + ((ty & 31) << 5) + (tx & 31);
+  if (((ty >> 5) & 1) && PPU_bgTilemapHigher(ppu, layer))
+    addr += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
+  if (((tx >> 5) & 1) && PPU_bgTilemapWider(ppu, layer))
+    addr += 0x400;
+  return ppu->vram[addr & 0x7fff];
+}
+
+/* Modes 2/4/6 use BG3's tilemap as per-column scroll overrides for the
+ * displayed layers.  Mode 2 (the Star Fox attract/game perspective screens)
+ * has separate horizontal and vertical rows: BG3VOFS-1 selects the horizontal
+ * row and BG3VOFS+7 the vertical row.  Bit 13 enables BG1, bit 14 enables BG2.
+ * The first visible tile column cannot be offset on hardware. */
+static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
+                                      PpuZbufType zhi, PpuZbufType zlo) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer)
+      ? PpuWindows_Calc(&win, ppu, layer, y)
+      : PpuWindows_Clear(&win, ppu, layer, y);
+
+  const bool big = PPU_bigTiles(ppu, layer) != 0;
+  const bool opt_big = PPU_bigTiles(ppu, 2) != 0;
+  const unsigned tile_shift = big ? 4 : 3;
+  const unsigned tile_mask = (1u << tile_shift) - 1u;
+  const unsigned coord_mask = big ? 0x3ffu : 0x1ffu;
+  const unsigned opt_shift = opt_big ? 4 : 3;
+  const unsigned opt_coord_mask = opt_big ? 0x3ffu : 0x1ffu;
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const unsigned hscroll = ppu->hScroll[layer];
+  const unsigned vscroll = ppu->vScroll[layer];
+  const unsigned opt_hscroll = ppu->hScroll[2];
+  const unsigned opt_vscroll = ppu->vScroll[2] - 1u;
+  const int opt_hrow = (opt_vscroll & opt_coord_mask) >> opt_shift;
+  const int opt_vrow = ((opt_vscroll + 8) & opt_coord_mask) >> opt_shift;
+  const uint16 enable = (uint16)(0x2000u << layer);
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    PpuZbufType *dstz =
+        ppu->bgBuffers[sub].data + left + kPpuExtraLeftRight;
+    bool left_edge = left < 8 - (hscroll & 7);
+
+    /* OPT values apply to a rendered segment, not independently to every
+     * screen pixel.  The selected horizontal offset determines where the
+     * next eight-pixel source-tile boundary lies; only there does the PPU
+     * fetch another BG3 offset-map entry. */
+    for (int screen_x = left; screen_x < right;) {
+      unsigned hoffset = hscroll;
+      unsigned voffset = vscroll;
+      if (left_edge) {
+        /* The SNES cannot apply OPT to the leftmost source-tile column. */
+        left_edge = false;
+      } else {
+        const unsigned opt_pos =
+            (opt_hscroll + (unsigned)screen_x - 1) & opt_coord_mask;
+        const int opt_x = opt_pos >> opt_shift;
+        const uint16 hcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_hrow);
+        const uint16 vcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_vrow);
+        if (hcell & enable)
+          hoffset = (hcell & ~7) | (hscroll & 7);
+        if (vcell & enable)
+          voffset = (uint16)(vcell + 1);
+      }
+
+      const unsigned sx = (hoffset + (unsigned)screen_x) & coord_mask;
+      const unsigned sy = (voffset + y) & coord_mask;
+      unsigned width = 8 - (sx & 7);
+      if (width > (unsigned)(right - screen_x))
+        width = right - screen_x;
+
+      for (unsigned i = 0; i < width; i++, dstz++) {
+        unsigned source_x = (sx + i) & coord_mask;
+        uint16 tile = PpuReadTilemapEntry(
+            ppu, layer, source_x >> tile_shift, sy >> tile_shift);
+        unsigned px = source_x & tile_mask;
+        unsigned py = sy & tile_mask;
+        if (tile & 0x4000)
+          px = tile_mask - px;
+        if (tile & 0x8000)
+          py = tile_mask - py;
+
+        unsigned character = tile & 0x3ff;
+        if (big)
+          character =
+              (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+        const unsigned addr =
+            (tileadr + character * 16 + (py & 7)) & 0x7fff;
+        const uint16 p01 = ppu->vram[addr];
+        const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+        const unsigned bit = 7 - (px & 7);
+        const unsigned pixel =
+            ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
+            (((p23 >> bit) & 1) << 2) |
+            (((p23 >> (bit + 8)) & 1) << 3);
+        const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+        if (pixel && z > *dstz)
+          *dstz = z + ((tile & 0x1c00) >> 6) + pixel;
+      }
+      screen_x += width;
+    }
+  }
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers
@@ -735,6 +914,16 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawBackground_2bpp_mosaic(ppu, y, sub, 2, bg3prio, 0x1200);
     else
       PpuDrawBackground_2bpp(ppu, y, sub, 2, bg3prio, 0x1200);
+  } else if (PPU_mode(ppu) == 2) {
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x8000);
+    PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, 0xb100, 0x7100);
+  } else if (PPU_mode(ppu) == 3) {
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
+    PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
   } else {
     // mode 7
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
@@ -951,12 +1140,11 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
     return (result >> (8 * (adr - 0x34))) & 0xff;
   }
     case 0x37: {
-      /* Frame-level recomp runs do not model per-scanline PPU time, but
-       * games still use SLHV/OPVCT busy-waits to wait until late visible
-       * scanlines before touching HDMA/window tables. Latch a stable
-       * late-line value so those waits can complete. */
-      ppu->hCount = 0;
-      ppu->vCount = 0xc0;
+      /* SLHV latches the live beam. LLE advances Snes::hPos/vPos from the
+       * shared master-clock timeline; hard-coding a convenient scanline made
+       * games waiting for any other line loop forever. */
+      ppu->hCount = g_snes->hPos / 4;
+      ppu->vCount = g_snes->vPos;
       ppu->hCountSecond = false;
       ppu->vCountSecond = false;
       ppu->countersLatched = true;
