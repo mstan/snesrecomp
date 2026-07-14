@@ -302,18 +302,29 @@ def build_emission_entries(manifest: ProgramManifest, parsed,
             pc16 in getattr(cfg, "hle_spc_upload", ())))
         if node.disposition != NodeDisposition.AOT_ELIGIBLE and not has_hle:
             continue
-        template = templates_exact.get(
-            (key.pc24, key.m, key.x), templates_any.get(key.pc24))
-        mirror_pc24 = _lorom_mirror_pc24(key.pc24)
-        if template is None and mirror_pc24 is not None:
+        # An HLE annotation replaces the architectural boundary, not one
+        # decoder specialization of it.  Runtime P.M/P.X can legitimately
+        # differ from the mode analysis observed (and the same boundary can
+        # be entered through a LoROM execution mirror).  Falling back to LLE
+        # for an absent exact slot would execute the ROM body instead of the
+        # declared override.  Materialize the tiny HLE shim for every exact
+        # M/X combination whenever any live manifest demand reaches it.
+        modes = ((0, 0), (0, 1), (1, 0), (1, 1)) if has_hle else (
+            (key.m, key.x),)
+        for m, x in modes:
+            if (m, x) in emitted[key.pc24]:
+                continue
             template = templates_exact.get(
-                (mirror_pc24, key.m, key.x),
-                templates_any.get(mirror_pc24))
-        name = name_for_pc.get(
-            key.pc24, f"bank_{bank:02X}_{pc16:04X}")
-        entries_by_bank[bank].append(_copy_entry(
-            template, name=name, pc24=key.pc24, m=key.m, x=key.x))
-        emitted[key.pc24].add((key.m, key.x))
+                (key.pc24, m, x), templates_any.get(key.pc24))
+            mirror_pc24 = _lorom_mirror_pc24(key.pc24)
+            if template is None and mirror_pc24 is not None:
+                template = templates_exact.get(
+                    (mirror_pc24, m, x), templates_any.get(mirror_pc24))
+            name = name_for_pc.get(
+                key.pc24, f"bank_{bank:02X}_{pc16:04X}")
+            entries_by_bank[bank].append(_copy_entry(
+                template, name=name, pc24=key.pc24, m=m, x=x))
+            emitted[key.pc24].add((m, x))
 
     # Every analyzed PC is a known executable entry even when it had no cfg
     # label.  Give it the same deterministic synthetic name used by emission
@@ -552,7 +563,13 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
             staging / "unresolved_stubs_v2.c",
             "/* Manifest-driven generation: unresolved execution remains LLE. */\n")
         write_if_changed(staging / "program_manifest.json", manifest_text)
-        emitted_count = sum(len(v) for v in emitted.values())
+        # Count analyzed architectural variants, not the additional exact HLE
+        # shims synthesized for runtime modes absent from the manifest.  Those
+        # shims are required override ABI coverage, not newly discovered AOT
+        # work, and must not make the reported LLE count negative.
+        emitted_count = sum(
+            1 for key in manifest.nodes
+            if (key.m, key.x) in emitted.get(key.pc24, ()))
         output_names = sorted(planned | {"program_manifest.json"})
         output_hashes = {
             name: hashlib.sha256((staging / name).read_bytes()).hexdigest()

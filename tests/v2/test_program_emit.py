@@ -122,6 +122,40 @@ def test_aot_interrupt_tail_to_lle_preserves_rti_boundary(tmp_path):
     assert "cpu->host_return_valid = _interrupted_hrv;" in source
 
 
+def test_hle_override_covers_all_mx_modes_at_lorom_mirror(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0xEA)
+    rom = bytearray(rom_path.read_bytes())
+    # The only analyzed transfer reaches the LoROM execution mirror in
+    # M1X1. At runtime a host scheduler can re-enter the same architectural
+    # boundary with any P.M/P.X combination; every exact slot must still use
+    # the HLE override rather than interpreting the replaced ROM loop.
+    rom[0:4] = bytes([0x5C, 0x99, 0x80, 0x80])  # JML $80:8099
+    rom[0x99:0x9B] = bytes([0x80, 0xFE])         # non-returning ROM loop
+    rom_path.write_bytes(rom)
+    (cfg_dir / "bank00.cfg").write_text(
+        "bank = 00\n"
+        "func I_RESET 8000 end:8004 entry_mx:1,1\n"
+        "func SchedulerLoop 8099 end:809B entry_mx:1,1\n"
+        "hle_func 8099 HleSchedulerReturn\n",
+        encoding="utf-8")
+
+    result = _run(rom_path, cfg_dir, out_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "exact AOT variants, -" not in result.stdout
+    source = (out_dir / "bank80_v2.c").read_text(encoding="utf-8")
+    dispatch = (out_dir / "dispatch_v2.c").read_text(encoding="utf-8")
+    for m in (0, 1):
+        for x in (0, 1):
+            name = f"bank_80_8099_M{m}X{x}"
+            assert f"RecompReturn {name}(CpuState *cpu)" in source
+            assert "RecompReturn _r = HleSchedulerReturn(cpu);" in source
+            assert name in dispatch
+    assert source.count(
+        "cpu_take_tailcall_return_context(NULL, NULL);") == 4
+    assert "0x808099u, { NULL" not in dispatch
+
+
 def test_lle_only_declared_sibling_remains_an_emission_boundary(tmp_path):
     rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0x00)
     rom = bytearray(rom_path.read_bytes())

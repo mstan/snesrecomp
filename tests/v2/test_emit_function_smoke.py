@@ -90,6 +90,24 @@ def test_function_body_is_brace_balanced():
     )
 
 
+def test_generic_hle_consumes_inherited_tail_context():
+    """An HLE replacement is still an architectural callee boundary.
+
+    A generated tail caller arms return-context inheritance before entering
+    it.  The forwarding shim must consume that one-shot metadata so the next
+    unrelated AOT call cannot mistake the old caller's stack for its own.
+    """
+    rom = make_lorom_bank0({0x8099: bytes([0x80, 0xFE])})
+    src = emit_function(
+        rom, bank=0, start=0x8099, entry_m=0, entry_x=0,
+        func_name="SchedulerLoop",
+        hle_func={0x8099: "HleSchedulerReturn"})
+
+    assert "cpu_take_tailcall_return_context(NULL, NULL);" in src, src
+    assert src.index("cpu_take_tailcall_return_context") < src.index(
+        "HleSchedulerReturn(cpu)"), src
+
+
 def test_jsr_emits_function_call():
     """JSR $8010 -> emits a runtime (m, x) dispatch switch that calls
     one of bank_00_8010_M{m}X{x}(cpu) per cpu->m_flag/x_flag, with the

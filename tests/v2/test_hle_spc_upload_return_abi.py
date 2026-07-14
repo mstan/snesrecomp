@@ -18,6 +18,7 @@ def test_hle_spc_upload_emits_rts_frame_pop_before_normal_return():
     assert 'RtlUploadSpcImageFromDp(cpu)' in src, src
     assert 'uint16 _entry_s = cpu->S;' in src, src
     assert 'uint8 _hrv = cpu->host_return_valid;' in src, src
+    assert 'cpu_take_tailcall_return_context(&_entry_s, &_hrv)' in src, src
     assert 'uint32 _host_return_pc24 = 0xFFFFFFFFu;' in src, src
     assert '_rpc24 == _host_return_pc24' in src, src
     assert 'HLE SPC upload RTS pop hardware return frame' in src, src

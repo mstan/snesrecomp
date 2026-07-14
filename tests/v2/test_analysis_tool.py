@@ -12,6 +12,7 @@ if str(REPO / "tools") not in sys.path:
 
 from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
 from v2.program_analysis import NodeDisposition  # noqa: E402
+from v2.program_emit import build_emission_entries  # noqa: E402
 
 
 def test_manifest_from_cfg_roots_is_stable_and_follows_calls():
@@ -197,8 +198,9 @@ def test_hle_overlay_contract_applies_to_lorom_execution_mirror():
             "func YieldOverlay 9000 end:9002 entry_mx:1,1\n"
             "hle_func 9000 HleYieldOverlay\n",
             encoding="utf-8")
+        parsed = _load_cfgs(cfg_dir)
         manifest, _helpers, _inline = build_manifest(
-            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            rom, parsed, max_insns=128, max_nodes=128,
             all_cfg_roots=True)
 
     caller_key = next(key for key in manifest.nodes
@@ -206,3 +208,13 @@ def test_hle_overlay_contract_applies_to_lorom_execution_mirror():
                       and (key.m, key.x) == (1, 1))
     assert manifest.nodes[caller_key].disposition == NodeDisposition.AOT_ELIGIBLE
     assert manifest.exit_modes[caller_key] == (1, 1)
+    entries_by_bank, emitted, _names, _cfgs = build_emission_entries(
+        manifest, parsed)
+    assert emitted[0x809000] == {
+        (0, 0), (0, 1), (1, 0), (1, 1)
+    }
+    assert {
+        (entry.entry_m, entry.entry_x)
+        for entry in entries_by_bank[0x80]
+        if entry.start == 0x9000
+    } == {(0, 0), (0, 1), (1, 0), (1, 1)}
