@@ -359,8 +359,9 @@ const DispatchLogEntry *cpu_dispatch_log_at(unsigned i) {
  *
  * The ring records every cpu_dispatch_pc_from (RTS/RTL trampoline) AND
  * cpu_dispatch_call_pc (runtime-pointer JSR (abs,X) — SM enemy/PLM/eproj
- * AI). `found:0` entries name targets that missed the AOT dispatch table
- * (they ran on the interpreter tier) — the promotion worklist. The TCP
+ * AI). `found:0` entries name targets with no exact AOT body
+ * (known rows run on LLE; unknown continuations unwind) — the promotion
+ * worklist. The TCP
  * `dispatch_log_get` command dumps the same ring live; this is the only
  * readable copy when the TCP server is unavailable (SM). */
 void CpuDispatchLogDumpJson(FILE *f) {
@@ -384,18 +385,24 @@ void CpuDispatchLogDumpJson(FILE *f) {
     fprintf(f, "]},\n");
 }
 
-static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState *) {
+static const DispatchEntry *_cpu_dispatch_find(uint32 pc24) {
     unsigned lo = 0;
     unsigned hi = g_dispatch_table_count;
     while (lo < hi) {
         unsigned mid = lo + (hi - lo) / 2;
         uint32 mid_pc = g_dispatch_table[mid].pc24;
-        if (mid_pc == pc24) {
-            unsigned idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
-            return g_dispatch_table[mid].variant[idx];
-        }
+        if (mid_pc == pc24) return &g_dispatch_table[mid];
         if (mid_pc < pc24) lo = mid + 1;
         else               hi = mid;
+    }
+    return NULL;
+}
+
+static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState *) {
+    const DispatchEntry *row = _cpu_dispatch_find(pc24);
+    if (row != NULL) {
+        unsigned idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
+        return row->variant[idx];
     }
     return NULL;
 }
@@ -407,7 +414,13 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
     source_pc24 &= 0xFFFFFFu;
     unsigned mx_idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
     int via_mirror = 0;
-    RecompReturn (*fp)(CpuState *) = _cpu_dispatch_lookup(cpu, pc24);
+    int known_entry = 0;
+    const DispatchEntry *row = _cpu_dispatch_find(pc24);
+    RecompReturn (*fp)(CpuState *) = NULL;
+    if (row != NULL) {
+        known_entry = 1;
+        fp = row->variant[mx_idx];
+    }
     if (fp == NULL) {
         /* LoROM bank-mirror fallback: $00-$3F and $80-$BF share bytes.
          * Cfg may declare a function in one bank while the trampoline
@@ -415,12 +428,26 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
          * before giving up — matches set_name_resolver's alias. */
         uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
         if (bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) {
-            fp = _cpu_dispatch_lookup(cpu, pc24 ^ 0x800000u);
-            if (fp != NULL) via_mirror = 1;
+            const DispatchEntry *mirror_row = _cpu_dispatch_find(pc24 ^ 0x800000u);
+            if (mirror_row != NULL) {
+                known_entry = 1;
+                fp = mirror_row->variant[mx_idx];
+                if (fp != NULL) via_mirror = 1;
+            }
         }
     }
     _dispatch_log_record(pc24, source_pc24, mx_idx, fp != NULL, via_mirror);
     if (fp == NULL) {
+        if (known_entry) {
+            /* The manifest knows this is a function boundary, but deliberately
+             * emitted no body for the live M/X state.  That is not a return
+             * continuation miss: execute the exact ROM bytes.  cpu->S already
+             * reflects the RTS/RTL pop that reached this tail target. */
+            cpu->host_return_valid = 0;
+            cpu->PB = (uint8)(pc24 >> 16);
+            return interp_tier_dispatch_popped_return(
+                cpu, pc24, source_pc24, entry_s_for_miss_restore);
+        }
         /* Not found: the popped (PB:PC) is a normal mid-caller return addr,
          * not a known function entry. Unwind by restoring cpu->S to the value
          * the caller expects after THIS function returns and returning NORMAL.
@@ -432,6 +459,7 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
          * frame on every miss (the heavy-load DMA-queue-corruption softlock;
          * cf. MMX Dr Light "sprite vanish" 2026-05-24). */
         cpu->S = entry_s_for_miss_restore;
+        cpu->PB = (uint8)(pc24 >> 16);
         return RECOMP_RETURN_NORMAL;
     }
     /* Option-1: a dispatched entry has no paired host-C caller. The target
@@ -439,6 +467,7 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
      * popped PC rather than host-returning into this dispatch frame. The
      * chain unwinds when a dispatch misses (S restored above) -> NORMAL. */
     cpu->host_return_valid = 0;
+    cpu->PB = (uint8)(pc24 >> 16);
     return fp(cpu);
 }
 
@@ -558,10 +587,9 @@ RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24, uint8 frame_size
     return fp(cpu);
 }
 
-/* Read-only probe: would a dispatch to pc24 find a function entry?
+/* Read-only probe: would a dispatch to pc24 find an exact AOT body?
  * Mirrors cpu_dispatch_pc_from's lookup + LoROM bank-mirror fallback so
- * the RTS-decision trace can classify a popped PC as DISPATCH (entry
- * exists) vs MISS_UNWIND (host-return continuation) without side effects. */
+ * the interpreter bounce never leaves LLE for a NULL manifest variant. */
 int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24) {
     pc24 &= 0xFFFFFFu;
     if (_cpu_dispatch_lookup(cpu, pc24) != NULL) return 1;

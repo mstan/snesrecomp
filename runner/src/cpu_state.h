@@ -435,13 +435,14 @@ void cpu_dbg_funcname(const char *name);
  *
  * The dispatch table is emitted by v2_regen.py at the end of each
  * regen run into `<prefix>_dispatch_v2.c`. Entries are sorted by
- * pc24 for binary search. Each row holds up to 4 fnptrs (one per
- * (m,x) variant). */
+ * pc24 for binary search. Each known function boundary has a row holding up
+ * to 4 fnptrs (one per exact (m,x) variant); absent bodies remain LLE. */
 typedef struct DispatchEntry {
     uint32 pc24;
     /* Indexed by ((m_flag & 1) << 1) | (x_flag & 1):
      *   0 = M0X0, 1 = M0X1, 2 = M1X0, 3 = M1X1.
-     * NULL = variant not emitted; cpu_dispatch_pc returns NORMAL. */
+     * NULL = this exact architectural variant remains authoritative LLE.
+     * The row itself still marks pc24 as a known function boundary. */
     RecompReturn (*variant[4])(CpuState *);
     /* Bytes embedded after a JSR/JSL and consumed by this callee.  The
      * interpreter bridge uses this to resume a bounced call at the same
@@ -454,9 +455,11 @@ extern const unsigned       g_dispatch_table_count;
 
 uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24);
 
-/* Dispatch on a popped trampoline target.
- * `entry_s_for_miss_restore`: on lookup MISS, cpu->S is set to this
- * value before returning RECOMP_RETURN_NORMAL. This prevents the
+/* Dispatch on a popped trampoline target. A known row with no exact live M/X
+ * body executes through LLE; only an address with no row is a continuation
+ * miss.
+ * `entry_s_for_miss_restore`: on an unknown-address miss, cpu->S is set to
+ * this value before returning RECOMP_RETURN_NORMAL. This prevents the
  * trampoline pop's bytes-consumed effect from leaking cpu->S drift up
  * to the caller. On lookup HIT, the dispatched function runs and its
  * own cpu->S manipulations are preserved (no restore). The trampoline-
@@ -495,7 +498,8 @@ RecompReturn cpu_dispatch_call_pc_pushed(CpuState *cpu, uint32 pc24,
  * is a registered function entry). Returns the callee's value. */
 RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24, uint8 frame_size);
 
-/* Read-only dispatch-table probe (task #7 RTS-decision trace). */
+/* Read-only exact-AOT probe used by interpreter bounce and RTS rewriting.
+ * A known LLE-only row intentionally returns false. */
 int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24);
 
 /* Balanced abandon of the current function invocation at an UNRESOLVED
@@ -534,6 +538,12 @@ RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
 RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
                                            uint32 site_pc24, uint16 entry_s,
                                            uint8 hrv);
+/* RTS/RTL trampoline reached a known function row whose live M/X variant has
+ * no AOT body.  The prior frame is already popped, so execution unwinds past
+ * the current cpu->S; a bounded bail restores the ordinary dispatch-miss S. */
+RecompReturn interp_tier_dispatch_popped_return(
+    CpuState *cpu, uint32 target_pc24, uint32 site_pc24,
+    uint16 miss_restore_s);
 RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
                                                     uint32 target_pc24,
                                                     uint32 site_pc24);

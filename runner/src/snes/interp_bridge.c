@@ -1119,6 +1119,33 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     return cpu_unresolved_abandon_balanced(cpu, site_pc24, entry_s, hrv);
 }
 
+RecompReturn interp_tier_dispatch_popped_return(CpuState *cpu,
+                                                uint32_t target_pc24,
+                                                uint32_t site_pc24,
+                                                uint16_t miss_restore_s) {
+    target_pc24 &= 0xFFFFFFu;
+    site_pc24 &= 0xFFFFFFu;
+    interp_tier_note(target_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
+
+    /* cpu_dispatch_pc_from is entered after the previous compiled routine has
+     * already popped the RTS/RTL that selected target_pc24.  The target thus
+     * inherits the next guest return frame.  Starting from the current S and
+     * stopping when its RTS/RTL moves above it exactly matches an hrv=0 AOT
+     * tail dispatch; using the enclosing routine's entry_s would conflate two
+     * distinct stack frames. */
+    const uint16_t target_entry_s = cpu->S;
+    uint32_t landing = target_pc24;
+    int ok = interp_bridge_run_ex2(cpu, target_pc24, target_entry_s, &landing,
+                                   NULL, 0, 0, 0, 0, NULL, 0);
+    tier2_record(site_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
+    if (s_lle_unwind_active)
+        return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
+    if (!ok)
+        cpu->S = miss_restore_s;
+    return RECOMP_RETURN_NORMAL;
+}
+
 RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
                                                     uint32_t target_pc24,
                                                     uint32_t site_pc24) {

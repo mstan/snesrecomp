@@ -340,6 +340,21 @@ int main(void) {
       CHECK(rc2 == 1, "second rc=%d exp 1 (input observed)", rc2);
       CHECK(g_c.S == 0x01FF, "return S=%04X exp 01FF (balanced)", g_c.S); }
 
+    /* S11: a dispatch-table row with no exact AOT M/X body is a known LLE
+     * entry, not a mid-caller continuation.  cpu_dispatch_pc_from invokes
+     * this bridge after the prior RTS already popped, so the current S is the
+     * target's unwind watermark and the inherited return frame is consumed. */
+    { memset(RAM, 0, MEMSZ); init_cpu();
+      uint8_t c[] = {0xA9,0x44, 0x60};       /* LDA #$44 ; RTS */
+      load(0x8300, c, sizeof c);
+      cpu_push_jsr_return_frame(&g_c);       /* inherited target return frame */
+      RecompReturn r = interp_tier_dispatch_popped_return(
+          &g_c, 0x008300, 0x0082FE, 0x01FF);
+      printf("S11 known non-AOT dispatch row executes exact LLE\n");
+      CHECK(r == RECOMP_RETURN_NORMAL, "r=%d exp NORMAL", (int)r);
+      CHECK((g_c.A & 0xFF) == 0x44, "A.lo=%02X exp 44", g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (inherited frame consumed)", g_c.S); }
+
     printf("\n==== interp_bridge Phase-1: %d/%d checks passed ====\n", g_check - g_fail, g_check);
     if (g_fail) { printf("RESULT: FAIL (%d)\n", g_fail); return 1; }
     printf("RESULT: PASS\n");
