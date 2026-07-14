@@ -27,6 +27,7 @@ static uint8_t *RAM;
 static int      g_aot_called;
 static int      g_aot_rewrites_return;
 static int      g_aot_nested_rewrite;
+static int      g_aot_interp_nlr;
 #define FAKE_AOT 0x008100u
 
 /* ── fakes the bridge links against (cpu_state.c provides these in prod) ── */
@@ -59,6 +60,9 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
 int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv) {
     (void)entry_s; (void)hrv; return 0;
 }
+void cpu_interrupt_context_enter(void) {}
+void cpu_interrupt_context_leave(void) {}
+int cpu_interrupt_context_active(void) { return 0; }
 uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24) {
     (void)pc24; return 0;
 }
@@ -89,6 +93,14 @@ RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24, uint16 miss_restore) {
 RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
                                     uint8 frame_size) {
     cpu->host_return_valid = frame_size;
+    if (g_aot_interp_nlr && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        /* Model PLA; PLA; RTS in a direct AOT bounce: consume the AOT JSR
+         * frame plus its interpreted caller's JSR frame, then continue in
+         * the interpreted grandparent at $8003. */
+        g_aot_called++;
+        cpu->S = (uint16)(cpu->S + 4);
+        return interp_tier_dispatch_rewritten_return(cpu, 0x008003, 0x0081FE);
+    }
     if (g_aot_nested_rewrite && (pc24 & 0xFFFFFF) == FAKE_AOT) {
         /* Model bridge -> compiled root -> compiled parent -> rewritten-return
          * callee.  The rewritten landing is the parent's PLB/PLP/RTL epilogue;
@@ -203,6 +215,9 @@ int main(void) {
     /* S5: interp_tier_dispatch_balanced (SM abandon-site upgrade). A clean
      * routine interprets to completion -> NORMAL, balanced, abandon NOT used. */
     { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0; g_abandon_called = 0;
+      /* Even if an unrelated ancestor would match this post-S, the bridge
+       * must not consult it when the tail consumed exactly its own frame. */
+      g_post_return_skip = 1;
       uint8_t c[] = {0xA9,0x0C, 0x60};      /* $8000: LDA #$0C ; RTS */
       load(0x8000, c, sizeof c);
       cpu_push_jsr_return_frame(&g_c);       /* inherited caller frame (hrv=2) */
@@ -214,6 +229,24 @@ int main(void) {
       CHECK((g_c.A & 0xFF) == 0x0C, "A.lo=%02X exp 0C (interpreted)", g_c.A & 0xFF);
       CHECK(g_abandon_called == 0, "abandon_called=%d exp 0 (clean interp)", g_abandon_called);
       CHECK(g_c.S == (uint16)(entry_s + 2), "S=%04X exp %04X (frame popped)", g_c.S, (uint16)(entry_s + 2)); }
+
+    /* S5b: a shared suffix interpreted by the balanced tail tier performs a
+     * guest non-local return (PLA; PLA; RTS).  It consumes the current return
+     * frame and then returns through a compiled ancestor, so the bridge must
+     * propagate the resolver's SKIP_N instead of resuming that ancestor. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_abandon_called = 0;
+      g_post_return_skip = 1;
+      uint8_t c[] = {0x68,0x68,0x60};        /* PLA ; PLA ; RTS */
+      load(0x8000, c, sizeof c);
+      cpu_push_jsr_return_frame(&g_c);       /* ancestor's return frame */
+      cpu_push_jsr_return_frame(&g_c);       /* current function's frame */
+      uint16 entry_s = g_c.S;
+      RecompReturn r = interp_tier_dispatch_balanced(&g_c, 0x008000, 0x00C0DE,
+                                                     entry_s, 2);
+      printf("S5b balanced tail propagates interpreted non-local return\n");
+      CHECK(r == RECOMP_RETURN_SKIP_1, "r=%d exp SKIP_1", (int)r);
+      CHECK(g_abandon_called == 0, "abandon_called=%d exp 0 (clean interp)", g_abandon_called);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (both frames consumed)", g_c.S); }
 
     /* S6: rewritten return enters the caller internally. The interpreter
      * consumes that caller's frame, so the bridge must propagate SKIP_1
@@ -227,6 +260,26 @@ int main(void) {
       printf("S6 rewritten return skips consumed host caller\n");
       CHECK(r == RECOMP_RETURN_SKIP_1, "r=%d exp SKIP_1", (int)r);
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (caller frame consumed once)", g_c.S); }
+
+    /* S6b: a direct AOT bounce non-locally returns through an interpreted
+     * caller. The owning ordinary (non-scheduler) interpreter must resume at
+     * the grandparent's real continuation and never execute the skipped
+     * inner continuation. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_interp_nlr = 1;
+      uint8_t outer[] = {0x20,0x00,0x82, 0xA9,0x5A, 0x60};
+      uint8_t inner[] = {0x20,0x00,0x81, 0xA9,0xEE, 0x60};
+      load(0x8000, outer, sizeof outer);
+      load(0x8200, inner, sizeof inner);
+      cpu_push_jsr_return_frame(&g_c);       /* outer host sentinel */
+      int rc = interp_bridge_run(&g_c, 0x008000);
+      printf("S6b AOT NLR resumes owning ordinary interpreter\n");
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_aot_called == 1, "aot_called=%d exp 1", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x5A,
+            "A.lo=%02X exp 5A (inner continuation skipped)", g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (all frames balanced)", g_c.S);
+      g_aot_interp_nlr = 0; }
 
     /* S7: an interrupt-owned stable-value poll must cooperatively yield at
      * CMP while the sampled WRAM byte is unchanged, then resume and return

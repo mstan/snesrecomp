@@ -171,13 +171,19 @@ int interp816_opcode_hook(uint32_t addr) { (void)addr; return 0; }
 static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
+static int      s_lle_unwind_owner_depth = 0;
 static uint32_t s_lle_resume_pc24   = 0;
-/* Recomp-stack depth immediately before the scheduler interpreter bounces
- * into a paired AOT root.  A rewritten return in that root belongs directly
- * to the interpreter; one reached below that root belongs to a compiled
- * ancestor and must first finish/skip that ancestor in the ordinary nested
- * tier path.  Saved/restored around each bounce because bridge runs nest. */
-static int      s_lle_bounce_recomp_base = -1;
+/* Depth of nested interpreter runs and the run that owns the current paired
+ * AOT bounce. A rewritten/non-local return from that AOT root must resume the
+ * owning interpreter's guest call chain. */
+static int      s_interp_bridge_depth = 0;
+static int      s_interp_bounce_owner_depth = 0;
+/* Recomp-stack depth immediately before any interpreter frame bounces into a
+ * paired AOT root. A rewritten return in that root belongs directly to the
+ * interpreter; one reached below that root belongs to a compiled ancestor
+ * and must first finish/skip that ancestor in the ordinary nested tier path.
+ * Saved/restored around each bounce because bridge runs nest. */
+static int      s_interp_bounce_recomp_base = -1;
 static uint32_t s_lle_bounce_exclusions[16];
 static size_t   s_lle_bounce_exclusion_count;
 
@@ -194,7 +200,14 @@ RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     cpu_take_tailcall_return_context(NULL, NULL);
     s_lle_unwind_active = 1;
     s_lle_unwind_pc24   = resume_pc24 & 0xFFFFFFu;
+    s_lle_unwind_owner_depth = s_interp_bounce_owner_depth;
     return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
+}
+
+int interp_bridge_has_direct_paired_bounce(void) {
+    return s_interp_bounce_owner_depth > 0 &&
+           (s_interp_bounce_recomp_base < 0 ||
+            g_recomp_stack_top <= s_interp_bounce_recomp_base + 1);
 }
 
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
@@ -768,11 +781,13 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     bridge_apu_flush(cpu);
                 int _apu_drv = g_interp_apu_driving;
                 g_interp_apu_driving = 0;
-                int _saved_bounce_base = s_lle_bounce_recomp_base;
-                if (yield_pc)
-                    s_lle_bounce_recomp_base = g_recomp_stack_top;
+                int _saved_bounce_base = s_interp_bounce_recomp_base;
+                int _saved_bounce_owner = s_interp_bounce_owner_depth;
+                s_interp_bounce_recomp_base = g_recomp_stack_top;
+                s_interp_bounce_owner_depth = s_interp_bridge_depth;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
-                s_lle_bounce_recomp_base = _saved_bounce_base;
+                s_interp_bounce_owner_depth = _saved_bounce_owner;
+                s_interp_bounce_recomp_base = _saved_bounce_base;
                 g_interp_apu_driving = _apu_drv;
                 sync_cpu_to_interp(cpu, &in);
                 if (_ibrw)
@@ -782,7 +797,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                             (unsigned)_sp_pre, (int)_air, (unsigned)in.sp);
                 if (_air != RECOMP_RETURN_NORMAL) {
                     if (s_lle_unwind_active) {
-                        if (yield_pc) {
+                        if (s_lle_unwind_owner_depth == s_interp_bridge_depth) {
                             if (getenv("SNESRECOMP_YIELD_STACK_DIAG") &&
                                 snes_frame_counter >= 5390) {
                                 fprintf(stderr,
@@ -802,6 +817,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                              * primitives), so the interpreted coroutine
                              * switch runs byte-exact. */
                             s_lle_unwind_active = 0;
+                            s_lle_unwind_owner_depth = 0;
                             sync_cpu_to_interp(cpu, &in);
                             in.k  = (uint8)((s_lle_unwind_pc24 >> 16) & 0xFF);
                             in.pc = (uint16)(s_lle_unwind_pc24 & 0xFFFF);
@@ -929,11 +945,13 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
 #endif
     g_interp_apu_driving = 1;
     if (yield_pc) s_lle_sched_depth++;
+    s_interp_bridge_depth++;
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
+    s_interp_bridge_depth--;
     if (yield_pc) {
         s_lle_sched_depth--;
         /* A pending yield unwind must have been consumed by this frame's
@@ -941,6 +959,7 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
          * unrelated non-NORMAL return. Contained: clear + log. */
         if (s_lle_unwind_active) {
             s_lle_unwind_active = 0;
+            s_lle_unwind_owner_depth = 0;
             fprintf(stderr, "[interp_bridge] stale LLE yield unwind cleared "
                     "at scheduler exit (pc=$%06X)\n",
                     (unsigned)s_lle_unwind_pc24);
@@ -1158,8 +1177,28 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     tier2_record(site_pc24 & 0xFFFFFF, rec_target, mx, kind, ok);
     if (s_lle_unwind_active)   /* yield unwound through this nested frame */
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
-    if (ok)
+    if (ok) {
+        /* A shared suffix may perform a guest non-local return (for example,
+         * PLA; PLA; RTS) after an AOT function tails into LLE past its static
+         * ownership boundary.  The interpreter has then consumed not only
+         * this function's return frame, but one or more compiled ancestors'
+         * frames as well.  Resuming the immediate C caller would execute code
+         * that the guest already returned past.
+         *
+         * The generated RTS path resolves the same condition from its
+         * pre-RTS S.  A completed interpreter run exposes post-RTS S instead,
+         * so use the post-return resolver to translate that architectural
+         * stack position into the existing SKIP_N host-unwind contract.  A
+         * normal tail return cannot match an ancestor's post-return S and
+         * remains NORMAL. */
+        const uint16_t expected_post_s = (uint16_t)(entry_s + hrv);
+        if (cpu->S != expected_post_s) {
+            int skip = cpu_resolve_post_return_skip(cpu->S);
+            if (skip > 0)
+                return (RecompReturn)skip;
+        }
         return RECOMP_RETURN_NORMAL;
+    }
     return cpu_unresolved_abandon_balanced(cpu, site_pc24, entry_s, hrv);
 }
 
@@ -1210,11 +1249,7 @@ RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
      * live scheduler after SpawnHardcodedPlm skipped its four inline bytes and
      * immediately corrupted S.  This branch is context/ABI based, not tied to
      * that function or address. */
-    const int _direct_lle_bounce =
-        s_lle_sched_depth > 0 &&
-        (s_lle_bounce_recomp_base < 0 ||
-         g_recomp_stack_top <= s_lle_bounce_recomp_base + 1);
-    if (_direct_lle_bounce)
+    if (interp_bridge_has_direct_paired_bounce())
         return interp_bridge_lle_yield_unwind(cpu, target_pc24);
 
     interp_tier_note(target_pc24);

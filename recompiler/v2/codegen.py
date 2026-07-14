@@ -2245,6 +2245,12 @@ def _emit_return(op: Return) -> List[str]:
         "    if (_anc_skip >= 0) {",
         "      cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
         f"      return (RecompReturn)_anc_skip;  /* {label_inner} return-to-ancestor */ }}",
+        # A skipped ancestor may be part of the active interpreter rather than
+        # g_recomp_stack. Return the real popped continuation to that owning
+        # bridge instead of creating a new dispatch root and then resuming code
+        # the guest RTS already returned past.
+        f"    if (_hrv == {frame_sz} && interp_bridge_has_direct_paired_bounce()) {{",
+        f"      return interp_tier_dispatch_rewritten_return(cpu, _rpc24, 0x{src24:06x}u); }}",
         "  }",
         "  cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
         # Miss-restore = post-return-pop S (entry_s + frame_size). On a dispatch

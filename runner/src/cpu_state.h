@@ -556,6 +556,10 @@ RecompReturn interp_tier_dispatch_popped_return(
 RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
                                                     uint32 target_pc24,
                                                     uint32 site_pc24);
+/* True while the current generated root was invoked directly by an active
+ * interpreter bounce. A rewritten/non-local RTS from that root belongs to
+ * the interpreter's guest call chain, not a compiled ancestor. */
+int interp_bridge_has_direct_paired_bounce(void);
 
 /* Interpreter-tier fallback for a runtime-pointer JSR (abs,X) whose loaded
  * target has no AOT body for the live (m,x). Called by cpu_dispatch_call_pc
