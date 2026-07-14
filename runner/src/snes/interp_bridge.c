@@ -330,7 +330,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  uint32_t yield_pc, uint16_t yield_flag_addr,
                                  uint8_t yield_flag_value,
                                  int reset_cap_on_bounce,
-                                 const uint32_t *stop_pcs, int n_stop) {
+                                 const uint32_t *stop_pcs, int n_stop,
+                                 int stop_on_rti) {
     /* Local interpreter context → nesting (an AOT bounce that itself traps and
      * re-enters the bridge) gets its own frame; no shared mutable interp. */
     Interp816 in;
@@ -677,6 +678,18 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
         }
 
+        /* A host-invoked architectural interrupt handler is paired with the
+         * real interrupt frame pushed by cpu_push_interrupt_frame(). Its RTI
+         * is the host boundary, just as RTS/RTL crossing the entry watermark
+         * is for an ordinary subroutine. The interpreter has already popped
+         * P/PC/PB here; host control flow deliberately discards guest PC/PB.
+         * Do not continue interpreting at the placeholder return address. */
+        if (stop_on_rti && op == 0x40) {
+            sync_interp_to_cpu(&in, cpu);
+            bridge_apu_flush(cpu);
+            return 1;
+        }
+
         /* Resolved-landing capture (Phase 2 manifest): the PC reached after
          * the FIRST opcode. When entered at an indirect JMP/JML (the
          * unresolved-IndirectGoto tier-down), this is the dynamically resolved
@@ -906,7 +919,8 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
                                  uint32_t yield_pc, uint16_t yield_flag_addr,
                                  uint8_t yield_flag_value,
                                  int reset_cap_on_bounce,
-                                 const uint32_t *stop_pcs, int n_stop) {
+                                 const uint32_t *stop_pcs, int n_stop,
+                                 int stop_on_rti) {
     int _saved = g_interp_apu_driving;
 #ifdef SNES_COSIM
     /* Shared APU clock: leave the flag clear so interpreted HW touches pace
@@ -918,7 +932,8 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
-                              reset_cap_on_bounce, stop_pcs, n_stop);
+                              reset_cap_on_bounce, stop_pcs, n_stop,
+                              stop_on_rti);
     if (yield_pc) {
         s_lle_sched_depth--;
         /* A pending yield unwind must have been consumed by this frame's
@@ -938,7 +953,8 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
 /* Public entry: exit watermark = the current stack depth (the routine is
  * entered balanced at cpu->S). */
 int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24) {
-    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL, 0, 0, 0, 0, NULL, 0);
+    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
+                                 0, 0, 0, 0, NULL, 0, 0);
 }
 
 /* Save-state task resume: interpret a suspended task from its recorded yield
@@ -951,7 +967,8 @@ int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24) {
 int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
                               uint16_t task_base_s,
                               const uint32_t *stop_pcs, int n_stop) {
-    return interp_bridge_run_ex2(cpu, resume_pc24, task_base_s, NULL, NULL, 0, 0, 0, 1, stop_pcs, n_stop);
+    return interp_bridge_run_ex2(cpu, resume_pc24, task_base_s, NULL, NULL,
+                                 0, 0, 0, 1, stop_pcs, n_stop, 0);
 }
 
 /* Faithful LLE of an infinite cooperative-scheduler loop: run the real guest
@@ -969,7 +986,7 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
                            uint32_t yield_pc, uint16_t flag_addr,
                            uint8_t flag_value) {
     return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL, yield_pc,
-                                 flag_addr, flag_value, 0, NULL, 0);
+                                 flag_addr, flag_value, 0, NULL, 0, 0);
 }
 
 /* ── tier-down entry (called from generated indirect-dispatch defaults) ───── */
@@ -1087,6 +1104,20 @@ RecompReturn interp_tier_dispatch(CpuState *cpu, uint32_t target_pc24) {
     return RECOMP_RETURN_NORMAL;
 }
 
+RecompReturn interp_tier_dispatch_interrupt(CpuState *cpu,
+                                            uint32_t target_pc24) {
+    interp_tier_note(target_pc24);
+    const uint8_t mx = tier2_entry_mx(cpu);
+    int ok = interp_bridge_run_ex2(
+        cpu, target_pc24 & 0xFFFFFF, cpu->S, NULL, NULL,
+        0, 0, 0, 0, NULL, 0, 1);
+    tier2_record(target_pc24 & 0xFFFFFF, target_pc24 & 0xFFFFFF, mx,
+                 TIER2_KIND_DISPATCH, ok);
+    if (s_lle_unwind_active)
+        return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
+    return RECOMP_RETURN_NORMAL;
+}
+
 /* Upgrade of an unresolved tail-dispatch site (one that would otherwise call
  * cpu_unresolved_abandon_balanced): run the target instead of dropping it. On
  * a clean return the routine's RTS/RTL has balanced the stack; on a bail fall
@@ -1105,7 +1136,8 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
-    int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s, &landing, NULL, 0, 0, 0, 0, NULL, 0);
+    int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s,
+                                   &landing, NULL, 0, 0, 0, 0, NULL, 0, 0);
     /* For an indirect goto the recorded target is where the JMP actually
      * resolved (the dynamically computed entry); for a dispatch default the
      * passed target already IS the entry. */
@@ -1137,7 +1169,7 @@ RecompReturn interp_tier_dispatch_popped_return(CpuState *cpu,
     const uint16_t target_entry_s = cpu->S;
     uint32_t landing = target_pc24;
     int ok = interp_bridge_run_ex2(cpu, target_pc24, target_entry_s, &landing,
-                                   NULL, 0, 0, 0, 0, NULL, 0);
+                                   NULL, 0, 0, 0, 0, NULL, 0, 0);
     tier2_record(site_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
     if (s_lle_unwind_active)
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
@@ -1178,7 +1210,7 @@ RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
     const uint16_t post_pop_s = cpu->S;
     uint32_t landing = target_pc24;
     int ok = interp_bridge_run_ex2(cpu, target_pc24, post_pop_s, &landing,
-                                   NULL, 0, 0, 0, 0, NULL, 0);
+                                   NULL, 0, 0, 0, 0, NULL, 0, 0);
     tier2_record(site_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
     if (s_lle_unwind_active)
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
@@ -1222,7 +1254,7 @@ RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
     const uint16_t post_call = (uint16_t)(cpu->S + frame_size);
     uint32_t landing = target_pc24;
     int ok = interp_bridge_run_ex2(cpu, target_pc24, watermark, &landing,
-                                   return_pc24, 0, 0, 0, 0, NULL, 0);
+                                   return_pc24, 0, 0, 0, 0, NULL, 0, 0);
     tier2_record(source_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, ok);
     if (s_lle_unwind_active)   /* yield unwound through this nested frame */
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
@@ -1247,7 +1279,8 @@ RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32_t addr_pc24,
     interp_tier_note(addr_pc24);
     const uint8_t mx = tier2_entry_mx(cpu);
     uint32_t landing = addr_pc24;
-    int ok = interp_bridge_run_ex2(cpu, addr_pc24, entry_s, &landing, NULL, 0, 0, 0, 0, NULL, 0);
+    int ok = interp_bridge_run_ex2(cpu, addr_pc24, entry_s, &landing, NULL,
+                                   0, 0, 0, 0, NULL, 0, 0);
     tier2_record(addr_pc24, addr_pc24, mx, TIER2_KIND_BANK_MISS, ok);
     if (s_lle_unwind_active)   /* yield unwound through this nested frame */
         return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;

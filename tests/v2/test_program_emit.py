@@ -59,6 +59,39 @@ def test_manifest_emitter_keeps_structural_target_as_lle(tmp_path):
     assert manifest["nodes"]["008010:M1X1"]["disposition"] == "lle_only"
 
 
+def test_all_lle_host_alias_still_links_to_authoritative_dispatch(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0x00)
+    (cfg_dir / "funcs.h").write_text(
+        "void I_RESET(CpuState *cpu);  /* $00:8000 alias */\n",
+        encoding="utf-8")
+
+    result = _run(rom_path, cfg_dir, out_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    source = (out_dir / "bank00_v2.c").read_text(encoding="utf-8")
+    assert "void I_RESET(CpuState *cpu)" in source
+    assert "I_RESET_M" not in source
+    assert source.count("interp_tier_dispatch(cpu, 0x008000u)") == 5
+
+
+def test_all_lle_interrupt_alias_uses_rti_aware_dispatch(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0x00)
+    rom = bytearray(rom_path.read_bytes())
+    rom[0x7FEA:0x7FEC] = bytes([0x00, 0x80])  # native NMI -> $00:8000
+    rom_path.write_bytes(rom)
+    (cfg_dir / "funcs.h").write_text(
+        "void Interrupt_NMI(CpuState *cpu);  /* $00:8000 alias */\n",
+        encoding="utf-8")
+
+    result = _run(rom_path, cfg_dir, out_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    source = (out_dir / "bank00_v2.c").read_text(encoding="utf-8")
+    assert "void Interrupt_NMI(CpuState *cpu)" in source
+    assert source.count(
+        "interp_tier_dispatch_interrupt(cpu, 0x008000u)") == 5
+
+
 def test_lle_only_declared_sibling_remains_an_emission_boundary(tmp_path):
     rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0x00)
     rom = bytearray(rom_path.read_bytes())

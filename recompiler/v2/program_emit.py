@@ -55,6 +55,20 @@ def _lorom_mirror_pc24(pc24: int):
     return None
 
 
+def _architectural_interrupt_pcs(rom: bytes) -> frozenset[int]:
+    """Return native/emulation NMI+IRQ vector entries and LoROM mirrors."""
+    if len(rom) < 0x8000:
+        return frozenset()
+    result = set()
+    for offset in (0x0A, 0x0E, 0x1A, 0x1E):
+        pc = rom[0x7FE0 + offset] | (rom[0x7FE0 + offset + 1] << 8)
+        if pc in (0, 0xFFFF):
+            continue
+        result.add(pc)
+        result.add(0x800000 | pc)
+    return frozenset(result)
+
+
 def _cfg_for_bank(cfg_by_bank, bank: int):
     cfg = cfg_by_bank.get(bank & 0xFF)
     if cfg is not None:
@@ -310,7 +324,7 @@ def _stable_hash(value) -> str:
 def _bank_cache_key(bank: int, manifest: ProgramManifest,
                     generator_digest: str, config_digest: str,
                     helpers: Mapping, inline_args: Mapping,
-                    enable_hle: bool) -> str:
+                    enable_hle: bool, host_alias_entries: Mapping) -> str:
     nodes = [
         (key.manifest_key, node.digest, node.disposition.value)
         for key, node in sorted(manifest.nodes.items())
@@ -328,6 +342,13 @@ def _bank_cache_key(bank: int, manifest: ProgramManifest,
         "config": config_digest,
         "helpers": sorted((int(k), str(v)) for k, v in helpers.items()),
         "inline_args": sorted((int(k), int(v)) for k, v in inline_args.items()),
+        "host_aliases": sorted(
+            (name, int(pc24), sorted((int(m), int(x)) for m, x in modes),
+             bool(is_interrupt))
+            for name, (pc24, modes, is_interrupt)
+            in host_alias_entries.items()
+            if ((pc24 >> 16) & 0xFF) == bank
+        ),
         "hle": bool(enable_hle),
     })
 
@@ -343,6 +364,13 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
     entries_by_bank, emitted, name_for_pc, cfg_by_bank = build_emission_entries(
         manifest, parsed, enable_hle=enable_hle)
     all_banks = sorted(set(cfg_by_bank) | set(entries_by_bank))
+    root_pcs = {key.pc24 for key in manifest.roots}
+    interrupt_pcs = _architectural_interrupt_pcs(rom)
+    host_alias_entries = {
+        name: (pc24, emitted.get(pc24, ()), pc24 in interrupt_pcs)
+        for name, pc24 in _host_aliases(parsed).items()
+        if pc24 in root_pcs
+    }
 
     live_cache_path = pathlib.Path(out_dir) / ".snesrecomp-cache.json"
     try:
@@ -375,7 +403,8 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
         for bank in all_banks:
             cache_key = _bank_cache_key(
                 bank, manifest, generator_digest, config_digest,
-                dispatch_helpers, inline_arg_map, enable_hle)
+                dispatch_helpers, inline_arg_map, enable_hle,
+                host_alias_entries)
             new_bank_keys[f"{bank:02X}"] = cache_key
             path = staging / f"bank{bank:02x}_v2.c"
             expected_output_hash = old_output_hashes.get(path.name)
@@ -432,6 +461,7 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                 declared_entry_pcs=(
                     {entry.start & 0xFFFF for entry in cfg.entries}
                     if cfg is not None else None),
+                host_alias_entries=host_alias_entries,
             )
             write_if_changed(path, source)
             emitted_banks += 1

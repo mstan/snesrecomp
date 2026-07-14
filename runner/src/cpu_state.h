@@ -535,6 +535,10 @@ RecompReturn cpu_unresolved_abandon_balanced(CpuState *cpu, uint32 site_pc24,
  * falls back to cpu_unresolved_abandon_balanced(site,entry_s,hrv) so it is
  * never worse than the drop path and still records the site. */
 RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
+/* Host interrupt-vector fallback: run until the handler's RTI consumes the
+ * cpu_push_interrupt_frame() frame, then return to the host scheduler. */
+RecompReturn interp_tier_dispatch_interrupt(CpuState *cpu,
+                                            uint32 target_pc24);
 RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
                                            uint32 site_pc24, uint16 entry_s,
                                            uint8 hrv);

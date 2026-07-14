@@ -87,7 +87,8 @@ def emit_bank(rom: bytes, bank: int,
               hle_func=None,
               hle_dispatch=None,
               inline_arg_map=None,
-              declared_entry_pcs=None) -> str:
+              declared_entry_pcs=None,
+              host_alias_entries=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -229,13 +230,34 @@ def emit_bank(rom: bytes, bank: int,
     alias_entries = {}
     for entry in entries:
         if entry.name:
-            alias_entries.setdefault(entry.name, []).append(entry)
-    for name, named_entries in alias_entries.items():
-        modes = {
-            (entry.entry_m & 1, entry.entry_x & 1)
-            for entry in named_entries
-        }
-        pc24 = ((bank & 0xFF) << 16) | (named_entries[0].start & 0xFFFF)
+            spec = alias_entries.setdefault(entry.name, {
+                "pc24": ((bank & 0xFF) << 16) | (entry.start & 0xFFFF),
+                "modes": set(),
+                "interrupt": False,
+            })
+            spec["modes"].add((entry.entry_m & 1, entry.entry_x & 1))
+    # A host ABI alias must exist even when every exact variant tiers to LLE.
+    # Otherwise an optional hand-written HLE caller cannot link against the
+    # authoritative interpreter fallback. The manifest emitter supplies only
+    # aliases for actual roots, so this does not manufacture dead entrypoints.
+    for name, raw_spec in (host_alias_entries or {}).items():
+        pc24, raw_modes, is_interrupt = raw_spec
+        if ((pc24 >> 16) & 0xFF) != (bank & 0xFF):
+            continue
+        spec = alias_entries.setdefault(name, {
+            "pc24": pc24 & 0xFFFFFF,
+            "modes": set(),
+            "interrupt": False,
+        })
+        spec["modes"].update(
+            (m & 1, x & 1) for m, x in raw_modes)
+        spec["interrupt"] = spec["interrupt"] or bool(is_interrupt)
+    for name, spec in alias_entries.items():
+        modes = spec["modes"]
+        pc24 = spec["pc24"]
+        tier_dispatch = (
+            "interp_tier_dispatch_interrupt"
+            if spec["interrupt"] else "interp_tier_dispatch")
         body = [
             f"void {name}(CpuState *cpu) {{",
             "  RecompReturn _r;",
@@ -249,10 +271,10 @@ def emit_bank(rom: bytes, bank: int,
                         f"    case {index}: _r = {name}_M{m}X{x}(cpu); break;")
                 else:
                     body.append(
-                        f"    case {index}: _r = interp_tier_dispatch(cpu, "
+                        f"    case {index}: _r = {tier_dispatch}(cpu, "
                         f"0x{pc24:06x}u); break; /* exact M{m}X{x} LLE */")
         body.extend([
-            "    default: _r = interp_tier_dispatch(cpu, "
+            f"    default: _r = {tier_dispatch}(cpu, "
             f"0x{pc24:06x}u); break;",
             "  }",
             "  if (_r != RECOMP_RETURN_NORMAL) {",
