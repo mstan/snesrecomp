@@ -272,62 +272,30 @@ def valid_variant_list(addr_24: int):
     return tuple(mx for mx in _MX_VARIANTS if mx in s)
 
 
-def _nearest_survivor(survivors, m: int, x: int):
-    """Pick the surviving (m, x) variant closest to the requested mode.
-    Prefer a matching m_flag (accumulator width) over a matching x_flag,
-    then fall back to the first survivor in canonical order. Returns None
-    only when `survivors` is empty (which the prune pass never produces —
-    the effective canonical variant is never pruned)."""
-    best = None
-    best_cost = None
-    for sm, sx in survivors:
-        cost = (0 if sm == m else 2) + (0 if sx == x else 1)
-        if best_cost is None or cost < best_cost:
-            best_cost = cost
-            best = (sm, sx)
-    return best
+def has_exact_variant(addr_24: int, m: int, x: int) -> bool:
+    """Whether an exact AOT body exists for this architectural entry.
 
-
-def resolve_variant_for_target(addr_24: int, m: int, x: int):
-    """Return the emitted (m, x) variant to call for a target address.
-
-    Before the emit-truth prune map is installed, every target reports all
-    four variants and this returns the requested mode. After pruning, direct
-    call sites must not name a dropped symbol; route them to the same nearest
-    surviving variant used by runtime (m, x) dispatch switches.
+    An absent validity map is the legacy pre-analysis state and therefore
+    assumes all four bodies will be emitted. Once a target has a survivor
+    set, width identity is exact: a sibling is never a correctness fallback.
     """
-    rm, rx = m & 1, x & 1
-    survivors = list(valid_variant_list(addr_24))
-    if not survivors:
-        return rm, rx
-    if (rm, rx) in set(survivors):
-        return rm, rx
-    picked = _nearest_survivor(survivors, rm, rx)
-    if picked is None:
-        return rm, rx
-    return picked
+    return ((m & 1), (x & 1)) in set(valid_variant_list(addr_24))
 
 
 def variant_dispatch_case_lines(addr_24: int, base_name: str,
-                                indent: str = "    ", pre_call=None):
+                                indent: str = "    ", pre_call=None,
+                                lle_fallback=None):
     """Emit the case/default body for a runtime (m, x) dispatch switch.
 
-    A case is emitted for ALL FOUR (m, x) indices. Surviving variants call
-    their own body; combos pruned by the emit-truth prune pass route to the
-    nearest surviving CLEAN sibling. This is sound because the prune only
-    drops a variant when a clean sibling decoding the SAME bytes exists —
-    so the bytes are real code, and a function reached at a "wrong" static
-    width still executes correctly (the dominant pruned class re-normalizes
-    width early, e.g. CE9A's `REP #$30`). Routing the default to a real body
-    instead of `RECOMP_RETURN_NORMAL` fixes the silent no-op that left a
-    reached-but-pruned callee's outputs unwritten (root cause of the Rangda
-    Bangda eye flying ~17x too far: the m=0,x=1 JSL into CE9A hit `default`,
-    CE9A never ran, and the fly-timer was computed from the un-overwritten
-    eyeX input). Only changes behaviour when the no-op path is actually
-    taken — i.e. exactly the broken case.
+    A case is emitted for all four (M, X) indices. Surviving variants call
+    their exact body. A combination without an exact AOT body executes ROM
+    through ``lle_fallback``; it never borrows a sibling decoded at a
+    different operand width. The caller supplies the ABI-correct expression:
+    call sites use ``interp_tier_run_call_frame`` after pushing the hardware
+    frame, while tail transfers use ``interp_tier_dispatch_balanced``.
 
-    `pre_call` is an optional list of statements emitted INSIDE each case
-    before the variant call (e.g. the JMP tail-call return-context inherit).
+    `pre_call` is emitted only before an AOT variant call (e.g. tail-call
+    return-context inheritance); the LLE bridge receives its own context.
 
     Every case/default is emitted as a SINGLE line beginning with
     `case N:` / `default:` — even with `pre_call`, the statements are inlined
@@ -348,19 +316,30 @@ def variant_dispatch_case_lines(addr_24: int, base_name: str,
         pre = (" ".join(pre_call) + " ") if pre_call else ""
         lines.append(f"{indent}{label}: {pre}_r = {name}(cpu); break;{comment}")
 
+    def emit_lle(label: str, m: int, x: int):
+        if not lle_fallback:
+            raise ValueError(
+                f"missing exact M{m}X{x} variant for ${addr_24:06X} "
+                "without an ABI-specific LLE fallback")
+        lines.append(
+            f"{indent}{label}: _r = {lle_fallback}; break;"
+            f"  /* exact M{m}X{x} -> authoritative LLE */")
+
     for m, x in _MX_VARIANTS:
         idx = (m << 1) | x
         if (m, x) in survivor_set:
             emit(f"case {idx}", f"{base_name}{_variant_suffix(m, x)}")
-        elif survivors:
-            sm, sx = _nearest_survivor(survivors, m, x)
-            emit(f"case {idx}", f"{base_name}{_variant_suffix(sm, sx)}",
-                 f"  /* M{m}X{x} pruned -> nearest survivor M{sm}X{sx} */")
-    if survivors:
-        sm, sx = _nearest_survivor(survivors, 0, 0)
-        emit("default", f"{base_name}{_variant_suffix(sm, sx)}")
-    else:
+        else:
+            emit_lle(f"case {idx}", m, x)
+    if lle_fallback:
+        lines.append(
+            f"{indent}default: _r = {lle_fallback}; break;"
+            "  /* masked M/X index should make this unreachable */")
+    elif survivor_set == set(_MX_VARIANTS):
         lines.append(f"{indent}default: _r = RECOMP_RETURN_NORMAL; break;")
+    else:
+        raise ValueError(
+            f"incomplete variant set for ${addr_24:06X} without LLE fallback")
     return lines
 
 
@@ -1518,7 +1497,13 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 lines.append(
                     "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
                 lines += variant_dispatch_case_lines(
-                    tgt_addr, base_name, indent="        ")
+                    tgt_addr, base_name, indent="        ",
+                    lle_fallback=(
+                        f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
+                        f"0x{site_pc24:06x}u, 2, NULL)"
+                        if is_jsr or is_call else
+                        f"interp_tier_dispatch_balanced(cpu, 0x{tgt_addr:06x}u, "
+                        f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
                 lines.append("      }")
                 lines.append(
                     f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, cpu->PB, _saved_pb, CPU_TR_RTL);")
@@ -1688,7 +1673,13 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
                     if not (is_jsr or is_call) else None)
             lines += variant_dispatch_case_lines(
-                tgt_addr, base_name, indent="        ", pre_call=_pre)
+                tgt_addr, base_name, indent="        ", pre_call=_pre,
+                lle_fallback=(
+                    f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
+                    f"0x{site_pc24:06x}u, 2, NULL)"
+                    if is_jsr or is_call else
+                    f"interp_tier_dispatch_balanced(cpu, 0x{tgt_addr:06x}u, "
+                    f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
             lines.append("      }")
             lines.append(
                 f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, cpu->PB, _saved_pb, CPU_TR_RTL);")
@@ -2047,7 +2038,11 @@ def _emit_call(op: Call) -> List[str]:
             "  RecompReturn _r;",
             "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
         ]
-        lines += variant_dispatch_case_lines(addr, base_name)
+        lines += variant_dispatch_case_lines(
+            addr, base_name,
+            lle_fallback=(
+                f"interp_tier_run_call_frame(cpu, 0x{addr:06x}u, "
+                f"{call_trace_pc}, 3, NULL)"))
         lines.extend([
             "  }",
             f"  cpu_trace_pb_change(cpu, {call_trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
@@ -2070,7 +2065,11 @@ def _emit_call(op: Call) -> List[str]:
         "  RecompReturn _r;",
         "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
     ]
-    lines += variant_dispatch_case_lines(addr, base_name)
+    lines += variant_dispatch_case_lines(
+        addr, base_name,
+        lle_fallback=(
+            f"interp_tier_run_call_frame(cpu, 0x{addr:06x}u, "
+            f"{call_trace_pc}, 2, NULL)"))
     lines.extend([
         "  }",
         "  if (_r != RECOMP_RETURN_NORMAL) {",

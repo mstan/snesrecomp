@@ -57,6 +57,7 @@ TEST_MODULES = [
     'test_variant_demand',
     'test_program_analysis',
     'test_analysis_tool',
+    'test_variant_dispatch_lle_fallback',
 ]
 
 

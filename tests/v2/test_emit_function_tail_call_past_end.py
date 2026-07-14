@@ -247,13 +247,13 @@ def test_tail_called_shared_epilogue_consumes_inherited_return_context():
     assert 'cpu_take_tailcall_return_context(&_entry_s, &_hrv)' in src_b, src_b
 
 
-def test_tail_call_past_end_routes_pruned_variant_to_survivor():
+def test_tail_call_past_end_routes_pruned_variant_to_lle():
     """A sibling tail call must not name a variant pruned from the callee.
 
     Super Metroid hit this with MotherBrain_Phase2_DecideAttackStrategy
     tail-calling MotherBrain_FiringBomb_DecideOnWalking_M0X1 after the
-    callee's M0X1 body was dropped. Runtime dispatch already routes pruned
-    cases to a survivor; direct sibling tail calls need the same rule.
+    callee's M0X1 body was dropped. The exact architectural mode executes
+    through LLE; a different-width sibling is not semantically equivalent.
     """
     target = (0x00 << 16) | 0x8003
     rom = make_lorom_bank0({
@@ -275,20 +275,19 @@ def test_tail_call_past_end_routes_pruned_variant_to_survivor():
                             func_name='Caller')
     demand = v2_codegen.take_unresolved_call_targets()
 
-    assert 'NextSibling_M0X0(cpu)' in src, src
+    assert 'interp_tier_dispatch_balanced(cpu, 0x008003u' in src, src
+    assert 'NextSibling_M0X0(cpu)' not in src, src
     assert 'NextSibling_M0X1(cpu)' not in src, src
-    # Emission uses the current survivor, but discovery must retain the live
-    # architectural demand.  v2_regen subtracts variants already present in
-    # cumulative_pruned, preventing an intentionally pruned body from being
-    # resurrected while still allowing a merely undiscovered body to appear
-    # on the next pass.
+    assert 'cpu_tailcall_inherit_return_context' not in src, src
+    # Migration-era discovery still records the exact architectural demand.
+    # The stable manifest will replace this generated-C feedback channel.
     assert (target, 0, 1) in demand, demand
     assert (target, 0, 0) not in demand, demand
     assert 'tail-call past end:' in src, src
 
 
-def test_tail_call_demands_missing_live_variant_before_survivor_routing():
-    """An existing fallback must not hide a newly observed live M/X mode."""
+def test_tail_call_demands_missing_live_variant_before_lle_routing():
+    """An existing AOT sibling must not hide a live exact LLE mode."""
     target = 0x008008
     rom = make_lorom_bank0({
         0x8000: bytes([
@@ -313,7 +312,8 @@ def test_tail_call_demands_missing_live_variant_before_survivor_routing():
                             sibling_entry_pcs={0x8008})
     demand = v2_codegen.take_unresolved_call_targets()
 
-    assert 'SharedBody_M1X1(cpu)' in src, src
+    assert 'interp_tier_dispatch_balanced(cpu, 0x008008u' in src, src
+    assert 'SharedBody_M1X1(cpu)' not in src, src
     assert (target, 0, 0) in demand, demand
     assert (target, 1, 1) not in demand, demand
 

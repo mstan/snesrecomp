@@ -768,6 +768,19 @@ def emit_function(rom: bytes, bank: int, start: int,
             f"RecompStackPop(); return _tc; }}  {comment}"
         )
 
+    def _lle_tail_stmt(target_pc24: int, site_pc24: int, comment: str,
+                       *, prefix: str = "") -> str:
+        # LLE consumes the current tail invocation directly using this
+        # function's stack watermark. Do not arm the compiled-tail context:
+        # there is no generated callee prologue to consume it.
+        return (
+            f"{prefix}{{ cpu->host_return_valid = _hrv; "
+            f"RecompReturn _tc = interp_tier_dispatch_balanced(cpu, "
+            f"0x{target_pc24 & 0xFFFFFF:06X}u, "
+            f"0x{site_pc24 & 0xFFFFFF:06X}u, _entry_s, _hrv); "
+            f"RecompStackPop(); return _tc; }}  {comment}"
+        )
+
     for key in block_order:
         pairs: List[Tuple[object, List[IROp]]] = []
         flat: List[IROp] = []
@@ -1199,17 +1212,21 @@ def emit_function(rom: bytes, bank: int, start: int,
             # SpotlightInternal_M1X0, etc.) on the 2026-05-17
             # tail-call-past-end class fix.
             tail_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
-            from v2.codegen import (register_call_demand,
-                                     resolve_variant_for_target)
+            from v2.codegen import (has_exact_variant,
+                                     register_call_demand)
             # Record the architectural boundary state before routing this
             # pass to a currently available survivor.  Registering only the
             # survivor makes variant discovery circular: a missing live
             # variant can never be promoted because every request for it is
             # rewritten to the already-emitted fallback first.
             register_call_demand(tail_pc24, target.m, target.x)
-            sib_m, sib_x = resolve_variant_for_target(
-                tail_pc24, target.m, target.x)
-            sib_suffix = _variant_suffix(sib_m, sib_x)
+            if not has_exact_variant(tail_pc24, target.m, target.x):
+                return _lle_tail_stmt(
+                    tail_pc24, source_pc24 or tail_pc24,
+                    f"/* tail_call missing exact M{target.m}X{target.x} "
+                    "body -> authoritative LLE */",
+                    prefix=prefix)
+            sib_suffix = _variant_suffix(target.m, target.x)
             return _tail_call_stmt(
                 f"{tail_call_target_name}{sib_suffix}(cpu)",
                 f"/* tail_call into sibling fn at ${target.pc & 0xFFFF:04X} "
@@ -1241,14 +1258,18 @@ def emit_function(rom: bytes, bank: int, start: int,
         # it isn't already in cfg.
         target_pc24 = (_SAME_BANK << 16) | (target.pc & 0xFFFF)
         src_pc24 = source_pc24 if source_pc24 is not None else 0
-        from v2.codegen import (get_name_for_pc, register_call_demand,
-                                 resolve_variant_for_target)
+        from v2.codegen import (get_name_for_pc, has_exact_variant,
+                                 register_call_demand)
         sibling_name = get_name_for_pc(target_pc24)
         if sibling_name is not None:
             register_call_demand(target_pc24, target.m, target.x)
-            sib_m, sib_x = resolve_variant_for_target(
-                target_pc24, target.m, target.x)
-            sib_suffix = _variant_suffix(sib_m, sib_x)
+            if not has_exact_variant(target_pc24, target.m, target.x):
+                return _lle_tail_stmt(
+                    target_pc24, src_pc24,
+                    f"/* tail-call past end: missing exact "
+                    f"M{target.m}X{target.x} body -> authoritative LLE */",
+                    prefix=prefix)
+            sib_suffix = _variant_suffix(target.m, target.x)
             return _tail_call_stmt(
                 f"{sibling_name}{sib_suffix}(cpu)",
                 f"/* tail-call past end: into {sibling_name}{sib_suffix} "
@@ -1533,15 +1554,16 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 jml_x = getattr(insn, 'x_flag', key.x) & 1
                                 from v2.codegen import (
                                     get_name_for_pc,
+                                    has_exact_variant,
                                     register_call_demand,
-                                    resolve_variant_for_target)
+                                )
                                 tgt_name = get_name_for_pc(target_pc24)
                                 if tgt_name is not None:
                                     register_call_demand(target_pc24,
                                                          jml_m, jml_x)
-                                    sib_m, sib_x = resolve_variant_for_target(
+                                    exact_aot = has_exact_variant(
                                         target_pc24, jml_m, jml_x)
-                                    sib_suffix = _variant_suffix(sib_m, sib_x)
+                                    sib_suffix = _variant_suffix(jml_m, jml_x)
                                     tgt_bank = (target_pc24 >> 16) & 0xFF
                                     # JML changes PB on real hardware
                                     # (the destination bank byte becomes
@@ -1562,14 +1584,21 @@ def emit_function(rom: bytes, bank: int, start: int,
                                         f"cpu->PB = 0x{tgt_bank:02X}; /* JML "
                                         f"into bank ${tgt_bank:02X} */"
                                     )
-                                    lines.append(_tail_call_stmt(
-                                        f"{tgt_name}{sib_suffix}(cpu)",
-                                        f"/* tail-call cross-bank into "
-                                        f"{tgt_name}{sib_suffix} at "
-                                        f"${target_pc24:06X} (JML "
-                                        f"unresolved successor) */",
-                                        nlr_info,
-                                    ))
+                                    if exact_aot:
+                                        lines.append(_tail_call_stmt(
+                                            f"{tgt_name}{sib_suffix}(cpu)",
+                                            f"/* tail-call cross-bank into "
+                                            f"{tgt_name}{sib_suffix} at "
+                                            f"${target_pc24:06X} (JML "
+                                            f"unresolved successor) */",
+                                            nlr_info,
+                                        ))
+                                    else:
+                                        lines.append(_lle_tail_stmt(
+                                            target_pc24, insn.addr,
+                                            f"/* cross-bank JML missing exact "
+                                            f"M{jml_m}X{jml_x} body -> "
+                                            f"authoritative LLE */"))
                                     block_terminated = True
                                     break  # exit `for op in ir_ops`
                             # No name resolved yet — for a CROSS-BANK
@@ -1604,7 +1633,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                                     register_call_demand,
                                     _is_invalid_lorom_call_target,
                                     get_name_for_pc,
-                                    resolve_variant_for_target)
+                                    has_exact_variant)
                                 if (_is_invalid_lorom_call_target(target_pc24)
                                         and get_name_for_pc(target_pc24)
                                         is None):
@@ -1627,9 +1656,9 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 else:
                                     register_call_demand(target_pc24,
                                                          jml_m, jml_x)
-                                    sib_m, sib_x = resolve_variant_for_target(
+                                    exact_aot = has_exact_variant(
                                         target_pc24, jml_m, jml_x)
-                                    sib_suffix = _variant_suffix(sib_m, sib_x)
+                                    sib_suffix = _variant_suffix(jml_m, jml_x)
                                     tgt_bank = (target_pc24 >> 16) & 0xFF
                                     tgt16 = target_pc24 & 0xFFFF
                                     synth_name = (
@@ -1639,14 +1668,22 @@ def emit_function(rom: bytes, bank: int, start: int,
                                         f"cpu->PB = 0x{tgt_bank:02X}; /* JML "
                                         f"into bank ${tgt_bank:02X} */"
                                     )
-                                    lines.append(_tail_call_stmt(
-                                        f"{synth_name}{sib_suffix}(cpu)",
-                                        f"/* tail-call cross-bank into "
-                                        f"{synth_name}{sib_suffix} at "
-                                        f"${target_pc24:06X} (auto-promoted "
-                                        f"via Call demand) */",
-                                        nlr_info,
-                                    ))
+                                    if exact_aot:
+                                        lines.append(_tail_call_stmt(
+                                            f"{synth_name}{sib_suffix}(cpu)",
+                                            f"/* tail-call cross-bank into "
+                                            f"{synth_name}{sib_suffix} at "
+                                            f"${target_pc24:06X} "
+                                            f"(auto-promoted via Call "
+                                            f"demand) */",
+                                            nlr_info,
+                                        ))
+                                    else:
+                                        lines.append(_lle_tail_stmt(
+                                            target_pc24, insn.addr,
+                                            f"/* cross-bank JML missing exact "
+                                            f"M{jml_m}X{jml_x} body -> "
+                                            f"authoritative LLE */"))
                             else:
                                 # Account the hit, then abandon balanced —
                                 # the bare `return ..._goto_trap(...)` this
