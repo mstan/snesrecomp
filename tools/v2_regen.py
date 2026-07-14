@@ -20,13 +20,10 @@ the rest of the integration run.
 """
 
 import argparse
-import atexit
 import os
 import pathlib
 import re
-import shutil
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -53,6 +50,10 @@ from v2.decoder import (  # noqa: E402
     set_decode_cache_enabled, clear_decode_cache, decode_cache_stats,
 )
 from v2.emit_bank import BankEntry, emit_bank  # noqa: E402
+from v2.atomic_output import (  # noqa: E402
+    AtomicOutputDir as _AtomicOutputDir,
+    write_if_changed,
+)
 from v2.wrapper_autoroute import detect_and_route as autoroute_wrappers, format_fix_summary  # noqa: E402
 from v2.tail_call_autoroute import (  # noqa: E402
     detect_and_route as autoroute_tail_calls,
@@ -69,130 +70,6 @@ from v2.pha_rts_autoroute import (  # noqa: E402
 
 
 _BANK_CFG_RE = re.compile(r'bank([0-9a-fA-F]+)\.cfg$')
-
-
-class _AtomicOutputDir:
-    """Transactional generated-output directory on the target filesystem.
-
-    Existing files are hard-linked into a sibling staging directory (copy2 is
-    the fallback). ``write_if_changed`` replaces changed staging files, so a
-    hard link is never modified in place. The live output remains untouched
-    throughout analysis and convergence.
-
-    Publish swaps whole directories. A deterministic previous-directory name
-    makes an interruption recoverable on the next invocation.
-    """
-
-    def __init__(self, target: pathlib.Path):
-        self.target = target.resolve()
-        self.parent = self.target.parent
-        self.parent.mkdir(parents=True, exist_ok=True)
-        self.previous = self.parent / f'.{self.target.name}.snesrecomp-previous'
-        self.staging: pathlib.Path | None = None
-        self.published = False
-
-        self._recover_interrupted_publish()
-        raw = tempfile.mkdtemp(
-            prefix=f'.{self.target.name}.snesrecomp-staging-',
-            dir=str(self.parent))
-        self.staging = pathlib.Path(raw)
-        if self.target.exists():
-            self._link_existing_tree(self.target, self.staging)
-        atexit.register(self.cleanup)
-
-    def _recover_interrupted_publish(self) -> None:
-        if self.previous.exists() and not self.target.exists():
-            os.replace(self.previous, self.target)
-        elif self.previous.exists() and self.target.exists():
-            shutil.rmtree(self.previous)
-
-    @staticmethod
-    def _link_existing_tree(source: pathlib.Path,
-                            destination: pathlib.Path) -> None:
-        for root, dirnames, filenames in os.walk(source):
-            root_path = pathlib.Path(root)
-            relative = root_path.relative_to(source)
-            dest_root = destination / relative
-            dest_root.mkdir(parents=True, exist_ok=True)
-            for dirname in dirnames:
-                (dest_root / dirname).mkdir(exist_ok=True)
-            for filename in filenames:
-                src = root_path / filename
-                dst = dest_root / filename
-                try:
-                    os.link(src, dst)
-                except OSError:
-                    shutil.copy2(src, dst)
-
-    def publish(self) -> None:
-        if self.staging is None or self.published:
-            raise RuntimeError('generated-output workspace is not publishable')
-        if self.previous.exists():
-            shutil.rmtree(self.previous)
-        moved_live = False
-        try:
-            if self.target.exists():
-                os.replace(self.target, self.previous)
-                moved_live = True
-            os.replace(self.staging, self.target)
-            self.staging = None
-            self.published = True
-        except BaseException:
-            if moved_live and not self.target.exists() and self.previous.exists():
-                os.replace(self.previous, self.target)
-            raise
-        if self.previous.exists():
-            shutil.rmtree(self.previous)
-
-    def cleanup(self) -> None:
-        if self.staging is not None and self.staging.exists():
-            shutil.rmtree(self.staging, ignore_errors=True)
-        self.staging = None
-
-
-def write_if_changed(path, content: str) -> bool:
-    """Write `content` to `path` only if it differs from what's already
-    on disk. Returns True if a write happened, False if skipped.
-
-    Optimization (2026-05-31): the regen rewrites every generated .c on
-    every fixpoint pass. The vast majority of banks are byte-identical
-    pass-to-pass (and run-to-run), so unconditional writes needlessly
-    bump mtimes -> the C build then recompiles every bank object even
-    when only one bank's bytes actually changed. Content-gating the
-    write preserves mtimes on unchanged files so the incremental build
-    skips their objects. Newline normalized to '\\n' to match the
-    write_text(..., newline='\\n') the callers used.
-    """
-    try:
-        existing = path.read_text(encoding='utf-8')
-        # read_text() translates platform newlines; compare against the
-        # same normalization the writer applies.
-        if existing == content:
-            return False
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Staging initially hard-links unchanged live files. Replace changed files
-    # rather than truncating them, which would mutate the live inode too.
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f'.{path.name}.tmp-', dir=str(path.parent), text=True)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(content)
-        fd = -1
-        os.replace(tmp_name, path)
-    except BaseException:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-    return True
 
 
 # Stub-lint markers. Any emitted C line containing one of these strings

@@ -91,3 +91,15 @@ def test_direct_jsr_missing_variant_uses_two_byte_call_frame_bridge():
         codegen.set_name_resolver(saved_names)
 
     assert "interp_tier_run_call_frame(cpu, 0x008000u, 0x009100u, 2, NULL)" in source
+
+
+def test_authoritative_manifest_treats_absent_target_as_all_lle():
+    saved = codegen._VALID_VARIANTS
+    saved_authoritative = codegen._VALID_VARIANTS_AUTHORITATIVE
+    try:
+        codegen.set_valid_variants({}, authoritative=True)
+        assert codegen.valid_variant_list(0x008000) == ()
+        assert not codegen.has_exact_variant(0x008000, 1, 1)
+    finally:
+        codegen.set_valid_variants(
+            saved, authoritative=saved_authoritative)

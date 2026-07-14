@@ -243,14 +243,16 @@ _MX_VARIANTS = ((0, 0), (0, 1), (1, 0), (1, 1))
 # address; the LoROM mirror ($00-$3F <-> $80-$BF) is consulted on a
 # miss, mirroring _NAME_RESOLVER's aliasing.
 _VALID_VARIANTS: Dict[int, frozenset] = {}
+_VALID_VARIANTS_AUTHORITATIVE = False
 
 
-def set_valid_variants(d) -> None:
+def set_valid_variants(d, *, authoritative: bool = False) -> None:
     """Install the per-target surviving-(m, x) map from v2_regen's
     emit-truth prune pass. Pass an empty dict to clear (=> emit all
     four everywhere, the pre-prune behaviour)."""
-    global _VALID_VARIANTS
+    global _VALID_VARIANTS, _VALID_VARIANTS_AUTHORITATIVE
     _VALID_VARIANTS = d or {}
+    _VALID_VARIANTS_AUTHORITATIVE = bool(authoritative)
 
 
 def valid_variant_list(addr_24: int):
@@ -259,7 +261,7 @@ def valid_variant_list(addr_24: int):
     recorded a pruned survivor set for the target (or its LoROM
     mirror), return that subset; otherwise return all four (pre-prune
     or cross-bank target with no recorded set)."""
-    if not _VALID_VARIANTS:
+    if not _VALID_VARIANTS and not _VALID_VARIANTS_AUTHORITATIVE:
         return _MX_VARIANTS
     a = addr_24 & 0xFFFFFF
     s = _VALID_VARIANTS.get(a)
@@ -267,8 +269,10 @@ def valid_variant_list(addr_24: int):
         bank = (a >> 16) & 0xFF
         if bank < 0x40 or 0x80 <= bank < 0xC0:
             s = _VALID_VARIANTS.get(a ^ 0x800000)
-    if not s:
+    if not s and not _VALID_VARIANTS_AUTHORITATIVE:
         return _MX_VARIANTS
+    if not s:
+        return ()
     return tuple(mx for mx in _MX_VARIANTS if mx in s)
 
 
@@ -1474,14 +1478,21 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             lines.append(f"    case {case_label}: {{")
             if is_rts_stack_dispatch:
                 # SEP #$30 forced m=x=1 immediately above; the M1X1
-                # variant is the only one ever entered. Keep the
-                # single-variant call.
-                _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
-                name = f"{base_name}{suffix}"
-                env = emitter_helpers.call_with_pb_save(
-                    target_bank, name, trace_pc24=site_pc24)
-                for stmt in env:
-                    lines.append(f"      {stmt}")
+                # architectural variant is the only one ever entered. It is
+                # still exact: a manifest NULL slot executes LLE rather than
+                # creating an undefined reference or borrowing a sibling.
+                if has_exact_variant(tgt_addr, em, ex):
+                    _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+                    name = f"{base_name}{suffix}"
+                    env = emitter_helpers.call_with_pb_save(
+                        target_bank, name, trace_pc24=site_pc24)
+                    for stmt in env:
+                        lines.append(f"      {stmt}")
+                else:
+                    lines.append(
+                        f"      return interp_tier_dispatch_balanced(cpu, "
+                        f"0x{tgt_addr:06x}u, 0x{site_pc24:06x}u, "
+                        f"_entry_s, _hrv); /* authoritative LLE M1X1 */")
             else:
                 # General indirect dispatch: runtime (m, x) dispatch
                 # inside one PB save/restore envelope so the wrong-
@@ -1639,16 +1650,24 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append(f"    case {i}: {{")
         if is_rts_stack_dispatch:
             # SEP #$30 forced m=x=1 immediately above; single-variant
-            # _M1X1 is the only one ever entered.
-            _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
-            name = f"{base_name}{suffix}"
-            env = emitter_helpers.call_with_pb_save(
-                target_bank, name, trace_pc24=site_pc24)
-            for stmt in env:
-                if not (is_jsr or is_call) and stmt.endswith(f"{name}(cpu);"):
-                    lines.append(
-                        "      cpu_tailcall_inherit_return_context(_entry_s, _hrv);")
-                lines.append(f"      {stmt}")
+            # _M1X1 is the only one ever entered, but it may intentionally
+            # remain LLE in the authoritative manifest.
+            if has_exact_variant(tgt_addr, em, ex):
+                _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+                name = f"{base_name}{suffix}"
+                env = emitter_helpers.call_with_pb_save(
+                    target_bank, name, trace_pc24=site_pc24)
+                for stmt in env:
+                    if (not (is_jsr or is_call)
+                            and stmt.endswith(f"{name}(cpu);")):
+                        lines.append(
+                            "      cpu_tailcall_inherit_return_context(_entry_s, _hrv);")
+                    lines.append(f"      {stmt}")
+            else:
+                lines.append(
+                    f"      return interp_tier_dispatch_balanced(cpu, "
+                    f"0x{tgt_addr:06x}u, 0x{site_pc24:06x}u, "
+                    f"_entry_s, _hrv); /* authoritative LLE M1X1 */")
         else:
             # General indirect dispatch: runtime (m, x) dispatch inside
             # one PB save/restore envelope. Eliminates the wrong-variant
@@ -1856,9 +1875,6 @@ def _emit_dispatch(insn) -> List[str]:
         base_name = _NAME_RESOLVER.get(tgt_addr)
         if base_name is None:
             base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
-        # Record demand for both resolved and synthetic targets.
-        _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
-        name = f"{base_name}{suffix}"
         # Multi-line case body: emit each statement on its own line so
         # the per-line scanner in emit_function.py can auto-inject
         # RecompStackPop() before any line starting with "return"
@@ -1866,11 +1882,28 @@ def _emit_dispatch(insn) -> List[str]:
         # Single-line emit silently dropped the RecompStackPop on NLR
         # paths through the dispatcher — caught by GameMode oscillation
         # at boot 2026-05-02.
-        env = emitter_helpers.call_with_pb_save(
-            target_bank, name, trace_pc24=site_pc24)
         lines.append(f"    case {i}: {{")
-        for stmt in env:
-            lines.append(f"      {stmt}")
+        if has_exact_variant(tgt_addr, em, ex):
+            # The compact manifest is authoritative: reference an AOT symbol
+            # only when the exact architectural entry (M1X1 after the
+            # trampoline's SEP #$30) was emitted.
+            _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em, ex))
+            name = f"{base_name}{suffix}"
+            env = emitter_helpers.call_with_pb_save(
+                target_bank, name, trace_pc24=site_pc24)
+            for stmt in env:
+                lines.append(f"      {stmt}")
+        else:
+            # ExecutePtr discarded its own return frame before tail-jumping
+            # to the selected handler.  Interpret the missing exact body with
+            # the enclosing function's unwind watermark; this is the same
+            # guest-stack contract as the compiled tail-dispatch and keeps
+            # LLE authoritative without inventing a C symbol or borrowing a
+            # sibling decoded at a different M/X width.
+            lines.append(
+                f"      return interp_tier_dispatch_balanced(cpu, "
+                f"0x{tgt_addr:06x}u, 0x{site_pc24:06x}u, "
+                f"_entry_s, _hrv); /* authoritative LLE M1X1 */")
         lines.append("    } break;")
     lines.append("    default: break;")
     lines.append("  }")

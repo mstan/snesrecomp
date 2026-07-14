@@ -62,3 +62,36 @@ def test_default_roots_are_vectors_not_every_function_boundary():
     assert len(manifest.roots) == 4  # RESET M1X1 overlaps NMI/IRQ M1X1.
     assert {key.pc24 for key in manifest.nodes} == {0x008000, 0x009000}
     assert all(key.pc24 != 0x00A000 for key in manifest.nodes)
+
+
+def test_reachable_exit_mx_fixed_point_redecodes_caller_continuation():
+    # Callee forces 16-bit X.  The caller's LDX immediate is therefore three
+    # bytes after return; preserve-by-default would decode only two and walk
+    # into the $12 operand as an opcode.
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x20, 0x00, 0x90,       # JSR $9000
+            0xA2, 0x34, 0x12,       # LDX #$1234 (X=0 after callee)
+            0x60,
+        ]),
+        0x9000: bytes([0xC2, 0x10, 0x60]),  # REP #$10; RTS
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func Root 8000 end:8007 entry_mx:1,1\n"
+            "func ForceX16 9000 end:9003 entry_mx:1,1\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            all_cfg_roots=True)
+
+    assert manifest.exit_modes[
+        next(key for key in manifest.exit_modes
+             if key.pc24 == 0x009000 and (key.m, key.x) == (1, 1))
+    ] == (1, 0)
+    root = next(node for key, node in manifest.nodes.items()
+                if key.pc24 == 0x008000 and (key.m, key.x) == (1, 1))
+    assert root.max_pc24 == 0x008006
+    assert all("brk_at" not in reason for reason in root.reasons)

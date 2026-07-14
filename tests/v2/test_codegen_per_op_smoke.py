@@ -318,14 +318,15 @@ def test_call_exempts_cfg_named_out_of_rom_target():
 
 
 def test_return_short_emits_return_stmt():
-    # Post-RecompReturn ABI (2026-05-02): Return ops consume the
-    # pending-skip slot and propagate it to the caller. The emit is
-    # `return _ps; /* RTS */` (or RTL), not a bare `return;`.
+    # LLE-first hardware-stack ABI: RTS pops the real guest return frame and
+    # either returns to its paired host caller, resolves an ancestor unwind,
+    # or dispatches the popped architectural PC.
     op = Return(long=False)
     s = _joined(emit_op(op))
-    assert "return _ps" in s
-    assert "/* RTS */" in s
-    assert "_pending_skip" in s
+    assert "RTS pop hardware return frame" in s
+    assert "cpu_resolve_ancestor_skip" in s
+    assert "cpu_dispatch_pc_from" in s
+    assert "RTS dispatch" in s
 
 
 def test_blockmove_mvn_increments():

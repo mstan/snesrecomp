@@ -29,6 +29,7 @@ classifier already detects), the codegen now:
 """
 from _helpers import make_lorom_bank0  # noqa: E402
 
+from v2 import codegen  # noqa: E402
 from v2.emit_function import emit_function  # noqa: E402
 
 
@@ -165,3 +166,38 @@ def test_phk_per_jml_dispatcher_calls_handlers_by_name():
             f'expected handler call {sym} in synthesized dispatch; '
             f'src=\n{src[:6000]}'
         )
+
+
+def test_phk_per_jml_dispatcher_tiers_manifest_lle_target_down():
+    """An authoritative NULL AOT slot is executable ROM, not a link error.
+
+    ExecutePtr forces M1X1, so a table entry without that exact body must run
+    through the balanced tail-dispatch bridge.  It may not reference the
+    absent C symbol or borrow another width variant.
+    """
+    rom = _build_rom_with_dispatcher()
+    saved_variants = codegen._VALID_VARIANTS
+    saved_authoritative = codegen._VALID_VARIANTS_AUTHORITATIVE
+    try:
+        codegen.set_valid_variants({
+            0x00C000: frozenset({(1, 1)}),
+            # C100 is intentionally absent => authoritative LLE-only.
+            0x00C200: frozenset({(1, 1)}),
+            0x00C300: frozenset({(1, 1)}),
+        }, authoritative=True)
+        src = emit_function(
+            rom=rom, bank=0, start=0xBFBC, entry_m=0, entry_x=0,
+            func_name='GenerateTile_Dispatch',
+            dispatch_helpers={0x0086DF: 'short'},
+        )
+    finally:
+        codegen.set_valid_variants(
+            saved_variants, authoritative=saved_authoritative)
+
+    assert 'bank_00_C000_M1X1(cpu)' in src
+    assert 'bank_00_C100_M1X1(cpu)' not in src
+    assert (
+        'interp_tier_dispatch_balanced(cpu, 0x00c100u, 0x00bfc5u, '
+        '_entry_s, _hrv)' in src
+    ), src
+    assert 'authoritative LLE M1X1' in src

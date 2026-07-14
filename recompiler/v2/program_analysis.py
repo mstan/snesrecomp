@@ -12,7 +12,7 @@ the generated program before making this graph authoritative for emission.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 import hashlib
 import heapq
@@ -99,7 +99,13 @@ class NodeSummary:
 class ProgramManifest:
     roots: Tuple[VariantKey, ...]
     nodes: Mapping[VariantKey, NodeSummary]
-    format_version: int = 1
+    # Exact architectural exit state proven for each reachable entry.  Calls
+    # are decoded against this fixed point; keeping it in the manifest makes
+    # the analysis result self-contained and the emitter/cache independent of
+    # hidden mutable cfg feedback.
+    exit_modes: Mapping[VariantKey, Tuple[int, int]] = field(
+        default_factory=dict)
+    format_version: int = 2
 
     def to_dict(self) -> dict:
         def key_dict(key: VariantKey) -> dict:
@@ -129,6 +135,10 @@ class ProgramManifest:
         return {
             "format_version": self.format_version,
             "roots": [key_dict(k) for k in sorted(self.roots)],
+            "exit_modes": {
+                key.manifest_key: {"m": pair[0] & 1, "x": pair[1] & 1}
+                for key, pair in sorted(self.exit_modes.items())
+            },
             "nodes": {
                 key.manifest_key: node_dict(self.nodes[key])
                 for key in sorted(self.nodes)

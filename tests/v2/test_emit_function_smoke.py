@@ -9,7 +9,7 @@ from v2.emit_function import emit_function  # noqa: E402
 def test_linear_function_signature_and_return():
     """A trivial LDA #$05; STA $00; RTS function.
 
-    Expected shape (current emit — post-width-aware-A-helper 2026-04):
+    Expected shape (LLE-first hardware-stack emit):
         RecompReturn bank_00_8000_M1X1(CpuState *cpu) {
           L_8000_M1X1:
             cpu_trace_block(cpu, 0x008000);
@@ -18,8 +18,8 @@ def test_linear_function_signature_and_return():
             ...
             uint16 _v2 = cpu_read_a16(cpu);      /* width-aware A read */
             cpu_write8(cpu, 0x7E, ..., _v2);
-            { RecompReturn _ps = _pending_skip; ...
-              return _ps; /* RTS */ }
+            { /* pop the guest RTS frame */
+              ... cpu_dispatch_pc_from(...); }
           return RECOMP_RETURN_NORMAL;
         }
     """
@@ -34,9 +34,10 @@ def test_linear_function_signature_and_return():
     assert "cpu_write_a_m" in src
     assert "cpu_read_a16" in src
     assert "cpu_write8" in src
-    # Function returns RecompReturn — Return ops consume pending_skip;
-    # exit-via-fallback returns NORMAL directly.
-    assert "return _ps" in src
+    # RTS consumes the real guest frame and dispatches its architectural PC;
+    # the unreachable/fallback function exit remains NORMAL.
+    assert "RTS pop hardware return frame" in src
+    assert "cpu_dispatch_pc_from" in src
     assert "return RECOMP_RETURN_NORMAL" in src
 
 

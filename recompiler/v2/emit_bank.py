@@ -86,7 +86,8 @@ def emit_bank(rom: bytes, bank: int,
               hle_spc_upload=None,
               hle_func=None,
               hle_dispatch=None,
-              inline_arg_map=None) -> str:
+              inline_arg_map=None,
+              declared_entry_pcs=None) -> str:
     """Emit one bank's C source.
 
     Args:
@@ -132,7 +133,18 @@ def emit_bank(rom: bytes, bank: int,
     # into Intro_Init_Continue and ran darken's submodule_index++ on
     # the wrong dispatch path). Each entry sees the set minus its own
     # start so back-edges to self stay local.
-    all_entry_pcs = {e.start & 0xFFFF for e in entries}
+    # A function boundary remains a boundary even when its exact body was
+    # selected for LLE rather than AOT. Using only `entries` here is subtly
+    # wrong in the manifest emitter because that list intentionally contains
+    # AOT survivors only: an AOT predecessor can then inline straight through
+    # an LLE-only sibling and silently change function ownership, stack-unwind
+    # watermarks, and P/M/X restoration. Analysis decoded against every cfg
+    # declaration, so emission must use the identical boundary set. The
+    # missing exact tail target is lowered to authoritative LLE below.
+    all_entry_pcs = {
+        int(pc) & 0xFFFF for pc in (declared_entry_pcs or ())
+    }
+    all_entry_pcs.update(e.start & 0xFFFF for e in entries)
 
     # Tail-call stack imbalance is handled dynamically by emitted tail
     # transfers: they pass the caller's _entry_s/_hrv to the tail target,
@@ -204,39 +216,55 @@ def emit_bank(rom: bytes, bank: int,
         parts.append(src)
         parts.append("")  # blank line between functions
 
-    # Aliases for cfg-named entries — un-suffixed wrapper that calls
-    # into one specific variant. Hand-written entry-point shims (e.g.
-    # smw_rtl.c calling `I_RESET(&g_cpu)`) bind to these. The alias
-    # picks the cfg-declared (entry_m, entry_x) — i.e. the canonical
-    # entry for that name. If a function has multiple (m,x) variants
-    # only one alias is emitted (the cfg-default); other variants are
-    # reachable only through gen-emitted Call ops that mangle names.
+    # Aliases for cfg-named entries. Hand-written entry-point shims (e.g.
+    # smw_rtl.c calling `I_RESET(&g_cpu)`) bind to these. An unsuffixed host
+    # call does not prove a canonical width, so the wrapper selects the exact
+    # live M/X body and dispatches an absent slot through authoritative LLE.
     # Aliases stay `void` for ABI compatibility with hand-written
     # callers (smw_rtl.c calls `I_RESET(&g_cpu)` etc.). They abort
     # loudly if a non-NORMAL RecompReturn propagates up to the v2
     # boundary — that would mean a SKIP_N idiom leaked past the v2
     # region into hand-written code, which is a design violation
     # worth crashing on.
-    aliased: set = set()
+    alias_entries = {}
     for entry in entries:
-        if not entry.name:
-            continue
-        if entry.name in aliased:
-            continue
-        suffix = _variant_suffix(entry.entry_m, entry.entry_x)
-        aliased.add(entry.name)
-        parts.append(
-            f"void {entry.name}(CpuState *cpu) {{\n"
-            f"  RecompReturn _r = {entry.name}{suffix}(cpu);\n"
-            f"  if (_r != RECOMP_RETURN_NORMAL) {{\n"
-            f"    fprintf(stderr,\n"
-            f"      \"[recomp] non-local-return SKIP_%d leaked past void alias %s\\n\",\n"
-            f"      (int)_r, \"{entry.name}\");\n"
-            f"    abort();\n"
-            f"  }}\n"
-            f"}}"
-        )
-    if aliased:
+        if entry.name:
+            alias_entries.setdefault(entry.name, []).append(entry)
+    for name, named_entries in alias_entries.items():
+        modes = {
+            (entry.entry_m & 1, entry.entry_x & 1)
+            for entry in named_entries
+        }
+        pc24 = ((bank & 0xFF) << 16) | (named_entries[0].start & 0xFFFF)
+        body = [
+            f"void {name}(CpuState *cpu) {{",
+            "  RecompReturn _r;",
+            "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+        ]
+        for m in (0, 1):
+            for x in (0, 1):
+                index = (m << 1) | x
+                if (m, x) in modes:
+                    body.append(
+                        f"    case {index}: _r = {name}_M{m}X{x}(cpu); break;")
+                else:
+                    body.append(
+                        f"    case {index}: _r = interp_tier_dispatch(cpu, "
+                        f"0x{pc24:06x}u); break; /* exact M{m}X{x} LLE */")
+        body.extend([
+            "    default: _r = interp_tier_dispatch(cpu, "
+            f"0x{pc24:06x}u); break;",
+            "  }",
+            "  if (_r != RECOMP_RETURN_NORMAL) {",
+            "    fprintf(stderr,",
+            "      \"[recomp] non-local-return SKIP_%d leaked past void alias %s\\n\",",
+            f"      (int)_r, \"{name}\");",
+            "    abort();",
+            "  }",
+            "}",
+        ])
+        parts.append("\n".join(body))
+    if alias_entries:
         parts.append("")
 
     return "\n".join(parts)

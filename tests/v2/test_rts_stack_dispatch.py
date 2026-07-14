@@ -1,6 +1,7 @@
 """Regression tests for PHA/SEP/RTS table dispatchers."""
 from _helpers import make_lorom_bank0  # noqa: E402
 
+from v2 import codegen
 from v2.emit_function import emit_function  # noqa: E402
 
 
@@ -54,3 +55,36 @@ def test_pha_rts_stack_dispatch_replaces_fake_return_push():
     assert 'bank_00_9100_M1X1(cpu)' in src
     assert 'bank_00_9000_M0X0(cpu)' not in src
     assert 'CPU_STACK_OP_PHA' not in src
+
+
+def test_pha_rts_dispatch_missing_exact_target_uses_lle():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x48, 0xE2, 0x30, 0x60]),
+        0x8020: bytes([0x00, 0x90, 0x00, 0x91]),
+        0x9000: bytes([0x60]),
+        0x9100: bytes([0x00]),
+    })
+    saved = codegen._VALID_VARIANTS
+    saved_authoritative = codegen._VALID_VARIANTS_AUTHORITATIVE
+    try:
+        codegen.set_valid_variants({
+            0x009000: frozenset({(1, 1)}),
+        }, authoritative=True)
+        src = emit_function(
+            rom=rom, bank=0, start=0x8000,
+            entry_m=1, entry_x=1,
+            indirect_dispatch={
+                0x008000: {
+                    'count': 2, 'idx_reg': 'Y',
+                    'table_bases': (0x8020,),
+                },
+            },
+        )
+    finally:
+        codegen.set_valid_variants(
+            saved, authoritative=saved_authoritative)
+
+    assert 'bank_00_9000_M1X1(cpu)' in src
+    assert 'bank_00_9100_M1X1(cpu)' not in src
+    assert ('interp_tier_dispatch_balanced(cpu, 0x009100u' in src
+            and 'authoritative LLE M1X1' in src)

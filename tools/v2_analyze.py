@@ -10,6 +10,7 @@ source of truth.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import os
 import pathlib
 import re
@@ -23,6 +24,7 @@ sys.path.insert(0, str(REPO / "recompiler"))
 from snes65816 import load_rom  # noqa: E402
 from v2.cfg_loader import load_bank_cfg  # noqa: E402
 from v2.decoder import (  # noqa: E402
+    analyze_function_exit_mx,
     classify_dispatch_helper,
     clear_decode_cache,
     decode_function,
@@ -147,7 +149,8 @@ def _architectural_roots(rom: bytes) -> list[VariantKey]:
 
 
 def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
-                   all_cfg_roots: bool = False):
+                   all_cfg_roots: bool = False,
+                   additional_roots=()):
     _seed_auto_vectors(parsed, rom)
     roots = []
     entries_by_address = {}
@@ -171,12 +174,17 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
 
     if not all_cfg_roots:
         roots = _architectural_roots(rom)
+    roots.extend(additional_roots)
 
     data_regions = tuple(all_data_regions)
     dispatch_map = _indirect_dispatch_map(parsed)
     declared_exit_modes = _declared_exit_modes(parsed)
+    active_exit_modes = dict(declared_exit_modes)
+    round_exit_modes = {}
     dispatch_helpers = {}
     inline_arg_map = {}
+    dispatch_helper_probes = set()
+    inline_arg_probes = set()
 
     def target_is_code(key: VariantKey) -> bool:
         bank = (key.pc24 >> 16) & 0xFF
@@ -212,7 +220,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 getattr(cfg, "indirect_call_tables", None) if cfg else None),
             "indirect_dispatch": dispatch_map or None,
             "data_regions": data_regions or None,
-            "callee_exit_mx": declared_exit_modes or None,
+            "callee_exit_mx": active_exit_modes or None,
             "sibling_entry_pcs": siblings or None,
             "inline_arg_map": inline_arg_map or None,
         }
@@ -229,7 +237,9 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             if insn.mnem == "JSL" or (
                     insn.mnem == "JMP" and insn.length == 4):
                 target = insn.operand & 0xFFFFFF
-                if target not in dispatch_helpers:
+                if (target not in dispatch_helpers
+                        and target not in dispatch_helper_probes):
+                    dispatch_helper_probes.add(target)
                     try:
                         kind = classify_dispatch_helper(
                             rom, (target >> 16) & 0xFF, target & 0xFFFF)
@@ -243,7 +253,8 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 target = (bank << 16) | (insn.operand & 0xFFFF)
             else:
                 continue
-            if target not in inline_arg_map:
+            if target not in inline_arg_map and target not in inline_arg_probes:
+                inline_arg_probes.add(target)
                 byte_counts = set()
                 for probe_m, probe_x in ((0, 0), (1, 1)):
                     try:
@@ -263,6 +274,10 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             kwargs["dispatch_helpers"] = dispatch_helpers or None
             kwargs["inline_arg_map"] = inline_arg_map or None
             graph = decode_function(rom, bank, pc, key.m, key.x, **kwargs)
+        exit_m, exit_x = analyze_function_exit_mx(
+            graph, active_exit_modes or None)
+        if exit_m is not None and exit_x is not None:
+            round_exit_modes[key] = (exit_m & 1, exit_x & 1)
         return graph
 
     # Graphs are intentionally one-shot: compact summaries, not CFG objects,
@@ -270,9 +285,45 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
     set_decode_cache_enabled(False)
     clear_decode_cache()
     try:
-        manifest = ProgramAnalyzer(
-            decode_variant, max_nodes=max_nodes,
-            target_is_code=target_is_code).analyze(roots)
+        # Callee exit M/X changes how every caller's return continuation is
+        # decoded.  Re-derive the reachable exact variants against immutable
+        # snapshots until both the exit facts and ROM-derived helper facts are
+        # stable.  This is the compact replacement for the legacy global
+        # cfg-entry x four-width pre-pass: unreachable functions never enter
+        # the solver, and no generated-C feedback participates.
+        manifest = None
+        for _round in range(12):
+            round_exit_modes = {}
+            before_helpers = dict(dispatch_helpers)
+            before_inline = dict(inline_arg_map)
+            clear_decode_cache()
+            manifest = ProgramAnalyzer(
+                decode_variant, max_nodes=max_nodes,
+                target_is_code=target_is_code).analyze(roots)
+
+            next_exit_modes = dict(declared_exit_modes)
+            next_exit_modes.update({
+                (key.pc24, key.m, key.x): pair
+                for key, pair in round_exit_modes.items()
+            })
+            facts_stable = (
+                next_exit_modes == active_exit_modes
+                and before_helpers == dispatch_helpers
+                and before_inline == inline_arg_map)
+            active_exit_modes = next_exit_modes
+            if facts_stable:
+                break
+        else:
+            raise RuntimeError(
+                "reachable exit-M/X analysis did not converge in 12 rounds")
+
+        assert manifest is not None
+        manifest = replace(
+            manifest,
+            exit_modes={
+                VariantKey(pc24, m, x): pair
+                for (pc24, m, x), pair in sorted(active_exit_modes.items())
+            })
     finally:
         clear_decode_cache()
     return manifest, dispatch_helpers, inline_arg_map
