@@ -56,6 +56,7 @@ TEST_MODULES = [
     'test_atomic_output',
     'test_variant_demand',
     'test_program_analysis',
+    'test_analysis_tool',
 ]
 
 

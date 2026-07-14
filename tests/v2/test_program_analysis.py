@@ -111,3 +111,17 @@ def test_invalid_static_target_is_recorded_as_exact_lle_not_enqueued():
     assert edge.target == VariantKey(0x018000, 1, 1)
     assert edge.resolution == EdgeResolution.LLE_EXACT
     assert edge.target not in manifest.nodes
+
+
+def test_cross_bank_long_jump_is_an_exact_tail_demand():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x5C, 0x00, 0x90, 0x00]),  # JML $009000
+        0x9000: bytes([0x60]),
+    })
+    manifest = ProgramAnalyzer(_decode(rom)).analyze([
+        VariantKey(0x008000, 0, 1)])
+    edge, = manifest.nodes[VariantKey(0x008000, 0, 1)].demands
+
+    assert edge.kind == EdgeKind.DIRECT_TAIL_CALL
+    assert edge.target == VariantKey(0x009000, 0, 1)
+    assert edge.target in manifest.nodes

@@ -37,8 +37,7 @@ must not contribute outgoing demand.
 
 ## Fixed Point
 
-1. Seed roots from vectors, explicit exports, preserved-bank imports, and
-   configured entry points.
+1. Seed roots from vectors, explicit host exports, and preserved-bank imports.
 2. Decode demanded nodes into compact summaries with a work queue.
 3. Propagate entry M/X and exit M/X facts along graph edges.
 4. Solve recursive call components as SCCs; requeue only dependents whose
@@ -50,6 +49,12 @@ must not contribute outgoing demand.
 
 Generated C is never an analysis input. Stub-marker scanning remains a final
 assertion during migration, not the mechanism that discovers dead variants.
+
+`func ... end:` is a boundary and ownership declaration, not by itself a
+reachability root. RESET and native NMI/IRQ vectors are architectural roots;
+explicit host exports and preserved-bank imports will be represented as
+separate root kinds. Native interrupts preserve live M/X, so analysis admits
+all four interrupt-entry states and lets exact unavailable variants use LLE.
 
 ## Variant Policy
 
@@ -98,6 +103,23 @@ clean/dirty function flag is insufficient: unresolved indirect dispatchers
 still contained approximately 970 legitimate direct-call demands. The final
 model therefore needs per-edge LLE fallback and compact node summaries, not
 eager promotion plus whole-function rejection.
+
+The first compact analysis-only implementation (`tools/v2_analyze.py`) then
+converged on Mega Man X in 14.9 seconds from 20 configured roots. It produced
+4,236 exact variants at 4,115 unique PCs and 31,374 demand edges. Of those
+PCs, 4,032 demanded one M/X form, 53 demanded two, 22 demanded three, and only
+8 demanded all four. A second run produced a byte-identical 9.3 MB manifest
+(SHA-256 `3A967D0A7B3C66DB5B90DA4B8092E894238E8CD2CE53DE8894B649BE169F8EFB`).
+This is analysis-only evidence, not yet an emission or gameplay claim.
+
+After separating cfg boundaries from architectural roots, the same bounded
+analysis completed in under one second per title: Mega Man X reached 29 exact
+variants, SMW 37, Zelda 43, and Super Metroid 85 from nine conservative roots
+(RESET M1X1 plus all native NMI/IRQ M/X states). These small sets are the
+statically proven AOT frontiers, not claims that the rest of each ROM is dead:
+execution beyond an unprovable dynamic edge remains reachable through LLE.
+The previous all-cfg-roots counts remain available through
+`v2_analyze.py --all-cfg-roots` as a migration diagnostic.
 
 ## Acceptance
 

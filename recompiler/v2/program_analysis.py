@@ -35,6 +35,7 @@ class NodeDisposition(str, Enum):
 
 class EdgeKind(str, Enum):
     DIRECT_CALL = "direct_call"
+    DIRECT_TAIL_CALL = "direct_tail_call"
     STATIC_DISPATCH = "static_dispatch"
     DYNAMIC_DISPATCH = "dynamic_dispatch"
     UNRESOLVED_INDIRECT = "unresolved_indirect"
@@ -235,6 +236,27 @@ def summarize_decode_graph(
                           else EdgeResolution.LLE_EXACT)
             edges.add(DemandEdge(
                 site, EdgeKind.DIRECT_CALL, resolution, target))
+        elif insn.mnem == "JMP" and insn.length == 4:
+            target = VariantKey(insn.operand, insn.m_flag, insn.x_flag)
+            resolution = (EdgeResolution.AOT_EXACT
+                          if target_is_code is None or target_is_code(target)
+                          else EdgeResolution.LLE_EXACT)
+            edges.add(DemandEdge(
+                site, EdgeKind.DIRECT_TAIL_CALL, resolution, target))
+
+        # Same-bank explicit jump/branch targets normally live inside this
+        # decode graph.  If the decoder deliberately omitted one because it
+        # is a separately declared sibling entry, it is an exact tail demand.
+        if insn.mnem in ("JMP", "BRA", "BRL") and insn.length != 4:
+            for successor in decoded.successors:
+                if successor in graph.insns:
+                    continue
+                target = VariantKey(successor.pc, successor.m, successor.x)
+                resolution = (EdgeResolution.AOT_EXACT
+                              if target_is_code is None or target_is_code(target)
+                              else EdgeResolution.LLE_EXACT)
+                edges.add(DemandEdge(
+                    site, EdgeKind.DIRECT_TAIL_CALL, resolution, target))
 
         if getattr(insn, "dispatch_runtime", False):
             edges.add(DemandEdge(
