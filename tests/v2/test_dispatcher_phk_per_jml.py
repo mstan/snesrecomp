@@ -197,7 +197,7 @@ def test_phk_per_jml_dispatcher_tiers_manifest_lle_target_down():
     assert 'bank_00_C000_M1X1(cpu)' in src
     assert 'bank_00_C100_M1X1(cpu)' not in src
     assert (
-        'interp_tier_dispatch_balanced(cpu, 0x00c100u, 0x00bfc5u, '
+        'interp_tier_dispatch_tail(cpu, 0x00c100u, 0x00bfc5u, '
         '_entry_s, _hrv)' in src
     ), src
     assert 'authoritative LLE M1X1' in src

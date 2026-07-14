@@ -60,6 +60,13 @@ void cpu_tailcall_inherit_return_context(uint16_t entry_s, uint8_t hrv);
 int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv);
 void cpu_tailcall_context_save(CpuTailcallContextSave *out);
 void cpu_tailcall_context_restore(const CpuTailcallContextSave *in);
+/* Architectural interrupt handlers may cross AOT/LLE boundaries before their
+ * terminal RTI.  Keep that host-boundary context independent of any one
+ * generated function so an LLE tail can stop on RTI instead of interpreting
+ * the placeholder return PC from cpu_push_interrupt_frame(). */
+void cpu_interrupt_context_enter(void);
+void cpu_interrupt_context_leave(void);
+int cpu_interrupt_context_active(void);
 #include <setjmp.h>
 extern jmp_buf g_watchdog_jmp;
 extern int g_watchdog_tripped;

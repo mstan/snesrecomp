@@ -205,7 +205,8 @@ def discover_host_roots(parsed, source_roots: Iterable[pathlib.Path],
     return tuple(sorted(roots))
 
 
-def discover_profile_roots(manifest_paths: Iterable[pathlib.Path]) \
+def discover_profile_roots(manifest_paths: Iterable[pathlib.Path],
+                           declared_entry_pcs: Iterable[int] = ()) \
         -> tuple[VariantKey, ...]:
     """Load clean runtime-observed targets as optional AOT roots.
 
@@ -213,7 +214,19 @@ def discover_profile_roots(manifest_paths: Iterable[pathlib.Path]) \
     behavior, changes decoding semantics, or removes the LLE fallback. Bailed
     observations are deliberately excluded because they are bug evidence, not
     proof that a target is executable code.
+
+    A clean interpreter landing is also not, by itself, proof of a callable
+    function boundary.  Computed returns, inline-argument continuations, and
+    indirect jumps can all land in the middle of an enclosing function.  Such
+    PCs are valid LLE resume points but acquire a false stack/return ABI if
+    emitted as standalone C functions.  Promote only hardware call landings
+    (``call_gap``) or targets independently declared as function boundaries.
     """
+    declared = {int(pc) & 0xFFFFFF for pc in declared_entry_pcs}
+    for pc in tuple(declared):
+        mirror = _lorom_mirror_pc24(pc)
+        if mirror is not None:
+            declared.add(mirror)
     roots = set()
     for path in manifest_paths:
         path = pathlib.Path(path)
@@ -249,6 +262,9 @@ def discover_profile_roots(manifest_paths: Iterable[pathlib.Path]) \
             try:
                 target = int(str(item["target_pc24"]), 0) & 0xFFFFFF
             except (KeyError, TypeError, ValueError):
+                continue
+            if (str(item.get("site_kind", "")) != "call_gap" and
+                    target not in declared):
                 continue
             roots.add(VariantKey(
                 target, int(match.group(1)), int(match.group(2))))

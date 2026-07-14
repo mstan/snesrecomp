@@ -140,8 +140,13 @@ def main() -> int:
             source_roots.append(conventional)
     host_roots = () if args.no_host_root_scan else discover_host_roots(
         parsed, source_roots, excluded_roots=(out_dir,))
+    declared_entry_pcs = {
+        ((bank & 0xFF) << 16) | (entry.start & 0xFFFF)
+        for bank, _path, cfg in parsed for entry in cfg.entries
+    }
     try:
-        profile_roots = discover_profile_roots(args.profile_manifest)
+        profile_roots = discover_profile_roots(
+            args.profile_manifest, declared_entry_pcs)
     except ValueError as exc:
         parser.error(str(exc))
     additional_roots = tuple(sorted(set(host_roots) | set(profile_roots)))

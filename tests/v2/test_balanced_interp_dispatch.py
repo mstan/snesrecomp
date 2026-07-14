@@ -17,7 +17,7 @@ def test_reserved_hle_dispatch_uses_balanced_interpreter_tier():
         hle_dispatch={0x8000: '__balanced_interp__'},
     )
 
-    assert 'interp_tier_dispatch_balanced(cpu, 0x008000u, 0x008000u' in src
+    assert 'interp_tier_dispatch_tail(cpu, 0x008000u, 0x008000u' in src
     assert '/* balanced_interp_dispatch */' in src
     assert 'RecompStackPop(); return _r;' in src
     assert 'extern RecompReturn __balanced_interp__' not in src

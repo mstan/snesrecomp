@@ -261,8 +261,16 @@ def emit_bank(rom: bytes, bank: int,
         body = [
             f"void {name}(CpuState *cpu) {{",
             "  RecompReturn _r;",
-            "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
         ]
+        if spec["interrupt"]:
+            body.extend([
+                "  uint8 _interrupted_hrv = cpu->host_return_valid;",
+                "  cpu->host_return_valid = 0;",
+                "  cpu_interrupt_context_enter();",
+            ])
+        body.extend([
+            "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+        ])
         for m in (0, 1):
             for x in (0, 1):
                 index = (m << 1) | x
@@ -277,6 +285,13 @@ def emit_bank(rom: bytes, bank: int,
             f"    default: _r = {tier_dispatch}(cpu, "
             f"0x{pc24:06x}u); break;",
             "  }",
+        ])
+        if spec["interrupt"]:
+            body.extend([
+                "  cpu_interrupt_context_leave();",
+                "  cpu->host_return_valid = _interrupted_hrv;",
+            ])
+        body.extend([
             "  if (_r != RECOMP_RETURN_NORMAL) {",
             "    fprintf(stderr,",
             "      \"[recomp] non-local-return SKIP_%d leaked past void alias %s\\n\",",

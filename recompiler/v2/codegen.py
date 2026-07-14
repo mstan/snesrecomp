@@ -296,7 +296,8 @@ def variant_dispatch_case_lines(addr_24: int, base_name: str,
     through ``lle_fallback``; it never borrows a sibling decoded at a
     different operand width. The caller supplies the ABI-correct expression:
     call sites use ``interp_tier_run_call_frame`` after pushing the hardware
-    frame, while tail transfers use ``interp_tier_dispatch_balanced``.
+    frame, while tail transfers use ``interp_tier_dispatch_tail`` so an
+    enclosing architectural interrupt retains its RTI boundary.
 
     `pre_call` is emitted only before an AOT variant call (e.g. tail-call
     return-context inheritance); the LLE bridge receives its own context.
@@ -1401,7 +1402,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         # it (interp shares CpuState + the AOT bus; bail -> abandon-balanced
         # fallback, never worse than the drop). See docs/MULTI_TIER.md.
         lines.append(
-            f"      return interp_tier_dispatch_balanced(cpu, "
+            f"      return interp_tier_dispatch_tail(cpu, "
             f"((uint32)cpu->PB << 16) | _target, "
             f"0x{site_pc24:06x}u, _entry_s, _hrv);")
         lines.append("  }")
@@ -1490,7 +1491,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                         lines.append(f"      {stmt}")
                 else:
                     lines.append(
-                        f"      return interp_tier_dispatch_balanced(cpu, "
+                        f"      return interp_tier_dispatch_tail(cpu, "
                         f"0x{tgt_addr:06x}u, 0x{site_pc24:06x}u, "
                         f"_entry_s, _hrv); /* authoritative LLE M1X1 */")
             else:
@@ -1513,7 +1514,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                         f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
                         f"0x{site_pc24:06x}u, 2, NULL)"
                         if is_jsr or is_call else
-                        f"interp_tier_dispatch_balanced(cpu, 0x{tgt_addr:06x}u, "
+                        f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                         f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
                 lines.append("      }")
                 lines.append(
@@ -1561,7 +1562,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # Interpreter-fallback tier: run the loaded target instead of
             # dropping it; bail -> abandon-balanced fallback. docs/MULTI_TIER.md.
             lines.append(
-                f"  return interp_tier_dispatch_balanced(cpu, "
+                f"  return interp_tier_dispatch_tail(cpu, "
                 f"((uint32)cpu->PB << 16) | _target, "
                 f"0x{site_pc24:06x}u, _entry_s, _hrv);")
         lines.append("}")
@@ -1665,7 +1666,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                     lines.append(f"      {stmt}")
             else:
                 lines.append(
-                    f"      return interp_tier_dispatch_balanced(cpu, "
+                    f"      return interp_tier_dispatch_tail(cpu, "
                     f"0x{tgt_addr:06x}u, 0x{site_pc24:06x}u, "
                     f"_entry_s, _hrv); /* authoritative LLE M1X1 */")
         else:
@@ -1697,7 +1698,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                     f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
                     f"0x{site_pc24:06x}u, 2, NULL)"
                     if is_jsr or is_call else
-                    f"interp_tier_dispatch_balanced(cpu, 0x{tgt_addr:06x}u, "
+                    f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                     f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
             lines.append("      }")
             lines.append(
@@ -1901,7 +1902,7 @@ def _emit_dispatch(insn) -> List[str]:
             # LLE authoritative without inventing a C symbol or borrowing a
             # sibling decoded at a different M/X width.
             lines.append(
-                f"      return interp_tier_dispatch_balanced(cpu, "
+                f"      return interp_tier_dispatch_tail(cpu, "
                 f"0x{tgt_addr:06x}u, 0x{site_pc24:06x}u, "
                 f"_entry_s, _hrv); /* authoritative LLE M1X1 */")
         lines.append("    } break;")

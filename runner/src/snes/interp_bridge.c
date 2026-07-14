@@ -1106,6 +1106,7 @@ RecompReturn interp_tier_dispatch(CpuState *cpu, uint32_t target_pc24) {
 
 RecompReturn interp_tier_dispatch_interrupt(CpuState *cpu,
                                             uint32_t target_pc24) {
+    cpu_interrupt_context_enter();
     interp_tier_note(target_pc24);
     const uint8_t mx = tier2_entry_mx(cpu);
     int ok = interp_bridge_run_ex2(
@@ -1113,9 +1114,20 @@ RecompReturn interp_tier_dispatch_interrupt(CpuState *cpu,
         0, 0, 0, 0, NULL, 0, 1);
     tier2_record(target_pc24 & 0xFFFFFF, target_pc24 & 0xFFFFFF, mx,
                  TIER2_KIND_DISPATCH, ok);
-    if (s_lle_unwind_active)
-        return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
-    return RECOMP_RETURN_NORMAL;
+    RecompReturn result = s_lle_unwind_active
+        ? (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE
+        : RECOMP_RETURN_NORMAL;
+    cpu_interrupt_context_leave();
+    return result;
+}
+
+RecompReturn interp_tier_dispatch_tail(CpuState *cpu, uint32_t target_pc24,
+                                       uint32_t site_pc24, uint16_t entry_s,
+                                       uint8_t hrv) {
+    if (cpu_interrupt_context_active())
+        return interp_tier_dispatch_interrupt(cpu, target_pc24);
+    return interp_tier_dispatch_balanced(cpu, target_pc24, site_pc24,
+                                         entry_s, hrv);
 }
 
 /* Upgrade of an unresolved tail-dispatch site (one that would otherwise call

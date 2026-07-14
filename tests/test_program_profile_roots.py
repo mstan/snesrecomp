@@ -36,16 +36,36 @@ def test_clean_profile_targets_are_optional_aot_roots():
             "schema": "snesrecomp tier2 coverage v1",
             "discoveries": [
                 {"target_pc24": "0x008123", "entry_mx": "M1X0",
-                 "clean_hits": 3, "bail_hits": 0},
+                 "site_kind": "call_gap", "clean_hits": 3, "bail_hits": 0},
                 {"target_pc24": "0x008456", "entry_mx": "M0X1",
                  "clean_hits": 2, "bail_hits": 1},
                 {"target_pc24": "0x008999", "entry_mx": "unknown",
                  "clean_hits": 1, "bail_hits": 0},
+                {"target_pc24": "0x008ABC", "entry_mx": "M0X0",
+                 "site_kind": "goto_gap", "clean_hits": 5,
+                 "bail_hits": 0},
             ],
         }), encoding="utf-8")
 
         assert discover_profile_roots((profile,)) == (
             VariantKey(0x008123, 1, 0),)
+
+
+def test_declared_profile_target_is_safe_even_when_landing_is_not_a_call():
+    with tempfile.TemporaryDirectory() as temp:
+        profile = pathlib.Path(temp) / "tier2_coverage.json"
+        profile.write_text(json.dumps({
+            "schema": "snesrecomp tier2 coverage v1",
+            "discoveries": [
+                {"target_pc24": "0x808ABC", "entry_mx": "M0X0",
+                 "site_kind": "indirect_dispatch", "clean_hits": 5,
+                 "bail_hits": 0},
+            ],
+        }), encoding="utf-8")
+
+        # A LoROM mirror of a declared boundary carries the same function ABI.
+        assert discover_profile_roots((profile,), (0x008ABC,)) == (
+            VariantKey(0x808ABC, 0, 0),)
 
 
 def test_profile_manifest_materializes_observed_exact_variant():

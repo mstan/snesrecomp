@@ -275,7 +275,7 @@ def test_tail_call_past_end_routes_pruned_variant_to_lle():
                             func_name='Caller')
     demand = v2_codegen.take_unresolved_call_targets()
 
-    assert 'interp_tier_dispatch_balanced(cpu, 0x008003u' in src, src
+    assert 'interp_tier_dispatch_tail(cpu, 0x008003u' in src, src
     assert 'NextSibling_M0X0(cpu)' not in src, src
     assert 'NextSibling_M0X1(cpu)' not in src, src
     assert 'cpu_tailcall_inherit_return_context' not in src, src
@@ -312,7 +312,7 @@ def test_tail_call_demands_missing_live_variant_before_lle_routing():
                             sibling_entry_pcs={0x8008})
     demand = v2_codegen.take_unresolved_call_targets()
 
-    assert 'interp_tier_dispatch_balanced(cpu, 0x008008u' in src, src
+    assert 'interp_tier_dispatch_tail(cpu, 0x008008u' in src, src
     assert 'SharedBody_M1X1(cpu)' not in src, src
     assert (target, 0, 0) in demand, demand
     assert (target, 1, 1) not in demand, demand

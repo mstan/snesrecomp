@@ -542,6 +542,11 @@ RecompReturn interp_tier_dispatch_interrupt(CpuState *cpu,
 RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32 target_pc24,
                                            uint32 site_pc24, uint16 entry_s,
                                            uint8 hrv);
+/* Tail transfer that preserves the enclosing architectural boundary.  Normal
+ * subroutines stop past entry_s; an interrupt handler stops at its RTI. */
+RecompReturn interp_tier_dispatch_tail(CpuState *cpu, uint32 target_pc24,
+                                       uint32 site_pc24, uint16 entry_s,
+                                       uint8 hrv);
 /* RTS/RTL trampoline reached a known function row whose live M/X variant has
  * no AOT body.  The prior frame is already popped, so execution unwinds past
  * the current cpu->S; a bounded bail restores the ordinary dispatch-miss S. */

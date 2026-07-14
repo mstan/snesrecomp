@@ -92,6 +92,36 @@ def test_all_lle_interrupt_alias_uses_rti_aware_dispatch(tmp_path):
         "interp_tier_dispatch_interrupt(cpu, 0x008000u)") == 5
 
 
+def test_aot_interrupt_tail_to_lle_preserves_rti_boundary(tmp_path):
+    rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0x00)
+    rom = bytearray(rom_path.read_bytes())
+    # Native NMI wrapper changes widths, then tail-transfers to a body that is
+    # deliberately LLE-only.  This is Super Metroid's $00:9583 -> $80:9589
+    # shape, expressed without any title-specific address or hint.
+    rom[0:6] = bytes([0xC2, 0x30, 0x5C, 0x10, 0x80, 0x80])
+    rom[0x10] = 0x00  # BRK keeps the tail body structural/LLE-only.
+    rom[0x7FEA:0x7FEC] = bytes([0x00, 0x80])
+    rom_path.write_bytes(rom)
+    (cfg_dir / "bank00.cfg").write_text(
+        "bank = 00\nfunc Interrupt_NMI 8000 end:8006 entry_mx:1,1\n",
+        encoding="utf-8")
+    (cfg_dir / "funcs.h").write_text(
+        "void Interrupt_NMI(CpuState *cpu);  /* $00:8000 alias */\n",
+        encoding="utf-8")
+
+    result = _run(rom_path, cfg_dir, out_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    source = (out_dir / "bank00_v2.c").read_text(encoding="utf-8")
+    assert "RecompReturn Interrupt_NMI_M1X1" in source
+    assert "interp_tier_dispatch_tail(cpu, 0x808010u" in source
+    assert "uint8 _interrupted_hrv = cpu->host_return_valid;" in source
+    assert "cpu->host_return_valid = 0;" in source
+    assert "cpu_interrupt_context_enter();" in source
+    assert "cpu_interrupt_context_leave();" in source
+    assert "cpu->host_return_valid = _interrupted_hrv;" in source
+
+
 def test_lle_only_declared_sibling_remains_an_emission_boundary(tmp_path):
     rom_path, cfg_dir, out_dir = _fixture(tmp_path, target_opcode=0x00)
     rom = bytearray(rom_path.read_bytes())
@@ -111,7 +141,7 @@ def test_lle_only_declared_sibling_remains_an_emission_boundary(tmp_path):
         (out_dir / "program_manifest.json").read_text(encoding="utf-8"))
     assert manifest["nodes"]["008010:M1X1"]["disposition"] == "lle_only"
     assert "RecompReturn Poison_M1X1" not in source
-    assert "interp_tier_dispatch_balanced(cpu, 0x008010u" in source
+    assert "interp_tier_dispatch_tail(cpu, 0x008010u" in source
     assert "tail-call past end: missing exact M1X1 body" in source
 
 

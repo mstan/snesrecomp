@@ -83,6 +83,19 @@ static uint8_t g_cpu_entry_return_frame[RECOMP_STACK_DEPTH];
 static uint8_t g_tailcall_context_valid;
 static uint16_t g_tailcall_entry_s;
 static uint8_t g_tailcall_hrv;
+static unsigned g_interrupt_context_depth;
+
+void cpu_interrupt_context_enter(void) {
+  g_interrupt_context_depth++;
+}
+
+void cpu_interrupt_context_leave(void) {
+  if (g_interrupt_context_depth) g_interrupt_context_depth--;
+}
+
+int cpu_interrupt_context_active(void) {
+  return g_interrupt_context_depth != 0;
+}
 
 void cpu_tailcall_inherit_return_context(uint16_t entry_s, uint8_t hrv) {
   g_tailcall_entry_s = entry_s;
@@ -423,6 +436,7 @@ void WatchdogFrameStart(void) {
   g_watchdog_counter = 0;
   g_recomp_stack_top = 0;
   g_tailcall_context_valid = 0;
+  g_interrupt_context_depth = 0;
 }
 
 // Called at loop headers in generated code — detect infinite loops

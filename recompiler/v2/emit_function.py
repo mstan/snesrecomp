@@ -775,7 +775,7 @@ def emit_function(rom: bytes, bank: int, start: int,
         # there is no generated callee prologue to consume it.
         return (
             f"{prefix}{{ cpu->host_return_valid = _hrv; "
-            f"RecompReturn _tc = interp_tier_dispatch_balanced(cpu, "
+            f"RecompReturn _tc = interp_tier_dispatch_tail(cpu, "
             f"0x{target_pc24 & 0xFFFFFF:06X}u, "
             f"0x{site_pc24 & 0xFFFFFF:06X}u, _entry_s, _hrv); "
             f"RecompStackPop(); return _tc; }}  {comment}"

@@ -86,5 +86,5 @@ def test_pha_rts_dispatch_missing_exact_target_uses_lle():
 
     assert 'bank_00_9000_M1X1(cpu)' in src
     assert 'bank_00_9100_M1X1(cpu)' not in src
-    assert ('interp_tier_dispatch_balanced(cpu, 0x009100u' in src
+    assert ('interp_tier_dispatch_tail(cpu, 0x009100u' in src
             and 'authoritative LLE M1X1' in src)
