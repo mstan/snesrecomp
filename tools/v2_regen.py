@@ -1,8 +1,8 @@
 """snesrecomp.tools.v2_regen
 
 Drive the v2 pipeline over every bank cfg in a SMW-style repo,
-producing one C file per bank into the single active generated-code
-directory.
+producing one or more C translation units per bank in the single active
+generated-code directory.
 
 Usage:
     python snesrecomp/tools/v2_regen.py --rom smw.sfc \
@@ -12,7 +12,8 @@ Usage:
 For each `bankXX.cfg` under --cfg-dir:
     1. parse via cfg_loader.load_bank_cfg
     2. emit via emit_bank.emit_bank
-    3. write to <out_dir>/bankXX_v2.c  (game-agnostic naming)
+    3. write small banks to <out_dir>/bankXX_v2.c and optionally shard large
+       banks into stable <out_dir>/bankXX_partNN_v2.c translation units
 
 Exits 0 if every bank completed; non-zero otherwise. Per-bank failures
 are caught and reported individually so a single bug doesn't block
@@ -54,6 +55,7 @@ from v2.atomic_output import (  # noqa: E402
     AtomicOutputDir as _AtomicOutputDir,
     write_if_changed,
 )
+from v2.translation_units import write_bank_translation_units  # noqa: E402
 from v2.wrapper_autoroute import detect_and_route as autoroute_wrappers, format_fix_summary  # noqa: E402
 from v2.tail_call_autoroute import (  # noqa: E402
     detect_and_route as autoroute_tail_calls,
@@ -183,7 +185,8 @@ _VARIANT_DEF_RE = re.compile(
     r'^RecompReturn\s+([A-Za-z0-9_]+)_M([01])X([01])'
     r'\(CpuState\s+\*cpu\)\s*\{')
 _SYNTHETIC_BASE_RE = re.compile(r'^bank_([0-9a-fA-F]{2})_([0-9a-fA-F]{4})$')
-_GEN_BANK_RE = re.compile(r'^bank([0-9a-fA-F]{2})_v2\.c$')
+_GEN_BANK_RE = re.compile(
+    r'^bank([0-9a-fA-F]{2})(?:_part[0-9a-fA-F]+)?_v2\.c$')
 
 
 def _variant_base_pc24(base_name: str, name_to_pc24: dict) -> int | None:
@@ -271,7 +274,7 @@ def _read_skipped_bank_results(out_dir: pathlib.Path,
     """
     if only_banks is None:
         return []
-    results: list[dict] = []
+    sources: dict[int, list[str]] = {}
     for p in sorted(out_dir.glob('bank*_v2.c')):
         m = _GEN_BANK_RE.match(p.name)
         if not m:
@@ -285,8 +288,11 @@ def _read_skipped_bank_results(out_dir: pathlib.Path,
             print(f"  partial scan: failed to read {p}: {e}",
                   file=sys.stderr)
             continue
-        results.append({'status': 'ok', 'bank': bank, 'src': src})
-    return results
+        sources.setdefault(bank, []).append(src)
+    return [
+        {'status': 'ok', 'bank': bank, 'src': '\n'.join(parts)}
+        for bank, parts in sorted(sources.items())
+    ]
 
 
 def _emit_dispatch_table(out_dir: pathlib.Path, parsed,
@@ -1009,6 +1015,11 @@ def _emit_bank_one(args_dict: dict) -> dict:
         'bank': bank,
         'status': 'ok',
         'src': src,
+        'symbol_pcs': {
+            (entry.name or f'bank_{bank:02X}_{entry.start & 0xFFFF:04X}'):
+                entry.start & 0xFFFF
+            for entry in cfg.entries
+        },
         'cfg_entries_count': len(cfg.entries),
         'suppressed': bank_suppressed,
         'const_z_folds': bank_const_z_folds,
@@ -1022,7 +1033,8 @@ def _emit_bank_one(args_dict: dict) -> dict:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="v2 regen — emit one C file per bank cfg")
+    p = argparse.ArgumentParser(
+        description="v2 regen — emit C translation units from bank cfgs")
     p.add_argument('--rom', required=True, help='Path to game ROM file (.sfc)')
     p.add_argument('--cfg-dir', required=True,
                    help='Directory containing bankXX.cfg files')
@@ -1076,6 +1088,14 @@ def main() -> int:
                         '8C/16T desktop); hyperthreads rarely help '
                         'and compete for execution units.'.format(
                             _default_jobs))
+    p.add_argument('--bank-shard-threshold-kib', type=int, default=4096,
+                   help='Shard generated banks at or above this source size '
+                        'into stable translation units (default: 4096 KiB; '
+                        '0 shards every non-empty bank)')
+    p.add_argument('--bank-shard-pc-span', type=lambda value: int(value, 0),
+                   default=0x0800,
+                   help='Entry-PC range per bank translation unit '
+                        '(default: 0x800; 0 disables sharding)')
     p.add_argument('--tier-down-stubs', action='store_true',
                    help='Opt-in (bring-up): emit cross-ROM-bank unresolved-'
                         'function stubs (unresolved_stubs_v2.c) as interpreter '
@@ -1086,6 +1106,9 @@ def main() -> int:
                         'titles stay strict (default off). See docs/MULTI_TIER.md '
                         'Phase 4.')
     args = p.parse_args()
+    bank_shard_threshold_bytes = max(
+        0, args.bank_shard_threshold_kib) * 1024
+    bank_shard_pc_span = max(0, args.bank_shard_pc_span)
 
     # ── Phase-tracking + watchdog ───────────────────────────────────
     regen_start_time = time.time()
@@ -2082,8 +2105,10 @@ def main() -> int:
                     print(r['traceback'])
                 failed.append((bank, r['error']))
                 continue
-            out_path = out_dir / f'bank{bank:02x}_v2.c'
-            write_if_changed(out_path, r['src'])
+            output_names, output_changes = write_bank_translation_units(
+                out_dir, bank, r['symbol_pcs'], r['src'],
+                threshold_bytes=bank_shard_threshold_bytes,
+                pc_span=bank_shard_pc_span)
             all_suppressed.extend(r['suppressed'])
             all_const_z_folds.extend(r['const_z_folds'])
             all_dispatch_suppressed.extend(r['dispatch_suppressed'])
@@ -2093,7 +2118,11 @@ def main() -> int:
             cumulative_trampoline_returns.update(
                 r['trampoline_returns_local'])
             if pass_idx == 0:
-                print(f"  OK    bank ${bank:02X}: {r['cfg_entries_count']} entries -> {out_path}")
+                shape = (f'{len(output_names)} shards'
+                         if len(output_names) > 1 else output_names[0])
+                print(f"  OK    bank ${bank:02X}: "
+                      f"{r['cfg_entries_count']} entries -> {shape} "
+                      f"({output_changes} file change(s))")
             succeeded += 1
         # Reseed main's _TRAMPOLINE_RETURNS for any later main-process
         # emit paths (none today) and keep main's view consistent.
