@@ -160,6 +160,9 @@ struct Ppu {
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
+  // Active kPpuRenderFlags_* set by PpuBeginDrawing. Kept outside the stable
+  // snapshot region because it is host rendering policy, not emulated state.
+  uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
   uint32_t renderPitch;
