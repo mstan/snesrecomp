@@ -147,6 +147,15 @@ static void sync_interp_to_cpu(const Interp816 *in, CpuState *c) {
     cpu_mirrors_to_p(c);   /* keep packed P consistent for PHP/PLP/stack ops */
 }
 
+static InterpPreOpcodeHook s_pre_opcode_hook;
+static uint32_t s_pre_opcode_hook_pc24;
+
+void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
+                                       InterpPreOpcodeHook hook) {
+    s_pre_opcode_hook_pc24 = pc24 & 0x7FFFFFu;
+    s_pre_opcode_hook = hook;
+}
+
 /* BRK bridge seam. The bounce is via explicit JSR/JSL interception below, not
  * via planted BRKs, so an interpreted BRK is treated as a no-op continue.
  * (Production hardening may route an unexpected BRK to a contained stop.) */
@@ -390,6 +399,12 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     long steps = 0;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        if (s_pre_opcode_hook &&
+            (pc_before & 0x7FFFFFu) == s_pre_opcode_hook_pc24) {
+            sync_interp_to_cpu(&in, cpu);
+            s_pre_opcode_hook(cpu, pc_before);
+            sync_cpu_to_interp(cpu, &in);
+        }
         /* Opt-in control-flow tripwire: game code normally executes from the
          * LoROM $8000-$FFFF half of a bank.  If a return/jump crosses from ROM
          * into the low I/O/RAM half, capture the transition and a substantial
