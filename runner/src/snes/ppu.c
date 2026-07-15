@@ -10,6 +10,7 @@
 #include "snes.h"
 #include "../debug_server.h"
 #include "snes_regs.h"
+#include "ws_shadow.h"
 
 
 extern bool g_new_ppu;
@@ -420,11 +421,14 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
+  bool ws_shadow = WsShadowLayerActive(layer);
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     uint x = win.edges[windex] + ppu->hScroll[layer] + ws_bias[windex];
     uint w = win.edges[windex + 1] - win.edges[windex];
+    int ws_sx = win.edges[windex];
     PpuZbufType *dstz = dstbuf->data + win.edges[windex] + kPpuExtraLeftRight;
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31;
@@ -434,7 +438,8 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
       w -= curw;
-      uint32 tile = *tp;
+      uint32 tile = WS_TILE(*tp, ws_sx);
+      ws_sx += curw;
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -454,7 +459,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     }
     // Handle full tiles in the middle
     while (w >= 8) {
-      uint32 tile = *tp;
+      uint32 tile = WS_TILE(*tp, ws_sx);
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -469,11 +474,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
           DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
         }
       }
-      dstz += 8, w -= 8;
+      dstz += 8, w -= 8, ws_sx += 8;
     }
     // Handle remaining clipped part
     if (w) {
-      uint32 tile = *tp;
+      uint32 tile = WS_TILE(*tp, ws_sx);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -487,6 +492,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
       }
     }
   }
+#undef WS_TILE
 #undef READ_BITS
 #undef DO_PIXEL
 #undef DO_PIXEL_HFLIP
@@ -781,18 +787,18 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   // HUD for those frames — split + real windows don't compose.
   int16 ws_bias[8] = { 0 };
   if (layer == 2 && y < ppu->wsHudSplitHeight &&
-      ppu->extraLeftCur && ppu->extraRightCur &&
+      ppu->extraLeftRight &&
       win.nr == 1 && win.bits == 0) {
     win.nr = 5;
     win.bits = 0x0A;  // spans 1 and 3 are the gaps
-    win.edges[0] = -ppu->extraLeftCur;
-    win.edges[1] = ppu->wsHudLeftEnd - ppu->extraLeftCur;
+    win.edges[0] = -ppu->extraLeftRight;
+    win.edges[1] = ppu->wsHudLeftEnd - ppu->extraLeftRight;
     win.edges[2] = ppu->wsHudLeftEnd;
     win.edges[3] = ppu->wsHudRightStart;
-    win.edges[4] = ppu->wsHudRightStart + ppu->extraRightCur;
-    win.edges[5] = 256 + ppu->extraRightCur;
-    ws_bias[0] = ppu->extraLeftCur;
-    ws_bias[4] = -(int16)ppu->extraRightCur;
+    win.edges[4] = ppu->wsHudRightStart + ppu->extraLeftRight;
+    win.edges[5] = 256 + ppu->extraLeftRight;
+    ws_bias[0] = ppu->extraLeftRight;
+    ws_bias[4] = -(int16)ppu->extraLeftRight;
   } else {
     PpuApplyMarginGap(ppu, layer, &win, ws_bias);
   }
@@ -907,10 +913,13 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
+  bool ws_shadow = WsShadowLayerActive(layer);
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int sx = win.edges[windex];
+    int ws_sx = sx;
     PpuZbufType *dstz = dstbuf->data + sx + kPpuExtraLeftRight;
     PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuExtraLeftRight;
     uint x = sx + ppu->hScroll[layer];
@@ -921,7 +930,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
     int w = mosaic_size - (sx - PpuMosaicAt(ppu, sx));
     do {
       w = IntMin(w, dstz_end - dstz);
-      uint32 tile = *tp;
+      uint32 tile = WS_TILE(*tp, ws_sx);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -934,12 +943,13 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
             dstz[i] = pixel + z;
         } while (++i != w);
       }
-      dstz += w, x += w;
+      dstz += w, x += w, ws_sx += w;
       for (; x >= 8; x -= 8)
         tp = (tp != tp_last) ? tp + 1 : tp_next;
       w = mosaic_size;
     } while (dstz_end - dstz != 0);
   }
+#undef WS_TILE
 #undef READ_BITS
 #undef GET_PIXEL
 #undef GET_PIXEL_HFLIP

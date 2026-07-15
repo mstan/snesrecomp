@@ -291,8 +291,9 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 // [0,left_end) anchored to the LEFT border edge, [left_end,right_start)
 // kept centered (unmoved), [right_start,256) anchored to the RIGHT border
 // edge. The vacated spans stay transparent. height 0 = off (authentic).
-// Only takes effect while extra border columns are active and BG3 is not
-// windowed; mosaic lines fall back to centered. Like the extra-space
+// Uses the fixed centering budget, independent of dynamic room-bound playfield
+// margins, and takes effect while BG3 is not windowed; mosaic lines fall back
+// to centered. Like the extra-space
 // setters, callers re-apply per frame (ppu_reset zeroes the fields).
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start);
