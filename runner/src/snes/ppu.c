@@ -34,9 +34,11 @@ void ppu_reset(Ppu* ppu) {
   {
     size_t pitch = ppu->renderPitch;
     uint8_t *renderBuffer = ppu->renderBuffer;
+    uint32_t renderFlags = ppu->renderFlags;
     memset(ppu, 0, sizeof(*ppu));
     ppu->renderBuffer = renderBuffer;
     ppu->renderPitch = (uint32_t)pitch;
+    ppu->renderFlags = renderFlags;
   }
   ppu->vramIncrement = 1;
 }
@@ -53,6 +55,7 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
   ppu->renderPitch = (uint)pitch;
   ppu->renderBuffer = pixels;
+  ppu->renderFlags = render_flags;
 }
 
 static inline void PpuResetLayerPolicies(Ppu *ppu) {
@@ -1343,7 +1346,8 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       if(x + spriteSize > -ppu->extraLeftCur) {
         // break if we found 32 sprites already
         spritesFound++;
-        if(spritesFound > 32) {
+        if(spritesFound > 32 &&
+           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
           ppu->rangeOver = true;
           break;
         }
@@ -1365,7 +1369,8 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
           if(col + x > -8 - ppu->extraLeftCur && col + x < 256 + ppu->extraRightCur) {
             // break if we found 34 8*1 slivers already
             tilesFound++;
-            if(tilesFound > 34) {
+            if(tilesFound > 34 &&
+               !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
               ppu->timeOver = true;
               break;
             }
@@ -1390,7 +1395,9 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
           }
         }
-        if(tilesFound > 34) break; // break out of sprite-loop if max tiles found
+        if(tilesFound > 34 &&
+           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
+          break; // break out of sprite-loop if max tiles found
       }
     }
     index += 2;
