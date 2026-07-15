@@ -54,6 +54,18 @@ void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_fl
   ppu->renderBuffer = pixels;
 }
 
+static inline void PpuResetLayerPolicies(Ppu *ppu) {
+  ppu->wsLayerClamp = 0;
+  ppu->wsLayerMirror = 0;
+  ppu->wsLayerRepeat = 0;
+  memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
+  memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
+  memset(ppu->wsRepeatY0, 0, sizeof(ppu->wsRepeatY0));
+  memset(ppu->wsRepeatY1, 0, sizeof(ppu->wsRepeatY1));
+  memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
+  memset(ppu->wsMarginGapR, 0, sizeof(ppu->wsMarginGapR));
+}
+
 void PpuSetExtraSpace(Ppu *ppu, uint8_t extra) {
   if (extra > kPpuExtraLeftRight)
     extra = kPpuExtraLeftRight;
@@ -63,6 +75,7 @@ void PpuSetExtraSpace(Ppu *ppu, uint8_t extra) {
   ppu->extraLeftRight = extra;
   ppu->extraLeftCur = extra;
   ppu->extraRightCur = extra;
+  PpuResetLayerPolicies(ppu);
 }
 
 void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget) {
@@ -75,6 +88,7 @@ void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget) {
   ppu->extraLeftRight = budget;
   ppu->extraLeftCur = 0;
   ppu->extraRightCur = 0;
+  PpuResetLayerPolicies(ppu);
 }
 
 void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom) {
@@ -100,6 +114,42 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
 
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
+}
+
+void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask) {
+  ppu->wsLayerClamp = mask;
+}
+
+void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask) {
+  ppu->wsLayerMirror = mask;
+}
+
+void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask) {
+  ppu->wsLayerRepeat = mask;
+}
+
+void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                    uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsClampY0[layer] = y0;
+    ppu->wsClampY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                     uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsRepeatY0[layer] = y0;
+    ppu->wsRepeatY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
+                                    uint8_t right_px) {
+  if (layer < 4) {
+    ppu->wsMarginGapL[layer] = left_px;
+    ppu->wsMarginGapR[layer] = right_px;
+  }
 }
 
 bool ppu_checkOverscan(Ppu* ppu) {
@@ -177,7 +227,8 @@ void ppu_runLine(Ppu* ppu, int line) {
 }
 
 typedef struct PpuWindows {
-  int16 edges[6];
+  // Up to five hardware-window spans plus two margin-gap splits.
+  int16 edges[8];
   uint8 nr;
   uint8 bits;
 } PpuWindows;
@@ -187,6 +238,19 @@ typedef struct PpuWindows {
 // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
 // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
 static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
+  // This helper is also used for the color window (logical layer 5), so guard
+  // all four-entry BG policy arrays.
+  if (layer < 4) {
+    if ((ppu->wsLayerClamp | ppu->wsLayerMirror | ppu->wsLayerRepeat) &
+        (1u << layer))
+      return 0;
+    if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
+        y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
+      return 0;
+    if (ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
+        y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer])
+      return 0;
+  }
   if (layer != 2)
     return extra;
   return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
@@ -210,20 +274,31 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   win->edges[1] = window_right;
   uint i, j;
   int t;
-  bool w1_ena = (winflags & kWindow1Enabled) && ppu->window1left <= ppu->window1right;
+  // A hardware edge pinned to 0/255 means "screen edge" in widescreen too.
+  // This is a no-op at authentic width and prevents full-screen color/windows
+  // from classifying otherwise valid side-margin pixels as outside.
+  int w1l = ppu->window1left, w1r = ppu->window1right;
+  int w2l = ppu->window2left, w2r = ppu->window2right;
+  if (win->edges[0] != 0 || window_right != 256) {
+    if (w1l == 0) w1l = win->edges[0];
+    if (w1r == 255) w1r = window_right - 1;
+    if (w2l == 0) w2l = win->edges[0];
+    if (w2r == 255) w2r = window_right - 1;
+  }
+  bool w1_ena = (winflags & kWindow1Enabled) && w1l <= w1r;
   if (w1_ena) {
-    if (ppu->window1left > win->edges[0]) {
-      win->edges[nr] = ppu->window1left;
+    if (w1l > win->edges[0]) {
+      win->edges[nr] = w1l;
       win->edges[++nr] = window_right;
     }
-    if (ppu->window1right + 1 < window_right) {
-      win->edges[nr] = ppu->window1right + 1;
+    if (w1r + 1 < window_right) {
+      win->edges[nr] = w1r + 1;
       win->edges[++nr] = window_right;
     }
   }
-  bool w2_ena = (winflags & kWindow2Enabled) && ppu->window2left <= ppu->window2right;
+  bool w2_ena = (winflags & kWindow2Enabled) && w2l <= w2r;
   if (w2_ena) {
-    for (i = 0; i <= nr && (t = ppu->window2left) != win->edges[i]; i++) {
+    for (i = 0; i <= nr && (t = w2l) != win->edges[i]; i++) {
       if (t < win->edges[i]) {
         for (j = nr++; j >= i; j--)
           win->edges[j + 1] = win->edges[j];
@@ -231,7 +306,7 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
         break;
       }
     }
-    for (; i <= nr && (t = ppu->window2right + 1) != win->edges[i]; i++) {
+    for (; i <= nr && (t = w2r + 1) != win->edges[i]; i++) {
       if (t < win->edges[i]) {
         for (j = nr++; j >= i; j--)
           win->edges[j + 1] = win->edges[j];
@@ -244,15 +319,15 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   // get a bitmap of how regions map to windows
   uint8 w1_bits = 0, w2_bits = 0;
   if (w1_ena) {
-    for (i = 0; win->edges[i] != ppu->window1left; i++);
-    for (j = i; win->edges[j] != ppu->window1right + 1; j++);
+    for (i = 0; win->edges[i] != w1l; i++);
+    for (j = i; win->edges[j] != w1r + 1; j++);
     w1_bits = ((1 << (j - i)) - 1) << i;
   }
   if ((winflags & (kWindow1Enabled | kWindow1Inversed)) == (kWindow1Enabled | kWindow1Inversed))
     w1_bits = ~w1_bits;
   if (w2_ena) {
-    for (i = 0; win->edges[i] != ppu->window2left; i++);
-    for (j = i; win->edges[j] != ppu->window2right + 1; j++);
+    for (i = 0; win->edges[i] != w2l; i++);
+    for (j = i; win->edges[j] != w2r + 1; j++);
     w2_bits = ((1 << (j - i)) - 1) << i;
   }
   if ((winflags & (kWindow2Enabled | kWindow2Inversed)) == (kWindow2Enabled | kWindow2Inversed))
@@ -260,8 +335,43 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   win->bits = w1_bits | w2_bits;
 }
 
+static void PpuWindowsSplit(PpuWindows *win, int16 *bias, int xpos) {
+  for (uint i = 0; i < win->nr; i++) {
+    if (win->edges[i] < xpos && xpos < win->edges[i + 1]) {
+      for (uint j = win->nr; j >= i + 1; j--)
+        win->edges[j + 1] = win->edges[j];
+      win->edges[i + 1] = (int16)xpos;
+      for (uint j = win->nr - 1; j >= i + 1; j--)
+        bias[j + 1] = bias[j];
+      bias[i + 1] = bias[i];
+      uint8 lo = win->bits & (uint8)((1u << (i + 1)) - 1);
+      uint8 hi = (uint8)((win->bits >> (i + 1)) << (i + 2));
+      win->bits = lo | hi | (uint8)(((win->bits >> i) & 1) << (i + 1));
+      win->nr++;
+      return;
+    }
+  }
+}
+
+static void PpuApplyMarginGap(Ppu *ppu, uint layer, PpuWindows *win,
+                              int16 *bias) {
+  int gl = ppu->wsMarginGapL[layer], gr = ppu->wsMarginGapR[layer];
+  if (!(gl | gr) || !(ppu->extraLeftCur | ppu->extraRightCur))
+    return;
+  PpuWindowsSplit(win, bias, 0);
+  PpuWindowsSplit(win, bias, 256);
+  for (uint i = 0; i < win->nr; i++) {
+    if (win->edges[i + 1] <= 0)
+      bias[i] = (int16)(bias[i] - gl);
+    else if (win->edges[i] >= 256)
+      bias[i] = (int16)(bias[i] + gr);
+  }
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
-static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                   uint y, bool sub, uint layer,
+                                   PpuZbufType zhi, PpuZbufType zlo) {
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
   if ((bits & (0x01010101 << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
@@ -274,6 +384,8 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     return;  // layer is completely hidden
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  int16 ws_bias[8] = { 0 };
+  PpuApplyMarginGap(ppu, layer, &win, ws_bias);
   y += ppu->vScroll[layer];
   int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
@@ -288,9 +400,9 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
-    uint x = win.edges[windex] + ppu->hScroll[layer];
+    uint x = win.edges[windex] + ppu->hScroll[layer] + ws_bias[windex];
     uint w = win.edges[windex + 1] - win.edges[windex];
-    PpuZbufType *dstz = ppu->bgBuffers[sub].data + win.edges[windex] + kPpuExtraLeftRight;
+    PpuZbufType *dstz = dstbuf->data + win.edges[windex] + kPpuExtraLeftRight;
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31;
     const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
@@ -382,7 +494,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   // through PpuWindows_Calc but degenerates to a single span. An actual
   // window shape (e.g. the level-start iris) keeps the authentic centered
   // HUD for those frames — split + real windows don't compose.
-  int16 ws_bias[6] = { 0, 0, 0, 0, 0, 0 };
+  int16 ws_bias[8] = { 0 };
   if (layer == 2 && y < ppu->wsHudSplitHeight &&
       ppu->extraLeftCur && ppu->extraRightCur &&
       win.nr == 1 && win.bits == 0) {
@@ -396,6 +508,8 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     win.edges[5] = 256 + ppu->extraRightCur;
     ws_bias[0] = ppu->extraLeftCur;
     ws_bias[4] = -(int16)ppu->extraRightCur;
+  } else {
+    PpuApplyMarginGap(ppu, layer, &win, ws_bias);
   }
   y += ppu->vScroll[layer];
   int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
@@ -485,7 +599,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 
 
 // Draw a whole line of a 4bpp background layer into bgBuffers, with mosaic applied
-static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
+                                          PpuPixelPrioBufs *dstbuf, uint y,
+                                          bool sub, uint layer,
+                                          PpuZbufType zhi, PpuZbufType zlo) {
 #define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8
 #define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2 | (bits >> 21) & 4 | (bits >> 28) & 8
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
@@ -509,8 +626,8 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu, uint y, bool sub, uint layer
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int sx = win.edges[windex];
-    PpuZbufType *dstz = ppu->bgBuffers[sub].data + sx + kPpuExtraLeftRight;
-    PpuZbufType *dstz_end = ppu->bgBuffers[sub].data + win.edges[windex + 1] + kPpuExtraLeftRight;
+    PpuZbufType *dstz = dstbuf->data + sx + kPpuExtraLeftRight;
+    PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuExtraLeftRight;
     uint x = sx + ppu->hScroll[layer];
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31, *tp_next = tps[(x >> 8 & 1) ^ 1];
@@ -541,6 +658,61 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu, uint y, bool sub, uint layer
 #undef READ_BITS
 #undef GET_PIXEL
 #undef GET_PIXEL_HFLIP
+}
+
+// Merge one isolated layer into the live priority buffer, padding only that
+// layer's side margins so transparent pixels never duplicate lower layers or
+// sprites. `repeat` selects cyclic continuation; otherwise reflect the edge.
+static void PpuMergePaddedBackground(Ppu *ppu, bool sub,
+                                     const PpuPixelPrioBufs *layerbuf,
+                                     bool repeat) {
+  PpuZbufType *dst = ppu->bgBuffers[sub].data;
+  const PpuZbufType *src = layerbuf->data;
+  for (int x = 0; x < kPpuXPixels; x++) {
+    int i = x + kPpuExtraLeftRight;
+    if (src[i] > dst[i]) dst[i] = src[i];
+  }
+  for (int x = -(int)ppu->extraLeftCur; x < 0; x++) {
+    int di = x + kPpuExtraLeftRight;
+    int sx = repeat ? kPpuXPixels + x : -x;
+    int si = sx + kPpuExtraLeftRight;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+  for (int x = kPpuXPixels;
+       x < kPpuXPixels + (int)ppu->extraRightCur; x++) {
+    int di = x + kPpuExtraLeftRight;
+    int sx = repeat ? x - kPpuXPixels : kPpuXPixels * 2 - 2 - x;
+    int si = sx + kPpuExtraLeftRight;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+}
+
+static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
+                                          uint layer, PpuZbufType zhi,
+                                          PpuZbufType zlo, bool mosaic) {
+  uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
+  bool repeat_band = layer < 4 &&
+      ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
+      y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
+  if (!(padding & (1u << layer)) && !repeat_band) {
+    if (mosaic)
+      PpuDrawBackground_4bpp_mosaic(ppu, &ppu->bgBuffers[sub], y, sub,
+                                    layer, zhi, zlo);
+    else
+      PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, layer,
+                             zhi, zlo);
+    return;
+  }
+
+  PpuPixelPrioBufs layerbuf;
+  ClearBackdrop(&layerbuf);
+  if (mosaic)
+    PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  else
+    PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  PpuMergePaddedBackground(ppu, sub, &layerbuf,
+                           repeat_band ||
+                           (ppu->wsLayerRepeat & (1u << layer)) != 0);
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
@@ -720,15 +892,12 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
 
     bool mosaic_size = PPU_mosaicSize(ppu) > 1;
-    if (mosaic_size && PPU_mosaicEnabled(ppu, 0))
-      PpuDrawBackground_4bpp_mosaic(ppu, y, sub, 0, 0xc000, 0x8000);
-    else
-      PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x8000);
-
-    if (mosaic_size && PPU_mosaicEnabled(ppu, 1))
-      PpuDrawBackground_4bpp_mosaic(ppu, y, sub, 1, 0xb100, 0x7100);
-    else
-      PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
+    PpuDrawBackground_4bpp_policy(
+        ppu, y, sub, 0, 0xc000, 0x8000,
+        mosaic_size && PPU_mosaicEnabled(ppu, 0));
+    PpuDrawBackground_4bpp_policy(
+        ppu, y, sub, 1, 0xb100, 0x7100,
+        mosaic_size && PPU_mosaicEnabled(ppu, 1));
 
     uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
     if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
