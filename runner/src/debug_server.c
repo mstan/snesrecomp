@@ -4143,23 +4143,21 @@ static void cmd_dump_oam(const char *args) {
 static void cmd_screenshot(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
 
-    // Render current PPU state into a temp buffer. PpuBeginDrawing rebinds
-    // ppu->renderBuffer + renderPitch; if we don't restore them, the next
-    // SmwDrawPpuFrame from the main loop renders into scr_pixels instead of
-    // g_my_pixels, and the on-screen window freezes on whatever was in
-    // g_my_pixels at the moment of the first screenshot.
-    static uint8_t scr_pixels[256 * 4 * 240];
+    // Copy the most recently presented PPU buffer. Re-rendering here loses
+    // presentation-only layers (including widescreen coprocessor pixels) and
+    // can observe forced blank after the frame has already been drawn.
+    static uint8_t scr_pixels[kPpuBufWidth * 4 * 240];
     uint8_t *saved_render_buffer = g_ppu->renderBuffer;
     uint32_t saved_render_pitch  = g_ppu->renderPitch;
-    PpuBeginDrawing(g_ppu, scr_pixels, 256 * 4, 0);
-
-    // Run HDMA + scanlines like SmwDrawPpuFrame but without IRQ
-    for (int i = 0; i <= 224; i++)
-        ppu_runLine(g_ppu, i);
-
-    // Restore the main loop's binding so the visible window keeps updating.
-    g_ppu->renderBuffer = saved_render_buffer;
-    g_ppu->renderPitch  = saved_render_pitch;
+    int w = 256 + 2 * g_ppu->extraLeftRight;
+    if (!saved_render_buffer || saved_render_pitch < (uint32_t)w * 4) {
+        send_fmt("{\"error\":\"render buffer unavailable\"}");
+        return;
+    }
+    for (int y = 0; y < 224; y++)
+        memcpy(scr_pixels + (size_t)y * w * 4,
+               saved_render_buffer + (size_t)y * saved_render_pitch,
+               (size_t)w * 4);
 
     // Determine output path
     const char *path = args[0] ? args : "debug_screenshot.bmp";
@@ -4168,7 +4166,7 @@ static void cmd_screenshot(const char *args) {
     FILE *f = fopen(path, "wb");
     if (!f) { send_fmt("{\"error\":\"cannot open file\",\"path\":\"%s\"}", path); return; }
 
-    int w = 256, h = 224;
+    int h = 224;
     int row_bytes = w * 3;
     int pad = (4 - (row_bytes % 4)) % 4;
     int stride = row_bytes + pad;
@@ -4192,10 +4190,10 @@ static void cmd_screenshot(const char *args) {
     fwrite(hdr, 1, 54, f);
 
     // Write pixels (BGRA -> BGR, top to bottom)
-    uint8_t row_buf[256 * 3 + 4];
+    uint8_t row_buf[kPpuBufWidth * 3 + 4];
     memset(row_buf, 0, sizeof(row_buf));
     for (int y = 0; y < h; y++) {
-        const uint8_t *src = scr_pixels + y * 256 * 4;
+        const uint8_t *src = scr_pixels + y * w * 4;
         for (int x = 0; x < w; x++) {
             row_buf[x * 3 + 0] = src[x * 4 + 0]; // B
             row_buf[x * 3 + 1] = src[x * 4 + 1]; // G
@@ -4218,6 +4216,7 @@ static void cmd_get_ppu_state(const char *args) {
              "\"bgTileAdr\":\"0x%04x\","
              "\"hScroll\":[%d,%d,%d,%d],\"vScroll\":[%d,%d,%d,%d],"
              "\"screenEnabled\":[\"0x%02x\",\"0x%02x\"],\"screenWindowed\":[\"0x%02x\",\"0x%02x\"],"
+             "\"windowsel\":\"0x%08x\",\"wbgobjlog\":\"0x%04x\","
              "\"cgadsub\":\"0x%02x\",\"cgwsel\":\"0x%02x\","
              "\"fixedColor\":\"0x%04x\","
              "\"vramPointer\":\"0x%04x\",\"vramIncrement\":%d,\"vramRemapMode\":%d,"
@@ -4231,6 +4230,7 @@ static void cmd_get_ppu_state(const char *args) {
              p->hScroll[0], p->hScroll[1], p->hScroll[2], p->hScroll[3],
              p->vScroll[0], p->vScroll[1], p->vScroll[2], p->vScroll[3],
              p->screenEnabled[0], p->screenEnabled[1], p->screenWindowed[0], p->screenWindowed[1],
+             p->windowsel, p->wbgobjlog,
              p->cgadsub, p->cgwsel,
              p->fixedColor,
              p->vramPointer, p->vramIncrement, p->vramRemapMode,
@@ -4268,6 +4268,23 @@ static void cmd_get_superfx_state(const char *args) {
     }
     SuperFx *f = g_snes->cart->superfx;
     const uint64_t instruction_count = f->instruction_count;
+    unsigned ws_valid_left = 0, ws_valid_right = 0;
+    unsigned ws_colored_left = 0, ws_colored_right = 0;
+    if (f->ws_valid && f->ws_width) {
+        for (unsigned y = 0; y < f->ws_height; y++) {
+            for (unsigned x = 0; x < f->ws_extra; x++) {
+                size_t i = (size_t)y * f->ws_width + x;
+                ws_valid_left += f->ws_valid[i] != 0;
+                ws_colored_left += f->ws_valid[i] && g_ppu->cgram[f->ws_pixels[i]];
+            }
+            for (unsigned x = f->ws_saved_max_x + 1u + f->ws_extra;
+                 x < f->ws_width; x++) {
+                size_t i = (size_t)y * f->ws_width + x;
+                ws_valid_right += f->ws_valid[i] != 0;
+                ws_colored_right += f->ws_valid[i] && g_ppu->cgram[f->ws_pixels[i]];
+            }
+        }
+    }
     char buf[8192];
     int pos = snprintf(buf, sizeof(buf),
         "{\"sfr\":\"0x%04x\",\"pbr\":\"0x%02x\","
@@ -4277,12 +4294,28 @@ static void cmd_get_superfx_state(const char *args) {
         "\"cfgr\":\"0x%02x\",\"clsr\":%u,\"pipeline\":\"0x%02x\","
         "\"ramaddr\":\"0x%04x\",\"romcl\":%u,\"ramcl\":%u,"
         "\"master_clock\":%llu,\"clock_credit\":%lld,"
-        "\"irq_pending\":%s,\"instruction_count\":%llu,\"r\":[",
+        "\"irq_pending\":%s,\"instruction_count\":%llu,"
+        "\"viewport_ram\":[%u,%u,%u,%u,%u,%u],"
+        "\"widescreen\":{\"extra\":%u,\"width\":%u,\"height\":%u,"
+        "\"active\":%s,\"ready\":%s,\"last_task\":\"0x%04x\","
+        "\"valid_left\":%u,\"valid_right\":%u,"
+        "\"colored_left\":%u,\"colored_right\":%u},"
+        "\"r\":[",
         f->sfr, f->pbr, f->rombr, f->rambr, f->cbr, f->scbr, f->scmr,
         f->colr, f->por, f->cfgr, f->clsr, f->pipeline, f->ramaddr,
         f->romcl, f->ramcl, (unsigned long long)f->master_clock,
         (long long)f->clock_credit, f->irq_pending ? "true" : "false",
-        (unsigned long long)instruction_count);
+        (unsigned long long)instruction_count,
+        f->ram[0x34] | (f->ram[0x35] << 8),
+        f->ram[0x36] | (f->ram[0x37] << 8),
+        f->ram[0x38] | (f->ram[0x39] << 8),
+        f->ram[0x3a] | (f->ram[0x3b] << 8),
+        f->ram[0x3c] | (f->ram[0x3d] << 8),
+        f->ram[0x3e] | (f->ram[0x3f] << 8),
+        f->ws_extra, f->ws_width, f->ws_height,
+        f->ws_render_active ? "true" : "false",
+        f->ws_frame_ready ? "true" : "false", f->ws_last_task,
+        ws_valid_left, ws_valid_right, ws_colored_left, ws_colored_right);
     for (int i = 0; i < 16 && pos > 0 && pos < (int)sizeof(buf); i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%04x\"",
                         i ? "," : "", f->r[i].data);

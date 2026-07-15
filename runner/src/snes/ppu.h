@@ -148,6 +148,14 @@ struct Ppu {
   // so a BG3 status bar never tiles into the margins). SMW sets it to the HUD
   // band height so water/level content on BG3 below the bar fills 16:9.
   uint8_t wsBg3WidenY;
+  // Optional bitmask of BG layers allowed to render in the side margins.
+  // Zero preserves the default behavior (BG1/BG2 wide, BG3 policy above).
+  uint8_t wsLayerWidenMask;
+  // Optional native-width Mode 2 layer capture. Stored as layer+1 so zero is
+  // disabled; pixels are palette indices for the most recently drawn frame.
+  uint8_t wsMode2CaptureLayer;
+  uint8_t wsMode2Capture[224][kPpuXPixels];
+  uint8_t wsMode2Bg1Palette[224][kPpuXPixels];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -283,6 +291,21 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
 // level content on BG3 below it (e.g. SMW water) fills 16:9. from_y 0 = off.
 // Like the other widescreen setters, callers re-apply per frame.
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y);
+
+// Restrict side-margin background rendering to the selected BG layer bits.
+// The authentic center and OBJ rendering are unaffected. A zero mask restores
+// the default layer policy.
+void PpuSetWidescreenLayerMask(Ppu *ppu, uint8_t bg_layer_mask);
+
+// Capture one native 256-pixel Mode 2 background layer before it is combined
+// with the other layers. This lets a game frontend synthesize presentation-
+// only margins without evaluating offset-per-tile data outside the real SNES
+// viewport. Pass layer 0 or 1; any other value disables capture.
+void PpuSetMode2LayerCapture(Ppu *ppu, int layer);
+const uint8_t *PpuGetMode2LayerCapture(const Ppu *ppu);
+const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu);
+
+
 
 int PpuGetCurrentRenderScale(Ppu *ppu, uint32_t render_flags);
 

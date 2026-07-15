@@ -10,8 +10,11 @@
 #include "superfx.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+enum { kSuperFxWsMaxExtra = 111, kSuperFxWsMaxWidth = 446 };
 
 enum {
   SFR_Z = 1u << 1, SFR_CY = 1u << 2, SFR_S = 1u << 3,
@@ -183,17 +186,25 @@ static uint8_t color(SuperFx *f, uint8_t s) {
   if (f->por & 8) return (f->colr & 0xf0) | (s & 15);
   return s;
 }
-static void plot(SuperFx *f, uint8_t x, uint8_t y) {
+static bool plot_transparent(const SuperFx *f) {
   if (!(f->por & 1)) {
     if (scmr_md(f) == 3) {
-      if ((f->por & 8) ? !(f->colr & 15) : !f->colr) return;
-    } else if (!(f->colr & 15)) return;
+      if ((f->por & 8) ? !(f->colr & 15) : !f->colr) return true;
+    } else if (!(f->colr & 15)) return true;
   }
+  return false;
+}
+
+static uint8_t plot_color(const SuperFx *f, uint16_t x, uint8_t y) {
   uint8_t c = f->colr;
   if ((f->por & 2) && scmr_md(f) != 3) {
     if ((x ^ y) & 1) c >>= 4;
     c &= 15;
   }
+  return c;
+}
+
+static void plot_native(SuperFx *f, uint8_t x, uint8_t y, uint8_t c) {
   uint16_t off = (uint16_t)((y << 5) + (x >> 3));
   if (off != f->pixel[0].offset) {
     flush_pixel(f, &f->pixel[1]);
@@ -209,6 +220,26 @@ static void plot(SuperFx *f, uint8_t x, uint8_t y) {
     f->pixel[1] = f->pixel[0];
     f->pixel[0].bitpend = 0;
   }
+}
+
+static void plot(SuperFx *f, uint16_t x, uint8_t y) {
+  if (plot_transparent(f)) return;
+
+  if (f->ws_replay_mode) {
+    const unsigned native_width = (unsigned)f->ws_saved_max_x + 1u;
+    const unsigned capture_base = (native_width - f->ws_extra) / 2u;
+    int logical_x = f->ws_replay_side == 1
+                        ? (int)x - (int)capture_base - f->ws_extra
+                        : (int)x - (int)capture_base + (int)native_width;
+    uint8_t c = plot_color(f, (uint16_t)logical_x, y);
+    /* Capture is decoded from the completed planar framebuffer after STOP.
+     * PLOT events are intermediate state: later polygons may overwrite them,
+     * and the game can read pixels while constructing the final image. */
+    plot_native(f, (uint8_t)x, y, c);
+    return;
+  }
+
+  plot_native(f, (uint8_t)x, y, plot_color(f, x, y));
 }
 static uint8_t rpix(SuperFx *f, uint8_t x, uint8_t y) {
   flush_pixel(f, &f->pixel[1]); flush_pixel(f, &f->pixel[0]);
@@ -229,6 +260,10 @@ static void set_sz(SuperFx *f, uint16_t v) {
 static void instruction(SuperFx *f, uint8_t op) {
   unsigned n = op & 15, a = alt(f);
   if (op == 0x00) {
+    if (f->ws_render_active) {
+      f->ws_render_active = false;
+      f->ws_replay_pending = true;
+    }
     if (!(f->cfgr & 0x80)) { f->sfr |= SFR_IRQ; f->irq_pending = true; }
     f->sfr &= (uint16_t)~SFR_G; f->pipeline = 1; reset_prefix(f); return;
   }
@@ -256,7 +291,7 @@ static void instruction(SuperFx *f, uint8_t op) {
   if (op == 0x3e) { f->sfr=(f->sfr&~SFR_B)|SFR_ALT2; return; }
   if (op == 0x3f) { f->sfr=(f->sfr&~SFR_B)|SFR_ALT1|SFR_ALT2; return; }
   if (op >= 0x40 && op <= 0x4b) { f->ramaddr=rv(f,n); uint16_t v=read_ram_buffer(f,f->ramaddr); if(!(f->sfr&SFR_ALT1)) v|=(uint16_t)read_ram_buffer(f,f->ramaddr^1)<<8; wd(f,v); reset_prefix(f); return; }
-  if (op == 0x4c) { if(!(f->sfr&SFR_ALT1)){ plot(f,(uint8_t)rv(f,1),(uint8_t)rv(f,2)); wr(f,1,rv(f,1)+1); } else { wd(f,rpix(f,(uint8_t)rv(f,1),(uint8_t)rv(f,2))); set_sz(f,rv(f,f->dreg)); } reset_prefix(f); return; }
+  if (op == 0x4c) { if(!(f->sfr&SFR_ALT1)){ plot(f,rv(f,1),(uint8_t)rv(f,2)); wr(f,1,rv(f,1)+1); } else { wd(f,rpix(f,(uint8_t)rv(f,1),(uint8_t)rv(f,2))); set_sz(f,rv(f,f->dreg)); } reset_prefix(f); return; }
   if (op == 0x4d) { wd(f,(sr(f)>>8)|(sr(f)<<8)); set_sz(f,rv(f,f->dreg)); reset_prefix(f); return; }
   if (op == 0x4e) { if(!(f->sfr&SFR_ALT1)) f->colr=color(f,(uint8_t)sr(f)); else f->por=(uint8_t)sr(f)&0x1f; reset_prefix(f); return; }
   if (op == 0x4f) { wd(f,~sr(f)); set_sz(f,rv(f,f->dreg)); reset_prefix(f); return; }
@@ -301,16 +336,122 @@ static void run_one(SuperFx *f) {
   if(f->r[15].modified) f->r[15].modified=false; else wr(f,15,rv(f,15)+1), f->r[15].modified=false;
 }
 
+static bool render_widescreen_pass(SuperFx *f, uint8_t side) {
+  SuperFx clone;
+  uint8_t *work_ram = (uint8_t *)malloc(f->ram_size);
+  if (!work_ram) return false;
+
+  memcpy(&clone, f->ws_task_state, sizeof(clone));
+  memcpy(work_ram, f->ws_task_ram, f->ram_size);
+  clone.ram = work_ram;
+  clone.ws_pixels = f->ws_pixels;
+  clone.ws_valid = f->ws_valid;
+  clone.ws_width = f->ws_width;
+  clone.ws_height = f->ws_height;
+  clone.ws_extra = f->ws_extra;
+  clone.ws_saved_center_x = f->ws_saved_center_x;
+  clone.ws_saved_max_x = f->ws_saved_max_x;
+  clone.ws_render_active = false;
+  clone.ws_replay_pending = false;
+  clone.ws_replay_mode = true;
+  clone.ws_replay_side = side;
+
+  /* Render each new side inside a full hardware-sized LLE viewport. Keep the
+   * capture strip in the middle of that viewport: placing it against x=0 or
+   * maxX makes the game's polygon clipper reshape an object precisely as it
+   * crosses the native/widescreen seam. */
+  const int native_width = (int)f->ws_saved_max_x + 1;
+  const int capture_base = (native_width - f->ws_extra) / 2;
+  int center = side == 1
+                   ? (int)f->ws_saved_center_x + f->ws_extra + capture_base
+                   : (int)f->ws_saved_center_x - native_width + capture_base;
+  clone.ram[f->ws_center_ram] = (uint8_t)center;
+  clone.ram[f->ws_center_ram + 1] = (uint8_t)((uint16_t)center >> 8);
+  /* Keep the game's authentic clipping maximum. Reducing max X to the side
+   * capture width changes polygon clipping itself, so an object deforms as it
+   * crosses the native/extended seam. The shifted projection center places
+   * the desired side frustum in x=0..extra-1; the host capture below simply
+   * ignores the remaining pixels from this full-width replay. */
+  clone.ram[f->ws_max_ram] = (uint8_t)f->ws_saved_max_x;
+  clone.ram[f->ws_max_ram + 1] = (uint8_t)(f->ws_saved_max_x >> 8);
+
+  unsigned guard = 0;
+  while ((clone.sfr & SFR_G) && guard++ < 20000000)
+    run_one(&clone);
+  bool complete = !(clone.sfr & SFR_G);
+  if (!complete)
+    fprintf(stderr, "[superfx] widescreen side %u replay exceeded guard\n",
+            side);
+
+  if (complete) {
+    /* Materialize the final two cached slivers, then decode the exact planar
+     * framebuffer that the cloned LLE task produced. Pixel zero is
+     * transparent to the PPU; palette selection is supplied later by BG1's
+     * tilemap rather than guessed from transient COLR writes. */
+    flush_pixel(&clone, &clone.pixel[1]);
+    flush_pixel(&clone, &clone.pixel[0]);
+    for (unsigned side_x = 0; side_x < f->ws_extra; side_x++) {
+      const uint8_t x = (uint8_t)(capture_base + side_x);
+      const unsigned host_x = side == 1
+                                  ? side_x
+                                  : (unsigned)native_width + f->ws_extra +
+                                        side_x;
+      for (unsigned y = 0; y < f->ws_height; y++) {
+        const uint32_t a = pixel_address(&clone, x, (uint8_t)y);
+        const unsigned bit_index = (x & 7) ^ 7;
+        uint8_t pixel = 0;
+        for (unsigned n = 0; n < bpp(&clone); n++) {
+          const uint32_t plane = ((n >> 1) << 4) + (n & 1);
+          pixel |= ((gsu_read(&clone, a + plane) >> bit_index) & 1) << n;
+        }
+        if (pixel && host_x < f->ws_width) {
+          f->ws_pixels[(size_t)y * f->ws_width + host_x] = pixel;
+          f->ws_valid[(size_t)y * f->ws_width + host_x] = 1;
+        }
+      }
+    }
+  }
+  free(work_ram);
+  return complete;
+}
+
+static void render_widescreen_sides(SuperFx *f) {
+  f->ws_replay_pending = false;
+  memset(f->ws_pixels, 0, (size_t)kSuperFxWsMaxWidth * 192);
+  memset(f->ws_valid, 0, (size_t)kSuperFxWsMaxWidth * 192);
+  bool left = render_widescreen_pass(f, 1);
+  bool right = render_widescreen_pass(f, 2);
+  f->ws_pending_ready = left && right;
+}
+
 SuperFx *superfx_create(uint8_t *rom, uint32_t rom_size, uint8_t *ram, uint32_t ram_size) {
   SuperFx *f=(SuperFx*)calloc(1,sizeof(*f)); if(!f) return NULL;
   f->rom=rom; f->rom_size=rom_size; f->rom_mask=rom_size-1;
   f->ram=ram; f->ram_size=ram_size; f->ram_mask=ram_size-1;
   superfx_reset(f); return f;
 }
-void superfx_destroy(SuperFx *f) { free(f); }
+void superfx_destroy(SuperFx *f) {
+  if (!f) return;
+  free(f->ws_pixels);
+  free(f->ws_valid);
+  free(f->ws_present_pixels);
+  free(f->ws_present_valid);
+  free(f->ws_task_state);
+  free(f->ws_task_ram);
+  free(f);
+}
 void superfx_reset(SuperFx *f) {
   uint8_t *rom=f->rom,*ram=f->ram; uint32_t rs=f->rom_size,rm=f->ram_size;
+  uint8_t *ws_pixels=f->ws_pixels,*ws_valid=f->ws_valid;
+  uint8_t *ws_present_pixels=f->ws_present_pixels;
+  uint8_t *ws_present_valid=f->ws_present_valid;
+  void *ws_task_state=f->ws_task_state; uint8_t *ws_task_ram=f->ws_task_ram;
+  uint8_t ws_extra=f->ws_extra;
   memset(f,0,sizeof(*f)); f->rom=rom;f->rom_size=rs;f->rom_mask=rs-1;f->ram=ram;f->ram_size=rm;f->ram_mask=rm-1;
+  f->ws_pixels=ws_pixels;f->ws_valid=ws_valid;f->ws_task_state=ws_task_state;
+  f->ws_present_pixels=ws_present_pixels;
+  f->ws_present_valid=ws_present_valid;
+  f->ws_task_ram=ws_task_ram;f->ws_extra=ws_extra;
   f->vcr=4; f->pipeline=1; f->pixel[0].offset=f->pixel[1].offset=UINT16_MAX;
 }
 void superfx_sync(SuperFx *f, uint64_t master) {
@@ -318,7 +459,11 @@ void superfx_sync(SuperFx *f, uint64_t master) {
   if(master < f->master_clock){ f->master_clock=master; f->clock_credit=0; return; }
   f->clock_credit += (int64_t)(master-f->master_clock); f->master_clock=master;
   /* Six clocks is the longest idle quantum and the normal uncached access. */
-  unsigned guard=0; while(f->clock_credit>=6 && guard++<2000000) run_one(f);
+  unsigned guard=0; while(f->clock_credit>=6 && guard++<2000000) {
+    run_one(f);
+    if (f->ws_replay_pending)
+      render_widescreen_sides(f);
+  }
 }
 
 uint8_t superfx_cpu_read_io(SuperFx *f, uint16_t a) {
@@ -336,7 +481,31 @@ uint8_t superfx_cpu_read_io(SuperFx *f, uint16_t a) {
 void superfx_cpu_write_io(SuperFx *f, uint16_t a, uint8_t v) {
   a=0x3000|(a&0x3ff);
   if(a>=0x3100){write_cache(f,a-0x3100,v);return;}
-  if(a<=0x301f){unsigned n=(a>>1)&15;uint16_t q=rv(f,n);wr(f,n,(a&1)?((q&255)|(v<<8)):((q&0xff00)|v));if(n==14)update_rom_buffer(f);if(a==0x301f)f->sfr|=SFR_G;return;}
+  if(a<=0x301f){unsigned n=(a>>1)&15;uint16_t q=rv(f,n);wr(f,n,(a&1)?((q&255)|(v<<8)):((q&0xff00)|v));if(n==14)update_rom_buffer(f);if(a==0x301f){
+    f->ws_last_task=rv(f,15);
+    f->sfr|=SFR_G;
+    /* Snapshot the configured rendering task so presentation-only side
+     * passes can replay it after the authoritative native pass. */
+    if(f->ws_extra && f->pbr==f->ws_task_pbr &&
+       rv(f,15)==f->ws_task_address && f->ws_pixels &&
+       f->ws_task_state && f->ws_task_ram){
+      f->ws_saved_center_x=f->ram[f->ws_center_ram]|
+          ((uint16_t)f->ram[f->ws_center_ram+1]<<8);
+      f->ws_saved_max_x=f->ram[f->ws_max_ram]|
+          ((uint16_t)f->ram[f->ws_max_ram+1]<<8);
+      unsigned base_width=(unsigned)f->ws_saved_max_x+1;
+      unsigned width=base_width+2u*f->ws_extra;
+      if(width<=kSuperFxWsMaxWidth &&
+         f->ws_saved_center_x<=f->ws_saved_max_x){
+        f->ws_width=(uint16_t)width;
+        memcpy(f->ws_task_state,f,sizeof(*f));
+        memcpy(f->ws_task_ram,f->ram,f->ram_size);
+        /* Keep presenting the last completed side frame while this native
+         * task and its replays are in flight. */
+        f->ws_render_active=true;
+      }
+    }
+  }return;}
   switch(a){
     case 0x3030:{bool g=f->sfr&SFR_G;f->sfr=(f->sfr&0xff00)|v;if(g&&!(f->sfr&SFR_G)){f->cbr=0;flush_cache(f);}}break;
     case 0x3031:f->sfr=(f->sfr&0x00ff)|((uint16_t)v<<8);break;
@@ -352,3 +521,70 @@ uint8_t superfx_cpu_read_rom(SuperFx *f,uint32_t a,uint8_t open){
 }
 uint8_t superfx_cpu_read_ram(SuperFx *f,uint32_t a,uint8_t open){return ((f->sfr&SFR_G)&&scmr_ran(f))?open:f->ram[a&f->ram_mask];}
 void superfx_cpu_write_ram(SuperFx *f,uint32_t a,uint8_t v){f->ram[a&f->ram_mask]=v;}
+
+void superfx_set_widescreen(SuperFx *f, uint8_t extra, uint8_t task_pbr,
+                            uint16_t task_address, uint16_t center_x_ram,
+                            uint16_t max_x_ram, uint8_t height) {
+  if (!f) return;
+  if (extra > kSuperFxWsMaxExtra) extra = kSuperFxWsMaxExtra;
+  /* The architectural framebuffer persists until the game replaces it, so
+   * its presentation-only side replays must persist as well. Clearing this
+   * on every host frame made objects disappear whenever RenderObjects did
+   * not finish a fresh task between two adjacent PPU draws. */
+  if (!extra || extra != f->ws_extra) {
+    f->ws_frame_ready = false;
+    f->ws_pending_ready = false;
+  }
+  f->ws_extra = extra;
+  f->ws_task_pbr = task_pbr;
+  f->ws_task_address = task_address;
+  f->ws_center_ram = center_x_ram;
+  f->ws_max_ram = max_x_ram;
+  f->ws_height = height > 192 ? 192 : height;
+  if (extra && !f->ws_pixels) {
+    f->ws_pixels =
+        (uint8_t *)calloc((size_t)kSuperFxWsMaxWidth * 192, 1);
+    f->ws_valid =
+        (uint8_t *)calloc((size_t)kSuperFxWsMaxWidth * 192, 1);
+    f->ws_present_pixels =
+        (uint8_t *)calloc((size_t)kSuperFxWsMaxWidth * 192, 1);
+    f->ws_present_valid =
+        (uint8_t *)calloc((size_t)kSuperFxWsMaxWidth * 192, 1);
+    f->ws_task_state = calloc(1, sizeof(*f));
+    f->ws_task_ram = (uint8_t *)malloc(f->ram_size);
+    if (!f->ws_pixels || !f->ws_valid || !f->ws_present_pixels ||
+        !f->ws_present_valid || !f->ws_task_state || !f->ws_task_ram) {
+      free(f->ws_pixels); free(f->ws_valid);
+      free(f->ws_present_pixels); free(f->ws_present_valid);
+      free(f->ws_task_state); free(f->ws_task_ram);
+      f->ws_pixels = f->ws_valid = NULL;
+      f->ws_present_pixels = f->ws_present_valid = NULL;
+      f->ws_task_state = NULL; f->ws_task_ram = NULL;
+      f->ws_extra = 0;
+    }
+  }
+}
+
+bool superfx_get_widescreen_frame(const SuperFx *f, const uint8_t **pixels,
+                                  const uint8_t **valid, unsigned *width,
+                                  unsigned *height) {
+  if (!f || !f->ws_frame_ready || !f->ws_present_pixels ||
+      !f->ws_present_valid) return false;
+  if (pixels) *pixels = f->ws_present_pixels;
+  if (valid) *valid = f->ws_present_valid;
+  if (width) *width = f->ws_width;
+  if (height) *height = f->ws_height;
+  return true;
+}
+
+void superfx_latch_widescreen_frame(SuperFx *f) {
+  if (!f || !f->ws_pending_ready) return;
+  uint8_t *pixels = f->ws_present_pixels;
+  uint8_t *valid = f->ws_present_valid;
+  f->ws_present_pixels = f->ws_pixels;
+  f->ws_present_valid = f->ws_valid;
+  f->ws_pixels = pixels;
+  f->ws_valid = valid;
+  f->ws_pending_ready = false;
+  f->ws_frame_ready = true;
+}

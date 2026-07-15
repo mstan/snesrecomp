@@ -103,6 +103,22 @@ void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
 }
 
+void PpuSetWidescreenLayerMask(Ppu *ppu, uint8_t bg_layer_mask) {
+  ppu->wsLayerWidenMask = bg_layer_mask & 0x0f;
+}
+
+void PpuSetMode2LayerCapture(Ppu *ppu, int layer) {
+  ppu->wsMode2CaptureLayer = layer >= 0 && layer < 2 ? (uint8_t)(layer + 1) : 0;
+}
+
+const uint8_t *PpuGetMode2LayerCapture(const Ppu *ppu) {
+  return ppu->wsMode2CaptureLayer ? &ppu->wsMode2Capture[0][0] : NULL;
+}
+
+const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu) {
+  return &ppu->wsMode2Bg1Palette[0][0];
+}
+
 bool ppu_checkOverscan(Ppu* ppu) {
   // called at (0,225)
   ppu->frameOverscan = PPU_overscan(ppu); // set if we have a overscan-frame
@@ -188,6 +204,9 @@ typedef struct PpuWindows {
 // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
 // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
 static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
+  if (layer < 4 && ppu->wsLayerWidenMask &&
+      !(ppu->wsLayerWidenMask & (1u << layer)))
+    return 0;
   if (layer != 2)
     return extra;
   return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
@@ -211,20 +230,24 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   win->edges[1] = window_right;
   uint i, j;
   int t;
-  bool w1_ena = (winflags & kWindow1Enabled) && ppu->window1left <= ppu->window1right;
+  int w1left = ppu->window1left;
+  int w1right = ppu->window1right;
+  int w2left = ppu->window2left;
+  int w2right = ppu->window2right;
+  bool w1_ena = (winflags & kWindow1Enabled) && w1left <= w1right;
   if (w1_ena) {
-    if (ppu->window1left > win->edges[0]) {
-      win->edges[nr] = ppu->window1left;
+    if (w1left > win->edges[0]) {
+      win->edges[nr] = w1left;
       win->edges[++nr] = window_right;
     }
-    if (ppu->window1right + 1 < window_right) {
-      win->edges[nr] = ppu->window1right + 1;
+    if (w1right + 1 < window_right) {
+      win->edges[nr] = w1right + 1;
       win->edges[++nr] = window_right;
     }
   }
-  bool w2_ena = (winflags & kWindow2Enabled) && ppu->window2left <= ppu->window2right;
+  bool w2_ena = (winflags & kWindow2Enabled) && w2left <= w2right;
   if (w2_ena) {
-    for (i = 0; i <= nr && (t = ppu->window2left) != win->edges[i]; i++) {
+    for (i = 0; i <= nr && (t = w2left) != win->edges[i]; i++) {
       if (t < win->edges[i]) {
         for (j = nr++; j >= i; j--)
           win->edges[j + 1] = win->edges[j];
@@ -232,7 +255,7 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
         break;
       }
     }
-    for (; i <= nr && (t = ppu->window2right + 1) != win->edges[i]; i++) {
+    for (; i <= nr && (t = w2right + 1) != win->edges[i]; i++) {
       if (t < win->edges[i]) {
         for (j = nr++; j >= i; j--)
           win->edges[j + 1] = win->edges[j];
@@ -245,15 +268,15 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   // get a bitmap of how regions map to windows
   uint8 w1_bits = 0, w2_bits = 0;
   if (w1_ena) {
-    for (i = 0; win->edges[i] != ppu->window1left; i++);
-    for (j = i; win->edges[j] != ppu->window1right + 1; j++);
+    for (i = 0; win->edges[i] != w1left; i++);
+    for (j = i; win->edges[j] != w1right + 1; j++);
     w1_bits = ((1 << (j - i)) - 1) << i;
   }
   if ((winflags & (kWindow1Enabled | kWindow1Inversed)) == (kWindow1Enabled | kWindow1Inversed))
     w1_bits = ~w1_bits;
   if (w2_ena) {
-    for (i = 0; win->edges[i] != ppu->window2left; i++);
-    for (j = i; win->edges[j] != ppu->window2right + 1; j++);
+    for (i = 0; win->edges[i] != w2left; i++);
+    for (j = i; win->edges[j] != w2right + 1; j++);
     w2_bits = ((1 << (j - i)) - 1) << i;
   }
   if ((winflags & (kWindow2Enabled | kWindow2Inversed)) == (kWindow2Enabled | kWindow2Inversed))
@@ -435,6 +458,73 @@ static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
   return ppu->vram[addr & 0x7fff];
 }
 
+/* Capture a native-width Mode 1 4bpp layer independently of the compositor.
+ * Star Fox temporarily changes its 3D scene from Mode 2 to Mode 1 for flashes
+ * and scripted effects while retaining the same landscape and GSU surface.
+ * The normal wide renderer is intentionally allowed to evaluate tiles beyond
+ * the SNES viewport, but those columns are not reliable source material for
+ * presentation synthesis, so retain only the authentic x=0..255 result. */
+static void PpuCaptureBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer) {
+  uint8_t *capture = NULL;
+  uint8_t *bg1_palette = NULL;
+  if (!sub && ppu->wsMode2CaptureLayer == layer + 1 && y > 0 && y <= 224) {
+    capture = ppu->wsMode2Capture[y - 1];
+    memset(capture, 0, kPpuXPixels);
+  }
+  if (!sub && ppu->wsMode2CaptureLayer && layer == 0 && y > 0 && y <= 224) {
+    bg1_palette = ppu->wsMode2Bg1Palette[y - 1];
+    memset(bg1_palette, 0, kPpuXPixels);
+  }
+  if ((!capture && !bg1_palette) || !IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer)
+      ? PpuWindows_Calc(&win, ppu, layer, y)
+      : PpuWindows_Clear(&win, ppu, layer, y);
+
+  const bool big = PPU_bigTiles(ppu, layer) != 0;
+  const unsigned tile_shift = big ? 4 : 3;
+  const unsigned tile_mask = (1u << tile_shift) - 1u;
+  const unsigned coord_mask = big ? 0x3ffu : 0x1ffu;
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const unsigned sy = (ppu->vScroll[layer] + y) & coord_mask;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = IntMax(win.edges[windex], 0);
+    const int right = IntMin(win.edges[windex + 1], kPpuXPixels);
+    for (int screen_x = left; screen_x < right; screen_x++) {
+      const unsigned sx =
+          (ppu->hScroll[layer] + (unsigned)screen_x) & coord_mask;
+      uint16 tile = PpuReadTilemapEntry(
+          ppu, layer, sx >> tile_shift, sy >> tile_shift);
+      unsigned px = sx & tile_mask;
+      unsigned py = sy & tile_mask;
+      if (tile & 0x4000) px = tile_mask - px;
+      if (tile & 0x8000) py = tile_mask - py;
+      unsigned character = tile & 0x3ff;
+      if (big)
+        character =
+            (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned addr =
+          (tileadr + character * 16 + (py & 7)) & 0x7fff;
+      const uint16 p01 = ppu->vram[addr];
+      const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+      const unsigned bit = 7 - (px & 7);
+      const unsigned pixel =
+          ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
+          (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3);
+      const uint8_t palette_base = (uint8_t)((tile & 0x1c00) >> 6);
+      if (capture && pixel)
+        capture[screen_x] = palette_base + (uint8_t)pixel;
+      if (bg1_palette)
+        bg1_palette[screen_x] = palette_base;
+    }
+  }
+}
+
 /* Modes 2/4/6 use BG3's tilemap as per-column scroll overrides for the
  * displayed layers.  Mode 2 (the Star Fox attract/game perspective screens)
  * has separate horizontal and vertical rows: BG3VOFS-1 selects the horizontal
@@ -442,6 +532,16 @@ static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
  * The first visible tile column cannot be offset on hardware. */
 static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
                                       PpuZbufType zhi, PpuZbufType zlo) {
+  uint8_t *capture = NULL;
+  uint8_t *bg1_palette = NULL;
+  if (!sub && ppu->wsMode2CaptureLayer == layer + 1 && y > 0 && y <= 224) {
+    capture = ppu->wsMode2Capture[y - 1];
+    memset(capture, 0, kPpuXPixels);
+  }
+  if (!sub && ppu->wsMode2CaptureLayer && layer == 0 && y > 0 && y <= 224) {
+    bg1_palette = ppu->wsMode2Bg1Palette[y - 1];
+    memset(bg1_palette, 0, kPpuXPixels);
+  }
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;
 
@@ -528,8 +628,15 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
             (((p23 >> bit) & 1) << 2) |
             (((p23 >> (bit + 8)) & 1) << 3);
         const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
-        if (pixel && z > *dstz)
-          *dstz = z + ((tile & 0x1c00) >> 6) + pixel;
+        const uint8_t palette_pixel =
+            pixel ? (uint8_t)(((tile & 0x1c00) >> 6) + pixel) : 0;
+        const int capture_x = screen_x + (int)i;
+        if (capture && capture_x >= 0 && capture_x < kPpuXPixels)
+          capture[capture_x] = palette_pixel;
+        if (bg1_palette && capture_x >= 0 && capture_x < kPpuXPixels)
+          bg1_palette[capture_x] = (uint8_t)((tile & 0x1c00) >> 6);
+        if (palette_pixel && z > *dstz)
+          *dstz = z + palette_pixel;
       }
       screen_x += width;
     }
@@ -897,6 +1004,11 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   if (PPU_mode(ppu) == 1) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
+
+    if (ppu->wsMode2CaptureLayer) {
+      PpuCaptureBackground_4bpp(ppu, y, sub, 0);
+      PpuCaptureBackground_4bpp(ppu, y, sub, 1);
+    }
 
     bool mosaic_size = PPU_mosaicSize(ppu) > 1;
     if (mosaic_size && PPU_mosaicEnabled(ppu, 0))
