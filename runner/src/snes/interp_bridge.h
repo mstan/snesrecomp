@@ -32,6 +32,15 @@
 #include <stdio.h>
 #include "cpu_state.h"
 
+/* Optional game policy invoked immediately before one interpreted opcode.
+ * The bridge compares the live PC first, so ordinary interpreted instructions
+ * pay only the address check. At a match it synchronizes registers into
+ * CpuState, invokes the callback, then copies any changes back. NULL disables
+ * it. */
+typedef void (*InterpPreOpcodeHook)(CpuState *cpu, uint32_t pc24);
+void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
+                                       InterpPreOpcodeHook hook);
+
 /*
  * Run the interpreter over guest code at entry_pc24, in the context of `cpu`.
  * `cpu` is updated in place. Returns:

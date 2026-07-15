@@ -60,7 +60,8 @@ def _config_digest(parsed) -> str:
 def _analysis_input_digest(*, rom: bytes, generator_digest: str,
                            config_digest: str, additional_roots,
                            enable_hle: bool, max_insns: int,
-                           max_nodes: int) -> str:
+                           max_nodes: int, shard_threshold_bytes: int,
+                           shard_pc_span: int) -> str:
     value = {
         "format": CACHE_FORMAT_VERSION,
         "rom": hashlib.sha256(rom).hexdigest(),
@@ -72,6 +73,7 @@ def _analysis_input_digest(*, rom: bytes, generator_digest: str,
         "hle": bool(enable_hle),
         "max_insns": int(max_insns),
         "max_nodes": int(max_nodes),
+        "sharding": [int(shard_threshold_bytes), int(shard_pc_span)],
     }
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":")).encode()
@@ -125,7 +127,19 @@ def main() -> int:
     parser.add_argument("--no-hle", action="store_true")
     parser.add_argument("--max-insns", type=int, default=4096)
     parser.add_argument("--max-nodes", type=int, default=100_000)
+    parser.add_argument(
+        "--bank-shard-threshold-kib", type=int, default=4096,
+        help="shard generated banks at or above this source size into "
+             "stable translation units (default: 4096 KiB; 0 shards every "
+             "non-empty bank)")
+    parser.add_argument(
+        "--bank-shard-pc-span", type=lambda value: int(value, 0),
+        default=0x0800,
+        help="entry-PC range per bank translation unit (default: 0x800; "
+             "0 disables sharding)")
     args = parser.parse_args()
+    shard_threshold_bytes = max(0, args.bank_shard_threshold_kib) * 1024
+    shard_pc_span = max(0, args.bank_shard_pc_span)
 
     started = time.perf_counter()
     cfg_dir = pathlib.Path(args.cfg_dir).resolve()
@@ -163,6 +177,8 @@ def main() -> int:
         enable_hle=not args.no_hle,
         max_insns=args.max_insns,
         max_nodes=args.max_nodes,
+        shard_threshold_bytes=shard_threshold_bytes,
+        shard_pc_span=shard_pc_span,
     )
     cached = _verified_cached_stats(out_dir, analysis_input_digest)
     if cached is not None:
@@ -196,6 +212,8 @@ def main() -> int:
             for key, pair in manifest.exit_modes.items()
         },
         enable_hle=not args.no_hle,
+        shard_threshold_bytes=shard_threshold_bytes,
+        shard_pc_span=shard_pc_span,
     )
     elapsed = time.perf_counter() - started
     print(

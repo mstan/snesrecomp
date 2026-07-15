@@ -35,9 +35,10 @@ from .decoder import (
 )
 from .emit_bank import BankEntry, emit_bank
 from .program_analysis import NodeDisposition, ProgramManifest, VariantKey
+from .translation_units import write_bank_translation_units
 
 
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 _HOST_CALL_RE = re.compile(r"\b([A-Za-z_]\w*(?:_M[01]X[01])?)\s*\(")
 _SUFFIX_RE = re.compile(r"^(.*)_M([01])X([01])$")
 _HOST_RUNTIME_DISPATCH_RE = re.compile(
@@ -402,7 +403,8 @@ def _stable_hash(value) -> str:
 def _bank_cache_key(bank: int, manifest: ProgramManifest,
                     generator_digest: str, config_digest: str,
                     helpers: Mapping, inline_args: Mapping,
-                    enable_hle: bool, host_alias_entries: Mapping) -> str:
+                    enable_hle: bool, host_alias_entries: Mapping,
+                    shard_threshold_bytes: int, shard_pc_span: int) -> str:
     nodes = [
         (key.manifest_key, node.digest, node.disposition.value)
         for key, node in sorted(manifest.nodes.items())
@@ -428,6 +430,7 @@ def _bank_cache_key(bank: int, manifest: ProgramManifest,
             if ((pc24 >> 16) & 0xFF) == bank
         ),
         "hle": bool(enable_hle),
+        "sharding": [int(shard_threshold_bytes), int(shard_pc_span)],
     })
 
 
@@ -438,7 +441,9 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                  analysis_input_digest: str,
                  callee_exit_mx: Mapping | None = None,
                  callee_exit_mx_modes: Mapping | None = None,
-                 enable_hle: bool = True) -> EmissionResult:
+                 enable_hle: bool = True,
+                 shard_threshold_bytes: int = 4 * 1024 * 1024,
+                 shard_pc_span: int = 0x0800) -> EmissionResult:
     entries_by_bank, emitted, name_for_pc, cfg_by_bank = build_emission_entries(
         manifest, parsed, enable_hle=enable_hle)
     all_banks = sorted(set(cfg_by_bank) | set(entries_by_bank))
@@ -456,6 +461,7 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
     except (OSError, ValueError):
         old_cache = {}
     old_bank_keys = old_cache.get("banks", {})
+    old_bank_outputs = old_cache.get("bank_outputs", {})
     old_output_hashes = old_cache.get("outputs", {})
 
     workspace = AtomicOutputDir(pathlib.Path(out_dir))
@@ -464,6 +470,8 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
     emitted_banks = 0
     reused_banks = 0
     new_bank_keys = {}
+    new_bank_outputs = {}
+    planned_bank_outputs = set()
     try:
         clear_decode_cache()
         set_decode_cache_enabled(True)
@@ -482,16 +490,20 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
             cache_key = _bank_cache_key(
                 bank, manifest, generator_digest, config_digest,
                 dispatch_helpers, inline_arg_map, enable_hle,
-                host_alias_entries)
+                host_alias_entries, shard_threshold_bytes, shard_pc_span)
             new_bank_keys[f"{bank:02X}"] = cache_key
-            path = staging / f"bank{bank:02x}_v2.c"
-            expected_output_hash = old_output_hashes.get(path.name)
-            reusable_output = bool(
-                expected_output_hash and path.is_file()
-                and hashlib.sha256(path.read_bytes()).hexdigest()
-                == expected_output_hash)
+            previous_names = old_bank_outputs.get(f"{bank:02X}", ())
+            reusable_output = bool(previous_names) and all(
+                old_output_hashes.get(name)
+                and (staging / name).is_file()
+                and hashlib.sha256((staging / name).read_bytes()).hexdigest()
+                    == old_output_hashes[name]
+                for name in previous_names)
             if (old_bank_keys.get(f"{bank:02X}") == cache_key
                     and reusable_output):
+                names = tuple(sorted(previous_names))
+                new_bank_outputs[f"{bank:02X}"] = list(names)
+                planned_bank_outputs.update(names)
                 reused_banks += 1
                 continue
 
@@ -541,11 +553,28 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                     if cfg is not None else None),
                 host_alias_entries=host_alias_entries,
             )
-            write_if_changed(path, source)
+            symbol_pcs = {
+                (entry.name or
+                 f"bank_{bank:02X}_{entry.start & 0xFFFF:04X}"):
+                    entry.start & 0xFFFF
+                for entry in entries_by_bank.get(bank, ())
+            }
+            symbol_pcs.update({
+                name: pc24 & 0xFFFF
+                for name, (pc24, _modes, _interrupt)
+                in host_alias_entries.items()
+                if ((pc24 >> 16) & 0xFF) == bank
+            })
+            names, _changes = write_bank_translation_units(
+                staging, bank, symbol_pcs, source,
+                threshold_bytes=max(0, int(shard_threshold_bytes)),
+                pc_span=max(0, int(shard_pc_span)))
+            new_bank_outputs[f"{bank:02X}"] = list(names)
+            planned_bank_outputs.update(names)
             emitted_banks += 1
 
         planned = {
-            *(f"bank{bank:02x}_v2.c" for bank in all_banks),
+            *planned_bank_outputs,
             "dispatch_v2.c",
             "unresolved_stubs_v2.c",
         }
@@ -581,6 +610,7 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
             "config_digest": config_digest,
             "analysis_input_digest": analysis_input_digest,
             "banks": new_bank_keys,
+            "bank_outputs": new_bank_outputs,
             "outputs": output_hashes,
             "stats": {
                 "roots": len(manifest.roots),

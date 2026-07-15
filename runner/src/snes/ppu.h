@@ -156,9 +156,21 @@ struct Ppu {
   uint8_t wsMode2CaptureLayer;
   uint8_t wsMode2Capture[224][kPpuXPixels];
   uint8_t wsMode2Bg1Palette[224][kPpuXPixels];
+  // Per-layer widescreen policies. Bit L refers to BG(L+1), layer 0..3.
+  // Clamp keeps a layer in the authentic 256 columns. Mirror/repeat render
+  // the authentic scanline in isolation and use it to fill the side margins.
+  uint8_t wsLayerClamp, wsLayerMirror, wsLayerRepeat;
+  // Optional scanline bands: clamp or cyclically repeat only [y0,y1).
+  uint8_t wsClampY0[4], wsClampY1[4];
+  uint8_t wsRepeatY0[4], wsRepeatY1[4];
+  // Skip offscreen staging columns before sampling a layer's side margins.
+  uint8_t wsMarginGapL[4], wsMarginGapR[4];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
+  // Active kPpuRenderFlags_* set by PpuBeginDrawing. Kept outside the stable
+  // snapshot region because it is host rendering policy, not emulated state.
+  uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
   uint32_t renderPitch;
@@ -305,7 +317,28 @@ void PpuSetMode2LayerCapture(Ppu *ppu, int layer);
 const uint8_t *PpuGetMode2LayerCapture(const Ppu *ppu);
 const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu);
 
+// Per-layer widescreen clamp: bit L keeps BG(L+1) in the authentic 256
+// columns while other layers extend into the margins. Re-apply per frame.
+void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
 
+// Fill Mode-1 4bpp BG1/BG2 margins by reflecting or cyclically repeating the
+// authentic rendered scanline. Rendering remains layer-, priority-, window-,
+// and color-math-correct. Repeat wins if both bits are set. Re-apply per frame.
+void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
+void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
+
+// Apply clamp or cyclic-repeat only on scanlines [y0,y1). y1<=y0 disables.
+// Repeat bands currently apply to the Mode-1 4bpp BG1/BG2 path.
+void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                    uint8_t y1);
+void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                     uint8_t y1);
+
+// Skip left_px/right_px offscreen tilemap pixels before sampling the margins
+// of BG(layer+1). This hides UI staging columns that hardware never displays.
+// Applies to non-mosaic 4bpp/2bpp paths. Re-apply per frame.
+void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
+                                    uint8_t right_px);
 
 int PpuGetCurrentRenderScale(Ppu *ppu, uint32_t render_flags);
 
