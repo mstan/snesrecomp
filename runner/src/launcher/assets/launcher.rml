@@ -83,7 +83,10 @@ button:hover { background-color: #222b3b; border-color: #7c3aed; }
 .ddsel:hover { border-color: #7c3aed; }
 .ddsel selectvalue { padding: 9dp 12dp; color: #e6e9ef; }
 .ddsel selectarrow { width: 24dp; background-color: #1c2433; border-left: 1dp #2b3446;
-	border-radius: 0dp 6dp 6dp 0dp; }
+	/* RmlUi briefly gives this internal element a negative content height
+	 * during select-box setup. A radius here produces invalid border geometry
+	 * before the final layout, so let the parent select own the rounded edge. */
+	border-radius: 0dp; }
 .ddsel selectbox { background-color: #161d28; border: 1dp #2b3446; border-radius: 7dp;
 	margin-top: 2dp; padding: 2dp 0dp; }
 .ddsel selectbox option { padding: 8dp 12dp; color: #e6e9ef; }
@@ -167,6 +170,7 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 .modal-confirm:hover { background-color: #8b5cf6; }
 .modal-confirm:focus { background-color: #8b5cf6; border-color: #a78bfa; }
 </style>
+<link type="text/rcss" href="theme.rcss"/>
 </head>
 
 <body id="root" data-model="launcher">

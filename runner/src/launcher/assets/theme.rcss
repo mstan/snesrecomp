@@ -1,0 +1,5 @@
+/* Optional per-game launcher theme.
+ *
+ * Game projects may stage their own theme.rcss after the shared launcher
+ * assets. Keeping this default file empty preserves the standard snesrecomp
+ * appearance for projects that do not provide a skin. */
