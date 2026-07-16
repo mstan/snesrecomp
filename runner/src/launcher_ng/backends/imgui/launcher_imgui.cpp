@@ -396,10 +396,13 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     // from the space actually left after the metadata + button, so the art is
     // as large as it can be WITHOUT pushing the last row out of the card.
     {
-        const float reserve = px(228.0f);   // state line + 4 meta rows + button + pad
+        // Reserve space for everything under the art: verified line + 2 meta rows
+        // + Change ROM, plus the SAVES block when this game has battery SRAM.
+        float reserve = px(198.0f);
+        if (m->saves_supported) reserve += px(96.0f);    // compact SAVES row below Change ROM
         float art_h = ImGui::GetContentRegionAvail().y - reserve;
-        if (art_h > px(300.0f)) art_h = px(300.0f);
-        if (art_h < px(140.0f)) art_h = px(140.0f);
+        if (art_h > px(280.0f)) art_h = px(280.0f);
+        if (art_h < px(132.0f)) art_h = px(132.0f);
         hero_boxart_centered(g_boxart, art_h / g_scale, availw);
     }
     ImGui::Dummy(ImVec2(0, px(10)));
@@ -418,31 +421,45 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     }
     ImGui::Dummy(ImVec2(0, px(10)));
 
-    // Metadata: what a PLAYER needs to know. Raw CRC32/SHA-256 digests are
-    // developer noise — the question a user has is "is my ROM good?", so the
-    // real fingerprint check is surfaced as one PASS/FAIL row.
-    if (ImGui::BeginTable("meta", 3, ImGuiTableFlags_SizingStretchProp)) {
+    // Metadata a PLAYER cares about — just Region + File. The "is my ROM good?"
+    // question is answered by the ROM-verified line above; raw size and CRC/SHA
+    // digests are developer noise, so they're not shown.
+    if (ImGui::BeginTable("meta", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(76));
         ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(22));
         kv_row("Region", m->region[0] ? m->region : "SNES", th, false, false);
         kv_row("File",   m->rom_file, th, false, false);
-        kv_row("Size",   m->rom_size, th, false, false);
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-        ImGui::TextUnformatted("Checksum");
-        ImGui::PopStyleColor();
-        ImGui::TableNextColumn();
-        ImGui::TextColored(verified ? col(th.good) : col(th.warn), "%s", verified ? "PASS" : "FAIL");
-        ImGui::TableNextColumn();
-        state_mark(verified, th);
         ImGui::EndTable();
     }
     ImGui::Dummy(ImVec2(0, px(12)));
     if (ImGui::Button("Change ROM", ImVec2(availw, px(34))))
         if (launcher_pick_rom(g_pick_buf, sizeof(g_pick_buf)))
             launcher_model_set_rom(m, g_pick_buf);
+
+    // SAVES lives in the GAME card as a compact row (no separate card / eyebrow).
+    // Present only for games with battery SRAM — data-driven, never by name.
+    if (m->saves_supported) {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::PushStyleColor(ImGuiCol_Separator, col(th.border));
+        ImGui::Separator();
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, px(6)));
+        const char* sp = m->sram_path ? m->sram_path : "";
+        const char* base = sp;
+        for (const char* q = sp; *q; ++q) if (*q == '/' || *q == '\\') base = q + 1;
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Saves");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(px(76));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(base[0] ? base : "(none yet)");
+        const float bw = px(84);
+        ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw*2 - px(th.spacing_sm));
+        ImGui::Button("Import", ImVec2(bw, px(30)));
+        ImGui::SameLine(0, px(th.spacing_sm));
+        ImGui::Button("Clear", ImVec2(bw, px(30)));
+    }
     end_panel();
 }
 
@@ -521,68 +538,6 @@ void draw_controllers_row(LauncherModel* m, const LauncherTheme& th) {
     }
 }
 
-// SAVES module — only exists for games with battery SRAM. MMX is a password
-// game (sram_path == NULL) so this module is absent entirely; Zelda/SMW get it.
-// Availability is data-driven off the game's C-ABI struct, never a game name.
-void draw_saves_panel(LauncherModel* m, const LauncherTheme& th) {
-    if (!begin_panel("saves", 0)) { end_panel(); return; }
-    eyebrow("SAVES");
-    const char* p = m->sram_path ? m->sram_path : "";
-    // basename for display
-    const char* base = p;
-    for (const char* q = p; *q; ++q) if (*q == '/' || *q == '\\') base = q + 1;
-    // Single compact row: file + the two actions, all on one line so the module
-    // stays short enough to stack under CONTROLLERS without clipping.
-    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("File");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(px(76));
-    ImGui::TextUnformatted(base[0] ? base : "(none yet)");
-    const float bw = px(96);
-    ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw*2 - px(th.spacing_sm));
-    ImGui::Button("Import", ImVec2(bw, px(30)));
-    ImGui::SameLine(0, px(th.spacing_sm));
-    ImGui::Button("Clear", ImVec2(bw, px(30)));
-    end_panel();
-}
-
-// MSU-1 module — only for games that ship/support an MSU-1 pack (SMW, Zelda).
-// Enable toggle + music-folder picker + the game's note about which patch.
-void draw_msu1_panel(LauncherModel* m, const LauncherTheme& th) {
-    if (!begin_panel("msu1", 0)) { end_panel(); return; }
-    eyebrow("MSU-1 AUDIO");
-    bool on = m->s.msu1_enabled != 0;
-    if (ImGui::Checkbox("Enable CD-quality music", &on))
-        launcher_model_toggle_msu1(m);
-
-    ImGui::Dummy(ImVec2(0, px(4)));
-    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("Folder");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(px(76));
-    const char* dir = m->s.msu1_dir[0] ? m->s.msu1_dir : "(not set)";
-    const float bw = px(90);
-    float avail = ImGui::GetContentRegionAvail().x - bw - px(th.spacing_sm);
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail);
-    ImGui::TextUnformatted(dir);
-    ImGui::PopTextWrapPos();
-    ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw);
-    if (ImGui::Button("Browse", ImVec2(bw, px(30)))) {
-        char buf[512];
-        if (launcher_pick_folder("Select MSU-1 music folder", buf, sizeof(buf)))
-            launcher_model_set_msu1_dir(m, buf);
-    }
-    if (m->msu1_note && m->msu1_note[0]) {
-        ImGui::Dummy(ImVec2(0, px(4)));
-        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-        ImGui::TextWrapped("%s", m->msu1_note);
-        ImGui::PopStyleColor();
-    }
-    end_panel();
-}
-
 // The dashboard COMPOSES whichever modules this game supports — it does not
 // hardcode a fixed set. GAME is always present; the side column stacks
 // CONTROLLERS plus any optional modules (SAVES only when the game has SRAM).
@@ -597,24 +552,15 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
 
         ImGui::SameLine(0, gap);
         begin_container("dash_r", ImVec2(0, 0), ImGuiChildFlags_None);
-            // One self-contained card per player (1 card for a 1P game, two
-            // side-by-side for a 2P game), then any optional modules.
+            // One self-contained card per player. SAVES now lives in the GAME
+            // card and MSU-1 in Settings > Audio, so the side column is just
+            // the controller card(s).
             draw_controllers_row(m, th);
-            if (m->saves_supported) {          // module: opt-in per game
-                ImGui::Dummy(ImVec2(0, px(th.spacing_md)));
-                draw_saves_panel(m, th);
-            }
-            if (m->msu1_supported) {
-                ImGui::Dummy(ImVec2(0, px(th.spacing_md)));
-                draw_msu1_panel(m, th);
-            }
         end_container();
     } else {
         draw_game_panel(m, th);
         ImGui::Spacing();
         draw_controllers_row(m, th);
-        if (m->saves_supported) { ImGui::Spacing(); draw_saves_panel(m, th); }
-        if (m->msu1_supported)  { ImGui::Spacing(); draw_msu1_panel(m, th); }
     }
 }
 
@@ -652,6 +598,52 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
         row_label("Volume", th);
         int dv = 0; stepper("vol", m->s.volume, "%", &dv);
         if (dv) launcher_model_volume_delta(m, dv);
+
+        // MSU-1 joins the Audio card (only for games that support a pack). The
+        // per-patch note is a hover tooltip, not always-on body text.
+        if (m->msu1_supported) {
+            ImGui::Dummy(ImVec2(0, px(8)));
+            ImGui::PushStyleColor(ImGuiCol_Separator, col(th.border));
+            ImGui::Separator();
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0, px(8)));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(col(th.text_muted), "MSU-1 music");
+            if (m->msu1_note && m->msu1_note[0]) {
+                ImGui::SameLine(0, px(6));
+                ImGui::TextColored(col(th.accent), "(?)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(px(360));
+                    ImGui::TextUnformatted(m->msu1_note);
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+            }
+            ImGui::Dummy(ImVec2(0, px(4)));
+            bool on = m->s.msu1_enabled != 0;
+            if (ImGui::Checkbox("Enable CD-quality music", &on))
+                launcher_model_toggle_msu1(m);
+            ImGui::Dummy(ImVec2(0, px(4)));
+            ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Folder");
+            ImGui::PopStyleColor();
+            ImGui::SameLine(px(76));
+            const char* dir = m->s.msu1_dir[0] ? m->s.msu1_dir : "(not set)";
+            const float bw = px(88);
+            float avail = ImGui::GetContentRegionAvail().x - bw - px(th.spacing_sm);
+            if (avail < px(60)) avail = px(60);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail);
+            ImGui::TextUnformatted(dir);
+            ImGui::PopTextWrapPos();
+            ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw);
+            if (ImGui::Button("Browse", ImVec2(bw, px(30)))) {
+                char buf[512];
+                if (launcher_pick_folder("Select MSU-1 music folder", buf, sizeof(buf)))
+                    launcher_model_set_msu1_dir(m, buf);
+            }
+        }
     } end_panel();
     end_container();
 
