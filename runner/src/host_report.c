@@ -24,6 +24,14 @@
  *     is resolved dynamically so no game build config needs new libs.
  */
 
+/* dl_iterate_phdr() and struct dl_phdr_info are glibc GNU extensions guarded by
+ * _GNU_SOURCE; newer glibc (GCC 13+) no longer leaks them without it, so the
+ * Linux module-list path fails to compile unless we ask for the GNU API here,
+ * before any system header pulls in <features.h>. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE 1
+#endif
+
 #include "host_report.h"
 
 #include <stdarg.h>
