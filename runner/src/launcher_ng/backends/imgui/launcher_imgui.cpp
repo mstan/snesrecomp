@@ -249,7 +249,15 @@ void eyebrow(const char* s) { eyebrow_tracked(s); }
 bool begin_panel(const char* id, float logical_w = 0.0f, bool fill_h = false) {
     ImGuiChildFlags flags = ImGuiChildFlags_Borders;
     if (!fill_h) flags |= ImGuiChildFlags_AutoResizeY;
-    return ImGui::BeginChild(id, ImVec2(px(logical_w), 0.0f), flags);
+    // NavFlattened: the card is a visual grouping, not a separate nav scope —
+    // flatten so gamepad/keyboard focus reaches the card's controls directly
+    // (a card left un-flattened becomes an un-enterable nav island). NoScrollbar:
+    // cards never scroll (the body container owns scrolling); sizing keeps
+    // content in-bounds, so suppress the stray scrollbar a tight fit would draw.
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NavFlattened |
+                              ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse;
+    return ImGui::BeginChild(id, ImVec2(px(logical_w), 0.0f), flags, wflags);
 }
 void end_panel() { ImGui::EndChild(); }
 
@@ -595,7 +603,9 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
     // grows taller than DISPLAY and forces the view to scroll).
     const float gap  = px(th.spacing_md);
     const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
-    const float row_h = px(176.0f);
+    // Both cards share this height so the row is balanced; sized to fit the
+    // taller card (AUDIO, which carries the MSU-1 line) with no scrollbar.
+    const float row_h = px(198.0f);
 
     begin_container("set_l", ImVec2(half, row_h));
     if (begin_panel("disp", 0, true)) {
