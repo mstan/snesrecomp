@@ -78,7 +78,9 @@ To keep new games consistent and free of leftover game-specific naming:
 - `recompiler/` — Python code that decodes 65816 ROM bytes,
   reconstructs control flow, and emits C.
 - `runner/` — C runtime that the generated code links against (CPU
-  state, memory mapping, debug server, always-on trace rings).
+  state, memory mapping, PPU/APU/DSP, debug server, always-on trace rings).
+  Its PPU can also export arbitrary BG/OBJ rectangles for independent host
+  composition; see [`docs/HOST_OVERLAY_EXTRACTION.md`](docs/HOST_OVERLAY_EXTRACTION.md).
 - `tests/` — framework tests (decoder, CFG, SSA placement, etc.) and
   L3 fixtures.
 - `fuzz/` — differential fuzzer over synthetic 65816 snippets.
