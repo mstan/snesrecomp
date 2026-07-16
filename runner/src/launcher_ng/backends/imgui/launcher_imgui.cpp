@@ -16,12 +16,23 @@
 #include "launcher_files.h"
 #include "launcher_debug.h"
 
-#include "imgui.h"
-#include "imgui_impl_sdl3.h"
-#include "imgui_impl_opengl3.h"
+#include "launcher_sdlcompat.h"   // pulls the right SDL header + event shim
 
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_opengl.h>   // glViewport/glClear/glClearColor (GL 1.1)
+#include "imgui.h"
+#if defined(LNG_SDL3)
+  #include "imgui_impl_sdl3.h"
+  #define LNG_ImplSDL_InitForOpenGL  ImGui_ImplSDL3_InitForOpenGL
+  #define LNG_ImplSDL_NewFrame       ImGui_ImplSDL3_NewFrame
+  #define LNG_ImplSDL_ProcessEvent   ImGui_ImplSDL3_ProcessEvent
+  #define LNG_ImplSDL_Shutdown       ImGui_ImplSDL3_Shutdown
+#else
+  #include "imgui_impl_sdl2.h"
+  #define LNG_ImplSDL_InitForOpenGL  ImGui_ImplSDL2_InitForOpenGL
+  #define LNG_ImplSDL_NewFrame       ImGui_ImplSDL2_NewFrame
+  #define LNG_ImplSDL_ProcessEvent   ImGui_ImplSDL2_ProcessEvent
+  #define LNG_ImplSDL_Shutdown       ImGui_ImplSDL2_Shutdown
+#endif
+#include "imgui_impl_opengl3.h"
 
 #include <string>
 
@@ -40,9 +51,7 @@ ImTextureID tid(const LauncherTexture& t) { return (ImTextureID)(intptr_t)t.id; 
 LauncherPad g_pads[LNG_MAX_PADS];   // live gamepad list (repolled every frame)
 int         g_pad_count = 0;
 
-SDL_Window* g_window = nullptr;      // for parenting the native file dialog
 char        g_pick_buf[512] = {};    // ROM picker result
-bool        g_pick_done = false;
 
 // ---- DPI: rebuild fonts + re-derive style from an unscaled baseline ----------
 void apply_scale(const LauncherTheme& th, float scale, const char* font_path) {
@@ -207,7 +216,8 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
         else                { ImGui::TextColored(col(th.warn), "No ROM loaded"); }
         ImGui::Spacing();
         if (ImGui::Button("Change ROM..."))   // native OS picker (Win/mac/Linux)
-            launcher_pick_rom(g_window, g_pick_buf, sizeof(g_pick_buf), &g_pick_done);
+            if (launcher_pick_rom(g_pick_buf, sizeof(g_pick_buf)))
+                launcher_model_set_rom(m, g_pick_buf);
     ImGui::EndGroup();
     // ...then the ROM details across the panel's full width.
     ImGui::Spacing();
@@ -470,12 +480,12 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
 bool try_capture(LauncherModel* m, const SDL_Event& ev) {
     if (!m->capturing) return false;
     if (ev.type == SDL_EVENT_KEY_DOWN) {
-        if (ev.key.key == SDLK_ESCAPE) { launcher_model_cancel_capture(m); return true; }
-        launcher_model_accept_capture(m, SDL_GetKeyName(ev.key.key));
+        if (LNG_EVKEY(ev) == SDLK_ESCAPE) { launcher_model_cancel_capture(m); return true; }
+        launcher_model_accept_capture(m, SDL_GetKeyName(LNG_EVKEY(ev)));
         return true;
     }
     if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-        const char* n = SDL_GetGamepadStringForButton((SDL_GamepadButton)ev.gbutton.button);
+        const char* n = SDL_GetGamepadStringForButton((LNG_GamepadButton)LNG_EVGBTN(ev));
         launcher_model_accept_capture(m, n ? n : "Pad");
         return true;
     }
@@ -500,10 +510,9 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
     io.IniFilename = nullptr;
 
     g_th = th;
-    ImGui_ImplSDL3_InitForOpenGL(p->window, p->gl);
+    LNG_ImplSDL_InitForOpenGL(p->window, p->gl);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    g_window = p->window;
     g_boxart = launcher_texture_load(asset("assets/img/boxart.tga").c_str());
     // snes_pad.tga is 24-bit (no alpha) with a flat backdrop baked in -> key it
     // out so the pad art sits transparently on the panel.
@@ -525,7 +534,7 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
             if (ev.type == SDL_EVENT_QUIT) p->should_quit = true;
             if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) p->should_quit = true;
             if (try_capture(m, ev)) continue;
-            ImGui_ImplSDL3_ProcessEvent(&ev);
+            LNG_ImplSDL_ProcessEvent(&ev);
         }
 
         launcher_platform_refresh_metrics(p);
@@ -539,14 +548,8 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
         // DualSense powered on after launch) appear without a relaunch.
         g_pad_count = launcher_input_poll(g_pads, LNG_MAX_PADS);
 
-        // The native ROM picker fires its callback during event pumping.
-        if (g_pick_done) {
-            g_pick_done = false;
-            launcher_model_set_rom(m, g_pick_buf);
-        }
-
         ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
+        LNG_ImplSDL_NewFrame();
         ImGui::NewFrame();
         draw_ui(m, *th, p->logical_w, p->logical_h);
         ImGui::Render();
@@ -564,7 +567,7 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
     launcher_texture_free(&g_pad);
     launcher_texture_free(&g_brand);
     ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
+    LNG_ImplSDL_Shutdown();
     ImGui::DestroyContext();
 
     if (p->should_quit && m->action == LNG_ACTION_NONE) m->action = LNG_ACTION_QUIT;

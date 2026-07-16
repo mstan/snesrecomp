@@ -11,7 +11,16 @@
 #ifndef LAUNCHER_NG_PLATFORM_H
 #define LAUNCHER_NG_PLATFORM_H
 
-#include <SDL3/SDL.h>
+// One switch selects the windowing backend for the whole launcher. SDL2 is the
+// shipping default (it matches the game runtime, so the launcher links
+// in-process with no migration); SDL3 is the follow-up that adds Wayland
+// fractional scaling. Everything above this header is identical either way.
+#if defined(LNG_SDL3)
+  #include <SDL3/SDL.h>
+#else
+  #include <SDL.h>
+#endif
+
 #include <stdbool.h>
 
 #ifdef __cplusplus

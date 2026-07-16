@@ -1,9 +1,7 @@
 // launcher_debug.c — LNG_SCRIPT interpreter + framebuffer capture.
 
 #include "launcher_debug.h"
-
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_opengl.h>
+#include "launcher_sdlcompat.h"   // SDL2/SDL3 event-symbol shim + GL header
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "third_party/stb_image_write.h"
@@ -83,13 +81,21 @@ static void synth_click(LauncherPlatform* p, float x, float y) {
     e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
     e.button.windowID = SDL_GetWindowID(p->window);
     e.button.button = SDL_BUTTON_LEFT;
-    e.button.down = true;
     e.button.clicks = 1;
     e.button.x = x; e.button.y = y;
+#if defined(LNG_SDL3)
+    e.button.down = true;
+#else
+    e.button.state = SDL_PRESSED;
+#endif
     SDL_PushEvent(&e);
 
     e.type = SDL_EVENT_MOUSE_BUTTON_UP;
+#if defined(LNG_SDL3)
     e.button.down = false;
+#else
+    e.button.state = SDL_RELEASED;
+#endif
     SDL_PushEvent(&e);
 }
 
@@ -97,11 +103,20 @@ static void synth_key(SDL_Keycode key) {
     SDL_Event e;
     SDL_zero(e);
     e.type = SDL_EVENT_KEY_DOWN;
+#if defined(LNG_SDL3)
     e.key.key = key;
     e.key.down = true;
+#else
+    e.key.keysym.sym = key;
+    e.key.state = SDL_PRESSED;
+#endif
     SDL_PushEvent(&e);
     e.type = SDL_EVENT_KEY_UP;
+#if defined(LNG_SDL3)
     e.key.down = false;
+#else
+    e.key.state = SDL_RELEASED;
+#endif
     SDL_PushEvent(&e);
 }
 

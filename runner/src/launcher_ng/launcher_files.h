@@ -1,29 +1,29 @@
-// launcher_files.h — platform-agnostic ROM picker + game handoff (shared core).
+// launcher_files.h — platform-agnostic ROM picker (shared core).
 //
-// Uses SDL3's native dialog + process APIs, so a single implementation gets the
-// real OS file picker on Windows (IFileDialog), macOS (NSOpenPanel) and Linux
-// (xdg-desktop-portal, with a Zenity fallback) — no per-platform code, no extra
-// dependency. This is the game-agnostic version every recomp reuses.
+// Uses tinyfiledialogs (zlib) so ONE implementation gets a real native picker
+// on Windows (GetOpenFileName), macOS (NSOpenPanel/osascript) and Linux
+// (zenity / kdialog / yad / qarma). This replaces the old launcher's
+// pick_file(), which was a Win32-only implementation with a
+// `return false;` stub on every other platform — i.e. "Change ROM" silently did
+// nothing on Linux and macOS.
+//
+// Deliberately SDL-version agnostic: it does not depend on SDL3's
+// SDL_ShowOpenFileDialog, so it works identically on the SDL2 build we ship now
+// and the SDL3 build that follows.
 
 #ifndef LAUNCHER_NG_FILES_H
 #define LAUNCHER_NG_FILES_H
 
-#include <SDL3/SDL.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Opens the OS "choose a ROM" dialog (non-blocking; the callback fires on the
-// main thread during event pumping). `parent` may be NULL.
-// On success, `out_path` (cap `out_cap`) is filled and `*done` set true.
-void launcher_pick_rom(SDL_Window* parent, char* out_path, size_t out_cap, bool* done);
-
-// Launch the real game executable, handing it the chosen ROM. Returns true if
-// the process was spawned. `exe_path` is the game binary; `rom_path` may be
-// NULL (the game then resolves its ROM as usual).
-bool launcher_launch_game(const char* exe_path, const char* rom_path);
+// Open the OS "choose a ROM" dialog (BLOCKING — returns when the user picks or
+// cancels). Returns true and fills `out_path` on success.
+bool launcher_pick_rom(char* out_path, size_t out_cap);
 
 #ifdef __cplusplus
 }

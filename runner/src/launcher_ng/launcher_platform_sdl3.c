@@ -9,6 +9,7 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
     if (!p) return false;
     SDL_zerop(p);
 
+    SDL_SetMainReady();   // we built with SDL_MAIN_HANDLED (real main() is entry)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[launcher] SDL_Init failed: %s\n", SDL_GetError());
         return false;

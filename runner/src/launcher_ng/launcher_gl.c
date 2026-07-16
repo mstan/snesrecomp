@@ -2,7 +2,7 @@
 
 #include "launcher_gl.h"
 
-#include <SDL3/SDL_opengl.h>   // GL types + glGenTextures/glTexImage2D (GL 1.1)
+#include "launcher_sdlcompat.h"   // GL header for the active SDL version
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F   // GL 1.2 token; runtime driver supports it

@@ -1,56 +1,28 @@
-// launcher_files.c — SDL3 native file dialog + process handoff.
+// launcher_files.c — native ROM picker via tinyfiledialogs (zlib).
 
 #include "launcher_files.h"
+
+#include "third_party/tinyfiledialogs.h"
 
 #include <stdio.h>
 #include <string.h>
 
-typedef struct {
-    char*  out;
-    size_t cap;
-    bool*  done;
-} PickCtx;
+bool launcher_pick_rom(char* out_path, size_t out_cap) {
+    if (!out_path || out_cap == 0) return false;
+    out_path[0] = '\0';
 
-static PickCtx g_pick;   // one dialog at a time is plenty for a launcher
+    static const char* kPatterns[] = { "*.sfc", "*.smc", "*.fig", "*.swc" };
 
-static void SDLCALL pick_cb(void* userdata, const char* const* filelist, int filter) {
-    (void)userdata; (void)filter;
-    if (!filelist) {                       // error
-        fprintf(stderr, "[launcher] file dialog error: %s\n", SDL_GetError());
-        return;
-    }
-    if (!filelist[0]) return;              // user cancelled
-    if (g_pick.out && g_pick.cap) {
-        snprintf(g_pick.out, g_pick.cap, "%s", filelist[0]);
-        if (g_pick.done) *g_pick.done = true;
-    }
-}
+    // tinyfd returns a pointer to its own static buffer, or NULL on cancel.
+    const char* sel = tinyfd_openFileDialog(
+        "Select SNES ROM",
+        "",                                    // default path/file
+        (int)(sizeof(kPatterns) / sizeof(kPatterns[0])),
+        kPatterns,
+        "SNES ROM (.sfc .smc .fig .swc)",
+        0);                                    // single select
+    if (!sel || !sel[0]) return false;
 
-void launcher_pick_rom(SDL_Window* parent, char* out_path, size_t out_cap, bool* done) {
-    static const SDL_DialogFileFilter filters[] = {
-        { "SNES ROM", "sfc;smc;fig;swc" },
-        { "All files", "*" },
-    };
-    g_pick.out = out_path; g_pick.cap = out_cap; g_pick.done = done;
-    SDL_ShowOpenFileDialog(pick_cb, NULL, parent, filters, SDL_arraysize(filters),
-                           NULL, false);
-}
-
-bool launcher_launch_game(const char* exe_path, const char* rom_path) {
-    if (!exe_path || !exe_path[0]) return false;
-
-    const char* argv[4];
-    int n = 0;
-    argv[n++] = exe_path;
-    if (rom_path && rom_path[0]) argv[n++] = rom_path;
-    argv[n] = NULL;
-
-    SDL_Process* proc = SDL_CreateProcess(argv, false);
-    if (!proc) {
-        fprintf(stderr, "[launcher] failed to launch %s: %s\n", exe_path, SDL_GetError());
-        return false;
-    }
-    // Detach: the launcher exits and the game keeps running.
-    SDL_DestroyProcess(proc);
+    snprintf(out_path, out_cap, "%s", sel);
     return true;
 }

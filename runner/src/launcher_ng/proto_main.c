@@ -7,7 +7,6 @@
 // snes_launcher_run_window() implemented once in the engine.
 
 #include "launcher_backend.h"
-#include "launcher_files.h"
 #include "launcher_model.h"
 #include "launcher_platform.h"
 #include "launcher_theme.h"
@@ -60,25 +59,14 @@ int main(int argc, char** argv) {
     LngAction act = launcher_backend_run(&plat, &model, &theme);
     launcher_platform_close(&plat);
 
+    // In production this is the value snes_launcher_run_window() returns to
+    // main.c, which then boots the game IN-PROCESS with the committed settings
+    // (0=LAUNCH, 1=QUIT). The standalone prototype just reports it.
     if (act == LNG_ACTION_LAUNCH) {
         launcher_model_commit(&model, &s);
         printf("[proto] LAUNCH  scale=%s filter=%d freq=%d skip=%d rom=%s\n",
                launcher_model_scale_label(&model), s.linear_filter,
                s.audio_freq, s.skip_launcher, launcher_model_rom_path(&model));
-
-        // In production this returns LAUNCH to main.c, which boots the game in
-        // this same process. The standalone prototype has no game linked in, so
-        // it hands off by spawning the real recomp exe -- proving the whole
-        // pick-a-ROM -> configure -> play flow end to end. Override the target
-        // with LNG_GAME_EXE.
-        const char* exe = SDL_getenv("LNG_GAME_EXE");
-        if (!exe || !exe[0])
-            exe = "F:/Projects/snesrecomp/MegamanXRecomp/build/bin-x64-Production/mmx.exe";
-        const char* rom = launcher_model_rom_path(&model);
-        if (launcher_launch_game(exe, rom && rom[0] ? rom : NULL))
-            printf("[proto] handed off to %s\n", exe);
-        else
-            printf("[proto] no game exe at %s (set LNG_GAME_EXE)\n", exe);
     } else {
         printf("[proto] QUIT\n");
     }
