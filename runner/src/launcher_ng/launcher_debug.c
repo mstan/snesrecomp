@@ -100,14 +100,21 @@ static void synth_click(LauncherPlatform* p, float x, float y) {
 }
 
 static void synth_key(SDL_Keycode key) {
+    SDL_Scancode sc = SDL_GetScancodeFromKey(key
+#if defined(LNG_SDL3)
+        , NULL
+#endif
+        );
     SDL_Event e;
     SDL_zero(e);
     e.type = SDL_EVENT_KEY_DOWN;
 #if defined(LNG_SDL3)
     e.key.key = key;
+    e.key.scancode = sc;
     e.key.down = true;
 #else
     e.key.keysym.sym = key;
+    e.key.keysym.scancode = sc;
     e.key.state = SDL_PRESSED;
 #endif
     SDL_PushEvent(&e);
@@ -144,6 +151,10 @@ void launcher_debug_step(LauncherPlatform* p, LauncherModel* m) {
         else if (strcmp(v, "controller") == 0) launcher_model_set_view(m, LNG_VIEW_CONTROLLER);
     } else if (strncmp(c, "player:", 7) == 0) {
         m->cfg_player = atoi(c + 7) ? 1 : 0;
+    } else if (strncmp(c, "capbtn:", 7) == 0) {
+        launcher_model_begin_capture(m, (LngButton)atoi(c + 7));   // rebind a player button
+    } else if (strncmp(c, "caphk:", 6) == 0) {
+        launcher_model_begin_hk_capture(m, (LngHotkey)atoi(c + 6)); // rebind a hotkey
     } else if (strncmp(c, "size:", 5) == 0) {
         int w = 0, h = 0;
         if (sscanf(c + 5, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
@@ -155,6 +166,11 @@ void launcher_debug_step(LauncherPlatform* p, LauncherModel* m) {
         if (sscanf(c + 6, "%f,%f", &x, &y) == 2) synth_click(p, x, y);
     } else if (strncmp(c, "key:", 4) == 0) {
         if (strcmp(c + 4, "escape") == 0) synth_key(SDLK_ESCAPE);
+        else {
+            SDL_Keycode k = SDL_GetKeyFromName(c + 4);
+            if (k != SDLK_UNKNOWN) synth_key(k);
+            else fprintf(stderr, "[dbg] unknown key: %s\n", c + 4);
+        }
     } else if (strncmp(c, "wait:", 5) == 0) {
         g_wait_frames = atoi(c + 5);
     } else if (strncmp(c, "shot:", 5) == 0) {

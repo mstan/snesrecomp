@@ -15,6 +15,7 @@
 #include "launcher_input.h"
 #include "launcher_files.h"
 #include "launcher_debug.h"
+#include "launcher_binds.h"
 
 #include "launcher_sdlcompat.h"   // pulls the right SDL header + event shim
 
@@ -586,8 +587,14 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
                 ImGui::PushID(h);
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextColored(col(th.text_muted), "%-13s", launcher_hotkey_name((LngHotkey)h));
-                ImGui::SameLine(px(120));
-                ImGui::Button(m->hotkeys[h], ImVec2(px(130), 0));  // display-only in prototype
+                ImGui::SameLine(px(130));
+                const bool cap = m->hk_capturing && m->capture_hk == (LngHotkey)h;
+                const char* lbl = cap ? "[ press... ]"
+                                : m->hotkeys[h][0] ? m->hotkeys[h] : "(unbound)";
+                if (cap) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
+                if (ImGui::Button(lbl, ImVec2(px(130), 0)))
+                    launcher_model_begin_hk_capture(m, (LngHotkey)h);
+                if (cap) ImGui::PopStyleColor();
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -651,7 +658,7 @@ void draw_controller(LauncherModel* m, const LauncherTheme& th) {
             ImGui::EndTable();
         }
         ImGui::Spacing();
-        if (ImGui::Button("Reset to Defaults")) launcher_model_reset_binds(m);
+        if (ImGui::Button("Reset to Defaults")) launcher_binds_reset_player(m, m->cfg_player + 1);
         if (m->capturing) ImGui::TextColored(col(th.warn), "Listening... (Esc cancels)");
     } end_panel();
 }
@@ -779,19 +786,33 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
     (void)logical_h;
 }
 
+bool is_modifier_scancode(SDL_Scancode sc) {
+    return sc == SDL_SCANCODE_LCTRL || sc == SDL_SCANCODE_RCTRL ||
+           sc == SDL_SCANCODE_LALT  || sc == SDL_SCANCODE_RALT  ||
+           sc == SDL_SCANCODE_LSHIFT|| sc == SDL_SCANCODE_RSHIFT ||
+           sc == SDL_SCANCODE_LGUI  || sc == SDL_SCANCODE_RGUI;
+}
+
+// Keyboard capture for the rebind editors. Player buttons persist a SCANCODE to
+// keybinds.ini; system hotkeys persist a KEYCODE+mods to config.ini [KeyMap].
 bool try_capture(LauncherModel* m, const SDL_Event& ev) {
-    if (!m->capturing) return false;
-    if (ev.type == SDL_EVENT_KEY_DOWN) {
-        if (LNG_EVKEY(ev) == SDLK_ESCAPE) { launcher_model_cancel_capture(m); return true; }
-        launcher_model_accept_capture(m, SDL_GetKeyName(LNG_EVKEY(ev)));
+    if (!m->capturing && !m->hk_capturing) return false;
+    if (ev.type != SDL_EVENT_KEY_DOWN) return true;   // swallow input while capturing
+    if (LNG_EVKEY(ev) == SDLK_ESCAPE) {
+        launcher_model_cancel_capture(m);
+        launcher_model_cancel_hk_capture(m);
         return true;
     }
-    if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-        const char* n = SDL_GetGamepadStringForButton((LNG_GamepadButton)LNG_EVGBTN(ev));
-        launcher_model_accept_capture(m, n ? n : "Pad");
+    if (m->capturing) {
+        launcher_binds_set_button(m, m->cfg_player + 1, m->capture_btn, (int)LNG_EVSCAN(ev));
+        launcher_model_cancel_capture(m);
         return true;
     }
-    return false;
+    // hotkey capture: wait past a bare modifier press for the real key
+    if (is_modifier_scancode((SDL_Scancode)LNG_EVSCAN(ev))) return true;
+    launcher_binds_set_hotkey(m, m->capture_hk, (int)LNG_EVKEY(ev), (int)LNG_EVMOD(ev));
+    launcher_model_cancel_hk_capture(m);
+    return true;
 }
 
 std::string asset(const char* rel) {

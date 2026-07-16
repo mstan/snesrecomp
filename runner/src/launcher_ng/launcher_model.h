@@ -49,10 +49,12 @@ typedef enum {
     LNG_BTN_COUNT
 } LngButton;
 
-// System hotkeys ([KeyMap] section) shown on the Settings page.
+// System hotkeys — mirrors the engine's config.ini [KeyMap] keys exactly, so
+// editing them here surgically rewrites the same lines config.c parses.
 typedef enum {
-    LNG_HK_PAUSE = 0, LNG_HK_RESET, LNG_HK_FASTFWD, LNG_HK_FULLSCREEN,
-    LNG_HK_SCREENSHOT, LNG_HK_QUIT,
+    LNG_HK_FULLSCREEN = 0, LNG_HK_RESET, LNG_HK_PAUSE, LNG_HK_PAUSE_DIMMED,
+    LNG_HK_TURBO, LNG_HK_WINDOW_BIGGER, LNG_HK_WINDOW_SMALLER,
+    LNG_HK_VOLUME_UP, LNG_HK_VOLUME_DOWN, LNG_HK_DISPLAY_PERF, LNG_HK_TOGGLE_RENDERER,
     LNG_HK_COUNT
 } LngHotkey;
 
@@ -101,10 +103,12 @@ typedef struct {
     char      player_pad_name[2][64];
 
     // rebind capture state machine
-    bool      capturing;
+    bool      capturing;         // capturing a player button
     LngButton capture_btn;
-    char      binds[2][LNG_BTN_COUNT][32];  // per-player binding labels
-    char      hotkeys[LNG_HK_COUNT][24];    // [KeyMap] labels
+    bool      hk_capturing;      // capturing a system hotkey
+    LngHotkey capture_hk;
+    char      binds[2][LNG_BTN_COUNT][32];  // per-player keyboard binding labels
+    char      hotkeys[LNG_HK_COUNT][32];    // [KeyMap] value strings, e.g. "Ctrl+R"
 } LauncherModel;
 
 // Build the model from the inbound C ABI structs. `initial_rom` may be NULL.
@@ -154,11 +158,12 @@ void launcher_model_request_skip_toggle(LauncherModel* m); // opens modal when e
 void launcher_model_skip_confirm(LauncherModel* m);
 void launcher_model_skip_cancel(LauncherModel* m);
 
-// ---- rebind capture ----
+// ---- rebind capture (player buttons) ----
 void launcher_model_begin_capture(LauncherModel* m, LngButton b);
-void launcher_model_accept_capture(LauncherModel* m, const char* label);
 void launcher_model_cancel_capture(LauncherModel* m);
-void launcher_model_reset_binds(LauncherModel* m);   // current player -> defaults
+// ---- hotkey capture ----
+void launcher_model_begin_hk_capture(LauncherModel* m, LngHotkey h);
+void launcher_model_cancel_hk_capture(LauncherModel* m);
 
 // ---- display-string helpers (single source of truth across backends) ----
 const char* launcher_model_scale_label(const LauncherModel* m);        // "3x"

@@ -28,8 +28,10 @@
 #define SDL_EVENT_MOUSE_WHEEL           SDL_MOUSEWHEEL
 #define SDL_EVENT_GAMEPAD_BUTTON_DOWN   SDL_CONTROLLERBUTTONDOWN
 
-// key event field: SDL3 ev.key.key  == SDL2 ev.key.keysym.sym
+// key event fields: SDL3 ev.key.{key,scancode,mod} == SDL2 ev.key.keysym.{sym,scancode,mod}
 #define LNG_EVKEY(ev)    ((ev).key.keysym.sym)
+#define LNG_EVSCAN(ev)   ((ev).key.keysym.scancode)
+#define LNG_EVMOD(ev)    ((ev).key.keysym.mod)
 // gamepad button event field: SDL3 ev.gbutton.button == SDL2 ev.cbutton.button
 #define LNG_EVGBTN(ev)   ((ev).cbutton.button)
 
@@ -37,10 +39,17 @@
 #define SDL_GetGamepadStringForButton(b)  SDL_GameControllerGetStringForButton((SDL_GameControllerButton)(b))
 typedef SDL_GameControllerButton  LNG_GamepadButton;
 
+// key-modifier masks (SDL3 renamed KMOD_* -> SDL_KMOD_*)
+#define SDL_KMOD_CTRL   KMOD_CTRL
+#define SDL_KMOD_ALT    KMOD_ALT
+#define SDL_KMOD_SHIFT  KMOD_SHIFT
+
 #else
 // ---- native SDL3 ----------------------------------------------------------
 #include <SDL3/SDL_opengl.h>
 #define LNG_EVKEY(ev)    ((ev).key.key)
+#define LNG_EVSCAN(ev)   ((ev).key.scancode)
+#define LNG_EVMOD(ev)    ((ev).key.mod)
 #define LNG_EVGBTN(ev)   ((ev).gbutton.button)
 typedef SDL_GamepadButton  LNG_GamepadButton;
 #endif
