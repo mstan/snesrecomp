@@ -406,90 +406,79 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     end_panel();
 }
 
-void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = false) {
-    if (!begin_panel("controllers", 0, fill_h)) { end_panel(); return; }
-    eyebrow("CONTROLLERS");
+// Each player is its OWN self-contained card ("PLAYER 1" as its eyebrow), not a
+// floating column inside one big CONTROLLERS box. A 1-player game shows a
+// single card (no wasted width); a 2-player game shows two identical cards side
+// by side. Same module, composed per the game's declared player count.
+void draw_player_panel(LauncherModel* m, const LauncherTheme& th, int p, float w) {
+    char id[24];  snprintf(id, sizeof(id), "player%d", p);
+    char eb[16];  snprintf(eb, sizeof(eb), "PLAYER %d", p + 1);
 
-    // One player card: PLAYER N label ABOVE its pad art, then the source
-    // dropdown and Configure flush beneath — everything in one column, so
-    // nothing floats out of alignment with its neighbour.
-    const float cw = px(196);   // shared control width => flush column
-    auto player_card = [&](int p) {
-        ImGui::PushID(p);
-        ImGui::BeginGroup();
-            const float x0 = ImGui::GetCursorPosX();
-            // label centered over the card
-            {
-                char lbl[16]; snprintf(lbl, sizeof(lbl), "PLAYER %d", p + 1);
-                float w = ImGui::CalcTextSize(lbl).x;
-                ImGui::SetCursorPosX(x0 + (cw - w) * 0.5f);
-                ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-                ImGui::TextUnformatted(lbl);
-                ImGui::PopStyleColor();
-            }
-            ImGui::Dummy(ImVec2(0, px(4)));
-            // pad art centered over the card
-            {
-                const float aw = px(116);
-                ImGui::SetCursorPosX(x0 + (cw - aw) * 0.5f);
-                image_fit(g_pad, 116, 70);
-            }
-            ImGui::Dummy(ImVec2(0, px(6)));
+    if (!begin_panel(id, w / g_scale, false)) { end_panel(); return; }
+    ImGui::PushID(p);
+    eyebrow(eb);
 
-            ImGui::SetCursorPosX(x0);
-            ImGui::SetNextItemWidth(cw);
-            if (ImGui::BeginCombo("##src", launcher_model_player_src_label(m, p))) {
-                if (ImGui::Selectable("None", m->s.player_src[p] == 0))
-                    launcher_model_set_source(m, p, 0, 0, nullptr);
-                if (ImGui::Selectable("Keyboard", m->s.player_src[p] == 1))
-                    launcher_model_set_source(m, p, 1, 0, nullptr);
-                for (int i = 0; i < g_pad_count; ++i) {
-                    bool sel = m->s.player_src[p] == 2 && m->player_pad_id[p] == g_pads[i].id;
-                    if (ImGui::Selectable(g_pads[i].name, sel))
-                        launcher_model_set_source(m, p, 2, g_pads[i].id, g_pads[i].name);
-                }
-                if (g_pad_count == 0) {
-                    ImGui::BeginDisabled();
-                    ImGui::Selectable("(no gamepad connected)");
-                    ImGui::EndDisabled();
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::Dummy(ImVec2(0, px(4)));
-            ImGui::SetCursorPosX(x0);
-            if (ImGui::Button("Configure", ImVec2(cw, px(32)))) launcher_model_open_config(m, p);
-            ImGui::Dummy(ImVec2(0, px(6)));
-            // status line, centered over the card
-            {
-                const bool on = m->s.player_src[p] != 0;
-                const char* st = on ? "connected" : "not assigned";
-                float w = px(10) + px(8) + ImGui::CalcTextSize(st).x;
-                ImGui::SetCursorPosX(x0 + (cw - w) * 0.5f);
-                draw_dot(on, th.good, th.text_muted);
-                ImGui::TextColored(on ? col(th.good) : col(th.text_muted), "%s", st);
-            }
-        ImGui::EndGroup();
-        ImGui::PopID();
-    };
+    const float inner = ImGui::GetContentRegionAvail().x;
+    const float cw    = inner;   // controls span the card => flush by construction
 
-    // Player 2 only exists for 2-player games (model-driven, never hardcoded):
-    // Mega Man X reports 1 and the row vanishes entirely.
-    // The card group is centered in the panel so it never sits left-packed
-    // against a pool of dead space.
+    // pad art centered in the card
     {
-        const float card_w = px(196);          // == the shared control width
-        const float gutter = px(28);
-        const int   n      = (m->player_count >= 2) ? 2 : 1;
-        const float group  = card_w * n + gutter * (n - 1);
-        const float availw = ImGui::GetContentRegionAvail().x;
-        if (availw > group)
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availw - group) * 0.5f);
-
-        player_card(0);
-        if (n == 2) { ImGui::SameLine(0, gutter); player_card(1); }
+        const float aw = px(116);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (inner - aw) * 0.5f);
+        image_fit(g_pad, 116, 70);
     }
+    ImGui::Dummy(ImVec2(0, px(8)));
 
+    ImGui::SetNextItemWidth(cw);
+    if (ImGui::BeginCombo("##src", launcher_model_player_src_label(m, p))) {
+        if (ImGui::Selectable("None", m->s.player_src[p] == 0))
+            launcher_model_set_source(m, p, 0, 0, nullptr);
+        if (ImGui::Selectable("Keyboard", m->s.player_src[p] == 1))
+            launcher_model_set_source(m, p, 1, 0, nullptr);
+        for (int i = 0; i < g_pad_count; ++i) {
+            bool sel = m->s.player_src[p] == 2 && m->player_pad_id[p] == g_pads[i].id;
+            if (ImGui::Selectable(g_pads[i].name, sel))
+                launcher_model_set_source(m, p, 2, g_pads[i].id, g_pads[i].name);
+        }
+        if (g_pad_count == 0) {
+            ImGui::BeginDisabled();
+            ImGui::Selectable("(no gamepad connected)");
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::Dummy(ImVec2(0, px(4)));
+    if (ImGui::Button("Configure", ImVec2(cw, px(32)))) launcher_model_open_config(m, p);
+    ImGui::Dummy(ImVec2(0, px(6)));
+    // status line, centered
+    {
+        const bool on = m->s.player_src[p] != 0;
+        const char* st = on ? "connected" : "not assigned";
+        float sw = px(10) + px(8) + ImGui::CalcTextSize(st).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (inner - sw) * 0.5f);
+        draw_dot(on, th.good, th.text_muted);
+        ImGui::TextColored(on ? col(th.good) : col(th.text_muted), "%s", st);
+    }
+    ImGui::PopID();
     end_panel();
+}
+
+// Lays out the player cards: one card for a 1-player game, two side-by-side
+// for a 2-player game. Driven by the model, never hardcoded.
+void draw_controllers_row(LauncherModel* m, const LauncherTheme& th) {
+    const int   n   = (m->player_count >= 2) ? 2 : 1;
+    const float gap = px(th.spacing_md);
+    const float availw = ImGui::GetContentRegionAvail().x;
+    // A 2P game splits the row; a 1P game gets ONE card of the same size rather
+    // than a full-width card with a lone pad floating in it.
+    float cardw = (availw - gap) * 0.5f;
+    if (n == 1 && cardw < px(300.0f)) cardw = availw;   // narrow window: fill
+    for (int p = 0; p < n; ++p) {
+        if (p) ImGui::SameLine(0, gap);
+        begin_container(p ? "pc1" : "pc0", ImVec2(cardw, 0), ImGuiChildFlags_AutoResizeY);
+        draw_player_panel(m, th, p, cardw);
+        end_container();
+    }
 }
 
 // SAVES module — only exists for games with battery SRAM. MMX is a password
@@ -531,12 +520,10 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
         end_container();
 
         ImGui::SameLine(0, gap);
-        // The side column scrolls independently, so stacking optional modules
-        // (SAVES, and future per-game panels) can never clip the last card.
         begin_container("dash_r", ImVec2(0, 0), ImGuiChildFlags_None);
-            // Cards hug their content; the column doesn't stretch a single
-            // player card into a mostly-empty box.
-            draw_controllers_panel(m, th, false);
+            // One self-contained card per player (1 card for a 1P game, two
+            // side-by-side for a 2P game), then any optional modules.
+            draw_controllers_row(m, th);
             if (m->saves_supported) {          // module: opt-in per game
                 ImGui::Dummy(ImVec2(0, px(th.spacing_md)));
                 draw_saves_panel(m, th);
@@ -545,7 +532,7 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
     } else {
         draw_game_panel(m, th);
         ImGui::Spacing();
-        draw_controllers_panel(m, th);
+        draw_controllers_row(m, th);
         if (m->saves_supported) { ImGui::Spacing(); draw_saves_panel(m, th); }
     }
 }
@@ -669,27 +656,38 @@ void draw_controller(LauncherModel* m, const LauncherTheme& th) {
     } end_panel();
 }
 
-void draw_footer(LauncherModel* m, const LauncherTheme& th) {
-    // thin neon divider spanning the footer (arcade cabinet trim)
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float fullw = ImGui::GetContentRegionAvail().x;
-    ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
-        p, ImVec2(p.x + fullw, p.y + px(1.5f)),
-        imcol(th.border, 0.2f), imcol(th.accent, 0.7f), imcol(th.accent, 0.7f), imcol(th.border, 0.2f));
-    ImGui::Dummy(ImVec2(0, px(10.0f)));
+// Footer: a fixed-height band with the neon divider pinned to its TOP and the
+// CTA vertically centred inside it. Laid out from an explicit origin (not the
+// running cursor) so it is pixel-identical on every view and the CTA's glow
+// always has clearance below the divider — Settings has less body content, and
+// a cursor-relative footer let the glow ride up into the rule.
+void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float  fullw  = ImGui::GetContentRegionAvail().x;
+    const float  play_w = px(210), play_h = px(46);
 
+    // divider at the very top of the band
+    ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
+        origin, ImVec2(origin.x + fullw, origin.y + px(1.5f)),
+        imcol(th.border, 0.2f), imcol(th.accent, 0.7f),
+        imcol(th.accent, 0.7f), imcol(th.border, 0.2f));
+
+    // CTA centred in the remaining band height (glow clears the rule on both sides)
+    const float band_y = origin.y + px(1.5f);
+    const float band_h = footer_h - px(1.5f);
+    const float cta_y  = band_y + (band_h - play_h) * 0.5f;
+
+    const ImVec2 win = ImGui::GetWindowPos();
     if (m->view == LNG_VIEW_DASHBOARD) {
         bool skip = m->s.skip_launcher != 0;
-        ImGui::AlignTextToFramePadding();
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y + (play_h - ImGui::GetFrameHeight()) * 0.5f));
         if (ImGui::Checkbox("Skip launcher on boot", &skip))
             launcher_model_request_skip_toggle(m);
     }
-    const float play_w = px(210), play_h = px(48);
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - play_w);
-    // nudge the CTA up so its glow isn't clipped by the footer top
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - px(4.0f));
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + fullw - play_w, cta_y));
     if (neon_cta("##play", "PLAY", ImVec2(play_w, play_h)))
         m->action = LNG_ACTION_LAUNCH;
+    (void)win;
 }
 
 void draw_skip_modal(LauncherModel* m) {
@@ -764,7 +762,7 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
 
     // Body: fixed-height child that scrolls when content overflows, so nothing
     // is ever clipped out of reach. The footer below stays fixed (in the fold).
-    const float footer_h = px(78.0f);   // room for the CTA + its glow
+    const float footer_h = px(92.0f);   // divider + clearance + CTA + its glow
     float body_h = ImGui::GetContentRegionAvail().y - footer_h;
     if (body_h < px(80.0f)) body_h = px(80.0f);
     begin_container("body", ImVec2(0, body_h));
@@ -775,7 +773,7 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
     }
     end_container();
 
-    draw_footer(m, th);
+    draw_footer(m, th, footer_h);
     draw_skip_modal(m);
     ImGui::End();
     (void)logical_h;
