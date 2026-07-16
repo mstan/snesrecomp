@@ -252,19 +252,38 @@ def test_bitclearmem_8bit_dispatch():
 
 # ── JSL bank save/restore envelope (Follow-up B) ────────────────────────
 
-def test_call_with_pb_save_returns_six_statements():
+def test_call_with_pb_save_emits_complete_return_envelope():
     from v2.emitter_helpers import call_with_pb_save
     env = call_with_pb_save(0x05, "MyFn_M1X1")
-    assert len(env) == 6, (
-        f"call_with_pb_save must return 6 statements (got {len(env)}):\n{env}")
+    assert len(env) == 11, (
+        f"call_with_pb_save must return 11 statements (got {len(env)}):\n{env}")
     # Order matters: save -> trace JSL -> set PB -> call -> trace RTL -> restore
+    # -> propagate a non-local return only after PB is restored.
     text = "\n".join(env)
     assert "_saved_pb = cpu->PB" in env[0], f"stmt 1 must save PB:\n{env[0]}"
     assert "CPU_TR_JSL" in env[1], f"stmt 2 must be JSL trace:\n{env[1]}"
     assert "cpu->PB = 0x05" in env[2], f"stmt 3 must set PB to target:\n{env[2]}"
-    assert "MyFn_M1X1(cpu);" == env[3], f"stmt 4 must be the callee:\n{env[3]}"
+    assert "RecompReturn _r = MyFn_M1X1(cpu);" == env[3], (
+        f"stmt 4 must capture the callee result:\n{env[3]}")
     assert "CPU_TR_RTL" in env[4], f"stmt 5 must be RTL trace:\n{env[4]}"
     assert "cpu->PB = _saved_pb" in env[5], f"stmt 6 must restore PB:\n{env[5]}"
+    assert "if (_r != RECOMP_RETURN_NORMAL)" in env[6]
+    assert "return (RecompReturn)((int)_r - 1);" in text
+
+
+def test_pb_save_restore_envelope_preserves_dispatch_body():
+    from v2.emitter_helpers import pb_save_restore_envelope
+    body = [
+        "RecompReturn _r;",
+        "switch (cpu->m_flag) {",
+        "  default: _r = Target(cpu); break;",
+        "}",
+    ]
+    env = pb_save_restore_envelope(0x86, body, trace_pc24=0x80ABCD)
+    assert env[3:7] == body
+    assert "0x80abcdu" in env[1]
+    assert "cpu->PB = 0x86" in env[2]
+    assert env.index("cpu->PB = _saved_pb;") > env.index("}")
 
 
 # ── Stack helpers (Follow-up C) ─────────────────────────────────────────

@@ -1500,33 +1500,23 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 # variant class is eliminated for indirect calls too.
                 for em_v, ex_v in valid_variant_list(tgt_addr):
                     _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
-                lines.append("      uint8 _saved_pb = cpu->PB;")
-                lines.append(
-                    f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, _saved_pb,"
-                    f" {target_bank:#04x}, CPU_TR_JSL);")
-                lines.append(f"      cpu->PB = {target_bank:#04x};")
-                lines.append("      RecompReturn _r;")
-                lines.append(
-                    "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
-                lines += variant_dispatch_case_lines(
-                    tgt_addr, base_name, indent="        ",
+                body = [
+                    "RecompReturn _r;",
+                    "switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+                ]
+                body += variant_dispatch_case_lines(
+                    tgt_addr, base_name, indent="  ",
                     lle_fallback=(
                         f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
                         f"0x{site_pc24:06x}u, 2, NULL)"
                         if is_jsr or is_call else
                         f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                         f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
-                lines.append("      }")
-                lines.append(
-                    f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, cpu->PB, _saved_pb, CPU_TR_RTL);")
-                lines.append("      cpu->PB = _saved_pb;")
-                lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
-                lines.append(
-                    "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
-                lines.append(
-                    "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
-                lines.append("        return (RecompReturn)((int)_r - 1);")
-                lines.append("      }")
+                body.append("}")
+                env = emitter_helpers.pb_save_restore_envelope(
+                    target_bank, body, trace_pc24=site_pc24)
+                for stmt in env:
+                    lines.append(f"      {stmt}")
             if is_jsr or is_call:
                 lines.append("      break;")
             else:
@@ -1677,14 +1667,10 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # path).
             for em_v, ex_v in valid_variant_list(tgt_addr):
                 _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
-            lines.append("      uint8 _saved_pb = cpu->PB;")
-            lines.append(
-                f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, _saved_pb,"
-                f" {target_bank:#04x}, CPU_TR_JSL);")
-            lines.append(f"      cpu->PB = {target_bank:#04x};")
-            lines.append("      RecompReturn _r;")
-            lines.append(
-                "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
+            body = [
+                "RecompReturn _r;",
+                "switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+            ]
             # Tail-context inherit is for TRUE tail transfers only. A JSR
             # dispatch and a PEA+JMP ptr-call both enter the handler as a
             # paired host call (fresh frame on cpu->S, hrv=2 set above) —
@@ -1692,25 +1678,19 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # misclassify its own balanced return.
             _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
                     if not (is_jsr or is_call) else None)
-            lines += variant_dispatch_case_lines(
-                tgt_addr, base_name, indent="        ", pre_call=_pre,
+            body += variant_dispatch_case_lines(
+                tgt_addr, base_name, indent="  ", pre_call=_pre,
                 lle_fallback=(
                     f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
                     f"0x{site_pc24:06x}u, 2, NULL)"
                     if is_jsr or is_call else
                     f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                     f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
-            lines.append("      }")
-            lines.append(
-                f"      cpu_trace_pb_change(cpu, 0x{site_pc24:06x}u, cpu->PB, _saved_pb, CPU_TR_RTL);")
-            lines.append("      cpu->PB = _saved_pb;")
-            lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
-            lines.append(
-                "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
-            lines.append(
-                "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
-            lines.append("        return (RecompReturn)((int)_r - 1);")
-            lines.append("      }")
+            body.append("}")
+            env = emitter_helpers.pb_save_restore_envelope(
+                target_bank, body, trace_pc24=site_pc24)
+            for stmt in env:
+                lines.append(f"      {stmt}")
         if is_jsr or is_call:
             # Handler host-returned (it popped the call frame). Fall
             # through to the post-dispatch block. (is_call previously
@@ -2029,23 +2009,15 @@ def _emit_call(op: Call) -> List[str]:
         if op.long:
             # JSL: keep the PB save/restore so the callee runs in its
             # target bank but the caller's PB is preserved on return.
-            return [
-                "{",
-                "  uint8 _saved_pb = cpu->PB;",
-                f"  cpu_trace_pb_change(cpu, {call_trace_pc}, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
-                f"  cpu->PB = {target_bank:#04x};",
-                f"  RecompReturn _r = {pinned_name}(cpu);  "
-                f"/* cfg force_variant_at ${op.source_pc24:06X} -> "
-                f"M{pm}X{px} */",
-                f"  cpu_trace_pb_change(cpu, {call_trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
-                "  cpu->PB = _saved_pb;",
-                "  if (_r != RECOMP_RETURN_NORMAL) {",
-                "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
-                "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-                "    return (RecompReturn)((int)_r - 1);",
-                "  }",
-                "}",
-            ]
+            env = emitter_helpers.pb_save_restore_envelope(
+                target_bank,
+                [
+                    f"RecompReturn _r = {pinned_name}(cpu);  "
+                    f"/* cfg force_variant_at ${op.source_pc24:06X} -> "
+                    f"M{pm}X{px} */",
+                ],
+                trace_pc24=op.source_pc24 or 0)
+            return ["{", *[f"  {stmt}" for stmt in env], "}"]
         # JSR: same-bank short call. No PB change.
         return [
             "{",
@@ -2065,29 +2037,20 @@ def _emit_call(op: Call) -> List[str]:
         # correct on the SKIP_N return path.
         lines = ["{"]
         lines += _emit_return_frame_push(op)
-        lines += [
-            "  uint8 _saved_pb = cpu->PB;",
-            f"  cpu_trace_pb_change(cpu, {call_trace_pc}, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
-            f"  cpu->PB = {target_bank:#04x};",
-            "  RecompReturn _r;",
-            "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
+        body = [
+            "RecompReturn _r;",
+            "switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
         ]
-        lines += variant_dispatch_case_lines(
-            addr, base_name,
+        body += variant_dispatch_case_lines(
+            addr, base_name, indent="  ",
             lle_fallback=(
                 f"interp_tier_run_call_frame(cpu, 0x{addr:06x}u, "
                 f"{call_trace_pc}, 3, NULL)"))
-        lines.extend([
-            "  }",
-            f"  cpu_trace_pb_change(cpu, {call_trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
-            "  cpu->PB = _saved_pb;",
-            "  if (_r != RECOMP_RETURN_NORMAL) {",
-            "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
-            "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-            "    return (RecompReturn)((int)_r - 1);",
-            "  }",
-            "}",
-        ])
+        body.append("}")
+        env = emitter_helpers.pb_save_restore_envelope(
+            target_bank, body, trace_pc24=op.source_pc24 or 0)
+        lines += [f"  {stmt}" for stmt in env]
+        lines.append("}")
         return lines
     # JSR: same-bank short call. PB doesn't change.
     # NB: emit_function.py's per-line scanner auto-injects a

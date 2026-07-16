@@ -132,15 +132,17 @@ def modify_p_via_mirrors(mask: int, kind: str) -> List[str]:
     ]
 
 
-def call_with_pb_save(
+def pb_save_restore_envelope(
     target_bank: int,
-    callee_name: str,
+    body: List[str],
     *,
     trace_pc24: int = 0,
 ) -> List[str]:
-    """Emit the JSL bank-save/restore envelope as a list of raw C
-    statements (no indentation). Caller is responsible for indent /
-    brace wrapping as needed.
+    """Wrap a RecompReturn-producing body in the canonical JSL PB envelope.
+
+    ``body`` must declare or assign ``RecompReturn _r``. Statements are raw C
+    lines with indentation relative to the envelope; callers add the envelope's
+    outer indentation and braces.
 
     Real 65816 hardware sets PB to the target bank for the call's
     duration, then RTL restores it. PHK inside the callee must push
@@ -162,7 +164,7 @@ def call_with_pb_save(
         "uint8 _saved_pb = cpu->PB;",
         f"cpu_trace_pb_change(cpu, {trace_pc}, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
         f"cpu->PB = {target_bank:#04x};",
-        f"RecompReturn _r = {callee_name}(cpu);",
+        *body,
         f"cpu_trace_pb_change(cpu, {trace_pc}, cpu->PB, _saved_pb, CPU_TR_RTL);",
         "cpu->PB = _saved_pb;",
         "if (_r != RECOMP_RETURN_NORMAL) {",
@@ -174,3 +176,17 @@ def call_with_pb_save(
         "  return (RecompReturn)((int)_r - 1);",
         "}",
     ]
+
+
+def call_with_pb_save(
+    target_bank: int,
+    callee_name: str,
+    *,
+    trace_pc24: int = 0,
+) -> List[str]:
+    """Emit the canonical JSL PB envelope around one AOT callee."""
+    return pb_save_restore_envelope(
+        target_bank,
+        [f"RecompReturn _r = {callee_name}(cpu);"],
+        trace_pc24=trace_pc24,
+    )
