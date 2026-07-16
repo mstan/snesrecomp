@@ -99,6 +99,57 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path) {
     ImGui::GetStyle() = style;
 }
 
+// ---- CRT / neon atmosphere (drawn with ImDrawList) ---------------------------
+ImU32 imcol(const LngColor& c, float a = 1.0f) {
+    return ImGui::GetColorU32(ImVec4(c.r, c.g, c.b, c.a * a));
+}
+
+// Vertical center-bright gradient (CRT ground) + faint scanlines. Drawn on the
+// background/foreground draw lists so it sits behind/over the whole UI.
+void draw_crt_background(ImVec2 origin, ImVec2 size) {
+    const LauncherTheme& th = *g_th;
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    ImU32 ink = imcol(th.background), lift = imcol(th.background2);
+    float midY = origin.y + size.y * 0.42f;
+    // top: ink -> lift, bottom: lift -> ink  (soft horizontal glow band)
+    bg->AddRectFilledMultiColor(origin, ImVec2(origin.x + size.x, midY),
+                                ink, ink, lift, lift);
+    bg->AddRectFilledMultiColor(ImVec2(origin.x, midY), ImVec2(origin.x + size.x, origin.y + size.y),
+                                lift, lift, ink, ink);
+    // a soft violet bloom behind the header (arcade marquee glow)
+    bg->AddRectFilledMultiColor(origin, ImVec2(origin.x + size.x, origin.y + px(90)),
+                                imcol(th.accent, 0.10f), imcol(th.accent, 0.10f),
+                                imcol(th.accent, 0.0f),  imcol(th.accent, 0.0f));
+    // scanlines over everything, very subtle
+    ImDrawList* fg = ImGui::GetForegroundDrawList();
+    float step = px(3.0f); if (step < 2.0f) step = 2.0f;
+    ImU32 sl = imcol(th.scanline);
+    for (float y = origin.y; y < origin.y + size.y; y += step)
+        fg->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + size.x, y), sl, 1.0f);
+}
+
+// Neon glow: concentric rounded rects fading outward behind [min,max].
+void glow_rect(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
+               const LngColor& c, float intensity, int layers = 5) {
+    for (int i = layers; i >= 1; --i) {
+        float grow = px(2.0f) * i;
+        float a = intensity * (0.10f) * (float)(layers - i + 1) / layers;
+        dl->AddRectFilled(ImVec2(mn.x - grow, mn.y - grow),
+                          ImVec2(mx.x + grow, mx.y + grow),
+                          imcol(c, a), rounding + grow);
+    }
+}
+
+// Filled rounded rect with a vertical gradient (top -> bottom).
+void grad_rect(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
+               const LngColor& top, const LngColor& bot) {
+    dl->AddRectFilled(mn, mx, imcol(bot), rounding);   // base (rounded)
+    // overlay a gradient clipped to the rounded rect via a slightly-inset fill
+    dl->PushClipRect(mn, mx, true);
+    dl->AddRectFilledMultiColor(mn, mx, imcol(top), imcol(top), imcol(bot), imcol(bot));
+    dl->PopClipRect();
+}
+
 // ---- primitive icons (crisp at any DPI, no font dependency) -------------------
 void draw_check(const LngColor& c) {   // green check, advances cursor like text
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -118,18 +169,58 @@ void draw_dot(bool on, const LngColor& good, const LngColor& off) {
     else    dl->AddCircle(c, r, ImGui::GetColorU32(col(off)), 0, px(1.5f));
     ImGui::Dummy(ImVec2(r * 2, s)); ImGui::SameLine(0, px(8));
 }
-bool play_button(const char* label, ImVec2 size, const LngColor& bg, const LngColor& fg) {
-    ImGui::PushStyleColor(ImGuiCol_Button, col(bg));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col(bg));
-    ImGui::PushStyleColor(ImGuiCol_Text, col(fg));
+// The primary neon CTA (PLAY): glow + violet gradient + play triangle. Fully
+// custom-drawn over an InvisibleButton so it looks nothing like a stock button.
+bool neon_cta(const char* id, const char* label, ImVec2 size) {
+    const LauncherTheme& th = *g_th;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    bool clk = ImGui::Button(label, size);
+    bool clk = ImGui::InvisibleButton(id, size);
+    bool hov = ImGui::IsItemHovered();
+    bool act = ImGui::IsItemActive();
+    ImVec2 mn = p, mx = ImVec2(p.x + size.x, p.y + size.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    float cy = p.y + size.y * 0.5f, x = p.x + px(22);
-    ImU32 u = ImGui::GetColorU32(col(fg));
-    dl->AddTriangleFilled(ImVec2(x, cy - px(7)), ImVec2(x, cy + px(7)), ImVec2(x + px(12), cy), u);
-    ImGui::PopStyleColor(3);
+    float r = px(th.radius_sm);
+
+    glow_rect(dl, mn, mx, r, th.accent, hov ? 1.6f : 1.0f, 6);
+    LngColor top = hov ? th.accent : th.accent;
+    LngColor bot = act ? th.accent_dim : th.accent_dim;
+    grad_rect(dl, mn, mx, r, top, bot);
+    dl->AddRect(mn, mx, imcol(th.accent, hov ? 0.9f : 0.5f), r, 0, px(1.0f));  // crisp edge
+
+    // centered "▶ label"
+    float th_h = ImGui::GetTextLineHeight();
+    float tw = ImGui::CalcTextSize(label).x;
+    float tri = px(11.0f), gap = px(10.0f);
+    float total = tri + gap + tw;
+    float cx = p.x + (size.x - total) * 0.5f, cy = p.y + size.y * 0.5f;
+    ImU32 fg = imcol(th.accent_text);
+    dl->AddTriangleFilled(ImVec2(cx, cy - tri*0.55f), ImVec2(cx, cy + tri*0.55f),
+                          ImVec2(cx + tri, cy), fg);
+    dl->AddText(ImVec2(cx + tri + gap, cy - th_h*0.5f), fg, label);
     return clk;
+}
+
+// Uppercase section eyebrow with letter-spacing + a short accent tick, e.g.
+//   ▎ CONTROLLERS   — encodes "this is a section header", arcade panel style.
+void eyebrow_tracked(const char* s) {
+    const LauncherTheme& th = *g_th;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float h = ImGui::GetTextLineHeight();
+    // accent tick
+    dl->AddRectFilled(ImVec2(p.x, p.y + h*0.12f), ImVec2(p.x + px(3.0f), p.y + h*0.9f),
+                      imcol(th.accent), px(1.5f));
+    // letter-spaced text
+    float x = p.x + px(10.0f);
+    ImU32 c = imcol(th.accent);
+    char buf[2] = {0,0};
+    for (const char* q = s; *q; ++q) {
+        buf[0] = *q;
+        dl->AddText(ImVec2(x, p.y), c, buf);
+        x += ImGui::CalcTextSize(buf).x + px(2.2f);
+    }
+    ImGui::Dummy(ImVec2(x - p.x, h));
+    ImGui::Spacing();
 }
 
 // Draw a texture fit inside a logical box, preserving aspect.
@@ -140,10 +231,7 @@ void image_fit(const LauncherTexture& t, float box_w, float box_h) {
     ImGui::Image(tid(t), ImVec2(t.w * s, t.h * s));
 }
 
-void eyebrow(const char* s) {
-    ImGui::PushStyleColor(ImGuiCol_Text, col(g_th->accent));
-    ImGui::TextUnformatted(s); ImGui::PopStyleColor(); ImGui::Spacing();
-}
+void eyebrow(const char* s) { eyebrow_tracked(s); }
 // A card: filled + bordered. Hugs its content by default; `fill_h` stretches it
 // to the remaining height (used by the dashboard columns so the layout doesn't
 // leave a big empty gap under short cards).
@@ -162,6 +250,25 @@ bool begin_container(const char* id, ImVec2 size, ImGuiChildFlags flags = ImGuiC
     return ImGui::BeginChild(id, size, flags);
 }
 void end_container() { ImGui::EndChild(); ImGui::PopStyleColor(); }
+
+// One metadata row inside a 3-column table (label | value | badge). Robust
+// alignment regardless of how deeply the table is nested/indented.
+void kv_row(const char* k, const char* v, const LauncherTheme& th,
+            const char* badge, bool good) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+    ImGui::TextUnformatted(k);
+    ImGui::PopStyleColor();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(v);
+    ImGui::TableNextColumn();
+    if (badge) {
+        ImGui::PushStyleColor(ImGuiCol_Text, col(good ? th.good : th.warn));
+        ImGui::Text("[%s]", badge);
+        ImGui::PopStyleColor();
+    }
+}
 
 // Key/value row, drawn full width: muted label column, value, and an optional
 // right-aligned badge. No wrapping — the row owns the whole panel width, so
@@ -200,32 +307,61 @@ void row_label(const char* text, const LauncherTheme& th) {
 }
 
 // ---- views -----------------------------------------------------------------
+// Box art drawn as a hero: a tall cover with a soft phosphor glow + framed
+// edge, like a cartridge under display glass. Fills the panel's left column.
+void hero_boxart(const LauncherTexture& t, float box_w, float box_h) {
+    const LauncherTheme& th = *g_th;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float bw = px(box_w), bh = px(box_h);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (t.id && t.w > 0 && t.h > 0) {
+        float s = (bw / t.w < bh / t.h) ? bw / (float)t.w : bh / (float)t.h;
+        float iw = t.w * s, ih = t.h * s;
+        ImVec2 mn = p, mx = ImVec2(p.x + iw, p.y + ih);
+        glow_rect(dl, mn, mx, px(3.0f), th.accent, 0.7f, 5);
+        dl->AddImageRounded(tid(t), mn, mx, ImVec2(0,0), ImVec2(1,1),
+                            imcol(lng_rgba(1,1,1,1)), px(3.0f));
+        dl->AddRect(mn, mx, imcol(th.border, 0.9f), px(3.0f), 0, px(1.0f));
+        ImGui::Dummy(ImVec2(iw, ih));
+    } else {
+        dl->AddRectFilled(p, ImVec2(p.x+bw, p.y+bh), imcol(th.control), px(3.0f));
+        ImGui::Dummy(ImVec2(bw, bh));
+    }
+}
+
 void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = false) {
     if (!begin_panel("game", 0, fill_h)) { end_panel(); return; }
     eyebrow("GAME");
-    // Art + identity side by side...
-    image_fit(g_boxart, 150, 190);
-    ImGui::SameLine();
+    // Hero: tall box art on the left, identity + verification on the right.
+    hero_boxart(g_boxart, 168, 234);
+    ImGui::SameLine(0, px(18));
     ImGui::BeginGroup();
-        ImGui::SetWindowFontScale(1.5f);
-        ImGui::TextUnformatted(m->game_name);
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::TextColored(col(th.text_muted), "%s", m->region);
-        ImGui::Spacing();
-        if (m->rom_present) { draw_check(th.good); ImGui::TextColored(col(th.good), "ROM loaded"); }
+        // region chip
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent));
+        ImGui::TextUnformatted(m->region[0] ? m->region : "SNES");
+        ImGui::PopStyleColor();
+        if (m->rom_present) { draw_check(th.good); ImGui::TextColored(col(th.good), "ROM verified"); }
         else                { ImGui::TextColored(col(th.warn), "No ROM loaded"); }
-        ImGui::Spacing();
-        if (ImGui::Button("Change ROM..."))   // native OS picker (Win/mac/Linux)
+        ImGui::Dummy(ImVec2(0, px(6)));
+        // ROM metadata as a borderless table — robust column alignment inside
+        // this indented column (manual SameLine math breaks here).
+        if (ImGui::BeginTable("meta", 3,
+                ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoClip)) {
+            ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(58));
+            ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, px(112));
+            ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(54));
+            kv_row("File",    m->rom_file,    th, nullptr, true);
+            kv_row("Size",    m->rom_size,    th, nullptr, true);
+            kv_row("Header",  m->rom_header,  th, nullptr, true);
+            kv_row("CRC32",   m->rom_crc_str, th, m->crc_match ? "MATCH" : "DIFF", m->crc_match);
+            kv_row("SHA-256", m->rom_sha_str, th, m->sha_match ? "MATCH" : nullptr, m->sha_match);
+            ImGui::EndTable();
+        }
+        ImGui::Dummy(ImVec2(0, px(10)));
+        if (ImGui::Button("Change ROM", ImVec2(px(150), px(32))))
             if (launcher_pick_rom(g_pick_buf, sizeof(g_pick_buf)))
                 launcher_model_set_rom(m, g_pick_buf);
     ImGui::EndGroup();
-    // ...then the ROM details across the panel's full width.
-    ImGui::Spacing();
-    kv("File",    m->rom_file,    th);
-    kv("Size",    m->rom_size,    th);
-    kv("Header",  m->rom_header,  th);
-    kv("CRC32",   m->rom_crc_str, th, m->crc_match ? "MATCH" : "DIFF", m->crc_match);
-    kv("SHA-256", m->rom_sha_str, th, m->sha_match ? "MATCH" : nullptr, m->sha_match);
     end_panel();
 }
 
@@ -234,11 +370,14 @@ void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill
     eyebrow("CONTROLLERS");
     for (int p = 0; p < 2; ++p) {
         ImGui::PushID(p);
-        image_fit(g_pad, 84, 50);
-        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(0, px(6)));
+        image_fit(g_pad, 104, 62);
+        ImGui::SameLine(0, px(14));
         ImGui::BeginGroup();
-            ImGui::Text("Player %d", p + 1);
-            ImGui::SetNextItemWidth(px(200));
+            ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+            ImGui::Text("PLAYER %d", p + 1);
+            ImGui::PopStyleColor();
+            ImGui::SetNextItemWidth(px(220));
             // Real dropdown: None / Keyboard / each connected gamepad by name.
             if (ImGui::BeginCombo("##src", launcher_model_player_src_label(m, p))) {
                 if (ImGui::Selectable("None", m->s.player_src[p] == 0))
@@ -262,10 +401,16 @@ void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill
                                "%s", m->s.player_src[p] ? "connected" : "none");
         ImGui::EndGroup();
         ImGui::SameLine();
-        if (ImGui::Button("Configure")) launcher_model_open_config(m, p);
-        ImGui::Spacing();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(4));
+        if (ImGui::Button("Configure", ImVec2(px(110), px(32)))) launcher_model_open_config(m, p);
+        ImGui::Dummy(ImVec2(0, px(10)));
         ImGui::PopID();
     }
+    ImGui::Dummy(ImVec2(0, px(6)));
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+    ImGui::TextWrapped("Plug in a controller any time - it appears here automatically, "
+                       "even after the launcher is open.");
+    ImGui::PopStyleColor();
     end_panel();
 }
 
@@ -398,15 +543,25 @@ void draw_controller(LauncherModel* m, const LauncherTheme& th) {
 }
 
 void draw_footer(LauncherModel* m, const LauncherTheme& th) {
-    ImGui::Separator();
+    // thin neon divider spanning the footer (arcade cabinet trim)
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float fullw = ImGui::GetContentRegionAvail().x;
+    ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
+        p, ImVec2(p.x + fullw, p.y + px(1.5f)),
+        imcol(th.border, 0.2f), imcol(th.accent, 0.7f), imcol(th.accent, 0.7f), imcol(th.border, 0.2f));
+    ImGui::Dummy(ImVec2(0, px(10.0f)));
+
     if (m->view == LNG_VIEW_DASHBOARD) {
         bool skip = m->s.skip_launcher != 0;
-        if (ImGui::Checkbox("Skip Launcher on Boot", &skip))
+        ImGui::AlignTextToFramePadding();
+        if (ImGui::Checkbox("Skip launcher on boot", &skip))
             launcher_model_request_skip_toggle(m);
     }
-    const float play_w = px(180);
+    const float play_w = px(210), play_h = px(48);
     ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - play_w);
-    if (play_button("     PLAY", ImVec2(play_w, px(40)), th.accent, th.accent_text))
+    // nudge the CTA up so its glow isn't clipped by the footer top
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - px(4.0f));
+    if (neon_cta("##play", "PLAY", ImVec2(play_w, play_h)))
         m->action = LNG_ACTION_LAUNCH;
 }
 
@@ -435,32 +590,54 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
+    // CRT ground + scanlines behind everything.
+    draw_crt_background(vp->Pos, vp->Size);
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));   // let CRT show
     ImGui::Begin("##launcher", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleColor();
 
-    // Titlebar: brand mark + game name + subtitle ......... [Settings|Back]
-    image_fit(g_brand, 40, 30); ImGui::SameLine();
-    ImGui::SetWindowFontScale(1.25f);
-    ImGui::TextUnformatted(m->game_name);
-    ImGui::SetWindowFontScale(1.0f);
-    ImGui::SameLine();
-    ImGui::TextColored(col(th.text_muted), "  |  Super Nintendo Launcher");
+    // ---- Marquee header: brand · GAME TITLE · subtitle .......... [nav] ----
+    ImVec2 hp = ImGui::GetCursorScreenPos();
+    image_fit(g_brand, 44, 33); ImGui::SameLine(0, px(12));
+    ImGui::BeginGroup();
+        ImGui::SetWindowFontScale(1.55f);
+        ImGui::TextUnformatted(m->game_name);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+        ImGui::TextUnformatted("SUPER NINTENDO  \xC2\xB7  RECOMPILED");
+        ImGui::PopStyleColor();
+    ImGui::EndGroup();
     {   // right-aligned nav button
         const char* label = (m->view == LNG_VIEW_DASHBOARD) ? "Settings" : "< Back";
-        const float w = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float w = px(110.0f);
         ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - w);
-        if (ImGui::Button(label)) {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(6.0f));
+        if (ImGui::Button(label, ImVec2(w, px(34)))) {
             launcher_model_set_view(m, m->view == LNG_VIEW_DASHBOARD
                                         ? LNG_VIEW_SETTINGS : LNG_VIEW_DASHBOARD);
         }
     }
-    ImGui::Spacing();
+    // marquee underline: neon gradient rule under the header
+    ImGui::Dummy(ImVec2(0, px(8.0f)));
+    {
+        ImVec2 u = ImGui::GetCursorScreenPos();
+        float fw = ImGui::GetContentRegionAvail().x;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilledMultiColor(u, ImVec2(u.x + fw, u.y + px(2.0f)),
+            imcol(th.accent, 0.9f), imcol(th.accent, 0.15f),
+            imcol(th.accent, 0.15f), imcol(th.accent, 0.9f));
+        glow_rect(dl, u, ImVec2(u.x + fw*0.5f, u.y + px(2.0f)), 0, th.accent, 0.5f, 3);
+    }
+    ImGui::Dummy(ImVec2(0, px(12.0f)));
+    (void)hp;
 
     // Body: fixed-height child that scrolls when content overflows, so nothing
     // is ever clipped out of reach. The footer below stays fixed (in the fold).
-    const float footer_h = px(60.0f);
+    const float footer_h = px(78.0f);   // room for the CTA + its glow
     float body_h = ImGui::GetContentRegionAvail().y - footer_h;
     if (body_h < px(80.0f)) body_h = px(80.0f);
     begin_container("body", ImVec2(0, body_h));
