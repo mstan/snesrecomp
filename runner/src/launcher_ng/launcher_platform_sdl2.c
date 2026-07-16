@@ -56,6 +56,8 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
     SDL_GL_MakeCurrent(p->window, p->gl);
     SDL_GL_SetSwapInterval(1);
 
+    SDL_RaiseWindow(p->window);   // foreground + keyboard focus (gamepad/kbd nav)
+
     launcher_platform_refresh_metrics(p);
     return true;
 }

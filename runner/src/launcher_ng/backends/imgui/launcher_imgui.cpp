@@ -96,6 +96,9 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path) {
     style.Colors[ImGuiCol_ScrollbarBg]     = col(th.panel);
     style.Colors[ImGuiCol_ScrollbarGrab]   = col(th.border);
     style.Colors[ImGuiCol_ScrollbarGrabHovered] = col(th.control_hovered);
+    // Gamepad/keyboard focus ring: bright cyan so a Deck user always sees where
+    // they are. (NavHighlight is the pre-1.91.4 alias of NavCursor.)
+    style.Colors[ImGuiCol_NavCursor]       = col(th.focus_ring);
     style.ScaleAllSizes(scale);
     ImGui::GetStyle() = style;
 }
@@ -694,6 +697,7 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
     ImGui::SetCursorScreenPos(ImVec2(origin.x + fullw - play_w, cta_y));
     if (neon_cta("##play", "PLAY", ImVec2(play_w, play_h)))
         m->action = LNG_ACTION_LAUNCH;
+    ImGui::SetItemDefaultFocus();   // gamepad/keyboard start on the primary action
     (void)win;
 }
 
@@ -831,6 +835,11 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.IniFilename = nullptr;
+    // Test hook: force the focus ring always-on so scripted screenshots can
+    // verify nav rendering without a physical pad. Off => normal auto behaviour
+    // (ring appears on pad/keyboard, hides on mouse).
+    if (const char* nv = SDL_getenv("LNG_NAV_ALWAYS"); nv && nv[0] == '1')
+        io.ConfigNavCursorVisibleAlways = true;
 
     g_th = th;
     LNG_ImplSDL_InitForOpenGL(p->window, p->gl);
