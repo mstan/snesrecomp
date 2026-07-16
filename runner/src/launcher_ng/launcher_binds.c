@@ -9,6 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// MSVC spells these differently than POSIX.
+#ifdef _MSC_VER
+  #define strtok_r     strtok_s
+  #define strncasecmp  _strnicmp
+  #define strdup       _strdup
+#endif
+
 const char* g_launcher_config_path = NULL;
 
 // LngButton -> keybinds button index. keybinds order is
