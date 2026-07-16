@@ -103,6 +103,22 @@ void launcher_model_set_rom(LauncherModel* m, const char* path) {
         if (*q == '/' || *q == '\\') base = q + 1;
     safe_copy(m->rom_file, sizeof(m->rom_file), m->rom_present ? base : "(none)");
 
+    /* Real size from the file on disk — never a hardcoded guess. */
+    m->rom_size[0] = '\0';
+    if (m->rom_present) {
+        FILE* f = fopen(m->rom_full, "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0) {
+                long n = ftell(f);
+                if (n > 0)
+                    snprintf(m->rom_size, sizeof(m->rom_size), "%.2f MB (%ld Mbit)",
+                             (double)n / (1024.0 * 1024.0), (long)((n * 8) / (1024 * 1024)));
+            }
+            fclose(f);
+        }
+    }
+    if (!m->rom_size[0]) safe_copy(m->rom_size, sizeof(m->rom_size), "--");
+
     // Prototype: presence implies verified. Production re-runs crc32/sha256 here.
     m->crc_match = m->rom_present;
     m->sha_match = m->rom_present;
