@@ -63,7 +63,8 @@ typedef struct {
     const char* game_name;          // e.g. "Mega Man X"
     const char* region;             // e.g. "USA"
     bool        widescreen_supported;
-    bool        msu1_supported;
+    bool        msu1_supported;      // sram-like: show the MSU-1 module when true
+    const char* msu1_note;           // borrowed; which patch, shown in the card
     bool        saves_supported;     // sram_path != NULL -> show the SAVES panel
     const char* sram_path;           // borrowed; NULL when the game has no SRAM
     // Number of players the GAME actually supports. Mega Man X is 1-player, so
@@ -144,6 +145,10 @@ void launcher_model_toggle_widescreen(LauncherModel* m);  // gated
 // ---- audio settings ----
 void launcher_model_cycle_freq(LauncherModel* m);    // 32000/44100/48000
 void launcher_model_volume_delta(LauncherModel* m, int delta);  // clamp 0..100
+
+// ---- MSU-1 (only when msu1_supported) ----
+void launcher_model_toggle_msu1(LauncherModel* m);
+void launcher_model_set_msu1_dir(LauncherModel* m, const char* dir);
 
 // ---- controllers ----
 void launcher_model_cycle_player_src(LauncherModel* m, int player); // None/Kbd/Pad

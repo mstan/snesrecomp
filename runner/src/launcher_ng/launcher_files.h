@@ -25,6 +25,10 @@ extern "C" {
 // cancels). Returns true and fills `out_path` on success.
 bool launcher_pick_rom(char* out_path, size_t out_cap);
 
+// Open the OS "choose a folder" dialog (for the MSU-1 music folder). Returns
+// true and fills `out_path` on success.
+bool launcher_pick_folder(const char* title, char* out_path, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

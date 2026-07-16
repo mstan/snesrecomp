@@ -427,11 +427,11 @@ void draw_player_panel(LauncherModel* m, const LauncherTheme& th, int p, float w
 
     // pad art centered in the card
     {
-        const float aw = px(116);
+        const float aw = px(96);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (inner - aw) * 0.5f);
-        image_fit(g_pad, 116, 70);
+        image_fit(g_pad, 96, 57);
     }
-    ImGui::Dummy(ImVec2(0, px(8)));
+    ImGui::Dummy(ImVec2(0, px(6)));
 
     ImGui::SetNextItemWidth(cw);
     if (ImGui::BeginCombo("##src", launcher_model_player_src_label(m, p))) {
@@ -511,6 +511,42 @@ void draw_saves_panel(LauncherModel* m, const LauncherTheme& th) {
     end_panel();
 }
 
+// MSU-1 module — only for games that ship/support an MSU-1 pack (SMW, Zelda).
+// Enable toggle + music-folder picker + the game's note about which patch.
+void draw_msu1_panel(LauncherModel* m, const LauncherTheme& th) {
+    if (!begin_panel("msu1", 0)) { end_panel(); return; }
+    eyebrow("MSU-1 AUDIO");
+    bool on = m->s.msu1_enabled != 0;
+    if (ImGui::Checkbox("Enable CD-quality music", &on))
+        launcher_model_toggle_msu1(m);
+
+    ImGui::Dummy(ImVec2(0, px(4)));
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Folder");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(px(76));
+    const char* dir = m->s.msu1_dir[0] ? m->s.msu1_dir : "(not set)";
+    const float bw = px(90);
+    float avail = ImGui::GetContentRegionAvail().x - bw - px(th.spacing_sm);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail);
+    ImGui::TextUnformatted(dir);
+    ImGui::PopTextWrapPos();
+    ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw);
+    if (ImGui::Button("Browse", ImVec2(bw, px(30)))) {
+        char buf[512];
+        if (launcher_pick_folder("Select MSU-1 music folder", buf, sizeof(buf)))
+            launcher_model_set_msu1_dir(m, buf);
+    }
+    if (m->msu1_note && m->msu1_note[0]) {
+        ImGui::Dummy(ImVec2(0, px(4)));
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+        ImGui::TextWrapped("%s", m->msu1_note);
+        ImGui::PopStyleColor();
+    }
+    end_panel();
+}
+
 // The dashboard COMPOSES whichever modules this game supports — it does not
 // hardcode a fixed set. GAME is always present; the side column stacks
 // CONTROLLERS plus any optional modules (SAVES only when the game has SRAM).
@@ -532,12 +568,17 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
                 ImGui::Dummy(ImVec2(0, px(th.spacing_md)));
                 draw_saves_panel(m, th);
             }
+            if (m->msu1_supported) {
+                ImGui::Dummy(ImVec2(0, px(th.spacing_md)));
+                draw_msu1_panel(m, th);
+            }
         end_container();
     } else {
         draw_game_panel(m, th);
         ImGui::Spacing();
         draw_controllers_row(m, th);
         if (m->saves_supported) { ImGui::Spacing(); draw_saves_panel(m, th); }
+        if (m->msu1_supported)  { ImGui::Spacing(); draw_msu1_panel(m, th); }
     }
 }
 
