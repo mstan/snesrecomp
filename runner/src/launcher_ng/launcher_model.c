@@ -5,7 +5,11 @@
 
 #include "launcher_model.h"
 
+#include "crc32.h"
+#include "sha256.h"
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const int kFreqTable[] = { 32000, 44100, 48000 };
@@ -56,6 +60,10 @@ void launcher_model_init(LauncherModel* m,
         m->sram_path            = game->sram_path;
         /* 0 = unset (caller predates the field) -> assume 2 players. */
         m->player_count         = game->num_players ? clampi(game->num_players, 1, 2) : 2;
+        m->expected_crc         = game->expected_crc;
+        m->has_expected_crc     = game->has_expected_crc;
+        m->known_sha256         = game->known_sha256;
+        m->num_known_sha256     = game->num_known_sha256;
     } else {
         m->game_name    = "Unknown Game";
         m->region       = "";
@@ -64,18 +72,9 @@ void launcher_model_init(LauncherModel* m,
 
     if (io) m->s = *io;
 
+    // Real ROM read + CRC/SHA verification (computes rom_size, crc_match,
+    // sha_match). No synthesized/faked facts.
     launcher_model_set_rom(m, initial_rom);
-    // Synthesized display facts for the prototype. Production fills these from
-    // the real cart header + crc32.c / sha256.c fingerprint check.
-    safe_copy(m->rom_size,   sizeof(m->rom_size),   "1.50 MB");
-    safe_copy(m->rom_header, sizeof(m->rom_header), "LoROM / FastROM");
-    if (game && game->has_expected_crc)
-        snprintf(m->rom_crc_str, sizeof(m->rom_crc_str), "%08X", game->expected_crc);
-    else
-        safe_copy(m->rom_crc_str, sizeof(m->rom_crc_str), "--------");
-    safe_copy(m->rom_sha_str, sizeof(m->rom_sha_str), "9c2e...d41f");
-    m->crc_match = m->rom_present;
-    m->sha_match = m->rom_present;
 
     m->view      = LNG_VIEW_DASHBOARD;
     m->action    = LNG_ACTION_NONE;
@@ -103,29 +102,54 @@ void launcher_model_set_rom(LauncherModel* m, const char* path) {
         if (*q == '/' || *q == '\\') base = q + 1;
     safe_copy(m->rom_file, sizeof(m->rom_file), m->rom_present ? base : "(none)");
 
-    /* Real size from the file on disk — never a hardcoded guess. */
+    /* Read the ROM once: real size, and real CRC32 + SHA-256 over the cartridge
+     * body (SMC copier header stripped) compared against the expected
+     * fingerprint. No faking — a wrong/corrupt ROM fails verification. */
     m->rom_size[0] = '\0';
+    m->crc_match = false;
+    m->sha_match = false;
     if (m->rom_present) {
         FILE* f = fopen(m->rom_full, "rb");
         if (f) {
-            if (fseek(f, 0, SEEK_END) == 0) {
-                long n = ftell(f);
-                if (n > 0)
-                    snprintf(m->rom_size, sizeof(m->rom_size), "%.2f MB (%ld Mbit)",
-                             (double)n / (1024.0 * 1024.0), (long)((n * 8) / (1024 * 1024)));
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) {
+                snprintf(m->rom_size, sizeof(m->rom_size), "%.2f MB (%ld Mbit)",
+                         (double)n / (1024.0 * 1024.0), (long)((n * 8) / (1024 * 1024)));
+                uint8_t* buf = (uint8_t*)malloc((size_t)n);
+                if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
+                    /* SMC copier header is present when (size % 1024 == 512). */
+                    size_t hdr  = ((size_t)n % 1024 == 512) ? 512 : 0;
+                    const uint8_t* body = buf + hdr;
+                    size_t blen = (size_t)n - hdr;
+                    uint32_t crc = crc32_compute(body, blen);
+                    uint8_t  sha[32];
+                    sha256_compute(body, blen, sha);
+                    m->crc_match = m->has_expected_crc && crc == m->expected_crc;
+                    for (size_t k = 0; k < m->num_known_sha256; ++k)
+                        if (memcmp(sha, m->known_sha256[k], 32) == 0) { m->sha_match = true; break; }
+                }
+                free(buf);
             }
             fclose(f);
         }
     }
     if (!m->rom_size[0]) safe_copy(m->rom_size, sizeof(m->rom_size), "--");
-
-    // Prototype: presence implies verified. Production re-runs crc32/sha256 here.
-    m->crc_match = m->rom_present;
-    m->sha_match = m->rom_present;
 }
 
 const char* launcher_model_rom_path(const LauncherModel* m) {
     return m->rom_full;
+}
+
+bool launcher_model_rom_verified(const LauncherModel* m) {
+    if (!m->rom_present) return false;
+    const int has_crc = m->has_expected_crc;
+    const int has_sha = m->num_known_sha256 > 0;
+    if (!has_crc && !has_sha) return false;   // no fingerprint => can't vouch
+    if (has_crc && !m->crc_match) return false;
+    if (has_sha && !m->sha_match) return false;
+    return true;
 }
 
 void launcher_model_set_view(LauncherModel* m, LngView v) {

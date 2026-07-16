@@ -365,20 +365,22 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     ImGui::Dummy(ImVec2(0, px(10)));
 
     // Region + verification state, centered under the art.
+    const bool verified = launcher_model_rom_verified(m);
     {
-        char line[96];
-        snprintf(line, sizeof(line), "%s", m->rom_present ? "ROM verified" : "No ROM loaded");
+        const char* line = !m->rom_present ? "No ROM loaded"
+                          : verified        ? "ROM verified"
+                                            : "ROM not recognized";
         float w = ImGui::GetTextLineHeight() + px(6) + ImGui::CalcTextSize(line).x;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availw - w) * 0.5f);
-        state_mark(m->rom_present, th);
+        state_mark(verified, th);
         ImGui::SameLine(0, px(6));
-        ImGui::TextColored(m->rom_present ? col(th.good) : col(th.warn), "%s", line);
+        ImGui::TextColored(verified ? col(th.good) : col(th.warn), "%s", line);
     }
     ImGui::Dummy(ImVec2(0, px(10)));
 
     // Metadata: what a PLAYER needs to know. Raw CRC32/SHA-256 digests are
     // developer noise — the question a user has is "is my ROM good?", so the
-    // fingerprint check is surfaced as one PASS/FAIL row instead.
+    // real fingerprint check is surfaced as one PASS/FAIL row.
     if (ImGui::BeginTable("meta", 3, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(76));
         ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
@@ -386,17 +388,15 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
         kv_row("Region", m->region[0] ? m->region : "SNES", th, false, false);
         kv_row("File",   m->rom_file, th, false, false);
         kv_row("Size",   m->rom_size, th, false, false);
-        // One verification verdict (CRC32 + SHA-256 both must match).
-        const bool ok = m->crc_match && m->sha_match;
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
         ImGui::TextUnformatted("Checksum");
         ImGui::PopStyleColor();
         ImGui::TableNextColumn();
-        ImGui::TextColored(ok ? col(th.good) : col(th.warn), "%s", ok ? "PASS" : "FAIL");
+        ImGui::TextColored(verified ? col(th.good) : col(th.warn), "%s", verified ? "PASS" : "FAIL");
         ImGui::TableNextColumn();
-        state_mark(ok, th);
+        state_mark(verified, th);
         ImGui::EndTable();
     }
     ImGui::Dummy(ImVec2(0, px(12)));
