@@ -41,8 +41,14 @@ extern "C" const char* launcher_backend_name(void) { return "Dear ImGui"; }
 
 namespace {
 
-float  g_scale = 1.0f;
-float  px(float logical) { return logical * g_scale; }
+// ImGui coordinates are already DPI-independent.  The SDL2 platform backend
+// reports the window in points and the OpenGL backend applies
+// DisplayFramebufferScale when it submits vertices to the Retina drawable.
+// Scaling widget geometry here as well doubles every size on macOS Retina
+// (and makes labels collide with their controls), so keep all layout tokens in
+// logical units.  Fonts are logical-sized too; the renderer scales their atlas
+// with the framebuffer.
+float  px(float logical) { return logical; }
 ImVec4 col(const LngColor& c) { return ImVec4(c.r, c.g, c.b, c.a); }
 const LauncherTheme* g_th = nullptr;
 
@@ -59,7 +65,7 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path) {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 2;
-    const float body = th.font_body * scale;
+    const float body = th.font_body;
     // Cover Basic Latin + Latin-1 AND General Punctuation so em/en dashes and
     // curly quotes used in the game notes render as glyphs, not "?" tofu.
     static const ImWchar kRanges[] = {
@@ -106,7 +112,6 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path) {
     // Gamepad/keyboard focus ring: bright cyan so a Deck user always sees where
     // they are. (NavHighlight is the pre-1.91.4 alias of NavCursor.)
     style.Colors[ImGuiCol_NavCursor]       = col(th.focus_ring);
-    style.ScaleAllSizes(scale);
     ImGui::GetStyle() = style;
 }
 
@@ -335,7 +340,9 @@ void stepper(const char* id, int value, const char* suffix, int* out_delta) {
 void row_label(const char* text, const LauncherTheme& th) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(col(th.text_muted), "%s", text);
-    ImGui::SameLine(px(170.0f));
+    // Continue from the actual label width.  A fixed x-position makes longer
+    // labels such as "Linear filtering" overlap the control on narrow windows.
+    ImGui::SameLine(0.0f, px(th.spacing_md));
 }
 
 // ---- views -----------------------------------------------------------------
@@ -425,7 +432,7 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
         float art_h = ImGui::GetContentRegionAvail().y - reserve;
         if (art_h > px(280.0f)) art_h = px(280.0f);
         if (art_h < px(132.0f)) art_h = px(132.0f);
-        hero_boxart_centered(g_boxart, art_h / g_scale, availw);
+        hero_boxart_centered(g_boxart, art_h, availw);
     }
     ImGui::Dummy(ImVec2(0, px(10)));
 
@@ -493,7 +500,7 @@ void draw_player_panel(LauncherModel* m, const LauncherTheme& th, int p, float w
     char id[24];  snprintf(id, sizeof(id), "player%d", p);
     char eb[16];  snprintf(eb, sizeof(eb), "PLAYER %d", p + 1);
 
-    if (!begin_panel(id, w / g_scale, false)) { end_panel(); return; }
+    if (!begin_panel(id, w, false)) { end_panel(); return; }
     ImGui::PushID(p);
     eyebrow(eb);
 
@@ -678,7 +685,7 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
     if (begin_panel("hotkeys", 0)) {
         eyebrow("HOTKEYS");
         // Same responsive grid treatment as the bindings list.
-        const float cell_w = px(280.0f);
+        const float cell_w = px(320.0f);
         int cols = (int)(ImGui::GetContentRegionAvail().x / cell_w);
         cols = cols < 1 ? 1 : (cols > 3 ? 3 : cols);
         if (ImGui::BeginTable("hk", cols)) {
@@ -686,8 +693,8 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
                 ImGui::TableNextColumn();
                 ImGui::PushID(h);
                 ImGui::AlignTextToFramePadding();
-                ImGui::TextColored(col(th.text_muted), "%-13s", launcher_hotkey_name((LngHotkey)h));
-                ImGui::SameLine(px(130));
+                ImGui::TextColored(col(th.text_muted), "%s", launcher_hotkey_name((LngHotkey)h));
+                ImGui::SameLine(0.0f, px(th.spacing_sm));
                 const bool cap = m->hk_capturing && m->capture_hk == (LngHotkey)h;
                 const char* lbl = cap ? "[ press... ]"
                                 : m->hotkeys[h][0] ? m->hotkeys[h] : "(unbound)";
@@ -984,7 +991,6 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
         }
 
         launcher_platform_refresh_metrics(p);
-        g_scale = p->display_scale;
         if (applied_scale != p->display_scale) {
             apply_scale(*th, p->display_scale, font_path.c_str());
             applied_scale = p->display_scale;
