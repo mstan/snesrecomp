@@ -60,9 +60,16 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path) {
     io.Fonts->Clear();
     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 2;
     const float body = th.font_body * scale;
+    // Cover Basic Latin + Latin-1 AND General Punctuation so em/en dashes and
+    // curly quotes used in the game notes render as glyphs, not "?" tofu.
+    static const ImWchar kRanges[] = {
+        0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement
+        0x2010, 0x2027,   // dashes, curly quotes, ellipsis (General Punctuation)
+        0,
+    };
     bool loaded = false;
     if (font_path && font_path[0])
-        loaded = io.Fonts->AddFontFromFileTTF(font_path, body, &cfg) != nullptr;
+        loaded = io.Fonts->AddFontFromFileTTF(font_path, body, &cfg, kRanges) != nullptr;
     if (!loaded) { cfg.SizePixels = body; io.Fonts->AddFontDefault(&cfg); }
     io.Fonts->Build();
     ImGui_ImplOpenGL3_DestroyFontsTexture();
