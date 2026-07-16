@@ -62,7 +62,12 @@ typedef struct {
     const char* region;             // e.g. "USA"
     bool        widescreen_supported;
     bool        msu1_supported;
-    bool        saves_supported;     // sram_path != NULL
+    bool        saves_supported;     // sram_path != NULL -> show the SAVES panel
+    const char* sram_path;           // borrowed; NULL when the game has no SRAM
+    // Number of players the GAME actually supports. Mega Man X is 1-player, so
+    // the launcher must not show a dead Player 2 row. Games that support 2
+    // report 2 and the second row appears. Driven by data, never hardcoded.
+    int         player_count;
 
     // ---- ROM verification (synthesized in prototype; real impl uses crc32/sha256) ----
     bool     rom_present;

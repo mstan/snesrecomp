@@ -42,6 +42,11 @@ typedef struct SnesLauncherCGameInfo {
     const uint8_t (*known_sha256)[32];
     size_t         num_known_sha256;
     int            widescreen_supported;   /* hide Widescreen settings when 0 */
+    /* How many players the GAME supports (1 or 2). The launcher hides the
+     * Player 2 row entirely when this is 1 — e.g. Mega Man X is 1-player, so a
+     * P2 row is dead UI. 0 means "unset" and is treated as 2 for backward
+     * compatibility with callers that predate this field. */
+    int            num_players;
     int            msu1_supported;
     const char*    msu1_note;          /* shown under MSU-1 settings (which patch) */
     const char*    msu1_patch_path;

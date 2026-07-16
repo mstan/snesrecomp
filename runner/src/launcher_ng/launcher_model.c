@@ -53,9 +53,13 @@ void launcher_model_init(LauncherModel* m,
         m->widescreen_supported = game->widescreen_supported != 0;
         m->msu1_supported       = game->msu1_supported != 0;
         m->saves_supported      = game->sram_path != NULL;
+        m->sram_path            = game->sram_path;
+        /* 0 = unset (caller predates the field) -> assume 2 players. */
+        m->player_count         = game->num_players ? clampi(game->num_players, 1, 2) : 2;
     } else {
-        m->game_name = "Unknown Game";
-        m->region    = "";
+        m->game_name    = "Unknown Game";
+        m->region       = "";
+        m->player_count = 2;
     }
 
     if (io) m->s = *io;

@@ -11,6 +11,8 @@
 #include "launcher_platform.h"
 #include "launcher_theme.h"
 
+#include <SDL.h>
+
 #include <stdio.h>
 #include <string.h>
 
@@ -41,6 +43,16 @@ int main(int argc, char** argv) {
     gi.widescreen_supported = 0;             // MMX: hide widescreen (matches main.c:854)
     gi.msu1_supported       = 0;             // MMX: hide MSU-1 (matches main.c:855)
     gi.sram_path            = NULL;          // MMX: password game, no SAVES panel
+    gi.num_players          = 1;             // MMX: 1-player -> no Player 2 row
+
+    // Flip these to preview the 2-player + SRAM module set (what a Zelda/SMW
+    // style game contributes), e.g. LNG_DEMO_FULL=1.
+    const char* demo = SDL_getenv("LNG_DEMO_FULL");
+    if (demo && demo[0] == '1') {
+        gi.num_players = 2;
+        gi.sram_path   = "saves/demo.srm";
+        gi.widescreen_supported = 1;
+    }
 
     LauncherModel model;
     launcher_model_init(&model, &s, &gi, "mmx.sfc");
