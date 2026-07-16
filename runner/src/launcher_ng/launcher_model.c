@@ -23,11 +23,11 @@ static const char* kButtonNames[LNG_BTN_COUNT] = {
 static const char* kP1Defaults[LNG_BTN_COUNT] = {
     "Up", "Down", "Left", "Right", "X", "Z", "S", "A", "D", "C", "Enter", "RShift"
 };
+// Display labels for the 11 engine hotkeys (order == LngHotkey == [KeyMap] keys).
 static const char* kHotkeyNames[LNG_HK_COUNT] = {
-    "Pause", "Reset", "Fast-forward", "Fullscreen", "Screenshot", "Quit"
-};
-static const char* kHotkeyDefaults[LNG_HK_COUNT] = {
-    "P", "Ctrl+R", "Space", "Alt+Enter", "F12", "Ctrl+Q"
+    "Fullscreen", "Reset", "Pause", "Pause (dimmed)", "Fast-forward",
+    "Window bigger", "Window smaller", "Volume up", "Volume down",
+    "FPS readout", "Toggle renderer"
 };
 static const char* kViewNames[3] = { "Dashboard", "Settings", "Controller" };
 static const char* kSrcNames[3]  = { "None", "Keyboard", "Gamepad" };
@@ -80,12 +80,14 @@ void launcher_model_init(LauncherModel* m,
     m->action    = LNG_ACTION_NONE;
     m->cfg_player = 0;
 
+    // Placeholder display until launcher_binds_load() fills real values from
+    // keybinds.ini / config.ini [KeyMap].
     for (int b = 0; b < LNG_BTN_COUNT; ++b) {
         safe_copy(m->binds[0][b], sizeof(m->binds[0][b]), kP1Defaults[b]);
         safe_copy(m->binds[1][b], sizeof(m->binds[1][b]), "(unbound)");
     }
     for (int h = 0; h < LNG_HK_COUNT; ++h)
-        safe_copy(m->hotkeys[h], sizeof(m->hotkeys[h]), kHotkeyDefaults[h]);
+        m->hotkeys[h][0] = '\0';
 }
 
 void launcher_model_commit(const LauncherModel* m, SnesLauncherCSettings* io) {
@@ -229,28 +231,19 @@ void launcher_model_skip_cancel(LauncherModel* m) {
 
 void launcher_model_begin_capture(LauncherModel* m, LngButton b) {
     if (b < 0 || b >= LNG_BTN_COUNT) return;
-    m->capturing   = true;
-    m->capture_btn = b;
+    m->hk_capturing = false;
+    m->capturing    = true;
+    m->capture_btn  = b;
 }
+void launcher_model_cancel_capture(LauncherModel* m) { m->capturing = false; }
 
-void launcher_model_accept_capture(LauncherModel* m, const char* label) {
-    if (!m->capturing) return;
-    safe_copy(m->binds[m->cfg_player][m->capture_btn],
-              sizeof(m->binds[m->cfg_player][m->capture_btn]), label);
-    m->capturing = false;
+void launcher_model_begin_hk_capture(LauncherModel* m, LngHotkey h) {
+    if (h < 0 || h >= LNG_HK_COUNT) return;
+    m->capturing    = false;
+    m->hk_capturing = true;
+    m->capture_hk   = h;
 }
-
-void launcher_model_cancel_capture(LauncherModel* m) {
-    m->capturing = false;
-}
-
-void launcher_model_reset_binds(LauncherModel* m) {
-    const char** def = (m->cfg_player == 0) ? kP1Defaults : NULL;
-    for (int b = 0; b < LNG_BTN_COUNT; ++b)
-        safe_copy(m->binds[m->cfg_player][b], sizeof(m->binds[m->cfg_player][b]),
-                  def ? def[b] : "(unbound)");
-    m->capturing = false;
-}
+void launcher_model_cancel_hk_capture(LauncherModel* m) { m->hk_capturing = false; }
 
 const char* launcher_model_scale_label(const LauncherModel* m) {
     static char buf[8];

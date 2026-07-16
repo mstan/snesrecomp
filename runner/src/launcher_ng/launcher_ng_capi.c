@@ -12,6 +12,7 @@
 #include "launcher/launcher_capi.h"
 
 #include "launcher_backend.h"
+#include "launcher_binds.h"
 #include "launcher_model.h"
 #include "launcher_platform.h"
 #include "launcher_theme.h"
@@ -37,6 +38,7 @@ int snes_launcher_run_window(const char* window_title,
 
     LauncherModel model;
     launcher_model_init(&model, io, game, initial_rom);
+    launcher_binds_load(&model, game ? game->config_path : NULL);
 
     LauncherTheme theme = launcher_theme_default();
 

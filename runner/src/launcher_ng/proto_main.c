@@ -7,6 +7,7 @@
 // snes_launcher_run_window() implemented once in the engine.
 
 #include "launcher_backend.h"
+#include "launcher_binds.h"
 #include "launcher_model.h"
 #include "launcher_platform.h"
 #include "launcher_theme.h"
@@ -58,6 +59,7 @@ int main(int argc, char** argv) {
     const char* rom = SDL_getenv("LNG_ROM");
     if (!rom || !rom[0]) rom = "mmx.sfc";
     launcher_model_init(&model, &s, &gi, rom);
+    launcher_binds_load(&model, NULL);   // keybinds.ini + config.ini [KeyMap]
     fprintf(stderr, "[proto] rom=%s present=%d crc_match=%d sha_match=%d verified=%d size=%s\n",
             rom, model.rom_present, model.crc_match, model.sha_match,
             launcher_model_rom_verified(&model), model.rom_size);
