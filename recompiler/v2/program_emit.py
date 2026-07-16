@@ -126,6 +126,40 @@ def _cfg_name_maps(parsed):
             if entry.name and entry.name not in claimed_names:
                 name_for_pc.setdefault(pc24, entry.name)
                 claimed_names.add(entry.name)
+
+    # Cross-bank `name <addr> <friendly>` declarations (cfg_loader only
+    # auto-promotes IN-bank name decls into cfg.entries; a decl whose
+    # address lives in a different bank than the cfg that declares it stays
+    # declaration-only, see cfg_loader.load_bank_cfg). These are naming
+    # hints only here -- they never manufacture a root or change what the
+    # manifest analyzer considers reachable, unlike v1/v2_regen's
+    # cross-bank auto-promote into emit entries.
+    #
+    # The same PC is frequently named from multiple cfgs (a bank-switch
+    # wrapper reached via JSL from several callers, each with its own
+    # cross-bank `name` line for documentation). Two DISTINCT PCs can also
+    # claim the SAME friendly name -- e.g. a `func Foo <bodyPC>` in the
+    # owning bank plus a cross-bank `name <wrapperPC> Foo` in a caller's
+    # cfg, where Foo is really a PHB/PHK-wrapper around a differently
+    # named body (see CLAUDE.md's wrapper-bypass note and v2_regen.py's
+    # "Track friendly-name claims GLOBALLY" comment for the historical
+    # background: v2_regen promotes cross-bank names into cfg.entries
+    # guarded by the identical first-seen-wins rule implemented here).
+    # Emitting two C functions under the same symbol is a hard build
+    # break (MSVC C2084 same-TU / LNK2005 cross-TU), so claim names
+    # globally and deterministically: first PC to claim a name (by bank
+    # order, then by declaration order within a cfg) keeps it; any later,
+    # DISTINCT PC that would reuse an already-claimed name falls back to
+    # the emitter's synthetic bank_<BB>_<AAAA> name instead of colliding.
+    for bank, _path, cfg in parsed:
+        for nd in cfg.names:
+            pc24 = nd.addr_24 & 0xFFFFFF
+            if pc24 in name_for_pc:
+                continue
+            if not nd.name or nd.name in claimed_names:
+                continue
+            name_for_pc[pc24] = nd.name
+            claimed_names.add(nd.name)
     return (name_for_pc, canonical_for_pc, templates_exact,
             templates_any, cfg_by_bank)
 

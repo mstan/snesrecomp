@@ -1,7 +1,9 @@
 import json
 import pathlib
+import re
 import subprocess
 import sys
+from collections import Counter
 
 from v2.cfg_loader import load_bank_cfg
 from v2.program_analysis import VariantKey
@@ -302,3 +304,101 @@ def test_host_alias_dispatches_live_mx_and_missing_exact_slot_to_lle(tmp_path):
     assert "case 3: _r = I_RESET_M1X1(cpu);" in source
     # Wrong-width reset decodes are structural and intentionally remain LLE.
     assert "interp_tier_dispatch(cpu, 0x008000u)" in source
+
+
+def _function_def_counts(source: str) -> Counter:
+    return Counter(re.findall(
+        r'^RecompReturn\s+([A-Za-z_]\w*)\(CpuState \*cpu\) \{',
+        source, re.MULTILINE))
+
+
+def test_cross_bank_name_promoted_when_unclaimed(tmp_path):
+    """A cross-bank `name <addr> <friendly>` decl (the address's bank
+    differs from the declaring cfg's own bank -- cfg_loader only
+    auto-promotes IN-bank decls into cfg.entries, see
+    load_bank_cfg's "Auto-promote in-bank name decls" comment) still
+    earns its friendly emitted name when nothing else claims it,
+    restoring v1/v2_regen's cross-bank labeling for the manifest-driven
+    emitter."""
+    rom = bytearray([0xFF] * 0x8000)
+    rom[0:7] = bytes([0x20, 0x10, 0x80, 0x20, 0x00, 0x81, 0x60])  # I_RESET
+    rom[0x10] = 0xEA
+    rom[0x11] = 0x60  # $8010: NOP; RTS
+    rom[0x100] = 0xEA
+    rom[0x101] = 0x60  # $8100: NOP; RTS
+    rom[0x7FFC:0x7FFE] = bytes([0x00, 0x80])
+    rom[0x7FEA:0x7FEC] = bytes([0xFF, 0xFF])
+    rom[0x7FEE:0x7FF0] = bytes([0xFF, 0xFF])
+    rom_path = tmp_path / "game.sfc"
+    rom_path.write_bytes(rom)
+    cfg_dir = tmp_path / "recomp"
+    cfg_dir.mkdir()
+    (cfg_dir / "bank00.cfg").write_text(
+        "bank = 00\nfunc I_RESET 8000 end:8007 entry_mx:1,1\n",
+        encoding="utf-8")
+    # Declared in bank01's cfg but the address is physically in bank 00 --
+    # a cross-bank alias, same shape as a caller bank documenting a callee
+    # it JSLs into.
+    (cfg_dir / "bank01.cfg").write_text(
+        "bank = 01\nname 008100 UniqueCrossBankName\n", encoding="utf-8")
+    out_dir = tmp_path / "gen"
+
+    result = subprocess.run([
+        sys.executable, str(REPO / "tools" / "v2_emit.py"),
+        "--rom", str(rom_path), "--cfg-dir", str(cfg_dir),
+        "--out-dir", str(out_dir), "--no-host-root-scan",
+    ], text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    source = (out_dir / "bank00_v2.c").read_text(encoding="utf-8")
+    counts = _function_def_counts(source)
+    assert counts["UniqueCrossBankName_M1X1"] == 1
+    assert all(n == 1 for n in counts.values()), counts
+
+
+def test_cross_bank_name_collision_falls_back_to_synthetic_name(tmp_path):
+    """Two DISTINCT PCs racing for the same friendly name -- one via an
+    in-bank `func`, one via a cross-bank `name` decl in another bank's
+    cfg -- must never both emit under the same C symbol (MSVC C2084
+    same-TU / LNK2005 cross-TU). This is the exact shape of SMW's
+    LoadStripeImage regression: `func LoadStripeImage 85d2` in
+    bank00.cfg plus bank0c.cfg's `name 0084C8 LoadStripeImage` aliasing
+    a distinct wrapper PC. The first claimant (bank/decl order) keeps
+    the friendly name; the later, distinct PC falls back to the
+    emitter's synthetic bank_<BB>_<AAAA> name instead of colliding."""
+    rom = bytearray([0xFF] * 0x8000)
+    rom[0:7] = bytes([0x20, 0x10, 0x80, 0x20, 0x00, 0x81, 0x60])  # I_RESET
+    rom[0x10] = 0xEA
+    rom[0x11] = 0x60  # $8010: NOP; RTS (claims "Foo" via cfg `func`)
+    rom[0x100] = 0xEA
+    rom[0x101] = 0x60  # $8100: NOP; RTS (collides via cross-bank `name`)
+    rom[0x7FFC:0x7FFE] = bytes([0x00, 0x80])
+    rom[0x7FEA:0x7FEC] = bytes([0xFF, 0xFF])
+    rom[0x7FEE:0x7FF0] = bytes([0xFF, 0xFF])
+    rom_path = tmp_path / "game.sfc"
+    rom_path.write_bytes(rom)
+    cfg_dir = tmp_path / "recomp"
+    cfg_dir.mkdir()
+    (cfg_dir / "bank00.cfg").write_text(
+        "bank = 00\n"
+        "func I_RESET 8000 end:8007 entry_mx:1,1\n"
+        "func Foo 8010\n",
+        encoding="utf-8")
+    (cfg_dir / "bank01.cfg").write_text(
+        "bank = 01\nname 008100 Foo\n", encoding="utf-8")
+    out_dir = tmp_path / "gen"
+
+    result = subprocess.run([
+        sys.executable, str(REPO / "tools" / "v2_emit.py"),
+        "--rom", str(rom_path), "--cfg-dir", str(cfg_dir),
+        "--out-dir", str(out_dir), "--no-host-root-scan",
+    ], text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    source = (out_dir / "bank00_v2.c").read_text(encoding="utf-8")
+    counts = _function_def_counts(source)
+    # No symbol is defined more than once -- the actual build-breaking bug.
+    assert all(n == 1 for n in counts.values()), \
+        f"duplicate symbol definition(s): {counts}"
+    assert counts["Foo_M1X1"] == 1
+    assert counts["bank_00_8100_M1X1"] == 1
