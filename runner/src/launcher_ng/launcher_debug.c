@@ -123,6 +123,11 @@ static void synth_key(SDL_Keycode key) {
 void launcher_debug_step(LauncherPlatform* p, LauncherModel* m) {
     if (!g_active) return;
 
+    // Never clobber an action the UI already set this frame (e.g. PLAY -> LAUNCH);
+    // otherwise a script that clicks PLAY and then ends would overwrite LAUNCH
+    // with the script-exhausted QUIT below.
+    if (m->action != LNG_ACTION_NONE) return;
+
     if (g_wait_frames > 0) { --g_wait_frames; return; }
 
     if (g_cmd_index >= g_cmd_count) {   // script exhausted -> exit
