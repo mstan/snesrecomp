@@ -258,7 +258,10 @@ void end_panel() { ImGui::EndChild(); }
 // which reads as "dead space".
 bool begin_container(const char* id, ImVec2 size, ImGuiChildFlags flags = ImGuiChildFlags_None) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    return ImGui::BeginChild(id, size, flags);
+    // NavFlattened: these are pure layout wrappers, not focus targets — gamepad/
+    // keyboard nav should descend straight into the real controls instead of
+    // stopping on the (often mostly-empty) column box first.
+    return ImGui::BeginChild(id, size, flags, ImGuiWindowFlags_NavFlattened);
 }
 void end_container() { ImGui::EndChild(); ImGui::PopStyleColor(); }
 
@@ -300,12 +303,19 @@ void kv(const char* k, const char* v, const LauncherTheme& th,
 }
 void stepper(const char* id, int value, const char* suffix, int* out_delta) {
     ImGui::PushID(id);
-    if (ImGui::Button("-", ImVec2(px(32), 0))) *out_delta = -5;
-    ImGui::SameLine();
+    const float bh = px(30), fw = px(58);
+    if (ImGui::Button("-", ImVec2(px(32), bh))) *out_delta = -5;
+    ImGui::SameLine(0, px(6));
+    // value centered in a fixed-width field so "+" never shifts with the digits
+    char buf[32]; snprintf(buf, sizeof(buf), "%d%s", value, suffix);
+    float cx = ImGui::GetCursorPosX();
+    ImVec2 ts = ImGui::CalcTextSize(buf);
+    ImGui::SetCursorPosX(cx + (fw - ts.x) * 0.5f);
     ImGui::AlignTextToFramePadding();
-    ImGui::Text("%d%s", value, suffix);
-    ImGui::SameLine();
-    if (ImGui::Button("+", ImVec2(px(32), 0))) *out_delta = +5;
+    ImGui::TextUnformatted(buf);
+    ImGui::SameLine(0, 0);
+    ImGui::SetCursorPosX(cx + fw + px(6));
+    if (ImGui::Button("+", ImVec2(px(32), bh))) *out_delta = +5;
     ImGui::PopID();
 }
 
@@ -449,7 +459,7 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
         for (const char* q = sp; *q; ++q) if (*q == '/' || *q == '\\') base = q + 1;
         ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Saves");
+        ImGui::TextUnformatted("Save");
         ImGui::PopStyleColor();
         ImGui::SameLine(px(76));
         ImGui::AlignTextToFramePadding();
@@ -564,14 +574,31 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
     }
 }
 
+// Trim a path from the LEFT to fit max_w, prefixing "…" so the meaningful tail
+// stays visible (e.g. "…\build\bin-x64-Release\msu"). Same idea as the old hash
+// ellipsis.
+static const char* elide_left(const char* s, float max_w, char* out, size_t cap) {
+    if (ImGui::CalcTextSize(s).x <= max_w) { snprintf(out, cap, "%s", s); return out; }
+    size_t n = strlen(s);
+    for (size_t start = 1; start < n; ++start) {
+        char tmp[320];
+        snprintf(tmp, sizeof(tmp), "\xE2\x80\xA6%s", s + start);   // "…" + tail
+        if (ImGui::CalcTextSize(tmp).x <= max_w) { snprintf(out, cap, "%s", tmp); return out; }
+    }
+    snprintf(out, cap, "\xE2\x80\xA6");
+    return out;
+}
+
 void draw_settings(LauncherModel* m, const LauncherTheme& th) {
-    // Row 1: DISPLAY | AUDIO share the top band (12-col style grid) instead of
-    // two near-empty full-width bars stacked with dead space to the right.
+    // Row 1: DISPLAY | AUDIO share the top band. Both cards are pinned to the
+    // SAME fixed height so the row reads as one balanced band (AUDIO no longer
+    // grows taller than DISPLAY and forces the view to scroll).
     const float gap  = px(th.spacing_md);
     const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+    const float row_h = px(176.0f);
 
-    begin_container("set_l", ImVec2(half, 0), ImGuiChildFlags_AutoResizeY);
-    if (begin_panel("disp", 0)) {
+    begin_container("set_l", ImVec2(half, row_h));
+    if (begin_panel("disp", 0, true)) {
         eyebrow("DISPLAY");
         row_label("Window scale", th);
         if (ImGui::Button(launcher_model_scale_label(m), ImVec2(px(120), px(30))))
@@ -589,8 +616,8 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
 
     ImGui::SameLine(0, gap);
 
-    begin_container("set_r", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
-    if (begin_panel("audio", 0)) {
+    begin_container("set_r", ImVec2(0, row_h));
+    if (begin_panel("audio", 0, true)) {
         eyebrow("AUDIO");
         row_label("Sample rate", th);
         if (ImGui::Button(launcher_model_freq_label(m), ImVec2(px(120), px(30))))
@@ -599,16 +626,12 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
         int dv = 0; stepper("vol", m->s.volume, "%", &dv);
         if (dv) launcher_model_volume_delta(m, dv);
 
-        // MSU-1 joins the Audio card (only for games that support a pack). The
-        // per-patch note is a hover tooltip, not always-on body text.
+        // MSU-1: no header/subsection — just one line under Volume:
+        //   [x] Enable MSU-1 music (?)   …folder tail     [Browse]
         if (m->msu1_supported) {
-            ImGui::Dummy(ImVec2(0, px(8)));
-            ImGui::PushStyleColor(ImGuiCol_Separator, col(th.border));
-            ImGui::Separator();
-            ImGui::PopStyleColor();
-            ImGui::Dummy(ImVec2(0, px(8)));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(col(th.text_muted), "MSU-1 music");
+            bool on = m->s.msu1_enabled != 0;
+            if (ImGui::Checkbox("Enable MSU-1 music", &on))
+                launcher_model_toggle_msu1(m);
             if (m->msu1_note && m->msu1_note[0]) {
                 ImGui::SameLine(0, px(6));
                 ImGui::TextColored(col(th.accent), "(?)");
@@ -620,25 +643,16 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
                     ImGui::EndTooltip();
                 }
             }
-            ImGui::Dummy(ImVec2(0, px(4)));
-            bool on = m->s.msu1_enabled != 0;
-            if (ImGui::Checkbox("Enable CD-quality music", &on))
-                launcher_model_toggle_msu1(m);
-            ImGui::Dummy(ImVec2(0, px(4)));
-            ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Folder");
-            ImGui::PopStyleColor();
-            ImGui::SameLine(px(76));
-            const char* dir = m->s.msu1_dir[0] ? m->s.msu1_dir : "(not set)";
-            const float bw = px(88);
+            const float bw = px(78);
+            ImGui::SameLine(0, px(14));
             float avail = ImGui::GetContentRegionAvail().x - bw - px(th.spacing_sm);
-            if (avail < px(60)) avail = px(60);
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail);
-            ImGui::TextUnformatted(dir);
-            ImGui::PopTextWrapPos();
+            if (avail < px(50)) avail = px(50);
+            const char* dir = m->s.msu1_dir[0] ? m->s.msu1_dir : "(not set)";
+            char elided[192]; elide_left(dir, avail, elided, sizeof(elided));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(col(th.text_muted), "%s", elided);
             ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw);
-            if (ImGui::Button("Browse", ImVec2(bw, px(30)))) {
+            if (ImGui::Button("Browse", ImVec2(bw, px(28)))) {
                 char buf[512];
                 if (launcher_pick_folder("Select MSU-1 music folder", buf, sizeof(buf)))
                     launcher_model_set_msu1_dir(m, buf);
@@ -807,7 +821,12 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
 
     // ---- Marquee header: brand · GAME TITLE · subtitle .......... [nav] ----
     ImVec2 hp = ImGui::GetCursorScreenPos();
+    // Vertically center the brand mark against the two-line title block (drop it
+    // down ~9px so it doesn't sit high against the first line).
+    float hdr_top = ImGui::GetCursorPosY();
+    ImGui::SetCursorPosY(hdr_top + px(9));
     image_fit(g_brand, 44, 33); ImGui::SameLine(0, px(12));
+    ImGui::SetCursorPosY(hdr_top);
     ImGui::BeginGroup();
         ImGui::SetWindowFontScale(1.55f);
         ImGui::TextUnformatted(m->game_name);
