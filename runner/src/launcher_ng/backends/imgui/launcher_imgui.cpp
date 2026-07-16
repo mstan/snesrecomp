@@ -354,9 +354,9 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
 
     // Box art on top (centered), everything else BELOW it. Height is derived
     // from the space actually left after the metadata + button, so the art is
-    // as large as it can be WITHOUT pushing the SHA row out of the card.
+    // as large as it can be WITHOUT pushing the last row out of the card.
     {
-        const float reserve = px(276.0f);   // state line + 6 meta rows + button + pad
+        const float reserve = px(228.0f);   // state line + 4 meta rows + button + pad
         float art_h = ImGui::GetContentRegionAvail().y - reserve;
         if (art_h > px(300.0f)) art_h = px(300.0f);
         if (art_h < px(140.0f)) art_h = px(140.0f);
@@ -376,18 +376,27 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     }
     ImGui::Dummy(ImVec2(0, px(10)));
 
-    // Metadata table: label | value | check. The check sits in its own column,
-    // so it can never crowd the panel border like the old [MATCH] badge did.
+    // Metadata: what a PLAYER needs to know. Raw CRC32/SHA-256 digests are
+    // developer noise — the question a user has is "is my ROM good?", so the
+    // fingerprint check is surfaced as one PASS/FAIL row instead.
     if (ImGui::BeginTable("meta", 3, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(66));
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(76));
         ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(22));
-        kv_row("Region",  m->region[0] ? m->region : "SNES", th, false, false);
-        kv_row("File",    m->rom_file,    th, false, false);
-        kv_row("Size",    m->rom_size,    th, false, false);
-        kv_row("Header",  m->rom_header,  th, false, false);
-        kv_row("CRC32",   m->rom_crc_str, th, true, m->crc_match);
-        kv_row("SHA-256", m->rom_sha_str, th, true, m->sha_match);
+        kv_row("Region", m->region[0] ? m->region : "SNES", th, false, false);
+        kv_row("File",   m->rom_file, th, false, false);
+        kv_row("Size",   m->rom_size, th, false, false);
+        // One verification verdict (CRC32 + SHA-256 both must match).
+        const bool ok = m->crc_match && m->sha_match;
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+        ImGui::TextUnformatted("Checksum");
+        ImGui::PopStyleColor();
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ok ? col(th.good) : col(th.warn), "%s", ok ? "PASS" : "FAIL");
+        ImGui::TableNextColumn();
+        state_mark(ok, th);
         ImGui::EndTable();
     }
     ImGui::Dummy(ImVec2(0, px(12)));
@@ -404,17 +413,30 @@ void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill
     // One player card: PLAYER N label ABOVE its pad art, then the source
     // dropdown and Configure flush beneath — everything in one column, so
     // nothing floats out of alignment with its neighbour.
+    const float cw = px(196);   // shared control width => flush column
     auto player_card = [&](int p) {
         ImGui::PushID(p);
         ImGui::BeginGroup();
-            ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-            ImGui::Text("PLAYER %d", p + 1);
-            ImGui::PopStyleColor();
+            const float x0 = ImGui::GetCursorPosX();
+            // label centered over the card
+            {
+                char lbl[16]; snprintf(lbl, sizeof(lbl), "PLAYER %d", p + 1);
+                float w = ImGui::CalcTextSize(lbl).x;
+                ImGui::SetCursorPosX(x0 + (cw - w) * 0.5f);
+                ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+                ImGui::TextUnformatted(lbl);
+                ImGui::PopStyleColor();
+            }
             ImGui::Dummy(ImVec2(0, px(4)));
-            image_fit(g_pad, 116, 70);
+            // pad art centered over the card
+            {
+                const float aw = px(116);
+                ImGui::SetCursorPosX(x0 + (cw - aw) * 0.5f);
+                image_fit(g_pad, 116, 70);
+            }
             ImGui::Dummy(ImVec2(0, px(6)));
 
-            const float cw = px(196);   // shared control width => flush column
+            ImGui::SetCursorPosX(x0);
             ImGui::SetNextItemWidth(cw);
             if (ImGui::BeginCombo("##src", launcher_model_player_src_label(m, p))) {
                 if (ImGui::Selectable("None", m->s.player_src[p] == 0))
@@ -434,21 +456,37 @@ void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill
                 ImGui::EndCombo();
             }
             ImGui::Dummy(ImVec2(0, px(4)));
+            ImGui::SetCursorPosX(x0);
             if (ImGui::Button("Configure", ImVec2(cw, px(32)))) launcher_model_open_config(m, p);
             ImGui::Dummy(ImVec2(0, px(6)));
-            draw_dot(m->s.player_src[p] != 0, th.good, th.text_muted);
-            ImGui::TextColored(m->s.player_src[p] ? col(th.good) : col(th.text_muted),
-                               "%s", m->s.player_src[p] ? "connected" : "not assigned");
+            // status line, centered over the card
+            {
+                const bool on = m->s.player_src[p] != 0;
+                const char* st = on ? "connected" : "not assigned";
+                float w = px(10) + px(8) + ImGui::CalcTextSize(st).x;
+                ImGui::SetCursorPosX(x0 + (cw - w) * 0.5f);
+                draw_dot(on, th.good, th.text_muted);
+                ImGui::TextColored(on ? col(th.good) : col(th.text_muted), "%s", st);
+            }
         ImGui::EndGroup();
         ImGui::PopID();
     };
 
     // Player 2 only exists for 2-player games (model-driven, never hardcoded):
     // Mega Man X reports 1 and the row vanishes entirely.
-    player_card(0);
-    if (m->player_count >= 2) {
-        ImGui::SameLine(0, px(28));
-        player_card(1);
+    // The card group is centered in the panel so it never sits left-packed
+    // against a pool of dead space.
+    {
+        const float card_w = px(196);          // == the shared control width
+        const float gutter = px(28);
+        const int   n      = (m->player_count >= 2) ? 2 : 1;
+        const float group  = card_w * n + gutter * (n - 1);
+        const float availw = ImGui::GetContentRegionAvail().x;
+        if (availw > group)
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availw - group) * 0.5f);
+
+        player_card(0);
+        if (n == 2) { ImGui::SameLine(0, gutter); player_card(1); }
     }
 
     end_panel();
@@ -464,18 +502,19 @@ void draw_saves_panel(LauncherModel* m, const LauncherTheme& th) {
     // basename for display
     const char* base = p;
     for (const char* q = p; *q; ++q) if (*q == '/' || *q == '\\') base = q + 1;
-    if (ImGui::BeginTable("savemeta", 3, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(66));
-        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(22));
-        kv_row("File", base[0] ? base : "(none yet)", th, false, false);
-        ImGui::EndTable();
-    }
-    ImGui::Dummy(ImVec2(0, px(8)));
-    const float w = (ImGui::GetContentRegionAvail().x - px(th.spacing_sm)) * 0.5f;
-    ImGui::Button("Import", ImVec2(w, px(32)));
+    // Single compact row: file + the two actions, all on one line so the module
+    // stays short enough to stack under CONTROLLERS without clipping.
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("File");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(px(76));
+    ImGui::TextUnformatted(base[0] ? base : "(none yet)");
+    const float bw = px(96);
+    ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw*2 - px(th.spacing_sm));
+    ImGui::Button("Import", ImVec2(bw, px(30)));
     ImGui::SameLine(0, px(th.spacing_sm));
-    ImGui::Button("Clear", ImVec2(w, px(32)));
+    ImGui::Button("Clear", ImVec2(bw, px(30)));
     end_panel();
 }
 
@@ -492,7 +531,9 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
         end_container();
 
         ImGui::SameLine(0, gap);
-        begin_container("dash_r", ImVec2(0, 0));
+        // The side column scrolls independently, so stacking optional modules
+        // (SAVES, and future per-game panels) can never clip the last card.
+        begin_container("dash_r", ImVec2(0, 0), ImGuiChildFlags_None);
             // Cards hug their content; the column doesn't stretch a single
             // player card into a mostly-empty box.
             draw_controllers_panel(m, th, false);
