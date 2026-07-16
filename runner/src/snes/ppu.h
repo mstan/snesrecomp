@@ -12,6 +12,8 @@
 #include "saveload.h"
 
 typedef struct Ppu Ppu;
+typedef void PpuWidescreenLineEnhancer(Ppu *ppu, uint y, bool sub,
+                                       void *context);
 
 typedef struct BgLayer {
   uint16_t xhScroll;
@@ -216,7 +218,9 @@ struct Ppu {
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
 
-  void *pad2;
+  // Host-only widescreen state; excluded from savestates and cleared by reset.
+  PpuWidescreenLineEnhancer *widescreenLineEnhancer;
+  void *widescreenLineEnhancerContext;
 
   // -- START OF SNAPSHOT, 0x10420 bytes
   uint16_t cgram[0x100];
@@ -299,6 +303,13 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
+
+// Replace stale BG1 tilemap pixels in widened side margins before final
+// composition. The callback is host-only and runs independently for main and
+// subscreen buffers.
+void PpuSetWidescreenLineEnhancer(Ppu *ppu,
+                                  PpuWidescreenLineEnhancer *enhancer,
+                                  void *context);
 
 // Renderer-neutral host-overlay extraction (opt-in; see
 // docs/HOST_OVERLAY_EXTRACTION.md). Default behavior is unchanged: with no
