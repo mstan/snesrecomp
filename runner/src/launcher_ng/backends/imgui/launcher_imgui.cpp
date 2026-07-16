@@ -329,7 +329,36 @@ void hero_boxart_centered(const LauncherTexture& t, float box_h, float avail_w) 
         dl->AddRect(mn, mx, imcol(th.border), px(4.0f), 0, px(1.0f));
         ImGui::Dummy(ImVec2(iw, ih));
     } else {
-        ImGui::Dummy(ImVec2(avail_w, bh));
+        // No box art was supplied for this game — draw a tasteful SNES-cartridge
+        // placeholder so the GAME card never shows dead space. Game-agnostic: any
+        // title that declares no boxart.tga gets this instead of an empty slot.
+        float iw = bh * 0.72f;               // match a box-art portrait aspect
+        if (iw > avail_w) iw = avail_w;
+        float ih = bh;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail_w - iw) * 0.5f);  // center
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImVec2 mn = p, mx = ImVec2(p.x + iw, p.y + ih);
+        dl->AddRectFilled(mn, mx, imcol(th.panel_hovered), px(6.0f));
+        dl->AddRect(mn, mx, imcol(th.border), px(6.0f), 0, px(1.0f));
+
+        // cartridge body, centered in the slot
+        float cw = iw * 0.52f, ch = cw * 1.04f;
+        float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
+        ImVec2 bmn = ImVec2(cx - cw * 0.5f, cy - ch * 0.5f);
+        ImVec2 bmx = ImVec2(cx + cw * 0.5f, cy + ch * 0.5f);
+        dl->AddRectFilled(bmn, bmx, imcol(th.accent_dim), cw * 0.10f);
+        // top ridges
+        for (int i = 0; i < 3; i++) {
+            float rx = bmn.x + cw * (0.20f + i * 0.24f);
+            dl->AddRectFilled(ImVec2(rx, bmn.y - ch * 0.05f),
+                              ImVec2(rx + cw * 0.12f, bmn.y + ch * 0.10f),
+                              imcol(th.accent), cw * 0.03f);
+        }
+        // recessed label window
+        dl->AddRectFilled(ImVec2(bmn.x + cw * 0.16f, bmn.y + ch * 0.30f),
+                          ImVec2(bmx.x - cw * 0.16f, bmx.y - ch * 0.16f),
+                          imcol(th.panel), cw * 0.04f);
+        ImGui::Dummy(ImVec2(iw, ih));
     }
 }
 
