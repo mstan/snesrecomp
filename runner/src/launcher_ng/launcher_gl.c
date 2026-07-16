@@ -8,6 +8,12 @@
 #define GL_CLAMP_TO_EDGE 0x812F   // GL 1.2 token; runtime driver supports it
 #endif
 
+// STB_IMAGE_STATIC gives the launcher its OWN private (static) stb_image, so it
+// never collides with a host that also embeds stb_image (the MMX game's
+// glsl_shader.c does — sharing one impl caused LNK2005, and relying on the
+// host's format config left TGA box art unloadable). Static = self-contained
+// impl with our own STBI_ONLY_* set, identical behaviour standalone or in-process.
+#define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_TGA
 #define STBI_ONLY_PNG
