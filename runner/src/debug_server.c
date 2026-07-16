@@ -1409,6 +1409,51 @@ static volatile int s_fdump_target = -1;
 static volatile int s_fdump_done   = -1;
 static char s_fdump_path[512];
 
+typedef struct DebugPpuHostState {
+    uint8_t *render_buffer;
+    uint32_t render_pitch, render_flags;
+    uint8_t extra_left_cur, extra_right_cur, extra_left_right;
+    uint8_t extra_bottom_cur;
+    PpuWidescreenLineEnhancer *enhancer;
+    void *enhancer_context;
+} DebugPpuHostState;
+
+static void DebugPpuSaveHostState(Ppu *ppu, DebugPpuHostState *state) {
+    state->render_buffer = ppu->renderBuffer;
+    state->render_pitch = ppu->renderPitch;
+    state->render_flags = ppu->renderFlags;
+    state->extra_left_cur = ppu->extraLeftCur;
+    state->extra_right_cur = ppu->extraRightCur;
+    state->extra_left_right = ppu->extraLeftRight;
+    state->extra_bottom_cur = ppu->extraBottomCur;
+    state->enhancer = ppu->widescreenLineEnhancer;
+    state->enhancer_context = ppu->widescreenLineEnhancerContext;
+}
+
+static void DebugPpuRestoreHostState(Ppu *ppu,
+                                     const DebugPpuHostState *state) {
+    ppu->renderBuffer = state->render_buffer;
+    ppu->renderPitch = state->render_pitch;
+    ppu->renderFlags = state->render_flags;
+    ppu->extraLeftCur = state->extra_left_cur;
+    ppu->extraRightCur = state->extra_right_cur;
+    ppu->extraLeftRight = state->extra_left_right;
+    ppu->extraBottomCur = state->extra_bottom_cur;
+    PpuSetWidescreenLineEnhancer(ppu, state->enhancer,
+                                 state->enhancer_context);
+}
+
+static void DebugPpuRenderAuthentic(uint8_t *pixels) {
+    DebugPpuHostState state;
+    DebugPpuSaveHostState(g_ppu, &state);
+    PpuBeginDrawing(g_ppu, pixels, 256 * 4, 0);
+    PpuSetExtraSpace(g_ppu, 0);
+    PpuSetWidescreenLineEnhancer(g_ppu, NULL, NULL);
+    for (int i = 0; i <= 224; i++)
+        ppu_runLine(g_ppu, i);
+    DebugPpuRestoreHostState(g_ppu, &state);
+}
+
 void debug_server_record_frame(int frame) {
     extern uint8_t g_ram[];
 
@@ -1425,12 +1470,7 @@ void debug_server_record_frame(int frame) {
 
     if (s_fdump_target >= 0 && frame == s_fdump_target && g_ppu) {
         static uint8_t fdump_scr[256 * 4 * 240];
-        uint8_t *saved_rb = g_ppu->renderBuffer;
-        uint32_t saved_rp = g_ppu->renderPitch;
-        PpuBeginDrawing(g_ppu, fdump_scr, 256 * 4, 0);
-        for (int i = 0; i <= 224; i++) ppu_runLine(g_ppu, i);
-        g_ppu->renderBuffer = saved_rb;
-        g_ppu->renderPitch  = saved_rp;
+        DebugPpuRenderAuthentic(fdump_scr);
         FILE *f = fopen(s_fdump_path, "wb");
         if (f) { fwrite(fdump_scr, 1, 256 * 224 * 4, f); fclose(f); }
         s_fdump_target = -1;
