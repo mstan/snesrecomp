@@ -188,6 +188,7 @@ bool neon_cta(const char* id, const char* label, ImVec2 size) {
     bool clk = ImGui::InvisibleButton(id, size);
     bool hov = ImGui::IsItemHovered();
     bool act = ImGui::IsItemActive();
+    bool foc = ImGui::IsItemFocused();   // gamepad/keyboard nav focus
     ImVec2 mn = p, mx = ImVec2(p.x + size.x, p.y + size.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float r = px(th.radius_sm);
@@ -197,6 +198,12 @@ bool neon_cta(const char* id, const char* label, ImVec2 size) {
     LngColor bot = act ? th.accent_dim : th.accent_dim;
     grad_rect(dl, mn, mx, r, top, bot);
     dl->AddRect(mn, mx, imcol(th.accent, hov ? 0.9f : 0.5f), r, 0, px(1.0f));  // crisp edge
+    // InvisibleButton draws no nav highlight itself — paint the cyan focus ring
+    // when nav-focused so the CTA reads as selectable via controller/keyboard.
+    if (foc) {
+        ImVec2 om = ImVec2(mn.x - px(2), mn.y - px(2)), ox = ImVec2(mx.x + px(2), mx.y + px(2));
+        dl->AddRect(om, ox, imcol(th.focus_ring), r + px(2), 0, px(th.focus_ring_width));
+    }
 
     // centered "▶ label"
     float th_h = ImGui::GetTextLineHeight();
@@ -249,13 +256,9 @@ void eyebrow(const char* s) { eyebrow_tracked(s); }
 bool begin_panel(const char* id, float logical_w = 0.0f, bool fill_h = false) {
     ImGuiChildFlags flags = ImGuiChildFlags_Borders;
     if (!fill_h) flags |= ImGuiChildFlags_AutoResizeY;
-    // NavFlattened: the card is a visual grouping, not a separate nav scope —
-    // flatten so gamepad/keyboard focus reaches the card's controls directly
-    // (a card left un-flattened becomes an un-enterable nav island). NoScrollbar:
-    // cards never scroll (the body container owns scrolling); sizing keeps
-    // content in-bounds, so suppress the stray scrollbar a tight fit would draw.
-    ImGuiWindowFlags wflags = ImGuiWindowFlags_NavFlattened |
-                              ImGuiWindowFlags_NoScrollbar |
+    // NoScrollbar: cards never scroll (the body container owns scrolling) — sizing
+    // keeps content in-bounds, so suppress the stray scrollbar a tight fit draws.
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoScrollbar |
                               ImGuiWindowFlags_NoScrollWithMouse;
     return ImGui::BeginChild(id, ImVec2(px(logical_w), 0.0f), flags, wflags);
 }
@@ -266,10 +269,7 @@ void end_panel() { ImGui::EndChild(); }
 // which reads as "dead space".
 bool begin_container(const char* id, ImVec2 size, ImGuiChildFlags flags = ImGuiChildFlags_None) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    // NavFlattened: these are pure layout wrappers, not focus targets — gamepad/
-    // keyboard nav should descend straight into the real controls instead of
-    // stopping on the (often mostly-empty) column box first.
-    return ImGui::BeginChild(id, size, flags, ImGuiWindowFlags_NavFlattened);
+    return ImGui::BeginChild(id, size, flags);
 }
 void end_container() { ImGui::EndChild(); ImGui::PopStyleColor(); }
 
