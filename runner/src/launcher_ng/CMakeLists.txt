@@ -94,6 +94,9 @@ add_library(launcher_ng_core STATIC
     ${LNG_DIR}/launcher_files.c
     ${LNG_DIR}/launcher_debug.c
     ${LNG_DIR}/third_party/tinyfiledialogs.c
+    # engine ROM-fingerprint helpers (in-process these come from the game build)
+    ${RUNNER_SRC}/crc32.c
+    ${RUNNER_SRC}/sha256.c
 )
 target_include_directories(launcher_ng_core PUBLIC ${LNG_DIR} ${RUNNER_SRC})
 target_link_libraries(launcher_ng_core PUBLIC ${LNG_SDL_LIB} ${LNG_GL_LIBS})

@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     gi.name                 = "Mega Man X";
     gi.region               = "USA";
     gi.has_expected_crc     = 1;
-    gi.expected_crc         = 0x1B4B2E9Cu;   // representative; real value verified in prod
+    gi.expected_crc         = 0xDED53C64u;   // real USA mmx.sfc CRC32 (post-header)
     gi.widescreen_supported = 0;             // MMX: hide widescreen (matches main.c:854)
     gi.msu1_supported       = 0;             // MMX: hide MSU-1 (matches main.c:855)
     gi.sram_path            = NULL;          // MMX: password game, no SAVES panel
@@ -55,7 +55,12 @@ int main(int argc, char** argv) {
     }
 
     LauncherModel model;
-    launcher_model_init(&model, &s, &gi, "mmx.sfc");
+    const char* rom = SDL_getenv("LNG_ROM");
+    if (!rom || !rom[0]) rom = "mmx.sfc";
+    launcher_model_init(&model, &s, &gi, rom);
+    fprintf(stderr, "[proto] rom=%s present=%d crc_match=%d sha_match=%d verified=%d size=%s\n",
+            rom, model.rom_present, model.crc_match, model.sha_match,
+            launcher_model_rom_verified(&model), model.rom_size);
 
     LauncherTheme theme = launcher_theme_default();
 

@@ -69,7 +69,13 @@ typedef struct {
     // report 2 and the second row appears. Driven by data, never hardcoded.
     int         player_count;
 
-    // ---- ROM verification (synthesized in prototype; real impl uses crc32/sha256) ----
+    // ---- ROM verification ----
+    // Expected fingerprint, borrowed from the game's C-ABI struct.
+    uint32_t        expected_crc;
+    int             has_expected_crc;
+    const uint8_t (*known_sha256)[32];
+    size_t          num_known_sha256;
+
     bool     rom_present;
     char     rom_full[512];          // absolute path (what we hand to the game)
     char     rom_file[128];          // basename for display, e.g. "mmx.sfc"
@@ -116,6 +122,11 @@ void launcher_model_set_rom(LauncherModel* m, const char* path);
 
 // Full path of the currently selected ROM ("" when none).
 const char* launcher_model_rom_path(const LauncherModel* m);
+
+// True iff a ROM is loaded and every fingerprint the game provides (CRC and/or
+// SHA-256) matches. If the game provides no fingerprint at all, returns false
+// (we can't vouch for an unknown ROM).
+bool launcher_model_rom_verified(const LauncherModel* m);
 
 // ---- navigation ----
 void launcher_model_set_view(LauncherModel* m, LngView v);
