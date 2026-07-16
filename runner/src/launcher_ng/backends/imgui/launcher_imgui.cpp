@@ -185,7 +185,11 @@ void draw_dot(bool on, const LngColor& good, const LngColor& off) {
 bool neon_cta(const char* id, const char* label, ImVec2 size) {
     const LauncherTheme& th = *g_th;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    bool clk = ImGui::InvisibleButton(id, size);
+    // EnableNav is REQUIRED: ImGui::InvisibleButton() adds ImGuiItemFlags_NoNav by
+    // default, which silently excludes the CTA from gamepad/keyboard nav — that was
+    // why PLAY could never be focused at runtime (only via boot SetItemDefaultFocus)
+    // while normal widgets (Skip, Settings) always could.
+    bool clk = ImGui::InvisibleButton(id, size, ImGuiButtonFlags_EnableNav);
     bool hov = ImGui::IsItemHovered();
     bool act = ImGui::IsItemActive();
     bool foc = ImGui::IsItemFocused();   // gamepad/keyboard nav focus
@@ -256,8 +260,7 @@ void eyebrow(const char* s) { eyebrow_tracked(s); }
 bool begin_panel(const char* id, float logical_w = 0.0f, bool fill_h = false) {
     ImGuiChildFlags flags = ImGuiChildFlags_Borders;
     if (!fill_h) flags |= ImGuiChildFlags_AutoResizeY;
-    // NoScrollbar: cards never scroll (the body container owns scrolling) — sizing
-    // keeps content in-bounds, so suppress the stray scrollbar a tight fit draws.
+    // NoScrollbar: cards never scroll (sizing keeps content in-bounds).
     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoScrollbar |
                               ImGuiWindowFlags_NoScrollWithMouse;
     return ImGui::BeginChild(id, ImVec2(px(logical_w), 0.0f), flags, wflags);
@@ -267,9 +270,10 @@ void end_panel() { ImGui::EndChild(); }
 // A layout container: no fill, no border. Without this a nested child inherits
 // ChildBg and paints a large panel-coloured rectangle behind the real cards,
 // which reads as "dead space".
-bool begin_container(const char* id, ImVec2 size, ImGuiChildFlags flags = ImGuiChildFlags_None) {
+bool begin_container(const char* id, ImVec2 size, ImGuiChildFlags flags = ImGuiChildFlags_None,
+                     ImGuiWindowFlags wflags = 0) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    return ImGui::BeginChild(id, size, flags);
+    return ImGui::BeginChild(id, size, flags, wflags);
 }
 void end_container() { ImGui::EndChild(); ImGui::PopStyleColor(); }
 
@@ -787,6 +791,18 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
         if (ImGui::Checkbox("Skip launcher on boot", &skip))
             launcher_model_request_skip_toggle(m);
     }
+    // Back/Cancel (Circle/O on a DualSense, B on Xbox, Backspace on keyboard) AND
+    // Start re-home the focus ring to PLAY. Directional nav through the card child
+    // windows is easy to wander out of with no way back; these are the forcing
+    // functions that snap the highlight back to the primary action. Start
+    // deliberately only HIGHLIGHTS PLAY (does not launch), so it can't fire the
+    // game by accident — the launch is the activate button (A/Cross) on the
+    // focused PLAY, or a mouse click. SetKeyboardFocusHere() targets the NEXT
+    // submitted item — PLAY's button.
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Backspace, false))
+        ImGui::SetKeyboardFocusHere();
     ImGui::SetCursorScreenPos(ImVec2(origin.x + fullw - play_w, cta_y));
     if (neon_cta("##play", "PLAY", ImVec2(play_w, play_h)))
         m->action = LNG_ACTION_LAUNCH;
