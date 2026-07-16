@@ -45,6 +45,38 @@ typedef struct PpuPixelPrioBufs {
   PpuZbufType data[kPpuBufWidth];
 } PpuPixelPrioBufs;
 
+/* Renderer-neutral host-overlay extraction. BG source values deliberately
+ * match the PPU layer indices; OBJ is the fifth screen layer. Each source can
+ * own one screen-space capture rectangle and one full-frame ARGB destination
+ * surface. A caller can crop several independently placed graphics from one
+ * captured bounding rectangle after scanout. */
+typedef enum PpuOverlaySource {
+  kPpuOverlaySource_Bg1 = 0,
+  kPpuOverlaySource_Bg2 = 1,
+  kPpuOverlaySource_Bg3 = 2,
+  kPpuOverlaySource_Bg4 = 3,
+  kPpuOverlaySource_Obj = 4,
+  kPpuOverlaySource_Count = 5,
+} PpuOverlaySource;
+
+enum {
+  /* Do not merge captured pixels back into either main or subscreen. The host
+   * can then reinsert them without a duplicate remaining in renderBuffer. */
+  kPpuOverlayFlag_RemoveFromGame = 1,
+};
+
+typedef struct PpuOverlayCapture {
+  /* SNES screen coordinates after scroll/window/mosaic processing. X may be
+   * negative or exceed 255 when a widescreen margin is active. Endpoints are
+   * exclusive. y uses visible output coordinates (0 is the first scanline). */
+  int16_t x0, x1;
+  int16_t y0, y1;
+  uint8_t flags;
+  /* OBJ-only selector. A zero count captures no objects. Games validate any
+   * semantic identity (HUD icon, portrait, etc.) before supplying the range. */
+  uint8_t oamFirst, oamCount;
+} PpuOverlayCapture;
+
 enum {
   kPpuRenderFlags_NewRenderer = 1,
   // Render mode7 upsampled by 4x4
@@ -173,8 +205,13 @@ struct Ppu {
   uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
+  /* Per-source isolated priority pixels for generic host-overlay captures. */
+  PpuPixelPrioBufs overlayBuffers[kPpuOverlaySource_Count];
+  PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];
   uint32_t renderPitch;
   uint8_t *renderBuffer;
+  uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
+  uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
   uint8_t brightnessMult[32 + 31];
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
@@ -262,6 +299,35 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
+
+// Renderer-neutral host-overlay extraction (opt-in; see
+// docs/HOST_OVERLAY_EXTRACTION.md). Default behavior is unchanged: with no
+// surface bound and no capture rectangle set, every source is a deterministic
+// no-op and the layer stays composited into renderBuffer exactly as before.
+
+// Clear/bind persistent transparent ARGB host-overlay surfaces. Bindings survive
+// ppu_reset; capture rectangles do not and are configured by game policy each
+// frame. Surfaces are 256-kPpuBufWidth pixels wide and use the same full-frame
+// coordinate system as renderBuffer.
+// Passing NULL disables extraction for that source. Call ClearBindings once
+// after PPU creation so a frontend can explicitly own all optional surfaces.
+void PpuClearOverlayBindings(Ppu *ppu);
+bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
+                           uint8_t *pixels, size_t pitch);
+
+// Clear per-frame capture policy, then configure an arbitrary screen-space
+// rectangle from BG1-BG4 or OBJ. With RemoveFromGame, pixels inside the rect
+// are omitted from both main and subscreen while still exported with palette,
+// transparency, windows, mosaic, and master brightness resolved. Coverage:
+// Mode 1 BG1/BG2 (4bpp) and BG3 (2bpp), and Mode 7 BG1; other modes/layers
+// leave the source inactive.
+void PpuClearOverlayCaptures(Ppu *ppu);
+bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
+                          int x, int y, int width, int height, uint8_t flags);
+
+// Select a contiguous OAM slot range for an already configured OBJ capture.
+// The game remains responsible for validating what those slots represent.
+bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
