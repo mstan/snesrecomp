@@ -251,10 +251,13 @@ bool begin_container(const char* id, ImVec2 size, ImGuiChildFlags flags = ImGuiC
 }
 void end_container() { ImGui::EndChild(); ImGui::PopStyleColor(); }
 
-// One metadata row inside a 3-column table (label | value | badge). Robust
-// alignment regardless of how deeply the table is nested/indented.
+void state_mark(bool ok, const LauncherTheme& th);   // fwd
+
+// One metadata row inside a 3-column table: label | value | optional check.
+// `show_mark` puts a mint check / amber cross in its own column instead of a
+// text badge, so it can never crowd the panel edge.
 void kv_row(const char* k, const char* v, const LauncherTheme& th,
-            const char* badge, bool good) {
+            bool show_mark, bool ok) {
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
     ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
@@ -263,11 +266,7 @@ void kv_row(const char* k, const char* v, const LauncherTheme& th,
     ImGui::TableNextColumn();
     ImGui::TextUnformatted(v);
     ImGui::TableNextColumn();
-    if (badge) {
-        ImGui::PushStyleColor(ImGuiCol_Text, col(good ? th.good : th.warn));
-        ImGui::Text("[%s]", badge);
-        ImGui::PopStyleColor();
-    }
+    if (show_mark) state_mark(ok, th);
 }
 
 // Key/value row, drawn full width: muted label column, value, and an optional
@@ -307,78 +306,116 @@ void row_label(const char* text, const LauncherTheme& th) {
 }
 
 // ---- views -----------------------------------------------------------------
-// Box art drawn as a hero: a tall cover with a soft phosphor glow + framed
-// edge, like a cartridge under display glass. Fills the panel's left column.
-void hero_boxart(const LauncherTexture& t, float box_w, float box_h) {
+// Box art, centered, framed. No neon glow — the art is photographic content and
+// a violet halo around it reads as a bug, not a design. Glow is reserved for
+// the PLAY CTA, where it means "this is the action".
+void hero_boxart_centered(const LauncherTexture& t, float box_h, float avail_w) {
     const LauncherTheme& th = *g_th;
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float bw = px(box_w), bh = px(box_h);
+    float bh = px(box_h);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (t.id && t.w > 0 && t.h > 0) {
-        float s = (bw / t.w < bh / t.h) ? bw / (float)t.w : bh / (float)t.h;
-        float iw = t.w * s, ih = t.h * s;
+        float s = bh / (float)t.h;
+        float iw = t.w * s, ih = bh;
+        if (iw > avail_w) { s = avail_w / (float)t.w; iw = avail_w; ih = t.h * s; }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail_w - iw) * 0.5f);  // center
+        ImVec2 p = ImGui::GetCursorScreenPos();
         ImVec2 mn = p, mx = ImVec2(p.x + iw, p.y + ih);
-        glow_rect(dl, mn, mx, px(3.0f), th.accent, 0.7f, 5);
         dl->AddImageRounded(tid(t), mn, mx, ImVec2(0,0), ImVec2(1,1),
-                            imcol(lng_rgba(1,1,1,1)), px(3.0f));
-        dl->AddRect(mn, mx, imcol(th.border, 0.9f), px(3.0f), 0, px(1.0f));
+                            imcol(lng_rgba(1,1,1,1)), px(4.0f));
+        dl->AddRect(mn, mx, imcol(th.border), px(4.0f), 0, px(1.0f));
         ImGui::Dummy(ImVec2(iw, ih));
     } else {
-        dl->AddRectFilled(p, ImVec2(p.x+bw, p.y+bh), imcol(th.control), px(3.0f));
-        ImGui::Dummy(ImVec2(bw, bh));
+        ImGui::Dummy(ImVec2(avail_w, bh));
     }
+}
+
+// A verified/failed state marker: mint check or amber cross. Replaces the
+// [MATCH] badge that crowded the panel edge.
+void state_mark(bool ok, const LauncherTheme& th) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float s = ImGui::GetTextLineHeight();
+    ImU32 c = imcol(ok ? th.good : th.warn);
+    float y = p.y + s * 0.5f;
+    if (ok) {
+        dl->AddLine(ImVec2(p.x + s*0.16f, y), ImVec2(p.x + s*0.40f, y + s*0.26f), c, px(2.0f));
+        dl->AddLine(ImVec2(p.x + s*0.40f, y + s*0.26f), ImVec2(p.x + s*0.84f, y - s*0.26f), c, px(2.0f));
+    } else {
+        dl->AddLine(ImVec2(p.x + s*0.22f, y - s*0.24f), ImVec2(p.x + s*0.78f, y + s*0.24f), c, px(2.0f));
+        dl->AddLine(ImVec2(p.x + s*0.78f, y - s*0.24f), ImVec2(p.x + s*0.22f, y + s*0.24f), c, px(2.0f));
+    }
+    ImGui::Dummy(ImVec2(s, s));
 }
 
 void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = false) {
     if (!begin_panel("game", 0, fill_h)) { end_panel(); return; }
     eyebrow("GAME");
-    // Hero: tall box art on the left, identity + verification on the right.
-    hero_boxart(g_boxart, 168, 234);
-    ImGui::SameLine(0, px(18));
-    ImGui::BeginGroup();
-        // region chip
-        ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent));
-        ImGui::TextUnformatted(m->region[0] ? m->region : "SNES");
-        ImGui::PopStyleColor();
-        if (m->rom_present) { draw_check(th.good); ImGui::TextColored(col(th.good), "ROM verified"); }
-        else                { ImGui::TextColored(col(th.warn), "No ROM loaded"); }
-        ImGui::Dummy(ImVec2(0, px(6)));
-        // ROM metadata as a borderless table — robust column alignment inside
-        // this indented column (manual SameLine math breaks here).
-        if (ImGui::BeginTable("meta", 3,
-                ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoClip)) {
-            ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(58));
-            ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, px(112));
-            ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(54));
-            kv_row("File",    m->rom_file,    th, nullptr, true);
-            kv_row("Size",    m->rom_size,    th, nullptr, true);
-            kv_row("Header",  m->rom_header,  th, nullptr, true);
-            kv_row("CRC32",   m->rom_crc_str, th, m->crc_match ? "MATCH" : "DIFF", m->crc_match);
-            kv_row("SHA-256", m->rom_sha_str, th, m->sha_match ? "MATCH" : nullptr, m->sha_match);
-            ImGui::EndTable();
-        }
-        ImGui::Dummy(ImVec2(0, px(10)));
-        if (ImGui::Button("Change ROM", ImVec2(px(150), px(32))))
-            if (launcher_pick_rom(g_pick_buf, sizeof(g_pick_buf)))
-                launcher_model_set_rom(m, g_pick_buf);
-    ImGui::EndGroup();
+    const float availw = ImGui::GetContentRegionAvail().x;
+
+    // Box art on top (centered), everything else BELOW it. Height is derived
+    // from the space actually left after the metadata + button, so the art is
+    // as large as it can be WITHOUT pushing the SHA row out of the card.
+    {
+        const float reserve = px(276.0f);   // state line + 6 meta rows + button + pad
+        float art_h = ImGui::GetContentRegionAvail().y - reserve;
+        if (art_h > px(300.0f)) art_h = px(300.0f);
+        if (art_h < px(140.0f)) art_h = px(140.0f);
+        hero_boxart_centered(g_boxart, art_h / g_scale, availw);
+    }
+    ImGui::Dummy(ImVec2(0, px(10)));
+
+    // Region + verification state, centered under the art.
+    {
+        char line[96];
+        snprintf(line, sizeof(line), "%s", m->rom_present ? "ROM verified" : "No ROM loaded");
+        float w = ImGui::GetTextLineHeight() + px(6) + ImGui::CalcTextSize(line).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availw - w) * 0.5f);
+        state_mark(m->rom_present, th);
+        ImGui::SameLine(0, px(6));
+        ImGui::TextColored(m->rom_present ? col(th.good) : col(th.warn), "%s", line);
+    }
+    ImGui::Dummy(ImVec2(0, px(10)));
+
+    // Metadata table: label | value | check. The check sits in its own column,
+    // so it can never crowd the panel border like the old [MATCH] badge did.
+    if (ImGui::BeginTable("meta", 3, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(66));
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(22));
+        kv_row("Region",  m->region[0] ? m->region : "SNES", th, false, false);
+        kv_row("File",    m->rom_file,    th, false, false);
+        kv_row("Size",    m->rom_size,    th, false, false);
+        kv_row("Header",  m->rom_header,  th, false, false);
+        kv_row("CRC32",   m->rom_crc_str, th, true, m->crc_match);
+        kv_row("SHA-256", m->rom_sha_str, th, true, m->sha_match);
+        ImGui::EndTable();
+    }
+    ImGui::Dummy(ImVec2(0, px(12)));
+    if (ImGui::Button("Change ROM", ImVec2(availw, px(34))))
+        if (launcher_pick_rom(g_pick_buf, sizeof(g_pick_buf)))
+            launcher_model_set_rom(m, g_pick_buf);
     end_panel();
 }
 
 void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = false) {
     if (!begin_panel("controllers", 0, fill_h)) { end_panel(); return; }
     eyebrow("CONTROLLERS");
-    for (int p = 0; p < 2; ++p) {
+
+    // One player card: PLAYER N label ABOVE its pad art, then the source
+    // dropdown and Configure flush beneath — everything in one column, so
+    // nothing floats out of alignment with its neighbour.
+    auto player_card = [&](int p) {
         ImGui::PushID(p);
-        ImGui::Dummy(ImVec2(0, px(6)));
-        image_fit(g_pad, 104, 62);
-        ImGui::SameLine(0, px(14));
         ImGui::BeginGroup();
             ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
             ImGui::Text("PLAYER %d", p + 1);
             ImGui::PopStyleColor();
-            ImGui::SetNextItemWidth(px(220));
-            // Real dropdown: None / Keyboard / each connected gamepad by name.
+            ImGui::Dummy(ImVec2(0, px(4)));
+            image_fit(g_pad, 116, 70);
+            ImGui::Dummy(ImVec2(0, px(6)));
+
+            const float cw = px(196);   // shared control width => flush column
+            ImGui::SetNextItemWidth(cw);
             if (ImGui::BeginCombo("##src", launcher_model_player_src_label(m, p))) {
                 if (ImGui::Selectable("None", m->s.player_src[p] == 0))
                     launcher_model_set_source(m, p, 0, 0, nullptr);
@@ -396,66 +433,118 @@ void draw_controllers_panel(LauncherModel* m, const LauncherTheme& th, bool fill
                 }
                 ImGui::EndCombo();
             }
+            ImGui::Dummy(ImVec2(0, px(4)));
+            if (ImGui::Button("Configure", ImVec2(cw, px(32)))) launcher_model_open_config(m, p);
+            ImGui::Dummy(ImVec2(0, px(6)));
             draw_dot(m->s.player_src[p] != 0, th.good, th.text_muted);
             ImGui::TextColored(m->s.player_src[p] ? col(th.good) : col(th.text_muted),
-                               "%s", m->s.player_src[p] ? "connected" : "none");
+                               "%s", m->s.player_src[p] ? "connected" : "not assigned");
         ImGui::EndGroup();
-        ImGui::SameLine();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(4));
-        if (ImGui::Button("Configure", ImVec2(px(110), px(32)))) launcher_model_open_config(m, p);
-        ImGui::Dummy(ImVec2(0, px(10)));
         ImGui::PopID();
+    };
+
+    // Player 2 only exists for 2-player games (model-driven, never hardcoded):
+    // Mega Man X reports 1 and the row vanishes entirely.
+    player_card(0);
+    if (m->player_count >= 2) {
+        ImGui::SameLine(0, px(28));
+        player_card(1);
     }
-    ImGui::Dummy(ImVec2(0, px(6)));
-    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-    ImGui::TextWrapped("Plug in a controller any time - it appears here automatically, "
-                       "even after the launcher is open.");
-    ImGui::PopStyleColor();
+
     end_panel();
 }
 
+// SAVES module — only exists for games with battery SRAM. MMX is a password
+// game (sram_path == NULL) so this module is absent entirely; Zelda/SMW get it.
+// Availability is data-driven off the game's C-ABI struct, never a game name.
+void draw_saves_panel(LauncherModel* m, const LauncherTheme& th) {
+    if (!begin_panel("saves", 0)) { end_panel(); return; }
+    eyebrow("SAVES");
+    const char* p = m->sram_path ? m->sram_path : "";
+    // basename for display
+    const char* base = p;
+    for (const char* q = p; *q; ++q) if (*q == '/' || *q == '\\') base = q + 1;
+    if (ImGui::BeginTable("savemeta", 3, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(66));
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, px(22));
+        kv_row("File", base[0] ? base : "(none yet)", th, false, false);
+        ImGui::EndTable();
+    }
+    ImGui::Dummy(ImVec2(0, px(8)));
+    const float w = (ImGui::GetContentRegionAvail().x - px(th.spacing_sm)) * 0.5f;
+    ImGui::Button("Import", ImVec2(w, px(32)));
+    ImGui::SameLine(0, px(th.spacing_sm));
+    ImGui::Button("Clear", ImVec2(w, px(32)));
+    end_panel();
+}
+
+// The dashboard COMPOSES whichever modules this game supports — it does not
+// hardcode a fixed set. GAME is always present; the side column stacks
+// CONTROLLERS plus any optional modules (SAVES only when the game has SRAM).
+// A different game simply contributes a different module set.
 void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
     if (logical_w >= 820) {
-        // Two columns, both stretched to the body height.
-        begin_container("dash_l", ImVec2(px(460), 0));
-        draw_game_panel(m, th, true); end_container();
-        ImGui::SameLine();
+        const float gap = px(th.spacing_md);
+        // Art-led left column sized to the box art; side column takes the rest.
+        begin_container("dash_l", ImVec2(px(400), 0));
+        draw_game_panel(m, th, true);
+        end_container();
+
+        ImGui::SameLine(0, gap);
         begin_container("dash_r", ImVec2(0, 0));
-        draw_controllers_panel(m, th, true); end_container();
+            // Cards hug their content; the column doesn't stretch a single
+            // player card into a mostly-empty box.
+            draw_controllers_panel(m, th, false);
+            if (m->saves_supported) {          // module: opt-in per game
+                ImGui::Dummy(ImVec2(0, px(th.spacing_md)));
+                draw_saves_panel(m, th);
+            }
+        end_container();
     } else {
-        draw_game_panel(m, th); ImGui::Spacing(); draw_controllers_panel(m, th);
+        draw_game_panel(m, th);
+        ImGui::Spacing();
+        draw_controllers_panel(m, th);
+        if (m->saves_supported) { ImGui::Spacing(); draw_saves_panel(m, th); }
     }
 }
 
 void draw_settings(LauncherModel* m, const LauncherTheme& th) {
+    // Row 1: DISPLAY | AUDIO share the top band (12-col style grid) instead of
+    // two near-empty full-width bars stacked with dead space to the right.
+    const float gap  = px(th.spacing_md);
+    const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+
+    begin_container("set_l", ImVec2(half, 0), ImGuiChildFlags_AutoResizeY);
     if (begin_panel("disp", 0)) {
         eyebrow("DISPLAY");
         row_label("Window scale", th);
-        if (ImGui::Button(launcher_model_scale_label(m), ImVec2(px(120), 0)))
+        if (ImGui::Button(launcher_model_scale_label(m), ImVec2(px(120), px(30))))
             launcher_model_cycle_scale(m);
         row_label("Linear filtering", th);
         bool filter = m->s.linear_filter != 0;
         if (ImGui::Checkbox("##filter", &filter)) launcher_model_toggle_filter(m);
-    } end_panel();
-
-    if (m->widescreen_supported) {
-        if (begin_panel("ws", 0)) {
-            eyebrow("WIDESCREEN");
+        if (m->widescreen_supported) {   // module: only for games that support it
+            row_label("Widescreen 16:9", th);
             bool ws = m->s.widescreen != 0;
-            if (ImGui::Checkbox("Widescreen 16:9 (experimental)", &ws))
-                launcher_model_toggle_widescreen(m);
-        } end_panel();
-    }
+            if (ImGui::Checkbox("##ws", &ws)) launcher_model_toggle_widescreen(m);
+        }
+    } end_panel();
+    end_container();
 
+    ImGui::SameLine(0, gap);
+
+    begin_container("set_r", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
     if (begin_panel("audio", 0)) {
         eyebrow("AUDIO");
         row_label("Sample rate", th);
-        if (ImGui::Button(launcher_model_freq_label(m), ImVec2(px(120), 0)))
+        if (ImGui::Button(launcher_model_freq_label(m), ImVec2(px(120), px(30))))
             launcher_model_cycle_freq(m);
         row_label("Volume", th);
         int dv = 0; stepper("vol", m->s.volume, "%", &dv);
         if (dv) launcher_model_volume_delta(m, dv);
     } end_panel();
+    end_container();
 
     if (begin_panel("hotkeys", 0)) {
         eyebrow("HOTKEYS");
@@ -475,9 +564,6 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
             }
             ImGui::EndTable();
         }
-        ImGui::Spacing();
-        ImGui::TextColored(col(th.text_muted),
-                           "Saved to config.ini [KeyMap] (edit wired in production).");
     } end_panel();
 }
 
@@ -608,7 +694,7 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
         ImGui::TextUnformatted(m->game_name);
         ImGui::SetWindowFontScale(1.0f);
         ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
-        ImGui::TextUnformatted("SUPER NINTENDO  \xC2\xB7  RECOMPILED");
+        ImGui::TextUnformatted("SUPER NINTENDO");
         ImGui::PopStyleColor();
     ImGui::EndGroup();
     {   // right-aligned nav button
