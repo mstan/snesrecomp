@@ -56,6 +56,7 @@ void launcher_model_init(LauncherModel* m,
         m->region               = game->region ? game->region : "";
         m->widescreen_supported = game->widescreen_supported != 0;
         m->msu1_supported       = game->msu1_supported != 0;
+        m->msu1_note            = game->msu1_note;
         m->saves_supported      = game->sram_path != NULL;
         m->sram_path            = game->sram_path;
         /* 0 = unset (caller predates the field) -> assume 2 players. */
@@ -186,6 +187,15 @@ void launcher_model_cycle_freq(LauncherModel* m) {
 
 void launcher_model_volume_delta(LauncherModel* m, int delta) {
     m->s.volume = clampi(m->s.volume + delta, 0, 100);
+}
+
+void launcher_model_toggle_msu1(LauncherModel* m) {
+    if (!m->msu1_supported) return;
+    m->s.msu1_enabled = !m->s.msu1_enabled;
+}
+
+void launcher_model_set_msu1_dir(LauncherModel* m, const char* dir) {
+    safe_copy(m->s.msu1_dir, sizeof(m->s.msu1_dir), dir ? dir : "");
 }
 
 void launcher_model_cycle_player_src(LauncherModel* m, int player) {

@@ -50,9 +50,16 @@ int main(int argc, char** argv) {
     // style game contributes), e.g. LNG_DEMO_FULL=1.
     const char* demo = SDL_getenv("LNG_DEMO_FULL");
     if (demo && demo[0] == '1') {
-        gi.num_players = 2;
-        gi.sram_path   = "saves/demo.srm";
+        // Mirrors an SMW/Zelda-style game: 1 player, SRAM save, MSU-1 support.
+        gi.num_players = 1;
+        gi.sram_path   = "saves/save.srm";
         gi.widescreen_supported = 1;
+        gi.msu1_supported = 1;
+        gi.msu1_note = "Place the MSU-1 pack (.pcm + .msu) in this folder.";
+    }
+    if (demo && demo[0] == '2') {   // 2-player variant for layout testing
+        gi.num_players = 2;
+        gi.sram_path   = "saves/save.srm";
     }
 
     LauncherModel model;
