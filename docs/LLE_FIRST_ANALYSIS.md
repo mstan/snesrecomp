@@ -121,6 +121,38 @@ execution beyond an unprovable dynamic edge remains reachable through LLE.
 The previous all-cfg-roots counts remain available through
 `v2_analyze.py --all-cfg-roots` as a migration diagnostic.
 
+## Static-Coverage Extensions (2026-07-16)
+
+The 29-variant frontier turned out to be gated by four provable-fact gaps,
+not by genuine dynamism. Per the standing 100%-static doctrine (the
+interpreter is a failsafe for missing coverage, never the plan of record),
+the analysis now additionally proves:
+
+- **Exit-mode SETS.** A callee whose return paths provably disagree on
+  (m, x) (conditional SEP/REP) publishes the proven set instead of nothing.
+  Callers fork the post-call continuation across the set — one DecodeKey per
+  proven mode — and the emitter's post-call runtime-width switch selects the
+  live continuation. Sets compose through tail/dispatch chains and share the
+  exact-fact monotone unstable-demotion lattice. Exact proofs supersede sets.
+- **Self-recursive exit components** are solved as a local least fixpoint
+  from the non-recursive return paths (≤4 lattice steps).
+- **Poison-driven width refutation.** A structurally-poisoned variant
+  (wrong-width decode into BRK/COP garbage) is proof that real execution
+  never enters that (pc24, m, x); truncated calls to it are dead paths that
+  neither block the caller's exit proof nor demote it. The emitted width
+  switch already sends the dead case to LLE defensively.
+- **`v2_emit.py --cfg-roots`** — the static-coverage root policy: every
+  declared `func` seeds the closure (union with architectural vectors),
+  participating in the analysis input digest. The manifest (format v3)
+  carries `exit_mode_sets`; bank cache keys include them.
+
+Measured on Mega Man X (USA): 27 roots → 4,561 analyzed exact variants
+(4,552 emitted, 9 LLE-only) versus 32 emitted before — recovering the
+early-probe 4,236-variant scale with proven facts instead of the legacy
+width-preservation assumption. Interp fallbacks are now LOUD at runtime
+(first-hit `[tier2] INTERP GAP` lines + exit summary; see
+`runner/src/snes/interp_bridge.c`).
+
 ## Acceptance
 
 - Deterministic full and partial generated manifests.

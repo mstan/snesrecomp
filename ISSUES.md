@@ -3,6 +3,26 @@
 Game-specific issues live in each game repo's ISSUES.md; this file tracks
 issues in the shared runner and recompiler that affect every port.
 
+## ROLLOUT NOTE: widescreen + static-coverage merge (2026-07-16)
+
+Merged from `feat/pr10-widescreen`. Everything is opt-in / pin-gated, but
+two things bite each game at its NEXT engine pin bump / regen:
+
+1. **`RendererFuncs` gained a MIDDLE member** (`GetOutputSize`, util.h).
+   Positional initializers in game repos mis-bind and fail to compile
+   (loud, type mismatch). Fix each game's initializer when it bumps.
+2. **Regen output grows.** The analyzer now proves exit-mode SETS, refutes
+   poisoned widths, and solves self-recursive exit components (see
+   docs/LLE_FIRST_ANALYSIS.md "Static-Coverage Extensions"), so closures
+   deepen even without the new `v2_emit --cfg-roots` flag. MMX USA went
+   32 → 4,552 exact AOT variants with `--cfg-roots`. Expect bigger gen
+   dirs (sharded TUs, LoROM mirror-bank keying) and re-run each game's
+   overrides injector after regen. Interp fallbacks are now LOUD at
+   runtime (`[tier2] INTERP GAP` + exit summary; SNESRECOMP_TIER2_QUIET=1).
+
+MMX widescreen itself remains WIP and hidden (see MegamanXRecomp
+ISSUES.md for the spawn/alignment/savestate ledger).
+
 ## OPEN: v2 regeneration mixes fixed-point analysis with full C emission
 
 **Status:** OPEN 2026-07-13. Immediate partial-regeneration link-root fix is

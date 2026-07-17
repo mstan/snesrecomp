@@ -38,7 +38,7 @@ from .program_analysis import NodeDisposition, ProgramManifest, VariantKey
 from .translation_units import write_bank_translation_units
 
 
-CACHE_FORMAT_VERSION = 3
+CACHE_FORMAT_VERSION = 4
 _HOST_CALL_RE = re.compile(r"\b([A-Za-z_]\w*(?:_M[01]X[01])?)\s*\(")
 _SUFFIX_RE = re.compile(r"^(.*)_M([01])X([01])$")
 _HOST_RUNTIME_DISPATCH_RE = re.compile(
@@ -451,6 +451,11 @@ def _bank_cache_key(bank: int, manifest: ProgramManifest,
         "exit_modes": [
             (key.manifest_key, pair[0] & 1, pair[1] & 1)
             for key, pair in sorted(manifest.exit_modes.items())
+        ],
+        "exit_mode_sets": [
+            (key.manifest_key,
+             sorted((m & 1, x & 1) for m, x in mode_set))
+            for key, mode_set in sorted(manifest.exit_mode_sets.items())
         ],
         "generator": generator_digest,
         "config": config_digest,
