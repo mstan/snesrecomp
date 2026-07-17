@@ -21,7 +21,14 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "recompiler"))
 
-from snes65816 import load_rom  # noqa: E402
+from snes65816 import (  # noqa: E402
+    detect_rom_mapping,
+    is_rom_address,
+    load_rom,
+    rom_offset,
+    set_rom_mapping,
+    vector_table_offset,
+)
 from v2.cfg_loader import load_bank_cfg  # noqa: E402
 from v2.decoder import (  # noqa: E402
     analyze_function_exit_mx,
@@ -72,7 +79,8 @@ def _seed_auto_vectors(parsed, rom: bytes) -> None:
     """Mirror v2_regen's byte-derived reset/NMI/IRQ roots."""
     from v2.emit_bank import BankEntry
 
-    if len(rom) < 0x8000:
+    vector_base = vector_table_offset(rom)
+    if len(rom) < vector_base + 0x20:
         return
     for bank, _path, cfg in parsed:
         if bank != 0 or not cfg.auto_vectors:
@@ -80,7 +88,7 @@ def _seed_auto_vectors(parsed, rom: bytes) -> None:
         existing_starts = {entry.start & 0xFFFF for entry in cfg.entries}
 
         def vector(offset: int) -> int:
-            return rom[0x7FE0 + offset] | (rom[0x7FE0 + offset + 1] << 8)
+            return rom[vector_base + offset] | (rom[vector_base + offset + 1] << 8)
 
         for name, pc in (
                 ("I_RESET", vector(0x1C)),
@@ -173,11 +181,12 @@ def _architectural_roots(rom: bytes) -> list[VariantKey]:
     Native NMI/IRQ preserve the interrupted M/X flags, so all four variants
     are real possibilities. Reset enters emulation mode with M=X=1.
     """
-    if len(rom) < 0x8000:
+    vector_base = vector_table_offset(rom)
+    if len(rom) < vector_base + 0x20:
         return []
 
     def vector(offset: int) -> int:
-        return rom[0x7FE0 + offset] | (rom[0x7FE0 + offset + 1] << 8)
+        return rom[vector_base + offset] | (rom[vector_base + offset + 1] << 8)
 
     roots = []
     reset = vector(0x1C)
@@ -194,6 +203,7 @@ def _architectural_roots(rom: bytes) -> list[VariantKey]:
 def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                    all_cfg_roots: bool = False,
                    additional_roots=()):
+    set_rom_mapping(detect_rom_mapping(rom))
     _seed_auto_vectors(parsed, rom)
     roots = []
     entries_by_address = {}
@@ -259,9 +269,9 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
     def target_is_code(key: VariantKey) -> bool:
         bank = (key.pc24 >> 16) & 0xFF
         pc = key.pc24 & 0xFFFF
-        if pc < 0x8000 or not (bank < 0x40 or bank >= 0x80):
+        if not is_rom_address(bank, pc):
             return False
-        offset = (bank & 0x7F) * 0x8000 + (pc - 0x8000)
+        offset = rom_offset(bank, pc)
         if offset >= len(rom):
             return False
         if any((region_bank & 0xFF) == bank

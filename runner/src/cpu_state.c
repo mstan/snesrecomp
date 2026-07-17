@@ -66,13 +66,16 @@ static int is_hw_reg(uint8 bank, uint16 addr) {
  * (which would trip the RomPtr-invalid off-rails detector). */
 static int cpu_sram_offset(uint8 bank, uint16 addr) {
     if (g_sram_size == 0 || g_sram == NULL) return -1;
+    int cart_type = g_snes && g_snes->cart ? g_snes->cart->type : 0;
     /* LoROM SRAM: banks $70-$7D + $F0-$FD, addr $0000-$7FFF. */
-    if (((bank >= 0x70 && bank < 0x7E) || (bank >= 0xF0 && bank < 0xFE))
+    if (cart_type == CART_LOROM &&
+        ((bank >= 0x70 && bank < 0x7E) || (bank >= 0xF0 && bank < 0xFE))
         && addr < 0x8000) {
         return (int)((((bank & 0xF) << 15) | addr) & (g_sram_size - 1));
     }
     /* HiROM SRAM: banks $00-$3F + $80-$BF, addr $6000-$7FFF. */
-    if ((bank < 0x40 || (bank >= 0x80 && bank < 0xC0))
+    if (cart_type == CART_HIROM &&
+        (bank < 0x40 || (bank >= 0x80 && bank < 0xC0))
         && addr >= 0x6000 && addr < 0x8000) {
         return (int)((((bank & 0x3F) << 13) | (addr & 0x1FFF))
                      & (g_sram_size - 1));

@@ -16,6 +16,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from snes65816 import vector_table_offset
+
 from .atomic_output import AtomicOutputDir, write_if_changed
 from .codegen import (
     set_force_variant_at,
@@ -58,12 +60,13 @@ def _lorom_mirror_pc24(pc24: int):
 
 
 def _architectural_interrupt_pcs(rom: bytes) -> frozenset[int]:
-    """Return native/emulation NMI+IRQ vector entries and LoROM mirrors."""
-    if len(rom) < 0x8000:
+    """Return native/emulation NMI+IRQ vector entries and bank mirrors."""
+    vector_base = vector_table_offset(rom)
+    if len(rom) < vector_base + 0x20:
         return frozenset()
     result = set()
     for offset in (0x0A, 0x0E, 0x1A, 0x1E):
-        pc = rom[0x7FE0 + offset] | (rom[0x7FE0 + offset + 1] << 8)
+        pc = rom[vector_base + offset] | (rom[vector_base + offset + 1] << 8)
         if pc in (0, 0xFFFF):
             continue
         result.add(pc)

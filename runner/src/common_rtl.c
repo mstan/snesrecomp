@@ -116,12 +116,43 @@ typedef struct FileSli {
   bool error;
 } FileSli;
 
+typedef struct MemorySli {
+  SaveLoadInfo base;
+  uint8 *data;
+  size_t capacity;
+  size_t position;
+  bool is_save;
+  bool error;
+} MemorySli;
+
 static void file_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
   FileSli *fs = (FileSli *)sli;
   if (fs->error) return;
   size_t got = fs->is_save ? fwrite(data, 1, n, fs->f)
                            : fread(data, 1, n, fs->f);
   if (got != n) fs->error = true;
+}
+
+static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
+  MemorySli *memory = (MemorySli *)sli;
+  if (memory->error || n > SIZE_MAX - memory->position) {
+    memory->error = true;
+    return;
+  }
+  if (memory->data) {
+    if (memory->position + n > memory->capacity) {
+      memory->error = true;
+      return;
+    }
+    if (memory->is_save)
+      memcpy(memory->data + memory->position, data, n);
+    else
+      memcpy(data, memory->data + memory->position, n);
+  } else if (!memory->is_save) {
+    memory->error = true;
+    return;
+  }
+  memory->position += n;
 }
 
 void RtlReset(int mode) {
@@ -481,6 +512,42 @@ bool RtlLoadSnapshot(const char *filename) {
   return true;
 }
 
+size_t RtlSaveSnapshotToMemory(void *data, size_t capacity) {
+  MemorySli memory = {
+    { &memory_sli_func }, (uint8 *)data, capacity, 0, true, false
+  };
+  uint32 hdr[2] = { RTL_SAV_MAGIC, RTL_SAV_VERSION };
+  memory_sli_func(&memory.base, hdr, sizeof hdr);
+  RtlApuLock();
+  snes_saveload(g_snes, &memory.base);
+  if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
+    g_rtl_game_info->state_save_extra(&memory.base);
+  RtlApuUnlock();
+  return memory.error ? 0 : memory.position;
+}
+
+bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
+  if (!data || size < sizeof(uint32) * 2) return false;
+  uint32 hdr[2];
+  memcpy(hdr, data, sizeof hdr);
+  if (hdr[0] != RTL_SAV_MAGIC || hdr[1] < RTL_SAV_VERSION_MIN ||
+      hdr[1] > RTL_SAV_VERSION)
+    return false;
+
+  MemorySli memory = {
+    { &memory_sli_func }, (uint8 *)data, size, sizeof hdr, false, false
+  };
+  RtlApuLock();
+  snes_saveload(g_snes, &memory.base);
+  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra)
+    g_rtl_game_info->state_load_extra(&memory.base, hdr[1]);
+  RtlApuUnlock();
+  if (memory.error) return false;
+  if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
+    g_rtl_game_info->on_state_loaded(hdr[1]);
+  return true;
+}
+
 void RtlSaveLoad(int cmd, int slot) {
   char name[128];
   const char *prefix = g_rtl_game_info->save_name_prefix;
@@ -516,28 +583,22 @@ bool Unreachable(void) {
 uint8 *RomPtr(uint32_t addr) {
   uint8_t bank = (uint8_t)(addr >> 16);
   uint16_t lo = (uint16_t)addr;
-  bool lorom_rom_window = (lo >= 0x8000) || ((bank & 0x7f) >= 0x40);
-  if (bank == 0x7e || bank == 0x7f || !lorom_rom_window) {
+  extern Snes *g_snes;
+  uint8_t *mapped = g_snes && g_snes->cart
+      ? cart_getRomPtr(g_snes->cart, bank, lo) : NULL;
+  if (bank == 0x7e || bank == 0x7f || !mapped) {
     if (!g_fail) g_fail = true;
     /* No printf — the ring buffer + cpu_trace_offrails is the
      * channel for backwards investigation. printf'ing every bad
      * read floods stderr with millions of identical lines. */
     cpu_trace_offrails("RomPtr-invalid", addr);
   }
-  /* Compute LoROM offset, then mirror against ACTUAL ROM size. SMW is
-   * 512KB but the original `& 0x3fffff` mask assumed 4MB, so reads at
-   * high banks (e.g. $FF:0100 — bogus pointer values from data-as-code
-   * regions or unmapped ARAM) computed index 0x7F8100, FAR past
-   * g_rom's 0x80000 bytes — instant SIGSEGV. The right behaviour:
-   * mirror to actual ROM size, matching real SNES bank-mirroring. */
-  extern Snes *g_snes;
-  uint32_t off = (((addr >> 16) << 15) | (addr & 0x7fff));
-  uint32_t rom_size = g_snes && g_snes->cart ? (uint32_t)g_snes->cart->romSize : 0x80000;
-  if (rom_size == 0) rom_size = 0x80000;
-  return (uint8 *)&g_rom[off % rom_size];
+  /* Resolve mapping and actual-size mirroring through Cart. This prevents a
+   * valid-looking guest address from becoming an out-of-allocation host read. */
+  return mapped ? mapped : (uint8 *)&g_rom[0];
 }
 
-// MVN/MVP block-move pointer: resolves (bank, addr) per 65816 LoROM rules.
+// MVN/MVP block-move pointer: resolve (bank, addr) through the cartridge map.
 // Banks $00-$3F and $80-$BF mirror WRAM at $0000-$1FFF; $7E/$7F are WRAM.
 // Everything else is ROM (same mapping as RomPtr). Returns a non-const pointer
 // because MVN dst writes through this; callers must only dst into WRAM banks.
@@ -546,8 +607,11 @@ uint8 *MvnPtr(uint8_t bank, uint16_t addr) {
   if (bank == 0x7F) return g_ram + 0x10000 + addr;
   if ((bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) && addr < 0x2000)
     return g_ram + addr;
-  uint32_t full = ((uint32_t)bank << 16) | addr;
-  return (uint8 *)&g_rom[(((full >> 16) << 15) | (full & 0x7fff)) & 0x3fffff];
+  uint8_t *mapped = g_snes && g_snes->cart
+      ? cart_getRomPtr(g_snes->cart, bank, addr) : NULL;
+  if (mapped) return mapped;
+  cpu_trace_offrails("MvnPtr-invalid", ((uint32_t)bank << 16) | addr);
+  return (uint8 *)&g_rom[0];
 }
 
 // Replay a DMA transfer into g_ppu after the emulator executed it into g_snes->ppu.
