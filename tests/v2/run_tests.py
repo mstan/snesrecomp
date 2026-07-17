@@ -19,6 +19,7 @@ sys.path.append(str(THIS.parent))
 
 
 TEST_MODULES = [
+    'test_rom_mapping',
     'test_decoder_mode_split',
     'test_decoder_repsep_independent_bits',
     'test_decoder_immediate_length_per_state',

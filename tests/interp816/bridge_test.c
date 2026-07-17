@@ -39,9 +39,16 @@ Snes *g_snes = &g_test_snes;
 uint64_t g_apu_last_sync_master;
 int g_interp_apu_driving;
 int g_recomp_stack_top;
+uint8 g_memsel;
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 void snes_catchupApu(Snes *snes) { (void)snes; }
+void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
+    (void)snes; (void)master_clock;
+}
+void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
+    (void)cart; (void)master_clock;
+}
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
 }

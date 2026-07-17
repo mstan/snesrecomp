@@ -84,8 +84,8 @@ class BankCfg:
     # docs/ABSTRACT_INTERPRETATION_GAPS.md).
     exit_mx_at_per_variant: List[Tuple[int, int, int, int, int, int]] = field(default_factory=list)
     # `auto_vectors` directive — when true and this cfg is bank 00,
-    # v2_regen reads the SNES interrupt-vector table at ROM offset
-    # 0x7FE0-0x7FFF (LoROM mirror of $00:FFE0-FFFF) and auto-seeds
+    # v2_regen reads the SNES interrupt-vector table from the detected
+    # LoROM/HiROM internal-header location and auto-seeds
     # `func I_RESET / I_NMI / I_IRQ` entries at the dereferenced PCs.
     # Lets a fresh game project ship a minimal bank00.cfg with just
     # the one directive instead of hand-decoding the vector table.
@@ -219,8 +219,8 @@ def load_bank_cfg(path: str) -> BankCfg:
                 continue
 
             # auto_vectors — request that v2_regen.py read the SNES
-            # interrupt-vector table at ROM offset 0x7FE0-0x7FFF
-            # (LoROM mirror of $00:FFE0-FFFF) and auto-seed
+            # interrupt-vector table from the detected cartridge mapping
+            # and auto-seed
             # `func I_RESET / I_NMI / I_IRQ` entries. Bank 00 only
             # (vectors live in bank 0); v2_regen warns and skips for
             # other banks.

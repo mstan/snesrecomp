@@ -111,6 +111,44 @@ int main(void) {
     printf("T12 BNE taken\n");
     CHECK((p->a & 0xFF)==0x01, "A.lo=%02X exp 01 (branch not taken?)", p->a & 0xFF); }
 
+  /* T13: BRA is relative to the byte after its one-byte operand. */
+  { uint8_t c[] = {0x80,0x02}; Interp816 *p = prep(c,sizeof c); run(p,1);
+    printf("T13 BRA relative base\n");
+    CHECK(p->pc==0x8004, "PC=%04X exp 8004", p->pc); }
+
+  /* T14: BRL is relative to the byte after its two-byte operand. */
+  { uint8_t c[] = {0x82,0xFE,0xFF}; Interp816 *p = prep(c,sizeof c); run(p,1);
+    printf("T14 BRL relative base\n");
+    CHECK(p->pc==0x8001, "PC=%04X exp 8001", p->pc); }
+
+  /* Program-bank bit 7 is architectural state, not a mapper mirror hint.
+   * Clearing it changes FastROM timing even when both banks read the same ROM
+   * bytes. Exercise every long control-flow form that installs a new PBR. */
+  { uint8_t c[] = {0x22,0x00,0x90,0xB5};
+    Interp816 *p = prep(c,sizeof c); run(p,1);
+    printf("T15 JSL preserves high program-bank bit\n");
+    CHECK(p->k==0xB5 && p->pc==0x9000,
+          "K:PC=%02X:%04X exp B5:9000", p->k, p->pc); }
+
+  { uint8_t c[] = {0x5C,0x00,0x90,0xBB};
+    Interp816 *p = prep(c,sizeof c); run(p,1);
+    printf("T16 JML preserves high program-bank bit\n");
+    CHECK(p->k==0xBB && p->pc==0x9000,
+          "K:PC=%02X:%04X exp BB:9000", p->k, p->pc); }
+
+  { uint8_t c[] = {0x6B}; Interp816 *p = prep(c,sizeof c);
+    p->sp=0x01FC; MEM[0x01FD]=0xFF; MEM[0x01FE]=0x8F; MEM[0x01FF]=0xB5;
+    run(p,1);
+    printf("T17 RTL restores high program-bank bit\n");
+    CHECK(p->k==0xB5 && p->pc==0x9000,
+          "K:PC=%02X:%04X exp B5:9000", p->k, p->pc); }
+
+  { uint8_t c[] = {0xDC,0x00,0x20}; Interp816 *p = prep(c,sizeof c);
+    MEM[0x2000]=0x00; MEM[0x2001]=0x90; MEM[0x2002]=0xBB; run(p,1);
+    printf("T18 JMP [abs] preserves high program-bank bit\n");
+    CHECK(p->k==0xBB && p->pc==0x9000,
+          "K:PC=%02X:%04X exp BB:9000", p->k, p->pc); }
+
   printf("\n==== interp816 Phase-0: %d/%d checks passed ====\n", g_check - g_fail, g_check);
   if (g_fail) { printf("RESULT: FAIL (%d)\n", g_fail); return 1; }
   printf("RESULT: PASS\n");

@@ -11,20 +11,102 @@ from typing import Optional, List
 # ROM LOADING
 # ==============================================================================
 
+ROM_MAP_LOROM = 'lorom'
+ROM_MAP_HIROM = 'hirom'
+_active_rom_mapping = ROM_MAP_LOROM
+
+
+def _header_score(data: bytes, base: int, expected_low_nibble: int) -> int:
+    """Score a conventional 32-byte SNES header without trusting its title.
+
+    The score is intentionally conservative: map-mode agreement, a plausible
+    reset vector, and a checksum/complement pair are independent signals. A
+    tie preserves the historical LoROM default.
+    """
+    if base < 0 or base + 0x40 > len(data):
+        return -1
+    score = 0
+    map_mode = data[base + 0x15]
+    if (map_mode & 0x0F) == expected_low_nibble:
+        score += 4
+    reset = data[base + 0x3C] | (data[base + 0x3D] << 8)
+    if reset >= 0x8000 and reset != 0xFFFF:
+        score += 2
+    complement = data[base + 0x1C] | (data[base + 0x1D] << 8)
+    checksum = data[base + 0x1E] | (data[base + 0x1F] << 8)
+    if (checksum ^ complement) == 0xFFFF:
+        score += 2
+    return score
+
+
+def detect_rom_mapping(data: bytes) -> str:
+    """Detect standard LoROM versus HiROM from their internal headers."""
+    lorom_score = _header_score(data, 0x7FC0, 0)
+    hirom_score = _header_score(data, 0xFFC0, 1)
+    return ROM_MAP_HIROM if hirom_score > lorom_score else ROM_MAP_LOROM
+
+
+def set_rom_mapping(mapping: str) -> None:
+    global _active_rom_mapping
+    if mapping not in (ROM_MAP_LOROM, ROM_MAP_HIROM):
+        raise ValueError(f"unsupported ROM mapping: {mapping}")
+    _active_rom_mapping = mapping
+
+
+def get_rom_mapping() -> str:
+    return _active_rom_mapping
+
+
 def load_rom(path: str) -> bytes:
     with open(path, 'rb') as f:
         data = f.read()
     if len(data) % 1024 == 512:
         data = data[512:]
+    set_rom_mapping(detect_rom_mapping(data))
     return data
 
 def lorom_offset(bank: int, addr: int) -> int:
-    """LoROM (bank, addr) -> physical ROM byte offset."""
-    assert 0x8000 <= addr <= 0xFFFF, f"addr ${addr:04X} not in LoROM range $8000-$FFFF"
+    """Active cartridge mapping's (bank, addr) -> physical ROM offset.
+
+    The legacy name remains as a compatibility alias for the v1/v2 decoder
+    modules. New code should call ``rom_offset``.
+    """
+    return rom_offset(bank, addr)
+
+
+def rom_offset(bank: int, addr: int) -> int:
+    bank &= 0xFF
+    addr &= 0xFFFF
+    assert bank not in (0x7E, 0x7F), (
+        f"address ${bank:02X}:{addr:04X} is WRAM, not ROM")
+    if _active_rom_mapping == ROM_MAP_HIROM:
+        canonical_bank = bank & 0x7F
+        assert canonical_bank >= 0x40 or addr >= 0x8000, (
+            f"address ${bank:02X}:{addr:04X} is not in a HiROM ROM window")
+        return ((canonical_bank & 0x3F) << 16) | addr
+    assert 0x8000 <= addr <= 0xFFFF, (
+        f"addr ${addr:04X} not in LoROM range $8000-$FFFF")
     return (bank & 0x7F) * 0x8000 + (addr - 0x8000)
 
+
+def is_rom_address(bank: int, addr: int) -> bool:
+    bank &= 0xFF
+    addr &= 0xFFFF
+    if bank in (0x7E, 0x7F):
+        return False
+    if _active_rom_mapping == ROM_MAP_HIROM:
+        canonical_bank = bank & 0x7F
+        return canonical_bank >= 0x40 or addr >= 0x8000
+    return addr >= 0x8000 and ((bank & 0xFF) < 0x40 or bank >= 0x80)
+
+
+def vector_table_offset(data: bytes) -> int:
+    """Return the physical offset of the $FFE0-$FFFF vector table."""
+    mapping = detect_rom_mapping(data)
+    return 0xFFE0 if mapping == ROM_MAP_HIROM else 0x7FE0
+
 def rom_slice(rom: bytes, bank: int, addr: int, length: int) -> bytes:
-    off = lorom_offset(bank, addr)
+    off = rom_offset(bank, addr)
     return rom[off:off + length]
 
 # ==============================================================================
