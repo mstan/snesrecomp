@@ -6,6 +6,7 @@
 #include "snes/cpu.h"
 #include "snes/snes.h"
 #include "snes/msu1.h"
+#include "snes/interp_bridge.h"
 #include "util.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
@@ -23,6 +24,21 @@ Cpu *g_snes_cpu;
 bool g_fail;
 const RtlGameInfo *g_rtl_game_info;
 
+/* Interp-coverage feedback manifest, written on process exit. The always-on
+ * tier-2 gap recorder in the interp bridge names every entry the interpreter
+ * had to resolve at runtime; this serializes that promotion worklist (schema
+ * "snesrecomp tier2 coverage v1") so tools/tier2_ingest.py can fold it back
+ * into the cfg and the next regen promotes those entries to AOT — the LLE-first
+ * burn-down loop. Path overridable via SNESRECOMP_TIER2_MANIFEST (default: CWD
+ * tier2_coverage.json). Empty discoveries on a fully-covered run is the
+ * expected dormant case. */
+static void rtl_write_tier2_coverage_manifest(void) {
+  const char *path = getenv("SNESRECOMP_TIER2_MANIFEST");
+  Tier2CoverageWriteManifest(path && *path ? path : "tier2_coverage.json",
+                             g_rtl_game_info ? g_rtl_game_info->title
+                                             : "unknown");
+}
+
 void RtlRegisterGame(const RtlGameInfo *info) {
   g_rtl_game_info = info;
   /* Arm MSU-1 from the environment for every game, with no per-game
@@ -30,6 +46,16 @@ void RtlRegisterGame(const RtlGameInfo *info) {
    * main.c may additionally call msu1_set_rom_path() to enable the
    * "auto" base-from-ROM-name mode. */
   msu1_init();
+  /* Harvest the interp-coverage manifest on exit for every game, same
+   * no-per-game-wiring policy as MSU-1 above. Registered once regardless of
+   * how many times a game re-registers (e.g. a reset path). */
+  {
+    static int coverage_atexit_registered = 0;
+    if (!coverage_atexit_registered) {
+      coverage_atexit_registered = 1;
+      atexit(rtl_write_tier2_coverage_manifest);
+    }
+  }
 }
 
 uint8_t *SnesRomPtr(uint32 v) {
