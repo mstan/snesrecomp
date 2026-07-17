@@ -235,7 +235,11 @@ struct Ppu {
 #define SPRITE_PRIO_TO_PRIO(prio, level6) (((prio) * 4 + 2) * 16 + 4 + (level6 ? 2 : 0))
 #define SPRITE_PRIO_TO_PRIO_HI(prio) ((prio) * 4 + 2)
 
-#define IS_SCREEN_ENABLED(ppu, sub, layer) (ppu->screenEnabled[sub] & (1 << layer))
+// Host-only debug render filter (SNESRECOMP_LAYER_MASK env; ppu.c). Guest
+// state and savestates are untouched — this only gates final composition.
+extern uint8_t g_snes_ppu_dbg_layer_mask;
+#define IS_SCREEN_ENABLED(ppu, sub, layer) \
+  (ppu->screenEnabled[sub] & g_snes_ppu_dbg_layer_mask & (1 << layer))
 #define IS_SCREEN_WINDOWED(ppu, sub, layer) (ppu->screenWindowed[sub] & (1 << layer))
 #define GET_WINDOW_FLAGS(ppu, layer) (ppu->windowsel >> (layer * 4))
 
