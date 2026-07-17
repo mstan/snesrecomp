@@ -59,6 +59,7 @@ def _config_digest(parsed) -> str:
 
 def _analysis_input_digest(*, rom: bytes, generator_digest: str,
                            config_digest: str, additional_roots,
+                           cfg_roots: bool,
                            enable_hle: bool, max_insns: int,
                            max_nodes: int, shard_threshold_bytes: int,
                            shard_pc_span: int) -> str:
@@ -70,6 +71,7 @@ def _analysis_input_digest(*, rom: bytes, generator_digest: str,
         "additional_roots": [
             (key.pc24, key.m, key.x) for key in sorted(additional_roots)
         ],
+        "cfg_roots": bool(cfg_roots),
         "hle": bool(enable_hle),
         "max_insns": int(max_insns),
         "max_nodes": int(max_nodes),
@@ -123,6 +125,13 @@ def main() -> int:
         "--profile-manifest", action="append", default=[],
         help="tier2 coverage manifest whose clean targets become optional "
              "AOT roots (repeatable)")
+    parser.add_argument(
+        "--cfg-roots", action="store_true",
+        help="treat every cfg `func` declaration as an analysis root in "
+             "addition to the architectural vectors. This is the static-"
+             "coverage policy: the declared surface is materialized as AOT "
+             "wherever the analysis proves it; LLE remains the failsafe for "
+             "anything unprovable, never the plan of record.")
     parser.add_argument("--no-host-root-scan", action="store_true")
     parser.add_argument("--no-hle", action="store_true")
     parser.add_argument("--max-insns", type=int, default=4096)
@@ -174,6 +183,7 @@ def main() -> int:
         generator_digest=generator_digest,
         config_digest=config_digest,
         additional_roots=additional_roots,
+        cfg_roots=args.cfg_roots,
         enable_hle=not args.no_hle,
         max_insns=args.max_insns,
         max_nodes=args.max_nodes,
@@ -195,6 +205,7 @@ def main() -> int:
 
     manifest, helpers, inline_args = build_manifest(
         rom, parsed, max_insns=args.max_insns, max_nodes=args.max_nodes,
+        all_cfg_roots=args.cfg_roots,
         additional_roots=additional_roots)
     result = emit_program(
         rom=rom,
@@ -210,6 +221,10 @@ def main() -> int:
         callee_exit_mx={
             (key.pc24, key.m, key.x): pair
             for key, pair in manifest.exit_modes.items()
+        },
+        callee_exit_mx_modes={
+            (key.pc24, key.m, key.x): frozenset(mode_set)
+            for key, mode_set in manifest.exit_mode_sets.items()
         },
         enable_hle=not args.no_hle,
         shard_threshold_bytes=shard_threshold_bytes,

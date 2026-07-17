@@ -105,7 +105,13 @@ class ProgramManifest:
     # hidden mutable cfg feedback.
     exit_modes: Mapping[VariantKey, Tuple[int, int]] = field(
         default_factory=dict)
-    format_version: int = 2
+    # Proven multi-mode exit sets for entries whose return paths provably
+    # disagree on (m, x) (conditional SEP/REP callees).  Callers fork the
+    # post-call continuation across the set and dispatch on the live width
+    # at runtime.  Disjoint from exit_modes: an exact proof supersedes.
+    exit_mode_sets: Mapping[VariantKey, frozenset] = field(
+        default_factory=dict)
+    format_version: int = 3
 
     def to_dict(self) -> dict:
         def key_dict(key: VariantKey) -> dict:
@@ -138,6 +144,13 @@ class ProgramManifest:
             "exit_modes": {
                 key.manifest_key: {"m": pair[0] & 1, "x": pair[1] & 1}
                 for key, pair in sorted(self.exit_modes.items())
+            },
+            "exit_mode_sets": {
+                key.manifest_key: [
+                    {"m": m & 1, "x": x & 1}
+                    for m, x in sorted(mode_set)
+                ]
+                for key, mode_set in sorted(self.exit_mode_sets.items())
             },
             "nodes": {
                 key.manifest_key: node_dict(self.nodes[key])

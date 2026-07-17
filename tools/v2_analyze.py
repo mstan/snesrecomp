@@ -25,6 +25,7 @@ from snes65816 import load_rom  # noqa: E402
 from v2.cfg_loader import load_bank_cfg  # noqa: E402
 from v2.decoder import (  # noqa: E402
     analyze_function_exit_mx,
+    analyze_function_exit_mx_modes,
     classify_dispatch_helper,
     clear_decode_cache,
     decode_function,
@@ -221,8 +222,10 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 roots.append(key)
             entries_by_address.setdefault(key.pc24, entry)
 
-    if not all_cfg_roots:
-        roots = _architectural_roots(rom)
+    # cfg roots are a UNION with the architectural roots, not a
+    # replacement: NMI/IRQ must still be analyzed at all four interrupt-
+    # entry widths (auto_vectors only seeds their cfg-canonical variant).
+    roots.extend(_architectural_roots(rom))
     roots.extend(additional_roots)
 
     data_regions = tuple(all_data_regions)
@@ -231,6 +234,23 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
     active_exit_modes = dict(declared_exit_modes)
     unstable_exit_modes = set()
     round_exit_modes = {}
+    # Proven multi-mode exit sets: (pc24, entry_m, entry_x) -> frozenset of
+    # (exit_m, exit_x). Published when every exit path resolves but the
+    # paths disagree, so no single exact fact exists. Callers fork their
+    # post-call continuation across the proven set (decoder) and dispatch
+    # on the live width at runtime (emitter) — exact, never speculative.
+    active_exit_mode_sets = {}
+    unstable_exit_mode_sets = set()
+    round_exit_mode_sets = {}
+    # Structurally-poisoned variants refute their own demand width: a
+    # wrong-width decode that lands in BRK/COP garbage is proof that real
+    # execution never enters that (pc24, m, x) — a console running those
+    # bytes would crash. A caller's truncated call to a refuted variant is
+    # therefore a DEAD path: it neither blocks the caller's exit proof nor
+    # contributes exit modes. (The emitted post-call width switch already
+    # sends absent variants to LLE, so the dead case stays defensively
+    # covered at runtime.) Grows monotonically across rounds.
+    poisoned_variants = set()
     dispatch_helpers = {}
     inline_arg_map = {}
     dispatch_helper_probes = set()
@@ -290,6 +310,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             "indirect_dispatch": dispatch_map or None,
             "data_regions": data_regions or None,
             "callee_exit_mx": active_exit_modes or None,
+            "callee_exit_mx_modes": active_exit_mode_sets or None,
             "sibling_entry_pcs": siblings or None,
             "inline_arg_map": inline_arg_map or None,
             # An unknown callee return width is not evidence that M/X is
@@ -348,6 +369,68 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             kwargs["dispatch_helpers"] = dispatch_helpers or None
             kwargs["inline_arg_map"] = inline_arg_map or None
             graph = decode_function(rom, bank, pc, key.m, key.x, **kwargs)
+
+        # Self-recursive exit fixpoint. A function whose only unknown callee
+        # exit is ITSELF (direct recursion at the same entry variant) can
+        # never receive its own fact from the outer rounds — the classic
+        # SCC bootstrap. Solve it locally as a least fixpoint from below:
+        # start from the non-recursive return paths, feed the resulting
+        # exit set back as a provisional self-fact, and re-decode until the
+        # set stops growing (the lattice has at most four elements). This
+        # is exact — every published mode is witnessed by a real decoded
+        # return path — and it unblocks every caller chain above the
+        # recursive base (e.g. MMX $84:95E6, which gated 19 callers
+        # including the Task0 boot chain).
+        self_keys = {(key.pc24, key.m, key.x)}
+        mirror_pc24 = _lorom_mirror_pc24(key.pc24)
+        if mirror_pc24 is not None:
+            self_keys.add((mirror_pc24, key.m, key.x))
+        if (graph.unknown_callee_exit_sites and all(
+                (t, tm, tx) in self_keys
+                for (_s, t, tm, tx) in graph.unknown_callee_exit_sites)):
+            overlay_exact = dict(active_exit_modes)
+            overlay_sets = dict(active_exit_mode_sets)
+            prev_modes = None
+            for _ in range(6):
+                modes = analyze_function_exit_mx_modes(
+                    graph, overlay_exact or None, overlay_sets or None)
+                if not modes or modes == prev_modes:
+                    break
+                prev_modes = modes
+                for skey in self_keys:
+                    overlay_exact.pop(skey, None)
+                    overlay_sets.pop(skey, None)
+                    if len(modes) == 1:
+                        overlay_exact[skey] = next(iter(modes))
+                    else:
+                        overlay_sets[skey] = frozenset(modes)
+                kwargs_self = dict(kwargs)
+                kwargs_self["callee_exit_mx"] = overlay_exact or None
+                kwargs_self["callee_exit_mx_modes"] = overlay_sets or None
+                candidate = decode_function(
+                    rom, bank, pc, key.m, key.x, **kwargs_self)
+                if any((t, tm, tx) not in self_keys
+                       for (_s, t, tm, tx)
+                       in candidate.unknown_callee_exit_sites):
+                    break
+                graph = candidate
+
+        # Strip truncation records for poison-refuted callee widths: those
+        # call paths are dead, so they must not demote this node to
+        # LLE_ONLY or block its exit-fact publication. Mutates the graph's
+        # list in place so the compact summary sees the filtered view.
+        if graph.unknown_callee_exit_sites and poisoned_variants:
+            def _refuted(site):
+                _s, t, tm, tx = site
+                if (t, tm, tx) in poisoned_variants:
+                    return True
+                t_mirror = _lorom_mirror_pc24(t)
+                return (t_mirror is not None
+                        and (t_mirror, tm, tx) in poisoned_variants)
+            kept = [s for s in graph.unknown_callee_exit_sites
+                    if not _refuted(s)]
+            if len(kept) != len(graph.unknown_callee_exit_sites):
+                graph.unknown_callee_exit_sites[:] = kept
         variant_tuple = (key.pc24, key.m, key.x)
         if variant_tuple in unstable_exit_modes:
             graph.unstable_exit_fact = True
@@ -355,9 +438,21 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             graph, active_exit_modes or None)
         if (not graph.unknown_callee_exit_sites
                 and variant_tuple not in unstable_exit_modes
-                and variant_tuple not in declared_exit_modes
-                and exit_m is not None and exit_x is not None):
-            round_exit_modes[key] = (exit_m & 1, exit_x & 1)
+                and variant_tuple not in declared_exit_modes):
+            if exit_m is not None and exit_x is not None:
+                round_exit_modes[key] = (exit_m & 1, exit_x & 1)
+            elif variant_tuple not in unstable_exit_mode_sets:
+                # No single exact exit — publish the proven exit-mode SET
+                # instead (multi-path SEP/REP callees). Only complete sets
+                # count: analyze_function_exit_mx_modes returns None while
+                # any exit path is still unresolved, and a truncated decode
+                # (unknown callee exit) never publishes at all.
+                modes = analyze_function_exit_mx_modes(
+                    graph, active_exit_modes or None,
+                    active_exit_mode_sets or None)
+                if modes and len(modes) > 1:
+                    round_exit_mode_sets[key] = frozenset(
+                        (m & 1, x & 1) for (m, x) in modes)
         return graph
 
     # Graphs are intentionally one-shot: compact summaries, not CFG objects,
@@ -374,12 +469,18 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
         manifest = None
         while True:
             round_exit_modes = {}
+            round_exit_mode_sets = {}
             before_helpers = dict(dispatch_helpers)
             before_inline = dict(inline_arg_map)
+            before_poisoned = set(poisoned_variants)
             clear_decode_cache()
             manifest = ProgramAnalyzer(
                 decode_variant, max_nodes=max_nodes,
                 target_is_code=target_is_code).analyze(roots)
+            poisoned_variants.update(
+                (node_key.pc24, node_key.m, node_key.x)
+                for node_key, node in manifest.nodes.items()
+                if "structural_poison" in node.reasons)
 
             # Exact exit proofs only grow. A caller that lacked a callee fact
             # was truncated at the call, so it could not publish a guess that
@@ -393,17 +494,41 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 previous = next_exit_modes.get(fact_key)
                 if previous is None:
                     next_exit_modes[fact_key] = pair
+                    # An exact proof supersedes any earlier multi-mode set
+                    # for the same variant (a graph reshaped by new callee
+                    # facts can sharpen ambiguous -> exact). Never keep both.
+                    active_exit_mode_sets.pop(fact_key, None)
                 elif previous != pair:
                     # A supposedly proven fact changed. Remove it once and
                     # permanently tier that entry to LLE; callers then stop at
                     # the boundary instead of participating in oscillation.
                     unstable_exit_modes.add(fact_key)
                     next_exit_modes.pop(fact_key, None)
+            # Same monotone-lattice treatment for the multi-mode sets: a
+            # published set that changes between rounds is demoted once and
+            # permanently, so callers stop at that boundary (LLE) instead of
+            # oscillating. An exact fact for the same variant always wins —
+            # never publish both.
+            next_exit_mode_sets = dict(active_exit_mode_sets)
+            for key, mode_set in sorted(round_exit_mode_sets.items()):
+                fact_key = (key.pc24, key.m, key.x)
+                if (fact_key in unstable_exit_mode_sets
+                        or fact_key in next_exit_modes):
+                    continue
+                previous = next_exit_mode_sets.get(fact_key)
+                if previous is None:
+                    next_exit_mode_sets[fact_key] = mode_set
+                elif previous != mode_set:
+                    unstable_exit_mode_sets.add(fact_key)
+                    next_exit_mode_sets.pop(fact_key, None)
             facts_stable = (
                 next_exit_modes == active_exit_modes
+                and next_exit_mode_sets == active_exit_mode_sets
                 and before_helpers == dispatch_helpers
-                and before_inline == inline_arg_map)
+                and before_inline == inline_arg_map
+                and before_poisoned == poisoned_variants)
             active_exit_modes = next_exit_modes
+            active_exit_mode_sets = next_exit_mode_sets
             if facts_stable:
                 break
 
@@ -413,6 +538,11 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             exit_modes={
                 VariantKey(pc24, m, x): pair
                 for (pc24, m, x), pair in sorted(active_exit_modes.items())
+            },
+            exit_mode_sets={
+                VariantKey(pc24, m, x): frozenset(mode_set)
+                for (pc24, m, x), mode_set
+                in sorted(active_exit_mode_sets.items())
             })
     finally:
         clear_decode_cache()
