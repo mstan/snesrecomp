@@ -1076,33 +1076,26 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                     if em is not None and ex is not None:
                         ret_m, ret_x = em & 1, ex & 1
                         callee_exit_known = True
-        if (stop_on_unknown_callee_exit and target_pc24 is not None
-                and not callee_exit_known):
-            if unknown_callee_exit_sites is not None:
-                item = (insn.addr & 0xFFFFFF, target_pc24,
-                        post_m & 1, post_x & 1)
-                if item not in unknown_callee_exit_sites:
-                    unknown_callee_exit_sites.append(item)
-            return []
-        if (target_pc24 is not None and callee_exit_mx_modes is not None
-                and (ret_m, ret_x) == (post_m, post_x)):
+        # Proven multi-mode exit set: the callee provably returns in more
+        # than one (m, x) state (e.g. a conditional SEP/REP on one return
+        # path). Fork the fall-through into one DecodeKey per PROVEN mode;
+        # the emitter selects the live continuation with its post-call
+        # runtime-width switch (`/* dynamic post-call MxXy */`). This is
+        # exact — every forked width is a real, proven callee exit — and
+        # it replaces the historic behaviors at these sites (truncate-to-
+        # LLE under stop_on_unknown_callee_exit, or the unsound width-
+        # preservation assumption otherwise). The former <=2-mode and
+        # next-insn-must-be-a-branch gates dated from when mode sets came
+        # from the heuristic exit-mx autoroute rather than the whole-
+        # program fixed point; proven facts need no such fences.
+        if (not callee_exit_known and target_pc24 is not None
+                and callee_exit_mx_modes is not None):
             mode_set = callee_exit_mx_modes.get((target_pc24, post_m, post_x))
             if mode_set is None:
                 tbank = (target_pc24 >> 16) & 0xFF
                 if tbank < 0x40 or 0x80 <= tbank < 0xC0:
                     mode_set = callee_exit_mx_modes.get(
                         (target_pc24 ^ 0x800000, post_m, post_x))
-            if mode_set and len(mode_set) > 2:
-                mode_set = None
-            if mode_set and rom is not None:
-                try:
-                    next_off = lorom_offset(bank, next_pc)
-                    next_ins = decode_insn(
-                        rom, next_off, next_pc, bank, m=post_m, x=post_x)
-                except Exception:
-                    next_ins = None
-                if next_ins is None or next_ins.mnem not in _COND_BRANCHES:
-                    mode_set = None
             if mode_set:
                 seen = set()
                 succs = []
@@ -1115,6 +1108,14 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                          'fall'))
                 if succs:
                     return succs
+        if (stop_on_unknown_callee_exit and target_pc24 is not None
+                and not callee_exit_known):
+            if unknown_callee_exit_sites is not None:
+                item = (insn.addr & 0xFFFFFF, target_pc24,
+                        post_m & 1, post_x & 1)
+                if item not in unknown_callee_exit_sites:
+                    unknown_callee_exit_sites.append(item)
+            return []
         return [(DecodeKey(addr24(bank, next_pc), ret_m, ret_x, post_p_stack), 'fall')]
 
     # Default: linear fall-through with post-instruction mode.
@@ -2406,8 +2407,27 @@ def _lookup_exit_mx(callee_exit_mx: Optional[Dict],
     return hit
 
 
+def _lookup_exit_mx_mode_set(callee_exit_mx: Optional[Dict],
+                             callee_exit_mx_modes: Optional[Dict],
+                             pc24: int, m: int, x: int):
+    """Resolve a callee's proven exit states as a set, or None.
+
+    An exact fact yields a one-element set; a proven multi-mode set is
+    returned as-is. Exact facts win when both exist (they should never
+    coexist, but the precedence keeps this total).
+    """
+    exact = _lookup_exit_mx(callee_exit_mx, pc24, m, x)
+    if exact is not None and exact[0] is not None and exact[1] is not None:
+        return {(exact[0] & 1, exact[1] & 1)}
+    mode_set = _lookup_exit_mx(callee_exit_mx_modes, pc24, m, x)
+    if mode_set:
+        return {(em & 1, ex & 1) for em, ex in mode_set}
+    return None
+
+
 def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
                                    callee_exit_mx: Optional[Dict] = None,
+                                   callee_exit_mx_modes: Optional[Dict] = None,
                                    ) -> Optional[Set[Tuple[int, int]]]:
     """Return the concrete set of (m, x) states at function exits.
 
@@ -2415,6 +2435,10 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
     handler exit state is not available yet. A set with more than one
     element is intentionally preserved for callers that need to decode
     post-call bytes under every possible width state.
+
+    A tail/dispatch target that itself has a proven multi-mode exit set
+    contributes every element of that set — exit sets compose through
+    tail chains the same way exact facts do.
     """
     modes: Set[Tuple[int, int]] = set()
 
@@ -2426,11 +2450,12 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
         tail_keys = _direct_tail_exit_keys(graph, di)
         if tail_keys:
             for target, site_m, site_x in tail_keys:
-                tail_exit = _lookup_exit_mx(
-                    callee_exit_mx, target, site_m, site_x)
-                if tail_exit is None:
+                tail_modes = _lookup_exit_mx_mode_set(
+                    callee_exit_mx, callee_exit_mx_modes,
+                    target, site_m, site_x)
+                if tail_modes is None:
                     return None
-                modes.add((tail_exit[0] & 1, tail_exit[1] & 1))
+                modes.update(tail_modes)
             continue
         is_dispatch_term = (
             getattr(ins, 'dispatch_entries', None) is not None
@@ -2438,8 +2463,6 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
             and ins.mnem in ('JSL', 'JMP')
         )
         if is_dispatch_term:
-            if callee_exit_mx is None:
-                return None
             site_m = ins.m_flag & 1
             site_x = ins.x_flag & 1
             dispatcher_bank = (ins.addr >> 16) & 0xFF
@@ -2451,13 +2474,12 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
                     tgt_pc24 = entry & 0xFFFFFF
                 else:
                     tgt_pc24 = (dispatcher_bank << 16) | (entry & 0xFFFF)
-                handler_exit = callee_exit_mx.get((tgt_pc24, site_m, site_x))
-                if handler_exit is None:
+                handler_modes = _lookup_exit_mx_mode_set(
+                    callee_exit_mx, callee_exit_mx_modes,
+                    tgt_pc24, site_m, site_x)
+                if handler_modes is None:
                     return None
-                hm, hx = handler_exit
-                if hm is None or hx is None:
-                    return None
-                modes.add((hm & 1, hx & 1))
+                modes.update(handler_modes)
 
     return modes if modes else None
 
