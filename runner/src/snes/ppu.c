@@ -59,7 +59,19 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
 }
 
+// Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
+// (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
+// never affects guest state. Unset/0xff = all layers (normal).
+uint8_t g_snes_ppu_dbg_layer_mask = 0xff;
+
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
+  static bool mask_init;
+  if (!mask_init) {
+    mask_init = true;
+    const char *m = getenv("SNESRECOMP_LAYER_MASK");
+    if (m && *m)
+      g_snes_ppu_dbg_layer_mask = (uint8_t)strtoul(m, NULL, 0);
+  }
   ppu->renderPitch = (uint)pitch;
   ppu->renderBuffer = pixels;
   ppu->renderFlags = render_flags;
