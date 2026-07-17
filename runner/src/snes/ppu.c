@@ -59,10 +59,29 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
 }
 
+// Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
+// (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
+// never affects guest state. Unset/0xff = all layers (normal).
+uint8_t g_snes_ppu_dbg_layer_mask = 0xff;
+
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
+  static bool mask_init;
+  if (!mask_init) {
+    mask_init = true;
+    const char *m = getenv("SNESRECOMP_LAYER_MASK");
+    if (m && *m)
+      g_snes_ppu_dbg_layer_mask = (uint8_t)strtoul(m, NULL, 0);
+  }
   ppu->renderPitch = (uint)pitch;
   ppu->renderBuffer = pixels;
   ppu->renderFlags = render_flags;
+}
+
+void PpuSetWidescreenLineEnhancer(Ppu *ppu,
+                                  PpuWidescreenLineEnhancer *enhancer,
+                                  void *context) {
+  ppu->widescreenLineEnhancer = enhancer;
+  ppu->widescreenLineEnhancerContext = enhancer ? context : NULL;
 }
 
 void PpuClearOverlayCaptures(Ppu *ppu) {
@@ -465,12 +484,16 @@ static void PpuApplyMarginGap(Ppu *ppu, uint layer, PpuWindows *win,
 static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                    uint y, bool sub, uint layer,
                                    PpuZbufType zhi, PpuZbufType zlo) {
+#define BG1_MARGIN_ALLOWED(i) \
+  (layer != 0 || !ppu->widescreenLineEnhancer || \
+   (dstz + (i) >= dstbuf->data + kPpuExtraLeftRight && \
+    dstz + (i) < dstbuf->data + kPpuExtraLeftRight + kPpuXPixels))
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
-  if ((bits & (0x01010101 << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+  if (BG1_MARGIN_ALLOWED(i) && (bits & (0x01010101 << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2 | (bits >> (21 - i)) & 4 | (bits >> (28 - i)) & 8; \
-  if ((bits & (0x80808080 >> i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+  if (BG1_MARGIN_ALLOWED(i) && (bits & (0x80808080 >> i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
@@ -565,6 +588,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 #undef READ_BITS
 #undef DO_PIXEL
 #undef DO_PIXEL_HFLIP
+#undef BG1_MARGIN_ALLOWED
 }
 
 /* Draw an 8bpp tiled background (mode 3/4 BG1).  The original renderer only
@@ -964,6 +988,10 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
                                           PpuPixelPrioBufs *dstbuf, uint y,
                                           bool sub, uint layer,
                                           PpuZbufType zhi, PpuZbufType zlo) {
+#define BG1_MARGIN_ALLOWED(i) \
+  (layer != 0 || !ppu->widescreenLineEnhancer || \
+   (dstz + (i) >= dstbuf->data + kPpuExtraLeftRight && \
+    dstz + (i) < dstbuf->data + kPpuExtraLeftRight + kPpuXPixels))
 #define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8
 #define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2 | (bits >> 21) & 4 | (bits >> 28) & 8
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
@@ -1009,7 +1037,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
         pixel += (tile & 0x1c00) >> kPaletteShift;
         int i = 0;
         do {
-          if (z > dstz[i])
+          if (BG1_MARGIN_ALLOWED(i) && z > dstz[i])
             dstz[i] = pixel + z;
         } while (++i != w);
       }
@@ -1023,6 +1051,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
 #undef READ_BITS
 #undef GET_PIXEL
 #undef GET_PIXEL_HFLIP
+#undef BG1_MARGIN_ALLOWED
 }
 
 // Merge one isolated layer into the live priority buffer, padding only that
@@ -1419,6 +1448,10 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   // Render main screen
   PpuDrawBackgrounds(ppu, y, false);
+  if (ppu->widescreenLineEnhancer &&
+      (ppu->extraLeftCur || ppu->extraRightCur))
+    ppu->widescreenLineEnhancer(ppu, y, false,
+                                ppu->widescreenLineEnhancerContext);
 
   // Render also the subscreen?
   bool rendered_subscreen = false;
@@ -1426,6 +1459,10 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     ClearBackdrop(&ppu->bgBuffers[1]);
     if (ppu->screenEnabled[1] != 0) {
       PpuDrawBackgrounds(ppu, y, true);
+      if (ppu->widescreenLineEnhancer &&
+          (ppu->extraLeftCur || ppu->extraRightCur))
+        ppu->widescreenLineEnhancer(ppu, y, true,
+                                    ppu->widescreenLineEnhancerContext);
       rendered_subscreen = true;
     }
   }
