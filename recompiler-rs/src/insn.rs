@@ -138,6 +138,23 @@ pub struct Insn {
     pub dispatch_idx_reg: Option<char>,
     pub dispatch_table_bases: Vec<u32>,
     pub dispatch_terminal: bool,
+    /// Indirect transfer has call semantics: handlers are separate demands
+    /// and execution may resume at the caller continuation.
+    pub dispatch_call: bool,
+    /// Dispatch compares a live pointer value against explicit targets rather
+    /// than indexing a contiguous ROM table.
+    pub dispatch_pointer_match: bool,
+    /// The dispatcher consumed an already-present JSR frame before tailing.
+    pub dispatch_popped_call_frame: bool,
+    /// Number of explicit guest-stack bytes consumed by a synthetic dynamic
+    /// call transfer (PEA/JMP = 2, PHK/PEA/JML = 3).
+    pub dispatch_consumed_stack_bytes: u8,
+    /// PEI fused with its following RTS as an authorized internal computed
+    /// transfer. The synthetic two-byte frame has no net local stack effect.
+    pub dispatch_stack_pointer: bool,
+    /// Direct JSR whose callee consumes the call frame and never resumes the
+    /// lexical fall-through.
+    pub terminal_jsr: bool,
     /// JSR (abs,X) through a pointer held in WRAM. The target is resolved by
     /// the runtime dispatcher, but the call's fall-through remains reachable.
     pub dispatch_runtime: bool,
@@ -172,6 +189,12 @@ impl Insn {
             dispatch_idx_reg: None,
             dispatch_table_bases: Vec::new(),
             dispatch_terminal: false,
+            dispatch_call: false,
+            dispatch_pointer_match: false,
+            dispatch_popped_call_frame: false,
+            dispatch_consumed_stack_bytes: 0,
+            dispatch_stack_pointer: false,
+            terminal_jsr: false,
             dispatch_runtime: false,
             dispatch_local_goto: false,
             const_z_fold_unconditional: false,

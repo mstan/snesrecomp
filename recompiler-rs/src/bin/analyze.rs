@@ -10,9 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::Instant;
 
 use serde_json::{json, Map, Value};
@@ -20,11 +18,12 @@ use serde_json::{json, Map, Value};
 use snesrecomp_analyzer::cfg::{load_bank_cfg, BankCfg, BankEntry};
 use snesrecomp_analyzer::decoder::{
     analyze_function_exit_mx, analyze_function_exit_mx_modes_with_sets, classify_dispatch_helper,
-    decode_function, detect_inline_arg_bytes, DecodeCache, DecodeEnv, FunctionDecodeGraph,
+    decode_function, detect_inline_arg_bytes, function_exit_mx_equation,
+    function_return_stack_delta_states, DecodeCache, DecodeEnv, FunctionDecodeGraph,
     IndirectDispatchSite,
 };
 use snesrecomp_analyzer::insn::Mode;
-use snesrecomp_analyzer::rom::load_rom;
+use snesrecomp_analyzer::rom::{detect_rom_mapping, load_rom, vector_table_offset, RomMapping};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct VariantKey {
@@ -111,6 +110,7 @@ struct Inputs {
     indirect_dispatch: HashMap<u32, IndirectDispatchSite>,
     hle_dispatch: HashMap<u32, String>,
     inline_skip: HashMap<u32, i32>,
+    terminal_jsr_sites: BTreeSet<u32>,
     declared_exit_modes: HashMap<(u32, u8, u8), (u8, u8)>,
 }
 
@@ -164,10 +164,11 @@ fn expand_auto_vectors(cfgs: &mut [BankCfg], rom: &[u8]) {
         .iter()
         .map(|entry| entry.start & 0xFFFF)
         .collect();
+    let vector_base = vector_table_offset(rom);
     let vectors = [
-        ("I_RESET", rom_u16(rom, 0x7FFC)),
-        ("I_NMI", rom_u16(rom, 0x7FEA)),
-        ("I_IRQ", rom_u16(rom, 0x7FEE)),
+        ("I_RESET", rom_u16(rom, vector_base + 0x1C)),
+        ("I_NMI", rom_u16(rom, vector_base + 0x0A)),
+        ("I_IRQ", rom_u16(rom, vector_base + 0x0E)),
     ];
     for (name, pc) in vectors {
         let Some(pc) = pc else { continue };
@@ -180,12 +181,13 @@ fn expand_auto_vectors(cfgs: &mut [BankCfg], rom: &[u8]) {
 
 fn architectural_roots(rom: &[u8]) -> BTreeSet<VariantKey> {
     let mut roots = BTreeSet::new();
-    if let Some(pc) = rom_u16(rom, 0x7FFC) {
+    let vector_base = vector_table_offset(rom);
+    if let Some(pc) = rom_u16(rom, vector_base + 0x1C) {
         if pc != 0 && pc != 0xFFFF {
             roots.insert(VariantKey::new(pc, 1, 1));
         }
     }
-    for offset in [0x7FEA, 0x7FEE] {
+    for offset in [vector_base + 0x0A, vector_base + 0x0E] {
         if let Some(pc) = rom_u16(rom, offset) {
             if pc != 0 && pc != 0xFFFF {
                 for m in 0..=1 {
@@ -228,6 +230,7 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
     let mut indirect_dispatch = HashMap::new();
     let mut hle_dispatch = HashMap::new();
     let mut inline_skip = HashMap::new();
+    let mut terminal_jsr_sites = BTreeSet::new();
     let mut declared_exit_modes = HashMap::new();
 
     for (index, cfg) in cfgs.iter().enumerate() {
@@ -259,6 +262,13 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
                 }
             }
         }
+        for &site_pc16 in &cfg.terminal_jsr {
+            let site = (bank << 16) | (site_pc16 & 0xFFFF);
+            terminal_jsr_sites.insert(site);
+            if let Some(mirror) = mirror_pc24(site) {
+                terminal_jsr_sites.insert(mirror);
+            }
+        }
         for site in &cfg.indirect_dispatch {
             let pc24 = (bank << 16) | (site.site_pc16 & 0xFFFF);
             let value = IndirectDispatchSite {
@@ -266,6 +276,9 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
                 idx_reg: site.idx_reg,
                 table_bases: site.table_bases.clone(),
                 ptr_call: site.ptr_call,
+                pointer_match: site.pointer_match,
+                popped_call_frame: site.popped_call_frame,
+                rts_stack: site.rts_stack,
                 targets: site.targets.clone(),
             };
             indirect_dispatch.insert(pc24, value.clone());
@@ -319,6 +332,7 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
         indirect_dispatch,
         hle_dispatch,
         inline_skip,
+        terminal_jsr_sites,
         declared_exit_modes,
     })
 }
@@ -374,7 +388,8 @@ fn summarize(
         let insn = &decoded.insn;
         let site = insn.addr & 0xFFFFFF;
         pcs.push(site);
-        if insn.mnem == "BRK" || insn.mnem == "COP" {
+        if (insn.mnem == "BRK" || insn.mnem == "COP") && !graph.data_region_exec_pcs.contains(&site)
+        {
             poison_reasons.insert(format!("{}_at_{site:06X}", insn.mnem.to_ascii_lowercase()));
         }
         if let Some(entries) = &insn.dispatch_entries {
@@ -473,6 +488,22 @@ fn summarize(
         }
     }
 
+    for &(site, ref target_key) in &graph.boundary_exits {
+        let target = VariantKey::new(target_key.pc, target_key.m, target_key.x);
+        let resolution = if target_is_code(target, inputs, rom) {
+            "aot_exact"
+        } else {
+            "lle_exact"
+        };
+        edges.insert(DemandEdge {
+            site_pc24: site & 0xFFFFFF,
+            kind: "direct_tail_call",
+            resolution,
+            target: Some(target),
+            detail: "declared_boundary".to_string(),
+        });
+    }
+
     for item in &graph.unresolved_indirects {
         edges.insert(DemandEdge {
             site_pc24: item.site_pc24,
@@ -560,6 +591,7 @@ fn summarize(
 fn discover_helpers(
     graph: &FunctionDecodeGraph,
     rom: &[u8],
+    mapping: RomMapping,
     known: &HashMap<u32, String>,
 ) -> HashMap<u32, String> {
     let mut result = HashMap::new();
@@ -572,7 +604,9 @@ fn discover_helpers(
         if known.contains_key(&target) || result.contains_key(&target) {
             continue;
         }
-        if let Some(kind) = classify_dispatch_helper(rom, (target >> 16) & 0xFF, target & 0xFFFF) {
+        if let Some(kind) =
+            classify_dispatch_helper(rom, mapping, (target >> 16) & 0xFF, target & 0xFFFF)
+        {
             result.insert(target, kind.to_string());
         }
     }
@@ -582,6 +616,7 @@ fn discover_helpers(
 fn discover_inline_args(
     graph: &FunctionDecodeGraph,
     rom: &[u8],
+    mapping: RomMapping,
     known: &HashMap<u32, i32>,
     probed: &mut HashSet<u32>,
 ) -> HashMap<u32, i32> {
@@ -602,7 +637,7 @@ fn discover_inline_args(
         let mut counts = BTreeSet::new();
         for (m, x) in [(0, 0), (1, 1)] {
             if let Some(count) =
-                detect_inline_arg_bytes(rom, (target >> 16) & 0xFF, target & 0xFFFF, m, x)
+                detect_inline_arg_bytes(rom, mapping, (target >> 16) & 0xFF, target & 0xFFFF, m, x)
             {
                 if count != 0 {
                     counts.insert(count);
@@ -616,9 +651,262 @@ fn discover_inline_args(
     result
 }
 
+type ExitDependency = (u32, u8, u8);
+type ExitAssumption = (ExitDependency, u8, u8);
+
+#[derive(Debug, Clone, Default)]
+struct ExitEquation {
+    local_modes: BTreeSet<(u8, u8)>,
+    dependencies: BTreeSet<ExitDependency>,
+    assumptions: BTreeSet<ExitAssumption>,
+}
+
+fn equation_target(
+    dependency: ExitDependency,
+    tuple_to_key: &HashMap<ExitDependency, VariantKey>,
+) -> Option<VariantKey> {
+    tuple_to_key.get(&dependency).copied().or_else(|| {
+        mirror_pc24(dependency.0).and_then(|pc24| {
+            tuple_to_key
+                .get(&(pc24, dependency.1, dependency.2))
+                .copied()
+        })
+    })
+}
+
+fn known_equation_modes(
+    dependency: ExitDependency,
+    exact: &HashMap<ExitDependency, (u8, u8)>,
+    sets: &HashMap<ExitDependency, Vec<(u8, u8)>>,
+    tuple_to_key: &HashMap<ExitDependency, VariantKey>,
+    solved: &BTreeMap<VariantKey, BTreeSet<(u8, u8)>>,
+) -> Option<BTreeSet<(u8, u8)>> {
+    let mirror = mirror_pc24(dependency.0).map(|pc24| (pc24, dependency.1, dependency.2));
+    if let Some(&(m, x)) = exact
+        .get(&dependency)
+        .or_else(|| mirror.and_then(|key| exact.get(&key)))
+    {
+        return Some(BTreeSet::from([(m & 1, x & 1)]));
+    }
+    if let Some(modes) = sets
+        .get(&dependency)
+        .or_else(|| mirror.and_then(|key| sets.get(&key)))
+    {
+        return Some(modes.iter().map(|&(m, x)| (m & 1, x & 1)).collect());
+    }
+    equation_target(dependency, tuple_to_key).and_then(|target| solved.get(&target).cloned())
+}
+
+fn solve_exit_equation_sccs(
+    equations: &BTreeMap<VariantKey, ExitEquation>,
+    exact: &HashMap<ExitDependency, (u8, u8)>,
+    sets: &HashMap<ExitDependency, Vec<(u8, u8)>>,
+) -> BTreeMap<VariantKey, BTreeSet<(u8, u8)>> {
+    if equations.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut tuple_to_key: HashMap<ExitDependency, VariantKey> = equations
+        .keys()
+        .map(|&key| ((key.pc24, key.m, key.x), key))
+        .collect();
+    for &key in equations.keys() {
+        if let Some(mirror) = mirror_pc24(key.pc24) {
+            tuple_to_key.entry((mirror, key.m, key.x)).or_insert(key);
+        }
+    }
+
+    let mut adjacency: BTreeMap<VariantKey, BTreeSet<VariantKey>> = equations
+        .keys()
+        .map(|&key| (key, BTreeSet::new()))
+        .collect();
+    let mut mode_adjacency = adjacency.clone();
+    for (&key, equation) in equations {
+        for &dependency in &equation.dependencies {
+            if let Some(target) = equation_target(dependency, &tuple_to_key) {
+                adjacency.get_mut(&key).unwrap().insert(target);
+                mode_adjacency.get_mut(&key).unwrap().insert(target);
+            }
+        }
+        for &(dependency, _, _) in &equation.assumptions {
+            if let Some(target) = equation_target(dependency, &tuple_to_key) {
+                adjacency.get_mut(&key).unwrap().insert(target);
+            }
+        }
+    }
+
+    struct Tarjan<'a> {
+        adjacency: &'a BTreeMap<VariantKey, BTreeSet<VariantKey>>,
+        next_index: usize,
+        indices: HashMap<VariantKey, usize>,
+        lowlinks: HashMap<VariantKey, usize>,
+        stack: Vec<VariantKey>,
+        on_stack: HashSet<VariantKey>,
+        components: Vec<BTreeSet<VariantKey>>,
+    }
+    impl Tarjan<'_> {
+        fn visit(&mut self, node: VariantKey) {
+            let node_index = self.next_index;
+            self.next_index += 1;
+            self.indices.insert(node, node_index);
+            self.lowlinks.insert(node, node_index);
+            self.stack.push(node);
+            self.on_stack.insert(node);
+            let targets: Vec<_> = self.adjacency[&node].iter().copied().collect();
+            for target in targets {
+                if !self.indices.contains_key(&target) {
+                    self.visit(target);
+                    let low = self.lowlinks[&node].min(self.lowlinks[&target]);
+                    self.lowlinks.insert(node, low);
+                } else if self.on_stack.contains(&target) {
+                    let low = self.lowlinks[&node].min(self.indices[&target]);
+                    self.lowlinks.insert(node, low);
+                }
+            }
+            if self.lowlinks[&node] != self.indices[&node] {
+                return;
+            }
+            let mut component = BTreeSet::new();
+            loop {
+                let item = self.stack.pop().unwrap();
+                self.on_stack.remove(&item);
+                component.insert(item);
+                if item == node {
+                    break;
+                }
+            }
+            self.components.push(component);
+        }
+    }
+    let mut tarjan = Tarjan {
+        adjacency: &adjacency,
+        next_index: 0,
+        indices: HashMap::new(),
+        lowlinks: HashMap::new(),
+        stack: Vec::new(),
+        on_stack: HashSet::new(),
+        components: Vec::new(),
+    };
+    for &key in equations.keys() {
+        if !tarjan.indices.contains_key(&key) {
+            tarjan.visit(key);
+        }
+    }
+
+    let mut solved: BTreeMap<VariantKey, BTreeSet<(u8, u8)>> = BTreeMap::new();
+    let mut pending = tarjan.components;
+    loop {
+        let mut next_pending = Vec::new();
+        let mut progressed = false;
+        for component in pending {
+            let mut values: BTreeMap<_, _> = component
+                .iter()
+                .map(|&key| (key, equations[&key].local_modes.clone()))
+                .collect();
+            let mut external: BTreeMap<_, BTreeSet<_>> = component
+                .iter()
+                .map(|&key| (key, BTreeSet::new()))
+                .collect();
+            let mut complete = true;
+            for &key in &component {
+                for &dependency in &equations[&key].dependencies {
+                    if equation_target(dependency, &tuple_to_key)
+                        .is_some_and(|target| component.contains(&target))
+                    {
+                        continue;
+                    }
+                    let Some(modes) =
+                        known_equation_modes(dependency, exact, sets, &tuple_to_key, &solved)
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    external.get_mut(&key).unwrap().extend(modes);
+                }
+                if !complete {
+                    break;
+                }
+                for &(dependency, _, _) in &equations[&key].assumptions {
+                    if equation_target(dependency, &tuple_to_key)
+                        .is_some_and(|target| component.contains(&target))
+                    {
+                        continue;
+                    }
+                    if known_equation_modes(dependency, exact, sets, &tuple_to_key, &solved)
+                        .is_none()
+                    {
+                        complete = false;
+                        break;
+                    }
+                }
+                if !complete {
+                    break;
+                }
+            }
+            if !complete {
+                next_pending.push(component);
+                continue;
+            }
+            for (&key, modes) in &external {
+                values.get_mut(&key).unwrap().extend(modes.iter().copied());
+            }
+            loop {
+                let mut changed = false;
+                for &key in &component {
+                    let targets: Vec<_> = mode_adjacency[&key]
+                        .intersection(&component)
+                        .copied()
+                        .collect();
+                    for target in targets {
+                        let target_modes = values[&target].clone();
+                        let before = values[&key].len();
+                        values.get_mut(&key).unwrap().extend(target_modes);
+                        changed |= values[&key].len() != before;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let assumptions_hold = component.iter().all(|key| {
+                equations[key]
+                    .assumptions
+                    .iter()
+                    .all(|&(dependency, m, x)| {
+                        let modes = equation_target(dependency, &tuple_to_key)
+                            .filter(|target| component.contains(target))
+                            .and_then(|target| values.get(&target).cloned())
+                            .or_else(|| {
+                                known_equation_modes(
+                                    dependency,
+                                    exact,
+                                    sets,
+                                    &tuple_to_key,
+                                    &solved,
+                                )
+                            });
+                        modes == Some(BTreeSet::from([(m & 1, x & 1)]))
+                    })
+            });
+            if !assumptions_hold {
+                continue;
+            }
+            solved.extend(values);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+        pending = next_pending;
+    }
+    solved
+}
+
 fn analyze(
     inputs: &Inputs,
     rom: &[u8],
+    max_insns: usize,
+    max_nodes: usize,
 ) -> Result<
     (
         BTreeMap<VariantKey, NodeSummary>,
@@ -629,6 +917,7 @@ fn analyze(
     ),
     String,
 > {
+    let mapping = detect_rom_mapping(rom);
     let mut active_exact = inputs.declared_exit_modes.clone();
     let mut active_sets: HashMap<(u32, u8, u8), Vec<(u8, u8)>> = HashMap::new();
     let mut unstable_exact = HashSet::new();
@@ -647,19 +936,12 @@ fn analyze(
             NodeSummary,
         ),
     > = HashMap::new();
-    let trace_rounds = std::env::var("SNESRECOMP_NATIVE_ANALYSIS_TRACE")
-        .map(|value| !value.is_empty() && value != "0")
-        .unwrap_or(false);
-    let mut decode_time = Duration::ZERO;
-    let mut recursion_time = Duration::ZERO;
-    let mut summary_time = Duration::ZERO;
-    let mut exit_time = Duration::ZERO;
-
-    for round in 1..=128 {
+    for _round in 1..=128 {
         let mut pending = inputs.roots.clone();
         let mut nodes = BTreeMap::new();
         let mut round_exact = BTreeMap::new();
         let mut round_sets = BTreeMap::new();
+        let mut round_equations = BTreeMap::new();
         let before_poisoned = poisoned.clone();
         let before_helpers = helpers.clone();
         let before_inline_args = inline_args.clone();
@@ -668,8 +950,8 @@ fn analyze(
             if nodes.contains_key(&key) {
                 continue;
             }
-            if nodes.len() >= 100_000 {
-                return Err("program analysis exceeded max_nodes=100000".to_string());
+            if nodes.len() >= max_nodes {
+                return Err(format!("program analysis exceeded max_nodes={max_nodes}"));
             }
             let bank = (key.pc24 >> 16) & 0xFF;
             let pc = key.pc24 & 0xFFFF;
@@ -693,6 +975,8 @@ fn analyze(
             siblings.remove(&pc);
             let inline_loops = cfg.map(|cfg| &cfg.inline_dispatch_loops);
             let env = DecodeEnv {
+                rom_mapping: mapping,
+                max_insns: Some(max_insns),
                 dispatch_helpers: Some(&helpers),
                 indirect_dispatch: Some(&inputs.indirect_dispatch),
                 hle_dispatch: Some(&inputs.hle_dispatch),
@@ -702,15 +986,14 @@ fn analyze(
                 sibling_entry_pcs: Some(&siblings),
                 callee_inline_skip: Some(&inline_args),
                 inline_dispatch_loop_pcs: inline_loops,
+                terminal_jsr_sites: Some(&inputs.terminal_jsr_sites),
                 global_inline_skip: Some(&inline_args),
                 stop_on_unknown_callee_exit: true,
                 ..Default::default()
             };
-            let phase_started = Instant::now();
             let decoded = catch_unwind(AssertUnwindSafe(|| {
                 cache.get_or_decode_local(rom, bank, pc, key.m, key.x, end, &env)
             }));
-            decode_time += phase_started.elapsed();
             let Ok(mut graph) = decoded else {
                 nodes.insert(
                     key,
@@ -730,7 +1013,6 @@ fn analyze(
             // fact from the outer rounds.  Bootstrap the SCC locally from
             // concrete non-recursive return paths; the M/X lattice has only
             // four elements, so six iterations is a conservative bound.
-            let phase_started = Instant::now();
             let self_keys: HashSet<(u32, u8, u8)> = [
                 Some((key.pc24, key.m, key.x)),
                 mirror_pc24(key.pc24).map(|pc24| (pc24, key.m, key.x)),
@@ -791,8 +1073,7 @@ fn analyze(
                     graph = Arc::new(candidate);
                 }
             }
-            recursion_time += phase_started.elapsed();
-            let additions = discover_helpers(&graph, rom, &helpers);
+            let additions = discover_helpers(&graph, rom, mapping, &helpers);
             if !additions.is_empty() {
                 helpers.extend(additions);
                 cache = DecodeCache::new();
@@ -801,7 +1082,7 @@ fn analyze(
                 continue;
             }
             let inline_additions =
-                discover_inline_args(&graph, rom, &inline_args, &mut inline_arg_probes);
+                discover_inline_args(&graph, rom, mapping, &inline_args, &mut inline_arg_probes);
             if !inline_additions.is_empty() {
                 inline_args.extend(inline_additions);
                 cache = DecodeCache::new();
@@ -821,7 +1102,6 @@ fn analyze(
                             .unwrap_or(true)
                 })
                 .collect();
-            let phase_started = Instant::now();
             let summary = match summary_cache.get(&key) {
                 Some((cached_graph, cached_unknown, cached_unstable, summary))
                     if Arc::ptr_eq(cached_graph, &graph)
@@ -844,7 +1124,6 @@ fn analyze(
                     summary
                 }
             };
-            summary_time += phase_started.elapsed();
             if summary
                 .reasons
                 .iter()
@@ -855,7 +1134,60 @@ fn analyze(
 
             let unknown = !relevant_unknown.is_empty();
             let fact_key = (key.pc24, key.m, key.x);
-            let phase_started = Instant::now();
+            let graph_has_poison = graph.insns().iter().any(|decoded| {
+                matches!(decoded.insn.mnem, "BRK" | "COP")
+                    && !graph
+                        .data_region_exec_pcs
+                        .contains(&(decoded.insn.addr & 0xFFFFFF))
+            });
+            let graph_has_dynamic_unknown = !graph.unresolved_indirects.is_empty()
+                || !graph.suppressed_indirect_calls.is_empty();
+            if !graph_has_poison && !graph_has_dynamic_unknown {
+                if !unknown {
+                    let (local_modes, dependencies) = function_exit_mx_equation(&graph);
+                    round_equations.insert(
+                        key,
+                        ExitEquation {
+                            local_modes: local_modes.into_iter().collect(),
+                            dependencies: dependencies.into_iter().collect(),
+                            assumptions: BTreeSet::new(),
+                        },
+                    );
+                } else {
+                    let probe_env = DecodeEnv {
+                        stop_on_unknown_callee_exit: false,
+                        ..env.clone()
+                    };
+                    let probe = catch_unwind(AssertUnwindSafe(|| {
+                        decode_function(rom, bank, pc, key.m, key.x, end, &probe_env)
+                    }));
+                    if let Ok(probe) = probe {
+                        let probe_has_poison = probe.insns().iter().any(|decoded| {
+                            matches!(decoded.insn.mnem, "BRK" | "COP")
+                                && !probe
+                                    .data_region_exec_pcs
+                                    .contains(&(decoded.insn.addr & 0xFFFFFF))
+                        });
+                        if !probe_has_poison {
+                            let (local_modes, dependencies) = function_exit_mx_equation(&probe);
+                            let assumptions = relevant_unknown
+                                .iter()
+                                .map(|&(_, target, m, x)| {
+                                    ((target & 0xFFFFFF, m & 1, x & 1), m & 1, x & 1)
+                                })
+                                .collect();
+                            round_equations.insert(
+                                key,
+                                ExitEquation {
+                                    local_modes: local_modes.into_iter().collect(),
+                                    dependencies: dependencies.into_iter().collect(),
+                                    assumptions,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             if !unknown
                 && !unstable_exact.contains(&fact_key)
                 && !inputs.declared_exit_modes.contains_key(&fact_key)
@@ -871,13 +1203,12 @@ fn analyze(
                     ) {
                         modes.sort();
                         modes.dedup();
-                        if modes.len() > 1 {
+                        if modes.len() != 1 {
                             round_sets.insert(fact_key, modes);
                         }
                     }
                 }
             }
-            exit_time += phase_started.elapsed();
             for edge in &summary.demands {
                 if edge.resolution == "aot_exact" {
                     if let Some(target) = edge.target {
@@ -888,6 +1219,26 @@ fn analyze(
                 }
             }
             nodes.insert(key, summary);
+        }
+
+        for (key, modes) in solve_exit_equation_sccs(&round_equations, &active_exact, &active_sets)
+        {
+            let fact_key = (key.pc24, key.m, key.x);
+            if inputs.declared_exit_modes.contains_key(&fact_key)
+                || unstable_exact.contains(&fact_key)
+                || unstable_sets.contains(&fact_key)
+            {
+                continue;
+            }
+            if modes.len() == 1 {
+                round_exact
+                    .entry(fact_key)
+                    .or_insert(*modes.first().unwrap());
+            } else {
+                round_sets
+                    .entry(fact_key)
+                    .or_insert_with(|| modes.into_iter().collect());
+            }
         }
 
         let mut next_exact = active_exact.clone();
@@ -976,28 +1327,53 @@ fn analyze(
             && before_inline_args == inline_args;
         active_exact = next_exact;
         active_sets = next_sets;
-        if trace_rounds {
-            eprintln!(
-                "native analysis round {round}: {} nodes, {} exact exits, {} mode sets",
-                nodes.len(),
-                active_exact.len(),
-                active_sets.len()
-            );
-        }
         if stable {
-            if trace_rounds {
-                eprintln!(
-                    "native decode cache: {} hits / {} misses",
-                    cache.hits.load(Ordering::Relaxed),
-                    cache.misses.load(Ordering::Relaxed)
-                );
-                eprintln!(
-                    "native phases: decode {:.3}s, recursion {:.3}s, summary {:.3}s, exits {:.3}s",
-                    decode_time.as_secs_f64(),
-                    recursion_time.as_secs_f64(),
-                    summary_time.as_secs_f64(),
-                    exit_time.as_secs_f64(),
-                );
+            if let (Ok(path), Ok(target_text)) = (
+                std::env::var("SNESRECOMP_NATIVE_ANALYSIS_SNAPSHOT"),
+                std::env::var("SNESRECOMP_NATIVE_ANALYSIS_SNAPSHOT_TARGET"),
+            ) {
+                if let Ok(target) = parse_root(&target_text) {
+                    let solved =
+                        solve_exit_equation_sccs(&round_equations, &active_exact, &active_sets);
+                    let equation = round_equations.get(&target);
+                    let dependencies = equation
+                        .map(|equation| {
+                            equation
+                                .dependencies
+                                .iter()
+                                .map(|&(pc24, m, x)| {
+                                    let key = VariantKey::new(pc24, m, x);
+                                    json!({
+                                        "key": key.manifest_key(),
+                                        "exact": active_exact.get(&(pc24, m, x)),
+                                        "set": active_sets.get(&(pc24, m, x)),
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let snapshot = json!({
+                        "target": target.manifest_key(),
+                        "equation": equation.map(|equation| json!({
+                            "local_modes": equation.local_modes,
+                            "dependencies": dependencies,
+                            "assumptions": equation.assumptions,
+                        })),
+                        "active_exact": active_exact.get(&(target.pc24, target.m, target.x)),
+                        "active_set": active_sets.get(&(target.pc24, target.m, target.x)),
+                        "solver_result": solved.get(&target),
+                        "return_stack_deltas": summary_cache.get(&target).map(
+                            |(graph, _, _, _)| function_return_stack_delta_states(graph)
+                                .into_iter()
+                                .map(|(pc24, states)| (format!("{pc24:06X}"), states))
+                                .collect::<BTreeMap<_, _>>()
+                        ),
+                    });
+                    let _ = fs::write(
+                        path,
+                        serde_json::to_string_pretty(&snapshot).unwrap() + "\n",
+                    );
+                }
             }
             return Ok((nodes, active_exact, active_sets, helpers, inline_args));
         }
@@ -1081,6 +1457,12 @@ fn main() {
     let rom_path = arg_value(&args, "--rom").expect("--rom required");
     let cfg_dir = arg_value(&args, "--cfg-dir").expect("--cfg-dir required");
     let manifest_path = arg_value(&args, "--manifest").expect("--manifest required");
+    let max_insns = arg_value(&args, "--max-insns")
+        .map(|value| value.parse::<usize>().expect("invalid --max-insns"))
+        .unwrap_or(4096);
+    let max_nodes = arg_value(&args, "--max-nodes")
+        .map(|value| value.parse::<usize>().expect("invalid --max-nodes"))
+        .unwrap_or(100_000);
     let started = Instant::now();
     let rom = load_rom(&rom_path).expect("load rom");
     let mut inputs = load_inputs(Path::new(&cfg_dir), &rom, has_arg(&args, "--all-cfg-roots"))
@@ -1091,7 +1473,7 @@ fn main() {
             .insert(parse_root(&value).expect("parse --root"));
     }
     let (nodes, exact, sets, helpers, inline_args) =
-        analyze(&inputs, &rom).expect("native analysis");
+        analyze(&inputs, &rom, max_insns, max_nodes).expect("native analysis");
     let manifest = manifest_json(&inputs, &nodes, &exact, &sets, &helpers, &inline_args);
     let text = serde_json::to_string_pretty(&manifest).expect("serialize manifest") + "\n";
     fs::write(&manifest_path, text).expect("write manifest");

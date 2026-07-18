@@ -1,4 +1,4 @@
-//! ROM loading + LoROM address mapping, reloc-aware (port of the ROM half of
+//! ROM loading + LoROM/HiROM address mapping, reloc-aware (port of the ROM half of
 //! `recompiler/snes65816.py`).
 //!
 //! Unlike the Python, there is no process-global reloc registry: reloc regions
@@ -7,6 +7,50 @@
 
 use std::io;
 use std::path::Path;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum RomMapping {
+    #[default]
+    LoRom,
+    HiRom,
+}
+
+fn header_score(data: &[u8], base: usize, expected_low_nibble: u8) -> i32 {
+    if base + 0x40 > data.len() {
+        return -1;
+    }
+    let mut score = 0;
+    if data[base + 0x15] & 0x0F == expected_low_nibble {
+        score += 4;
+    }
+    let reset = u16::from_le_bytes([data[base + 0x3C], data[base + 0x3D]]);
+    if reset >= 0x8000 && reset != 0xFFFF {
+        score += 2;
+    }
+    let complement = u16::from_le_bytes([data[base + 0x1C], data[base + 0x1D]]);
+    let checksum = u16::from_le_bytes([data[base + 0x1E], data[base + 0x1F]]);
+    if checksum ^ complement == 0xFFFF {
+        score += 2;
+    }
+    score
+}
+
+pub fn detect_rom_mapping(data: &[u8]) -> RomMapping {
+    let lorom_score = header_score(data, 0x7FC0, 0);
+    let hirom_score = header_score(data, 0xFFC0, 1);
+    if hirom_score > lorom_score {
+        RomMapping::HiRom
+    } else {
+        RomMapping::LoRom
+    }
+}
+
+pub fn vector_table_offset(data: &[u8]) -> usize {
+    match detect_rom_mapping(data) {
+        RomMapping::LoRom => 0x7FE0,
+        RomMapping::HiRom => 0xFFE0,
+    }
+}
 
 /// Load a ROM image, stripping a 512-byte copier header if present.
 pub fn load_rom<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
@@ -29,6 +73,38 @@ pub fn lorom_offset(bank: u32, addr: u32) -> usize {
         "addr ${addr:04X} not in LoROM range $8000-$FFFF"
     );
     ((bank & 0x7F) as usize) * 0x8000 + (addr as usize - 0x8000)
+}
+
+pub fn rom_offset(mapping: RomMapping, bank: u32, addr: u32) -> usize {
+    let bank = bank & 0xFF;
+    let addr = addr & 0xFFFF;
+    assert!(
+        bank != 0x7E && bank != 0x7F,
+        "WRAM address has no ROM offset"
+    );
+    match mapping {
+        RomMapping::LoRom => lorom_offset(bank, addr),
+        RomMapping::HiRom => {
+            let canonical_bank = bank & 0x7F;
+            assert!(
+                canonical_bank >= 0x40 || addr >= 0x8000,
+                "address ${bank:02X}:{addr:04X} is not in a HiROM ROM window"
+            );
+            (((canonical_bank & 0x3F) as usize) << 16) | addr as usize
+        }
+    }
+}
+
+pub fn is_rom_address(mapping: RomMapping, bank: u32, addr: u32) -> bool {
+    let bank = bank & 0xFF;
+    let addr = addr & 0xFFFF;
+    if bank == 0x7E || bank == 0x7F {
+        return false;
+    }
+    match mapping {
+        RomMapping::LoRom => addr >= 0x8000 && (bank < 0x40 || bank >= 0x80),
+        RomMapping::HiRom => (bank & 0x7F) >= 0x40 || addr >= 0x8000,
+    }
 }
 
 /// A RAM-executed-from-ROM region: the bytes at WRAM `ram_addr..ram_addr+length`
@@ -80,12 +156,17 @@ pub fn addr_in_reloc_region(bank: u32, addr: u32, regions: &[RelocRegion]) -> Op
 /// Map (bank, addr) to a physical ROM byte offset, reloc-aware. If (bank, addr)
 /// is inside a registered reloc region, return the ROM offset of the source
 /// byte; otherwise fall back to plain `lorom_offset`.
-pub fn addr_to_rom_offset(bank: u32, addr: u32, regions: &[RelocRegion]) -> usize {
+pub fn addr_to_rom_offset(
+    mapping: RomMapping,
+    bank: u32,
+    addr: u32,
+    regions: &[RelocRegion],
+) -> usize {
     if let Some(r) = addr_in_reloc_region(bank, addr, regions) {
         let delta = (addr & 0xFFFF) - (r.ram_addr as u32);
-        return lorom_offset(r.rom_bank as u32, r.rom_off as u32) + delta as usize;
+        return rom_offset(mapping, r.rom_bank as u32, r.rom_off as u32) + delta as usize;
     }
-    lorom_offset(bank, addr)
+    rom_offset(mapping, bank, addr)
 }
 
 /// Borrow a `length`-byte slice of the ROM at LoROM (bank, addr).
@@ -117,15 +198,29 @@ mod tests {
         let regions = vec![RelocRegion::new(0x7E, 0x321F, 0x02, 0x8000, 0x6000)];
         // Inside the region: $7E:321F maps to ROM offset of $02:8000.
         assert_eq!(
-            addr_to_rom_offset(0x7E, 0x321F, &regions),
+            addr_to_rom_offset(RomMapping::LoRom, 0x7E, 0x321F, &regions),
             lorom_offset(0x02, 0x8000)
         );
         // Offset 0x10 in: maps 0x10 past the ROM base.
         assert_eq!(
-            addr_to_rom_offset(0x7E, 0x322F, &regions),
+            addr_to_rom_offset(RomMapping::LoRom, 0x7E, 0x322F, &regions),
             lorom_offset(0x02, 0x8000) + 0x10
         );
         // Outside the region (different bank) falls back to lorom_offset.
         assert!(addr_in_reloc_region(0x00, 0x8000, &regions).is_none());
+    }
+
+    #[test]
+    fn mapping_detection_and_hirom_offsets() {
+        let mut rom = vec![0u8; 0x10000];
+        rom[0xFFD5] = 0x21;
+        rom[0xFFFC..0xFFFE].copy_from_slice(&0x84F8u16.to_le_bytes());
+        rom[0xFFDC..0xFFDE].copy_from_slice(&0x1234u16.to_le_bytes());
+        rom[0xFFDE..0xFFE0].copy_from_slice(&0xEDCBu16.to_le_bytes());
+        assert_eq!(detect_rom_mapping(&rom), RomMapping::HiRom);
+        assert_eq!(vector_table_offset(&rom), 0xFFE0);
+        assert_eq!(rom_offset(RomMapping::HiRom, 0x80, 0x84F8), 0x84F8);
+        assert_eq!(rom_offset(RomMapping::HiRom, 0xC0, 0x1234), 0x1234);
+        assert_eq!(rom_offset(RomMapping::HiRom, 0xFD, 0x819D), 0x3D819D);
     }
 }
