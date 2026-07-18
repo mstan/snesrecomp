@@ -92,7 +92,7 @@ uint8_t *cart_getRomPtr(Cart *cart, uint8_t bank, uint16_t adr) {
 
 uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
   switch(cart->type) {
-    case 0: 
+    case 0:
       assert(0);
       return 0;
     case CART_LOROM: return cart_readLorom(cart, bank, adr);
