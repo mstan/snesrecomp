@@ -178,18 +178,6 @@ def main() -> int:
     analysis_backend = args.analysis_backend
     if analysis_backend == "auto":
         analysis_backend = "native" if native_path.is_file() else "python"
-    if analysis_backend == "native":
-        if (analysis_backend == "native"
-                and (args.max_insns != 4096 or args.max_nodes != 100_000)):
-            if args.analysis_backend == "native":
-                parser.error(
-                    "the native analyzer currently supports the default "
-                    "--max-insns=4096 and --max-nodes=100000 limits")
-            print(
-                "v2_emit: non-default analysis limits require Python; "
-                "falling back")
-            analysis_backend = "python"
-
     source_roots = [pathlib.Path(p).resolve() for p in args.source_root]
     if not source_roots and not args.no_host_root_scan:
         conventional = cfg_dir.parent / "src"
@@ -260,7 +248,9 @@ def main() -> int:
                     rom_path=args.rom, cfg_dir=cfg_dir,
                     all_cfg_roots=args.cfg_roots,
                     additional_roots=additional_roots,
-                    executable=native_path)
+                    executable=native_path,
+                    max_insns=args.max_insns,
+                    max_nodes=args.max_nodes)
             if native_output:
                 print(native_output)
         except (OSError, RuntimeError, ValueError) as exc:
