@@ -133,8 +133,12 @@ class Insn:
                  'dispatch_call', 'dispatch_pushed_call',
                  'dispatch_pushed_call_frame_size',
                  'dispatch_return_pc', 'dispatch_return_m', 'dispatch_return_x',
-                 'dispatch_local_goto', 'dispatch_runtime',
-                 'const_z_fold_unconditional', 'const_z_fold_dead_pc24')
+                  'dispatch_local_goto', 'dispatch_runtime',
+                  'dispatch_pointer_match', 'dispatch_popped_call_frame',
+                  'dispatch_stack_pointer', 'dispatch_forced_m',
+                  'dispatch_forced_x', 'dispatch_consumed_stack_bytes',
+                  'const_z_fold_unconditional', 'const_z_fold_dead_pc24',
+                  'data_region_exec', 'terminal_jsr')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
         self.addr = addr
@@ -175,6 +179,23 @@ class Insn:
         # Codegen routes it through cpu_dispatch_call_pc. See decoder
         # runtime-pointer recovery + codegen._emit_runtime_dispatch.
         self.dispatch_runtime = False
+        # Explicit target universe selected by the loaded runtime pointer
+        # value rather than by a fixed ROM table index (ptrcall/ptrtail).
+        self.dispatch_pointer_match = False
+        # Inline return-address trampoline: its dispatch body has already
+        # consumed the JSR frame it was entered with (PLA) and transfers the
+        # the enclosing long-call return obligation to the selected state
+        # handler.
+        self.dispatch_popped_call_frame = False
+        self.dispatch_stack_pointer = False
+        self.dispatch_forced_m = 1
+        self.dispatch_forced_x = 1
+        self.dispatch_consumed_stack_bytes = 0
+        # Direct JSR whose callee consumes the two-byte return address as
+        # inline data and never resumes the lexical fall-through.  Imported
+        # from assembly source as a call-site ABI contract; see cfg_loader's
+        # `terminal_jsr` directive.
+        self.terminal_jsr = False
         self.m_flag = 1
         self.x_flag = 1
         # Constant-Z branch fold: when set on a BEQ/BNE, the preceding
@@ -184,6 +205,7 @@ class Insn:
         # build report.
         self.const_z_fold_unconditional = False
         self.const_z_fold_dead_pc24 = None
+        self.data_region_exec = False
 
     def __repr__(self):
         bank = (self.addr >> 16) & 0xFF

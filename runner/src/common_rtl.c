@@ -587,7 +587,18 @@ uint8 *RomPtr(uint32_t addr) {
   uint8_t *mapped = g_snes && g_snes->cart
       ? cart_getRomPtr(g_snes->cart, bank, lo) : NULL;
   if (bank == 0x7e || bank == 0x7f || !mapped) {
-    if (!g_fail) g_fail = true;
+    if (!g_fail) {
+      const char *verbose = getenv("SNESRECOMP_OFFRAILS_STDERR");
+      if (verbose && verbose[0] && verbose[0] != '0') {
+        extern const char *g_last_recomp_func;
+        fprintf(stderr,
+                "[off-rails-romptr] addr=$%06X PB=$%02X DB=$%02X "
+                "S=$%04X func=%s\n",
+                (unsigned)(addr & 0xFFFFFFu), g_cpu.PB, g_cpu.DB, g_cpu.S,
+                g_last_recomp_func ? g_last_recomp_func : "<none>");
+      }
+      g_fail = true;
+    }
     /* No printf — the ring buffer + cpu_trace_offrails is the
      * channel for backwards investigation. printf'ing every bad
      * read floods stderr with millions of identical lines. */

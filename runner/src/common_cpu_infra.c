@@ -311,18 +311,34 @@ const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
     return &g_recomp_snap_ring[slot];
 }
 
-/* Write-log scope: arm the shared write ring around the AOT body of
- * vram_payload_handler (all exact variants). A zero-write
+/* Write-log scope: arm the shared write ring around the selected AOT body.
+ * SNESRECOMP_WLOG_FUNC_PREFIX overrides the historical
+ * "vram_payload_handler_M" default so the same first-divergence probe can be
+ * reused without rebuilding this file for every function. A zero-write
  * scope (e.g. denied bounce) is not counted, keeping call indices aligned with
  * a denied(interp) run. See cpu_state.c. */
 static int g_wlog_aot_slot = -1;
+
+static int wlog_func_matches(const char *name) {
+  static const char *prefix;
+  static size_t prefix_len;
+  static int initialized;
+  if (!initialized) {
+    prefix = getenv("SNESRECOMP_WLOG_FUNC_PREFIX");
+    if (!prefix || !*prefix) prefix = "vram_payload_handler_M";
+    prefix_len = strlen(prefix);
+    initialized = 1;
+  }
+  return name && strncmp(name, prefix, prefix_len) == 0;
+}
+
+void RecompStackDump(void);
 
 void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH) {
     int slot = g_recomp_stack_top++;
     g_recomp_stack[slot] = name;
-    if (g_wlog_aot_slot < 0 && name &&
-        strncmp(name, "vram_payload_handler_M", 22) == 0) {
+    if (g_wlog_aot_slot < 0 && wlog_func_matches(name)) {
       g_wlog_aot_slot = slot;
       wlog_scope_enter(name);
     }
@@ -330,6 +346,15 @@ void RecompStackPush(const char *name) {
         (g_cpu.host_return_valid == 2 || g_cpu.host_return_valid == 3)
             ? g_cpu.host_return_valid
             : 0;
+  } else if (getenv("SNESRECOMP_STACK_CAP_ABORT")) {
+    /* Diagnostic-only: stop at the first host-call-depth overflow while the
+     * bounded attribution stack still contains the causal chain.  Letting C
+     * recursion continue loses that evidence to Windows 0xC00000FD. */
+    fprintf(stderr, "\n[recomp-stack-cap] next=%s depth=%d\n",
+            name ? name : "(null)", g_recomp_stack_top);
+    RecompStackDump();
+    fflush(stderr);
+    abort();
   }
   g_last_recomp_func = name;
   debug_server_profile_push(name);

@@ -88,3 +88,40 @@ def test_pha_rts_dispatch_missing_exact_target_uses_lle():
     assert 'bank_00_9100_M1X1(cpu)' not in src
     assert ('interp_tier_dispatch_tail(cpu, 0x009100u' in src
             and 'authoritative LLE M1X1' in src)
+
+
+def test_pei_rts_stack_dispatch_is_same_function_goto_and_preserves_mx():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x8B,              # PHB
+            0x5A,              # PHY (16-bit)
+            0xE2, 0x20,        # SEP #$20 -> M1X0
+            0xD4, 0x10,        # PEI ($10), DP contains target-1
+            0x60,              # RTS (fused with PEI by the decoder)
+        ]),
+        0x8100: bytes([
+            0xC2, 0x20,        # REP #$20 -> M0X0
+            0x7A,              # PLY
+            0xAB,              # PLB
+            0x6B,              # RTL
+        ]),
+    })
+
+    src = emit_function(
+        rom=rom, bank=0, start=0x8000, entry_m=0, entry_x=0,
+        indirect_dispatch={
+            0x008004: {
+                'count': 1,
+                'idx_reg': 'X',
+                'table_bases': (),
+                'targets': (0x008100,),
+                'rts_stack': True,
+            },
+        },
+    )
+
+    assert 'PEI(dp); RTS consumes target-1 as an internal goto' in src
+    assert 'cpu->D + 0x0010' in src
+    assert 'case 0x8100: goto L_8100_M1X0;' in src
+    assert 'L_8100_M1X0:' in src
+    assert 'CPU_STACK_OP_PEI' not in src

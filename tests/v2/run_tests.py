@@ -46,6 +46,7 @@ TEST_MODULES = [
     'test_nlr_idiom',
     'test_dispatcher_phk_per_jml',
     'test_indirect_dispatch_parallel_tables',
+    'test_pointer_target_dispatch',
     'test_indirect_jsr_dispatch_continuation',
     'test_local_stride_runway_dispatch',
     'test_rts_stack_dispatch',
@@ -63,6 +64,7 @@ TEST_MODULES = [
     'test_analysis_tool',
     'test_variant_dispatch_lle_fallback',
     'test_program_profile_roots',
+    'test_ingest_dkc2_disasm',
 ]
 
 

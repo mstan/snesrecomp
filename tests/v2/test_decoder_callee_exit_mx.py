@@ -16,7 +16,8 @@ post-JSR (m, x) reflects the callee's exit state.
 from _helpers import make_lorom_bank0  # noqa: E402
 
 from v2.decoder import (  # noqa: E402
-    decode_function, analyze_function_exit_mx, addr24, DecodeKey,
+    decode_function, analyze_function_exit_mx, function_exit_mx_equation,
+    addr24, DecodeKey,
 )
 
 
@@ -162,3 +163,158 @@ def test_analyze_function_exit_mx_returns_none_for_no_terminators():
     rom = make_lorom_bank0(blobs)
     graph = decode_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
     assert analyze_function_exit_mx(graph) == (None, None)
+
+
+def test_computed_pei_rts_is_not_a_callable_exit_mode():
+    """A stack-deep RTS is an internal dispatch, not a function return.
+
+    DKC2's decompressor saves DB/Y, pushes a command pointer with PEI, and
+    executes RTS to jump into the command table.  The dispatcher happens to
+    run in M=1, but its terminal command later restores M=0 before RTL.  Using
+    this RTS as the callee exit fact makes callers decode their continuation
+    one byte short (``LDA #imm16`` becomes ``LDA #imm8; RTI``).
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x8B,        # PHB
+            0x5A,        # PHY (2 bytes with X=0)
+            0xE2, 0x20,  # SEP #$20 -> transient M=1 dispatcher mode
+            0xD4, 0x10,  # PEI ($10)
+            0x60,        # RTS computed jump
+        ]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0)
+
+    assert analyze_function_exit_mx(graph) == (None, None)
+    local_modes, dependencies = function_exit_mx_equation(graph)
+    assert local_modes == {(1, 0)}
+    assert (0xFFFFFFFF, 0, 0) in dependencies
+
+
+def test_authorized_pei_rts_dispatch_proves_real_terminal_exit_mode():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x8B,        # PHB
+            0x5A,        # PHY (16-bit)
+            0xE2, 0x20,  # SEP #$20 -> transient M1X0
+            0xD4, 0x10,  # PEI ($10), followed by synthetic-transfer RTS
+            0x60,
+        ]),
+        0x8100: bytes([
+            0xC2, 0x20,  # real terminal path restores M0
+            0x7A,        # PLY
+            0xAB,        # PLB
+            0x6B,        # RTL
+        ]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0,
+        indirect_dispatch={
+            0x008004: {
+                'count': 1, 'idx_reg': 'X', 'table_bases': (),
+                'targets': (0x008100,), 'rts_stack': True,
+            },
+        })
+
+    assert analyze_function_exit_mx(graph) == (0, 0)
+
+
+def test_authorized_pea_jmp_ptrcall_consumes_synthetic_return_frame():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x8B,              # PHB local save
+            0xF4, 0x06, 0x80,  # PEA $8006 (return $8007 minus one)
+            0x6C, 0x10, 0x00,  # JMP ($0010), handler RTSes to $8007
+            0xAB,              # PLB
+            0x6B,              # RTL
+        ]),
+        0x8100: bytes([0x60]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0,
+        indirect_dispatch={
+            0x008004: {
+                'count': 1, 'idx_reg': 'X', 'table_bases': (),
+                'targets': (0x008100,), 'ptr_call': True,
+                'pointer_match': True,
+            },
+        })
+
+    assert analyze_function_exit_mx(graph) == (0, 0)
+
+
+def test_authorized_phk_pea_jml_ptrcall_consumes_three_byte_return_frame():
+    """Opcode $DC decodes as JMP, but its long ptrcall frame is 3 bytes."""
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x4B,              # PHK (bank byte for handler RTL)
+            0xF4, 0x06, 0x80,  # PEA $8006 (return $8007 minus one)
+            0xDC, 0x10, 0x00,  # JML [$0010], handler RTLs to $8007
+            0x6B,              # RTL
+        ]),
+        0x8100: bytes([0x6B]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0,
+        indirect_dispatch={
+            0x008004: {
+                'count': 1, 'idx_reg': 'X', 'table_bases': (),
+                'targets': (0x008100,), 'ptr_call': True,
+                'pointer_match': True,
+            },
+        })
+
+    dispatch = graph.insns[DecodeKey(0x008004, 0, 0, ())].insn
+    assert dispatch.dispatch_kind == 'long'
+    assert dispatch.dispatch_consumed_stack_bytes == 3
+    assert analyze_function_exit_mx(graph) == (0, 0)
+
+
+def test_balanced_push_pull_rts_remains_a_callable_exit_mode():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x8B,  # PHB
+            0xAB,  # PLB
+            0x60,  # RTS
+        ]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0)
+
+    assert analyze_function_exit_mx(graph) == (0, 0)
+
+
+def test_terminal_jsr_has_no_lexical_fallthrough_or_unknown_exit():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x20, 0x00, 0x81,  # JSR $8100; inline table begins here
+            0x00, 0x81,        # dw $8100 (must not decode as code)
+        ]),
+        0x8100: bytes([0x60]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0,
+        terminal_jsr_sites={0x008000},
+        stop_on_unknown_callee_exit=True)
+
+    assert {key.pc for key in graph.insns} == {0x008000}
+    insn = next(iter(graph.insns.values())).insn
+    assert insn.terminal_jsr
+    assert graph.unknown_callee_exit_sites == []
+
+
+def test_analyze_function_exit_mx_inherits_natural_boundary_fallthrough():
+    """Falling through ``end:`` is a tail edge, not a missing exit."""
+    rom = make_lorom_bank0({
+        0x8000: bytes([0xEA]),  # NOP, naturally falls into sibling $8001
+        0x8001: bytes([0x60]),  # sibling RTS
+    })
+    graph = decode_function(
+        rom, 0, 0x8000, entry_m=0, entry_x=0,
+        end=0x8001, sibling_entry_pcs={0x8001})
+    assert [(site, target.pc) for site, target in graph.boundary_exits] == [
+        (0x008000, 0x008001)
+    ]
+    assert analyze_function_exit_mx(
+        graph, {(0x008001, 0, 0): (1, 0)}) == (1, 0)
