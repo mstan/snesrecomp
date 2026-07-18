@@ -712,6 +712,185 @@ def collect_indexed_record_dispatch_contracts(
     return contracts, target_entries
 
 
+def collect_indexed_pointer_field_contracts(
+    full_symbols: Path, disasm_dir: Path
+) -> tuple[list[DispatchContract], list[Entry]]:
+    """Import callbacks loaded from a symbolic field in indexed records.
+
+    H4 describes some mixed data/callback records by naming byte offsets with
+    ``%offset(field, N)`` and placing a symbolic ``dw`` after N numeric bytes.
+    Code then loads that field with ``LDA field,x``, stores it in a direct-page
+    pointer, pushes a return with ``%return(...)``, and jumps through the
+    pointer.  Relating all four source facts gives the analyzer an exact finite
+    ptrcall target set without interpreting unrelated record fields as code.
+    """
+    full_entries = parse_wla_symbols(full_symbols)
+    full_by_name: dict[str, set[int]] = defaultdict(set)
+    names_by_pc: dict[int, list[str]] = defaultdict(list)
+    for entry in full_entries:
+        full_by_name[entry.name].add(entry.pc24)
+        names_by_pc[entry.pc24].append(entry.name)
+
+    line_pc = _source_line_pc_maps(full_symbols, disasm_dir)
+    numeric_re = re.compile(r"^\s*(?:\$[0-9A-Fa-f]+|%[01]+|[0-9]+)\s*$")
+    offset_re = re.compile(
+        r"^%offset\s*\(\s*(\.{0,2}[A-Za-z_][A-Za-z0-9_]*)\s*,"
+        r"\s*(\d+)\s*\)\s*$", re.IGNORECASE)
+    record_re = re.compile(
+        r"^db\s+(.+?)\s*:\s*dw\s+"
+        r"(\.{0,2}[A-Za-z_][A-Za-z0-9_]*)\s*$", re.IGNORECASE)
+    targets_by_field: dict[str, set[int]] = defaultdict(set)
+
+    # First pass: a field alias is executable only when its declared byte
+    # offset lands exactly on the symbolic word following the numeric bytes.
+    for path in sorted(disasm_dir.glob("bank_*.asm")):
+        scope = _SourceScope()
+        field_offsets: dict[int, set[str]] = defaultdict(set)
+        in_record = False
+        for raw_line in path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            source = raw_line.split(";", 1)[0].strip()
+            global_label = GLOBAL_LABEL_RE.match(source)
+            local_label = LOCAL_LABEL_RE.match(source)
+            if global_label:
+                scope.define("", global_label.group(1))
+                field_offsets.clear()
+                in_record = True
+                continue
+            if local_label:
+                scope.define(local_label.group(1), local_label.group(2))
+                field_offsets.clear()
+                in_record = False
+                continue
+            if not in_record:
+                continue
+
+            offset = offset_re.match(source)
+            if offset:
+                resolved = scope.resolve(offset.group(1))
+                if resolved:
+                    field_offsets[int(offset.group(2))].add(resolved)
+                continue
+
+            record = record_re.match(source)
+            if record:
+                byte_fields = [part.strip() for part in record.group(1).split(",")]
+                if not byte_fields or not all(numeric_re.match(part)
+                                              for part in byte_fields):
+                    continue
+                target_name = scope.resolve(record.group(2))
+                addresses = full_by_name.get(target_name or "", set())
+                if len(addresses) != 1:
+                    continue
+                target = next(iter(addresses))
+                for field_name in field_offsets.get(len(byte_fields), ()):
+                    targets_by_field[field_name].add(target)
+                continue
+
+            if source and _statement_kind(source) is not None:
+                field_offsets.clear()
+                in_record = False
+
+    load_re = re.compile(
+        r"^LDA\s+(\.{0,2}[A-Za-z_][A-Za-z0-9_]*)\s*,\s*x\s*$",
+        re.IGNORECASE)
+    write_re = re.compile(
+        r"^(STA|STX|STY|STZ|INC|DEC|ASL|LSR|ROL|ROR|TRB|TSB)\s+"
+        r"\$([0-9A-Fa-f]{1,4})\s*$", re.IGNORECASE)
+    return_re = re.compile(r"^%return\s*\(", re.IGNORECASE)
+    jump_re = re.compile(
+        r"^JMP\s+\(\s*\$([0-9A-Fa-f]{1,4})\s*\)\s*$",
+        re.IGNORECASE)
+    contracts: list[DispatchContract] = []
+    all_targets: set[int] = set()
+
+    # Second pass: carry a proven field through the direct-page pointer store,
+    # invalidating it on every other write to that cell.  The synthetic return
+    # must be immediately followed by the indirect jump, making this ptrcall
+    # rather than a tail dispatch.
+    for path in sorted(disasm_dir.glob("bank_*.asm")):
+        scope = _SourceScope()
+        pending_field: str | None = None
+        fields_by_cell: dict[int, str] = {}
+        return_armed = False
+        for line_number, raw_line in enumerate(path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines(), 1):
+            source = raw_line.split(";", 1)[0].strip()
+            global_label = GLOBAL_LABEL_RE.match(source)
+            local_label = LOCAL_LABEL_RE.match(source)
+            if global_label:
+                scope.define("", global_label.group(1))
+                pending_field = None
+                return_armed = False
+                continue
+            if local_label:
+                scope.define(local_label.group(1), local_label.group(2))
+                pending_field = None
+                return_armed = False
+                continue
+            if not source or _statement_kind(source) is None:
+                continue
+
+            load = load_re.match(source)
+            if load:
+                resolved = scope.resolve(load.group(1))
+                pending_field = (resolved if resolved in targets_by_field
+                                 else None)
+                return_armed = False
+                continue
+
+            write = write_re.match(source)
+            if write:
+                cell = int(write.group(2), 16)
+                if write.group(1).upper() != "STA" or pending_field is None:
+                    fields_by_cell.pop(cell, None)
+                else:
+                    fields_by_cell[cell] = pending_field
+                pending_field = None
+                return_armed = False
+                continue
+
+            pending_field = None
+            if return_re.match(source):
+                return_armed = True
+                continue
+
+            jump = jump_re.match(source)
+            if jump and return_armed:
+                field_name = fields_by_cell.get(int(jump.group(1), 16))
+                pc24 = line_pc.get((path, line_number))
+                targets = tuple(sorted(targets_by_field.get(
+                    field_name or "", ())))
+                if pc24 is not None and targets:
+                    bank = (pc24 >> 16) & 0xFF
+                    targets = tuple(target for target in targets
+                                    if ((target >> 16) & 0xFF) == bank)
+                    if targets:
+                        contracts.append(DispatchContract(
+                            bank, pc24 & 0xFFFF, targets, mode="ptrcall"))
+                        all_targets.update(targets)
+                return_armed = False
+                fields_by_cell.clear()
+                continue
+
+            return_armed = False
+            if re.match(r"^(?:RTS|RTL|RTI|JMP|JML|JSR|JSL)\b", source,
+                        re.IGNORECASE):
+                fields_by_cell.clear()
+
+    target_entries: list[Entry] = []
+    for pc24 in sorted(all_targets):
+        friendly = sorted(
+            name for name in names_by_pc.get(pc24, ())
+            if not re.fullmatch(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}", name)
+        )
+        name = friendly[0] if friendly else f"record_callback_{pc24:06X}"
+        target_entries.append(Entry(pc24, name, "indirect"))
+    return contracts, target_entries
+
+
 def collect_symbolic_indexed_dispatch_contracts(
     full_symbols: Path, disasm_dir: Path
 ) -> tuple[list[DispatchContract], list[Entry]]:
@@ -1389,6 +1568,10 @@ def collect_entries(
             collect_indexed_record_dispatch_contracts(
                 full_symbols, disasm_dir)
         collected.extend(record_entries)
+        _field_contracts, field_entries = \
+            collect_indexed_pointer_field_contracts(
+                full_symbols, disasm_dir)
+        collected.extend(field_entries)
         _indexed_contracts, indexed_entries = \
             collect_symbolic_indexed_dispatch_contracts(
                 full_symbols, disasm_dir)
@@ -1556,6 +1739,9 @@ def main() -> int:
     record_dispatches, _record_entries = \
         collect_indexed_record_dispatch_contracts(args.full_sym, args.disasm)
     dispatches.extend(record_dispatches)
+    field_dispatches, _field_entries = \
+        collect_indexed_pointer_field_contracts(args.full_sym, args.disasm)
+    dispatches.extend(field_dispatches)
     indexed_dispatches, _indexed_entries = \
         collect_symbolic_indexed_dispatch_contracts(
             args.full_sym, args.disasm)

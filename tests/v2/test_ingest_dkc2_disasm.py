@@ -13,6 +13,7 @@ from ingest_dkc2_disasm import (  # noqa: E402
     collect_data_regions,
     collect_entries,
     collect_interaction_callback_contracts,
+    collect_indexed_pointer_field_contracts,
     collect_kong_cutscene_contracts,
     collect_rts_stack_dispatch_contracts,
     collect_indexed_record_dispatch_contracts,
@@ -21,6 +22,67 @@ from ingest_dkc2_disasm import (  # noqa: E402
     collect_terrain_dispatch_contracts,
     emit_cfg,
 )
+
+
+def test_imports_indexed_record_pointer_field_as_ptrcall():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        disasm = root / "disasm"
+        disasm.mkdir()
+        source_lines = [
+            "Routine:",
+            "    LDA HandlerField,x",
+            "    STA $36",
+            "LoopLabel:",
+            "    NOP",
+            "JoinLabel:",
+            "    %return(.resume)",
+            "    JMP ($0036)",
+            ".resume:",
+            "    RTL",
+            "BadRoutine:",
+            "    LDA HandlerField,x",
+            "    STA $36",
+            "    STZ $36",
+            "    %return(.resume)",
+            "    JMP ($0036)",
+            ".resume:",
+            "    RTL",
+            "HandlerTable:",
+            "    %offset(MaskField, 2)",
+            "    %offset(HandlerField, 4)",
+            "    db $01,$02,$03,$04 : dw HandlerA",
+            "    db $05,$06,$07,$08 : dw HandlerB",
+            "HandlerA:",
+            "    LSR A",
+            "HandlerB:",
+            "    RTS",
+        ]
+        (disasm / "bank_B5.asm").write_text(
+            "\n".join(source_lines) + "\n", encoding="utf-8")
+        jump_line = source_lines.index("    JMP ($0036)") + 1
+        bad_jump_line = source_lines.index("    JMP ($0036)", jump_line) + 1
+        full = root / "full.sym"
+        full.write_text(
+            "[labels]\n"
+            "B5:8102 HandlerField\n"
+            "B5:8200 HandlerA\n"
+            "B5:8201 HandlerB\n"
+            f"b5:8008 0001:{jump_line:08x}\n"
+            f"b5:8018 0001:{bad_jump_line:08x}\n",
+            encoding="utf-8",
+        )
+
+        contracts, entries = collect_indexed_pointer_field_contracts(
+            full, disasm)
+
+        assert [(item.bank, item.site_pc16, item.targets, item.mode)
+                for item in contracts] == [
+            (0xB5, 0x8008, (0xB58200, 0xB58201), "ptrcall")]
+        assert {(entry.pc24, entry.name) for entry in entries} == {
+            (0xB58200, "HandlerA"),
+            (0xB58201, "HandlerB"),
+        }
 
 
 def test_imports_local_symbolic_indexed_state_table_only_as_code_targets():
