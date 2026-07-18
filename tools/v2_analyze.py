@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -43,11 +45,82 @@ from v2.decoder import (  # noqa: E402
 from v2.program_analysis import (  # noqa: E402
     NodeDisposition,
     ProgramAnalyzer,
+    ProgramManifest,
     VariantKey,
 )
 
 
 _BANK_CFG_RE = re.compile(r"bank([0-9a-fA-F]+)\.cfg$")
+
+
+def native_analyzer_path() -> pathlib.Path:
+    """Return the configured/default release native-analyzer executable."""
+    configured = os.environ.get("SNESRECOMP_NATIVE_ANALYZER")
+    if configured:
+        return pathlib.Path(configured).expanduser().resolve()
+    executable = ("snesrecomp-analyze.exe" if os.name == "nt"
+                  else "snesrecomp-analyze")
+    return REPO / "recompiler-rs" / "target" / "release" / executable
+
+
+def native_unsupported_features(parsed) -> tuple[str, ...]:
+    """Return cfg features not yet contract-equivalent in full projects."""
+    unsupported = set()
+    for _bank, _path, cfg in parsed:
+        if any(directive.get("ptr_call")
+               for directive in cfg.indirect_dispatch):
+            unsupported.add("indirect_dispatch ptrcall")
+    return tuple(sorted(unsupported))
+
+
+def build_manifest_native(*, rom_path, cfg_dir, all_cfg_roots=False,
+                          additional_roots=(), executable=None):
+    """Run the compiled analyzer and load its stable manifest contract."""
+    executable = pathlib.Path(
+        executable or native_analyzer_path()).resolve()
+    if not executable.is_file():
+        raise FileNotFoundError(
+            f"native analyzer not built at {executable}; run "
+            "`python tools/build_native_analyzer.py` from the snesrecomp "
+            "checkout")
+    fd, temporary = tempfile.mkstemp(
+        prefix="snesrecomp-native-analysis-", suffix=".json")
+    os.close(fd)
+    command = [
+        str(executable),
+        "--rom", str(pathlib.Path(rom_path).resolve()),
+        "--cfg-dir", str(pathlib.Path(cfg_dir).resolve()),
+        "--manifest", temporary,
+    ]
+    if all_cfg_roots:
+        command.append("--all-cfg-roots")
+    for key in sorted(set(additional_roots)):
+        command.extend(("--root", f"{key.pc24:06X}:{key.m}:{key.x}"))
+    try:
+        completed = subprocess.run(
+            command, text=True, capture_output=True, check=False)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                f"native analyzer exited {completed.returncode}: {detail}")
+        value = json.loads(pathlib.Path(temporary).read_text(
+            encoding="utf-8"))
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+    manifest = ProgramManifest.from_dict(value)
+    metadata = value.get("native_analysis", {})
+    helpers = {
+        int(pc24, 16): str(kind)
+        for pc24, kind in metadata.get("dispatch_helpers", {}).items()
+    }
+    inline_args = {
+        int(pc24, 16): int(count)
+        for pc24, count in metadata.get("inline_args", {}).items()
+    }
+    return manifest, helpers, inline_args, completed.stdout.strip()
 
 
 def _lorom_mirror_bank(bank: int):

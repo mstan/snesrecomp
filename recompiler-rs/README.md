@@ -11,7 +11,8 @@ hide a compatibility regression.
 
 ## Build
 
-Install a current stable Rust toolchain, then run from the repository root:
+Install rustup, then run from the repository root. The checked-in toolchain
+file selects the same Rust version and components used by CI:
 
 ```sh
 python tools/build_native_analyzer.py --test
