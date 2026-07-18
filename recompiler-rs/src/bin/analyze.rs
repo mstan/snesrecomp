@@ -20,7 +20,8 @@ use serde_json::{json, Map, Value};
 use snesrecomp_analyzer::cfg::{load_bank_cfg, BankCfg, BankEntry};
 use snesrecomp_analyzer::decoder::{
     analyze_function_exit_mx, analyze_function_exit_mx_modes_with_sets, classify_dispatch_helper,
-    decode_function, DecodeCache, DecodeEnv, FunctionDecodeGraph, IndirectDispatchSite,
+    decode_function, detect_inline_arg_bytes, DecodeCache, DecodeEnv, FunctionDecodeGraph,
+    IndirectDispatchSite,
 };
 use snesrecomp_analyzer::insn::Mode;
 use snesrecomp_analyzer::rom::load_rom;
@@ -377,29 +378,31 @@ fn summarize(
             poison_reasons.insert(format!("{}_at_{site:06X}", insn.mnem.to_ascii_lowercase()));
         }
         if let Some(entries) = &insn.dispatch_entries {
-            for &raw in entries {
-                if raw == 0 {
-                    continue;
+            if !insn.dispatch_local_goto {
+                for &raw in entries {
+                    if raw == 0 {
+                        continue;
+                    }
+                    let target = target_key(
+                        site,
+                        raw,
+                        insn.dispatch_kind.as_deref(),
+                        insn.m_flag,
+                        insn.x_flag,
+                    );
+                    let resolution = if target_is_code(target, inputs, rom) {
+                        "aot_exact"
+                    } else {
+                        "lle_exact"
+                    };
+                    edges.insert(DemandEdge {
+                        site_pc24: site,
+                        kind: "static_dispatch",
+                        resolution,
+                        target: Some(target),
+                        detail: String::new(),
+                    });
                 }
-                let target = target_key(
-                    site,
-                    raw,
-                    insn.dispatch_kind.as_deref(),
-                    insn.m_flag,
-                    insn.x_flag,
-                );
-                let resolution = if target_is_code(target, inputs, rom) {
-                    "aot_exact"
-                } else {
-                    "lle_exact"
-                };
-                edges.insert(DemandEdge {
-                    site_pc24: site,
-                    kind: "static_dispatch",
-                    resolution,
-                    target: Some(target),
-                    detail: String::new(),
-                });
             }
             continue;
         }
@@ -458,6 +461,15 @@ fn summarize(
                     detail: String::new(),
                 });
             }
+        }
+        if insn.dispatch_runtime {
+            edges.insert(DemandEdge {
+                site_pc24: site,
+                kind: "dynamic_dispatch",
+                resolution: "lle_dynamic",
+                target: None,
+                detail: format!("table_base={:04X}", insn.operand & 0xFFFF),
+            });
         }
     }
 
@@ -567,6 +579,43 @@ fn discover_helpers(
     result
 }
 
+fn discover_inline_args(
+    graph: &FunctionDecodeGraph,
+    rom: &[u8],
+    known: &HashMap<u32, i32>,
+    probed: &mut HashSet<u32>,
+) -> HashMap<u32, i32> {
+    let mut result = HashMap::new();
+    for decoded in graph.insns() {
+        let insn = &decoded.insn;
+        let bank = (insn.addr >> 16) & 0xFF;
+        let target = if insn.mnem == "JSL" {
+            insn.operand & 0xFFFFFF
+        } else if insn.mnem == "JSR" && insn.length == 3 {
+            (bank << 16) | (insn.operand & 0xFFFF)
+        } else {
+            continue;
+        };
+        if known.contains_key(&target) || result.contains_key(&target) || !probed.insert(target) {
+            continue;
+        }
+        let mut counts = BTreeSet::new();
+        for (m, x) in [(0, 0), (1, 1)] {
+            if let Some(count) =
+                detect_inline_arg_bytes(rom, (target >> 16) & 0xFF, target & 0xFFFF, m, x)
+            {
+                if count != 0 {
+                    counts.insert(count);
+                }
+            }
+        }
+        if counts.len() == 1 {
+            result.insert(target, i32::from(*counts.first().unwrap()));
+        }
+    }
+    result
+}
+
 fn analyze(
     inputs: &Inputs,
     rom: &[u8],
@@ -576,6 +625,7 @@ fn analyze(
         HashMap<(u32, u8, u8), (u8, u8)>,
         HashMap<(u32, u8, u8), Vec<(u8, u8)>>,
         HashMap<u32, String>,
+        HashMap<u32, i32>,
     ),
     String,
 > {
@@ -585,6 +635,8 @@ fn analyze(
     let mut unstable_sets = HashSet::new();
     let mut poisoned = HashSet::new();
     let mut helpers: HashMap<u32, String> = HashMap::new();
+    let mut inline_args = inputs.inline_skip.clone();
+    let mut inline_arg_probes = HashSet::new();
     let mut cache = DecodeCache::new();
     let mut summary_cache: HashMap<
         VariantKey,
@@ -610,6 +662,7 @@ fn analyze(
         let mut round_sets = BTreeMap::new();
         let before_poisoned = poisoned.clone();
         let before_helpers = helpers.clone();
+        let before_inline_args = inline_args.clone();
 
         while let Some(key) = pending.pop_first() {
             if nodes.contains_key(&key) {
@@ -647,9 +700,9 @@ fn analyze(
                 callee_exit_mx: Some(&active_exact),
                 callee_exit_mx_modes: Some(&active_sets),
                 sibling_entry_pcs: Some(&siblings),
-                callee_inline_skip: Some(&inputs.inline_skip),
+                callee_inline_skip: Some(&inline_args),
                 inline_dispatch_loop_pcs: inline_loops,
-                global_inline_skip: Some(&inputs.inline_skip),
+                global_inline_skip: Some(&inline_args),
                 stop_on_unknown_callee_exit: true,
                 ..Default::default()
             };
@@ -742,6 +795,15 @@ fn analyze(
             let additions = discover_helpers(&graph, rom, &helpers);
             if !additions.is_empty() {
                 helpers.extend(additions);
+                cache = DecodeCache::new();
+                summary_cache.clear();
+                pending.insert(key);
+                continue;
+            }
+            let inline_additions =
+                discover_inline_args(&graph, rom, &inline_args, &mut inline_arg_probes);
+            if !inline_additions.is_empty() {
+                inline_args.extend(inline_additions);
                 cache = DecodeCache::new();
                 summary_cache.clear();
                 pending.insert(key);
@@ -847,9 +909,15 @@ fn analyze(
         }
         let mut next_sets = active_sets.clone();
         for (key, modes) in round_sets {
-            if unstable_sets.contains(&key) || next_exact.contains_key(&key) {
+            if unstable_sets.contains(&key) || inputs.declared_exit_modes.contains_key(&key) {
                 continue;
             }
+            // New callee facts can expose an additional return path that was
+            // truncated in an earlier round. A complete multi-mode proof is
+            // therefore stronger than a previously published inferred exact
+            // fact; replace the stale singleton instead of letting it prune
+            // one of the now-proven continuations forever.
+            next_exact.remove(&key);
             match next_sets.get(&key) {
                 None => {
                     next_sets.insert(key, modes);
@@ -861,10 +929,51 @@ fn analyze(
                 _ => {}
             }
         }
+
+        // LoROM mirror banks execute the same physical bytes with the same
+        // decode environment. If one reachable mirror proves multiple exit
+        // modes after its counterpart prematurely published a single mode,
+        // retain the stronger multi-mode proof for both variants. Python's
+        // solver exposes the same invariant; keeping an exact fact on only
+        // one mirror would incorrectly prune a caller continuation.
+        let proven_sets: Vec<_> = next_sets
+            .iter()
+            .map(|(&key, modes)| (key, modes.clone()))
+            .collect();
+        for ((pc24, m, x), modes) in proven_sets {
+            let Some(mirror_pc) = mirror_pc24(pc24) else {
+                continue;
+            };
+            let mirror_key = (mirror_pc, m, x);
+            let mirror_node = VariantKey::new(mirror_pc, m, x);
+            if nodes.contains_key(&mirror_node)
+                && !inputs.declared_exit_modes.contains_key(&mirror_key)
+            {
+                next_exact.remove(&mirror_key);
+                next_sets.insert(mirror_key, modes);
+            }
+        }
+        // A later round may expose an unresolved call beyond a continuation
+        // that was previously truncated. Any inferred exit fact from that
+        // shorter graph is no longer proven; declared cfg/HLE ABI facts remain
+        // authoritative and are intentionally retained.
+        for (node_key, node) in &nodes {
+            let fact_key = (node_key.pc24, node_key.m, node_key.x);
+            if !inputs.declared_exit_modes.contains_key(&fact_key)
+                && node
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "unproven_callee_exit")
+            {
+                next_exact.remove(&fact_key);
+                next_sets.remove(&fact_key);
+            }
+        }
         let stable = next_exact == active_exact
             && next_sets == active_sets
             && before_poisoned == poisoned
-            && before_helpers == helpers;
+            && before_helpers == helpers
+            && before_inline_args == inline_args;
         active_exact = next_exact;
         active_sets = next_sets;
         if trace_rounds {
@@ -890,7 +999,7 @@ fn analyze(
                     exit_time.as_secs_f64(),
                 );
             }
-            return Ok((nodes, active_exact, active_sets, helpers));
+            return Ok((nodes, active_exact, active_sets, helpers, inline_args));
         }
     }
     Err("program analysis failed to converge within 128 rounds".to_string())
@@ -902,6 +1011,7 @@ fn manifest_json(
     exact: &HashMap<(u32, u8, u8), (u8, u8)>,
     sets: &HashMap<(u32, u8, u8), Vec<(u8, u8)>>,
     helpers: &HashMap<u32, String>,
+    inline_args: &HashMap<u32, i32>,
 ) -> Value {
     let mut node_map = Map::new();
     for (key, node) in nodes {
@@ -940,7 +1050,9 @@ fn manifest_json(
             "dispatch_helpers": helpers.iter().map(
                 |(pc24, kind)| (format!("{pc24:06X}"), kind.clone()),
             ).collect::<BTreeMap<_, _>>(),
-            "inline_args": {},
+            "inline_args": inline_args.iter().map(
+                |(pc24, count)| (format!("{pc24:06X}"), *count),
+            ).collect::<BTreeMap<_, _>>(),
         },
     })
 }
@@ -978,8 +1090,9 @@ fn main() {
             .roots
             .insert(parse_root(&value).expect("parse --root"));
     }
-    let (nodes, exact, sets, helpers) = analyze(&inputs, &rom).expect("native analysis");
-    let manifest = manifest_json(&inputs, &nodes, &exact, &sets, &helpers);
+    let (nodes, exact, sets, helpers, inline_args) =
+        analyze(&inputs, &rom).expect("native analysis");
+    let manifest = manifest_json(&inputs, &nodes, &exact, &sets, &helpers, &inline_args);
     let text = serde_json::to_string_pretty(&manifest).expect("serialize manifest") + "\n";
     fs::write(&manifest_path, text).expect("write manifest");
     let edge_count: usize = nodes.values().map(|node| node.demands.len()).sum();

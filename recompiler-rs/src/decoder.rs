@@ -347,6 +347,7 @@ struct Auth {
     table_bases: Vec<u32>,
     ptr_call: bool,
     targets: Vec<u32>,
+    local_goto: bool,
 }
 
 /// Walk the dispatch table for a `JMP/JML/JSR (abs,X)`. Port of
@@ -430,6 +431,107 @@ fn autorecover_indirect_xtable(
     } else {
         Some(entries)
     }
+}
+
+/// Recover the same-function stride runway used by Duff-style computed JMPs.
+/// Port of Python's `_autorecover_local_stride_runway`.
+fn autorecover_local_stride_runway(
+    rom: &[u8],
+    bank: u32,
+    func_start: u32,
+    site_pc: u32,
+    insn: &Insn,
+    end: Option<u32>,
+    data_regions: Option<&[(u32, u32, u32)]>,
+    reloc: &[RelocRegion],
+) -> Option<Vec<u32>> {
+    if insn.mnem != "JMP" || insn.mode != Mode::Indir || insn.length != 3 {
+        return None;
+    }
+    let dp = insn.operand & 0xFFFF;
+    if dp > 0xFF {
+        return None;
+    }
+    let read8 = |pc: u32| -> Option<u8> {
+        if !(0x8000..=0xFFFF).contains(&pc) {
+            return None;
+        }
+        let offset = try_rom_offset(bank, pc, reloc)?;
+        rom.get(offset).copied()
+    };
+
+    let site_pc = site_pc & 0xFFFF;
+    let pattern_start = site_pc.checked_sub(17)?;
+    if pattern_start < 0x8000 {
+        return None;
+    }
+    let expected = [
+        (0, 0x4A),
+        (1, 0x85),
+        (2, dp as u8),
+        (3, 0x4A),
+        (4, 0x65),
+        (5, dp as u8),
+        (6, 0x18),
+        (7, 0x69),
+        (10, 0x85),
+        (11, dp as u8),
+        (12, 0xA9),
+        (15, 0xE2),
+        (16, 0x30),
+        (17, 0x6C),
+        (18, dp as u8),
+        (19, 0x00),
+    ];
+    if expected
+        .iter()
+        .any(|&(relative, byte)| read8(pattern_start + relative) != Some(byte))
+    {
+        return None;
+    }
+
+    let base = read8(pattern_start + 8)? as u32 | ((read8(pattern_start + 9)? as u32) << 8);
+    let start = func_start & 0xFFFF;
+    if !(0x8000..=0xFFFF).contains(&base)
+        || base < start
+        || end.is_some_and(|limit| base >= (limit & 0xFFFF))
+        || addr_in_data_regions(data_regions, bank, base)
+        || dispatch_target_is_padding(rom, bank, base, reloc)
+    {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    let mut first_store_addr = None;
+    for index in 0..4096u32 {
+        let target = base + index * 3;
+        if target + 2 > 0xFFFF
+            || end.is_some_and(|limit| target >= (limit & 0xFFFF))
+            || addr_in_data_regions(data_regions, bank, target)
+        {
+            break;
+        }
+        let Some(opcode) = read8(target) else {
+            break;
+        };
+        let Some(lo) = read8(target + 1) else {
+            break;
+        };
+        let Some(hi) = read8(target + 2) else {
+            break;
+        };
+        if opcode != 0x8D {
+            break;
+        }
+        let store_addr = lo as u32 | ((hi as u32) << 8);
+        match first_store_addr {
+            None => first_store_addr = Some(store_addr),
+            Some(first) if store_addr != ((first + index * 4) & 0xFFFF) => break,
+            _ => {}
+        }
+        entries.push((bank << 16) | target);
+    }
+    (entries.len() >= 4).then_some(entries)
 }
 
 /// Walk back from func start to find the LDA/STA pairs that compose a DP
@@ -1062,6 +1164,7 @@ pub fn decode_function(
                         table_bases: s.table_bases.clone(),
                         ptr_call: s.ptr_call,
                         targets: s.targets.clone(),
+                        local_goto: false,
                     });
             if auth.is_none() && insn.mode == Mode::IndirX {
                 if let Some(entries) =
@@ -1073,6 +1176,7 @@ pub fn decode_function(
                         table_bases: vec![],
                         ptr_call: false,
                         targets: vec![],
+                        local_goto: false,
                     });
                 }
             }
@@ -1091,6 +1195,7 @@ pub fn decode_function(
                                 table_bases,
                                 ptr_call: false,
                                 targets: vec![],
+                                local_goto: false,
                             });
                         }
                     }
@@ -1116,8 +1221,30 @@ pub fn decode_function(
                             table_bases: vec![tbl_pc],
                             ptr_call: false,
                             targets: vec![],
+                            local_goto: false,
                         });
                     }
+                }
+            }
+            if auth.is_none() && insn.mode == Mode::Indir {
+                if let Some(entries) = autorecover_local_stride_runway(
+                    rom,
+                    bank,
+                    start,
+                    pc,
+                    &insn,
+                    end,
+                    data_regions,
+                    reloc,
+                ) {
+                    auth = Some(Auth {
+                        count: entries.len() as u32,
+                        idx_reg: 'X',
+                        table_bases: vec![insn.operand & 0xFFFF],
+                        ptr_call: false,
+                        targets: entries,
+                        local_goto: true,
+                    });
                 }
             }
             if let Some(auth) = auth {
@@ -1141,6 +1268,7 @@ pub fn decode_function(
                     );
                     insn.dispatch_idx_reg = Some(auth.idx_reg);
                     insn.dispatch_table_bases = auth.table_bases.clone();
+                    insn.dispatch_local_goto = auth.local_goto;
                     if inline_loop_sites.contains(&pc) {
                         insn.inline_dispatch_loop = true;
                         inline_pcs.insert(pc);
@@ -1287,6 +1415,7 @@ pub fn decode_function(
                     table_bases: s.table_bases.clone(),
                     ptr_call: s.ptr_call,
                     targets: s.targets.clone(),
+                    local_goto: false,
                 });
             if ud_auth.is_none() {
                 if let Some(entries) =
@@ -1298,6 +1427,7 @@ pub fn decode_function(
                         table_bases: vec![],
                         ptr_call: false,
                         targets: vec![],
+                        local_goto: false,
                     });
                 }
             }
@@ -1419,6 +1549,34 @@ pub fn decode_function(
                 for (s, sk) in labeled_succ {
                     if !graph.contains(&s) {
                         worklist.push((s, sk, pc as i64));
+                    }
+                }
+                continue;
+            }
+            // A low-RAM operand is a runtime function-pointer slot, not a ROM
+            // jump table. Preserve JSR fall-through and let the emitted
+            // runtime dispatcher resolve the target. ROM/register-range
+            // operands remain suppressed below as likely phantom decodes.
+            if insn.operand & 0xFFFF < 0x2000 {
+                insn.dispatch_runtime = true;
+                insn.dispatch_idx_reg = Some('X');
+                let labeled_succ = labeled_successors(
+                    &insn,
+                    &key,
+                    bank,
+                    env,
+                    rom,
+                    &mut graph.unknown_callee_exit_sites,
+                );
+                let succ = labeled_succ.iter().map(|(key, _)| key.clone()).collect();
+                graph.insert(DecodedInsn {
+                    key,
+                    insn,
+                    successors: succ,
+                });
+                for (successor, kind) in labeled_succ {
+                    if !graph.contains(&successor) {
+                        worklist.push((successor, kind, pc as i64));
                     }
                 }
                 continue;
@@ -2003,6 +2161,161 @@ pub fn classify_dispatch_helper(rom: &[u8], bank: u32, addr: u32) -> Option<&'st
     None
 }
 
+/// Detect a subroutine that advances its stacked return address past a fixed
+/// number of inline argument bytes. Port of Python's
+/// `detect_inline_arg_bytes`.
+///
+/// This deliberately recognizes only the load-return-address, add-immediate,
+/// store-back-to-the-same-stack-slot idiom. Instructions that may clobber A
+/// reset the match, which keeps ordinary routines that merely inspect their
+/// return address from being classified as inline-argument callees.
+pub fn detect_inline_arg_bytes(
+    rom: &[u8],
+    bank: u32,
+    addr: u32,
+    entry_m: u8,
+    entry_x: u8,
+) -> Option<u8> {
+    fn preserves_a(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            0x85 | 0x8D
+                | 0x8F
+                | 0x95
+                | 0x9D
+                | 0x99
+                | 0x92
+                | 0x87
+                | 0x97
+                | 0x81
+                | 0x91
+                | 0x9C
+                | 0x9E
+                | 0x86
+                | 0x8E
+                | 0x96
+                | 0x84
+                | 0x8C
+                | 0x94
+                | 0x18
+                | 0x38
+                | 0xD8
+                | 0xF8
+                | 0x58
+                | 0x78
+                | 0xB8
+                | 0xAA
+                | 0xA8
+                | 0xE8
+                | 0xC8
+                | 0xCA
+                | 0x88
+                | 0xA2
+                | 0xA6
+                | 0xB6
+                | 0xAE
+                | 0xBE
+                | 0xA0
+                | 0xA4
+                | 0xB4
+                | 0xAC
+                | 0xBC
+                | 0xE0
+                | 0xE4
+                | 0xEC
+                | 0xC0
+                | 0xC4
+                | 0xCC
+                | 0x48
+                | 0xDA
+                | 0x5A
+                | 0x08
+                | 0x8B
+                | 0x4B
+                | 0x0B
+                | 0xEA
+                | 0x42
+        )
+    }
+
+    fn mutates_y(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            0xA0 | 0xA4 | 0xB4 | 0xAC | 0xBC | 0xC8 | 0x88 | 0x7A
+        )
+    }
+
+    let mut pc = addr & 0xFFFF;
+    let mut m = entry_m & 1;
+    let mut x = entry_x & 1;
+    let mut a_slot: Option<u8> = None;
+    let mut a_added = 0u32;
+    let mut y_slot: Option<u8> = None;
+    let mut y_added = 0u32;
+
+    for _ in 0..96 {
+        let offset = lorom_offset_opt(bank, pc)?;
+        if offset >= rom.len() {
+            return None;
+        }
+        let ins = decode_insn(rom, offset, pc, bank, m, x)?;
+        if is_terminator(ins.mnem) {
+            return None;
+        }
+
+        match ins.mnem {
+            "REP" => {
+                if ins.operand & 0x20 != 0 {
+                    m = 0;
+                }
+                if ins.operand & 0x10 != 0 {
+                    x = 0;
+                }
+            }
+            "SEP" => {
+                if ins.operand & 0x20 != 0 {
+                    m = 1;
+                }
+                if ins.operand & 0x10 != 0 {
+                    x = 1;
+                }
+            }
+            "LDA" if ins.mode == Mode::Stk => {
+                a_slot = Some((ins.operand & 0xFF) as u8);
+                a_added = 0;
+            }
+            "TAY" => {
+                y_slot = a_slot;
+                y_added = if a_slot.is_some() { a_added } else { 0 };
+            }
+            "TYA" => {
+                a_slot = y_slot;
+                a_added = if y_slot.is_some() { y_added } else { 0 };
+            }
+            "ADC" if ins.opcode == 0x69 && a_slot.is_some() => {
+                a_added = (a_added + ins.operand) & 0xFFFF;
+            }
+            "STA" if ins.opcode == 0x83 && ins.mode == Mode::Stk => {
+                if a_slot == Some((ins.operand & 0xFF) as u8) && a_added != 0 {
+                    return Some((a_added & 0xFF) as u8);
+                }
+            }
+            _ if preserves_a(ins.opcode) => {
+                if mutates_y(ins.opcode) {
+                    y_slot = None;
+                    y_added = 0;
+                }
+            }
+            _ => {
+                a_slot = None;
+                a_added = 0;
+            }
+        }
+        pc = (pc + ins.length as u32) & 0xFFFF;
+    }
+    None
+}
+
 /// `lorom_offset` returning `None` instead of panicking out of range.
 fn lorom_offset_opt(bank: u32, addr: u32) -> Option<usize> {
     let a = addr & 0xFFFF;
@@ -2285,6 +2598,61 @@ mod tests {
         rom
     }
 
+    #[test]
+    fn detects_direct_inline_argument_adjustment() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xA3, 0x01, // LDA $01,S
+            0x18, // CLC
+            0x69, 0x03, 0x00, // ADC #$0003
+            0x83, 0x01, // STA $01,S
+            0x6B, // RTL
+        ]);
+        assert_eq!(detect_inline_arg_bytes(&rom, 0, 0x8000, 1, 1), Some(3));
+    }
+
+    #[test]
+    fn detects_y_carried_inline_argument_adjustment() {
+        let rom = rom_at_8000(&[
+            0x08, // PHP
+            0x8B, // PHB
+            0xC2, 0x30, // REP #$30
+            0xA3, 0x04, // LDA $04,S
+            0x48, // PHA
+            0xAB, // PLB
+            0xAB, // PLB
+            0xA3, 0x03, // LDA $03,S
+            0xA8, // TAY
+            0xB9, 0x01, 0x00, // LDA $0001,Y
+            0x29, 0xFF, 0x00, // AND #$00FF
+            0xAA, // TAX
+            0x98, // TYA
+            0x18, // CLC
+            0x69, 0x08, 0x00, // ADC #$0008
+            0x83, 0x03, // STA $03,S
+            0xAB, // PLB
+            0x28, // PLP
+            0x6B, // RTL
+        ]);
+        assert_eq!(detect_inline_arg_bytes(&rom, 0, 0x8000, 1, 1), Some(8));
+    }
+
+    #[test]
+    fn rejects_y_carrier_after_y_mutation() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xA3, 0x03, // LDA $03,S
+            0xA8, // TAY
+            0xC8, // INY
+            0x98, // TYA
+            0x18, // CLC
+            0x69, 0x08, 0x00, // ADC #$0008
+            0x83, 0x03, // STA $03,S
+            0x6B, // RTL
+        ]);
+        assert_eq!(detect_inline_arg_bytes(&rom, 0, 0x8000, 1, 1), None);
+    }
+
     fn k(pc: u32) -> DecodeKey {
         DecodeKey::new(addr24(0, pc), 1, 1)
     }
@@ -2330,6 +2698,38 @@ mod tests {
         let jump = graph.get(&k(0x8003)).unwrap();
         assert_eq!(jump.insn.dispatch_entries, Some(vec![0x008010]));
         assert_eq!(jump.successors, vec![k(0x8009)]);
+    }
+
+    #[test]
+    fn runtime_pointer_jsr_preserves_fallthrough() {
+        // JSR ($0FA8,X) reads a runtime pointer from low RAM and returns to
+        // the following RTS. It must not be treated as a phantom ROM table.
+        let rom = rom_at_8000(&[0xFC, 0xA8, 0x0F, 0x60]);
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &DecodeEnv::default());
+        let call = graph.get(&k(0x8000)).unwrap();
+        assert!(call.insn.dispatch_runtime);
+        assert_eq!(call.successors, vec![k(0x8003)]);
+        assert!(graph.suppressed_indirect_calls.is_empty());
+    }
+
+    #[test]
+    fn recovers_local_stride_runway() {
+        let mut rom = rom_at_8000(&[]);
+        let pattern = [
+            0x4A, 0x85, 0x12, 0x4A, 0x65, 0x12, 0x18, 0x69, 0x00, 0x90, 0x85, 0x12, 0xA9, 0x00,
+            0x00, 0xE2, 0x30, 0x6C, 0x12, 0x00,
+        ];
+        rom[..pattern.len()].copy_from_slice(&pattern);
+        for index in 0..4usize {
+            let offset = 0x1000 + index * 3;
+            let store = 0x2000 + index as u16 * 4;
+            rom[offset..offset + 3].copy_from_slice(&[0x8D, store as u8, (store >> 8) as u8]);
+        }
+        let jump = decode_insn(&rom, 17, 0x8011, 0, 1, 1).unwrap();
+        assert_eq!(
+            autorecover_local_stride_runway(&rom, 0, 0x8000, 0x8011, &jump, None, None, &[]),
+            Some(vec![0x009000, 0x009003, 0x009006, 0x009009])
+        );
     }
 
     #[test]

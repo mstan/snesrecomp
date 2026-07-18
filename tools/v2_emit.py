@@ -27,7 +27,6 @@ from v2_analyze import (  # noqa: E402
     build_manifest,
     build_manifest_native,
     native_analyzer_path,
-    native_unsupported_features,
 )
 
 
@@ -157,9 +156,6 @@ def main() -> int:
         help="whole-program analyzer (default: use the release native binary "
              "when present, otherwise Python)")
     parser.add_argument(
-        "--allow-experimental-native-features", action="store_true",
-        help=argparse.SUPPRESS)
-    parser.add_argument(
         "--bank-shard-threshold-kib", type=int, default=4096,
         help="shard generated banks at or above this source size into "
              "stable translation units (default: 4096 KiB; 0 shards every "
@@ -183,23 +179,6 @@ def main() -> int:
     if analysis_backend == "auto":
         analysis_backend = "native" if native_path.is_file() else "python"
     if analysis_backend == "native":
-        unsupported = native_unsupported_features(parsed)
-        if unsupported and not args.allow_experimental_native_features:
-            detail = ", ".join(unsupported)
-            if args.analysis_backend == "native":
-                parser.error(
-                    f"native analysis is not yet contract-equivalent for: "
-                    f"{detail}; use Python or explicitly allow experimental "
-                    f"native features with "
-                    f"--allow-experimental-native-features")
-            print(
-                f"v2_emit: native analysis is not yet contract-equivalent "
-                f"for {detail}; falling back to Python")
-            analysis_backend = "python"
-        elif unsupported:
-            print(
-                "v2_emit: WARNING: allowing experimental native features: "
-                + ", ".join(unsupported))
         if (analysis_backend == "native"
                 and (args.max_insns != 4096 or args.max_nodes != 100_000)):
             if args.analysis_backend == "native":

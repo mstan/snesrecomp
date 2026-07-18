@@ -15,7 +15,6 @@ from v2_analyze import (  # noqa: E402
     build_manifest,
     build_manifest_native,
     native_analyzer_path,
-    native_unsupported_features,
 )
 from v2.program_analysis import NodeDisposition  # noqa: E402
 from v2.program_emit import build_emission_entries  # noqa: E402
@@ -81,18 +80,6 @@ def test_native_manifest_matches_python_ptrcall_emission_contract():
     } == {
         key: node.disposition for key, node in expected.nodes.items()
     }
-
-
-def test_ptrcall_is_guarded_until_full_project_contract_matches():
-    with tempfile.TemporaryDirectory() as directory:
-        cfg_dir = pathlib.Path(directory)
-        (cfg_dir / "bank00.cfg").write_text(
-            "bank = 00\n"
-            "indirect_dispatch 8003 1 ptrcall targets:8010\n"
-            "func Root 8000\n",
-            encoding="utf-8")
-        unsupported = native_unsupported_features(_load_cfgs(cfg_dir))
-    assert unsupported == ("indirect_dispatch ptrcall",)
 
 
 def test_default_roots_are_vectors_not_every_function_boundary():
