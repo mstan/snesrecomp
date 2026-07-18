@@ -599,7 +599,7 @@ converted **225** sites; built clean under mingw gcc (third compiler — WSL-gcc
 MSVC, mingw all clean).
 
 **Result — the tier fires, fails safe, and is a diagnostic:** SM hit the real
-gap `$0FE8B7` at frame 2863; `[interp_tier]` fired. The PC-trail
+gap `$0FE8B7` at frame 2863; the tier counter recorded it. The PC-trail
 (`SNESRECOMP_INTERP_TRACE=1`) root-caused the bail: `$0FE8B7` = `JMP ($0012)`,
 and `$0012` held **`$FFFF`** (garbage) → the interpreter faithfully jumped to
 `$0F:FFFF`, ran into bank-`$0F` garbage, looped, hit the step cap, and fell back
