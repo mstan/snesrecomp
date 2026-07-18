@@ -379,9 +379,27 @@ RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
 }
 
 int interp_bridge_has_direct_paired_bounce(void) {
-    return s_interp_bounce_owner_depth > 0 &&
-           (s_interp_bounce_recomp_base < 0 ||
-            g_recomp_stack_top <= s_interp_bounce_recomp_base + 1);
+    if (s_interp_bounce_owner_depth <= 0)
+        return 0;
+    if (s_interp_bounce_recomp_base < 0 ||
+        g_recomp_stack_top <= s_interp_bounce_recomp_base + 1)
+        return 1;
+
+    /* A generated root may reach its terminal return through one or more
+     * architectural tail transfers. Those transfers add host frames, but
+     * every callee inherits the root's _entry_s watermark; semantically they
+     * are still the direct paired bounce owned by the active interpreter.
+     *
+     * A real nested JSR/JSL has a lower entry S and therefore fails this
+     * test. Its rewritten return continues to use the compiled-ancestor
+     * SKIP path, while a pure tail chain is handed back to the interpreter. */
+    const int base = s_interp_bounce_recomp_base;
+    const uint16_t root_entry_s = g_cpu_entry_s[base];
+    for (int i = base + 1; i < g_recomp_stack_top; i++) {
+        if (g_cpu_entry_s[i] != root_entry_s)
+            return 0;
+    }
+    return 1;
 }
 
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,

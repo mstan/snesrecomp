@@ -53,3 +53,40 @@ def test_deeper_computed_rts_unknown_target_tiers_into_interpreter():
     assert '(uint16)(_entry_s - _ret_s) < 0x8000u' in src, src
     assert '!cpu_dispatch_has_entry(cpu, _rpc24)' in src, src
     assert tier < miss, src
+
+
+def test_partial_frame_return_uses_rewritten_return_bridge():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x8B, 0x60]),  # PHB; RTS crosses entry watermark
+    })
+    src = emit_function(rom=rom, bank=0, start=0x8000,
+                        entry_m=0, entry_x=0,
+                        func_name='PartialFrameReturn')
+    partial = src.index('cpu->S - _entry_s')
+    rewritten = src.index('interp_tier_dispatch_rewritten_return(cpu, _rpc24',
+                          partial)
+    popped = src.index('interp_tier_dispatch_popped_return(cpu, _rpc24')
+    assert rewritten < popped, src
+
+
+def test_jsr_bounce_that_returns_through_outer_rtl_yields_to_bridge():
+    """Return ownership follows the stack, not the final opcode's frame size.
+
+    A dispatcher can be entered by an interpreter-owned JSR, consume that
+    two-byte frame, and tail into a shared RTL that returns through the
+    interpreter's enclosing JSL frame. The final RTL therefore sees hrv=2.
+    Its pre-pop S is shallower than the bounced entry S, which must yield the
+    popped continuation to the owning interpreter instead of starting a new
+    dispatch root.
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x6B]),  # RTL
+    })
+    src = emit_function(rom=rom, bank=0, start=0x8000,
+                        entry_m=0, entry_x=0,
+                        func_name='OuterFrameRtl')
+
+    assert ('(uint16)(_ret_s - _entry_s) < 0x8000u' in src), src
+    assert ('interp_bridge_has_direct_paired_bounce()' in src), src
+    assert ('_hrv == 3 && interp_bridge_has_direct_paired_bounce()'
+            not in src), src

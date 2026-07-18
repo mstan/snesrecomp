@@ -1332,6 +1332,10 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
     int slot = (int)(g_cpu_trace_idx++ & (g_cpu_trace_capacity - 1));
     CpuTraceEvent *e = &g_cpu_trace_ring[slot];
     e->pc24 = pc24;
+    {
+        extern int snes_frame_counter;
+        e->frame = snes_frame_counter;
+    }
     uint32_t h = name ? fnv1a(name) : 0;
     e->native_func_id_or_hash = h;
     e->A = cpu->A;
@@ -1347,6 +1351,11 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
     e->event_type = CPU_TR_FUNC_ENTRY;
     e->extra0 = 0;
     e->extra1 = 0;
+    e->bank = 0;
+    e->addr16 = 0;
+    e->width = 0;
+    e->old_value = 0;
+    e->new_value = 0;
     /* Function-name tripwire: one-shot dump if entered. */
     extern uint32_t g_func_watch_hash;
     extern const char *g_func_watch_name;

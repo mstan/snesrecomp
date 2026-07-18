@@ -814,7 +814,11 @@ def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
             tv = int(t)
             if tv > 0xFFFFFF:
                 return None
-            entries.append(tv if tv > 0xFFFF else ((bank << 16) | (tv & 0xFFFF)))
+            # Zero is a real null dispatch slot, not bank:$0000. Preserve it
+            # so every downstream consumer can skip the slot consistently.
+            entries.append(
+                0 if tv == 0 else (
+                    tv if tv > 0xFFFF else ((bank << 16) | (tv & 0xFFFF))))
         if len(entries) != count:
             return None
         return entries
@@ -1885,6 +1889,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         'count': len(entries),
                         'idx_reg': 'X',
                         'table_bases': (),
+                        # Preserve tolerated null slots. Re-reading only the
+                        # count turned a raw $0000 into bank:$0000.
+                        'targets': tuple(entries),
                         '_autorecovered': True,
                     }
             # Auto-recovery for (abs) / [abs] DP-built-pointer form:
@@ -2226,6 +2233,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         'count': len(entries),
                         'idx_reg': 'X',
                         'table_bases': (),
+                        # Preserve tolerated null slots. Re-reading only the
+                        # count turned a raw $0000 into bank:$0000.
+                        'targets': tuple(entries),
                         '_autorecovered': True,
                     }
             if ud_auth is not None:
@@ -2578,6 +2588,8 @@ def _return_stack_delta_states(
     clamped to keep malformed push loops finite while preserving realistic
     local frames.
     """
+    restoring_tcs = _entry_stack_restore_tcs_keys(graph)
+
     def local_delta(ins) -> Optional[int]:
         mnem = ins.mnem
         consumed = int(getattr(ins, 'dispatch_consumed_stack_bytes', 0) or 0)
@@ -2628,11 +2640,17 @@ def _return_stack_delta_states(
             continue
         delta = local_delta(ins)
         next_states: Set[Optional[int]] = set()
-        for state in states:
-            if state is None or delta is None:
-                next_states.add(None)
-            else:
-                next_states.add(clamp(state + delta))
+        if key in restoring_tcs:
+            # A source-verified TSC;STA scratch save at entry and matching
+            # LDA scratch;TCS restore makes the current dynamic stack value
+            # irrelevant: this instruction restores the exact entry S.
+            next_states.add(0)
+        else:
+            for state in states:
+                if state is None or delta is None:
+                    next_states.add(None)
+                else:
+                    next_states.add(clamp(state + delta))
         for succ in di.successors:
             if succ not in graph.insns:
                 continue
@@ -2644,18 +2662,122 @@ def _return_stack_delta_states(
     return dict(returns)
 
 
-def _has_unproven_nonlocal_return(graph: 'FunctionDecodeGraph') -> bool:
-    """Whether any return can consume an internal/synthetic stack frame.
+def _entry_stack_restore_tcs_keys(
+    graph: 'FunctionDecodeGraph',
+) -> Set[DecodeKey]:
+    """Prove the narrow ``TSC; STA dp ... LDA dp; TCS`` restore idiom.
 
-    Positive delta means explicit pushes remain below entry S, so RTS/RTL is
-    consuming a frame created inside this routine rather than returning to its
-    caller.  ``None`` is equally unprovable.  Negative deltas are deliberate
-    non-local returns that pop caller/ancestor state; their M/X at the guest
-    exit is still real, and the existing NLR skip contract prevents the
-    skipped caller continuation from running.
+    DKC2's 3D background builder temporarily repurposes S as an arithmetic
+    cursor, but saves the entry stack pointer in scratch RAM first and restores
+    it immediately before RTS. Treating every TCS as permanently indeterminate
+    hides that real callable exit and poisons its callers.
+
+    This recognizer is deliberately strict: the save must be the function's
+    first two instructions in M=0, the scratch location/mode must match, no
+    call or D-register mutation may occur, and no other instruction may write
+    that scratch location. Anything less remains unknown.
     """
-    return any(any(state is None or state > 0 for state in states)
-               for states in _return_stack_delta_states(graph).values())
+    entry_di = graph.insns.get(graph.entry)
+    if entry_di is None or entry_di.insn.mnem != 'TSC':
+        return set()
+    if len(entry_di.successors) != 1:
+        return set()
+    save_key = entry_di.successors[0]
+    save_di = graph.insns.get(save_key)
+    if save_di is None:
+        return set()
+    save = save_di.insn
+    if (save.mnem != 'STA' or (save.m_flag & 1) != 0
+            or save.mode == IMM):
+        return set()
+    scratch = save.operand & 0xFFFFFF
+    scratch_mode = save.mode
+
+    writers = {
+        'STA', 'STX', 'STY', 'STZ', 'INC', 'DEC', 'ASL', 'LSR',
+        'ROL', 'ROR', 'TRB', 'TSB',
+    }
+    for key, di in graph.insns.items():
+        ins = di.insn
+        if ins.mnem in ('JSR', 'JSL', 'PLD', 'TCD'):
+            return set()
+        if (ins.mnem in writers and ins.mode == scratch_mode
+                and (ins.operand & 0xFFFFFF) == scratch
+                and key != save_key):
+            return set()
+
+    predecessors: Dict[DecodeKey, Set[DecodeKey]] = defaultdict(set)
+    for key, di in graph.insns.items():
+        for succ in di.successors:
+            if succ in graph.insns:
+                predecessors[succ].add(key)
+
+    restores: Set[DecodeKey] = set()
+    for key, di in graph.insns.items():
+        if di.insn.mnem != 'TCS':
+            continue
+        preds = predecessors.get(key, set())
+        if len(preds) != 1:
+            continue
+        load = graph.insns[next(iter(preds))].insn
+        if (load.mnem == 'LDA' and (load.m_flag & 1) == 0
+                and load.mode == scratch_mode
+                and (load.operand & 0xFFFFFF) == scratch):
+            restores.add(key)
+    return restores
+
+
+def _return_frame_size(ins) -> Optional[int]:
+    if ins.mnem == 'RTS':
+        return 2
+    if ins.mnem == 'RTL':
+        return 3
+    # RTI depends on emulation state, which this local analysis does not
+    # model. Keep any unbalanced RTI conservative.
+    return None
+
+
+def _return_site_is_partial_nlr(graph: 'FunctionDecodeGraph', ins,
+                                states_by_pc=None) -> bool:
+    """Whether this site only performs a caller-crossing rewritten return.
+
+    With local delta ``d`` and return-frame size ``f``, ``0 < d < f`` means
+    the RTS/RTL consumes the remaining local bytes *and part of its caller's
+    frame*. It cannot resume the immediate compiled caller normally. Codegen
+    routes this runtime shape through the rewritten-return interpreter bridge,
+    so it is not a callable M/X exit fact.
+    """
+    frame = _return_frame_size(ins)
+    if frame is None:
+        return False
+    states = (states_by_pc or _return_stack_delta_states(graph)).get(
+        ins.addr & 0xFFFFFF, set())
+    return bool(states) and all(
+        state is not None and 0 < state < frame for state in states)
+
+
+def _has_unproven_nonlocal_return(graph: 'FunctionDecodeGraph') -> bool:
+    """Whether a return can enter an internal/synthetic stack frame.
+
+    A positive delta at least as large as the return frame leaves S at or below
+    the function-entry watermark after the pop. Control is still inside the
+    routine's dynamic component, so its eventual callable M/X exit remains
+    unknown until finite targets are modeled. ``None`` is equally unprovable.
+
+    Smaller positive deltas are caller-crossing rewritten returns and are
+    handled separately: they never resume this function's immediate caller.
+    """
+    states_by_pc = _return_stack_delta_states(graph)
+    for di in graph.insns.values():
+        ins = di.insn
+        if ins.mnem not in ('RTS', 'RTL', 'RTI'):
+            continue
+        frame = _return_frame_size(ins)
+        for state in states_by_pc.get(ins.addr & 0xFFFFFF, ()):
+            if state is None or (state > 0 and (
+                    frame is None or state >= frame)):
+                return True
+    return False
 
 
 def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
@@ -2677,10 +2799,13 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
         return None
 
     modes: Set[Tuple[int, int]] = set()
+    return_states = _return_stack_delta_states(graph)
 
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            if _return_site_is_partial_nlr(graph, ins, return_states):
+                continue
             modes.add((ins.m_flag & 1, ins.x_flag & 1))
             continue
         tail_keys = _direct_tail_exit_keys(graph, di)
@@ -2760,9 +2885,13 @@ def function_exit_mx_equation(
     if _has_unproven_nonlocal_return(graph):
         dependencies.add((0xFFFFFFFF, 0, 0))
 
+    return_states = _return_stack_delta_states(graph)
+
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            if _return_site_is_partial_nlr(graph, ins, return_states):
+                continue
             local_modes.add((ins.m_flag & 1, ins.x_flag & 1))
             continue
         tail_keys = _direct_tail_exit_keys(graph, di)
@@ -2836,6 +2965,7 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
     if _has_unproven_nonlocal_return(graph):
         return (None, None)
 
+    return_states = _return_stack_delta_states(graph)
     exit_m: Optional[int] = None
     exit_x: Optional[int] = None
     have_any = False
@@ -2856,6 +2986,8 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            if _return_site_is_partial_nlr(graph, ins, return_states):
+                continue
             _accumulate(ins.m_flag & 1, ins.x_flag & 1)
             continue
         tail_keys = _direct_tail_exit_keys(graph, di)

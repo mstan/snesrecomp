@@ -7,6 +7,8 @@ TOOLS = Path(__file__).resolve().parents[2] / "tools"
 sys.path.insert(0, str(TOOLS))
 
 from ingest_dkc2_disasm import (  # noqa: E402
+    DispatchContract,
+    Entry,
     collect_animation_callback_contracts,
     collect_data_regions,
     collect_entries,
@@ -14,10 +16,60 @@ from ingest_dkc2_disasm import (  # noqa: E402
     collect_kong_cutscene_contracts,
     collect_rts_stack_dispatch_contracts,
     collect_indexed_record_dispatch_contracts,
+    collect_symbolic_indexed_dispatch_contracts,
     collect_sprite_state_contracts,
     collect_terrain_dispatch_contracts,
     emit_cfg,
 )
+
+
+def test_imports_local_symbolic_indexed_state_table_only_as_code_targets():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        disasm = root / "disasm"
+        disasm.mkdir()
+        (disasm / "bank_B3.asm").write_text(
+            """\
+ActorMain:
+    JMP (.state_table,x)
+.state_table:
+    dw .idle_state
+    dw .active_state,DataOnly
+.idle_state:
+    RTL
+.active_state:
+    JML Done
+DataOnly:
+    dw $1234
+Done:
+    RTL
+""",
+            encoding="utf-8",
+        )
+        full = root / "full.sym"
+        full.write_text(
+            """\
+[labels]
+B3:8000 ActorMain
+B3:8010 ActorMain_state_table
+B3:8020 ActorMain_idle_state
+B3:8030 ActorMain_active_state
+B3:8040 DataOnly
+B3:8050 Done
+b3:8000 0001:00000002
+""",
+            encoding="utf-8",
+        )
+        contracts, entries = collect_symbolic_indexed_dispatch_contracts(
+            full, disasm)
+
+        assert [(item.bank, item.site_pc16, item.targets, item.mode)
+                for item in contracts] == [
+            (0xB3, 0x8000, (0xB38020, 0xB38030), "ptrtail")]
+        assert {(entry.pc24, entry.name) for entry in entries} == {
+            (0xB38020, "ActorMain_idle_state"),
+            (0xB38030, "ActorMain_active_state"),
+        }
 
 
 def test_animation_command_83_is_tail_dispatch_without_synthetic_frame():
@@ -269,6 +321,21 @@ def test_emits_next_entry_as_exclusive_function_boundary():
         assert "func Computed_entry 8030 end:10000" in text
 
 
+def test_dispatch_contract_can_publish_source_verified_entry_mode():
+    with tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / "cfg"
+        emit_cfg(
+            [Entry(0xBB8000, "Command_entry", "indirect")],
+            output,
+            [DispatchContract(
+                0xBB, 0x8E0D, (0xBB8001,), "rtsstack",
+                ((0xBB8000, 1, 0),),
+            )],
+        )
+        text = (output / "bankbb.cfg").read_text(encoding="utf-8")
+        assert "func Command_entry 8000 end:10000 entry_mx:1,0" in text
+
+
 def test_direct_only_mode_excludes_table_targets():
     with tempfile.TemporaryDirectory() as temp:
         disasm, direct, full = _fixture(Path(temp))
@@ -420,6 +487,10 @@ execute_command_set_2:
         full.write_text(
             """\
 [labels]
+BB:8000 copy_or_return_1_entry
+BB:8004 stream_byte_1_entry
+BB:8040 copy_or_return_2_entry
+BB:8043 stream_byte_2_entry
 bb:8000 0001:00000002
 bb:8001 0001:00000003
 bb:8004 0001:00000005
@@ -440,6 +511,10 @@ bb:8e29 0001:00000011
             (0xBB, 0x8E0D, (0xBB8001, 0xBB8005), "rtsstack"),
             (0xBB, 0x8E27, (0xBB8040, 0xBB8044), "rtsstack"),
         ]
+        assert contracts[0].entry_mx_overrides == (
+            (0xBB8000, 1, 0), (0xBB8004, 1, 0))
+        assert contracts[1].entry_mx_overrides == (
+            (0xBB8040, 1, 0), (0xBB8043, 1, 0))
 
 
 def test_imports_symbolic_terrain_table_and_override_as_ptrtail_contract():

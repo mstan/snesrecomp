@@ -19,8 +19,9 @@ importers.  Literal fall-through across a boundary remains supported by v2's
 tail-call autorouter.
 
 The output is deterministic and intentionally contains no ROM-derived bytes.
-It consists only of names, PCs, and structural CFG metadata from the GPL
-assembly source.
+It consists only of names, PCs, and structural CFG metadata from the referenced
+assembly address map. The validated H4 revision has no explicit license; its
+assembly source and comments are not copied into the generated CFG files.
 """
 from __future__ import annotations
 
@@ -41,6 +42,10 @@ DEBUG_RE = re.compile(
     r"([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8})\s*$"
 )
 GLOBAL_LABEL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):")
+# Asar's `#Label:` form defines a global symbol without changing the active
+# dot-local parent. H4 uses it for externally named state-table handlers.
+NONSCOPING_GLOBAL_LABEL_RE = re.compile(
+    r"^#([A-Za-z_][A-Za-z0-9_]*):")
 LOCAL_LABEL_RE = re.compile(r"^(\.{1,2})([A-Za-z_][A-Za-z0-9_]*):?\s*$")
 TABLE_RE = re.compile(r"^\s*(?:dw|dl)\s+(.+)$", re.IGNORECASE)
 SYMBOL_TOKEN_RE = re.compile(
@@ -81,6 +86,10 @@ class DispatchContract:
     site_pc16: int
     targets: tuple[int, ...]
     mode: str = "ptrtail"
+    # Some dispatch ABIs enter a named table stub in a mode different from
+    # DKC2's usual M0X0 function ABI.  These are cfg-root mode facts, separate
+    # from ``targets`` (which names the actual post-dispatch instruction).
+    entry_mx_overrides: tuple[tuple[int, int, int], ...] = ()
 
 
 def collect_data_regions(
@@ -703,6 +712,138 @@ def collect_indexed_record_dispatch_contracts(
     return contracts, target_entries
 
 
+def collect_symbolic_indexed_dispatch_contracts(
+    full_symbols: Path, disasm_dir: Path
+) -> tuple[list[DispatchContract], list[Entry]]:
+    """Import ordinary symbolic ``JMP (table,x)`` pointer tables.
+
+    H4 expresses many sprite/boss state machines as a local or global label,
+    one or more contiguous ``dw`` rows, and an absolute-indexed indirect jump
+    through that label.  The byte decoder cannot safely infer the table length
+    from ROM alone; if it treats the words following the jump as code, a later
+    coincidental BRK/COP poisons the whole routine and every shared caller.
+
+    Only uniquely resolved symbols whose source labels begin CPU code are
+    accepted as targets, and a 16-bit table entry must remain in the jump's
+    program bank.  Runtime RAM pointers and mixed data records therefore stay
+    outside this contract.  Specialized importers may override a site when
+    their table ABI selects only one field of a wider record.
+    """
+    full_entries = parse_wla_symbols(full_symbols)
+    full_by_name: dict[str, set[int]] = defaultdict(set)
+    names_by_pc: dict[int, list[str]] = defaultdict(list)
+    for entry in full_entries:
+        full_by_name[entry.name].add(entry.pc24)
+        names_by_pc[entry.pc24].append(entry.name)
+
+    label_kind, _table_refs = scan_disassembly(disasm_dir)
+    line_pc = _source_line_pc_maps(full_symbols, disasm_dir)
+    table_targets: dict[str, set[int]] = defaultdict(set)
+
+    # First pass: bind each labeled contiguous DW run to its symbolic code
+    # targets. Multiple aliases immediately before the first row share it.
+    for path in sorted(disasm_dir.glob("bank_*.asm")):
+        scope = _SourceScope()
+        pending_labels: list[str] = []
+        active_tables: list[str] = []
+        for raw_line in path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            source = raw_line.split(";", 1)[0].strip()
+            global_label = GLOBAL_LABEL_RE.match(source)
+            nonscoping_global = NONSCOPING_GLOBAL_LABEL_RE.match(source)
+            local_label = LOCAL_LABEL_RE.match(source)
+            if global_label:
+                resolved = scope.define("", global_label.group(1))
+                pending_labels = [resolved] if resolved else []
+                active_tables = []
+                continue
+            if nonscoping_global:
+                pending_labels = [nonscoping_global.group(1)]
+                active_tables = []
+                continue
+            if local_label:
+                resolved = scope.define(
+                    local_label.group(1), local_label.group(2))
+                if resolved:
+                    pending_labels.append(resolved)
+                active_tables = []
+                continue
+
+            table = TABLE_RE.match(source)
+            if table and source.lower().startswith("dw"):
+                if pending_labels:
+                    active_tables = list(pending_labels)
+                    pending_labels.clear()
+                if not active_tables:
+                    continue
+                for token in SYMBOL_TOKEN_RE.findall(table.group(1)):
+                    resolved = scope.resolve(token)
+                    if not resolved or label_kind.get(resolved) != "code":
+                        continue
+                    addresses = full_by_name.get(resolved, set())
+                    if len(addresses) != 1:
+                        continue
+                    target = next(iter(addresses))
+                    for table_name in active_tables:
+                        table_targets[table_name].add(target)
+                continue
+
+            if source and _statement_kind(source) is not None:
+                pending_labels.clear()
+                active_tables = []
+
+    site_re = re.compile(
+        r"^JMP\s+\(\s*(\.{0,2}[A-Za-z_][A-Za-z0-9_]*)\s*,\s*x\s*\)",
+        re.IGNORECASE,
+    )
+    contracts: list[DispatchContract] = []
+    all_targets: set[int] = set()
+    for path in sorted(disasm_dir.glob("bank_*.asm")):
+        scope = _SourceScope()
+        for line_number, raw_line in enumerate(path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines(), 1):
+            source = raw_line.split(";", 1)[0].strip()
+            global_label = GLOBAL_LABEL_RE.match(source)
+            nonscoping_global = NONSCOPING_GLOBAL_LABEL_RE.match(source)
+            local_label = LOCAL_LABEL_RE.match(source)
+            if global_label:
+                scope.define("", global_label.group(1))
+                continue
+            if nonscoping_global:
+                continue
+            if local_label:
+                scope.define(local_label.group(1), local_label.group(2))
+                continue
+            match = site_re.match(source)
+            if not match:
+                continue
+            table_name = scope.resolve(match.group(1))
+            pc24 = line_pc.get((path, line_number))
+            targets = tuple(sorted(table_targets.get(table_name or "", ())))
+            if pc24 is None or not targets:
+                continue
+            bank = (pc24 >> 16) & 0xFF
+            targets = tuple(target for target in targets
+                            if ((target >> 16) & 0xFF) == bank)
+            if not targets:
+                continue
+            contracts.append(DispatchContract(
+                bank, pc24 & 0xFFFF, targets, mode="ptrtail"))
+            all_targets.update(targets)
+
+    target_entries: list[Entry] = []
+    for pc24 in sorted(all_targets):
+        friendly = sorted(
+            name for name in names_by_pc.get(pc24, ())
+            if not re.fullmatch(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}", name)
+        )
+        name = friendly[0] if friendly else f"indexed_target_{pc24:06X}"
+        target_entries.append(Entry(pc24, name, "indirect"))
+    return contracts, target_entries
+
+
 def collect_terrain_dispatch_contracts(
     full_symbols: Path, disasm_dir: Path
 ) -> tuple[list[DispatchContract], list[Entry]]:
@@ -1025,7 +1166,11 @@ def collect_rts_stack_dispatch_contracts(
     and share its saved DB/Y stack frame.
     """
     line_pc = _source_line_pc_maps(full_symbols, disasm_dir)
+    full_by_name: dict[str, set[int]] = defaultdict(set)
+    for entry in parse_wla_symbols(full_symbols):
+        full_by_name[entry.name].add(entry.pc24)
     targets_by_set: dict[int, list[int]] = defaultdict(list)
+    entry_pcs_by_set: dict[int, list[int]] = defaultdict(list)
     sites: list[tuple[int, int]] = []
     entry_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*_([12])_entry$")
     pei_re = re.compile(r"^PEI\s+\(\$([0-9A-Fa-f]{2})\)(?:\s|$)",
@@ -1034,6 +1179,7 @@ def collect_rts_stack_dispatch_contracts(
     for path in sorted(disasm_dir.glob("bank_*.asm")):
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         current_set: int | None = None
+        current_entry_pc24: int | None = None
         code_rows: list[tuple[int, str, int]] = []
         for line_number, raw_line in enumerate(lines, 1):
             source = raw_line.split(";", 1)[0].strip()
@@ -1043,6 +1189,11 @@ def collect_rts_stack_dispatch_contracts(
             if global_label:
                 match = entry_re.match(global_label.group(1))
                 current_set = int(match.group(1)) if match else None
+                addresses = full_by_name.get(global_label.group(1), ())
+                current_entry_pc24 = (
+                    next(iter(addresses)) if current_set is not None
+                    and len(addresses) == 1 else None
+                )
                 continue
 
             pc24 = line_pc.get((path, line_number))
@@ -1054,7 +1205,10 @@ def collect_rts_stack_dispatch_contracts(
             if current_set is not None and re.match(r"^JMP\b", source,
                                                     re.IGNORECASE):
                 targets_by_set[current_set].append(pc24)
+                if current_entry_pc24 is not None:
+                    entry_pcs_by_set[current_set].append(current_entry_pc24)
                 current_set = None
+                current_entry_pc24 = None
 
         for index, (_line, source, pc24) in enumerate(code_rows[:-1]):
             match = pei_re.match(source)
@@ -1072,11 +1226,21 @@ def collect_rts_stack_dispatch_contracts(
     for site, command_set in sorted(sites):
         targets = tuple(sorted(set(targets_by_set.get(command_set, ()))))
         if targets:
+            # The three PEI/RTS sites execute after ``SEP #$20`` in the
+            # decompressor, while X remains 16-bit.  The *_entry labels name
+            # the one-byte runway immediately before (or exactly at) the JMP
+            # landing.  Publishing those roots as M1X0 prevents an artificial
+            # M0 decode from treating 8-bit operands as BRK/COP instructions.
+            entry_mx_overrides = tuple(
+                (pc24, 1, 0)
+                for pc24 in sorted(set(entry_pcs_by_set.get(command_set, ())))
+            )
             contracts.append(DispatchContract(
                 bank=(site >> 16) & 0xFF,
                 site_pc16=site & 0xFFFF,
                 targets=targets,
                 mode="rtsstack",
+                entry_mx_overrides=entry_mx_overrides,
             ))
     return contracts
 
@@ -1113,11 +1277,15 @@ def scan_disassembly(disasm_dir: Path) -> tuple[dict[str, str], Counter[str]]:
             source = raw_line.split(";", 1)[0].rstrip()
             stripped = source.strip()
             global_label = GLOBAL_LABEL_RE.match(stripped)
+            nonscoping_global = NONSCOPING_GLOBAL_LABEL_RE.match(stripped)
             local_label = LOCAL_LABEL_RE.match(stripped)
             if global_label:
                 resolved = scope.define("", global_label.group(1))
                 if resolved:
                     pending.append(resolved)
+                continue
+            if nonscoping_global:
+                pending.append(nonscoping_global.group(1))
                 continue
             if local_label:
                 resolved = scope.define(
@@ -1221,6 +1389,10 @@ def collect_entries(
             collect_indexed_record_dispatch_contracts(
                 full_symbols, disasm_dir)
         collected.extend(record_entries)
+        _indexed_contracts, indexed_entries = \
+            collect_symbolic_indexed_dispatch_contracts(
+                full_symbols, disasm_dir)
+        collected.extend(indexed_entries)
         _terrain_contracts, terrain_entries = \
             collect_terrain_dispatch_contracts(full_symbols, disasm_dir)
         collected.extend(terrain_entries)
@@ -1271,6 +1443,19 @@ def emit_cfg(entries: Iterable[Entry], output_dir: Path,
     terminal_jsrs_by_bank: dict[int, set[int]] = defaultdict(set)
     for pc24 in terminal_jsrs:
         terminal_jsrs_by_bank[(pc24 >> 16) & 0xFF].add(pc24 & 0xFFFF)
+    entry_modes: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for dispatch in dispatches:
+        for pc24, m_flag, x_flag in dispatch.entry_mx_overrides:
+            entry_modes[pc24 & 0xFFFFFF].add((m_flag & 1, x_flag & 1))
+    conflicts = {
+        pc24: modes for pc24, modes in entry_modes.items() if len(modes) > 1
+    }
+    if conflicts:
+        details = ", ".join(
+            f"${pc24:06X}={sorted(modes)}"
+            for pc24, modes in sorted(conflicts.items())
+        )
+        raise ValueError(f"conflicting inferred entry M/X modes: {details}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for stale in output_dir.glob("bank*.cfg"):
@@ -1279,15 +1464,12 @@ def emit_cfg(entries: Iterable[Entry], output_dir: Path,
     # Architectural vectors execute through the bank-$00 HiROM mirror.  Keep
     # that bootstrap separate from H4's bank-$80 source labels so vector entry
     # modes come from the ROM header and missing bodies retain the LLE fallback.
-    (output_dir / "bank00.cfg").write_text(
-        """\
+    _write_text_lf(output_dir / "bank00.cfg", """\
 # DKC2 architectural bootstrap; generated by ingest_dkc2_disasm.py.
 bank = 0
 auto_vectors
 tier_down_stubs
-""",
-        encoding="utf-8",
-    )
+""")
 
     for bank in sorted(by_bank):
         items = sorted(by_bank[bank], key=lambda entry: entry.pc24)
@@ -1320,13 +1502,20 @@ tier_down_stubs
                 if index + 1 < len(items)
                 else 0x10000
             )
+            modes = entry_modes.get(entry.pc24 & 0xFFFFFF)
+            entry_m, entry_x = next(iter(modes)) if modes else (0, 0)
             lines.append(
                 f"func {entry.name} {entry.pc24 & 0xFFFF:04X} "
-                f"end:{end:04X} entry_mx:0,0"
+                f"end:{end:04X} entry_mx:{entry_m},{entry_x}"
             )
-        (output_dir / f"bank{bank:02x}.cfg").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
+        _write_text_lf(
+            output_dir / f"bank{bank:02x}.cfg", "\n".join(lines) + "\n")
+
+
+def _write_text_lf(path: Path, text: str) -> None:
+    """Write deterministic LF metadata even when the importer runs on Windows."""
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
 
 
 def main() -> int:
@@ -1367,6 +1556,16 @@ def main() -> int:
     record_dispatches, _record_entries = \
         collect_indexed_record_dispatch_contracts(args.full_sym, args.disasm)
     dispatches.extend(record_dispatches)
+    indexed_dispatches, _indexed_entries = \
+        collect_symbolic_indexed_dispatch_contracts(
+            args.full_sym, args.disasm)
+    # A specialized importer understands record stride/field semantics better
+    # than the generic symbolic-DW collector. Preserve the first contract for
+    # any already modeled site and add only genuinely new indexed tables.
+    existing_sites = {(item.bank, item.site_pc16) for item in dispatches}
+    dispatches.extend(
+        item for item in indexed_dispatches
+        if (item.bank, item.site_pc16) not in existing_sites)
     terrain_dispatches, _terrain_entries = \
         collect_terrain_dispatch_contracts(args.full_sym, args.disasm)
     dispatches.extend(terrain_dispatches)
