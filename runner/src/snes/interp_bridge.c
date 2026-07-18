@@ -1479,11 +1479,17 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     const uint8_t kind = (target_pc24 == site_pc24) ? TIER2_KIND_INDIRECT_GOTO
                                                     : TIER2_KIND_DISPATCH;
     uint32_t landing = target_pc24 & 0xFFFFFF;
+    /* Write-log scope: capture the interp's write sequence for a targeted node
+     * so it can be first-divergence-diffed against the AOT body. Gated to the
+     * function under investigation; a leaf runs exactly its own writes here. */
+    const int wlog_this = ((target_pc24 & 0xFFFFFF) == 0xBB8CB5u);
+    if (wlog_this) wlog_scope_enter("interp:vram_payload_handler");
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
     int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s,
                                    &landing, NULL, 0, 0, 0, 0, NULL, 0, 0);
+    if (wlog_this) wlog_scope_exit();
     /* For an indirect goto the recorded target is where the JMP actually
      * resolved (the dynamically computed entry); for a dispatch default the
      * passed target already IS the entry. */

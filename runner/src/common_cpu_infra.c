@@ -311,10 +311,21 @@ const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
     return &g_recomp_snap_ring[slot];
 }
 
+/* Write-log scope: arm the shared write ring around the AOT body of
+ * vram_payload_handler (all exact variants). A zero-write
+ * scope (e.g. denied bounce) is not counted, keeping call indices aligned with
+ * a denied(interp) run. See cpu_state.c. */
+static int g_wlog_aot_slot = -1;
+
 void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH) {
     int slot = g_recomp_stack_top++;
     g_recomp_stack[slot] = name;
+    if (g_wlog_aot_slot < 0 && name &&
+        strncmp(name, "vram_payload_handler_M", 22) == 0) {
+      g_wlog_aot_slot = slot;
+      wlog_scope_enter(name);
+    }
     g_cpu_entry_return_frame[slot] =
         (g_cpu.host_return_valid == 2 || g_cpu.host_return_valid == 3)
             ? g_cpu.host_return_valid
@@ -442,6 +453,10 @@ void RecompStackPop(void) {
       if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
     }
     boundary_audit_record_exit(g_recomp_stack[g_recomp_stack_top - 1]);
+    if (g_wlog_aot_slot == g_recomp_stack_top - 1) {
+      wlog_scope_exit();
+      g_wlog_aot_slot = -1;
+    }
     g_recomp_stack_top--;
   }
   g_last_recomp_func = g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)";

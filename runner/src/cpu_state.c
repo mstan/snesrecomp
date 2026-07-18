@@ -37,6 +37,121 @@ extern Snes *g_snes;
 
 CpuState g_cpu;
 
+/* ── Scoped write-log ring (dev, env-gated) ────────────────────────────────
+ * Captures the exact guest write sequence (WRAM + hardware regs) performed
+ * while a scope is armed. BOTH engines funnel here: the AOT body calls
+ * cpu_write8/16 directly, and the interpreter's bridge_bus_write ultimately
+ * calls cpu_write8/16 too — so a single ring captures either engine with no
+ * per-engine instrumentation. Used to first-divergence-diff one function's
+ * writes between AOT and interp (the interp is the oracle).
+ *
+ * Arming: RecompStackPush(name)/Pop wrap the AOT body (name-matched), and
+ * interp_tier_dispatch_balanced wraps the interp run. A scope that produces
+ * zero writes is NOT counted, so the empty AOT push-then-bounce that precedes
+ * a denied interp run does not consume a call slot — call indices stay aligned
+ * between an all-AOT run and a denied(interp) run.
+ *
+ * Env: SNESRECOMP_WLOG=<path> enables; SNESRECOMP_WLOG_MAXCALLS caps captured
+ * calls (default 3). Zero cost when SNESRECOMP_WLOG is unset. */
+int  g_wlog_active = 0;              /* fast-path gate read in cpu_write8/16 */
+static FILE *g_wlog_fp = NULL;
+static int   g_wlog_inited = 0;
+static int   g_wlog_calls = 0;
+static int   g_wlog_max_calls = 3;
+static int   g_wlog_scope_open = 0;
+static int   g_wlog_scope_wrote = 0;
+static char  g_wlog_tag[80];
+static uint16 g_wlog_eA, g_wlog_eX, g_wlog_eY;
+static uint8  g_wlog_eM, g_wlog_eXf, g_wlog_eDB, g_wlog_ePB;
+
+static void wlog_lazy_init(void) {
+    if (g_wlog_inited) return;
+    g_wlog_inited = 1;
+    const char *p = getenv("SNESRECOMP_WLOG");
+    if (p && p[0]) g_wlog_fp = fopen(p, "w");
+    const char *m = getenv("SNESRECOMP_WLOG_MAXCALLS");
+    if (m && m[0]) g_wlog_max_calls = atoi(m);
+}
+
+void wlog_scope_enter(const char *tag) {
+    wlog_lazy_init();
+    if (!g_wlog_fp) return;
+    if (g_wlog_calls >= g_wlog_max_calls) { g_wlog_active = 0; return; }
+    /* snapshot entry register state from the single global CpuState */
+    g_wlog_eA = g_cpu.A; g_wlog_eX = g_cpu.X; g_wlog_eY = g_cpu.Y;
+    g_wlog_eM = (uint8)(g_cpu.m_flag & 1); g_wlog_eXf = (uint8)(g_cpu.x_flag & 1);
+    g_wlog_eDB = g_cpu.DB; g_wlog_ePB = g_cpu.PB;
+    size_t n = 0; if (tag) { while (tag[n] && n < sizeof(g_wlog_tag) - 1) { g_wlog_tag[n] = tag[n]; n++; } }
+    g_wlog_tag[n] = 0;
+    g_wlog_scope_open = 1; g_wlog_scope_wrote = 0; g_wlog_active = 1;
+}
+
+void wlog_scope_exit(void) {
+    if (!g_wlog_scope_open) return;
+    g_wlog_scope_open = 0; g_wlog_active = 0;
+    if (g_wlog_scope_wrote) {
+        if (g_wlog_fp)
+            fprintf(g_wlog_fp, "# EXIT %d A=%04X X=%04X Y=%04X M=%d Xf=%d DB=%02X\n",
+                    g_wlog_calls, g_cpu.A, g_cpu.X, g_cpu.Y,
+                    (int)(g_cpu.m_flag & 1), (int)(g_cpu.x_flag & 1), g_cpu.DB);
+        g_wlog_calls++;
+        if (g_wlog_fp) fflush(g_wlog_fp);
+    }
+}
+
+/* ── Always-on address-range write logger ─────────────────────────────────
+ * Independent of the scope ring above: logs EVERY write whose 16-bit address
+ * falls in [lo,hi], tagged with frame + the current AOT function name. Both
+ * engines funnel through cpu_write8/16, so an all-AOT run and an all-interp
+ * (deny-all) run produce comparable streams; diffing them finds the first
+ * divergent write (e.g. an APU command $2140-$2143) and, from the AOT stream's
+ * function tag at that point, the culprit function. Env:
+ * SNESRECOMP_WLOG_ADDR="LO:HI:PATH" (hex LO/HI). Zero cost when unset. */
+static int    g_wlog_addr_inited = 0;
+static FILE  *g_wlog_addr_fp = NULL;
+static uint16 g_wlog_addr_lo = 0xFFFF, g_wlog_addr_hi = 0x0000;
+static long   g_wlog_addr_n = 0, g_wlog_addr_cap = 2000000;
+
+static void wlog_addr_lazy(void) {
+    g_wlog_addr_inited = 1;
+    const char *p = getenv("SNESRECOMP_WLOG_ADDR");
+    if (!p || !p[0]) return;
+    unsigned lo = 0, hi = 0; char path[512] = {0};
+    /* "LO:HI:PATH" */
+    if (sscanf(p, "%x:%x:%511[^\n]", &lo, &hi, path) >= 3 && path[0]) {
+        g_wlog_addr_lo = (uint16)lo; g_wlog_addr_hi = (uint16)hi;
+        g_wlog_addr_fp = fopen(path, "w");
+    }
+    const char *c = getenv("SNESRECOMP_WLOG_ADDR_CAP");
+    if (c && c[0]) g_wlog_addr_cap = strtol(c, NULL, 0);
+}
+
+static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
+    if (!g_wlog_addr_inited) wlog_addr_lazy();
+    if (!g_wlog_addr_fp) return;
+    if (addr < g_wlog_addr_lo || addr > g_wlog_addr_hi) return;
+    if (g_wlog_addr_n++ >= g_wlog_addr_cap) return;
+    extern int snes_frame_counter;
+    extern const char *g_last_recomp_func;
+    fprintf(g_wlog_addr_fp, "f%-6d %02X:%04X=%0*X w%d %s\n",
+            snes_frame_counter, bank, addr, width * 2,
+            (unsigned)(v & (width == 1 ? 0xFF : 0xFFFF)), width,
+            g_last_recomp_func ? g_last_recomp_func : "?");
+}
+
+static inline void wlog_note(uint8 bank, uint16 addr, uint16 v, int width) {
+    if (!g_wlog_active || !g_wlog_fp) return;
+    if (!g_wlog_scope_wrote) {
+        g_wlog_scope_wrote = 1;
+        fprintf(g_wlog_fp,
+                "# CALL %d %s A=%04X X=%04X Y=%04X M=%d Xf=%d DB=%02X PB=%02X\n",
+                g_wlog_calls, g_wlog_tag, g_wlog_eA, g_wlog_eX, g_wlog_eY,
+                (int)g_wlog_eM, (int)g_wlog_eXf, g_wlog_eDB, g_wlog_ePB);
+    }
+    fprintf(g_wlog_fp, "%02X:%04X=%0*X w%d\n",
+            bank, addr, width * 2, (unsigned)(v & (width == 1 ? 0xFF : 0xFFFF)), width);
+}
+
 /* Map a 24-bit logical address onto a g_ram offset. Returns -1 for
  * addresses that are NOT WRAM — the caller routes those to the HW-reg
  * helpers (WriteReg/ReadReg) or to ROM. */
@@ -204,6 +319,8 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
 }
 
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
+    if (g_wlog_active) wlog_note(bank, addr, v, 1);
+    wlog_addr_note(bank, addr, v, 1);
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
@@ -258,6 +375,8 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
 }
 
 void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
+    if (g_wlog_active) wlog_note(bank, addr, v, 2);
+    wlog_addr_note(bank, addr, v, 2);
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0 && off + 1 < 0x20000) {
         uint16 old = (uint16)cpu->ram[off]
