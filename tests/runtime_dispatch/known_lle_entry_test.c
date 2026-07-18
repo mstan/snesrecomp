@@ -9,6 +9,11 @@
 #include "snes/snes.h"
 #include "snes/superfx.h"
 
+/* cpu_state.c's optional write-state recorder reads the interpreter PC. The
+ * production definition lives in interp_bridge.c, which this focused dispatch
+ * harness intentionally does not link. */
+uint32_t g_interp_wlog_pc24 = 0;
+
 static int g_aot_calls;
 static int g_lle_calls;
 static uint32 g_lle_target;
