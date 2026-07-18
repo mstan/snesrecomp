@@ -304,6 +304,56 @@ static int interp_file_target_cmp(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return (x > y) - (x < y);
 }
+/* Lazy-load the SNESRECOMP_LLE_INTERP_TARGET_FILE set (idempotent). Shared by
+ * the interp->AOT bounce gate and the AOT body-entry guard (rtl_aot_node_denied),
+ * so the set is populated no matter which fires first. */
+static void ensure_interp_file_targets_loaded(void) {
+    static int s_loaded;
+    if (s_loaded) return;
+    s_loaded = 1;
+    const char *fp = getenv("SNESRECOMP_LLE_INTERP_TARGET_FILE");
+    if (!fp || !*fp) return;
+    FILE *f = fopen(fp, "r");
+    if (!f) return;
+    size_t cap = 256, n = 0;
+    uint32_t *arr = (uint32_t *)malloc(cap * sizeof *arr);
+    char line[64];
+    while (arr && fgets(line, sizeof line, f)) {
+        char *end = NULL;
+        unsigned long pc = strtoul(line, &end, 16);
+        if (end == line) continue;
+        if (n == cap) {
+            cap *= 2;
+            uint32_t *g = (uint32_t *)realloc(arr, cap * sizeof *arr);
+            if (!g) break;
+            arr = g;
+        }
+        arr[n++] = (uint32_t)(pc & 0xFFFFFFu);
+    }
+    fclose(f);
+    if (arr && n) {
+        qsort(arr, n, sizeof *arr, interp_file_target_cmp);
+        s_interp_file_targets = arr;
+        s_interp_file_count = n;
+    } else {
+        free(arr);
+    }
+    fprintf(stderr, "[lle] forcing %zu file target(s) to interp\n",
+            s_interp_file_count);
+}
+
+/* AOT body-entry guard: generated variant bodies (when emitted with the
+ * SNESRECOMP_EMIT_AOT_DENY_GATE codegen flag) call this at the prologue and
+ * tier down to the interpreter if their PC is in the deny set. Unlike the
+ * interp->AOT bounce gate, this fires for EVERY entry path (direct call, tail,
+ * dispatch, alias), so a subset can be soundly disabled for bisection. */
+int rtl_aot_node_denied(uint32 pc24) {
+    ensure_interp_file_targets_loaded();
+    if (!s_interp_file_count) return 0;
+    uint32_t key = (uint32_t)pc24 & 0xFFFFFFu;
+    return bsearch(&key, s_interp_file_targets, s_interp_file_count,
+                   sizeof key, interp_file_target_cmp) != NULL;
+}
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
@@ -373,37 +423,7 @@ static int lle_bounce_target_excluded(uint32_t target_pc24) {
         const char *v = getenv("SNESRECOMP_LLE_INTERP_TARGET");
         if (v && *v)
             s_target = (uint32_t)strtoul(v, NULL, 16) & 0xFFFFFFu;
-        const char *fp = getenv("SNESRECOMP_LLE_INTERP_TARGET_FILE");
-        if (fp && *fp) {
-            FILE *f = fopen(fp, "r");
-            if (f) {
-                size_t cap = 256, n = 0;
-                uint32_t *arr = (uint32_t *)malloc(cap * sizeof *arr);
-                char line[64];
-                while (arr && fgets(line, sizeof line, f)) {
-                    char *end = NULL;
-                    unsigned long pc = strtoul(line, &end, 16);
-                    if (end == line) continue;
-                    if (n == cap) {
-                        cap *= 2;
-                        uint32_t *g = (uint32_t *)realloc(arr, cap * sizeof *arr);
-                        if (!g) break;
-                        arr = g;
-                    }
-                    arr[n++] = (uint32_t)(pc & 0xFFFFFFu);
-                }
-                fclose(f);
-                if (arr && n) {
-                    qsort(arr, n, sizeof *arr, interp_file_target_cmp);
-                    s_interp_file_targets = arr;
-                    s_interp_file_count = n;
-                } else {
-                    free(arr);
-                }
-                fprintf(stderr, "[lle] forcing %zu file target(s) to interp\n",
-                        s_interp_file_count);
-            }
-        }
+        ensure_interp_file_targets_loaded();
         s_init = 1;
     }
     if (s_target != 0xFFFFFFFFu &&

@@ -17,6 +17,7 @@ Returns a complete `void <func_name>(CpuState *cpu) { ... }` C source
 string.
 """
 
+import os
 import sys
 import pathlib
 
@@ -2025,6 +2026,17 @@ def emit_function(rom: bytes, bank: int, start: int,
     src.append(f'  if (cpu_take_tailcall_return_context(&_entry_s, &_hrv)) {{')
     src.append(f'    cpu->host_return_valid = _hrv;')
     src.append(f'  }}')
+    # Debug bisection guard (codegen-flag gated): after the prologue has
+    # established the ACTUAL invocation's _entry_s/_hrv (incl. tail-call
+    # context), tier the whole body to the interpreter if this node's PC is in
+    # the runtime deny set. Uses the runtime continuation, so it is sound for
+    # every entry path — enabling rebuild-free subset bisection of a seeded AOT
+    # set against the interpreter oracle. Off unless SNESRECOMP_EMIT_AOT_DENY_GATE.
+    if os.environ.get('SNESRECOMP_EMIT_AOT_DENY_GATE'):
+        src.append(
+            f'  if (rtl_aot_node_denied(0x{fn_entry_pc:06X}u)) {{ '
+            f'RecompStackPop(); return interp_tier_dispatch_balanced('
+            f'cpu, 0x{fn_entry_pc:06X}u, 0x{fn_entry_pc:06X}u, _entry_s, _hrv); }}')
     src.append(f'  uint32 _host_return_pc24 = 0xFFFFFFFFu;')
     src.append(f'  if (_hrv == 2 || _hrv == 3) {{')
     src.append(f'    uint16 _host_rpcl = cpu_read8(cpu, 0x00, (uint16)(_entry_s + 1u));')
