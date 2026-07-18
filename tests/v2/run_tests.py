@@ -49,6 +49,7 @@ TEST_MODULES = [
     'test_indirect_jsr_dispatch_continuation',
     'test_local_stride_runway_dispatch',
     'test_rts_stack_dispatch',
+    'test_host_return_pc_guard',
     'test_wrapper_autoroute',
     'test_tail_call_autoroute',
     'test_emit_function_tail_call_past_end',

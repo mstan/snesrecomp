@@ -498,7 +498,17 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
 
     k = seg.kind
     if k == SegKind.DIRECT:
-        return ("0x7E", f"(uint16)(cpu->D + {seg.offset:#06x}{idx})")
+        # Direct-page addressing ALWAYS resolves in bank $00 (65816 contract):
+        # effective = (D + dp + index) & 0xFFFF, bank 0. The old "0x7E" bank
+        # only happened to work when the effective address stayed below $2000,
+        # where $7E:0000-1FFF aliases $00:0000-1FFF in the WRAM low mirror; once
+        # D+index reaches $2000-$5FFF the bank decides everything — $00:21xx is a
+        # PPU/hw register, $7E:21xx is plain WRAM. DKC2 set_ppu_registers does
+        # `STA $00,x` with X = a PPU register number ($2105 …); the $7E emit sent
+        # every PPU register write into WRAM, so the PPU config never applied →
+        # forced-blank stall. The (uint16) addr_expr already models the bank-0
+        # 16-bit wrap; only the bank was wrong.
+        return ("0x00", f"(uint16)(cpu->D + {seg.offset:#06x}{idx})")
     if k == SegKind.ABS_BANK:
         if seg.index is None:
             return ("cpu->DB", f"(uint16)({seg.offset:#06x})")
@@ -2152,8 +2162,11 @@ def _emit_return(op: Return) -> List[str]:
     #     handlers); equal S alone must not discard that control-flow change.
     #   - otherwise (dispatched entry _hrv==0, OR a trampoline/NLR that
     #     changed the net stack so _ret_s != _entry_s) dispatch on the popped
-    #     PC24. The chain unwinds when a dispatch misses (cpu_dispatch_pc_from
-    #     restores S and returns NORMAL).
+    #     PC24. A deeper-than-entry RTS has popped a frame created by the
+    #     current routine (the common PEI;RTS computed-dispatch idiom), so an
+    #     unknown target must tier into LLE rather than be mistaken for a
+    #     mid-caller return continuation. Shallower return continuations still
+    #     use cpu_dispatch_pc_from's normal miss-unwind behavior.
     # This subsumes the old _TRAMPOLINE_RETURNS + _pending_skip paths — PLA*N
     # NLR now flows through the real cpu->S pops exposed below.
     label = "/* RTL */" if op.long else "/* RTS */"
@@ -2214,6 +2227,20 @@ def _emit_return(op: Return) -> List[str]:
         # the guest RTS already returned past.
         f"    if (_hrv == {frame_sz} && interp_bridge_has_direct_paired_bounce()) {{",
         f"      return interp_tier_dispatch_rewritten_return(cpu, _rpc24, 0x{src24:06x}u); }}",
+        "  }",
+        # The stack grows downward. If pre-RTS S is deeper than the routine's
+        # entry S, the RTS consumed a synthetic frame pushed inside this
+        # routine, not its caller's return frame. This is a live computed jump
+        # even when its target was not discovered as a CFG root. Execute the
+        # exact ROM continuation in LLE; treating an unknown target as the
+        # usual mid-caller dispatch miss prematurely returns with locals (and
+        # saved DB/P/Y state) still on the stack. The unsigned delta makes the
+        # comparison safe across 16-bit S wrap for realistic (<32 KiB) frames.
+        "  if (_ret_s != _entry_s &&",
+        "      (uint16)(_entry_s - _ret_s) < 0x8000u &&",
+        "      !cpu_dispatch_has_entry(cpu, _rpc24)) {",
+        f"    return interp_tier_dispatch_popped_return(cpu, _rpc24, 0x{src24:06x}u,",
+        f"        (uint16)(_entry_s + {frame_sz}u));",
         "  }",
         "  cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
         # Miss-restore = post-return-pop S (entry_s + frame_size). On a dispatch
