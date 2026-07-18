@@ -84,6 +84,20 @@ def test_structural_poison_does_not_propagate_plausible_calls():
     assert VariantKey(0x009000, 1, 1) not in manifest.nodes
 
 
+def test_decomp_declared_embedded_data_break_does_not_poison_routine():
+    rom = make_lorom_bank0({
+        # BCC $8004; embedded BRK/signature data; RTS
+        0x8000: bytes([0x90, 0x02, 0x00, 0x00, 0x60]),
+    })
+    manifest = ProgramAnalyzer(_decode(
+        rom, data_regions=[(0x00, 0x8002, 0x8004)])).analyze([
+            VariantKey(0x008000, 1, 1)])
+    root = manifest.nodes[VariantKey(0x008000, 1, 1)]
+
+    assert root.disposition == NodeDisposition.AOT_ELIGIBLE
+    assert "structural_poison" not in root.reasons
+
+
 def test_decode_budget_classifies_node_lle_only_without_partial_graph():
     rom = make_lorom_bank0({
         0x8000: bytes([0xEA, 0xEA, 0xEA, 0x60]),

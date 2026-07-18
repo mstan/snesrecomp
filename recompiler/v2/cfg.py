@@ -96,7 +96,9 @@ def _identify_leaders(graph: FunctionDecodeGraph,
     leaders: Set[DecodeKey] = {graph.entry}
 
     for key, di in graph.insns.items():
-        if di.insn.mnem in _BLOCK_ENDERS:
+        if (di.insn.mnem in _BLOCK_ENDERS
+                or getattr(di.insn, 'dispatch_terminal', False)
+                or len(di.successors) != 1):
             for s in di.successors:
                 # Successor may be outside the graph (cross-bank, indirect);
                 # only mark it as a leader if it's actually decoded here.
@@ -135,7 +137,8 @@ def _build_blocks(graph: FunctionDecodeGraph,
             seen.add(cur)
             block_insns.append(di)
 
-            if di.insn.mnem in _BLOCK_ENDERS:
+            if (di.insn.mnem in _BLOCK_ENDERS
+                    or getattr(di.insn, 'dispatch_terminal', False)):
                 break
             # Non-control-flow insn: a single canonical fall-through successor.
             if len(di.successors) != 1:

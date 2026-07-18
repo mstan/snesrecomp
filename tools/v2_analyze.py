@@ -37,6 +37,7 @@ from v2.decoder import (  # noqa: E402
     clear_decode_cache,
     decode_function,
     detect_inline_arg_bytes,
+    function_exit_mx_equation,
     set_decode_cache_enabled,
 )
 from v2.program_analysis import (  # noqa: E402
@@ -61,6 +62,189 @@ def _lorom_mirror_pc24(pc24: int):
     if mirror is None:
         return None
     return (mirror << 16) | (pc24 & 0xFFFF)
+
+
+def _solve_exit_equation_sccs(equations, exact_facts, set_facts):
+    """Solve closed mutually-recursive tail/dispatch exit components.
+
+    Each equation maps a VariantKey to ``(local_modes, dependencies)`` where
+    a dependency is ``(pc24, entry_m, entry_x)``.  Single-function fixed-point
+    inference cannot bootstrap ``A -> B -> A`` even when A or B has a real
+    local return.  This solver condenses the exact dependency graph and solves
+    only components whose outgoing dependencies already have complete facts.
+    Unknown external edges keep the whole component unpublished.
+    """
+    if not equations:
+        return {}
+
+    def equation_parts(value):
+        if len(value) == 2:
+            return value[0], value[1], frozenset()
+        return value[0], value[1], value[2]
+
+    keys = set(equations)
+    tuple_to_key = {(key.pc24, key.m, key.x): key for key in keys}
+    for key in keys:
+        mirror = _lorom_mirror_pc24(key.pc24)
+        if mirror is not None:
+            tuple_to_key.setdefault((mirror, key.m, key.x), key)
+
+    def equation_target(dep):
+        hit = tuple_to_key.get(dep)
+        if hit is not None:
+            return hit
+        mirror = _lorom_mirror_pc24(dep[0])
+        if mirror is not None:
+            return tuple_to_key.get((mirror, dep[1], dep[2]))
+        return None
+
+    # SCC adjacency includes both true tail-exit dependencies and proof-only
+    # call requirements. Only the former contribute exit modes to the caller.
+    # Conflating them made a non-returning function inherit the exit mode of
+    # an ordinary helper it called before entering its WAI loop.
+    adjacency = {key: set() for key in keys}
+    mode_adjacency = {key: set() for key in keys}
+    for key, value in equations.items():
+        _local, dependencies, assumptions = equation_parts(value)
+        for dep in dependencies:
+            target = equation_target(dep)
+            if target is not None:
+                adjacency[key].add(target)
+                mode_adjacency[key].add(target)
+        for dep, _assumed_m, _assumed_x in assumptions:
+            target = equation_target(dep)
+            if target is not None:
+                adjacency[key].add(target)
+
+    # Tarjan SCCs over exact variant dependencies.
+    index = 0
+    indices = {}
+    lowlinks = {}
+    stack = []
+    on_stack = set()
+    components = []
+
+    def visit(node):
+        nonlocal index
+        indices[node] = index
+        lowlinks[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for target in sorted(adjacency[node]):
+            if target not in indices:
+                visit(target)
+                lowlinks[node] = min(lowlinks[node], lowlinks[target])
+            elif target in on_stack:
+                lowlinks[node] = min(lowlinks[node], indices[target])
+        if lowlinks[node] != indices[node]:
+            return
+        component = set()
+        while True:
+            item = stack.pop()
+            on_stack.remove(item)
+            component.add(item)
+            if item == node:
+                break
+        components.append(component)
+
+    for key in sorted(keys):
+        if key not in indices:
+            visit(key)
+
+    def known_modes(dep, solved):
+        pair = exact_facts.get(dep)
+        if pair is None:
+            mirror = _lorom_mirror_pc24(dep[0])
+            if mirror is not None:
+                pair = exact_facts.get((mirror, dep[1], dep[2]))
+        if pair is not None:
+            return {(pair[0] & 1, pair[1] & 1)}
+        modes = set_facts.get(dep)
+        if modes is None:
+            mirror = _lorom_mirror_pc24(dep[0])
+            if mirror is not None:
+                modes = set_facts.get((mirror, dep[1], dep[2]))
+        if modes is not None:
+            return {(m & 1, x & 1) for m, x in modes}
+        target = equation_target(dep)
+        if target is not None:
+            return solved.get(target)
+        return None
+
+    solved = {}
+    pending = list(components)
+    while pending:
+        next_pending = []
+        progressed = False
+        for component in pending:
+            values = {
+                key: {(m & 1, x & 1)
+                      for m, x in equation_parts(equations[key])[0]}
+                for key in component
+            }
+            external = {key: set() for key in component}
+            complete = True
+            for key in component:
+                _local, dependencies, assumptions = equation_parts(
+                    equations[key])
+                for dep in dependencies:
+                    target = equation_target(dep)
+                    if target in component:
+                        continue
+                    modes = known_modes(dep, solved)
+                    if modes is None:
+                        complete = False
+                        break
+                    external[key].update(modes)
+                if not complete:
+                    break
+                for dep, _assumed_m, _assumed_x in assumptions:
+                    target = equation_target(dep)
+                    if target in component:
+                        continue
+                    if known_modes(dep, solved) is None:
+                        complete = False
+                        break
+                if not complete:
+                    break
+            if not complete:
+                next_pending.append(component)
+                continue
+            for key in component:
+                values[key].update(external[key])
+            changed = True
+            while changed:
+                changed = False
+                for key in sorted(component):
+                    before = len(values[key])
+                    for target in mode_adjacency[key] & component:
+                        values[key].update(values[target])
+                    changed |= len(values[key]) != before
+            assumptions_hold = True
+            for key in component:
+                _local, _dependencies, assumptions = equation_parts(
+                    equations[key])
+                for dep, assumed_m, assumed_x in assumptions:
+                    target = equation_target(dep)
+                    modes = (values.get(target) if target in component
+                             else known_modes(dep, solved))
+                    if modes != {(assumed_m & 1, assumed_x & 1)}:
+                        assumptions_hold = False
+                        break
+                if not assumptions_hold:
+                    break
+            if not assumptions_hold:
+                # The preservation-probe decoded the continuation under a
+                # mode the recursive callee does not in fact return with.
+                continue
+            for key, modes in values.items():
+                solved[key] = frozenset(modes)
+            progressed = True
+        if not progressed:
+            break
+        pending = next_pending
+    return solved
 
 
 def _load_cfgs(cfg_dir: pathlib.Path):
@@ -112,6 +296,19 @@ def _indirect_dispatch_map(parsed) -> dict:
             mirror = _lorom_mirror_pc24(site)
             if mirror is not None:
                 result.setdefault(mirror, result[site])
+    return result
+
+
+def _terminal_jsr_sites(parsed) -> set:
+    """Expand cfg-local terminal JSR call sites to canonical + LoROM mirror PCs."""
+    result = set()
+    for bank, _path, cfg in parsed:
+        for site_pc16 in getattr(cfg, "terminal_jsr", ()):
+            site = (bank << 16) | (site_pc16 & 0xFFFF)
+            result.add(site)
+            mirror = _lorom_mirror_pc24(site)
+            if mirror is not None:
+                result.add(mirror)
     return result
 
 
@@ -240,10 +437,12 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
 
     data_regions = tuple(all_data_regions)
     dispatch_map = _indirect_dispatch_map(parsed)
+    terminal_jsr_sites = _terminal_jsr_sites(parsed)
     declared_exit_modes = _declared_exit_modes(parsed)
     active_exit_modes = dict(declared_exit_modes)
     unstable_exit_modes = set()
     round_exit_modes = {}
+    round_exit_equations = {}
     # Proven multi-mode exit sets: (pc24, entry_m, entry_x) -> frozenset of
     # (exit_m, exit_x). Published when every exit path resolves but the
     # paths disagree, so no single exact fact exists. Callers fork their
@@ -323,6 +522,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             "callee_exit_mx_modes": active_exit_mode_sets or None,
             "sibling_entry_pcs": siblings or None,
             "inline_arg_map": inline_arg_map or None,
+            "terminal_jsr_sites": terminal_jsr_sites or None,
             # An unknown callee return width is not evidence that M/X is
             # preserved. Stop the speculative caller continuation at that
             # call; once the callee is proven, a later immutable round
@@ -441,6 +641,47 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                     if not _refuted(s)]
             if len(kept) != len(graph.unknown_callee_exit_sites):
                 graph.unknown_callee_exit_sites[:] = kept
+        graph_has_poison = any(
+            decoded.insn.mnem in ("BRK", "COP")
+            and (decoded.insn.addr & 0xFFFFFF)
+            not in graph.data_region_exec_pcs
+            for decoded in graph.insns.values())
+        graph_has_dynamic_unknown = bool(
+            graph.unresolved_indirects or graph.suppressed_indirect_calls)
+        if (not graph.unknown_callee_exit_sites and not graph_has_poison
+                and not graph_has_dynamic_unknown):
+            local_modes, dependencies = function_exit_mx_equation(graph)
+            round_exit_equations[key] = (
+                local_modes, dependencies, frozenset())
+        elif (graph.unknown_callee_exit_sites and not graph_has_poison
+              and not graph_has_dynamic_unknown):
+            # General recursive-call bootstrap. Decode a proof probe with the
+            # historic preservation behavior solely to expose the bytes after
+            # each unknown call. The resulting equation is not publishable
+            # unless the closed SCC solver proves every recursive callee
+            # returns in exactly the preserved mode used by this probe.
+            kwargs_probe = dict(kwargs)
+            kwargs_probe["stop_on_unknown_callee_exit"] = False
+            try:
+                probe = decode_function(
+                    rom, bank, pc, key.m, key.x, **kwargs_probe)
+            except RuntimeError:
+                probe = None
+            if (probe is not None
+                    and not any(
+                        decoded.insn.mnem in ("BRK", "COP")
+                        and (decoded.insn.addr & 0xFFFFFF)
+                        not in probe.data_region_exec_pcs
+                        for decoded in probe.insns.values())):
+                local_modes, dependencies = function_exit_mx_equation(probe)
+                assumptions = set()
+                for _site, target, target_m, target_x in \
+                        graph.unknown_callee_exit_sites:
+                    dep = (target & 0xFFFFFF,
+                           target_m & 1, target_x & 1)
+                    assumptions.add((dep, target_m & 1, target_x & 1))
+                round_exit_equations[key] = (
+                    local_modes, dependencies, frozenset(assumptions))
         variant_tuple = (key.pc24, key.m, key.x)
         if variant_tuple in unstable_exit_modes:
             graph.unstable_exit_fact = True
@@ -460,7 +701,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 modes = analyze_function_exit_mx_modes(
                     graph, active_exit_modes or None,
                     active_exit_mode_sets or None)
-                if modes and len(modes) > 1:
+                if modes is not None and len(modes) != 1:
                     round_exit_mode_sets[key] = frozenset(
                         (m & 1, x & 1) for (m, x) in modes)
         return graph
@@ -480,6 +721,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
         while True:
             round_exit_modes = {}
             round_exit_mode_sets = {}
+            round_exit_equations = {}
             before_helpers = dict(dispatch_helpers)
             before_inline = dict(inline_arg_map)
             before_poisoned = set(poisoned_variants)
@@ -491,6 +733,20 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
                 (node_key.pc24, node_key.m, node_key.x)
                 for node_key, node in manifest.nodes.items()
                 if "structural_poison" in node.reasons)
+
+            recursive_solutions = _solve_exit_equation_sccs(
+                round_exit_equations, active_exit_modes,
+                active_exit_mode_sets)
+            for key, modes in sorted(recursive_solutions.items()):
+                fact_key = (key.pc24, key.m, key.x)
+                if (fact_key in declared_exit_modes
+                        or fact_key in unstable_exit_modes
+                        or fact_key in unstable_exit_mode_sets):
+                    continue
+                if len(modes) == 1:
+                    round_exit_modes.setdefault(key, next(iter(modes)))
+                else:
+                    round_exit_mode_sets.setdefault(key, frozenset(modes))
 
             # Exact exit proofs only grow. A caller that lacked a callee fact
             # was truncated at the call, so it could not publish a guess that

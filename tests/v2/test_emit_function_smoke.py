@@ -151,6 +151,17 @@ def test_rep_sep_emits_p_updates_with_mirrors():
     assert "0x30" in src
 
 
+def test_wai_bounce_unwind_pops_generated_diagnostic_frame():
+    """The per-line return scanner must balance RecompStackPush on WAI."""
+    rom = make_lorom_bank0({0x8000: bytes([0xCB])})
+    src = emit_function(rom, bank=0, start=0x8000,
+                        entry_m=1, entry_x=1)
+    needle = "return interp_bridge_lle_yield_unwind(cpu, 0x008001u);"
+    assert needle in src, src
+    before = src[:src.index(needle)]
+    assert before.rstrip().endswith("RecompStackPop();"), src
+
+
 if __name__ == '__main__':
     import sys, traceback
     failed = 0

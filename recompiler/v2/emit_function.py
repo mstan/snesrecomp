@@ -44,7 +44,7 @@ from snes65816 import (  # noqa: E402
 from v2.ir import (  # noqa: E402
     IROp, IRBlock, Value,
     CondBranch, Goto, IndirectGoto, Call, Return,
-    PullReg, PushReg, Pull, Push, Reg,
+    PullReg, PushReg, Pull, Push, PushEffectiveAddress, Reg,
 )
 
 
@@ -485,6 +485,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                   hle_func=None,
                   hle_dispatch=None,
                   inline_arg_map=None,
+                  terminal_jsr_sites=None,
                   entry_s_offset: int = 0) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
@@ -597,7 +598,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                             callee_exit_mx=callee_exit_mx,
                             callee_exit_mx_modes=callee_exit_mx_modes,
                             sibling_entry_pcs=sibling_entry_pcs,
-                            inline_arg_map=inline_arg_map)
+                            inline_arg_map=inline_arg_map,
+                            terminal_jsr_sites=terminal_jsr_sites)
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:
@@ -1851,11 +1853,11 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 f"_entry_s, _hrv); "
                                 f"/* unresolved IndirectGoto -> interpreter tier */")
                         block_terminated = True
-                elif isinstance(op, PushReg) and getattr(
+                elif isinstance(op, (PushReg, PushEffectiveAddress)) and getattr(
                         di_insn, 'dispatch_entries', None):
-                    # RTS-stack dispatch: the decoder marked the PHA
-                    # that would normally push target-1 for a following
-                    # RTS. Emit a switch instead of the literal stack
+                    # RTS-stack dispatch: the decoder marked the PHA/PEI
+                    # that would normally push target-1 for a following RTS.
+                    # Emit a switch instead of the literal stack
                     # push, otherwise the synthesized return address
                     # leaks onto the simulated SNES stack.
                     from v2.codegen import _emit_indirect_dispatch
@@ -1899,6 +1901,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                     else:
                         for ln in emit_op(op, getattr(di_insn, 'addr', None)):
                             lines.append(ln)
+                        if op.terminal:
+                            block_terminated = True
                 else:
                     # ReadReg, ALU, Read/Write, etc. — non-terminating.
                     for ln in emit_op(op, getattr(di_insn, 'addr', None)):

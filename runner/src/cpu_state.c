@@ -111,6 +111,7 @@ static int    g_wlog_addr_inited = 0;
 static FILE  *g_wlog_addr_fp = NULL;
 static uint16 g_wlog_addr_lo = 0xFFFF, g_wlog_addr_hi = 0x0000;
 static long   g_wlog_addr_n = 0, g_wlog_addr_cap = 2000000;
+static int    g_wlog_addr_state = 0;
 
 static void wlog_addr_lazy(void) {
     g_wlog_addr_inited = 1;
@@ -124,6 +125,7 @@ static void wlog_addr_lazy(void) {
     }
     const char *c = getenv("SNESRECOMP_WLOG_ADDR_CAP");
     if (c && c[0]) g_wlog_addr_cap = strtol(c, NULL, 0);
+    g_wlog_addr_state = getenv("SNESRECOMP_WLOG_STATE") != NULL;
 }
 
 static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
@@ -133,10 +135,38 @@ static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) 
     if (g_wlog_addr_n++ >= g_wlog_addr_cap) return;
     extern int snes_frame_counter;
     extern const char *g_last_recomp_func;
-    fprintf(g_wlog_addr_fp, "f%-6d %02X:%04X=%0*X w%d %s\n",
+    fprintf(g_wlog_addr_fp, "f%-6d %02X:%04X=%0*X w%d %s",
             snes_frame_counter, bank, addr, width * 2,
             (unsigned)(v & (width == 1 ? 0xFF : 0xFFFF)), width,
             g_last_recomp_func ? g_last_recomp_func : "?");
+    if (g_wlog_addr_state)
+        {
+        extern uint32_t g_interp_wlog_pc24;
+        fprintf(g_wlog_addr_fp,
+                " A=%04X X=%04X Y=%04X S=%04X D=%04X DB=%02X M=%u Xf=%u"
+                " IPC=%06X"
+                " p34=%02X%04X p38=%04X p3C=%04X p3E=%04X"
+                " p42=%02X p46=%02X p4A=%02X p4E=%02X"
+                " p52=%02X p53=%02X p54=%04X p56=%02X p57=%02X",
+                g_cpu.A, g_cpu.X, g_cpu.Y, g_cpu.S, g_cpu.D, g_cpu.DB,
+                (unsigned)(g_cpu.m_flag & 1), (unsigned)(g_cpu.x_flag & 1),
+                (unsigned)(g_interp_wlog_pc24 & 0xFFFFFFu),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x36)),
+                cpu_read16(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x34)),
+                cpu_read16(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x38)),
+                cpu_read16(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x3C)),
+                cpu_read16(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x3E)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x42)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x46)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x4A)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x4E)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x52)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x53)),
+                cpu_read16(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x54)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x56)),
+                cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x57)));
+        }
+    fputc('\n', g_wlog_addr_fp);
 }
 
 static inline void wlog_note(uint8 bank, uint16 addr, uint16 v, int width) {
@@ -295,8 +325,18 @@ uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
 
 uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     int off = cpu_ram_offset(bank, addr);
-    if (off >= 0 && off + 1 < 0x20000)
-        return (uint16)cpu->ram[off] | ((uint16)cpu->ram[off + 1] << 8);
+    if (off >= 0) {
+        /* A 16-bit guest access wraps its high-byte address within the same
+         * bank. The corresponding host WRAM offsets are not necessarily
+         * contiguous: $7F:FFFF -> $7F:0000 maps $1FFFF -> $10000, while
+         * $00:1FFF -> $00:2000 crosses from WRAM into an I/O register. */
+        uint16 hi_addr = (uint16)(addr + 1);
+        int hi_off = cpu_ram_offset(bank, hi_addr);
+        uint8 hi = (hi_off >= 0)
+            ? cpu->ram[hi_off]
+            : cpu_read8(cpu, bank, hi_addr);
+        return (uint16)cpu->ram[off] | ((uint16)hi << 8);
+    }
     if (is_hw_reg(bank, addr)) { cpu_pace_cycles_word(addr); cpu_hw_log(addr, 1, 0); return ReadRegWord(addr); }
     if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX)
         return (uint16)cart_read(g_snes->cart, bank, addr) |
@@ -378,6 +418,18 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     if (g_wlog_active) wlog_note(bank, addr, v, 2);
     wlog_addr_note(bank, addr, v, 2);
     int off = cpu_ram_offset(bank, addr);
+    if (off >= 0) {
+        uint16 hi_addr = (uint16)(addr + 1);
+        int hi_off = cpu_ram_offset(bank, hi_addr);
+        if (hi_off != off + 1) {
+            /* Same boundary class as cpu_read16 above. Route each byte
+             * through the authoritative byte bus so WRAM wrap and WRAM->I/O
+             * crossings preserve their distinct mappings and side effects. */
+            cpu_write8(cpu, bank, addr, (uint8)(v & 0xFF));
+            cpu_write8(cpu, bank, hi_addr, (uint8)(v >> 8));
+            return;
+        }
+    }
     if (off >= 0 && off + 1 < 0x20000) {
         uint16 old = (uint16)cpu->ram[off]
                    | ((uint16)cpu->ram[off + 1] << 8);

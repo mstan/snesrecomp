@@ -114,6 +114,13 @@ class BankCfg:
     # entry as a decode successor (for auto-promote / reachability), and
     # stamps `insn.dispatch_entries` so codegen emits a real switch.
     indirect_dispatch: List[dict] = field(default_factory=list)
+    # `terminal_jsr <site_pc16>` — the direct JSR at this call site pushes a
+    # real return address which the callee consumes as inline-table data, then
+    # tail-transfers instead of returning to the byte after JSR.  This is a
+    # call-site ABI fact recovered from assembly source, not an inferred
+    # no-return heuristic.  The decoder severs lexical fall-through and the
+    # emitter hands the caller's outer return context to the callee.
+    terminal_jsr: set = field(default_factory=set)
     # `hle_spc_upload <pc>` directives — replace the recompiled body of
     # the function starting at <pc> with a single call to the runtime
     # HLE helper RtlUploadSpcImageFromDp. The standard SNES SPC upload
@@ -349,6 +356,25 @@ def load_bank_cfg(path: str) -> BankCfg:
                 cfg.force_variant_at[site_pc24] = (m_val, x_val)
                 continue
 
+            # terminal_jsr <site_pc16> — source-authoritative call-site ABI
+            # for inline-return-address dispatch helpers.  The opcode itself
+            # is validated by the decoder when this site is reached.
+            if head == 'terminal_jsr':
+                if len(tokens) != 2:
+                    raise ValueError(
+                        f"{path}: terminal_jsr needs exactly one <site_pc16>, "
+                        f"got: {stripped!r}")
+                try:
+                    site_pc16 = _parse_hex(tokens[1]) & 0xFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: terminal_jsr bad site {tokens[1]!r}: {e}")
+                if site_pc16 in cfg.terminal_jsr:
+                    raise ValueError(
+                        f"{path}: terminal_jsr duplicate site ${site_pc16:04X}")
+                cfg.terminal_jsr.add(site_pc16)
+                continue
+
             # hle_dispatch <site_pc16> <c_function_name> — replace the
             # unresolved-dispatch trap at the indirect JMP/JML/JSR site
             # at <site_pc16> with a tail-call to the named C helper.
@@ -412,10 +438,19 @@ def load_bank_cfg(path: str) -> BankCfg:
                 # pointers. Keep full-width values intact: long pointer
                 # dispatches such as SM's HDMA pre-instruction call need
                 # to distinguish $88:EBB0 from local $08:EBB0.
-                if 'ptrcall' in tokens[3:]:
+                pointer_modes = set(tokens[3:]) & {
+                    'ptrcall', 'ptrtail', 'ptrtail_popcall', 'rtsstack'
+                }
+                if pointer_modes:
+                    if len(pointer_modes) != 1:
+                        raise ValueError(
+                            f"{path}: indirect_dispatch chooses exactly one "
+                            f"of ptrcall/ptrtail/ptrtail_popcall/rtsstack: "
+                            f"{stripped!r}")
+                    pointer_mode = next(iter(pointer_modes))
                     targets: Tuple[int, ...] = ()
                     for t in tokens[3:]:
-                        if t == 'ptrcall':
+                        if t == pointer_mode:
                             continue
                         if t.startswith('targets:'):
                             raw = t[len('targets:'):].split(',')
@@ -426,20 +461,27 @@ def load_bank_cfg(path: str) -> BankCfg:
                                     f"{path}: indirect_dispatch targets: bad hex {t!r}: {e}")
                         else:
                             raise ValueError(
-                                f"{path}: indirect_dispatch ptrcall unknown option {t!r}")
+                                f"{path}: indirect_dispatch {pointer_mode} "
+                                f"unknown option {t!r}")
                     if not targets:
                         raise ValueError(
                             f"{path}: indirect_dispatch ptrcall needs targets:<...> — got: {stripped!r}")
                     if len(targets) != count:
                         raise ValueError(
-                            f"{path}: indirect_dispatch ptrcall count {count} != "
+                            f"{path}: indirect_dispatch {pointer_mode} count {count} != "
                             f"{len(targets)} targets")
                     cfg.indirect_dispatch.append({
                         'site_pc16': site_pc16,
                         'count': count,
                         'idx_reg': 'X',          # unused (value-matched), kept for emit path
                         'table_bases': (),
-                        'ptr_call': True,
+                        'ptr_call': pointer_mode == 'ptrcall',
+                        'pointer_match': pointer_mode != 'rtsstack',
+                        # The dispatcher has already PLA'd the two-byte JSR
+                        # frame it entered with and hands control to a state
+                        # body which owns the enclosing three-byte JSL return.
+                        'popped_call_frame': pointer_mode == 'ptrtail_popcall',
+                        'rts_stack': pointer_mode == 'rtsstack',
                         'targets': targets,
                     })
                     continue

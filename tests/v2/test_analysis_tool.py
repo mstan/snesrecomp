@@ -10,9 +10,58 @@ REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 if str(REPO / "tools") not in sys.path:
     sys.path.insert(0, str(REPO / "tools"))
 
-from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
-from v2.program_analysis import NodeDisposition  # noqa: E402
+from v2_analyze import (  # noqa: E402
+    _load_cfgs,
+    _solve_exit_equation_sccs,
+    build_manifest,
+)
+from v2.program_analysis import NodeDisposition, VariantKey  # noqa: E402
 from v2.program_emit import build_emission_entries  # noqa: E402
+
+
+def test_exit_equation_solver_bootstraps_closed_recursive_component():
+    first = VariantKey(0xB98000, 0, 0)
+    second = VariantKey(0xB98100, 0, 0)
+    blocked = VariantKey(0xB98200, 0, 0)
+    equations = {
+        first: ({(0, 0)}, {(second.pc24, 0, 0)}),
+        second: (set(), {(first.pc24, 0, 0)}),
+        blocked: (set(), {(0xB9F000, 0, 0)}),
+    }
+    solved = _solve_exit_equation_sccs(equations, {}, {})
+    assert solved[first] == frozenset({(0, 0)})
+    assert solved[second] == frozenset({(0, 0)})
+    assert blocked not in solved
+
+
+def test_exit_equation_solver_rejects_false_preservation_probe():
+    caller = VariantKey(0xB98000, 0, 0)
+    callee = VariantKey(0xB98100, 0, 0)
+    callee_dep = (callee.pc24, 0, 0)
+    equations = {
+        caller: ({(0, 0)}, {callee_dep}, {(callee_dep, 0, 0)}),
+        callee: ({(1, 0)}, {(caller.pc24, 0, 0)}, frozenset()),
+    }
+    assert _solve_exit_equation_sccs(equations, {}, {}) == {}
+
+
+def test_exit_equation_solver_preserves_closed_noreturn_fact():
+    loop = VariantKey(0xB98000, 0, 0)
+    solved = _solve_exit_equation_sccs(
+        {loop: (set(), set())}, {}, {})
+    assert solved[loop] == frozenset()
+
+
+def test_probe_requirement_does_not_become_caller_exit():
+    caller = VariantKey(0xB98000, 0, 0)
+    helper = VariantKey(0xB98100, 0, 0)
+    helper_dep = (helper.pc24, 0, 0)
+    solved = _solve_exit_equation_sccs({
+        caller: (set(), set(), {(helper_dep, 0, 0)}),
+        helper: ({(0, 0)}, set(), frozenset()),
+    }, {}, {})
+    assert solved[caller] == frozenset()
+    assert solved[helper] == frozenset({(0, 0)})
 
 
 def test_manifest_from_cfg_roots_is_stable_and_follows_calls():
@@ -98,6 +147,30 @@ def test_reachable_exit_mx_fixed_point_redecodes_caller_continuation():
     assert root.max_pc24 == 0x008006
     assert all("brk_at" not in reason for reason in root.reasons)
     assert root.disposition == NodeDisposition.AOT_ELIGIBLE
+
+
+def test_proven_noreturn_callee_does_not_poison_caller_continuation():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x20, 0x00, 0x90, 0x00]),  # JSR $9000; dead BRK
+        0x9000: bytes([0xCB]),                    # WAI: no return path
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func Root 8000 end:8004 entry_mx:1,1\n"
+            "func WaitForever 9000 end:9001 entry_mx:1,1\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=128, max_nodes=128,
+            all_cfg_roots=True)
+
+    root_key = VariantKey(0x008000, 1, 1)
+    wait_key = VariantKey(0x009000, 1, 1)
+    assert manifest.exit_mode_sets[wait_key] == frozenset()
+    assert manifest.exit_mode_sets[root_key] == frozenset()
+    assert manifest.nodes[root_key].disposition == NodeDisposition.AOT_ELIGIBLE
+    assert manifest.nodes[root_key].max_pc24 == 0x008000
 
 
 def test_recursive_unknown_exit_component_converges_to_lle():

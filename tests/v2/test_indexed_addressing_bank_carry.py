@@ -1,4 +1,5 @@
-"""Pin the bank-carry semantics of ABS_X / ABS_Y / LONG_X / LONG_Y
+"""Pin the bank-carry semantics of ABS_X / ABS_Y / LONG_X / LONG_Y and
+direct-page-indirect-long,Y
 indexed addressing modes (2026-05-17 class fix).
 
 When `STA $7E2000,X` runs with X = 0xFF10, hardware computes a 24-bit
@@ -110,3 +111,27 @@ def test_long_x_read_emits_24bit_effective_with_bank_carry():
 
     assert 'cpu_read16(cpu, 0x7e, (uint16)(0x2000 + cpu->X)' not in src, src
     assert 'cpu_read16(cpu, (uint8)' in src, src
+
+
+def test_dp_indirect_long_y_read_carries_pointer_bank():
+    """`LDA [$34],Y` adds Y to the complete 24-bit pointer.
+
+    DKC2 reaches the exact boundary `$DF:D537 + $2AC9 = $E0:0000` in its
+    decompressor.  The old emit kept bank `$DF` and truncated the word sum to
+    `$0000`, returning a wrong compressed byte and garbling level graphics.
+    """
+    # $8000: REP #$10        ; 16-bit index registers
+    # $8002: B7 34           ; LDA [$34],Y (m=1)
+    # $8004: RTS
+    rom = make_lorom_bank0({
+        0x8000: bytes([0xC2, 0x10,
+                       0xB7, 0x34,
+                       0x60]),
+    })
+    src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
+
+    # Both bank and offset must derive from one 24-bit pointer-plus-Y
+    # expression; a bare pointer-bank argument is the pre-fix form.
+    assert 'cpu_read8(cpu, cpu_read8(cpu, 0x00' not in src, src
+    assert 'cpu_read8(cpu, (uint8)' in src, src
+    assert 'cpu->Y' in src and '<< 16' in src and '| (uint32)cpu_read16' in src, src

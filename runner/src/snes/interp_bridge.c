@@ -290,6 +290,9 @@ static int      s_interp_bounce_owner_depth = 0;
  * and must first finish/skip that ancestor in the ordinary nested tier path.
  * Saved/restored around each bounce because bridge runs nest. */
 static int      s_interp_bounce_recomp_base = -1;
+/* Env-gated write-log observability: current interpreter opcode PC, published
+ * immediately before execution when SNESRECOMP_WLOG_STATE is armed. */
+uint32_t g_interp_wlog_pc24 = 0;
 static uint32_t s_lle_bounce_exclusions[16];
 static size_t   s_lle_bounce_exclusion_count;
 
@@ -533,6 +536,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     in.write = bridge_bus_write;
     in.read_word = bridge_bus_read_word;
     in.write_word = bridge_bus_write_word;
+    const int wlog_state_sync = getenv("SNESRECOMP_WLOG_STATE") != NULL;
 
     sync_cpu_to_interp(cpu, &in);
     in.k  = (uint8)((entry_pc24 >> 16) & 0xFF);
@@ -917,6 +921,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         s_interp_bus_master=0;
         s_interp_bus_cycles=0;
         s_interp_bus_timing_active=1;
+        /* Optional first-divergence observability: bus callbacks receive only
+         * CpuState, while the live interpreter registers normally stay in the
+         * local Interp816 struct until a bridge boundary.  Publish the pre-op
+         * state so an address write-log can compare the exact store-site
+         * registers against AOT.  Completely inert unless explicitly armed. */
+        if (wlog_state_sync) {
+            g_interp_wlog_pc24 = pc_before & 0xFFFFFFu;
+            sync_interp_to_cpu(&in, cpu);
+        }
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         s_interp_bus_timing_active=0;
         if (dtrace && in.dp != dp_before) {
@@ -1460,6 +1473,17 @@ RecompReturn interp_tier_dispatch_tail(CpuState *cpu, uint32_t target_pc24,
                                        uint8_t hrv) {
     if (cpu_interrupt_context_active())
         return interp_tier_dispatch_interrupt(cpu, target_pc24);
+    /* This tail transfer abandons every compiled guest frame beneath the AOT
+     * root that the active interpreter bounced into.  Starting a new nested
+     * interpreter here leaves those host frames live; if the guest continuation
+     * loops back through another compiled call (DKC2's sprite dispatcher is one
+     * example), each iteration recursively nests another AOT/LLE pair until the
+     * host stack overflows.  Use the existing arbitrary-depth control-transfer
+     * sentinel to unwind to the owning interpreter and resume there at the tail
+     * target.  The guest S/register state is untouched, and ordinary top-level
+     * AOT tail fallbacks retain the balanced nested-interpreter path below. */
+    if (s_interp_bounce_owner_depth > 0)
+        return interp_bridge_lle_yield_unwind(cpu, target_pc24);
     return interp_tier_dispatch_balanced(cpu, target_pc24, site_pc24,
                                          entry_s, hrv);
 }
@@ -1482,8 +1506,18 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     /* Write-log scope: capture the interp's write sequence for a targeted node
      * so it can be first-divergence-diffed against the AOT body. Gated to the
      * function under investigation; a leaf runs exactly its own writes here. */
-    const int wlog_this = ((target_pc24 & 0xFFFFFF) == 0xBB8CB5u);
-    if (wlog_this) wlog_scope_enter("interp:vram_payload_handler");
+    static int wlog_target_init = 0;
+    static uint32_t wlog_target_pc24 = 0xBB8CB5u;
+    if (!wlog_target_init) {
+        const char *wlog_target_env = getenv("SNESRECOMP_WLOG_INTERP_TARGET");
+        if (wlog_target_env && *wlog_target_env)
+            wlog_target_pc24 = (uint32_t)strtoul(
+                wlog_target_env, NULL, 16) & 0xFFFFFFu;
+        wlog_target_init = 1;
+    }
+    const int wlog_this = (
+        (target_pc24 & 0xFFFFFFu) == wlog_target_pc24);
+    if (wlog_this) wlog_scope_enter("interp:scoped_target");
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
