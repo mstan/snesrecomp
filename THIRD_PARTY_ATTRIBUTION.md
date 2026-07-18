@@ -2,6 +2,19 @@
 
 snesrecomp incorporates the following third-party software.
 
+## Native analyzer performance inspiration
+
+Derrick Gold's independent Go port of the snesrecomp recompiler demonstrated
+that moving the Python pipeline to a compiled implementation could deliver an
+approximately 25x speedup. That result prompted the production native-analyzer
+work in this repository.
+
+- Project: https://github.com/DerrickGold/ar-recomp
+- Go migration commit: https://github.com/DerrickGold/ar-recomp/commit/ae3d2d1ffaa87281241bb1a2822d5b3dde35ca96
+
+No source from the Go implementation is incorporated into `recompiler-rs/`.
+The Rust code's implementation foundation and provenance are documented below.
+
 ## Native analyzer foundation
 
 The Rust instruction decoder, cfg parser, and ROM mapping foundation under
