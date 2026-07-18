@@ -10,7 +10,13 @@ REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 if str(REPO / "tools") not in sys.path:
     sys.path.insert(0, str(REPO / "tools"))
 
-from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
+from v2_analyze import (  # noqa: E402
+    _load_cfgs,
+    build_manifest,
+    build_manifest_native,
+    native_analyzer_path,
+    native_unsupported_features,
+)
 from v2.program_analysis import NodeDisposition  # noqa: E402
 from v2.program_emit import build_emission_entries  # noqa: E402
 
@@ -37,6 +43,56 @@ def test_manifest_from_cfg_roots_is_stable_and_follows_calls():
     assert len(first.nodes) == 2
     assert not first_helpers and not second_helpers
     assert not first_inline and not second_inline
+
+
+def test_native_manifest_matches_python_ptrcall_emission_contract():
+    """CI exercises the native boundary; source-only users may skip it."""
+    if not native_analyzer_path().is_file():
+        return
+    rom = make_lorom_bank0({
+        0x8000: bytes([0xF4, 0x08, 0x80, 0x6C, 0x10, 0x00]),
+        0x8009: bytes([0x60]),
+        0x8010: bytes([0x60]),
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        cfg_dir = root / "cfg"
+        cfg_dir.mkdir()
+        rom_path = root / "fixture.sfc"
+        rom_path.write_bytes(rom)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "indirect_dispatch 8003 1 ptrcall targets:8010\n"
+            "func Root 8000 end:800a entry_mx:1,1\n"
+            "func Handler 8010 end:8011 entry_mx:1,1\n",
+            encoding="utf-8")
+        expected, _helpers, _inline = build_manifest(
+            rom, _load_cfgs(cfg_dir), max_insns=4096, max_nodes=100_000,
+            all_cfg_roots=True)
+        actual, _helpers, _inline, _output = build_manifest_native(
+            rom_path=rom_path, cfg_dir=cfg_dir, all_cfg_roots=True)
+
+    assert actual.roots == expected.roots
+    assert set(actual.nodes) == set(expected.nodes)
+    assert actual.exit_modes == expected.exit_modes
+    assert actual.exit_mode_sets == expected.exit_mode_sets
+    assert {
+        key: node.disposition for key, node in actual.nodes.items()
+    } == {
+        key: node.disposition for key, node in expected.nodes.items()
+    }
+
+
+def test_ptrcall_is_guarded_until_full_project_contract_matches():
+    with tempfile.TemporaryDirectory() as directory:
+        cfg_dir = pathlib.Path(directory)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "indirect_dispatch 8003 1 ptrcall targets:8010\n"
+            "func Root 8000\n",
+            encoding="utf-8")
+        unsupported = native_unsupported_features(_load_cfgs(cfg_dir))
+    assert unsupported == ("indirect_dispatch ptrcall",)
 
 
 def test_default_roots_are_vectors_not_every_function_boundary():

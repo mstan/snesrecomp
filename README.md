@@ -75,8 +75,10 @@ To keep new games consistent and free of leftover game-specific naming:
 
 ## What's in this repo
 
-- `recompiler/` — Python code that decodes 65816 ROM bytes,
-  reconstructs control flow, and emits C.
+- `recompiler/` — the Python reference analyzer and authoritative C emitter.
+- `recompiler-rs/` — the production native whole-program analyzer used
+  automatically when built; it preserves the Python manifest/emitter boundary
+  while accelerating the dominant analysis phase.
 - `runner/` — C runtime that the generated code links against (CPU
   state, memory mapping, PPU/APU/DSP, debug server, always-on trace rings).
   Its PPU can also export arbitrary BG/OBJ rectangles for independent host
