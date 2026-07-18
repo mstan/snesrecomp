@@ -192,6 +192,56 @@ def test_computed_pei_rts_is_not_a_callable_exit_mode():
     assert (0xFFFFFFFF, 0, 0) in dependencies
 
 
+def test_tsc_scratch_save_and_tcs_restore_proves_balanced_exit():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x3B,              # TSC
+            0x85, 0x10,        # STA $10 (save entry S)
+            0xA9, 0x34, 0x12,  # LDA #$1234
+            0x1B,              # TCS (temporary dynamic S)
+            0xA5, 0x10,        # LDA $10
+            0x1B,              # TCS (restore entry S)
+            0x60,              # RTS
+        ]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0)
+    assert analyze_function_exit_mx(graph) == (0, 0)
+
+
+def test_tsc_scratch_clobber_keeps_tcs_exit_unproven():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0x3B,              # TSC
+            0x85, 0x10,        # STA $10
+            0x64, 0x10,        # STZ $10 (clobber saved S)
+            0xA5, 0x10,        # LDA $10
+            0x1B,              # TCS
+            0x60,              # RTS
+        ]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0)
+    assert analyze_function_exit_mx(graph) == (None, None)
+
+
+def test_partial_frame_return_is_nlr_not_callable_exit():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xD0, 0x01,  # BNE $8003
+            0x60,        # balanced RTS: the real callable exit
+            0x8B,        # PHB: one local byte remains
+            0x60,        # RTS pops local byte + one caller-frame byte
+        ]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0)
+    assert analyze_function_exit_mx(graph) == (0, 0)
+    local_modes, dependencies = function_exit_mx_equation(graph)
+    assert local_modes == {(0, 0)}
+    assert (0xFFFFFFFF, 0, 0) not in dependencies
+
+
 def test_authorized_pei_rts_dispatch_proves_real_terminal_exit_mode():
     rom = make_lorom_bank0({
         0x8000: bytes([

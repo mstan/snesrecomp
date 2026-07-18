@@ -2336,10 +2336,28 @@ def _emit_return(op: Return) -> List[str]:
         # A skipped ancestor may be part of the active interpreter rather than
         # g_recomp_stack. Return the real popped continuation to that owning
         # bridge instead of creating a new dispatch root and then resuming code
-        # the guest RTS already returned past.
-        f"    if (_hrv == {frame_sz} && "
-        "interp_bridge_has_direct_paired_bounce()) {",
+        # the guest RTS already returned past. Test the architectural stack
+        # direction, not whether the bounce frame size matches this final
+        # return opcode: a JSR-bounced dispatcher may consume its two-byte
+        # frame and tail into code that ultimately RTLs through an enclosing
+        # interpreter-owned JSL frame (DKC2 sprite-state handlers). In that
+        # case _hrv is 2 while this opcode's frame size is 3, but _ret_s is
+        # still shallower than _entry_s and ownership belongs to the bridge.
+        "    if ((uint16)(_ret_s - _entry_s) < 0x8000u &&",
+        "        interp_bridge_has_direct_paired_bounce()) {",
         f"      return interp_tier_dispatch_rewritten_return(cpu, _rpc24, 0x{src24:06x}u); }}",
+        "  }",
+        # A positive local delta smaller than this RTS/RTL frame consumes
+        # local bytes plus part of the caller's return frame. The pop has
+        # already crossed above entry S, so this is a rewritten/non-local
+        # return, not an internal computed jump. Keep the continuation in the
+        # interpreter and propagate SKIP_N; resuming the compiled caller would
+        # execute guest code that the hardware return already crossed.
+        "  if (_ret_s != _entry_s &&",
+        "      (uint16)(_entry_s - _ret_s) < 0x8000u &&",
+        "      cpu->S != _entry_s &&",
+        "      (uint16)(cpu->S - _entry_s) < 0x8000u) {",
+        f"    return interp_tier_dispatch_rewritten_return(cpu, _rpc24, 0x{src24:06x}u);",
         "  }",
         # The stack grows downward. If pre-RTS S is deeper than the routine's
         # entry S, the RTS consumed a synthetic frame pushed inside this

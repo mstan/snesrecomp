@@ -21,7 +21,23 @@ handler.
 """
 from _helpers import make_lorom_bank0  # noqa: E402
 
-from v2.decoder import decode_function, _dispatch_target_is_padding  # noqa: E402
+from types import SimpleNamespace
+
+from v2.decoder import (  # noqa: E402
+    decode_function,
+    _dispatch_target_is_padding,
+    _resolve_indirect_dispatch_targets,
+)
+
+
+def test_explicit_dispatch_target_list_preserves_null_slot():
+    insn = SimpleNamespace(operand=0x8100, mnem='JSR', length=3, opcode=0xFC)
+    entries = _resolve_indirect_dispatch_targets(
+        b'', 0xB6, insn,
+        {'count': 3, 'idx_reg': 'X', 'table_bases': (),
+         'targets': (0xB69000, 0, 0xB69100)},
+    )
+    assert entries == [0xB69000, 0, 0xB69100]
 
 
 def test_padding_gate_recognises_all_ff_target():

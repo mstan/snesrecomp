@@ -6411,15 +6411,23 @@ static void cmd_get_spc_writes(const char *args) {
     send_line(buf);
 }
 
-/* Post-mortem JSON dump — calls into recomp_post_mortem_dump (in
- * src/post_mortem.c). Declared weakly so projects sharing this
- * debug_server.c don't fail to link; if no implementation is present,
- * the command just emits a sentinel reply. */
-extern void recomp_post_mortem_dump(const char *reason, void *fault_info);
+/* Post-mortem JSON dump — available only when the host project supplies
+ * src/post_mortem.h + its implementation.  Keep the shared debug server
+ * linkable for small/headless hosts that intentionally omit that subsystem. */
+#if defined(__has_include)
+#  if __has_include("post_mortem.h")
+#    include "post_mortem.h"
+#    define SNESRECOMP_HAS_POST_MORTEM 1
+#  endif
+#endif
 static void cmd_post_mortem_dump(const char *args) {
     (void)args;
+#if defined(SNESRECOMP_HAS_POST_MORTEM)
     recomp_post_mortem_dump("on_demand", NULL);
     send_line("{\"ok\":true,\"path\":\"build/last_run_report.json\"}");
+#else
+    send_line("{\"ok\":false,\"error\":\"post-mortem support is not linked by this host\"}");
+#endif
 }
 
 // ---- task #7 focused OAM-overflow trace commands ----
