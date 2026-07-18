@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -35,11 +37,72 @@ from v2.decoder import (  # noqa: E402
 from v2.program_analysis import (  # noqa: E402
     NodeDisposition,
     ProgramAnalyzer,
+    ProgramManifest,
     VariantKey,
 )
 
 
 _BANK_CFG_RE = re.compile(r"bank([0-9a-fA-F]+)\.cfg$")
+
+
+def native_analyzer_path() -> pathlib.Path:
+    """Return the configured/default release native-analyzer executable."""
+    configured = os.environ.get("SNESRECOMP_NATIVE_ANALYZER")
+    if configured:
+        return pathlib.Path(configured).expanduser().resolve()
+    executable = ("snesrecomp-analyze.exe" if os.name == "nt"
+                  else "snesrecomp-analyze")
+    return REPO / "recompiler-rs" / "target" / "release" / executable
+
+
+def build_manifest_native(*, rom_path, cfg_dir, all_cfg_roots=False,
+                          additional_roots=(), executable=None):
+    """Run the compiled analyzer and load its stable manifest contract."""
+    executable = pathlib.Path(
+        executable or native_analyzer_path()).resolve()
+    if not executable.is_file():
+        raise FileNotFoundError(
+            f"native analyzer not built at {executable}; run "
+            "`python tools/build_native_analyzer.py` from the snesrecomp "
+            "checkout")
+    fd, temporary = tempfile.mkstemp(
+        prefix="snesrecomp-native-analysis-", suffix=".json")
+    os.close(fd)
+    command = [
+        str(executable),
+        "--rom", str(pathlib.Path(rom_path).resolve()),
+        "--cfg-dir", str(pathlib.Path(cfg_dir).resolve()),
+        "--manifest", temporary,
+    ]
+    if all_cfg_roots:
+        command.append("--all-cfg-roots")
+    for key in sorted(set(additional_roots)):
+        command.extend(("--root", f"{key.pc24:06X}:{key.m}:{key.x}"))
+    try:
+        completed = subprocess.run(
+            command, text=True, capture_output=True, check=False)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                f"native analyzer exited {completed.returncode}: {detail}")
+        value = json.loads(pathlib.Path(temporary).read_text(
+            encoding="utf-8"))
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+    manifest = ProgramManifest.from_dict(value)
+    metadata = value.get("native_analysis", {})
+    helpers = {
+        int(pc24, 16): str(kind)
+        for pc24, kind in metadata.get("dispatch_helpers", {}).items()
+    }
+    inline_args = {
+        int(pc24, 16): int(count)
+        for pc24, count in metadata.get("inline_args", {}).items()
+    }
+    return manifest, helpers, inline_args, completed.stdout.strip()
 
 
 def _lorom_mirror_bank(bank: int):
@@ -513,13 +576,29 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             for key, mode_set in sorted(round_exit_mode_sets.items()):
                 fact_key = (key.pc24, key.m, key.x)
                 if (fact_key in unstable_exit_mode_sets
-                        or fact_key in next_exit_modes):
+                        or fact_key in declared_exit_modes):
                     continue
+                # A later callee fact can reveal a return path that was
+                # truncated when an inferred singleton was first published.
+                # The complete multi-mode proof supersedes that stale exact
+                # fact; declared ABI facts remain authoritative above.
+                next_exit_modes.pop(fact_key, None)
                 previous = next_exit_mode_sets.get(fact_key)
                 if previous is None:
                     next_exit_mode_sets[fact_key] = mode_set
                 elif previous != mode_set:
                     unstable_exit_mode_sets.add(fact_key)
+                    next_exit_mode_sets.pop(fact_key, None)
+
+            # If a later round exposes an unresolved call in a variant, an
+            # inferred exit fact retained from an earlier shorter graph is no
+            # longer proven. Retract it and let callers stop at the boundary.
+            # Declared cfg/HLE ABI facts are independent of ROM decode and stay.
+            for node_key, node in manifest.nodes.items():
+                fact_key = (node_key.pc24, node_key.m, node_key.x)
+                if (fact_key not in declared_exit_modes
+                        and "unproven_callee_exit" in node.reasons):
+                    next_exit_modes.pop(fact_key, None)
                     next_exit_mode_sets.pop(fact_key, None)
             facts_stable = (
                 next_exit_modes == active_exit_modes
