@@ -63,16 +63,6 @@ def native_analyzer_path() -> pathlib.Path:
     return REPO / "recompiler-rs" / "target" / "release" / executable
 
 
-def native_unsupported_features(parsed) -> tuple[str, ...]:
-    """Return cfg features not yet contract-equivalent in full projects."""
-    unsupported = set()
-    for _bank, _path, cfg in parsed:
-        if any(directive.get("ptr_call")
-               for directive in cfg.indirect_dispatch):
-            unsupported.add("indirect_dispatch ptrcall")
-    return tuple(sorted(unsupported))
-
-
 def build_manifest_native(*, rom_path, cfg_dir, all_cfg_roots=False,
                           additional_roots=(), executable=None):
     """Run the compiled analyzer and load its stable manifest contract."""
@@ -852,13 +842,29 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             for key, mode_set in sorted(round_exit_mode_sets.items()):
                 fact_key = (key.pc24, key.m, key.x)
                 if (fact_key in unstable_exit_mode_sets
-                        or fact_key in next_exit_modes):
+                        or fact_key in declared_exit_modes):
                     continue
+                # A later callee fact can reveal a return path that was
+                # truncated when an inferred singleton was first published.
+                # The complete multi-mode proof supersedes that stale exact
+                # fact; declared ABI facts remain authoritative above.
+                next_exit_modes.pop(fact_key, None)
                 previous = next_exit_mode_sets.get(fact_key)
                 if previous is None:
                     next_exit_mode_sets[fact_key] = mode_set
                 elif previous != mode_set:
                     unstable_exit_mode_sets.add(fact_key)
+                    next_exit_mode_sets.pop(fact_key, None)
+
+            # If a later round exposes an unresolved call in a variant, an
+            # inferred exit fact retained from an earlier shorter graph is no
+            # longer proven. Retract it and let callers stop at the boundary.
+            # Declared cfg/HLE ABI facts are independent of ROM decode and stay.
+            for node_key, node in manifest.nodes.items():
+                fact_key = (node_key.pc24, node_key.m, node_key.x)
+                if (fact_key not in declared_exit_modes
+                        and "unproven_callee_exit" in node.reasons):
+                    next_exit_modes.pop(fact_key, None)
                     next_exit_mode_sets.pop(fact_key, None)
             facts_stable = (
                 next_exit_modes == active_exit_modes

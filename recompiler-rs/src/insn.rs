@@ -138,6 +138,12 @@ pub struct Insn {
     pub dispatch_idx_reg: Option<char>,
     pub dispatch_table_bases: Vec<u32>,
     pub dispatch_terminal: bool,
+    /// JSR (abs,X) through a pointer held in WRAM. The target is resolved by
+    /// the runtime dispatcher, but the call's fall-through remains reachable.
+    pub dispatch_runtime: bool,
+    /// Computed jump whose recovered targets are labels inside this function,
+    /// not separate whole-program demands.
+    pub dispatch_local_goto: bool,
     pub const_z_fold_unconditional: bool,
     pub const_z_fold_dead_pc24: Option<u32>,
     pub inline_dispatch_loop: bool,
@@ -166,6 +172,8 @@ impl Insn {
             dispatch_idx_reg: None,
             dispatch_table_bases: Vec::new(),
             dispatch_terminal: false,
+            dispatch_runtime: false,
+            dispatch_local_goto: false,
             const_z_fold_unconditional: false,
             const_z_fold_dead_pc24: None,
             inline_dispatch_loop: false,

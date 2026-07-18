@@ -70,13 +70,15 @@ cache hit took 0.641 seconds.
 
 The native parser/decoder implements the `indirect_dispatch ... ptrcall
 targets:...` form used by Super Metroid-style pointer calls, including explicit
-16/24-bit targets and PEA-derived return continuations. Full Super Metroid
-analysis now completes in about 3.4 seconds, but its manifest is not yet
-contract-equivalent (8,263 native variants versus 8,370 from Python). Therefore
-`auto` deliberately falls back to Python when a cfg contains `ptrcall`.
-Developers doing parity work can combine `--analysis-backend native` with the
-hidden `--allow-experimental-native-features` switch; generated output from
-that combination is not a production-supported path yet.
+16/24-bit targets and PEA-derived return continuations. It also matches the
+Python analyzer's inline-argument callee detection, runtime-pointer JSR
+continuations, local computed-jump runway recovery, and exit-mode fixed point.
+
+On the 2026-07-18 Super Metroid static-coverage workload, Python completed in
+48.2 seconds and native completed in 2.6 seconds (about 18.4x faster). Both
+produced 8,370 variants, 4,893 exact exit facts, 156 exit-mode sets, and the
+same 5,204/3,166 AOT/LLE split. The emission contract comparison passes; 13
+strict-summary differences remain in backend-local diagnostic graph details.
 
 ## Why Python remains
 
