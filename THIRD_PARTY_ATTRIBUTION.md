@@ -2,6 +2,18 @@
 
 snesrecomp incorporates the following third-party software.
 
+## Native analyzer foundation
+
+The Rust instruction decoder, cfg parser, and ROM mapping foundation under
+`recompiler-rs/` originated in Colin Curtin's `perplexes/snesrecomp`
+`feat/superfx-gsu/recompiler-rs` work and has since been reduced to the native
+analysis boundary, updated for the current Python semantics, and extended with
+the whole-program fixed point and production integration.
+
+- Upstream: https://github.com/perplexes/snesrecomp
+- Original branch: `feat/superfx-gsu/recompiler-rs`
+- License declared by the upstream crate: MIT
+
 ## LakeSnes — 65816 CPU core
 
 `runner/src/snes/interp816.{c,h}`, the 65816 interpreter backing the
