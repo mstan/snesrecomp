@@ -341,8 +341,6 @@ static void ensure_interp_file_targets_loaded(void) {
     } else {
         free(arr);
     }
-    fprintf(stderr, "[lle] forcing %zu file target(s) to interp\n",
-            s_interp_file_count);
 }
 
 /* AOT body-entry guard: generated variant bodies (when emitted with the
@@ -1335,14 +1333,12 @@ extern int snes_frame_counter;
 static long s_tier_hits = 0;
 long interp_tier_hit_count(void) { return s_tier_hits; }
 
-/* Bounded observability: a coverage-gap tier-down is an event worth seeing.
- * First N go to stderr (matching the existing dispatch_oob single-line style);
- * the counter is always live for the manifest (Phase 2) and tests. */
+/* Count each coverage-gap tier-down. The value is exposed through structured
+ * coverage manifests and tests; runtime execution does not print per-hit
+ * diagnostics. */
 static void interp_tier_note(uint32_t target_pc24) {
-    long n = ++s_tier_hits;
-    if (n <= 32)
-        fprintf(stderr, "[interp_tier] #%ld -> $%06X\n", n,
-                (unsigned)(target_pc24 & 0xFFFFFF));
+    (void)target_pc24;
+    ++s_tier_hits;
 }
 
 /* ── Phase-2 gap manifest: always-on tier-down coverage worklist ───────────
@@ -1375,21 +1371,8 @@ static uint64_t     g_tier2_cov_overflow;
 static const char *tier2_mx_str(uint8_t mx);
 static const char *tier2_kind_str(uint8_t k);
 
-/* Interp fallbacks are LOUD by default (owner directive 2026-07-16): every
- * distinct gap tuple announces itself on stderr the first time it fires, and
- * the manifest writer prints an exit summary. The interpreter is a failsafe
- * for missing static coverage — silence made a shrinking-coverage regression
- * look like health. Bounded by TIER2_COVERAGE_MAX, so it cannot spam
- * unboundedly; SNESRECOMP_TIER2_QUIET=1 opts out (CI capture etc.). */
-static int tier2_loud(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *q = getenv("SNESRECOMP_TIER2_QUIET");
-        cached = !(q && q[0] && q[0] != '0');
-    }
-    return cached;
-}
-
+/* Gap tuples remain in this bounded structured table for manifest consumers;
+ * runtime execution does not print per-gap diagnostics. */
 static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
                          uint8_t kind, int clean) {
     /* Canonicalize LoROM exec-mirror banks ($80-$BF ≡ $00-$3F) so one guest
@@ -1431,14 +1414,6 @@ static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
             g_tier2_cov[i].clean_hits  = 0;
             g_tier2_cov[i].bail_hits   = 0;
             g_tier2_cov[i].first_frame = snes_frame_counter;
-            if (tier2_loud()) {
-                fprintf(stderr,
-                        "[tier2] INTERP GAP #%d %s site=$%06X "
-                        "target=$%06X %s %s frame=%d\n",
-                        g_tier2_cov_count, tier2_kind_str(kind),
-                        (unsigned)site, (unsigned)target, tier2_mx_str(mx),
-                        clean ? "clean" : "BAIL", snes_frame_counter);
-            }
         }
         s_cache[h] = (uint16_t)(i + 1);
     }
@@ -1759,60 +1734,7 @@ void Tier2CoverageDumpJson(FILE *f) {
     fprintf(f, "\n    ]\n  },\n");
 }
 
-/* Loud exit summary (owner directive 2026-07-16): the interp share of a run
- * must be visible without opening the manifest. Printed by the manifest
- * writer so it lands on every exit path that harvests coverage. */
-static void tier2_log_summary(void) {
-    if (!tier2_loud()) return;
-    if (g_tier2_cov_count == 0) {
-        fprintf(stderr, "[tier2] interp fallbacks: NONE — full static "
-                        "coverage on every executed path\n");
-        return;
-    }
-    uint64_t clean = 0, bail = 0;
-    for (int i = 0; i < g_tier2_cov_count; i++) {
-        clean += g_tier2_cov[i].clean_hits;
-        bail  += g_tier2_cov[i].bail_hits;
-    }
-    fprintf(stderr,
-            "[tier2] interp fallbacks: %d distinct gap site(s), "
-            "%llu clean / %llu bail hit(s), %llu dropped tuple(s)\n",
-            g_tier2_cov_count, (unsigned long long)clean,
-            (unsigned long long)bail,
-            (unsigned long long)g_tier2_cov_overflow);
-    /* Top offenders by total hits — the promotion worklist, right on the
-     * console. */
-    int top[8];
-    int tops = 0;
-    for (int i = 0; i < g_tier2_cov_count; i++) {
-        uint64_t hits = g_tier2_cov[i].clean_hits + g_tier2_cov[i].bail_hits;
-        int j = tops;
-        while (j > 0) {
-            const Tier2CovSite *p = &g_tier2_cov[top[j - 1]];
-            if (p->clean_hits + p->bail_hits >= hits) break;
-            j--;
-        }
-        if (j < 8) {
-            if (tops < 8) tops++;
-            for (int k = tops - 1; k > j; k--) top[k] = top[k - 1];
-            top[j] = i;
-        }
-    }
-    for (int j = 0; j < tops; j++) {
-        const Tier2CovSite *s = &g_tier2_cov[top[j]];
-        fprintf(stderr,
-                "[tier2]   %s site=$%06X target=$%06X %s "
-                "clean=%llu bail=%llu frames=%d..%d\n",
-                tier2_kind_str(s->kind), (unsigned)s->site_pc24,
-                (unsigned)s->target_pc24, tier2_mx_str(s->mx),
-                (unsigned long long)s->clean_hits,
-                (unsigned long long)s->bail_hits,
-                s->first_frame, s->last_frame);
-    }
-}
-
 void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
-    tier2_log_summary();
     FILE *f = fopen(path, "w");
     if (!f) return;
     /* Minimal title sanitize: drop quotes/backslashes/control so the JSON is
