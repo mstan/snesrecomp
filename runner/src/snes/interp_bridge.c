@@ -293,6 +293,18 @@ static int      s_interp_bounce_recomp_base = -1;
 static uint32_t s_lle_bounce_exclusions[16];
 static size_t   s_lle_bounce_exclusion_count;
 
+/* Debug lever (SNESRECOMP_LLE_INTERP_TARGET_FILE): a file of hex PC24s, one per
+ * line, each forced to the byte interpreter instead of its AOT body. Unbounded
+ * (unlike the 16-slot programmatic list) so a whole seeded root set can be
+ * disabled at once for structural-vs-execution bisection, editable between runs
+ * with no rebuild. Sorted for bsearch; masked to 24 bits. */
+static uint32_t *s_interp_file_targets;
+static size_t    s_interp_file_count;
+static int interp_file_target_cmp(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
 void interp_bridge_set_master_deadline(uint64_t master_clock) {
@@ -361,6 +373,37 @@ static int lle_bounce_target_excluded(uint32_t target_pc24) {
         const char *v = getenv("SNESRECOMP_LLE_INTERP_TARGET");
         if (v && *v)
             s_target = (uint32_t)strtoul(v, NULL, 16) & 0xFFFFFFu;
+        const char *fp = getenv("SNESRECOMP_LLE_INTERP_TARGET_FILE");
+        if (fp && *fp) {
+            FILE *f = fopen(fp, "r");
+            if (f) {
+                size_t cap = 256, n = 0;
+                uint32_t *arr = (uint32_t *)malloc(cap * sizeof *arr);
+                char line[64];
+                while (arr && fgets(line, sizeof line, f)) {
+                    char *end = NULL;
+                    unsigned long pc = strtoul(line, &end, 16);
+                    if (end == line) continue;
+                    if (n == cap) {
+                        cap *= 2;
+                        uint32_t *g = (uint32_t *)realloc(arr, cap * sizeof *arr);
+                        if (!g) break;
+                        arr = g;
+                    }
+                    arr[n++] = (uint32_t)(pc & 0xFFFFFFu);
+                }
+                fclose(f);
+                if (arr && n) {
+                    qsort(arr, n, sizeof *arr, interp_file_target_cmp);
+                    s_interp_file_targets = arr;
+                    s_interp_file_count = n;
+                } else {
+                    free(arr);
+                }
+                fprintf(stderr, "[lle] forcing %zu file target(s) to interp\n",
+                        s_interp_file_count);
+            }
+        }
         s_init = 1;
     }
     if (s_target != 0xFFFFFFFFu &&
@@ -369,6 +412,12 @@ static int lle_bounce_target_excluded(uint32_t target_pc24) {
     for (size_t i = 0; i < s_lle_bounce_exclusion_count; i++) {
         if ((target_pc24 & 0x7FFFFFu) ==
             (s_lle_bounce_exclusions[i] & 0x7FFFFFu))
+            return 1;
+    }
+    if (s_interp_file_count) {
+        uint32_t key = target_pc24 & 0xFFFFFFu;
+        if (bsearch(&key, s_interp_file_targets, s_interp_file_count,
+                    sizeof key, interp_file_target_cmp))
             return 1;
     }
     return 0;
