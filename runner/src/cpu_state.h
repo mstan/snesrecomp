@@ -413,6 +413,14 @@ void cpu_state_init(CpuState *cpu, uint8 *ram);
  * thread `cpu` explicitly. */
 extern CpuState g_cpu;
 
+/* Scoped write-log ring (dev, env SNESRECOMP_WLOG). g_wlog_active is the
+ * fast-path gate read at the top of cpu_write8/16; wlog_scope_enter/exit
+ * arm/disarm around a function scope (AOT body via RecompStackPush/Pop,
+ * interp via interp_tier_dispatch_balanced). See cpu_state.c. */
+extern int g_wlog_active;
+void wlog_scope_enter(const char *tag);
+void wlog_scope_exit(void);
+
 /* Live $420D FastROM (MEMSEL) bit, tracked in common_rtl.c WriteReg. Generated
  * blocks in the $80-$FF WS2 mirror banks reference it to weight their Axis-5
  * master-cycle charge (6 fast clocks/access when set, 8 slow when clear); it's
