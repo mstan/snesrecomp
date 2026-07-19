@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -205,9 +206,16 @@ def main() -> int:
                 REPO / "recompiler-rs" / "Cargo.lock",
                 native_path,
             )
-        return _tree_digest((
+        tree_digest = _tree_digest((
             REPO / "recompiler" / "v2", pathlib.Path(__file__).resolve(),
             REPO / "tools" / "v2_analyze.py", *native_inputs))
+        # This environment switch changes every emitted AOT body, so it must
+        # participate in the published-output cache key.  Treat any non-empty
+        # value as enabled to match emit_function.py's codegen guard.
+        deny_gate = bool(os.environ.get("SNESRECOMP_EMIT_AOT_DENY_GATE"))
+        return hashlib.sha256(
+            f"{tree_digest}\0aot_deny_gate={int(deny_gate)}".encode()
+        ).hexdigest()
 
     generator_digest = generator_digest_for(analysis_backend)
     config_digest = _config_digest(parsed)
