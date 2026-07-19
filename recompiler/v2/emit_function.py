@@ -768,8 +768,21 @@ def emit_function(rom: bytes, bank: int, start: int,
         # it flows through cpu->S + dispatch, so nlr_info_for_block is
         # ignored here.
         del nlr_info_for_block
+        # A tail target can be auto-named in another bank. Monolithic banks
+        # only carry their own forward declarations, so relying on a shard's
+        # declaration scan leaves the cross-bank caller without a prototype.
+        # Keep every emitted tail call valid C11 by declaring its simple
+        # CpuState signature at the use site. Repeating an identical extern in
+        # a same-bank caller is harmless and avoids compiler-specific implicit
+        # declaration behavior.
+        declaration = ""
+        if call_expr.endswith("(cpu)"):
+            callee = call_expr[:-5]
+            if callee and callee.replace("_", "").isalnum():
+                declaration = (
+                    f"extern RecompReturn {callee}(CpuState *cpu); ")
         return (
-            f"{prefix}{{ cpu->host_return_valid = _hrv; "
+            f"{prefix}{{ {declaration}cpu->host_return_valid = _hrv; "
             f"cpu_tailcall_inherit_return_context(_entry_s, _hrv); "
             f"RecompReturn _tc = {call_expr}; "
             f"RecompStackPop(); return _tc; }}  {comment}"
