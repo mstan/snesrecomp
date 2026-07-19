@@ -1317,9 +1317,10 @@ fn analyze(
         for (node_key, node) in &nodes {
             let fact_key = (node_key.pc24, node_key.m, node_key.x);
             if !inputs.declared_exit_modes.contains_key(&fact_key)
-                && node.reasons.iter().any(|reason| {
-                    reason == "unproven_callee_exit" || reason == "structural_poison"
-                })
+                && node
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "unproven_callee_exit" || reason == "structural_poison")
             {
                 next_exact.remove(&fact_key);
                 next_sets.remove(&fact_key);

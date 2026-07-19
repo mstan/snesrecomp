@@ -102,7 +102,7 @@ pub fn is_rom_address(mapping: RomMapping, bank: u32, addr: u32) -> bool {
         return false;
     }
     match mapping {
-        RomMapping::LoRom => addr >= 0x8000 && (bank < 0x40 || bank >= 0x80),
+        RomMapping::LoRom => addr >= 0x8000 && !(0x40..0x80).contains(&bank),
         RomMapping::HiRom => (bank & 0x7F) >= 0x40 || addr >= 0x8000,
     }
 }

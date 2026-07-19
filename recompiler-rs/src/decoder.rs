@@ -2318,7 +2318,7 @@ fn has_unproven_nonlocal_return(
         {
             match state {
                 None => return true,
-                Some(value) if *value > 0 && frame.map_or(true, |size| *value >= size) => {
+                Some(value) if *value > 0 && frame.is_none_or(|size| *value >= size) => {
                     return true;
                 }
                 _ => {}
