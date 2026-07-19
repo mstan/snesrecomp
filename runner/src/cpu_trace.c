@@ -1259,6 +1259,12 @@ void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
 #endif
     phantom_check(cpu, pc24);
     cpu_trace_block_watch_check(cpu, pc24);
+#if SNESRECOMP_REVERSE_DEBUG
+    /* v2 emits cpu_trace_block() at every block boundary. Feed that existing
+     * hook into the bounded Tier-2 TCP ring so reverse-debug builds actually
+     * expose the block history they allocate and advertise. */
+    debug_on_block_enter(pc24, cpu->A, cpu->X, cpu->Y);
+#endif
     debug_server_on_trace_block(cpu, pc24);
     cpu_trace_mx_async_check(cpu, pc24);
     /* Stack-range tripwire — fires once when S first leaves the

@@ -9,6 +9,7 @@
 #include "interp816.h"
 #include "snes.h"   /* Snes, apuCatchupCycles, snes_catchupApu */
 #include "superfx.h"
+#include "debug_server.h"
 #include "cosim.h"  /* cosim_insn — instruction-granular lockstep (no-op unless SNES_COSIM) */
 #include "common_cpu_infra.h"  /* cpu_take_tailcall_return_context — swallow a stale
                                 * tail-armed context on the LLE yield unwind */
@@ -603,6 +604,17 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+#if SNESRECOMP_REVERSE_DEBUG
+        /* The reverse debugger must observe whichever execution tier owns the
+         * next guest instruction. AOT blocks arrive through cpu_trace_block;
+         * interpreted instructions arrive here. Synchronize the live bridge
+         * registers so breakpoint-time TCP snapshots report the state the
+         * interpreter will execute, then accept debugger register edits before
+         * continuing. This is compiled out of production builds. */
+        sync_interp_to_cpu(&in, cpu);
+        debug_on_block_enter(pc_before, in.a, in.x, in.y);
+        sync_cpu_to_interp(cpu, &in);
+#endif
         /* IRQs are sampled between instructions.  An auto-quiescent whole-
          * program run must return to its owning scheduler as soon as either
          * the CPU H/V comparator or a coprocessor asserts IRQ; otherwise a

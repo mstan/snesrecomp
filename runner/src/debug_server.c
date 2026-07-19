@@ -647,6 +647,7 @@ static struct {
         uint16_t val;     // value after the store (16-bit to hold word writes)
         uint8_t width;    // 1 = byte, 2 = word
         uint64_t block_idx;  // Tier 3: monotonic block counter at time of write
+        uint32_t pc;      // current AOT block / interpreted opcode PC
         char func[48];
         char parent[48];  // caller of `func` (one level up the recomp stack)
     } log[WRAM_TRACE_LOG_SIZE];
@@ -682,6 +683,7 @@ void debug_server_arm_default_wram_trace(void) {
 // "this WRAM write happened during this block." Read-only from outside
 // for query purposes.
 volatile uint64_t g_block_counter = 0;
+static volatile uint32_t s_current_block_pc = 0;
 
 // ---- Tier 3 WRAM anchors ----
 // Periodic full-WRAM snapshots that let wram_at_block reconstruct
@@ -742,6 +744,7 @@ static inline void rdb_record(uint32_t adr, uint16_t old_val, uint16_t new_val, 
     s_wram_trace.log[idx].val = new_val;
     s_wram_trace.log[idx].width = width;
     s_wram_trace.log[idx].block_idx = g_block_counter;
+    s_wram_trace.log[idx].pc = s_current_block_pc;
     if (g_last_recomp_func)
         strncpy(s_wram_trace.log[idx].func, g_last_recomp_func, 47);
     else
@@ -806,10 +809,13 @@ static struct {
 // emu side has full PC-attributed write tracing while recomp had only
 // post-frame snapshots.
 #define BLOCK_TRACE_LOG_SIZE 262144
+#define BLOCK_TRACE_RANGE_MAX 8
 static struct {
     int active;
     int write_idx;
     int count;
+    int range_count;
+    struct { uint32_t lo, hi; } ranges[BLOCK_TRACE_RANGE_MAX];
     struct {
         int frame;
         int depth;
@@ -1081,6 +1087,7 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
     // regardless of trace state, so WRAM writes can correlate to block
     // index even when the block trace itself isn't being recorded.
     g_block_counter++;
+    s_current_block_pc = pc & 0xFFFFFFu;
 
     // Main-CPU cycle estimate: ~24 cycles per basic block (typically
     // 3-5 65816 instructions averaging ~6 cycles each). Used for trace
@@ -1093,7 +1100,17 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
     if (s_anchor_active && (g_block_counter % s_anchor_interval) == 0) {
         anchor_capture(snes_frame_counter);
     }
-    if (s_block_trace.active) {
+    int record_block = s_block_trace.active && s_block_trace.range_count == 0;
+    if (s_block_trace.active && !record_block) {
+        for (int i = 0; i < s_block_trace.range_count; i++) {
+            if (pc >= s_block_trace.ranges[i].lo &&
+                pc <= s_block_trace.ranges[i].hi) {
+                record_block = 1;
+                break;
+            }
+        }
+    }
+    if (record_block) {
         int idx = s_block_trace.write_idx % BLOCK_TRACE_LOG_SIZE;
         s_block_trace.log[idx].frame = snes_frame_counter;
         s_block_trace.log[idx].depth = g_recomp_stack_top;
@@ -2869,7 +2886,7 @@ static void cmd_get_wram_trace(const char *args) {
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s{\"f\":%d,\"adr\":\"0x%05x\","
             "\"old\":\"0x%04x\",\"val\":\"0x%04x\",\"w\":%u,"
-            "\"bi\":%llu,\"func\":\"%s\",\"parent\":\"%s\"}",
+            "\"bi\":%llu,\"pc\":\"0x%06x\",\"func\":\"%s\",\"parent\":\"%s\"}",
             i ? "," : "",
             s_wram_trace.log[idx].frame,
             s_wram_trace.log[idx].adr,
@@ -2877,6 +2894,7 @@ static void cmd_get_wram_trace(const char *args) {
             s_wram_trace.log[idx].val,
             (unsigned)s_wram_trace.log[idx].width,
             (unsigned long long)s_wram_trace.log[idx].block_idx,
+            s_wram_trace.log[idx].pc,
             s_wram_trace.log[idx].func,
             s_wram_trace.log[idx].parent);
     }
@@ -3290,7 +3308,26 @@ static void cmd_trace_blocks_reset(const char *args) {
     s_block_trace.active = 0;
     s_block_trace.write_idx = 0;
     s_block_trace.count = 0;
+    s_block_trace.range_count = 0;
     send_fmt("{\"ok\":true}");
+}
+
+static void cmd_trace_blocks_range(const char *args) {
+    uint32_t lo = 0, hi = 0;
+    if (!args || sscanf(args, "%x %x", &lo, &hi) != 2 || lo > hi) {
+        send_fmt("{\"error\":\"usage: trace_blocks_range <hex_lo> <hex_hi>\"}");
+        return;
+    }
+    if (s_block_trace.range_count >= BLOCK_TRACE_RANGE_MAX) {
+        send_fmt("{\"error\":\"block trace range table full (max %d)\"}",
+                 BLOCK_TRACE_RANGE_MAX);
+        return;
+    }
+    int slot = s_block_trace.range_count++;
+    s_block_trace.ranges[slot].lo = lo & 0xFFFFFFu;
+    s_block_trace.ranges[slot].hi = hi & 0xFFFFFFu;
+    send_fmt("{\"ok\":true,\"slot\":%d,\"lo\":\"0x%06x\",\"hi\":\"0x%06x\"}",
+             slot, s_block_trace.ranges[slot].lo, s_block_trace.ranges[slot].hi);
 }
 
 static void cmd_get_block_trace(const char *args) {
@@ -7091,6 +7128,7 @@ static const CmdEntry s_commands[] = {
     {"get_call_trace",    cmd_get_call_trace},
     {"trace_blocks",       cmd_trace_blocks},
     {"trace_blocks_reset", cmd_trace_blocks_reset},
+    {"trace_blocks_range", cmd_trace_blocks_range},
     {"get_block_trace",    cmd_get_block_trace},
     {"break_add",          cmd_break_add},
     {"break_clear",        cmd_break_clear},
