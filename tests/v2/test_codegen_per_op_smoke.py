@@ -271,6 +271,26 @@ def test_call_long_emits_function_call():
     assert "bank_7E_8034" in s
 
 
+def test_terminal_jsr_pushes_inline_frame_but_inherits_outer_context():
+    from v2.codegen import set_name_resolver, set_valid_variants
+    set_name_resolver({0x008100: "InlineDispatchHelper"})
+    set_valid_variants({0x008100: {(0, 0)}})
+    try:
+        op = Call(target=0x008100, long=False, source_pc24=0x008000,
+                  entry_m=0, entry_x=0, terminal=True)
+        s = _joined(emit_op(op))
+        assert "terminal JSR: callee consumes inline return frame" in s
+        assert "JSR return frame -> cpu->S" in s
+        assert "cpu_tailcall_inherit_return_context(_entry_s, _hrv)" in s
+        assert "interp_tier_dispatch_tail" in s
+        assert "interp_tier_run_call_frame" not in s
+        assert "return _r" in s
+        assert "(int)_r - 1" not in s
+    finally:
+        set_name_resolver({})
+        set_valid_variants({})
+
+
 def test_call_rejects_sub_8000_lorom_target():
     """Sub-$8000 LoROM addresses are RAM/registers, never ROM code. A
     Call decoded with such a target arose from the decoder following
@@ -342,6 +362,18 @@ def test_pea_pushes_immediate_onto_stack():
     assert "cpu->S" in s
     assert "0x1234" in s
     assert "cpu_write16" in s
+
+
+def test_wai_unwinds_to_owning_lle_scheduler_at_architectural_pc():
+    """A bounced compiled WAI is a scheduler boundary, not a guest return."""
+    s = _joined(emit_op(Stop(wait=True), source_pc24=0x808652))
+    assert "interp_bridge_in_lle_scheduler()" in s
+    assert "interp_bridge_lle_yield_unwind(cpu, 0x808653u)" in s
+
+
+def test_stp_does_not_arm_the_wai_scheduler_resume_contract():
+    s = _joined(emit_op(Stop(wait=False), source_pc24=0x808653))
+    assert "interp_bridge_lle_yield_unwind" not in s
 
 
 def test_emit_block_wraps_in_braces():

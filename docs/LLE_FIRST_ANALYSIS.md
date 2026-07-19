@@ -149,9 +149,9 @@ the analysis now additionally proves:
 Measured on Mega Man X (USA): 27 roots → 4,561 analyzed exact variants
 (4,552 emitted, 9 LLE-only) versus 32 emitted before — recovering the
 early-probe 4,236-variant scale with proven facts instead of the legacy
-width-preservation assumption. Interp fallbacks are now LOUD at runtime
-(first-hit `[tier2] INTERP GAP` lines + exit summary; see
-`runner/src/snes/interp_bridge.c`).
+width-preservation assumption. Interpreter fallbacks are retained in the
+bounded tier-2 coverage table and JSON manifest; runtime execution does not
+print per-gap diagnostics.
 
 ## Acceptance
 

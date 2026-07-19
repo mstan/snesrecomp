@@ -364,6 +364,10 @@ class Call(IROp):
     # in that case).
     source_pc24: Optional[int] = None
     table_base: Optional[int] = None
+    # The callee consumes this JSR's hardware frame and transfers control
+    # onward, so the caller has no lexical continuation.  The generated call
+    # still pushes the real return address because the callee uses it as data.
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -409,6 +413,8 @@ class Nop(IROp):
 class Break(IROp):
     """BRK / COP — software interrupt."""
     cop: bool
+    source_pc24: Optional[int] = None
+    tier_to_lle: bool = False
 
 
 @dataclass(frozen=True)

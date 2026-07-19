@@ -792,7 +792,7 @@ restart:
         break;
       case 2: // rtl
         cpu->pc = interp816_pullWord(cpu) + 1;
-        cpu->k = interp816_pullByte(cpu) & 0x7f;
+        cpu->k = interp816_pullByte(cpu);
         break;
       default:
         goto restart;
@@ -1007,7 +1007,7 @@ restart:
       interp816_pushByte(cpu, cpu->k);
       interp816_pushWord(cpu, cpu->pc - 1);
       cpu->pc = value;
-      cpu->k = newK & 0x7f;
+      cpu->k = newK;
       break;
     }
     case 0x23: { // and sr
@@ -1378,7 +1378,7 @@ restart:
     case 0x5c: { // jml abl
       uint16_t value = interp816_readOpcodeWord(cpu);
       uint8_t new_k = interp816_readOpcode(cpu);
-      cpu->k = new_k & 0x7f;
+      cpu->k = new_k;
       cpu->pc = value;
       break;
     }
@@ -1474,7 +1474,7 @@ restart:
     }
     case 0x6b: { // rtl imp
       cpu->pc = interp816_pullWord(cpu) + 1;
-      cpu->k = interp816_pullByte(cpu) & 0x7f;
+      cpu->k = interp816_pullByte(cpu);
       break;
     }
     case 0x6c: { // jmp ind
@@ -1594,7 +1594,8 @@ restart:
       break;
     }
     case 0x80: { // bra rel
-      cpu->pc += (int8_t) interp816_readOpcode(cpu);
+      uint8_t offset = interp816_readOpcode(cpu);
+      cpu->pc += (int8_t) offset;
       break;
     }
     case 0x81: { // sta idx
@@ -1604,7 +1605,8 @@ restart:
       break;
     }
     case 0x82: { // brl rll
-      cpu->pc += (int16_t) interp816_readOpcodeWord(cpu);
+      uint16_t offset = interp816_readOpcodeWord(cpu);
+      cpu->pc += (int16_t) offset;
       break;
     }
     case 0x83: { // sta sr
@@ -2161,7 +2163,7 @@ restart:
     case 0xdc: { // jml ial
       uint16_t adr = interp816_readOpcodeWord(cpu);
       cpu->pc = interp816_readWord(cpu, adr, (adr + 1) & 0xffff);
-      cpu->k = interp816_read(cpu, (adr + 2) & 0xffff) & 0x7f;
+      cpu->k = interp816_read(cpu, (adr + 2) & 0xffff);
       break;
     }
     case 0xdd: { // cmp abx(r)

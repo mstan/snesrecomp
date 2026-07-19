@@ -69,6 +69,13 @@ pub struct IndirectDispatch {
     pub table_bases: Vec<u32>, // 0..3 entries (see cfg_loader doc)
     /// Pointer-sourced call (`PEA <ret>; JMP (ptr)` / `JSR (ptr)`).
     pub ptr_call: bool,
+    /// Match an explicit runtime pointer value rather than indexing a ROM
+    /// table. True for ptrcall/ptrtail/ptrtail_popcall.
+    pub pointer_match: bool,
+    /// The dispatcher consumed the two-byte JSR frame before tail transfer.
+    pub popped_call_frame: bool,
+    /// PEI/PHA + RTS internal computed transfer, not a whole-program call.
+    pub rts_stack: bool,
     /// Explicit 16- or 24-bit targets for a pointer-sourced call.
     pub targets: Vec<u32>,
 }
@@ -88,6 +95,7 @@ pub struct BankCfg {
     pub auto_vectors: bool,
     pub indirect_dispatch: Vec<IndirectDispatch>,
     pub inline_dispatch_loops: BTreeSet<u32>,
+    pub terminal_jsr: BTreeSet<u32>,
     pub hle_spc_upload: Vec<u32>,
     pub hle_func: BTreeMap<u32, String>, // pc16 -> c_function_name
     pub hle_dispatch: BTreeMap<u32, String>, // site_pc16 -> c_function_name
@@ -301,10 +309,26 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                     "{path}: indirect_dispatch count {count} out of range (1..4096)"
                 ));
             }
-            if tokens[3..].contains(&"ptrcall") {
+            let pointer_modes: Vec<&str> = tokens[3..]
+                .iter()
+                .copied()
+                .filter(|token| {
+                    matches!(
+                        *token,
+                        "ptrcall" | "ptrtail" | "ptrtail_popcall" | "rtsstack"
+                    )
+                })
+                .collect();
+            if !pointer_modes.is_empty() {
+                if pointer_modes.len() != 1 {
+                    return Err(format!(
+                        "{path}: indirect_dispatch chooses exactly one pointer mode: {stripped:?}"
+                    ));
+                }
+                let pointer_mode = pointer_modes[0];
                 let mut targets = Vec::new();
                 for t in &tokens[3..] {
-                    if *t == "ptrcall" {
+                    if *t == pointer_mode {
                         continue;
                     }
                     if let Some(raw) = t.strip_prefix("targets:") {
@@ -317,7 +341,7 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                         }
                     } else {
                         return Err(format!(
-                            "{path}: indirect_dispatch ptrcall unknown option {t:?}"
+                            "{path}: indirect_dispatch {pointer_mode} unknown option {t:?}"
                         ));
                     }
                 }
@@ -328,7 +352,7 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 }
                 if targets.len() != count as usize {
                     return Err(format!(
-                        "{path}: indirect_dispatch ptrcall count {count} != {} targets",
+                        "{path}: indirect_dispatch {pointer_mode} count {count} != {} targets",
                         targets.len()
                     ));
                 }
@@ -337,7 +361,10 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                     count: count as u32,
                     idx_reg: 'X',
                     table_bases: Vec::new(),
-                    ptr_call: true,
+                    ptr_call: pointer_mode == "ptrcall",
+                    pointer_match: pointer_mode != "rtsstack",
+                    popped_call_frame: pointer_mode == "ptrtail_popcall",
+                    rts_stack: pointer_mode == "rtsstack",
                     targets,
                 });
                 continue;
@@ -383,6 +410,9 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 idx_reg,
                 table_bases,
                 ptr_call: false,
+                pointer_match: false,
+                popped_call_frame: false,
+                rts_stack: false,
                 targets: Vec::new(),
             });
             continue;
@@ -398,6 +428,22 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 .map_err(|e| format!("{path}: inline_dispatch_loop {e}"))?
                 & 0xFFFF;
             cfg.inline_dispatch_loops.insert(site_pc16);
+            continue;
+        }
+        // terminal_jsr <site_pc16>
+        if head == "terminal_jsr" {
+            if tokens.len() != 2 {
+                return Err(format!(
+                    "{path}: terminal_jsr needs exactly one <site_pc16>, got: {stripped:?}"
+                ));
+            }
+            let site_pc16 =
+                parse_hex(tokens[1]).map_err(|e| format!("{path}: terminal_jsr {e}"))? & 0xFFFF;
+            if !cfg.terminal_jsr.insert(site_pc16) {
+                return Err(format!(
+                    "{path}: terminal_jsr duplicate site ${site_pc16:04X}"
+                ));
+            }
             continue;
         }
         // func <name> <hex_pc> [end:..] [tail_call:..] [exit_mx:M,X] ...
@@ -711,6 +757,9 @@ mod tests {
         assert_eq!(d.idx_reg, 'X');
         assert_eq!(d.table_bases, vec![0x9000, 0x9100]);
         assert!(!d.ptr_call);
+        assert!(!d.pointer_match);
+        assert!(!d.popped_call_frame);
+        assert!(!d.rts_stack);
         assert!(d.targets.is_empty());
     }
 
@@ -723,8 +772,36 @@ mod tests {
         .unwrap();
         let dispatch = &cfg.indirect_dispatch[0];
         assert!(dispatch.ptr_call);
+        assert!(dispatch.pointer_match);
         assert_eq!(dispatch.idx_reg, 'X');
         assert_eq!(dispatch.targets, vec![0x8569, 0x8884B8, 0x91D27F]);
+    }
+
+    #[test]
+    fn dkc2_pointer_tail_modes_parse() {
+        let cfg = parse_bank_cfg(
+            "bank = B3\n\
+             indirect_dispatch A364 2 ptrtail targets:B39E10,B3A441\n\
+             indirect_dispatch A010 1 ptrtail_popcall targets:B38052\n\
+             indirect_dispatch F000 2 rtsstack targets:B3F100,B3F200\n",
+            "t",
+        )
+        .unwrap();
+        let tail = &cfg.indirect_dispatch[0];
+        assert!(!tail.ptr_call && tail.pointer_match);
+        assert!(!tail.popped_call_frame && !tail.rts_stack);
+        let pop = &cfg.indirect_dispatch[1];
+        assert!(!pop.ptr_call && pop.pointer_match && pop.popped_call_frame);
+        assert!(!pop.rts_stack);
+        let rts = &cfg.indirect_dispatch[2];
+        assert!(!rts.ptr_call && !rts.pointer_match);
+        assert!(!rts.popped_call_frame && rts.rts_stack);
+    }
+
+    #[test]
+    fn terminal_jsr_parse() {
+        let cfg = parse_bank_cfg("bank = B3\nterminal_jsr A436\n", "test.cfg").unwrap();
+        assert_eq!(cfg.terminal_jsr, BTreeSet::from([0xA436]));
     }
 
     #[test]

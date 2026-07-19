@@ -9,6 +9,7 @@
 #include "interp816.h"
 #include "snes.h"   /* Snes, apuCatchupCycles, snes_catchupApu */
 #include "superfx.h"
+#include "debug_server.h"
 #include "cosim.h"  /* cosim_insn — instruction-granular lockstep (no-op unless SNES_COSIM) */
 #include "common_cpu_infra.h"  /* cpu_take_tailcall_return_context — swallow a stale
                                 * tail-armed context on the LLE yield unwind */
@@ -290,8 +291,71 @@ static int      s_interp_bounce_owner_depth = 0;
  * and must first finish/skip that ancestor in the ordinary nested tier path.
  * Saved/restored around each bounce because bridge runs nest. */
 static int      s_interp_bounce_recomp_base = -1;
+/* Env-gated write-log observability: current interpreter opcode PC, published
+ * immediately before execution when SNESRECOMP_WLOG_STATE is armed. */
+uint32_t g_interp_wlog_pc24 = 0;
 static uint32_t s_lle_bounce_exclusions[16];
 static size_t   s_lle_bounce_exclusion_count;
+
+/* Debug lever (SNESRECOMP_LLE_INTERP_TARGET_FILE): a file of hex PC24s, one per
+ * line, each forced to the byte interpreter instead of its AOT body. Unbounded
+ * (unlike the 16-slot programmatic list) so a whole seeded root set can be
+ * disabled at once for structural-vs-execution bisection, editable between runs
+ * with no rebuild. Sorted for bsearch; masked to 24 bits. */
+static uint32_t *s_interp_file_targets;
+static size_t    s_interp_file_count;
+static int interp_file_target_cmp(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+/* Lazy-load the SNESRECOMP_LLE_INTERP_TARGET_FILE set (idempotent). Shared by
+ * the interp->AOT bounce gate and the AOT body-entry guard (rtl_aot_node_denied),
+ * so the set is populated no matter which fires first. */
+static void ensure_interp_file_targets_loaded(void) {
+    static int s_loaded;
+    if (s_loaded) return;
+    s_loaded = 1;
+    const char *fp = getenv("SNESRECOMP_LLE_INTERP_TARGET_FILE");
+    if (!fp || !*fp) return;
+    FILE *f = fopen(fp, "r");
+    if (!f) return;
+    size_t cap = 256, n = 0;
+    uint32_t *arr = (uint32_t *)malloc(cap * sizeof *arr);
+    char line[64];
+    while (arr && fgets(line, sizeof line, f)) {
+        char *end = NULL;
+        unsigned long pc = strtoul(line, &end, 16);
+        if (end == line) continue;
+        if (n == cap) {
+            cap *= 2;
+            uint32_t *g = (uint32_t *)realloc(arr, cap * sizeof *arr);
+            if (!g) break;
+            arr = g;
+        }
+        arr[n++] = (uint32_t)(pc & 0xFFFFFFu);
+    }
+    fclose(f);
+    if (arr && n) {
+        qsort(arr, n, sizeof *arr, interp_file_target_cmp);
+        s_interp_file_targets = arr;
+        s_interp_file_count = n;
+    } else {
+        free(arr);
+    }
+}
+
+/* AOT body-entry guard: generated variant bodies (when emitted with the
+ * SNESRECOMP_EMIT_AOT_DENY_GATE codegen flag) call this at the prologue and
+ * tier down to the interpreter if their PC is in the deny set. Unlike the
+ * interp->AOT bounce gate, this fires for EVERY entry path (direct call, tail,
+ * dispatch, alias), so a subset can be soundly disabled for bisection. */
+int rtl_aot_node_denied(uint32 pc24) {
+    ensure_interp_file_targets_loaded();
+    if (!s_interp_file_count) return 0;
+    uint32_t key = (uint32_t)pc24 & 0xFFFFFFu;
+    return bsearch(&key, s_interp_file_targets, s_interp_file_count,
+                   sizeof key, interp_file_target_cmp) != NULL;
+}
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
@@ -314,9 +378,27 @@ RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
 }
 
 int interp_bridge_has_direct_paired_bounce(void) {
-    return s_interp_bounce_owner_depth > 0 &&
-           (s_interp_bounce_recomp_base < 0 ||
-            g_recomp_stack_top <= s_interp_bounce_recomp_base + 1);
+    if (s_interp_bounce_owner_depth <= 0)
+        return 0;
+    if (s_interp_bounce_recomp_base < 0 ||
+        g_recomp_stack_top <= s_interp_bounce_recomp_base + 1)
+        return 1;
+
+    /* A generated root may reach its terminal return through one or more
+     * architectural tail transfers. Those transfers add host frames, but
+     * every callee inherits the root's _entry_s watermark; semantically they
+     * are still the direct paired bounce owned by the active interpreter.
+     *
+     * A real nested JSR/JSL has a lower entry S and therefore fails this
+     * test. Its rewritten return continues to use the compiled-ancestor
+     * SKIP path, while a pure tail chain is handed back to the interpreter. */
+    const int base = s_interp_bounce_recomp_base;
+    const uint16_t root_entry_s = g_cpu_entry_s[base];
+    for (int i = base + 1; i < g_recomp_stack_top; i++) {
+        if (g_cpu_entry_s[i] != root_entry_s)
+            return 0;
+    }
+    return 1;
 }
 
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
@@ -361,6 +443,7 @@ static int lle_bounce_target_excluded(uint32_t target_pc24) {
         const char *v = getenv("SNESRECOMP_LLE_INTERP_TARGET");
         if (v && *v)
             s_target = (uint32_t)strtoul(v, NULL, 16) & 0xFFFFFFu;
+        ensure_interp_file_targets_loaded();
         s_init = 1;
     }
     if (s_target != 0xFFFFFFFFu &&
@@ -369,6 +452,12 @@ static int lle_bounce_target_excluded(uint32_t target_pc24) {
     for (size_t i = 0; i < s_lle_bounce_exclusion_count; i++) {
         if ((target_pc24 & 0x7FFFFFu) ==
             (s_lle_bounce_exclusions[i] & 0x7FFFFFu))
+            return 1;
+    }
+    if (s_interp_file_count) {
+        uint32_t key = target_pc24 & 0xFFFFFFu;
+        if (bsearch(&key, s_interp_file_targets, s_interp_file_count,
+                    sizeof key, interp_file_target_cmp))
             return 1;
     }
     return 0;
@@ -464,6 +553,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     in.write = bridge_bus_write;
     in.read_word = bridge_bus_read_word;
     in.write_word = bridge_bus_write_word;
+    const int wlog_state_sync = getenv("SNESRECOMP_WLOG_STATE") != NULL;
 
     sync_cpu_to_interp(cpu, &in);
     in.k  = (uint8)((entry_pc24 >> 16) & 0xFF);
@@ -514,6 +604,17 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+#if SNESRECOMP_REVERSE_DEBUG
+        /* The reverse debugger must observe whichever execution tier owns the
+         * next guest instruction. AOT blocks arrive through cpu_trace_block;
+         * interpreted instructions arrive here. Synchronize the live bridge
+         * registers so breakpoint-time TCP snapshots report the state the
+         * interpreter will execute, then accept debugger register edits before
+         * continuing. This is compiled out of production builds. */
+        sync_interp_to_cpu(&in, cpu);
+        debug_on_block_enter(pc_before, in.a, in.x, in.y);
+        sync_cpu_to_interp(cpu, &in);
+#endif
         /* IRQs are sampled between instructions.  An auto-quiescent whole-
          * program run must return to its owning scheduler as soon as either
          * the CPU H/V comparator or a coprocessor asserts IRQ; otherwise a
@@ -848,6 +949,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         s_interp_bus_master=0;
         s_interp_bus_cycles=0;
         s_interp_bus_timing_active=1;
+        /* Optional first-divergence observability: bus callbacks receive only
+         * CpuState, while the live interpreter registers normally stay in the
+         * local Interp816 struct until a bridge boundary.  Publish the pre-op
+         * state so an address write-log can compare the exact store-site
+         * registers against AOT.  Completely inert unless explicitly armed. */
+        if (wlog_state_sync) {
+            g_interp_wlog_pc24 = pc_before & 0xFFFFFFu;
+            sync_interp_to_cpu(&in, cpu);
+        }
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         s_interp_bus_timing_active=0;
         if (dtrace && in.dp != dp_before) {
@@ -1235,14 +1345,12 @@ extern int snes_frame_counter;
 static long s_tier_hits = 0;
 long interp_tier_hit_count(void) { return s_tier_hits; }
 
-/* Bounded observability: a coverage-gap tier-down is an event worth seeing.
- * First N go to stderr (matching the existing dispatch_oob single-line style);
- * the counter is always live for the manifest (Phase 2) and tests. */
+/* Count each coverage-gap tier-down. The value is exposed through structured
+ * coverage manifests and tests; runtime execution does not print per-hit
+ * diagnostics. */
 static void interp_tier_note(uint32_t target_pc24) {
-    long n = ++s_tier_hits;
-    if (n <= 32)
-        fprintf(stderr, "[interp_tier] #%ld -> $%06X\n", n,
-                (unsigned)(target_pc24 & 0xFFFFFF));
+    (void)target_pc24;
+    ++s_tier_hits;
 }
 
 /* ── Phase-2 gap manifest: always-on tier-down coverage worklist ───────────
@@ -1275,21 +1383,8 @@ static uint64_t     g_tier2_cov_overflow;
 static const char *tier2_mx_str(uint8_t mx);
 static const char *tier2_kind_str(uint8_t k);
 
-/* Interp fallbacks are LOUD by default (owner directive 2026-07-16): every
- * distinct gap tuple announces itself on stderr the first time it fires, and
- * the manifest writer prints an exit summary. The interpreter is a failsafe
- * for missing static coverage — silence made a shrinking-coverage regression
- * look like health. Bounded by TIER2_COVERAGE_MAX, so it cannot spam
- * unboundedly; SNESRECOMP_TIER2_QUIET=1 opts out (CI capture etc.). */
-static int tier2_loud(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *q = getenv("SNESRECOMP_TIER2_QUIET");
-        cached = !(q && q[0] && q[0] != '0');
-    }
-    return cached;
-}
-
+/* Gap tuples remain in this bounded structured table for manifest consumers;
+ * runtime execution does not print per-gap diagnostics. */
 static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
                          uint8_t kind, int clean) {
     /* Canonicalize LoROM exec-mirror banks ($80-$BF ≡ $00-$3F) so one guest
@@ -1331,14 +1426,6 @@ static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
             g_tier2_cov[i].clean_hits  = 0;
             g_tier2_cov[i].bail_hits   = 0;
             g_tier2_cov[i].first_frame = snes_frame_counter;
-            if (tier2_loud()) {
-                fprintf(stderr,
-                        "[tier2] INTERP GAP #%d %s site=$%06X "
-                        "target=$%06X %s %s frame=%d\n",
-                        g_tier2_cov_count, tier2_kind_str(kind),
-                        (unsigned)site, (unsigned)target, tier2_mx_str(mx),
-                        clean ? "clean" : "BAIL", snes_frame_counter);
-            }
         }
         s_cache[h] = (uint16_t)(i + 1);
     }
@@ -1391,6 +1478,17 @@ RecompReturn interp_tier_dispatch_tail(CpuState *cpu, uint32_t target_pc24,
                                        uint8_t hrv) {
     if (cpu_interrupt_context_active())
         return interp_tier_dispatch_interrupt(cpu, target_pc24);
+    /* This tail transfer abandons every compiled guest frame beneath the AOT
+     * root that the active interpreter bounced into.  Starting a new nested
+     * interpreter here leaves those host frames live; if the guest continuation
+     * loops back through another compiled call (DKC2's sprite dispatcher is one
+     * example), each iteration recursively nests another AOT/LLE pair until the
+     * host stack overflows.  Use the existing arbitrary-depth control-transfer
+     * sentinel to unwind to the owning interpreter and resume there at the tail
+     * target.  The guest S/register state is untouched, and ordinary top-level
+     * AOT tail fallbacks retain the balanced nested-interpreter path below. */
+    if (s_interp_bounce_owner_depth > 0)
+        return interp_bridge_lle_yield_unwind(cpu, target_pc24);
     return interp_tier_dispatch_balanced(cpu, target_pc24, site_pc24,
                                          entry_s, hrv);
 }
@@ -1410,11 +1508,27 @@ RecompReturn interp_tier_dispatch_balanced(CpuState *cpu, uint32_t target_pc24,
     const uint8_t kind = (target_pc24 == site_pc24) ? TIER2_KIND_INDIRECT_GOTO
                                                     : TIER2_KIND_DISPATCH;
     uint32_t landing = target_pc24 & 0xFFFFFF;
+    /* Write-log scope: capture the interp's write sequence for a targeted node
+     * so it can be first-divergence-diffed against the AOT body. Gated to the
+     * function under investigation; a leaf runs exactly its own writes here. */
+    static int wlog_target_init = 0;
+    static uint32_t wlog_target_pc24 = 0xBB8CB5u;
+    if (!wlog_target_init) {
+        const char *wlog_target_env = getenv("SNESRECOMP_WLOG_INTERP_TARGET");
+        if (wlog_target_env && *wlog_target_env)
+            wlog_target_pc24 = (uint32_t)strtoul(
+                wlog_target_env, NULL, 16) & 0xFFFFFFu;
+        wlog_target_init = 1;
+    }
+    const int wlog_this = (
+        (target_pc24 & 0xFFFFFFu) == wlog_target_pc24);
+    if (wlog_this) wlog_scope_enter("interp:scoped_target");
     /* Unwind watermark is the enclosing function's entry_s (NOT the current S:
      * a PEA+JMP idiom may have pushed a return below entry). Exit when the
      * function RTS/RTLs past entry_s. */
     int ok = interp_bridge_run_ex2(cpu, target_pc24 & 0xFFFFFF, entry_s,
                                    &landing, NULL, 0, 0, 0, 0, NULL, 0, 0);
+    if (wlog_this) wlog_scope_exit();
     /* For an indirect goto the recorded target is where the JMP actually
      * resolved (the dynamically computed entry); for a dispatch default the
      * passed target already IS the entry. */
@@ -1632,60 +1746,7 @@ void Tier2CoverageDumpJson(FILE *f) {
     fprintf(f, "\n    ]\n  },\n");
 }
 
-/* Loud exit summary (owner directive 2026-07-16): the interp share of a run
- * must be visible without opening the manifest. Printed by the manifest
- * writer so it lands on every exit path that harvests coverage. */
-static void tier2_log_summary(void) {
-    if (!tier2_loud()) return;
-    if (g_tier2_cov_count == 0) {
-        fprintf(stderr, "[tier2] interp fallbacks: NONE — full static "
-                        "coverage on every executed path\n");
-        return;
-    }
-    uint64_t clean = 0, bail = 0;
-    for (int i = 0; i < g_tier2_cov_count; i++) {
-        clean += g_tier2_cov[i].clean_hits;
-        bail  += g_tier2_cov[i].bail_hits;
-    }
-    fprintf(stderr,
-            "[tier2] interp fallbacks: %d distinct gap site(s), "
-            "%llu clean / %llu bail hit(s), %llu dropped tuple(s)\n",
-            g_tier2_cov_count, (unsigned long long)clean,
-            (unsigned long long)bail,
-            (unsigned long long)g_tier2_cov_overflow);
-    /* Top offenders by total hits — the promotion worklist, right on the
-     * console. */
-    int top[8];
-    int tops = 0;
-    for (int i = 0; i < g_tier2_cov_count; i++) {
-        uint64_t hits = g_tier2_cov[i].clean_hits + g_tier2_cov[i].bail_hits;
-        int j = tops;
-        while (j > 0) {
-            const Tier2CovSite *p = &g_tier2_cov[top[j - 1]];
-            if (p->clean_hits + p->bail_hits >= hits) break;
-            j--;
-        }
-        if (j < 8) {
-            if (tops < 8) tops++;
-            for (int k = tops - 1; k > j; k--) top[k] = top[k - 1];
-            top[j] = i;
-        }
-    }
-    for (int j = 0; j < tops; j++) {
-        const Tier2CovSite *s = &g_tier2_cov[top[j]];
-        fprintf(stderr,
-                "[tier2]   %s site=$%06X target=$%06X %s "
-                "clean=%llu bail=%llu frames=%d..%d\n",
-                tier2_kind_str(s->kind), (unsigned)s->site_pc24,
-                (unsigned)s->target_pc24, tier2_mx_str(s->mx),
-                (unsigned long long)s->clean_hits,
-                (unsigned long long)s->bail_hits,
-                s->first_frame, s->last_frame);
-    }
-}
-
 void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
-    tier2_log_summary();
     FILE *f = fopen(path, "w");
     if (!f) return;
     /* Minimal title sanitize: drop quotes/backslashes/control so the JSON is

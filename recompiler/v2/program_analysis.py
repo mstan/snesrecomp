@@ -295,7 +295,8 @@ def summarize_decode_graph(
                      insn.length, tuple(
                          (s.pc, s.m, s.x) for s in decoded.successors)))
 
-        if insn.mnem in ("BRK", "COP"):
+        if (insn.mnem in ("BRK", "COP")
+                and site not in graph.data_region_exec_pcs):
             poison_reasons.add(f"{insn.mnem.lower()}_at_{site:06X}")
 
         entries = getattr(insn, "dispatch_entries", None)
@@ -372,6 +373,15 @@ def summarize_decode_graph(
             item.site_pc24, EdgeKind.SUPPRESSED_INDIRECT_CALL,
             EdgeResolution.LLE_DYNAMIC,
             detail=f"table_base={item.table_base:04X}"))
+
+    for site, successor in getattr(graph, "boundary_exits", ()):
+        target = VariantKey(successor.pc, successor.m, successor.x)
+        resolution = (EdgeResolution.AOT_EXACT
+                      if target_is_code is None or target_is_code(target)
+                      else EdgeResolution.LLE_EXACT)
+        edges.add(DemandEdge(
+            site, EdgeKind.DIRECT_TAIL_CALL, resolution, target,
+            detail="declared_boundary"))
 
     reasons = set()
     if not graph.insns:

@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::insn::{decode_insn, Insn, Mode};
-use crate::rom::{addr_in_reloc_region, addr_to_rom_offset, RelocRegion};
+use crate::rom::{
+    addr_in_reloc_region, addr_to_rom_offset, is_rom_address, RelocRegion, RomMapping,
+};
 
 pub const PHP_STACK_MAX_DEPTH: usize = 8;
 
@@ -132,6 +134,13 @@ pub struct FunctionDecodeGraph {
     pub const_z_folds: Vec<ConstZFold>,
     pub dispatch_targets_suppressed: Vec<DispatchTargetSuppressed>,
     pub unresolved_indirects: Vec<UnresolvedIndirect>,
+    /// PCs explicitly declared as data that are reached by real control flow.
+    /// Their bytes are retained for exact execution but BRK/COP-shaped data
+    /// does not structurally poison the surrounding function.
+    pub data_region_exec_pcs: HashSet<u32>,
+    /// Control flow intentionally stopped at a declared function boundary.
+    /// The predecessor site and outside target form a tail-exit dependency.
+    pub boundary_exits: Vec<(u32, DecodeKey)>,
     /// Direct call sites whose continuation was deliberately truncated
     /// because no architectural callee exit-(M,X) fact was available.
     pub unknown_callee_exit_sites: Vec<(u32, u32, u8, u8)>,
@@ -195,6 +204,9 @@ impl FunctionDecodeGraph {
 /// can build them once and share across all decodes.
 #[derive(Debug, Clone, Default)]
 pub struct DecodeEnv<'a> {
+    pub rom_mapping: RomMapping,
+    /// Per-function decode budget. `None` preserves the public default.
+    pub max_insns: Option<usize>,
     pub dispatch_helpers: Option<&'a HashMap<u32, String>>, // target_pc24 -> 'short'|'long'
     pub indirect_call_tables: Option<&'a HashMap<u32, IndirectCallTable>>,
     pub indirect_dispatch: Option<&'a HashMap<u32, IndirectDispatchSite>>,
@@ -206,6 +218,7 @@ pub struct DecodeEnv<'a> {
     pub reloc_regions: Option<&'a [RelocRegion]>,
     pub callee_inline_skip: Option<&'a HashMap<u32, i32>>,
     pub inline_dispatch_loop_pcs: Option<&'a std::collections::BTreeSet<u32>>,
+    pub terminal_jsr_sites: Option<&'a std::collections::BTreeSet<u32>>,
     /// Folded-in process-global the Python decode path read (set_global_inline_skip).
     pub global_inline_skip: Option<&'a HashMap<u32, i32>>,
     /// LLE-first analysis must not guess that a callee preserves M/X.  Stop
@@ -229,6 +242,9 @@ pub struct IndirectDispatchSite {
     pub idx_reg: char,         // 'X' | 'Y'
     pub table_bases: Vec<u32>, // 0..3 entries
     pub ptr_call: bool,
+    pub pointer_match: bool,
+    pub popped_call_frame: bool,
+    pub rts_stack: bool,
     pub targets: Vec<u32>,
 }
 
@@ -283,13 +299,18 @@ pub fn post_mx(insn: &Insn, in_m: u8, in_x: u8) -> (u8, u8) {
 
 /// `addr_to_rom_offset` with the Python AssertionError mapped to `None`: a
 /// non-reloc address outside $8000-$FFFF has no LoROM offset.
-fn try_rom_offset(bank: u32, pc16: u32, reloc: &[RelocRegion]) -> Option<usize> {
+fn try_rom_offset(
+    mapping: RomMapping,
+    bank: u32,
+    pc16: u32,
+    reloc: &[RelocRegion],
+) -> Option<usize> {
     if addr_in_reloc_region(bank, pc16, reloc).is_some() {
-        return Some(addr_to_rom_offset(bank, pc16, reloc));
+        return Some(addr_to_rom_offset(mapping, bank, pc16, reloc));
     }
     let a = pc16 & 0xFFFF;
-    if (0x8000..=0xFFFF).contains(&a) {
-        Some(addr_to_rom_offset(bank, a, reloc))
+    if is_rom_address(mapping, bank, a) {
+        Some(addr_to_rom_offset(mapping, bank, a, reloc))
     } else {
         None
     }
@@ -299,9 +320,15 @@ fn try_rom_offset(bank: u32, pc16: u32, reloc: &[RelocRegion]) -> Option<usize> 
 
 /// True iff the dispatch-table target's bytes look like unmapped ROM padding
 /// (all $FF) or cleared region (all $00). Port of `_dispatch_target_is_padding`.
-fn dispatch_target_is_padding(rom: &[u8], bank: u32, pc16: u32, reloc: &[RelocRegion]) -> bool {
+fn dispatch_target_is_padding(
+    rom: &[u8],
+    mapping: RomMapping,
+    bank: u32,
+    pc16: u32,
+    reloc: &[RelocRegion],
+) -> bool {
     const WINDOW: usize = 16;
-    let off = match try_rom_offset(bank, pc16, reloc) {
+    let off = match try_rom_offset(mapping, bank, pc16, reloc) {
         Some(o) => o,
         None => return true,
     };
@@ -346,14 +373,24 @@ struct Auth {
     idx_reg: char,
     table_bases: Vec<u32>,
     ptr_call: bool,
+    pointer_match: bool,
+    popped_call_frame: bool,
     targets: Vec<u32>,
     local_goto: bool,
+}
+
+fn is_long_dispatch(insn: &Insn, table_bases: &[u32]) -> bool {
+    // Opcode $DC is the three-byte `JML [abs]` form: instruction length is
+    // not the target width. Parallel tables with an explicit bank plane and
+    // ordinary four-byte JML/JSL encodings are long for the same reason.
+    insn.opcode == 0xDC || insn.length == 4 || table_bases.len() == 3
 }
 
 /// Walk the dispatch table for a `JMP/JML/JSR (abs,X)`. Port of
 /// `_autorecover_indirect_xtable`.
 fn autorecover_indirect_xtable(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     insn: &Insn,
     data_regions: Option<&[(u32, u32, u32)]>,
@@ -361,7 +398,7 @@ fn autorecover_indirect_xtable(
     func_start: u32,
 ) -> Option<Vec<u32>> {
     let base = insn.operand & 0xFFFF;
-    let entry_size: u32 = if insn.length == 4 { 3 } else { 2 };
+    let entry_size: u32 = if is_long_dispatch(insn, &[]) { 3 } else { 2 };
     let max_entries = 256usize;
     let mut entries: Vec<u32> = Vec::new();
     let mut tbl_pc = base;
@@ -384,7 +421,7 @@ fn autorecover_indirect_xtable(
         if inbank_handler_pcs.iter().any(|&h| tbl_pc >= h) {
             break;
         }
-        let off = match try_rom_offset(bank, tbl_pc & 0xFFFF, reloc) {
+        let off = match try_rom_offset(mapping, bank, tbl_pc & 0xFFFF, reloc) {
             Some(o) => o,
             None => break,
         };
@@ -417,7 +454,7 @@ fn autorecover_indirect_xtable(
         if addr_in_data_regions(data_regions, eb, addr16) {
             break;
         }
-        if dispatch_target_is_padding(rom, eb, addr16, reloc) {
+        if dispatch_target_is_padding(rom, mapping, eb, addr16, reloc) {
             break;
         }
         entries.push(full);
@@ -437,6 +474,7 @@ fn autorecover_indirect_xtable(
 /// Port of Python's `_autorecover_local_stride_runway`.
 fn autorecover_local_stride_runway(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     func_start: u32,
     site_pc: u32,
@@ -456,7 +494,7 @@ fn autorecover_local_stride_runway(
         if !(0x8000..=0xFFFF).contains(&pc) {
             return None;
         }
-        let offset = try_rom_offset(bank, pc, reloc)?;
+        let offset = try_rom_offset(mapping, bank, pc, reloc)?;
         rom.get(offset).copied()
     };
 
@@ -496,7 +534,7 @@ fn autorecover_local_stride_runway(
         || base < start
         || end.is_some_and(|limit| base >= (limit & 0xFFFF))
         || addr_in_data_regions(data_regions, bank, base)
-        || dispatch_target_is_padding(rom, bank, base, reloc)
+        || dispatch_target_is_padding(rom, mapping, bank, base, reloc)
     {
         return None;
     }
@@ -538,6 +576,7 @@ fn autorecover_local_stride_runway(
 /// dispatch pointer. Port of `_autorecover_indirect_dp`.
 fn autorecover_indirect_dp(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     func_start: u32,
     site_pc: u32,
@@ -553,7 +592,7 @@ fn autorecover_indirect_dp(
     let mut scanned = 0;
     let max_scan = 256;
     while pc < site_pc && scanned < max_scan {
-        let off = try_rom_offset(bank, pc, reloc)?;
+        let off = try_rom_offset(mapping, bank, pc, reloc)?;
         if off >= rom.len() {
             return None;
         }
@@ -624,6 +663,7 @@ fn autorecover_indirect_dp(
 /// `_autorecover_dp_table_count`.
 fn autorecover_dp_table_count(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     table_bases: &[u32],
     data_regions: Option<&[(u32, u32, u32)]>,
@@ -641,7 +681,7 @@ fn autorecover_dp_table_count(
             if tbl_pc + 1 > 0xFFFF {
                 break;
             }
-            let off = match try_rom_offset(bank, tbl_pc, reloc) {
+            let off = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
                 Some(o) => o,
                 None => break,
             };
@@ -658,7 +698,7 @@ fn autorecover_dp_table_count(
             if addr_in_data_regions(data_regions, bank, addr16) {
                 break;
             }
-            if dispatch_target_is_padding(rom, bank, addr16, reloc) {
+            if dispatch_target_is_padding(rom, mapping, bank, addr16, reloc) {
                 break;
             }
             count += 1;
@@ -674,11 +714,11 @@ fn autorecover_dp_table_count(
     };
     let mut count = 0u32;
     for i in 0..max_entries {
-        let lo_off = match try_rom_offset(bank, (lo_base + i) & 0xFFFF, reloc) {
+        let lo_off = match try_rom_offset(mapping, bank, (lo_base + i) & 0xFFFF, reloc) {
             Some(o) => o,
             None => break,
         };
-        let hi_off = match try_rom_offset(bank, (hi_base + i) & 0xFFFF, reloc) {
+        let hi_off = match try_rom_offset(mapping, bank, (hi_base + i) & 0xFFFF, reloc) {
             Some(o) => o,
             None => break,
         };
@@ -688,7 +728,7 @@ fn autorecover_dp_table_count(
         let lo = rom[lo_off] as u32;
         let hi = rom[hi_off] as u32;
         let eb = if let Some(bk) = bk_base {
-            let bk_off = match try_rom_offset(bank, (bk + i) & 0xFFFF, reloc) {
+            let bk_off = match try_rom_offset(mapping, bank, (bk + i) & 0xFFFF, reloc) {
                 Some(o) => o,
                 None => break,
             };
@@ -709,7 +749,7 @@ fn autorecover_dp_table_count(
         if addr_in_data_regions(data_regions, eb, addr16) {
             break;
         }
-        if dispatch_target_is_padding(rom, eb, addr16, reloc) {
+        if dispatch_target_is_padding(rom, mapping, eb, addr16, reloc) {
             break;
         }
         count += 1;
@@ -725,6 +765,7 @@ fn autorecover_dp_table_count(
 /// `_resolve_indirect_dispatch_targets`.
 fn resolve_indirect_dispatch_targets(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     insn: &Insn,
     count: u32,
@@ -742,6 +783,10 @@ fn resolve_indirect_dispatch_targets(
             .map(|target| {
                 if target > 0xFFFFFF {
                     None
+                } else if target == 0 {
+                    // Preserve an explicit null slot instead of turning it
+                    // into bank:$0000; every downstream consumer skips zero.
+                    Some(0)
                 } else if target > 0xFFFF {
                     Some(target)
                 } else {
@@ -760,15 +805,15 @@ fn resolve_indirect_dispatch_targets(
         };
         let mut entries = Vec::new();
         for i in 0..count {
-            let lo_off = try_rom_offset(bank, (lo_base + i) & 0xFFFF, reloc)?;
-            let hi_off = try_rom_offset(bank, (hi_base + i) & 0xFFFF, reloc)?;
+            let lo_off = try_rom_offset(mapping, bank, (lo_base + i) & 0xFFFF, reloc)?;
+            let hi_off = try_rom_offset(mapping, bank, (hi_base + i) & 0xFFFF, reloc)?;
             if lo_off.max(hi_off) >= rom.len() {
                 return None;
             }
             let lo = rom[lo_off] as u32;
             let hi = rom[hi_off] as u32;
             if let Some(bk) = bk_base {
-                let bk_off = try_rom_offset(bank, (bk + i) & 0xFFFF, reloc)?;
+                let bk_off = try_rom_offset(mapping, bank, (bk + i) & 0xFFFF, reloc)?;
                 if bk_off >= rom.len() {
                     return None;
                 }
@@ -786,14 +831,14 @@ fn resolve_indirect_dispatch_targets(
     } else {
         insn.operand & 0xFFFF
     };
-    let entry_size: u32 = if insn.length == 4 { 3 } else { 2 };
+    let entry_size: u32 = if is_long_dispatch(insn, bases) { 3 } else { 2 };
     let mut entries = Vec::new();
     let mut tbl_pc = base;
     for _ in 0..count {
         if tbl_pc + entry_size - 1 > 0xFFFF {
             return None;
         }
-        let off = try_rom_offset(bank, tbl_pc & 0xFFFF, reloc)?;
+        let off = try_rom_offset(mapping, bank, tbl_pc & 0xFFFF, reloc)?;
         if off + (entry_size as usize) > rom.len() {
             return None;
         }
@@ -814,13 +859,14 @@ fn resolve_indirect_dispatch_targets(
 /// Return the hardware RTS destination for `PEA <ret-1>; JMP (ptr)`.
 fn pea_ptrcall_return_pc(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     pc: u32,
     fallback_next: u32,
     reloc: &[RelocRegion],
 ) -> u32 {
     let prev_pc = pc.wrapping_sub(3) & 0xFFFF;
-    let Some(off) = try_rom_offset(bank, prev_pc, reloc) else {
+    let Some(off) = try_rom_offset(mapping, bank, prev_pc, reloc) else {
         return fallback_next & 0xFFFF;
     };
     if off + 2 >= rom.len() || rom[off] != 0xF4 {
@@ -874,19 +920,19 @@ fn labeled_successors(
             )];
         }
         if insn.mode == Mode::Long {
-            let tgt = insn.operand & 0xFFFFFF;
-            if ((tgt >> 16) & 0xFF) == bank {
-                return vec![(
-                    DecodeKey::with_stack(tgt, post_m, post_x, post_p_stack),
-                    "jump",
-                )];
-            }
+            // JML is a cross-routine tail transfer even when its explicit
+            // bank byte happens to equal the current bank. The program
+            // analyzer records a direct-tail demand; importing the target
+            // body here would merge two ABI/exit domains.
             return vec![];
         }
         return vec![];
     }
 
     if mnem == "JSR" || mnem == "JSL" {
+        if insn.terminal_jsr {
+            return vec![];
+        }
         let (mut ret_m, mut ret_x) = (post_m, post_x);
         let target_pc24: Option<u32> =
             if mnem == "JSR" && insn.length == 3 && insn.mode != Mode::IndirX {
@@ -942,6 +988,12 @@ fn labeled_successors(
                     let mut pairs: Vec<(u8, u8)> = v.iter().map(|&(m, x)| (m & 1, x & 1)).collect();
                     pairs.sort();
                     pairs.dedup();
+                    if pairs.is_empty() {
+                        // A proven empty exit set means the callee never
+                        // resumes this call site. This is a terminal edge,
+                        // not an unknown return width.
+                        return vec![];
+                    }
                     let mut succs = Vec::new();
                     for (em, ex) in pairs {
                         succs.push((
@@ -994,9 +1046,10 @@ pub fn decode_function(
     end: Option<u32>,
     env: &DecodeEnv,
 ) -> FunctionDecodeGraph {
+    let mapping = env.rom_mapping;
     let reloc: &[RelocRegion] = env.reloc_regions.unwrap_or(&[]);
     let data_regions = env.data_regions;
-    let max_insns = 12000usize;
+    let max_insns = env.max_insns.unwrap_or(4096);
 
     let entry_m = entry_m & 1;
     let entry_x = entry_x & 1;
@@ -1034,32 +1087,54 @@ pub fn decode_function(
         // Boundary-crossing fall-through past end:.
         if let Some(end_v) = end {
             if pc >= end_v && edge_kind == "fall" && pred_pc >= 0 && (pred_pc as u32) < end_v {
+                let boundary = (addr24(bank, pred_pc as u32), key.clone());
+                if !graph.boundary_exits.contains(&boundary) {
+                    graph.boundary_exits.push(boundary);
+                }
                 continue;
             }
         }
         // Jump edge onto a named sibling function entry.
         if let Some(sib) = env.sibling_entry_pcs {
             if edge_kind == "jump" && sib.contains(&pc) && !pred_in_territory {
+                let boundary = (addr24(bank, pred_pc as u32), key.clone());
+                if !graph.boundary_exits.contains(&boundary) {
+                    graph.boundary_exits.push(boundary);
+                }
                 continue;
             }
         }
         // Address-range gate.
         let in_reloc = addr_in_reloc_region(bank, pc, reloc).is_some();
-        if !in_reloc && !(0x8000..=0xFFFF).contains(&pc) {
+        if !in_reloc && !is_rom_address(mapping, bank, pc) {
             continue;
         }
-        let offset = match try_rom_offset(bank, pc, reloc) {
+        let offset = match try_rom_offset(mapping, bank, pc, reloc) {
             Some(o) => o,
             None => continue,
         };
         if offset >= rom.len() {
             continue;
         }
+        if addr_in_data_regions(data_regions, bank, pc) {
+            graph.data_region_exec_pcs.insert(addr24(bank, pc));
+        }
 
         let mut insn = decode_insn(rom, offset, pc, bank, key.m, key.x)
             .unwrap_or_else(|| panic!("v2 decoder: unknown opcode at ${bank:02X}:{pc:04X}"));
         insn.m_flag = key.m;
         insn.x_flag = key.x;
+        if env
+            .terminal_jsr_sites
+            .is_some_and(|sites| sites.contains(&(insn.addr & 0xFFFFFF)))
+        {
+            assert!(
+                insn.mnem == "JSR" && insn.mode != Mode::IndirX && insn.length == 3,
+                "terminal_jsr at ${:06X} does not name a direct three-byte JSR",
+                insn.addr & 0xFFFFFF
+            );
+            insn.terminal_jsr = true;
+        }
 
         // JSL/JML dispatch-helper table.
         let is_jsl_or_jml = insn.mnem == "JSL" || (insn.mnem == "JMP" && insn.length == 4);
@@ -1074,7 +1149,7 @@ pub fn decode_function(
             let mut entries: Vec<u32> = Vec::new();
             let mut tbl_pc = (pc + insn.length as u32) & 0xFFFF;
             while entries.len() < 256 && tbl_pc + entry_size - 1 <= 0xFFFF {
-                let tbl_off = match try_rom_offset(bank, tbl_pc, reloc) {
+                let tbl_off = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
                     Some(o) => o,
                     None => break,
                 };
@@ -1098,7 +1173,7 @@ pub fn decode_function(
                     if !is_valid_lorom_bank {
                         break;
                     }
-                    if dispatch_target_is_padding(rom, eb, addr16, reloc) {
+                    if dispatch_target_is_padding(rom, mapping, eb, addr16, reloc) {
                         break;
                     }
                     if addr_in_data_regions(data_regions, eb, addr16) {
@@ -1122,7 +1197,7 @@ pub fn decode_function(
                     if addr16 < 0x8000 && addr_in_reloc_region(bank, addr16, reloc).is_none() {
                         break;
                     }
-                    if dispatch_target_is_padding(rom, bank, addr16, reloc) {
+                    if dispatch_target_is_padding(rom, mapping, bank, addr16, reloc) {
                         break;
                     }
                     if addr_in_data_regions(data_regions, bank, addr16) {
@@ -1163,19 +1238,31 @@ pub fn decode_function(
                         idx_reg: s.idx_reg,
                         table_bases: s.table_bases.clone(),
                         ptr_call: s.ptr_call,
+                        pointer_match: s.pointer_match,
+                        popped_call_frame: s.popped_call_frame,
                         targets: s.targets.clone(),
                         local_goto: false,
                     });
             if auth.is_none() && insn.mode == Mode::IndirX {
-                if let Some(entries) =
-                    autorecover_indirect_xtable(rom, bank, &insn, data_regions, reloc, start)
-                {
+                if let Some(entries) = autorecover_indirect_xtable(
+                    rom,
+                    mapping,
+                    bank,
+                    &insn,
+                    data_regions,
+                    reloc,
+                    start,
+                ) {
                     auth = Some(Auth {
                         count: entries.len() as u32,
                         idx_reg: 'X',
                         table_bases: vec![],
                         ptr_call: false,
-                        targets: vec![],
+                        pointer_match: false,
+                        popped_call_frame: false,
+                        // Preserve tolerated null slots; re-reading only the
+                        // count would turn raw $0000 into bank:$0000.
+                        targets: entries,
                         local_goto: false,
                     });
                 }
@@ -1183,17 +1270,31 @@ pub fn decode_function(
             if auth.is_none() && insn.mode == Mode::Indir {
                 let dp_op = insn.operand & 0xFFFF;
                 if dp_op <= 0x00FF {
-                    if let Some((table_bases, idx_reg)) =
-                        autorecover_indirect_dp(rom, bank, start, pc, dp_op, insn.length, reloc)
-                    {
-                        if let Some(count) =
-                            autorecover_dp_table_count(rom, bank, &table_bases, data_regions, reloc)
-                        {
+                    if let Some((table_bases, idx_reg)) = autorecover_indirect_dp(
+                        rom,
+                        mapping,
+                        bank,
+                        start,
+                        pc,
+                        dp_op,
+                        insn.length,
+                        reloc,
+                    ) {
+                        if let Some(count) = autorecover_dp_table_count(
+                            rom,
+                            mapping,
+                            bank,
+                            &table_bases,
+                            data_regions,
+                            reloc,
+                        ) {
                             auth = Some(Auth {
                                 count,
                                 idx_reg,
                                 table_bases,
                                 ptr_call: false,
+                                pointer_match: false,
+                                popped_call_frame: false,
                                 targets: vec![],
                                 local_goto: false,
                             });
@@ -1203,23 +1304,29 @@ pub fn decode_function(
             }
             if auth.is_none() && insn.mode == Mode::Indir && (insn.operand & 0xFFFF) >= 0x8000 {
                 let tbl_pc = insn.operand & 0xFFFF;
-                let need = if insn.length == 4 { 3usize } else { 2usize };
-                let rom_ok = match try_rom_offset(bank, tbl_pc, reloc) {
+                let need = if is_long_dispatch(&insn, &[]) {
+                    3usize
+                } else {
+                    2usize
+                };
+                let rom_ok = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
                     Some(tbl_off) => tbl_off + need - 1 < rom.len(),
                     None => false,
                 };
                 if rom_ok {
-                    let tbl_off = try_rom_offset(bank, tbl_pc, reloc).unwrap();
+                    let tbl_off = try_rom_offset(mapping, bank, tbl_pc, reloc).unwrap();
                     let tgt16 = rom[tbl_off] as u32 | ((rom[tbl_off + 1] as u32) << 8);
                     if tgt16 >= 0x8000
                         && !addr_in_data_regions(data_regions, bank, tgt16)
-                        && !dispatch_target_is_padding(rom, bank, tgt16, reloc)
+                        && !dispatch_target_is_padding(rom, mapping, bank, tgt16, reloc)
                     {
                         auth = Some(Auth {
                             count: 1,
                             idx_reg: 'X',
                             table_bases: vec![tbl_pc],
                             ptr_call: false,
+                            pointer_match: false,
+                            popped_call_frame: false,
                             targets: vec![],
                             local_goto: false,
                         });
@@ -1229,6 +1336,7 @@ pub fn decode_function(
             if auth.is_none() && insn.mode == Mode::Indir {
                 if let Some(entries) = autorecover_local_stride_runway(
                     rom,
+                    mapping,
                     bank,
                     start,
                     pc,
@@ -1242,6 +1350,8 @@ pub fn decode_function(
                         idx_reg: 'X',
                         table_bases: vec![insn.operand & 0xFFFF],
                         ptr_call: false,
+                        pointer_match: false,
+                        popped_call_frame: false,
                         targets: entries,
                         local_goto: true,
                     });
@@ -1250,6 +1360,7 @@ pub fn decode_function(
             if let Some(auth) = auth {
                 if let Some(entries) = resolve_indirect_dispatch_targets(
                     rom,
+                    mapping,
                     bank,
                     &insn,
                     auth.count,
@@ -1259,7 +1370,7 @@ pub fn decode_function(
                 ) {
                     insn.dispatch_entries = Some(entries.clone());
                     insn.dispatch_kind = Some(
-                        if insn.length == 4 || auth.table_bases.len() == 3 {
+                        if is_long_dispatch(&insn, &auth.table_bases) {
                             "long"
                         } else {
                             "short"
@@ -1267,8 +1378,23 @@ pub fn decode_function(
                         .to_string(),
                     );
                     insn.dispatch_idx_reg = Some(auth.idx_reg);
-                    insn.dispatch_table_bases = auth.table_bases.clone();
+                    insn.dispatch_table_bases = if auth.pointer_match || auth.ptr_call {
+                        vec![insn.operand & 0xFFFF]
+                    } else {
+                        auth.table_bases.clone()
+                    };
                     insn.dispatch_local_goto = auth.local_goto;
+                    insn.dispatch_call = auth.ptr_call;
+                    insn.dispatch_pointer_match = auth.pointer_match;
+                    insn.dispatch_popped_call_frame = auth.popped_call_frame;
+                    if auth.ptr_call {
+                        insn.dispatch_consumed_stack_bytes =
+                            if is_long_dispatch(&insn, &auth.table_bases) {
+                                3
+                            } else {
+                                2
+                            };
+                    }
                     if inline_loop_sites.contains(&pc) {
                         insn.inline_dispatch_loop = true;
                         inline_pcs.insert(pc);
@@ -1293,6 +1419,7 @@ pub fn decode_function(
                     let succ: Vec<DecodeKey> = if auth.ptr_call {
                         let next_pc = pea_ptrcall_return_pc(
                             rom,
+                            mapping,
                             bank,
                             pc,
                             (pc + insn.length as u32) & 0xFFFF,
@@ -1347,12 +1474,75 @@ pub fn decode_function(
             continue;
         }
 
+        // Explicit PEI;RTS internal computed transfer. DKC2 stores a
+        // return-address-minus-one in DP, PEI pushes it, and the following
+        // RTS jumps to one of the finite cfg targets. This is a same-function
+        // goto: it creates no whole-program call demand and preserves M/X.
+        if insn.mnem == "PEI" {
+            let site_pc24 = (bank << 16) | pc;
+            if let Some(site) = env
+                .indirect_dispatch
+                .and_then(|m| m.get(&site_pc24))
+                .filter(|site| site.rts_stack)
+            {
+                if let Some(entries) = resolve_indirect_dispatch_targets(
+                    rom,
+                    mapping,
+                    bank,
+                    &insn,
+                    site.count,
+                    &site.table_bases,
+                    &site.targets,
+                    reloc,
+                ) {
+                    insn.dispatch_entries = Some(entries.clone());
+                    insn.dispatch_kind = Some("short".to_string());
+                    insn.dispatch_idx_reg = Some('X');
+                    insn.dispatch_terminal = true;
+                    insn.dispatch_local_goto = true;
+                    insn.dispatch_stack_pointer = true;
+                    let site_m = insn.m_flag & 1;
+                    let site_x = insn.x_flag & 1;
+                    let mut labeled_succ = Vec::new();
+                    for &entry in &entries {
+                        if entry == 0 {
+                            continue;
+                        }
+                        let eb = (entry >> 16) & 0xFF;
+                        let e16 = entry & 0xFFFF;
+                        if eb == bank
+                            && ((0x8000..=0xFFFF).contains(&e16)
+                                || addr_in_reloc_region(eb, e16, reloc).is_some())
+                        {
+                            labeled_succ.push((
+                                DecodeKey::new(addr24(eb, e16), site_m, site_x),
+                                "dispatch",
+                            ));
+                        }
+                    }
+                    let successors = labeled_succ.iter().map(|(key, _)| key.clone()).collect();
+                    graph.insert(DecodedInsn {
+                        key,
+                        insn,
+                        successors,
+                    });
+                    for (successor, kind) in labeled_succ {
+                        if !graph.contains(&successor) {
+                            worklist.push((successor, kind, pc as i64));
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
         // cfg indirect_dispatch for RTS-stack PHA dispatchers.
         if insn.mnem == "PHA" {
             let site_pc24 = (bank << 16) | pc;
             if let Some(site) = env.indirect_dispatch.and_then(|m| m.get(&site_pc24)) {
                 if let Some(entries) = resolve_indirect_dispatch_targets(
                     rom,
+                    mapping,
                     bank,
                     &insn,
                     site.count,
@@ -1362,7 +1552,7 @@ pub fn decode_function(
                 ) {
                     insn.dispatch_entries = Some(entries.clone());
                     insn.dispatch_kind = Some(
-                        if site.table_bases.len() == 3 {
+                        if is_long_dispatch(&insn, &site.table_bases) {
                             "long"
                         } else {
                             "short"
@@ -1414,19 +1604,31 @@ pub fn decode_function(
                     idx_reg: s.idx_reg,
                     table_bases: s.table_bases.clone(),
                     ptr_call: s.ptr_call,
+                    pointer_match: s.pointer_match,
+                    popped_call_frame: s.popped_call_frame,
                     targets: s.targets.clone(),
                     local_goto: false,
                 });
             if ud_auth.is_none() {
-                if let Some(entries) =
-                    autorecover_indirect_xtable(rom, bank, &insn, data_regions, reloc, start)
-                {
+                if let Some(entries) = autorecover_indirect_xtable(
+                    rom,
+                    mapping,
+                    bank,
+                    &insn,
+                    data_regions,
+                    reloc,
+                    start,
+                ) {
                     ud_auth = Some(Auth {
                         count: entries.len() as u32,
                         idx_reg: 'X',
                         table_bases: vec![],
                         ptr_call: false,
-                        targets: vec![],
+                        pointer_match: false,
+                        popped_call_frame: false,
+                        // Preserve tolerated null slots; re-reading only the
+                        // count would turn raw $0000 into bank:$0000.
+                        targets: entries,
                         local_goto: false,
                     });
                 }
@@ -1434,6 +1636,7 @@ pub fn decode_function(
             if let Some(ud) = &ud_auth {
                 if let Some(entries) = resolve_indirect_dispatch_targets(
                     rom,
+                    mapping,
                     bank,
                     &insn,
                     ud.count,
@@ -1443,7 +1646,7 @@ pub fn decode_function(
                 ) {
                     insn.dispatch_entries = Some(entries.clone());
                     insn.dispatch_kind = Some(
-                        if insn.length == 4 || ud.table_bases.len() == 3 {
+                        if is_long_dispatch(&insn, &ud.table_bases) {
                             "long"
                         } else {
                             "short"
@@ -1451,30 +1654,73 @@ pub fn decode_function(
                         .to_string(),
                     );
                     insn.dispatch_idx_reg = Some(ud.idx_reg);
-                    insn.dispatch_table_bases = ud.table_bases.clone();
-                    let mut labeled_succ = labeled_successors(
-                        &insn,
-                        &key,
-                        bank,
-                        env,
-                        rom,
-                        &mut graph.unknown_callee_exit_sites,
-                    );
+                    insn.dispatch_call = true;
+                    insn.dispatch_pointer_match = ud.ptr_call;
+                    insn.dispatch_table_bases = if ud.ptr_call {
+                        vec![insn.operand & 0xFFFF]
+                    } else {
+                        ud.table_bases.clone()
+                    };
                     let site_m = insn.m_flag & 1;
                     let site_x = insn.x_flag & 1;
+                    let kind = insn.dispatch_kind.as_deref();
+                    let mut return_modes = HashSet::new();
+                    let mut missing_targets = Vec::new();
                     for &e in &entries {
                         if e == 0 {
                             continue;
                         }
-                        let eb = (e >> 16) & 0xFF;
-                        let e16 = e & 0xFFFF;
-                        if eb == bank && (0x8000..=0xFFFF).contains(&e16) {
-                            labeled_succ
-                                .push((DecodeKey::new(addr24(eb, e16), site_m, site_x), "jump"));
+                        let target_pc24 = if kind == Some("long") {
+                            e & 0xFFFFFF
+                        } else {
+                            addr24(bank, e & 0xFFFF)
+                        };
+                        match lookup_exit_mx_modes(
+                            env.callee_exit_mx,
+                            env.callee_exit_mx_modes,
+                            target_pc24,
+                            site_m,
+                            site_x,
+                        ) {
+                            Some(modes) => return_modes.extend(modes),
+                            None => missing_targets.push(target_pc24),
                         }
                     }
-                    let succ: Vec<DecodeKey> =
-                        labeled_succ.iter().map(|(k, _)| k.clone()).collect();
+                    let labeled_succ =
+                        if !missing_targets.is_empty() && env.stop_on_unknown_callee_exit {
+                            for target_pc24 in missing_targets {
+                                let item = (insn.addr & 0xFFFFFF, target_pc24, site_m, site_x);
+                                if !graph.unknown_callee_exit_sites.contains(&item) {
+                                    graph.unknown_callee_exit_sites.push(item);
+                                }
+                            }
+                            Vec::new()
+                        } else {
+                            if !missing_targets.is_empty() || return_modes.is_empty() {
+                                return_modes.insert((site_m, site_x));
+                            }
+                            let mut modes: Vec<_> = return_modes.into_iter().collect();
+                            modes.sort();
+                            let return_pc = (pc + insn.length as u32) & 0xFFFF;
+                            modes
+                                .into_iter()
+                                .map(|(m, x)| {
+                                    (
+                                        DecodeKey::with_stack(
+                                            addr24(bank, return_pc),
+                                            m & 1,
+                                            x & 1,
+                                            key.p_stack.clone(),
+                                        ),
+                                        "fall",
+                                    )
+                                })
+                                .collect()
+                        };
+                    let succ: Vec<DecodeKey> = labeled_succ
+                        .iter()
+                        .map(|(successor, _)| successor.clone())
+                        .collect();
                     graph.insert(DecodedInsn {
                         key,
                         insn,
@@ -1500,7 +1746,7 @@ pub fn decode_function(
                     if tbl_pc + entry_size - 1 > 0xFFFF {
                         break;
                     }
-                    let tbl_off = match try_rom_offset(bank, tbl_pc, reloc) {
+                    let tbl_off = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
                         Some(o) => o,
                         None => break,
                     };
@@ -1850,6 +2096,297 @@ fn direct_tail_exit_keys(graph: &FunctionDecodeGraph, di: &DecodedInsn) -> Vec<(
     Vec::new()
 }
 
+/// Prove the narrow `TSC; STA scratch ... LDA scratch; TCS` entry-stack
+/// restore idiom used by DKC2's 3D background builder.
+fn entry_stack_restore_tcs_keys(graph: &FunctionDecodeGraph) -> HashSet<DecodeKey> {
+    let Some(entry) = graph.entry.as_ref() else {
+        return HashSet::new();
+    };
+    let Some(entry_di) = graph.get(entry) else {
+        return HashSet::new();
+    };
+    if entry_di.insn.mnem != "TSC" || entry_di.successors.len() != 1 {
+        return HashSet::new();
+    }
+    let save_key = &entry_di.successors[0];
+    let Some(save_di) = graph.get(save_key) else {
+        return HashSet::new();
+    };
+    let save = &save_di.insn;
+    if save.mnem != "STA" || (save.m_flag & 1) != 0 || save.mode == Mode::Imm {
+        return HashSet::new();
+    }
+    let scratch = save.operand & 0xFFFFFF;
+    let scratch_mode = save.mode;
+    let is_writer = |mnem: &str| {
+        matches!(
+            mnem,
+            "STA"
+                | "STX"
+                | "STY"
+                | "STZ"
+                | "INC"
+                | "DEC"
+                | "ASL"
+                | "LSR"
+                | "ROL"
+                | "ROR"
+                | "TRB"
+                | "TSB"
+        )
+    };
+    for di in graph.insns() {
+        let ins = &di.insn;
+        if matches!(ins.mnem, "JSR" | "JSL" | "PLD" | "TCD") {
+            return HashSet::new();
+        }
+        if is_writer(ins.mnem)
+            && ins.mode == scratch_mode
+            && (ins.operand & 0xFFFFFF) == scratch
+            && &di.key != save_key
+        {
+            return HashSet::new();
+        }
+    }
+
+    let mut predecessors: HashMap<DecodeKey, HashSet<DecodeKey>> = HashMap::new();
+    for di in graph.insns() {
+        for successor in &di.successors {
+            if graph.contains(successor) {
+                predecessors
+                    .entry(successor.clone())
+                    .or_default()
+                    .insert(di.key.clone());
+            }
+        }
+    }
+
+    let mut restores = HashSet::new();
+    for di in graph.insns() {
+        if di.insn.mnem != "TCS" {
+            continue;
+        }
+        let Some(preds) = predecessors.get(&di.key) else {
+            continue;
+        };
+        if preds.len() != 1 {
+            continue;
+        }
+        let Some(load_di) = graph.get(preds.iter().next().unwrap()) else {
+            continue;
+        };
+        let load = &load_di.insn;
+        if load.mnem == "LDA"
+            && (load.m_flag & 1) == 0
+            && load.mode == scratch_mode
+            && (load.operand & 0xFFFFFF) == scratch
+        {
+            restores.insert(di.key.clone());
+        }
+    }
+    restores
+}
+
+/// Local guest-stack deltas reaching each architectural return instruction.
+/// `None` is an indeterminate height after TCS/TXS.
+fn return_stack_delta_states(graph: &FunctionDecodeGraph) -> HashMap<u32, HashSet<Option<i32>>> {
+    fn local_delta(ins: &Insn) -> Option<i32> {
+        if ins.dispatch_consumed_stack_bytes != 0 {
+            return Some(-(ins.dispatch_consumed_stack_bytes as i32));
+        }
+        if ins.mnem == "PEI" && ins.dispatch_stack_pointer {
+            return Some(0);
+        }
+        match ins.mnem {
+            "PEA" | "PEI" | "PER" | "PHD" => Some(2),
+            "PHP" | "PHB" | "PHK" => Some(1),
+            "PHA" => Some(if (ins.m_flag & 1) != 0 { 1 } else { 2 }),
+            "PHX" | "PHY" => Some(if (ins.x_flag & 1) != 0 { 1 } else { 2 }),
+            "PLD" => Some(-2),
+            "PLP" | "PLB" => Some(-1),
+            "PLA" => Some(if (ins.m_flag & 1) != 0 { -1 } else { -2 }),
+            "PLX" | "PLY" => Some(if (ins.x_flag & 1) != 0 { -1 } else { -2 }),
+            "TCS" | "TXS" => None,
+            _ => Some(0),
+        }
+    }
+
+    let restoring_tcs = entry_stack_restore_tcs_keys(graph);
+    let Some(entry) = graph.entry.as_ref() else {
+        return HashMap::new();
+    };
+    let mut in_states: HashMap<DecodeKey, HashSet<Option<i32>>> =
+        HashMap::from([(entry.clone(), HashSet::from([Some(0)]))]);
+    let mut worklist = vec![entry.clone()];
+    let mut returns: HashMap<u32, HashSet<Option<i32>>> = HashMap::new();
+    while let Some(key) = worklist.pop() {
+        let Some(di) = graph.get(&key) else {
+            continue;
+        };
+        let states = in_states.get(&key).cloned().unwrap_or_default();
+        if states.is_empty() {
+            continue;
+        }
+        let ins = &di.insn;
+        if matches!(ins.mnem, "RTS" | "RTL" | "RTI") {
+            returns
+                .entry(ins.addr & 0xFFFFFF)
+                .or_default()
+                .extend(states);
+            continue;
+        }
+        let mut next_states = HashSet::new();
+        if restoring_tcs.contains(&key) {
+            next_states.insert(Some(0));
+        } else {
+            let delta = local_delta(ins);
+            for state in states {
+                next_states.insert(match (state, delta) {
+                    (Some(value), Some(change)) => Some((value + change).clamp(-64, 64)),
+                    _ => None,
+                });
+            }
+        }
+        for successor in &di.successors {
+            if !graph.contains(successor) {
+                continue;
+            }
+            let old = in_states.get(successor).cloned().unwrap_or_default();
+            let mut merged = old.clone();
+            merged.extend(next_states.iter().copied());
+            if merged != old {
+                in_states.insert(successor.clone(), merged);
+                worklist.push(successor.clone());
+            }
+        }
+    }
+    returns
+}
+
+/// Deterministic structured diagnostic for the env-gated solver snapshot.
+pub fn function_return_stack_delta_states(
+    graph: &FunctionDecodeGraph,
+) -> std::collections::BTreeMap<u32, Vec<Option<i32>>> {
+    return_stack_delta_states(graph)
+        .into_iter()
+        .map(|(pc24, states)| {
+            let mut states: Vec<_> = states.into_iter().collect();
+            states.sort();
+            (pc24, states)
+        })
+        .collect()
+}
+
+fn return_frame_size(ins: &Insn) -> Option<i32> {
+    match ins.mnem {
+        "RTS" => Some(2),
+        "RTL" => Some(3),
+        _ => None,
+    }
+}
+
+fn return_site_is_partial_nlr(
+    ins: &Insn,
+    states_by_pc: &HashMap<u32, HashSet<Option<i32>>>,
+) -> bool {
+    let Some(frame) = return_frame_size(ins) else {
+        return false;
+    };
+    let Some(states) = states_by_pc.get(&(ins.addr & 0xFFFFFF)) else {
+        return false;
+    };
+    !states.is_empty()
+        && states
+            .iter()
+            .all(|state| matches!(state, Some(value) if *value > 0 && *value < frame))
+}
+
+fn has_unproven_nonlocal_return(
+    graph: &FunctionDecodeGraph,
+    states_by_pc: &HashMap<u32, HashSet<Option<i32>>>,
+) -> bool {
+    for di in graph.insns() {
+        let ins = &di.insn;
+        if !matches!(ins.mnem, "RTS" | "RTL" | "RTI") {
+            continue;
+        }
+        let frame = return_frame_size(ins);
+        for state in states_by_pc
+            .get(&(ins.addr & 0xFFFFFF))
+            .into_iter()
+            .flatten()
+        {
+            match state {
+                None => return true,
+                Some(value) if *value > 0 && frame.is_none_or(|size| *value >= size) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Return this graph's local exits and exact tail/dispatch exit dependencies.
+/// This equation form lets the whole-program analyzer prove a closed recursive
+/// component without guessing that any callee preserves M/X.
+pub fn function_exit_mx_equation(
+    graph: &FunctionDecodeGraph,
+) -> (HashSet<(u8, u8)>, HashSet<(u32, u8, u8)>) {
+    let mut local_modes = HashSet::new();
+    let mut dependencies = HashSet::new();
+    let return_states = return_stack_delta_states(graph);
+    if has_unproven_nonlocal_return(graph, &return_states) {
+        dependencies.insert((0xFFFFFFFF, 0, 0));
+    }
+
+    for di in graph.insns() {
+        let ins = &di.insn;
+        if matches!(ins.mnem, "RTS" | "RTL" | "RTI") {
+            if return_site_is_partial_nlr(ins, &return_states) {
+                continue;
+            }
+            local_modes.insert((ins.m_flag & 1, ins.x_flag & 1));
+            continue;
+        }
+        let tail_keys = direct_tail_exit_keys(graph, di);
+        if !tail_keys.is_empty() {
+            dependencies.extend(
+                tail_keys
+                    .into_iter()
+                    .map(|(target, m, x)| (target & 0xFFFFFF, m & 1, x & 1)),
+            );
+            continue;
+        }
+        let is_dispatch_term = ins.dispatch_entries.is_some()
+            && di.successors.is_empty()
+            && matches!(ins.mnem, "JSL" | "JMP");
+        if !is_dispatch_term {
+            continue;
+        }
+        let site_m = ins.m_flag & 1;
+        let site_x = ins.x_flag & 1;
+        let dispatcher_bank = (ins.addr >> 16) & 0xFF;
+        let kind = ins.dispatch_kind.as_deref();
+        for &entry in ins.dispatch_entries.as_deref().unwrap_or(&[]) {
+            if entry == 0 {
+                continue;
+            }
+            let target = if kind == Some("long") {
+                entry & 0xFFFFFF
+            } else {
+                (dispatcher_bank << 16) | (entry & 0xFFFF)
+            };
+            dependencies.insert((target, site_m, site_x));
+        }
+    }
+    for (_, target) in &graph.boundary_exits {
+        dependencies.insert((target.pc & 0xFFFFFF, target.m & 1, target.x & 1));
+    }
+    (local_modes, dependencies)
+}
+
 fn lookup_exit_mx(
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
     pc24: u32,
@@ -1927,6 +2464,11 @@ pub fn analyze_function_exit_mx(
         }
     }
 
+    let return_states = return_stack_delta_states(graph);
+    if has_unproven_nonlocal_return(graph, &return_states) {
+        return (None, None);
+    }
+
     let mut exit_m: Option<u8> = None;
     let mut exit_x: Option<u8> = None;
     let mut have_any = false;
@@ -1936,6 +2478,9 @@ pub fn analyze_function_exit_mx(
     for di in graph.insns() {
         let ins = &di.insn;
         if ins.mnem == "RTS" || ins.mnem == "RTL" || ins.mnem == "RTI" {
+            if return_site_is_partial_nlr(ins, &return_states) {
+                continue;
+            }
             accumulate(
                 ins.m_flag & 1,
                 ins.x_flag & 1,
@@ -2002,6 +2547,21 @@ pub fn analyze_function_exit_mx(
         }
     }
 
+    for (_, target) in &graph.boundary_exits {
+        let Some((em, ex)) = lookup_exit_mx(callee_exit_mx, target.pc, target.m, target.x) else {
+            return (None, None);
+        };
+        accumulate(
+            em & 1,
+            ex & 1,
+            &mut exit_m,
+            &mut exit_x,
+            &mut have_any,
+            &mut m_ambig,
+            &mut x_ambig,
+        );
+    }
+
     if m_ambig {
         exit_m = None;
     }
@@ -2030,10 +2590,17 @@ pub fn analyze_function_exit_mx_modes_with_sets(
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
     callee_exit_mx_modes: Option<&HashMap<(u32, u8, u8), Vec<(u8, u8)>>>,
 ) -> Option<Vec<(u8, u8)>> {
+    let return_states = return_stack_delta_states(graph);
+    if has_unproven_nonlocal_return(graph, &return_states) {
+        return None;
+    }
     let mut modes: HashSet<(u8, u8)> = HashSet::new();
     for di in graph.insns() {
         let ins = &di.insn;
         if ins.mnem == "RTS" || ins.mnem == "RTL" || ins.mnem == "RTI" {
+            if return_site_is_partial_nlr(ins, &return_states) {
+                continue;
+            }
             modes.insert((ins.m_flag & 1, ins.x_flag & 1));
             continue;
         }
@@ -2077,18 +2644,37 @@ pub fn analyze_function_exit_mx_modes_with_sets(
             }
         }
     }
-    if modes.is_empty() {
-        None
-    } else {
-        let mut v: Vec<(u8, u8)> = modes.into_iter().collect();
-        v.sort();
-        Some(v)
+
+    for (_, target) in &graph.boundary_exits {
+        modes.extend(lookup_exit_mx_modes(
+            callee_exit_mx,
+            callee_exit_mx_modes,
+            target.pc,
+            target.m,
+            target.x,
+        )?);
     }
+    if !graph.unresolved_indirects.is_empty()
+        || !graph.suppressed_indirect_calls.is_empty()
+        || !graph.unknown_callee_exit_sites.is_empty()
+    {
+        return None;
+    }
+    // Empty is a complete proof for a closed graph with no architectural
+    // return path; None is reserved for unresolved dependencies.
+    let mut v: Vec<(u8, u8)> = modes.into_iter().collect();
+    v.sort();
+    Some(v)
 }
 
 /// Classify a JSL-jump-table dispatch helper: Some("short"|"long") or None.
 /// Port of `classify_dispatch_helper`.
-pub fn classify_dispatch_helper(rom: &[u8], bank: u32, addr: u32) -> Option<&'static str> {
+pub fn classify_dispatch_helper(
+    rom: &[u8],
+    mapping: RomMapping,
+    bank: u32,
+    addr: u32,
+) -> Option<&'static str> {
     let mut insns: Vec<Insn> = Vec::new();
     let mut pc = addr & 0xFFFF;
     let mut m = 1u8;
@@ -2096,10 +2682,10 @@ pub fn classify_dispatch_helper(rom: &[u8], bank: u32, addr: u32) -> Option<&'st
     let mut safety = 0;
     while safety < 256 {
         safety += 1;
-        if !(0x8000..=0xFFFF).contains(&pc) {
+        if !is_rom_address(mapping, bank, pc) {
             return None;
         }
-        let offset = lorom_offset_opt(bank, pc)?;
+        let offset = rom_offset_opt(mapping, bank, pc)?;
         if offset >= rom.len() {
             return None;
         }
@@ -2171,6 +2757,7 @@ pub fn classify_dispatch_helper(rom: &[u8], bank: u32, addr: u32) -> Option<&'st
 /// return address from being classified as inline-argument callees.
 pub fn detect_inline_arg_bytes(
     rom: &[u8],
+    mapping: RomMapping,
     bank: u32,
     addr: u32,
     entry_m: u8,
@@ -2254,7 +2841,7 @@ pub fn detect_inline_arg_bytes(
     let mut y_added = 0u32;
 
     for _ in 0..96 {
-        let offset = lorom_offset_opt(bank, pc)?;
+        let offset = rom_offset_opt(mapping, bank, pc)?;
         if offset >= rom.len() {
             return None;
         }
@@ -2316,14 +2903,9 @@ pub fn detect_inline_arg_bytes(
     None
 }
 
-/// `lorom_offset` returning `None` instead of panicking out of range.
-fn lorom_offset_opt(bank: u32, addr: u32) -> Option<usize> {
-    let a = addr & 0xFFFF;
-    if (0x8000..=0xFFFF).contains(&a) {
-        Some(((bank & 0x7F) as usize) * 0x8000 + (a as usize - 0x8000))
-    } else {
-        None
-    }
+/// Active cartridge mapping returning `None` for addresses outside a ROM window.
+fn rom_offset_opt(mapping: RomMapping, bank: u32, addr: u32) -> Option<usize> {
+    is_rom_address(mapping, bank, addr).then(|| addr_to_rom_offset(mapping, bank, addr, &[]))
 }
 
 // ── Decode-dependency derivation (for the emit-output cache) ──────────────────
@@ -2365,7 +2947,27 @@ pub(crate) fn compute_deps(
     let mut sib_pcs: Vec<u32> = Vec::new();
     for di in graph.insns() {
         let ins = &di.insn;
-        let tp: Option<u32> = if ins.mnem == "JSR" && ins.length == 3 {
+        let dispatch_targets: Vec<u32> =
+            if ins.mnem == "JSR" && ins.mode == Mode::IndirX && ins.dispatch_entries.is_some() {
+                let bank = (ins.addr >> 16) & 0xFF;
+                ins.dispatch_entries
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .copied()
+                    .filter(|entry| *entry != 0)
+                    .map(|entry| {
+                        if ins.dispatch_kind.as_deref() == Some("long") {
+                            entry & 0xFFFFFF
+                        } else {
+                            addr24(bank, entry & 0xFFFF)
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let tp: Option<u32> = if ins.mnem == "JSR" && ins.length == 3 && ins.mode != Mode::IndirX {
             Some(addr24((ins.addr >> 16) & 0xFF, ins.operand & 0xFFFF))
         } else if ins.mnem == "JSL" {
             Some(ins.operand & 0xFFFFFF)
@@ -2373,6 +2975,13 @@ pub(crate) fn compute_deps(
             None
         };
         if let Some(tp) = tp {
+            cem_keys.push((tp, ins.m_flag, ins.x_flag));
+            let tbank = (tp >> 16) & 0xFF;
+            if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+                cem_keys.push((tp ^ 0x800000, ins.m_flag, ins.x_flag));
+            }
+        }
+        for tp in dispatch_targets {
             cem_keys.push((tp, ins.m_flag, ins.x_flag));
             let tbank = (tp >> 16) & 0xFF;
             if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
@@ -2608,7 +3217,10 @@ mod tests {
             0x83, 0x01, // STA $01,S
             0x6B, // RTL
         ]);
-        assert_eq!(detect_inline_arg_bytes(&rom, 0, 0x8000, 1, 1), Some(3));
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(3)
+        );
     }
 
     #[test]
@@ -2634,7 +3246,10 @@ mod tests {
             0x28, // PLP
             0x6B, // RTL
         ]);
-        assert_eq!(detect_inline_arg_bytes(&rom, 0, 0x8000, 1, 1), Some(8));
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(8)
+        );
     }
 
     #[test]
@@ -2650,7 +3265,10 @@ mod tests {
             0x83, 0x03, // STA $03,S
             0x6B, // RTL
         ]);
-        assert_eq!(detect_inline_arg_bytes(&rom, 0, 0x8000, 1, 1), None);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
     }
 
     fn k(pc: u32) -> DecodeKey {
@@ -2672,7 +3290,7 @@ mod tests {
     }
 
     #[test]
-    fn ptrcall_uses_pea_return_and_discovers_explicit_target() {
+    fn ptrcall_uses_pea_return_without_inlining_explicit_target() {
         // PEA $8008; JMP ($0010). The dispatched RTS resumes at $8009,
         // while $8010 is an independently discovered handler target.
         let mut bytes = vec![0u8; 0x12];
@@ -2687,6 +3305,9 @@ mod tests {
                 idx_reg: 'X',
                 table_bases: vec![],
                 ptr_call: true,
+                pointer_match: true,
+                popped_call_frame: false,
+                rts_stack: false,
                 targets: vec![0x8010],
             },
         )]);
@@ -2697,7 +3318,111 @@ mod tests {
         let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
         let jump = graph.get(&k(0x8003)).unwrap();
         assert_eq!(jump.insn.dispatch_entries, Some(vec![0x008010]));
+        assert!(jump.insn.dispatch_call);
+        assert!(jump.insn.dispatch_pointer_match);
         assert_eq!(jump.successors, vec![k(0x8009)]);
+        assert!(graph.get(&k(0x8010)).is_none());
+    }
+
+    #[test]
+    fn indirect_jsr_decode_cache_depends_on_each_handler_exit() {
+        let mut bytes = vec![0u8; 0x12];
+        bytes[0..3].copy_from_slice(&[0xFC, 0x10, 0x80]);
+        bytes[3] = 0x60;
+        bytes[0x10] = 0x60;
+        let rom = rom_at_8000(&bytes);
+        let dispatch = HashMap::from([(
+            0x008000,
+            IndirectDispatchSite {
+                count: 1,
+                idx_reg: 'X',
+                table_bases: vec![],
+                ptr_call: true,
+                pointer_match: true,
+                popped_call_frame: false,
+                rts_stack: false,
+                targets: vec![0x8010],
+            },
+        )]);
+        let env = DecodeEnv {
+            indirect_dispatch: Some(&dispatch),
+            stop_on_unknown_callee_exit: true,
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        let (exact, sets, _) = compute_deps(&graph, &env);
+        assert!(exact.iter().any(|(key, _)| *key == (0x008010, 1, 1)));
+        assert!(sets.iter().any(|(key, _)| *key == (0x008010, 1, 1)));
+    }
+
+    #[test]
+    fn explicit_null_dispatch_target_stays_zero() {
+        let rom = rom_at_8000(&[0xFC, 0x10, 0x80]);
+        let insn = decode_insn(&rom, 0, 0x8000, 0, 1, 1).unwrap();
+        assert_eq!(
+            resolve_indirect_dispatch_targets(&rom, RomMapping::LoRom, 0, &insn, 1, &[], &[0], &[],),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn computed_pei_rts_is_not_a_callable_exit_mode() {
+        let rom = rom_at_8000(&[
+            0x8B, // PHB
+            0x5A, // PHY (two bytes with X=0)
+            0xE2, 0x20, // SEP #$20
+            0xD4, 0x10, // PEI ($10)
+            0x60, // computed RTS
+        ]);
+        let graph = decode_function(&rom, 0, 0x8000, 0, 0, None, &DecodeEnv::default());
+        assert_eq!(analyze_function_exit_mx(&graph, None), (None, None));
+        let (local, dependencies) = function_exit_mx_equation(&graph);
+        assert_eq!(local, HashSet::from([(1, 0)]));
+        assert!(dependencies.contains(&(0xFFFFFFFF, 0, 0)));
+    }
+
+    #[test]
+    fn tsc_scratch_restore_proves_balanced_exit() {
+        let rom = rom_at_8000(&[
+            0x3B, // TSC
+            0x85, 0x10, // STA $10
+            0xA9, 0x34, 0x12, // LDA #$1234
+            0x1B, // TCS (temporary)
+            0xA5, 0x10, // LDA $10
+            0x1B, // TCS (restore)
+            0x60, // RTS
+        ]);
+        let graph = decode_function(&rom, 0, 0x8000, 0, 0, None, &DecodeEnv::default());
+        assert_eq!(analyze_function_exit_mx(&graph, None), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn clobbered_tsc_scratch_keeps_exit_unproven() {
+        let rom = rom_at_8000(&[
+            0x3B, // TSC
+            0x85, 0x10, // STA $10
+            0x64, 0x10, // STZ $10
+            0xA5, 0x10, // LDA $10
+            0x1B, // TCS
+            0x60, // RTS
+        ]);
+        let graph = decode_function(&rom, 0, 0x8000, 0, 0, None, &DecodeEnv::default());
+        assert_eq!(analyze_function_exit_mx(&graph, None), (None, None));
+    }
+
+    #[test]
+    fn partial_frame_return_is_not_a_callable_exit() {
+        let rom = rom_at_8000(&[
+            0xD0, 0x01, // BNE $8003
+            0x60, // balanced RTS
+            0x8B, // PHB
+            0x60, // consumes local byte and caller frame byte
+        ]);
+        let graph = decode_function(&rom, 0, 0x8000, 0, 0, None, &DecodeEnv::default());
+        assert_eq!(analyze_function_exit_mx(&graph, None), (Some(0), Some(0)));
+        let (local, dependencies) = function_exit_mx_equation(&graph);
+        assert_eq!(local, HashSet::from([(0, 0)]));
+        assert!(!dependencies.contains(&(0xFFFFFFFF, 0, 0)));
     }
 
     #[test]
@@ -2710,6 +3435,38 @@ mod tests {
         assert!(call.insn.dispatch_runtime);
         assert_eq!(call.successors, vec![k(0x8003)]);
         assert!(graph.suppressed_indirect_calls.is_empty());
+    }
+
+    #[test]
+    fn empty_callee_exit_set_makes_direct_call_terminal() {
+        let rom = rom_at_8000(&[0x20, 0x00, 0x90, 0x00]);
+        let exit_sets = HashMap::from([((0x009000, 1, 1), Vec::new())]);
+        let env = DecodeEnv {
+            callee_exit_mx_modes: Some(&exit_sets),
+            stop_on_unknown_callee_exit: true,
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        assert_eq!(graph.len(), 1);
+        assert!(graph.unknown_callee_exit_sites.is_empty());
+        assert!(graph.get(&k(0x8000)).unwrap().successors.is_empty());
+    }
+
+    #[test]
+    fn declared_terminal_jsr_does_not_decode_fallthrough() {
+        let rom = rom_at_8000(&[0x20, 0x00, 0x90, 0x00]);
+        let sites = std::collections::BTreeSet::from([0x008000]);
+        let env = DecodeEnv {
+            terminal_jsr_sites: Some(&sites),
+            stop_on_unknown_callee_exit: true,
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        assert_eq!(graph.len(), 1);
+        assert!(graph.unknown_callee_exit_sites.is_empty());
+        let call = graph.get(&k(0x8000)).unwrap();
+        assert!(call.insn.terminal_jsr);
+        assert!(call.successors.is_empty());
     }
 
     #[test]
@@ -2727,7 +3484,17 @@ mod tests {
         }
         let jump = decode_insn(&rom, 17, 0x8011, 0, 1, 1).unwrap();
         assert_eq!(
-            autorecover_local_stride_runway(&rom, 0, 0x8000, 0x8011, &jump, None, None, &[]),
+            autorecover_local_stride_runway(
+                &rom,
+                RomMapping::LoRom,
+                0,
+                0x8000,
+                0x8011,
+                &jump,
+                None,
+                None,
+                &[],
+            ),
             Some(vec![0x009000, 0x009003, 0x009006, 0x009009])
         );
     }
@@ -2774,8 +3541,8 @@ mod tests {
     }
 
     #[test]
-    fn same_bank_jml_is_jump_crossbank_is_none() {
-        // JML $00:8005 (same bank) -> jump successor.
+    fn jml_is_always_a_separate_tail_demand() {
+        // Even a same-bank JML crosses the current routine boundary.
         let mut bytes = vec![0u8; 6];
         bytes[0] = 0x5C; // JMP long (JML)
         bytes[1] = 0x05;
@@ -2785,7 +3552,8 @@ mod tests {
         let rom = rom_at_8000(&bytes);
         let g = decode_function(&rom, 0, 0x8000, 1, 1, None, &DecodeEnv::default());
         let jml = g.get(&k(0x8000)).unwrap();
-        assert_eq!(jml.successors, vec![k(0x8005)]);
+        assert!(jml.successors.is_empty());
+        assert_eq!(g.len(), 1);
 
         // Cross-bank JML -> no static successor.
         let mut b2 = vec![0u8; 4];
@@ -2797,6 +3565,14 @@ mod tests {
         let g2 = decode_function(&rom2, 0, 0x8000, 1, 1, None, &DecodeEnv::default());
         assert!(g2.get(&k(0x8000)).unwrap().successors.is_empty());
         assert_eq!(g2.len(), 1);
+    }
+
+    #[test]
+    fn indirect_long_jmp_uses_long_dispatch_width() {
+        let rom = rom_at_8000(&[0xDC, 0x34, 0x12]);
+        let insn = decode_insn(&rom, 0, 0x8000, 0, 1, 1).unwrap();
+        assert_eq!(insn.length, 3);
+        assert!(is_long_dispatch(&insn, &[]));
     }
 
     #[test]

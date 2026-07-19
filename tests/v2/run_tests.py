@@ -19,6 +19,7 @@ sys.path.append(str(THIS.parent))
 
 
 TEST_MODULES = [
+    'test_rom_mapping',
     'test_decoder_mode_split',
     'test_decoder_repsep_independent_bits',
     'test_decoder_immediate_length_per_state',
@@ -45,9 +46,11 @@ TEST_MODULES = [
     'test_nlr_idiom',
     'test_dispatcher_phk_per_jml',
     'test_indirect_dispatch_parallel_tables',
+    'test_pointer_target_dispatch',
     'test_indirect_jsr_dispatch_continuation',
     'test_local_stride_runway_dispatch',
     'test_rts_stack_dispatch',
+    'test_host_return_pc_guard',
     'test_wrapper_autoroute',
     'test_tail_call_autoroute',
     'test_emit_function_tail_call_past_end',
@@ -61,6 +64,7 @@ TEST_MODULES = [
     'test_analysis_tool',
     'test_variant_dispatch_lle_fallback',
     'test_program_profile_roots',
+    'test_ingest_dkc2_disasm',
 ]
 
 

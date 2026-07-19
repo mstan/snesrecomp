@@ -37,4 +37,7 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize); //
 uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr);
 void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
 void cart_saveload(Cart *cart, SaveLoadInfo *sli);
+// Resolve a CPU-visible ROM address to stable cart storage. Returns NULL for
+// WRAM, I/O, SRAM, or another non-ROM window.
+uint8_t *cart_getRomPtr(Cart *cart, uint8_t bank, uint16_t adr);
 #endif
