@@ -1132,7 +1132,11 @@ fn analyze(
                 poisoned.insert((key.pc24, key.m, key.x));
             }
 
-            let unknown = !relevant_unknown.is_empty();
+            let analysis_unknown = !graph.unknown_callee_exit_sites.is_empty();
+            let structural_poison = summary
+                .reasons
+                .iter()
+                .any(|reason| reason == "structural_poison");
             let fact_key = (key.pc24, key.m, key.x);
             let graph_has_poison = graph.insns().iter().any(|decoded| {
                 matches!(decoded.insn.mnem, "BRK" | "COP")
@@ -1142,8 +1146,8 @@ fn analyze(
             });
             let graph_has_dynamic_unknown = !graph.unresolved_indirects.is_empty()
                 || !graph.suppressed_indirect_calls.is_empty();
-            if !graph_has_poison && !graph_has_dynamic_unknown {
-                if !unknown {
+            if !structural_poison && !graph_has_poison && !graph_has_dynamic_unknown {
+                if !analysis_unknown {
                     let (local_modes, dependencies) = function_exit_mx_equation(&graph);
                     round_equations.insert(
                         key,
@@ -1170,7 +1174,8 @@ fn analyze(
                         });
                         if !probe_has_poison {
                             let (local_modes, dependencies) = function_exit_mx_equation(&probe);
-                            let assumptions = relevant_unknown
+                            let assumptions = graph
+                                .unknown_callee_exit_sites
                                 .iter()
                                 .map(|&(_, target, m, x)| {
                                     ((target & 0xFFFFFF, m & 1, x & 1), m & 1, x & 1)
@@ -1188,7 +1193,8 @@ fn analyze(
                     }
                 }
             }
-            if !unknown
+            if !analysis_unknown
+                && !structural_poison
                 && !unstable_exact.contains(&fact_key)
                 && !inputs.declared_exit_modes.contains_key(&fact_key)
             {
@@ -1311,10 +1317,9 @@ fn analyze(
         for (node_key, node) in &nodes {
             let fact_key = (node_key.pc24, node_key.m, node_key.x);
             if !inputs.declared_exit_modes.contains_key(&fact_key)
-                && node
-                    .reasons
-                    .iter()
-                    .any(|reason| reason == "unproven_callee_exit")
+                && node.reasons.iter().any(|reason| {
+                    reason == "unproven_callee_exit" || reason == "structural_poison"
+                })
             {
                 next_exact.remove(&fact_key);
                 next_sets.remove(&fact_key);
@@ -1362,6 +1367,16 @@ fn analyze(
                         "active_exact": active_exact.get(&(target.pc24, target.m, target.x)),
                         "active_set": active_sets.get(&(target.pc24, target.m, target.x)),
                         "solver_result": solved.get(&target),
+                        "boundary_exits": summary_cache.get(&target).map(
+                            |(graph, _, _, _)| graph.boundary_exits.iter()
+                                .map(|(site, successor)| json!({
+                                    "site": format!("{site:06X}"),
+                                    "target": format!("{:06X}", successor.pc & 0xFFFFFF),
+                                    "m": successor.m,
+                                    "x": successor.x,
+                                }))
+                                .collect::<Vec<_>>()
+                        ),
                         "return_stack_deltas": summary_cache.get(&target).map(
                             |(graph, _, _, _)| function_return_stack_delta_states(graph)
                                 .into_iter()

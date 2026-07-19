@@ -128,6 +128,38 @@ def test_native_manifest_matches_python_ptrcall_emission_contract():
     }
 
 
+def test_native_poisoned_callee_does_not_publish_false_noreturn_fact():
+    """An undecodable target is unknown, not a proven non-returning callee."""
+    if not native_analyzer_path().is_file():
+        return
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x22, 0x00, 0x80, 0x7F, 0x60]),
+    })
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        cfg_dir = root / "cfg"
+        cfg_dir.mkdir()
+        rom_path = root / "fixture.sfc"
+        rom_path.write_bytes(rom)
+        (cfg_dir / "bank00.cfg").write_text(
+            "bank = 00\n"
+            "func Root 8000 end:8005 entry_mx:1,1\n",
+            encoding="utf-8")
+        (cfg_dir / "bank7f.cfg").write_text(
+            "bank = 7f\n"
+            "func Poison 8000 entry_mx:1,1\n",
+            encoding="utf-8")
+        manifest, _helpers, _inline, _output = build_manifest_native(
+            rom_path=rom_path, cfg_dir=cfg_dir, all_cfg_roots=True)
+
+    root_key = VariantKey(0x008000, 1, 1)
+    poisoned_key = VariantKey(0x7F8000, 1, 1)
+    assert manifest.nodes[poisoned_key].disposition == NodeDisposition.LLE_ONLY
+    assert "structural_poison" in manifest.nodes[poisoned_key].reasons
+    assert poisoned_key not in manifest.exit_mode_sets
+    assert root_key not in manifest.exit_mode_sets
+
+
 def test_default_roots_are_vectors_not_every_function_boundary():
     image = bytearray(make_lorom_bank0({
         0x8000: bytes([0x20, 0x00, 0x90, 0x60]),
