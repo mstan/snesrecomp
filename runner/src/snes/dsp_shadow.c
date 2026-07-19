@@ -118,7 +118,8 @@ void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
     s = (int16_t)(s * 2);
     prev2 = prev1; prev1 = s;
     int canon_full = (int)canonOut16[i] * 2;     // canon half -> full scale
-    audio_trace_on_brr_div((double)(canon_full - s) / 32768.0);
+    audio_trace_on_brr_compare(blockStart, (uint8_t)header, (uint8_t)i,
+                               canon_full, s, oldSeed, olderSeed);
   }
 }
 #else
@@ -129,8 +130,8 @@ void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
 #endif
 
 // Faithful echo-FIR reference = blargg's snes9x/bsnes CALC_FIR: taps 0-6 summed,
-// (int16) clip, then tap 7 ADDED AS (int16), CLAMP16, clear LSB. Canon adds tap 7
-// raw (no int16 cast) and omits the LSB clear -- the only differences, isolated.
+// (int16) clip, then tap 7 added as (int16), CLAMP16, clear LSB. Production
+// mirrors this sequence; the reference remains an independent bit-exact check.
 #if defined(SNESRECOMP_TRACE)
 static int ref_echo_fir(const int16_t* fir, const int8_t* coeff, int idx) {
   int sum = 0;

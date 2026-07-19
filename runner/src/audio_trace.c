@@ -147,11 +147,23 @@ void audio_trace_on_faithful_div(double d) {
   s_stats.faithful_div_count++;
 }
 
-void audio_trace_on_brr_div(double d) {
+void audio_trace_on_brr_compare(uint16_t block, uint8_t header, uint8_t sample,
+                                int canon, int reference, int old, int older) {
+  double d = (double)(canon - reference) / 32768.0;
   double a = d < 0 ? -d : d;
   if (a > s_stats.brr_div_max) s_stats.brr_div_max = a;
   s_stats.brr_div_sumsq += d * d;
   s_stats.brr_div_count++;
+  if (canon != reference && !s_stats.brr_first_valid) {
+    s_stats.brr_first_valid = 1;
+    s_stats.brr_first_block = block;
+    s_stats.brr_first_header = header;
+    s_stats.brr_first_sample = sample;
+    s_stats.brr_first_canon = canon;
+    s_stats.brr_first_reference = reference;
+    s_stats.brr_first_old = old;
+    s_stats.brr_first_older = older;
+  }
 }
 
 void audio_trace_on_echo_div(double d) {

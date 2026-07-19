@@ -197,17 +197,20 @@ static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR) {
   dsp->firBufferR[dsp->firBufferIndex] >>= 1;
   // calculate FIR-sum
   int sumL = 0, sumR = 0;
-  for(int i = 0; i < 8; i++) {
+  for(int i = 0; i < 7; i++) {
     sumL += (dsp->firBufferL[(dsp->firBufferIndex + i + 1) & 0x7] * dsp->firValues[i]) >> 6;
     sumR += (dsp->firBufferR[(dsp->firBufferIndex + i + 1) & 0x7] * dsp->firValues[i]) >> 6;
-    if(i == 6) {
-      // clip to 16-bit before last addition
-      sumL = ((int16_t) (sumL & 0xffff)); // clip 16-bit
-      sumR = ((int16_t) (sumR & 0xffff)); // clip 16-bit
-    }
   }
+  // Hardware clips the first seven taps, casts tap 7 independently to signed
+  // 16-bit, then clamps and clears the result LSB.
+  sumL = (int16_t)sumL;
+  sumR = (int16_t)sumR;
+  sumL += (int16_t)((dsp->firBufferL[dsp->firBufferIndex] * dsp->firValues[7]) >> 6);
+  sumR += (int16_t)((dsp->firBufferR[dsp->firBufferIndex] * dsp->firValues[7]) >> 6);
   sumL = sumL < -0x8000 ? -0x8000 : (sumL > 0x7fff ? 0x7fff : sumL); // clamp 16-bit
   sumR = sumR < -0x8000 ? -0x8000 : (sumR > 0x7fff ? 0x7fff : sumR); // clamp 16-bit
+  sumL &= ~1;
+  sumR &= ~1;
 #if defined(SNESRECOMP_TRACE)
   dsp_shadow_verify_echo(dsp->firBufferL, dsp->firBufferR, dsp->firValues,
                          dsp->firBufferIndex, sumL, sumR);
@@ -464,7 +467,11 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
     if(shift <= 0xc) {
       s = (s << shift) >> 1;
     } else {
-      s = (s >> 3) << 12;
+      /* Invalid/high BRR shifts (13-15) preserve only the sign contribution.
+       * This is the hardware/blargg operation in canon's half-scale domain:
+       * negative nybbles become -2048 and nonnegative nybbles become 0 before
+       * filtering. The old expression produced -4096, doubling these samples. */
+      s &= ~0x7ff;
     }
     switch(filter) {
       case 1: s += old + (-old >> 4); break;

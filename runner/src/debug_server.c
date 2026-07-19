@@ -6698,11 +6698,16 @@ static void cmd_audio_shadow_div(const char *args) {
     send_fmt("{\"ok\":true,"
              "\"cubic\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f},"
              "\"faithful_gauss\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f},"
-             "\"faithful_brr\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f},"
+             "\"faithful_brr\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f,"
+             "\"first\":{\"valid\":%u,\"block\":\"%04X\",\"header\":\"%02X\","
+             "\"sample\":%u,\"canon\":%d,\"reference\":%d,\"old\":%d,\"older\":%d}},"
              "\"faithful_echo\":{\"count\":%llu,\"rms_db\":%.2f,\"max_db\":%.2f}}",
              (unsigned long long)st.shadow_div_count, rms_db, max_db,
              (unsigned long long)st.faithful_div_count, frms_db, fmax_db,
              (unsigned long long)st.brr_div_count, brms_db, bmax_db,
+             st.brr_first_valid, st.brr_first_block, st.brr_first_header,
+             st.brr_first_sample, st.brr_first_canon, st.brr_first_reference,
+             st.brr_first_old, st.brr_first_older,
              (unsigned long long)st.echo_div_count, erms_db, emax_db);
 }
 
