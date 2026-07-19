@@ -39,6 +39,15 @@ int main(void) {
   apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
   failures += check(apu.inPorts[2] == 0x00, "clear follows music observation");
 
+  memset(&apu, 0, sizeof(apu));
+  apu_clearPortQueue(&apu);
+  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
+  apu_schedulePortWrite(&apu, 2, 0x80, 0);
+  apu_schedulePortWrite(&apu, 2, 0x23, 0);
+  apu_applyDuePortWrites(&apu, 1000);
+  failures += check(apu.inPorts[2] == 0x80,
+                    "duplicate command cannot pull a later value forward");
+
   if (failures)
     return 1;
   puts("apu_port_transition_test: PASS");

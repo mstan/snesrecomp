@@ -75,6 +75,8 @@ static void apu_applyPortWrite(Apu* apu, const ApuPortWrite *w) {
 void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
                            uint64_t target_sample) {
   port &= 3;
+  if (apu->portQueued[port] && target_sample < apu->portLastTarget[port])
+    target_sample = apu->portLastTarget[port];
   if (apu->portLastValid[port] && val != apu->portLastValue[port] &&
       (apu->portAwaitingRead[port] || apu->portQueued[port])) {
     uint64_t floor = apu->portLastTarget[port] + APU_PORT_MIN_DWELL;
