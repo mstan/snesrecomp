@@ -56,15 +56,31 @@ void apu_reset(Apu* apu) {
 
 void apu_clearPortQueue(Apu* apu) {
   apu->portQHead = apu->portQTail = 0;
+  memset(apu->portLastTarget, 0, sizeof(apu->portLastTarget));
+  memset(apu->portQueued, 0, sizeof(apu->portQueued));
+  memset(apu->portLastValue, 0, sizeof(apu->portLastValue));
+  memset(apu->portLastValid, 0, sizeof(apu->portLastValid));
+  memset(apu->portAwaitingRead, 0, sizeof(apu->portAwaitingRead));
 }
 
 static void apu_applyPortWrite(Apu* apu, const ApuPortWrite *w) {
-  apu->inPorts[w->port & 3] = w->val;
-  audio_trace_on_cpu_port_apply(w->port, w->val);
+  uint8_t port = w->port & 3;
+  if (apu->portQueued[port])
+    apu->portQueued[port]--;
+  apu->inPorts[port] = w->val;
+  apu->portAwaitingRead[port] = w->val != 0;
+  audio_trace_on_cpu_port_apply(port, w->val);
 }
 
 void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
                            uint64_t target_sample) {
+  port &= 3;
+  if (apu->portLastValid[port] && val != apu->portLastValue[port] &&
+      (apu->portAwaitingRead[port] || apu->portQueued[port])) {
+    uint64_t floor = apu->portLastTarget[port] + APU_PORT_MIN_DWELL;
+    if (target_sample < floor)
+      target_sample = floor;
+  }
   if (apu->portQTail - apu->portQHead >= APU_PORT_QUEUE_LEN) {
     /* Full — apply the oldest immediately so ordering survives. */
     apu_applyPortWrite(apu, &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)]);
@@ -72,23 +88,29 @@ void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
   }
   ApuPortWrite *w = &apu->portQueue[apu->portQTail & (APU_PORT_QUEUE_LEN - 1)];
   w->target_sample = target_sample;
-  w->port = (uint8_t)(port & 3);
+  w->port = port;
   w->val = val;
   apu->portQTail++;
+  apu->portQueued[port]++;
+  apu->portLastTarget[port] = target_sample;
+  apu->portLastValue[port] = val;
+  apu->portLastValid[port] = 1;
 }
 
-/* Apply every queued write whose target the produced-sample clock has
- * reached. Called at each DSP sample boundary inside apu_cycle. */
-static void apu_drainPortQueue(Apu* apu) {
-  uint64_t produced;
-  audio_trace_sample_clocks(&produced, NULL);
+void apu_applyDuePortWrites(Apu *apu, uint64_t produced_sample) {
   while (apu->portQHead != apu->portQTail) {
     ApuPortWrite *w = &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
-    if (w->target_sample > produced)
+    if (w->target_sample > produced_sample)
       break;
     apu_applyPortWrite(apu, w);
     apu->portQHead++;
   }
+}
+
+void apu_noteSpcPortRead(Apu *apu, uint8_t port, uint8_t val) {
+  port &= 3;
+  if (apu->portAwaitingRead[port] && apu->inPorts[port] == val)
+    apu->portAwaitingRead[port] = 0;
 }
 
 void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
@@ -111,8 +133,10 @@ void apu_cycle(Apu* apu) {
   apu->cpuCyclesLeft--;
 
   if((apu->cycles & 0x1f) == 0) {
+    uint64_t produced;
     // every 32 cycles
-    apu_drainPortQueue(apu);
+    audio_trace_sample_clocks(&produced, NULL);
+    apu_applyDuePortWrites(apu, produced);
     dsp_cycle(apu->dsp);
   }
 
@@ -157,6 +181,7 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
     case 0xf6:
     case 0xf7: {
       uint8_t v = apu->inPorts[adr - 0xf4];
+      apu_noteSpcPortRead(apu, (uint8_t)(adr - 0xf4), v);
       audio_trace_on_spc_port_read((uint8_t)(adr - 0xf4), v);
       return v;
     }

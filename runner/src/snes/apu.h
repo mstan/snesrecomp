@@ -77,8 +77,13 @@ struct Apu {
    * and on the HLE SPC-image upload; deliberately not serialized (any
    * still-pending write applies on the first cycles after load). */
   ApuPortWrite portQueue[APU_PORT_QUEUE_LEN];
+  uint64_t portLastTarget[4];
   uint32_t portQHead;     /* next slot to apply  */
   uint32_t portQTail;     /* next slot to fill   */
+  uint16_t portQueued[4]; /* queued writes by port */
+  uint8_t portLastValue[4];
+  uint8_t portLastValid[4];
+  uint8_t portAwaitingRead[4];
 };
 
 Apu* apu_init();
@@ -89,11 +94,14 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr);
 void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val);
 void apu_saveload(Apu *apu, SaveLoadInfo *sli);
 /* Schedule a CPU-side port write ($2140+port) to land in inPorts when
- * the produced-sample clock reaches target_sample. Caller must hold
- * RtlApuLock. Queue overflow applies the oldest entry immediately
- * (order is always preserved). */
+ * the produced-sample clock reaches target_sample. A distinct value waits
+ * for an outstanding command on the same port to be observed by the SPC. */
 void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
                            uint64_t target_sample);
+/* Apply queued writes due at produced_sample. Caller is the DSP sample tick. */
+void apu_applyDuePortWrites(Apu *apu, uint64_t produced_sample);
+/* Record an SPC read so the next CPU command can use immediate visibility. */
+void apu_noteSpcPortRead(Apu *apu, uint8_t port, uint8_t val);
 /* Drop all pending scheduled port writes (reset / HLE image upload). */
 void apu_clearPortQueue(Apu* apu);
 #endif
