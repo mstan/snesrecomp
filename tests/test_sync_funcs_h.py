@@ -26,7 +26,11 @@ def _load_sync_funcs_h():
     framework_root = pathlib.Path(__file__).resolve().parent.parent
     game_root = framework_root.parent
     script = game_root / 'tools' / 'sync_funcs_h.py'
-    if not script.exists():
+    if (not script.exists()
+            or not (framework_root / 'recompiler' / 'recomp.py').is_file()):
+        # sync_funcs_h is a legacy v1-recompiler tool. The v2 framework does
+        # not provide its dependency, so this cross-repository contract is
+        # inapplicable.
         return None
     # Inject game's snesrecomp/recompiler so sync_funcs_h's own imports work.
     sys.path.insert(0, str(framework_root / 'recompiler'))
