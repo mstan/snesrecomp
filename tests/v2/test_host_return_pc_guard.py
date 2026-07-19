@@ -55,6 +55,30 @@ def test_deeper_computed_rts_unknown_target_tiers_into_interpreter():
     assert tier < miss, src
 
 
+def test_direct_bounce_computed_rts_returns_to_owning_interpreter():
+    """A fully consumed synthetic frame must not start a nested bridge.
+
+    PHA target-1; RTS leaves S exactly at the AOT entry depth while preserving
+    the interpreted caller's real frame above it.  The continuation therefore
+    belongs to the active interpreter, even though pre-RTS S was deeper than
+    entry.  A generic popped-return tier would execute a later non-local caller
+    epilogue once inside that nested tier and again in the owner.
+    """
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x48, 0x60]),  # PHA; RTS computed dispatch
+    })
+    src = emit_function(rom=rom, bank=0, start=0x8000,
+                        entry_m=0, entry_x=0,
+                        func_name='ComputedRtsDirectBounce')
+
+    guard = src.index('cpu->S == _entry_s &&')
+    rewritten = src.index('interp_tier_dispatch_rewritten_return(cpu, _rpc24',
+                          guard)
+    popped = src.index('interp_tier_dispatch_popped_return(cpu, _rpc24')
+    assert 'interp_bridge_has_direct_paired_bounce()' in src[guard:rewritten], src
+    assert guard < rewritten < popped, src
+
+
 def test_partial_frame_return_uses_rewritten_return_bridge():
     rom = make_lorom_bank0({
         0x8000: bytes([0x8B, 0x60]),  # PHB; RTS crosses entry watermark

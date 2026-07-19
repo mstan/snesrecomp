@@ -28,10 +28,12 @@ static int      g_aot_called;
 static int      g_aot_rewrites_return;
 static int      g_aot_nested_rewrite;
 static int      g_aot_interp_nlr;
+static int      g_aot_double_rewrite;
 static int      g_aot_tail_chain_probe;
 static int      g_tail_chain_direct;
 static int      g_nested_chain_direct;
 #define FAKE_AOT 0x008100u
+#define FAKE_AOT_2 0x008200u
 
 /* ── fakes the bridge links against (cpu_state.c provides these in prod) ── */
 /* The Phase-2 manifest recorder stamps the live frame counter on each
@@ -44,6 +46,9 @@ int g_interp_apu_driving;
 int g_recomp_stack_top;
 uint16_t g_cpu_entry_s[64];
 uint8 g_memsel;
+void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
+    (void)pc; (void)a; (void)x; (void)y;
+}
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 void snes_catchupApu(Snes *snes) { (void)snes; }
@@ -80,7 +85,9 @@ uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24) {
     (void)pc24; return 0;
 }
 int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24) {
-    (void)cpu; return (pc24 & 0xFFFFFF) == FAKE_AOT;
+    (void)cpu;
+    pc24 &= 0xFFFFFF;
+    return pc24 == FAKE_AOT || (g_aot_double_rewrite && pc24 == FAKE_AOT_2);
 }
 static int g_abandon_called;
 static int g_post_return_skip;
@@ -106,6 +113,22 @@ RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24, uint16 miss_restore) {
 RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
                                     uint8 frame_size) {
     cpu->host_return_valid = frame_size;
+    if (g_aot_double_rewrite && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        /* Computed-RTS dispatcher shape: a synthetic handler address is
+         * pushed and immediately popped, so the interpreted caller's real
+         * JSR frame remains on the guest stack.  Continue at the selected
+         * handler through the rewritten-return bridge. */
+        g_aot_called++;
+        return interp_tier_dispatch_rewritten_return(cpu, 0x008300, 0x0081FE);
+    }
+    if (g_aot_double_rewrite && (pc24 & 0xFFFFFF) == FAKE_AOT_2) {
+        /* Later in that interpreted handler, a second AOT helper performs
+         * PLA; PLA; RTS: consume its own JSR frame plus the dispatcher's
+         * preserved caller frame, then resume the interpreted grandparent. */
+        g_aot_called++;
+        cpu->S = (uint16)(cpu->S + 4);
+        return interp_tier_dispatch_rewritten_return(cpu, 0x008003, 0x0082FE);
+    }
     if (g_aot_tail_chain_probe && (pc24 & 0xFFFFFF) == FAKE_AOT) {
         const int base = g_recomp_stack_top;
         g_recomp_stack_top += 3;
@@ -309,6 +332,28 @@ int main(void) {
             "A.lo=%02X exp 5A (inner continuation skipped)", g_c.A & 0xFF);
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (all frames balanced)", g_c.S);
       g_aot_interp_nlr = 0; }
+
+    /* S6c: LttP's sprite dispatch shape performs two rewritten AOT returns in
+     * one interpreted call chain.  The first computed RTS preserves the
+     * caller frame and selects an interpreted handler; a later AOT helper
+     * consumes its own frame plus that preserved frame.  Both continuations
+     * belong to the same owning interpreter.  The wrapper epilogue must run
+     * once, never once in a nested bridge and again in its owner. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_double_rewrite = 1;
+      uint8_t outer[] = {0x20,0x00,0x81, 0xA9,0x5A, 0x60};
+      uint8_t handler[] = {0x20,0x00,0x82, 0xA9,0xEE, 0x60};
+      load(0x8000, outer, sizeof outer);
+      load(0x8300, handler, sizeof handler);
+      cpu_push_jsr_return_frame(&g_c);
+      int rc = interp_bridge_run(&g_c, 0x008000);
+      printf("S6c consecutive rewritten AOT returns stay in one interpreter\n");
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_aot_called == 2, "aot_called=%d exp 2", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x5A,
+            "A.lo=%02X exp 5A (handler continuation skipped)", g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (all frames balanced)", g_c.S);
+      g_aot_double_rewrite = 0; }
 
     /* S7: an interrupt-owned stable-value poll must cooperatively yield at
      * CMP while the sampled WRAM byte is unchanged, then resume and return
