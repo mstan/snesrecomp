@@ -52,13 +52,29 @@ alone do not constitute a pass. Unknown and untested are not pass states.
 
 ## Current truthful status
 
-- DKC2: automated frame/WRAM/VRAM regression gate and two-cycle attract soak
-  pass on the candidate; final manual validation remains pending.
-- SMW: the black-boot regression is fixed at its first deterministic
-  checkpoint; longer attract/audio and manual validation remain pending.
-- LttP: confirmed indoor-to-overworld transition regression; failed.
-- MMX: built but not yet genuinely validated; unknown.
-- Super Metroid: built but not yet genuinely validated; unknown.
+The runtime candidate tested below is `2b00d9f` (the following commits may be
+documentation-only). Its Linux x86-64, Windows x86-64, and macOS arm64 CI jobs
+pass. All generation in this matrix uses the native Rust analyzer.
+
+| Game | Automated runtime/video | Automated audio | User gameplay |
+| --- | --- | --- | --- |
+| DKC2 | Pass: current-candidate frame/WRAM/VRAM preservation plus a 12,000-frame, two-attract-cycle state soak | Pass: the DKC2 integrity soak exercises the boot upload and sustained SPC run | Pass: previously checked by the user on this candidate line |
+| SMW | Pass: Rust regeneration, 7,200-frame attract soak, zero dispatch misses, and inspected clean framebuffer | Pending: the prior manual launch was invalid for audio because a local, untracked test override disabled the SDL consumer; rerun required with the corrected validation configuration | In progress; current visible title/gameplay session is clean so far, but the user has not reported a final result |
+| LttP | Pass: Rust regeneration, exact indoor-to-overworld save transition, 7,200-frame soak, zero dispatch misses, and inspected clean framebuffer | Pending explicit live-consumer/WAV integrity gate | Pending |
+| MMX | Pass: Rust regeneration, 7,200-frame title/intro soak, zero dispatch misses, and inspected clean framebuffers | Pending explicit live-consumer/WAV integrity gate | Pending |
+| Super Metroid | Pass: Rust regeneration, 7,200-frame title/cinematic soak, zero dispatch misses, and inspected clean framebuffers | Pending explicit live-consumer/WAV integrity gate | Pending |
+
+The LttP transition regression was a class-level computed-RTS ownership bug in
+the interpreter/AOT bridge. Commit `be4a706` fixes it and includes emitted-code
+and bridge-runtime regressions. The no-deny save transition now reaches the
+known-good state hash
+`81d71b22fc929c218fa57335c6e5f5b7da50fb3182dd585cd018d11c15efa716`.
+
+The remaining automated work is the explicit live audio-consumer gate for the
+four non-DKC2 games. It requires active nonzero PCM, no clipping, no audible
+ring drops, an active consumer, and populated faithful Gaussian/BRR/echo
+reference measurements. Runtime/video success does not substitute for this
+gate.
 
 Draft PR #4 remains a draft until every row passes both automated and user
 validation and there are no known hangs, crashes, visual bugs, or garbled audio
