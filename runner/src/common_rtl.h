@@ -266,7 +266,7 @@ void RtlWriteSram();
 // (idempotent). Call before the launcher so its SAVES panel reflects the carried-
 // forward save; RtlReadSram also calls it on boot as a fallback.
 void RtlMigrateLegacySram(const char *legacy_title);
-void RtlSaveSnapshot(const char *filename);
+bool RtlSaveSnapshot(const char *filename);
 bool RtlLoadSnapshot(const char *filename);
 size_t RtlSaveSnapshotToMemory(void *data, size_t capacity);
 bool RtlLoadSnapshotFromMemory(const void *data, size_t size);
