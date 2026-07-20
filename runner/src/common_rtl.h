@@ -44,6 +44,9 @@ extern uint64_t g_apu_last_sync_cycles;
 // it; it's defined alongside the pacing state in common_rtl.c.
 extern uint64_t g_apu_last_sync_master;
 void rtl_accumulate_apu_catchup(void);
+/* Caller holds RtlApuLock. Before the first frame, retain bootstrap synthetic
+ * pacing; afterward synchronize reads to the authoritative guest timestamp. */
+void rtl_sync_apu_to_cpu_locked(void);
 
 #ifdef SNES_COSIM
 // Co-sim shared APU clock (SNES_COSIM_APU_SHARED=1, dev-only): pace the SPC
@@ -258,7 +261,12 @@ void RtlSaveLoad(int cmd, int slot);
 void RtlApuLock();
 void RtlApuUnlock();
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
-bool RtlUploadSpcImageFromDp(CpuState *cpu);
+/* Notify the shared audio runner of host fast-forward state. Guest-frame SPC
+ * synchronization is automatic inside RtlRunFrame; clients only supply the
+ * presentation policy needed to discard stale PCM after fast-forward. */
+void RtlAudioSetFastForward(bool active);
+  bool RtlUploadSpcImageFromDp(CpuState *cpu);
+  bool RtlUploadSpcImageFromDpLive(CpuState *cpu);
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
 void RtlWriteSram();

@@ -92,6 +92,17 @@ void audio_trace_set_producer(int producer) {
   s_producer = producer;
 }
 
+void audio_trace_on_fast_forward_discard(uint32_t samples,
+                                         uint32_t occupancy_after) {
+  s_stats.fast_forward_discarded += samples;
+  s_stats.occupancy_current = occupancy_after;
+}
+
+void audio_trace_on_output_underflow(uint32_t occupancy) {
+  s_stats.output_underflows++;
+  s_stats.occupancy_current = occupancy;
+}
+
 void audio_trace_on_sample(int16_t l, int16_t r, int dropped, uint32_t ring_fill) {
   uint32_t w = (uint32_t)(s_stats.produced & (AUDIO_TRACE_PCM_RING - 1));
   s_pcm[w * 2] = l;
@@ -119,6 +130,7 @@ void audio_trace_on_sample(int16_t l, int16_t r, int dropped, uint32_t ring_fill
   if (s_producer == AUDIO_TRACE_PRODUCER_CPU) s_stats.produced_cpu++;
   else if (s_producer == AUDIO_TRACE_PRODUCER_AUDIO) s_stats.produced_audio++;
   if (ring_fill > s_stats.occupancy_highwater) s_stats.occupancy_highwater = ring_fill;
+  s_stats.occupancy_current = ring_fill;
   maybe_snap(ring_fill);
 }
 
@@ -177,6 +189,13 @@ void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles) {
   s_stats.pace_consumer_active = (uint32_t)(consumer_active != 0);
   s_stats.pace_baseline_cycles += baseline_cycles;
   s_stats.pace_accumulate_calls++;
+}
+
+void audio_trace_on_guest_sync(int frame_boundary, uint64_t cycles) {
+  if (frame_boundary)
+    s_stats.guest_frame_sync_cycles += cycles;
+  else
+    s_stats.guest_read_sync_cycles += cycles;
 }
 
 /* ---- CPU<->SPC port traffic ----
@@ -269,6 +288,7 @@ void audio_trace_on_consume(uint64_t read_idx, uint32_t count, uint32_t avail_af
   (void)read_idx;
   s_stats.consumed += count;
   s_stats.consume_calls++;
+  s_stats.occupancy_current = avail_after;
   if (count > s_max_consume_chunk) s_max_consume_chunk = count;
   s_open_drop_event = UINT64_MAX;
 }

@@ -6611,26 +6611,47 @@ static void cmd_audio_stats(const char *args) {
     if (want > 256) want = 256;
     AudioTraceStats st;
     audio_trace_get_stats(&st);
+    uint32_t apu_port_queue_depth = 0;
+    uint64_t apu_port_queue_lag = 0;
+    RtlApuLock();
+    if (g_snes && g_snes->apu) {
+        apu_port_queue_depth = apu_portQueueDepth(g_snes->apu);
+        if (apu_port_queue_depth != 0 &&
+            g_snes->apu->portLastTarget > g_snes->apu->portClock)
+            apu_port_queue_lag = g_snes->apu->portLastTarget -
+                                 g_snes->apu->portClock;
+    }
+    RtlApuUnlock();
     static char buf[65536];
     int pos = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"produced\":%llu,\"produced_cpu\":%llu,\"produced_audio\":%llu,"
-        "\"dropped\":%llu,\"dropped_audible\":%llu,\"drop_runs\":%llu,\"consumed\":%llu,\"consume_calls\":%llu,"
+        "\"dropped\":%llu,\"dropped_audible\":%llu,\"drop_runs\":%llu,\"consumed\":%llu,"
+        "\"fast_forward_discarded\":%llu,\"output_underflows\":%llu,"
+        "\"consume_calls\":%llu,"
         "\"reg_writes\":%llu,\"kon_writes\":%llu,\"occupancy_highwater\":%u,"
+        "\"occupancy_current\":%u,"
         "\"pace_baseline_cycles\":%llu,\"pace_accumulate_calls\":%llu,"
         "\"pace_consumer_active\":%u,"
+        "\"guest_frame_sync_cycles\":%llu,\"guest_read_sync_cycles\":%llu,"
         "\"cpu_port_writes\":%llu,\"spc_port_reads_seen\":%llu,"
         "\"spc_port_reads_logged\":%llu,\"spc_port_writes\":%llu,"
         "\"cpu_port_reads_logged\":%llu,"
         "\"cpu_port_overwrites\":[%llu,%llu,%llu,%llu],"
+        "\"apu_port_queue_depth\":%u,\"apu_port_queue_lag\":%llu,"
         "\"event_count\":%llu,\"snap_count\":%llu,\"snaps\":[",
         (unsigned long long)st.produced, (unsigned long long)st.produced_cpu,
         (unsigned long long)st.produced_audio, (unsigned long long)st.dropped,
         (unsigned long long)st.dropped_audible,
         (unsigned long long)st.drop_runs, (unsigned long long)st.consumed,
+        (unsigned long long)st.fast_forward_discarded,
+        (unsigned long long)st.output_underflows,
         (unsigned long long)st.consume_calls, (unsigned long long)st.reg_writes,
         (unsigned long long)st.kon_writes, st.occupancy_highwater,
+        st.occupancy_current,
         (unsigned long long)st.pace_baseline_cycles,
         (unsigned long long)st.pace_accumulate_calls, st.pace_consumer_active,
+        (unsigned long long)st.guest_frame_sync_cycles,
+        (unsigned long long)st.guest_read_sync_cycles,
         (unsigned long long)st.cpu_port_writes,
         (unsigned long long)st.spc_port_reads_seen,
         (unsigned long long)st.spc_port_reads_logged,
@@ -6640,6 +6661,7 @@ static void cmd_audio_stats(const char *args) {
         (unsigned long long)st.cpu_port_overwrites[1],
         (unsigned long long)st.cpu_port_overwrites[2],
         (unsigned long long)st.cpu_port_overwrites[3],
+        apu_port_queue_depth, (unsigned long long)apu_port_queue_lag,
         (unsigned long long)st.event_count, (unsigned long long)st.snap_count);
     uint64_t first = st.snap_count > (uint64_t)want ? st.snap_count - want : 0;
     static AudioTraceSnap snaps[256];

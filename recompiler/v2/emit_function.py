@@ -511,10 +511,14 @@ def emit_function(rom: bytes, bank: int, start: int,
     if hle_spc_upload and (start & 0xFFFF) in set(hle_spc_upload):
         variant_name = f"{base_func_name}{_variant_suffix(entry_m, entry_x)}"
         pc24 = ((bank & 0xFF) << 16) | (start & 0xFFFF)
+        live_upload = (isinstance(hle_spc_upload, dict) and
+                       hle_spc_upload.get(start & 0xFFFF) == 'live')
+        upload_helper = ('RtlUploadSpcImageFromDpLive' if live_upload else
+                         'RtlUploadSpcImageFromDp')
         return "\n".join([
             f"RecompReturn {variant_name}(CpuState *cpu) {{",
             "  extern const char *g_last_recomp_func;",
-            "  extern bool RtlUploadSpcImageFromDp(CpuState *cpu);",
+            f"  extern bool {upload_helper}(CpuState *cpu);",
             f"  g_last_recomp_func = \"{variant_name}\";",
             f"  RecompStackPush(\"{variant_name}\");",
             f"  cpu_dbg_funcname(\"{variant_name}\");",
@@ -533,7 +537,7 @@ def emit_function(rom: bytes, bank: int, start: int,
             "  }",
             f"  cpu_trace_block(cpu, 0x{pc24:06X});",
             "  WatchdogCheck();",
-            "  if (!RtlUploadSpcImageFromDp(cpu)) {",
+            f"  if (!{upload_helper}(cpu)) {{",
             f"    fprintf(stderr, \"[apu] {base_func_name} HLE upload failed\\n\");",
             "  }",
             "  { uint16 _ret_s = cpu->S;  /* HLE SPC upload RTS pop hardware return frame */",

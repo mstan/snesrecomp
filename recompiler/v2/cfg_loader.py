@@ -133,7 +133,10 @@ class BankCfg:
     # Per-game: declare the SPC upload entry PC here. Works for SMW
     # (HandleSPCUploads_Inner / SPC700UploadLoop at $00:8079) and
     # ALttP (LoadSongBank at $00:8888) — both use the same protocol.
-    hle_spc_upload: List[int] = field(default_factory=list)
+    # Map entry PC to protocol ownership mode. `live` preserves the running
+    # driver's AA/BB-ready and CC-terminator handshake; `legacy` retains the
+    # direct state replacement required by older per-game declarations.
+    hle_spc_upload: dict = field(default_factory=dict)
     # `hle_func <pc16> <c_function_name>` — replace the recompiled body
     # of the function at <pc> with a single forwarding call to the named
     # C function. Used for hand-written HLE bodies that need to run
@@ -286,16 +289,21 @@ def load_bank_cfg(path: str) -> BankCfg:
             # block stream pointed to by DP+0..2 and writes directly
             # into apu->ram. See BankCfg.hle_spc_upload comment.
             if head == 'hle_spc_upload':
-                if len(tokens) != 2:
+                if len(tokens) not in (2, 3):
                     raise ValueError(
-                        f"{path}: hle_spc_upload needs exactly one <pc> "
-                        f"argument, got: {stripped!r}")
+                        f"{path}: hle_spc_upload needs <pc> and optional "
+                        f"legacy|live mode, got: {stripped!r}")
                 try:
                     pc16 = _parse_hex(tokens[1]) & 0xFFFF
                 except ValueError as e:
                     raise ValueError(
                         f"{path}: hle_spc_upload bad pc {tokens[1]!r}: {e}")
-                cfg.hle_spc_upload.append(pc16)
+                mode = tokens[2].lower() if len(tokens) == 3 else 'legacy'
+                if mode not in ('legacy', 'live'):
+                    raise ValueError(
+                        f"{path}: hle_spc_upload bad mode {mode!r}; "
+                        "expected legacy or live")
+                cfg.hle_spc_upload[pc16] = mode
                 continue
 
             # hle_func <pc16> <c_function_name> — replace the decoded
