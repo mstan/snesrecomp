@@ -331,7 +331,29 @@ static struct {
     VramTraceEntry *log;        /* heap-allocated; calloc'd at init */
 } s_vram_trace = {0};
 
+/* ── Always-on VRAM byte-write mini ring ─────────────────────────────
+ * Compiled into every build (the big REVERSE_DEBUG ring above is not).
+ * Records EVERY VRAM byte write — PIO ($2118/$2119, atomic word STA)
+ * and per-byte DMA both funnel through this hook — with the writing
+ * recomp function. Query backward via "vwring_get"; never armed. */
+#define VWRING_LEN (1u << 17)
+typedef struct {
+    int frame;
+    uint16_t adr_byte;
+    uint8_t  val;
+    const char *func;   /* g_last_recomp_func string literal */
+} VwRingEntry;
+static VwRingEntry s_vwring[VWRING_LEN];
+static uint64_t s_vwring_widx;
+
 void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) {
+    {
+        VwRingEntry *e = &s_vwring[s_vwring_widx++ & (VWRING_LEN - 1)];
+        e->frame = snes_frame_counter;
+        e->adr_byte = (uint16_t)(byte_addr & 0xFFFF);
+        e->val = value;
+        e->func = g_last_recomp_func;
+    }
     if (!s_vram_trace.active || !s_vram_trace.log) return;
     uint16_t adr_b = (uint16_t)(byte_addr & 0xFFFF);
     int hit = 0;
@@ -2428,6 +2450,37 @@ static void cmd_trace_vram(const char *args) {
     s_vram_trace.active = 1;
     send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
              lo, hi, s_vram_trace.nranges);
+}
+
+/* vwring_get <lo> <hi> [n] — newest n (default 256) always-on VRAM
+ * byte-write ring entries whose BYTE address lies in [lo,hi], oldest
+ * first. Works in every build; nothing to arm. */
+static void cmd_vwring_get(const char *args) {
+    unsigned int lo = 0, hi = 0xFFFF, n = 256;
+    if (args) sscanf(args, "%x %x %u", &lo, &hi, &n);
+    if (n > 4096) n = 4096;
+    static VwRingEntry sel[4096];
+    unsigned int found = 0;
+    uint64_t have = s_vwring_widx < VWRING_LEN ? s_vwring_widx : VWRING_LEN;
+    for (uint64_t back = 0; back < have && found < n; back++) {
+        const VwRingEntry *e =
+            &s_vwring[(s_vwring_widx - 1 - back) & (VWRING_LEN - 1)];
+        if (e->adr_byte >= lo && e->adr_byte <= hi)
+            sel[found++] = *e;
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"total_writes\":%llu,\"matched\":%u,\"log\":[",
+        (unsigned long long)s_vwring_widx, found);
+    for (unsigned int i = 0; i < found && pos < (int)sizeof(buf) - 256; i++) {
+        const VwRingEntry *e = &sel[found - 1 - i];  /* oldest first */
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"a\":\"0x%04x\",\"v\":\"0x%02x\",\"fn\":\"%s\"}",
+            i ? "," : "", e->frame, e->adr_byte, e->val,
+            e->func ? e->func : "(none)");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
 }
 
 static void cmd_trace_vram_reset(const char *args) {
@@ -7061,6 +7114,7 @@ static const CmdEntry s_commands[] = {
     {"trace_reg_reset", cmd_trace_reg_reset},
     {"get_reg_trace", cmd_get_reg_trace},
     {"trace_vram",    cmd_trace_vram},
+    {"vwring_get",    cmd_vwring_get},
     {"trace_vram_reset", cmd_trace_vram_reset},
     {"get_vram_trace", cmd_get_vram_trace},
     {"get_oracle_vram_trace", cmd_get_oracle_vram_trace},
