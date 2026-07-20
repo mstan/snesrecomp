@@ -29,3 +29,14 @@ def test_hle_spc_upload_emits_rts_frame_pop_before_normal_return():
 
     assert src.index('HLE SPC upload RTS pop hardware return frame') < src.index(
         'return RECOMP_RETURN_NORMAL;  /* HLE RTS host return */')
+
+
+def test_hle_spc_upload_live_mode_selects_protocol_preserving_helper():
+    rom = make_lorom_bank0({0x8059: bytes([0x60])})
+    src = emit_function(rom, bank=0, start=0x8059,
+                        entry_m=1, entry_x=1,
+                        func_name='SpcUpload',
+                        hle_spc_upload={0x8059: 'live'})
+
+    assert 'RtlUploadSpcImageFromDpLive(cpu)' in src, src
+    assert 'RtlUploadSpcImageFromDp(cpu)' not in src, src

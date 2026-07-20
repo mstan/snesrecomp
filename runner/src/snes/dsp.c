@@ -655,3 +655,12 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame) {
   dsp->sampleRead += 534;
   audio_trace_on_consume(base, 534, dsp->sampleWrite - dsp->sampleRead);
 }
+
+uint32_t dsp_trimSamples(Dsp* dsp, uint32_t samples_to_keep) {
+  uint32_t available = dsp->sampleWrite - dsp->sampleRead;
+  if (samples_to_keep > available)
+    samples_to_keep = available;
+  uint32_t discarded = available - samples_to_keep;
+  dsp->sampleRead += discarded;
+  return discarded;
+}

@@ -1,4 +1,3 @@
-
 #ifndef APU_H
 #define APU_H
 
@@ -22,41 +21,17 @@ typedef struct Timer {
   bool enabled;
 } Timer;
 
-/* CPU->APU port write, ordered in APU-sample time.
- *
- * The queue serializes CPU writes with the audio thread, which advances the
- * SPC in callback-sized bursts. The correctness path targets the current
- * produced-sample clock, making writes visible at the APU's present execution
- * point just as the hardware bus does. A legacy diagnostic path may assign
- * later targets to study host/audio pacing, but delayed wall-time scheduling
- * is not part of the guest machine model. */
-/* Power of 2. SMW peaks at ~4 writes/frame at 1x, but under turbo the
- * uncapped game thread schedules many frames of writes into the bounded
- * latency window faster than the 1x SPC drains them, and the per-port
- * minimum-dwell floor (see APU_PORT_MIN_DWELL) pushes distinct values
- * later still. 128 keeps the in-flight set inside the queue so the
- * overflow force-apply path (which bypasses a write's target) stays a
- * rare backstop rather than the common case under sustained turbo. */
-#define APU_PORT_QUEUE_LEN 128u
-
-/* Minimum produced-sample spacing the scheduler enforces between two
- * DISTINCT values written to the SAME APU port. The SPC sound engine
- * polls its command ports about every ~64 samples of its own time; if
- * two distinct values to one port land closer than that, the engine
- * never observes the first (it is overwritten in inPorts before any
- * read) and that command is silently lost. At 1x the game spaces its
- * per-frame writes ~534 samples apart so this floor never engages, but
- * turbo runs the game thread uncapped while the SPC still advances at
- * 1x, compressing successive same-port writes below the poll period --
- * the audio-dropout-at-level-transition bug. Flooring distinct same-port
- * writes two poll periods apart guarantees the engine polls every value.
- * Expressed in native DSP samples (32040 Hz), so host resample rate is
- * irrelevant. */
-#define APU_PORT_MIN_DWELL 128u
+/* CPU->APU bus events are timestamped in guest APU cycles. The audio callback
+ * may execute the SPC ahead of or behind the CPU thread, but it must not turn
+ * two writes from different emulated frames into back-to-back host mutations.
+ * A power-of-two queue preserves global CPU bus order. If it ever fills, the
+ * caller advances the SPC until space exists; no event is overwritten or
+ * force-applied before its guest timestamp. */
+#define APU_PORT_QUEUE_LEN 1024u
 
 typedef struct ApuPortWrite {
-  uint64_t target_sample; /* apply when the produced-sample clock reaches this */
-  uint8_t port;           /* 0-3 */
+  uint64_t target_cycle; /* apply when portClock reaches this APU cycle */
+  uint8_t port;          /* 0-3 */
   uint8_t val;
 } ApuPortWrite;
 
@@ -72,13 +47,18 @@ struct Apu {
   Timer timer[3];
   uint8_t cpuCyclesLeft;
   uint8_t pad[6];
-  /* Port-write scheduler — MUST stay after `pad`: apu_saveload snapshots
-   * [ram, pad+6) and the savestate layout is frozen. Cleared on reset
-   * and on the HLE SPC-image upload; deliberately not serialized (any
-   * still-pending write applies on the first cycles after load). */
+  /* Port event state must stay after pad: apu_saveload snapshots [ram,pad+6),
+   * and that savestate layout is frozen. Callback lead is host state, so the
+   * queue and its mapping are deliberately reset rather than serialized. */
   ApuPortWrite portQueue[APU_PORT_QUEUE_LEN];
-  uint32_t portQHead;     /* next slot to apply  */
-  uint32_t portQTail;     /* next slot to fill   */
+  uint32_t portQHead;
+  uint32_t portQTail;
+  uint64_t portClock;        /* APU cycles executed since reset */
+  uint64_t portGuestAnchor;  /* guest-cycle origin for current mapping */
+  uint64_t portTargetAnchor; /* matching portClock origin */
+  uint64_t portLastGuest;
+  uint64_t portLastTarget;
+  bool portTimeValid;
 };
 
 Apu* apu_init();
@@ -88,12 +68,29 @@ void apu_cycle(Apu* apu);
 uint8_t apu_cpuRead(Apu* apu, uint16_t adr);
 void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val);
 void apu_saveload(Apu *apu, SaveLoadInfo *sli);
-/* Schedule a CPU-side port write ($2140+port) to land in inPorts when
- * the produced-sample clock reaches target_sample. Caller must hold
- * RtlApuLock. Queue overflow applies the oldest entry immediately
- * (order is always preserved). */
-void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
-                           uint64_t target_sample);
-/* Drop all pending scheduled port writes (reset / HLE image upload). */
+
+/* Immediate visibility is reserved for boot and synchronous protocol code
+ * which advances the SPC itself. Caller holds RtlApuLock. */
+void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val);
+/* Map a monotonic guest APU-cycle timestamp onto the live SPC timeline and
+ * enqueue the write. False means the caller must advance the APU and retry. */
+bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
+                           uint64_t guest_cycle);
+uint32_t apu_portQueueDepth(const Apu* apu);
+/* Advance real SPC execution until every queued bus event has landed. */
+bool apu_runUntilPortQueueEmpty(Apu* apu, uint32_t max_cycles);
+/* Advance the live SPC to a guest timestamp using the same mapping as queued
+ * CPU writes. This is the fast-forward coupling point: game frames and SPC
+ * state advance together even when the host audio device cannot play them. */
+bool apu_runToGuestCycle(Apu* apu, uint64_t guest_cycle,
+                         uint32_t max_cycles);
+/* HLE for a declared live transfer protocol: wait for the driver-ready AA/BB
+ * pair, then deliver the standard CC terminator and wait for its echo. */
+bool apu_waitForTransferReady(Apu* apu, uint8_t request_port,
+                              uint8_t request_value, uint32_t max_cycles);
+bool apu_finishHleTransfer(Apu* apu, uint16_t final_pc,
+                           uint32_t max_cycles);
+/* Drop pending events and reset the guest-to-SPC mapping. */
 void apu_clearPortQueue(Apu* apu);
+
 #endif

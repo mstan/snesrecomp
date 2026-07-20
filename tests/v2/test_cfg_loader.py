@@ -45,6 +45,19 @@ func SpriteMain 9dac end:9db0 entry_mx:0,0
         os.unlink(path)
 
 
+def test_hle_spc_upload_protocol_mode_parses():
+    path = _write("""\
+bank = 00
+hle_spc_upload 8079 live
+func Upload 8079
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.hle_spc_upload == {0x8079: 'live'}
+    finally:
+        os.unlink(path)
+
+
 def test_func_with_end_directive_parses_end():
     path = _write("""\
 bank = 00

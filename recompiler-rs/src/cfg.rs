@@ -214,11 +214,19 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             end_at.insert(pc16, end);
             continue;
         }
-        // hle_spc_upload <hex_pc>
+        // hle_spc_upload <hex_pc> [legacy|live]
+        // The Rust analyzer only needs the entry address; the Python emitter
+        // retains the optional protocol mode when selecting the runtime helper.
         if head == "hle_spc_upload" {
-            if tokens.len() != 2 {
+            if tokens.len() < 2 || tokens.len() > 3 {
                 return Err(format!(
-                    "{path}: hle_spc_upload needs exactly one <pc> argument, got: {stripped:?}"
+                    "{path}: hle_spc_upload needs <pc> and optional [legacy|live], got: {stripped:?}"
+                ));
+            }
+            if tokens.len() == 3 && tokens[2] != "legacy" && tokens[2] != "live" {
+                return Err(format!(
+                    "{path}: hle_spc_upload mode must be legacy or live, got: {:?}",
+                    tokens[2]
                 ));
             }
             let pc16 =
