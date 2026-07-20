@@ -5074,6 +5074,101 @@ static void cmd_dispatch_log_get(const char *args) {
     send_line(buf);
 }
 
+/* interp_stats
+ *   Whole-run AOT-vs-interpreter execution split. Answers "is this game
+ *   mostly statically recompiled, or silently interpreting?" without
+ *   pausing — all counters are always-on aggregates.
+ *     dispatch_total : all runtime indirect dispatches
+ *     found1/found0  : hit an exact AOT body / fell to the interp tier
+ *     found0_pct     : found0 as % of dispatch_total (interp-fallback rate)
+ *     tier_hits      : total interp tier-down invocations
+ *     tier2_sites    : distinct (site,target,m/x) interp gaps
+ *     tier2_clean/bail : summed clean vs bail (bail = interp step-cap = risk)
+ */
+extern unsigned cpu_dispatch_log_count(void);
+extern void cpu_dispatch_found_totals(uint64_t *found1, uint64_t *found0);
+extern long interp_tier_hit_count(void);
+extern void interp_tier2_stats(int *sites, unsigned long long *clean,
+                               unsigned long long *bail);
+extern uint64_t interp816_insns_total(void);
+extern uint64_t interp816_cycles_total(void);
+static void cmd_interp_stats(const char *args) {
+    (void)args;
+    uint64_t f1 = 0, f0 = 0;
+    cpu_dispatch_found_totals(&f1, &f0);
+    unsigned total = cpu_dispatch_log_count();
+    int sites = 0;
+    unsigned long long clean = 0, bail = 0;
+    interp_tier2_stats(&sites, &clean, &bail);
+    double pct = total ? (100.0 * (double)f0 / (double)total) : 0.0;
+    /* Mode-independent truth: guest cycles run by the 65816 interpreter vs
+     * total guest cycles (AOT+interp). 100 - interp_cycle_pct == the fraction
+     * of execution that ran as statically-recompiled C, in HLE OR LLE. */
+    uint64_t icyc = interp816_cycles_total();
+    uint64_t iins = interp816_insns_total();
+    uint64_t mcyc = g_cpu.master_cycles;
+    double icyc_pct = mcyc ? (100.0 * (double)icyc / (double)mcyc) : 0.0;
+    send_fmt("{\"ok\":true,\"dispatch_total\":%u,"
+             "\"found1\":%llu,\"found0\":%llu,\"found0_pct\":%.3f,"
+             "\"tier_hits\":%ld,\"tier2_sites\":%d,"
+             "\"tier2_clean\":%llu,\"tier2_bail\":%llu,"
+             "\"interp_insns\":%llu,\"interp_cycles\":%llu,"
+             "\"master_cycles\":%llu,\"interp_cycle_pct\":%.4f}",
+             total, (unsigned long long)f1, (unsigned long long)f0, pct,
+             interp_tier_hit_count(), sites, clean, bail,
+             (unsigned long long)iins, (unsigned long long)icyc,
+             (unsigned long long)mcyc, icyc_pct);
+}
+
+/* tier2_dump [path]
+ *   Write the tier-2 interp-coverage manifest ON DEMAND from the always-on
+ *   in-memory table — no clean exit required (the atexit path is skipped by
+ *   a force-kill; this never is). With no arg, the filename is auto-built as
+ *   tier2_<romid>_<UTCstamp>.json so every run and every variant lands in its
+ *   OWN file (Mega Man X vs Rockman X never collide, nothing overwrites).
+ *   romid derives from the registered game title. Optional explicit path arg
+ *   overrides the auto name. */
+extern void Tier2CoverageWriteManifest(const char *path, const char *rom_title);
+extern const char *rtl_game_title(void);
+static void cmd_tier2_dump(const char *args) {
+    const char *title = rtl_game_title();
+    /* sanitize title -> filesystem-safe lowercase romid */
+    char romid[64];
+    int j = 0;
+    for (const char *p = title; *p && j < 63; ++p) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        romid[j++] = ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+                         ? c : '_';
+    }
+    romid[j] = '\0';
+
+    char path[300];
+    /* explicit path arg (skip leading spaces) overrides the auto name */
+    const char *a = args;
+    while (a && (*a == ' ' || *a == '\t')) a++;
+    if (a && *a) {
+        snprintf(path, sizeof path, "%s", a);
+    } else {
+        time_t t = time(NULL);
+        struct tm tmv;
+#ifdef _WIN32
+        localtime_s(&tmv, &t);
+#else
+        localtime_r(&t, &tmv);
+#endif
+        char stamp[24];
+        strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &tmv);
+        /* per-run sequence guarantees a distinct file even for multiple dumps
+         * within the same wall-clock second. */
+        static unsigned s_tier2_dump_seq = 0;
+        snprintf(path, sizeof path, "tier2_%s_%s_%03u.json",
+                 romid, stamp, s_tier2_dump_seq++);
+    }
+    Tier2CoverageWriteManifest(path, title);
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"title\":\"%s\"}", path, title);
+}
+
 static void cmd_db_trip_arm(const char *args) {
 #if SNESRECOMP_TRACE
     unsigned int target = 0xC0;
@@ -7108,6 +7203,8 @@ static const CmdEntry s_commands[] = {
     {"db_trip_arm",    cmd_db_trip_arm},
     {"db_trip_get",    cmd_db_trip_get},
     {"dispatch_log_get", cmd_dispatch_log_get},
+    {"interp_stats", cmd_interp_stats},
+    {"tier2_dump", cmd_tier2_dump},
     {"nlr_diag",       cmd_nlr_diag},
     {"stack_drift_get", cmd_stack_drift_get},
     {"stack_drift_arm", cmd_stack_drift_arm},

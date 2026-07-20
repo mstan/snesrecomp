@@ -136,6 +136,15 @@ void interp816_dump_ring(const char* path, long n) {
 }
 #endif
 
+/* Always-on interpreter execution tally: instructions and guest cycles
+ * actually run by the 65816 interpreter tier. Divided by g_cpu.master_cycles
+ * (total guest cycles, AOT+interp) this gives the mode-independent fraction
+ * of execution that is NOT statically recompiled. Read via interp816_*_total. */
+static uint64_t s_interp816_insns;
+static uint64_t s_interp816_cycles;
+uint64_t interp816_insns_total(void)  { return s_interp816_insns; }
+uint64_t interp816_cycles_total(void) { return s_interp816_cycles; }
+
 int interp816_runOpcode(Interp816* cpu) {
   cpu->cyclesUsed = 0;
   if(cpu->stopped) return 1;
@@ -159,6 +168,8 @@ int interp816_runOpcode(Interp816* cpu) {
 #endif
   cpu->cyclesUsed = cyclesPerOpcode[opcode];
   interp816_doOpcode(cpu, opcode);
+  s_interp816_insns++;
+  s_interp816_cycles += (uint64_t)cpu->cyclesUsed;
 #ifdef SNES_COSIM
   { I816RingEnt* e = &g_i816_ring[g_i816_ring_head & (I816_RING_N - 1)];
     e->pc = _pcb; e->op = opcode; e->mf = _mf; e->xf = _xf;

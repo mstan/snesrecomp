@@ -519,6 +519,12 @@ typedef struct DispatchLogEntry {
 static DispatchLogEntry g_dispatch_log[DISPATCH_LOG_CAP];
 static unsigned g_dispatch_log_idx;  /* monotonic; modulo via CAP for storage */
 
+/* Always-on aggregate found tallies (the ring only keeps the last CAP
+ * events, so a whole-run found:0 rate is not recoverable from it). Never
+ * evicted; read via cpu_dispatch_found_totals for the interp_stats command. */
+static uint64_t g_dispatch_found1;   /* dispatches that hit an exact AOT body */
+static uint64_t g_dispatch_found0;   /* dispatches with no AOT body (interp)  */
+
 extern int snes_frame_counter;  /* common_rtl.c — game frame number */
 extern const char *g_last_recomp_func;
 
@@ -535,10 +541,17 @@ static void _dispatch_log_record(uint32 pc24, uint32 source_pc24,
     g_dispatch_log[slot].pad = 0;
     g_dispatch_log[slot].frame = (uint32_t)snes_frame_counter;
     g_dispatch_log_idx++;
+    if (found) g_dispatch_found1++; else g_dispatch_found0++;
 }
 
 unsigned cpu_dispatch_log_count(void) {
     return g_dispatch_log_idx;
+}
+
+/* Whole-run aggregate: exact AOT-hit vs interp-miss dispatch tallies. */
+void cpu_dispatch_found_totals(uint64_t *found1, uint64_t *found0) {
+    if (found1) *found1 = g_dispatch_found1;
+    if (found0) *found0 = g_dispatch_found0;
 }
 
 const DispatchLogEntry *cpu_dispatch_log_at(unsigned i) {
