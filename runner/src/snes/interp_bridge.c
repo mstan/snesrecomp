@@ -1389,6 +1389,100 @@ static uint64_t     g_tier2_cov_overflow;
 static const char *tier2_mx_str(uint8_t mx);
 static const char *tier2_kind_str(uint8_t k);
 
+/* ── RAM-resident routine discovery (static-coverage burn-down) ────────────
+ * A tier-2 target in a RAM bank ($7E/$7F) is code the game built/copied into
+ * RAM at runtime — it is not in ROM, so the static analyzer never sees it and
+ * it can only run via the interpreter. We snapshot every such routine here so
+ * an offline pass can declare it per-game and AOT-compile the *actual bytes*
+ * (faithful literal recompilation of RAM code, guarded by a runtime byte-match;
+ * NOT a semantic HLE reimplementation). Deduped by entry PC.
+ *
+ * Faithfulness gate: on the first sightings we re-hash the live bytes; any
+ * change flags the routine `nondeterministic` — meaning a snapshot is NOT safe
+ * to hardcode and it must stay on the interpreter. A deterministic routine
+ * (e.g. SMW OAMResetRoutine, an unrolled OAM clear built from constants) is
+ * safe to promote. Always-on and bounded; an overflow counter never lies. */
+#define RAM_ROUTINE_MAX      64
+#define RAM_ROUTINE_SNAP     512   /* bytes captured from the entry PC */
+#define RAM_ROUTINE_VERIFY   64    /* re-hash the first N sightings, then stop */
+typedef struct {
+    uint32_t entry_pc24;
+    uint32_t first_caller;      /* site of the first dispatch we saw */
+    uint8_t  mx;                /* entry (m,x) at first sighting */
+    uint8_t  nondeterministic;  /* live bytes changed between sightings */
+    uint16_t likely_len;        /* entry..first RTL/RTS/RTI (<=SNAP); 0 = none */
+    uint32_t hash;              /* FNV-1a over [entry, likely_len) */
+    uint64_t hits;
+    int32_t  first_frame;
+    uint8_t  snap[RAM_ROUTINE_SNAP];
+} RamRoutine;
+static RamRoutine g_ram_routines[RAM_ROUTINE_MAX];
+static int        g_ram_routine_count;
+static uint64_t   g_ram_routine_overflow;
+
+static uint32_t ram_routine_hash(const uint8_t *b, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+
+/* Snapshot up to RAM_ROUTINE_SNAP bytes at `entry` via the live bus and record
+ * the offset just past the first return opcode (RTL $6B / RTS $60 / RTI $40) as
+ * a length estimate. The offline decoder computes the true extent; this is only
+ * to bound the determinism hash so trailing unused RAM can't cause false
+ * nondeterministic flags. Returns 0 in *likely_len when no terminator is in
+ * the window (routine larger than the snapshot — flagged for a wider capture). */
+static void ram_routine_snapshot(uint32_t entry, uint8_t *snap,
+                                 uint16_t *likely_len) {
+    extern CpuState g_cpu;
+    uint8_t  bank = (uint8_t)((entry >> 16) & 0xFF);
+    uint16_t addr = (uint16_t)(entry & 0xFFFF);
+    uint16_t term = 0;
+    for (uint32_t i = 0; i < RAM_ROUTINE_SNAP; i++) {
+        uint8_t v = cpu_read8(&g_cpu, bank, (uint16_t)(addr + i));
+        snap[i] = v;
+        if (!term && (v == 0x6B || v == 0x60 || v == 0x40))
+            term = (uint16_t)(i + 1);
+    }
+    *likely_len = term;
+}
+
+/* Record a RAM-bank dispatch target. No-op for ROM targets. Called from the
+ * tier-2 recorder chokepoint so it dedups with the gap table. */
+static void ram_routine_note(uint32_t target, uint32_t site, uint8_t mx) {
+    extern int snes_frame_counter;
+    if (target < 0x7E0000u) return;   /* ROM target — statically analyzable */
+    int i;
+    for (i = 0; i < g_ram_routine_count; i++)
+        if (g_ram_routines[i].entry_pc24 == target) break;
+    if (i == g_ram_routine_count) {
+        if (i >= RAM_ROUTINE_MAX) { g_ram_routine_overflow++; return; }
+        g_ram_routine_count++;
+        RamRoutine *r = &g_ram_routines[i];
+        r->entry_pc24       = target;
+        r->first_caller     = site;
+        r->mx               = mx;
+        r->nondeterministic = 0;
+        r->hits             = 0;
+        r->first_frame      = snes_frame_counter;
+        ram_routine_snapshot(target, r->snap, &r->likely_len);
+        r->hash = ram_routine_hash(r->snap,
+                    r->likely_len ? r->likely_len : RAM_ROUTINE_SNAP);
+    } else {
+        RamRoutine *r = &g_ram_routines[i];
+        /* Bounded determinism re-check: enough to catch a routine that varies,
+         * without re-hashing 512 bytes on every hit of a hot path. */
+        if (r->hits < RAM_ROUTINE_VERIFY && !r->nondeterministic) {
+            uint8_t  cur[RAM_ROUTINE_SNAP];
+            uint16_t ll;
+            ram_routine_snapshot(target, cur, &ll);
+            uint32_t h = ram_routine_hash(cur, ll ? ll : RAM_ROUTINE_SNAP);
+            if (h != r->hash || ll != r->likely_len) r->nondeterministic = 1;
+        }
+    }
+    g_ram_routines[i].hits++;
+}
+
 /* Gap tuples remain in this bounded structured table for manifest consumers;
  * runtime execution does not print per-gap diagnostics. */
 static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
@@ -1438,6 +1532,9 @@ static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
     if (clean) g_tier2_cov[i].clean_hits++;
     else       g_tier2_cov[i].bail_hits++;
     g_tier2_cov[i].last_frame = snes_frame_counter;
+    /* RAM-bank targets are runtime-built code the static pass can't see; snapshot
+     * them for the offline AOT-declaration pass. No-op for ROM targets. */
+    ram_routine_note(target, site, mx);
 }
 
 static uint8_t tier2_entry_mx(const CpuState *cpu) {
@@ -1752,6 +1849,29 @@ void Tier2CoverageDumpJson(FILE *f) {
     fprintf(f, "\n    ]\n  },\n");
 }
 
+/* Emit the discovered RAM-resident routines (runtime-built/copied code the
+ * static analyzer can't see). `bytes` is the hex-encoded snapshot up to the
+ * likely terminator; the offline pass decodes it, confirms determinism, and
+ * declares it per-game for AOT. */
+static void ram_routines_emit(FILE *f, const char *indent) {
+    for (int i = 0; i < g_ram_routine_count; i++) {
+        RamRoutine *r = &g_ram_routines[i];
+        uint32_t n = r->likely_len ? r->likely_len : RAM_ROUTINE_SNAP;
+        fprintf(f,
+            "%s%s{\"entry_pc24\":\"0x%06X\",\"likely_len\":%u,"
+            "\"terminated\":%s,\"hash\":\"0x%08X\",\"hits\":%llu,"
+            "\"first_frame\":%d,\"first_caller\":\"0x%06X\",\"entry_mx\":\"%s\","
+            "\"nondeterministic\":%s,\"bytes\":\"",
+            (i ? ",\n" : "\n"), indent,
+            r->entry_pc24, (unsigned)n, r->likely_len ? "true" : "false",
+            r->hash, (unsigned long long)r->hits, r->first_frame,
+            r->first_caller, tier2_mx_str(r->mx),
+            r->nondeterministic ? "true" : "false");
+        for (uint32_t b = 0; b < n; b++) fprintf(f, "%02X", r->snap[b]);
+        fprintf(f, "\"}");
+    }
+}
+
 void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
     FILE *f = fopen(path, "w");
     if (!f) return;
@@ -1777,6 +1897,11 @@ void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
         title, interp_tier_hit_count(), g_tier2_cov_count,
         (unsigned long long)g_tier2_cov_overflow);
     tier2_emit_discoveries(f, "    ");
+    fprintf(f, "\n  ],\n"
+               "  \"ram_routines_overflow\": %llu,\n"
+               "  \"ram_routines\": [",
+            (unsigned long long)g_ram_routine_overflow);
+    ram_routines_emit(f, "    ");
     fprintf(f, "\n  ]\n}\n");
     fclose(f);
 }
