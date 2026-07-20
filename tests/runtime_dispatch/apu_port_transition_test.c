@@ -3,9 +3,16 @@
 
 #include "apu.h"
 
+static int applied_count;
+static uint8_t applied_port;
+static uint8_t applied_value;
+uint64_t g_apu_timer0_total_ticks;
+int snes_frame_counter;
+
 void audio_trace_on_cpu_port_apply(uint8_t port, uint8_t value) {
-  (void)port;
-  (void)value;
+  applied_count++;
+  applied_port = port;
+  applied_value = value;
 }
 
 static int check(int condition, const char *message) {
@@ -19,64 +26,41 @@ int main(void) {
   int failures = 0;
 
   memset(&apu, 0, sizeof(apu));
-  apu_clearPortQueue(&apu);
 
-  /* A transition can queue a fade, music command, and NMI clear before the
-   * audio thread advances another sample. Every distinct command must remain
-   * visible for at least one SPC poll. */
-  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
-  apu_schedulePortWrite(&apu, 2, 0x23, 1000);
-  apu_schedulePortWrite(&apu, 2, 0x00, 1000);
-
-  apu_applyDuePortWrites(&apu, 1000);
-  failures += check(apu.inPorts[2] == 0x80, "fade visible before music");
-  apu_noteSpcPortRead(&apu, 2, 0x80);
-
-  apu_applyDuePortWrites(&apu, 1000 + APU_PORT_MIN_DWELL);
-  failures += check(apu.inPorts[2] == 0x23, "music visible before clear");
-  apu_noteSpcPortRead(&apu, 2, 0x23);
-
-  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
-  failures += check(apu.inPorts[2] == 0x00, "clear follows music observation");
-
-  /* The mixer can catch up past every queued timestamp in one callback.
-   * Timestamps alone must not collapse the transition into its final clear. */
-  memset(&apu, 0, sizeof(apu));
-  apu_clearPortQueue(&apu);
-  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
-  apu_schedulePortWrite(&apu, 2, 0x23, 1000);
-  apu_schedulePortWrite(&apu, 2, 0x00, 1000);
-  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
+  apu_writePortNow(&apu, 2, 0x80);
   failures += check(apu.inPorts[2] == 0x80,
-                    "burst catch-up preserves fade until SPC observes it");
-  apu_noteSpcPortRead(&apu, 2, 0x80);
-  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
+                    "CPU port write is visible in the current APU cycle");
+  failures += check(applied_count == 1 && applied_port == 2 &&
+                    applied_value == 0x80,
+                    "CPU port write is traced when it becomes visible");
+
+  apu_writePortNow(&apu, 2, 0x23);
   failures += check(apu.inPorts[2] == 0x23,
-                    "burst catch-up preserves music until SPC observes it");
-  apu_noteSpcPortRead(&apu, 2, 0x23);
-  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
-  failures += check(apu.inPorts[2] == 0x00,
-                    "burst catch-up applies clear after music observation");
+                    "a later command replaces the port immediately");
 
-  /* Overflow must not force-apply over a command the SPC has not read. */
-  memset(&apu, 0, sizeof(apu));
-  apu_clearPortQueue(&apu);
-  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
-  apu_applyDuePortWrites(&apu, 1000);
-  for (uint32_t i = 0; i < APU_PORT_QUEUE_LEN; i++)
-    apu_schedulePortWrite(&apu, 2, 0x23, 1000);
-  apu_schedulePortWrite(&apu, 2, 0x00, 1000);
-  failures += check(apu.inPorts[2] == 0x80,
-                    "queue overflow cannot overwrite unread command");
+  apu_writePortNow(&apu, 6, 0x00);
+  failures += check(apu.inPorts[2] == 0x00 && applied_port == 2 &&
+                    applied_value == 0x00,
+                    "port index is masked and clear is immediately visible");
 
   memset(&apu, 0, sizeof(apu));
-  apu_clearPortQueue(&apu);
-  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
-  apu_schedulePortWrite(&apu, 2, 0x80, 0);
-  apu_schedulePortWrite(&apu, 2, 0x23, 0);
-  apu_applyDuePortWrites(&apu, 1000);
-  failures += check(apu.inPorts[2] == 0x80,
-                    "duplicate command cannot pull a later value forward");
+  apu.outPorts[0] = 0xaa;
+  apu.outPorts[1] = 0xbb;
+  failures += check(apu_waitForTransferReady(&apu, 1, 0xff, 0),
+                    "HLE upload waits for the SPC transfer-ready handshake");
+
+  apu.outPorts[0] = 0;
+  failures += check(!apu_waitForTransferReady(&apu, 1, 0xff, 0),
+                    "HLE upload rejects a missing transfer-ready handshake");
+  failures += check(apu.inPorts[1] == 0xff,
+                    "HLE upload reasserts a transfer request cleared during startup");
+
+  apu.outPorts[0] = 0xcc;
+  failures += check(apu_finishHleTransfer(&apu, 0x1234, 0),
+                    "HLE upload waits for the SPC terminator acknowledgement");
+  failures += check(apu.inPorts[0] == 0 && apu.inPorts[1] == 0 &&
+                    apu.inPorts[2] == 0 && apu.inPorts[3] == 0,
+                    "HLE upload clears CPU ports after acknowledgement");
 
   if (failures)
     return 1;

@@ -816,152 +816,24 @@ void rtl_accumulate_apu_catchup(void) {
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
 #ifdef SNES_COSIM
-  /* Shared APU clock (common_rtl.h): do NOT convert pending touch credit on a
-   * port WRITE — schedule the byte at the current produced clock and leave the
-   * credit for the next port READ. Rationale: the interp tier executes a guest
-   * word store to $2140/$2141 as two byte writes; converting credit between
-   * them runs the SPC ~73 cycles with the kick byte applied but the data byte
-   * not yet — the IPL latches stale data and the upload handshake wedges
-   * (measured: LLE-shared stuck at outPorts=AABB to frame 360+). On hardware
-   * the two bytes land ~2 SPC cycles apart — effectively atomic. Deferring
-   * write-side conversion makes byte pairs land at the SAME produced tick, in
-   * program order, for BOTH the interp (lo,hi) and compiled (hi,lo) models —
-   * which also makes word-write APU evolution identical across tiers. */
+  /* Apply the byte at the current shared APU clock. Guest execution advances
+   * the shared clock; injecting extra SPC cycles here could let a word store's
+   * trigger byte overtake its data byte in the IPL upload handshake. */
   if (cosim_apu_shared_clock()) {
     RtlApuLock();
     audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
-    uint64_t produced_now, consumed_now;
-    audio_trace_sample_clocks(&produced_now, &consumed_now);
-    apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
+    apu_writePortNow(g_snes->apu, (uint8_t)(adr & 0x3), val);
     RtlApuUnlock();
     return;
   }
 #endif
-  // Catch the APU up to the current cycle, then SCHEDULE the port write
-  // in APU-sample time rather than mutating inPorts at wall time.
-  //
-  // Rationale (SMW missed-SFX root cause): the audio thread advances
-  // the SPC in whole-callback bursts, so a wall-time port mutation gives
-  // the value a lifetime of however many samples happen to be produced
-  // before the next mutation — measured ~9 samples (vs the 64 an engine
-  // poll needs) whenever the 60.0988 Hz NMI beats across the 60.00 Hz
-  // callback phase. Anchoring each write one callback quantum past the
-  // CONSUMED clock keeps successive frame writes a full frame apart in
-  // the SPC's own execution time, so the engine always polls every
-  // value, exactly as on hardware. Steady-state added latency is ~zero:
-  // consumed + quantum ~= produced, i.e. the next burst applies it.
-  // Serialise with the audio thread via RtlApuLock -- it holds the same
-  // lock while cycling the APU in RtlRenderAudio.
+  /* Catch the APU up to the CPU's current guest cycle before exposing the
+   * write. RtlApuLock serializes this with callback-driven SPC execution. */
   RtlApuLock();
   rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
   audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
-  {
-    /* Write clock: each target advances from the PREVIOUS write's target
-     * by the real wall-time gap between the two writes, converted to
-     * samples. This preserves hardware-faithful inter-write spacing in
-     * the SPC's execution timeline — frame-spaced NMI writes stay ~534
-     * samples apart, same-frame double writes keep their ms-scale gap —
-     * independent of where the audio thread's burst boundaries fall.
-     *
-     * (First attempt anchored targets at consumed+quantum; that fails
-     * because produced runs AHEAD of consumed by the output-ring fill,
-     * so every target was in the past and the floor collapsed
-     * consecutive writes onto the same sample — measured as +0-sample
-     * command lifetimes, i.e. the original race in a new costume.)
-     *
-     * Floor at produced: a target in the APU's past applies on the next
-     * executed sample. Ceiling at produced + 3 callback quanta bounds
-     * worst-case latency and sheds the slow forward drift from the
-     * NMI(60.0988 Hz)/callback(60.00 Hz) rate mismatch. Both caps scale
-     * with the observed burst granularity (audio_samples in config.ini
-     * is user-tunable): a ceiling smaller than the real burst would pin
-     * late-window writes to the same target and re-collapse spacing. */
-    static uint64_t s_port_clock;     /* previous write's target */
-    static uint64_t s_port_clock_ns;  /* wall_ns of previous write */
-    /* Per-port history for the minimum-dwell floor below. Statics, like
-     * s_port_clock: not reset across RtlReset/upload, which is benign —
-     * after a reset `produced` has advanced far past any stale target, so
-     * the floor (stale_target + dwell) is already in the past and never
-     * engages spuriously. */
-    static uint64_t s_port_last_target[4];
-    static uint8_t  s_port_last_val[4];
-    static uint8_t  s_port_last_valid[4];
-    /* Hardware visibility is the correctness default: a CPU port write lands
-     * at the APU's current execution point. Delaying it according to host wall
-     * time is not an LLE property and breaks real write -> echo -> poll
-     * protocols (MMX's runtime SPC upload used to spend >5 seconds in one
-     * faithfully recompiled polling loop). Keep the deferred scheduler below
-     * only as an explicit legacy/audio experiment selected with
-     * SNESRECOMP_APU_IMMEDIATE_PORTS=0; it must not be a per-game or per-region
-     * compile-time correctness hint. */
-    static int s_immediate = -1;
-    if (s_immediate < 0) {
-      const char *e = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
-      s_immediate = (e && e[0]) ? (e[0] != '0') : 1;
-#ifdef SNES_COSIM
-      /* Shared APU clock implies immediate ports: the deferred scheduler
-       * anchors targets to the co-sim virtual wall clock, which derives from
-       * master_cycles — a per-execution-model clock that would re-skew the
-       * A/B pair this mode aligns. */
-      if (cosim_apu_shared_clock()) s_immediate = 1;
-#endif
-    }
-    if (s_immediate) {
-      uint64_t produced_now, consumed_now;
-      audio_trace_sample_clocks(&produced_now, &consumed_now);
-      apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
-      RtlApuUnlock();
-      return;
-    }
-    uint64_t quantum = audio_trace_consume_quantum();
-    uint64_t now_ns = audio_trace_wall_ns();
-    uint64_t produced, consumed;
-    audio_trace_sample_clocks(&produced, &consumed);
-    uint64_t delta = 0;
-    if (s_port_clock_ns != 0)
-      delta = (now_ns - s_port_clock_ns) * 32040u / 1000000000u;
-    if (delta > 4u * quantum) delta = 4u * quantum;
-    uint64_t target = s_port_clock + delta;
-    if (target < produced) target = produced;
-    if (target > produced + 3u * quantum) target = produced + 3u * quantum;
-
-    /* Minimum per-port dwell — the turbo audio-dropout fix. A level
-     * transition fires several DISTINCT values at the same APU port
-     * (fade, silence, the new song; or a one-shot command then the NMI's
-     * next-frame 0-clear) within a few frames. The wall-clock spacing
-     * computed above reproduces hardware timing faithfully at 1x, but
-     * turbo runs the game thread uncapped while the SPC still advances at
-     * 1x, compressing that spacing below the engine's ~64-sample poll
-     * period — so an earlier value is overwritten in inPorts before the
-     * engine ever reads it and the command is silently lost (music/SFX
-     * drop out; because a surviving fade can zero global output, they do
-     * not come back until the next track change, i.e. never within a
-     * level). Floor a DISTINCT value's target so the previous distinct
-     * value on that port holds the bus for at least APU_PORT_MIN_DWELL
-     * produced-samples — one guaranteed engine poll. The drain runs once
-     * per produced sample (apu_cycle), so this target spacing becomes
-     * apply spacing directly. Bounded by produced + 8*quantum so a
-     * pathological sustained burst degrades to today's bounded latency
-     * rather than unbounding it. Identical repeats (e.g. repeated
-     * 0-clears) need no spacing. No effect at 1x: frame-spaced writes are
-     * already ~534 samples apart, far above the floor. */
-    {
-      int p = (int)(adr & 0x3);
-      if (s_port_last_valid[p] && val != s_port_last_val[p]) {
-        uint64_t floor = s_port_last_target[p] + APU_PORT_MIN_DWELL;
-        uint64_t ceil  = produced + 8u * quantum;
-        if (target < floor) target = floor < ceil ? floor : ceil;
-      }
-      s_port_last_target[p] = target;
-      s_port_last_val[p]    = val;
-      s_port_last_valid[p]  = 1;
-    }
-
-    s_port_clock = target;
-    s_port_clock_ns = now_ns;
-    apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, target);
-  }
+  apu_writePortNow(g_snes->apu, (uint8_t)(adr & 0x3), val);
   RtlApuUnlock();
 }
 
@@ -975,6 +847,21 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
   int block_count = 0;
 
   RtlApuLock();
+  bool ipl_phase = g_snes->apu->romReadable;
+  uint8_t transfer_request = g_snes->apu->inPorts[1];
+  if (!ipl_phase &&
+      !apu_waitForTransferReady(g_snes->apu, 1, transfer_request, 1u << 20)) {
+    fprintf(stderr,
+            "[apu] SPC transfer-ready timeout pc=%04x stopped=%d "
+            "in=%02x%02x out=%02x%02x edge=%02x%02x buf=%02x%02x\n",
+            g_snes->apu->spc->pc, g_snes->apu->spc->stopped,
+            g_snes->apu->inPorts[0], g_snes->apu->inPorts[1],
+            g_snes->apu->outPorts[0], g_snes->apu->outPorts[1],
+            g_snes->apu->ram[0], g_snes->apu->ram[1],
+            g_snes->apu->ram[4], g_snes->apu->ram[5]);
+    RtlApuUnlock();
+    return false;
+  }
   for (;;) {
     uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
     uint16_t target = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
@@ -1011,18 +898,11 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
    * just-uploaded music data would never start playing. SFX would
    * still work since they're triggered by inPort writes processed
    * after the restart's re-init, but song state would never persist.
-   *
-   * Detect "first upload" via apu->romReadable: it's reset to true by
-   * apu_reset() and only flipped false here, so on the IPL-phase
-   * upload it's still true. */
-  bool ipl_phase = g_snes->apu->romReadable;
-  /* The upload supersedes any not-yet-applied scheduled port writes;
-   * a stale pre-upload command landing on the freshly cleared ports
-   * would replay into the re-initialised engine. */
-  apu_clearPortQueue(g_snes->apu);
-  memset(g_snes->apu->inPorts, 0, sizeof(g_snes->apu->inPorts));
-  memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
+   * Complete subsequent transfers through the driver's terminator handshake
+   * so its post-transfer mute, port, and music-state cleanup runs naturally. */
   if (ipl_phase) {
+    memset(g_snes->apu->inPorts, 0, 4);
+    memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
     g_snes->apu->romReadable = false;
     g_snes->apuCatchupCycles = 0;
     g_snes->apu->cpuCyclesLeft = 0;
@@ -1034,6 +914,10 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
         g_snes->apu->spc->sp = 0xef;
       g_snes->apu->spc->pc = final_pc;
     }
+  } else if (!apu_finishHleTransfer(g_snes->apu, final_pc, 1u << 20)) {
+    RtlApuUnlock();
+    fprintf(stderr, "[apu] SPC transfer terminator timed out\n");
+    return false;
   }
   g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   // Resync the master pointer too: an IPL-phase upload zeroes apuCatchupCycles,
