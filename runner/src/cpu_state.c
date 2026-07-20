@@ -122,6 +122,12 @@ static void wlog_addr_lazy(void) {
     if (sscanf(p, "%x:%x:%511[^\n]", &lo, &hi, path) >= 3 && path[0]) {
         g_wlog_addr_lo = (uint16)lo; g_wlog_addr_hi = (uint16)hi;
         g_wlog_addr_fp = fopen(path, "w");
+        /* Unbuffered: writes to a narrow addr range are rare, and probes
+         * commonly force-kill the process (no atexit flush) after a free-run
+         * capture. On Windows/MSVCRT _IOLBF degrades to full buffering, so use
+         * _IONBF to make the log durable across force-kill and readable while
+         * the game is still running. */
+        if (g_wlog_addr_fp) setvbuf(g_wlog_addr_fp, NULL, _IONBF, 0);
     }
     const char *c = getenv("SNESRECOMP_WLOG_ADDR_CAP");
     if (c && c[0]) g_wlog_addr_cap = strtol(c, NULL, 0);
