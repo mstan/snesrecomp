@@ -363,6 +363,12 @@ void interp_bridge_set_master_deadline(uint64_t master_clock) {
     s_lle_master_deadline = master_clock;
 }
 
+int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
+    return cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
+           s_lle_master_deadline != 0 &&
+           cpu->master_cycles >= s_lle_master_deadline;
+}
+
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     (void)cpu;
     /* A JMP-reached primitive (task-die / scheduler-dispatch) arrives via a

@@ -458,24 +458,26 @@ bool RtlRunFrame(uint32 inputs) {
   return false;
 }
 
-void RtlSaveSnapshot(const char *filename) {
+bool RtlSaveSnapshot(const char *filename) {
   FILE *f = fopen(filename, "wb");
   if (!f) {
     printf("Failed fopen for save: %s\n", filename);
-    return;
+    return false;
   }
   uint32 hdr[2] = { RTL_SAV_MAGIC, RTL_SAV_VERSION };
-  fwrite(hdr, sizeof(hdr), 1, f);
+  bool header_ok = fwrite(hdr, sizeof(hdr), 1, f) == 1;
   RtlApuLock();
-  FileSli fs = { { &file_sli_func }, f, true, false };
-  snes_saveload(g_snes, &fs.base);
+  FileSli fs = { { &file_sli_func }, f, true, !header_ok };
+  if (header_ok)
+    snes_saveload(g_snes, &fs.base);
   /* v5: game-specific chunk (task-slot resume contexts etc.). Streamed
    * through the same FileSli so the format stays one linear blob. */
   if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
     g_rtl_game_info->state_save_extra(&fs.base);
   RtlApuUnlock();
   if (fs.error) printf("Save write error: %s\n", filename);
-  fclose(f);
+  bool close_ok = fclose(f) == 0;
+  return !fs.error && close_ok;
 }
 
 bool RtlLoadSnapshot(const char *filename) {

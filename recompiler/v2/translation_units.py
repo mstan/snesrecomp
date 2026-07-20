@@ -20,6 +20,31 @@ _SYNTHETIC_BANK_FN_RE = re.compile(
 _FORWARD_DECL_MARKER = "/* Forward declarations for in-bank entries. */"
 
 
+def _with_referenced_variant_declarations(source: str) -> str:
+    """Give a monolithic bank file prototypes for every generated callee.
+
+    ``emit_bank`` knows only about entries owned by the current bank, while
+    indirect dispatch tables and cross-bank tail transfers can call generated
+    variants owned by another bank.  A block-local ``extern`` at one tail-call
+    site does not declare that target for later dispatch calls in the same
+    translation unit.  Shards already rebuild their declaration list from all
+    call references; apply the same rule to monolithic banks.
+    """
+    marker = source.find(_FORWARD_DECL_MARKER)
+    if marker < 0:
+        raise ValueError("emitted source lacks forward declarations")
+    references = sorted(set(_VARIANT_CALL_NAME_RE.findall(source)))
+    if not references:
+        return source
+    line_end = source.find("\n", marker)
+    if line_end < 0:
+        line_end = len(source)
+    declarations = "".join(
+        f"RecompReturn {name}(CpuState *cpu);\n"
+        for name in references)
+    return source[:line_end + 1] + declarations + source[line_end + 1:]
+
+
 def split_bank_translation_units(
         source: str, bank: int, symbol_pcs: Mapping[str, int], *,
         threshold_bytes: int, pc_span: int) -> dict[str, str]:
@@ -34,7 +59,9 @@ def split_bank_translation_units(
     monolithic_name = f"bank{bank:02x}_v2.c"
     if (pc_span <= 0 or threshold_bytes < 0
             or len(source.encode("utf-8")) < threshold_bytes):
-        return {monolithic_name: source}
+        return {
+            monolithic_name: _with_referenced_variant_declarations(source)
+        }
 
     matches = list(_TOP_LEVEL_CPU_FN_RE.finditer(source))
     if not matches:
