@@ -11,7 +11,8 @@ typedef struct WsShadowLayer {
   bool registered;
   bool active;
   bool wide;
-  bool fold;      /* periodic-fold mode (vs world-keyed history mode) */
+  bool fold;      /* periodic fold enabled (composes with world history) */
+  bool worldSet;  /* WsShadowSetWorld called this frame */
   uint32_t worldX;
   uint32_t worldY;
   uint16_t mapBaseWord;
@@ -75,6 +76,7 @@ void WsShadowReset(void) {
     layer->registered = false;
     layer->active = false;
     layer->fold = false;
+    layer->worldSet = false;
     memset(layer->foldRow, 0, sizeof(layer->foldRow));
   }
 }
@@ -85,6 +87,9 @@ void WsShadowSetPeriodicFold(int layerIndex) {
   WsShadowLayer *layer = &s_layers[layerIndex];
   layer->registered = true;
   layer->fold = true;
+  /* Composable with WsShadowSetWorld: rows with a detected period fold
+   * to fresh native columns; the remaining (world-anchored) rows fall
+   * through to the world-keyed history, then to the plain map wrap. */
 }
 
 void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
@@ -103,7 +108,7 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
     }
   }
   layer->registered = true;
-  layer->fold = false;
+  layer->worldSet = true;
   layer->worldX = worldX;
   layer->worldY = worldY;
 }
@@ -140,9 +145,10 @@ void WsShadowFrame(const struct Ppu *ppu) {
     if (layer->fold) {
       layer->foldVram = ppu->vram;
       memset(layer->foldRow, 0, sizeof(layer->foldRow));
-      continue;
     }
-    if (!layer->entries)
+    bool sweep = layer->worldSet && layer->entries;
+    layer->worldSet = false;
+    if (!sweep)
       continue;
 
     uint32_t tx0 = layer->worldX >> 3;
@@ -201,23 +207,25 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
   if (!layer->active || screenX >= 0 && screenX < 256)
     return realTile;
 
-  if (layer->fold) {
-    if (!layer->foldVram)
-      return realTile;
+  /* Layered margin sources: (1) periodic fold for rows whose native
+   * window proves an exact period — always this-frame fresh; (2) the
+   * world-keyed history for the remaining (world-anchored) rows;
+   * (3) the renderer's plain map wrap as the final fallback. */
+  if (layer->fold && layer->foldVram) {
     uint16_t off = (uint16_t)(mapWordAdr - layer->mapBaseWord);
-    if (off >= 0x800)
-      return realTile;  /* 64x64 map half not modeled: keep plain wrap */
-    int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
-    int row = (off >> 5) & 0x1f;
-    int natCol = (hScroll >> 3) & 63;
-    uint8_t period = FoldRowPeriod(layer, row, natCol);
-    if (!period)
-      return realTile;
-    /* Fold to the congruent column inside the native window. */
-    int rel = (col - natCol) & 63;
-    if (rel < 32)
-      return realTile;  /* native column (or margin overlapping it) */
-    return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
+    if (off < 0x800) {
+      int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
+      int row = (off >> 5) & 0x1f;
+      int natCol = (hScroll >> 3) & 63;
+      uint8_t period = FoldRowPeriod(layer, row, natCol);
+      if (period) {
+        int rel = (col - natCol) & 63;
+        if (rel < 32)
+          return realTile;  /* native column (or margin overlapping it) */
+        return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
+      }
+      /* no exact period: fall through to the world-keyed history */
+    }
   }
 
   if (!layer->entries)
