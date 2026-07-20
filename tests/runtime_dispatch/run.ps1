@@ -7,6 +7,7 @@ $args = @(
     "-I$root\runner\src", "-I$root\runner\src\snes",
     "$root\tests\runtime_dispatch\known_lle_entry_test.c",
     "$root\runner\src\cpu_state.c",
+    "$root\runner\src\snes\cart.c",
     "-Wl,--gc-sections", "-o", $out
 )
 

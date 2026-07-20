@@ -2,6 +2,31 @@
 
 snesrecomp incorporates the following third-party software.
 
+## Native analyzer performance inspiration
+
+Derrick Gold's independent Go port of the snesrecomp recompiler demonstrated
+that moving the Python pipeline to a compiled implementation could deliver an
+approximately 25x speedup. That result prompted the production native-analyzer
+work in this repository.
+
+- Project: https://github.com/DerrickGold/ar-recomp
+- Go migration commit: https://github.com/DerrickGold/ar-recomp/commit/ae3d2d1ffaa87281241bb1a2822d5b3dde35ca96
+
+No source from the Go implementation is incorporated into `recompiler-rs/`.
+The Rust code's implementation foundation and provenance are documented below.
+
+## Native analyzer foundation
+
+The Rust instruction decoder, cfg parser, and ROM mapping foundation under
+`recompiler-rs/` originated in Colin Curtin's `perplexes/snesrecomp`
+`feat/superfx-gsu/recompiler-rs` work and has since been reduced to the native
+analysis boundary, updated for the current Python semantics, and extended with
+the whole-program fixed point and production integration.
+
+- Upstream: https://github.com/perplexes/snesrecomp
+- Original branch: `feat/superfx-gsu/recompiler-rs`
+- License declared by the upstream crate: MIT
+
 ## LakeSnes — 65816 CPU core
 
 `runner/src/snes/interp816.{c,h}`, the 65816 interpreter backing the

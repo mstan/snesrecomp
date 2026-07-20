@@ -9,6 +9,7 @@ from v2.program_analysis import (  # noqa: E402
     EdgeKind,
     EdgeResolution,
     NodeDisposition,
+    ProgramManifest,
     ProgramAnalyzer,
     VariantKey,
     summarize_decode_graph,
@@ -41,6 +42,35 @@ def test_direct_call_closure_preserves_exact_mx_and_is_deterministic():
         [VariantKey(0x008000, 1, 0)]).to_json()
     assert list(json.loads(manifest.to_json())["nodes"]) == [
         "008000:M1X0", "009000:M1X0"]
+
+
+def test_node_digest_is_stable_and_changes_with_decoded_content():
+    first_rom = make_lorom_bank0({
+        0x8000: bytes([0xEA, 0x60]),       # NOP; RTS
+    })
+    changed_rom = make_lorom_bank0({
+        0x8000: bytes([0x18, 0x60]),       # CLC; RTS
+    })
+    key = VariantKey(0x008000, 1, 1)
+
+    first = ProgramAnalyzer(_decode(first_rom)).analyze([key])
+    repeated = ProgramAnalyzer(_decode(first_rom)).analyze([key])
+    changed = ProgramAnalyzer(_decode(changed_rom)).analyze([key])
+
+    assert first.nodes[key].digest == repeated.nodes[key].digest
+    assert first.nodes[key].digest != changed.nodes[key].digest
+
+
+def test_manifest_wire_format_round_trips_and_ignores_backend_metadata():
+    rom = make_lorom_bank0({0x8000: bytes([0x60])})
+    manifest = ProgramAnalyzer(_decode(rom)).analyze([
+        VariantKey(0x008000, 1, 1)])
+    value = json.loads(manifest.to_json())
+    value["native_analysis"] = {"dispatch_helpers": {}, "inline_args": {}}
+
+    restored = ProgramManifest.from_dict(value)
+
+    assert restored.to_dict() == manifest.to_dict()
 
 
 def test_unresolved_indirect_is_per_edge_lle_and_keeps_direct_demand():
@@ -82,6 +112,20 @@ def test_structural_poison_does_not_propagate_plausible_calls():
     assert "structural_poison" in root.reasons
     assert not root.demands
     assert VariantKey(0x009000, 1, 1) not in manifest.nodes
+
+
+def test_decomp_declared_embedded_data_break_does_not_poison_routine():
+    rom = make_lorom_bank0({
+        # BCC $8004; embedded BRK/signature data; RTS
+        0x8000: bytes([0x90, 0x02, 0x00, 0x00, 0x60]),
+    })
+    manifest = ProgramAnalyzer(_decode(
+        rom, data_regions=[(0x00, 0x8002, 0x8004)])).analyze([
+            VariantKey(0x008000, 1, 1)])
+    root = manifest.nodes[VariantKey(0x008000, 1, 1)]
+
+    assert root.disposition == NodeDisposition.AOT_ELIGIBLE
+    assert "structural_poison" not in root.reasons
 
 
 def test_decode_budget_classifies_node_lle_only_without_partial_graph():

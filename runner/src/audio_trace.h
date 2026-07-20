@@ -152,6 +152,14 @@ typedef struct AudioTraceStats {
   uint64_t brr_div_count;
   double   brr_div_sumsq;
   double   brr_div_max;
+  uint32_t brr_first_valid;
+  uint16_t brr_first_block;
+  uint8_t  brr_first_header;
+  uint8_t  brr_first_sample;
+  int32_t  brr_first_canon;
+  int32_t  brr_first_reference;
+  int32_t  brr_first_old;
+  int32_t  brr_first_older;
 
   /* Echo-FIR faithful-reference divergence (dev only). Per output sample, canon
    * dsp_handleEcho 8-tap FIR sum vs blargg's CALC_FIR reference on the same FIR
@@ -174,9 +182,11 @@ void audio_trace_on_shadow_div(double dl, double dr);
 /* Record one active-voice sample's canon-vs-faithful-reference Gaussian
  * divergence (normalized [-1,1]). Dev-only; called from dsp_shadow per voice. */
 void audio_trace_on_faithful_div(double d);
-/* Record one BRR-decoded sample's canon-vs-reference divergence (normalized).
+/* Record one BRR-decoded sample's canon-vs-reference comparison. Retains the
+ * first mismatching block/header/sample as a deterministic runtime witness.
  * Dev-only; called from dsp_shadow_verify_brr. */
-void audio_trace_on_brr_div(double d);
+void audio_trace_on_brr_compare(uint16_t block, uint8_t header, uint8_t sample,
+                                int canon, int reference, int old, int older);
 /* Record one output sample's canon-vs-reference echo-FIR divergence (normalized
  * [-1,1], L/R averaged). Dev-only; called from dsp_handleEcho. */
 void audio_trace_on_echo_div(double d);

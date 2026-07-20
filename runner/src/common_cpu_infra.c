@@ -6,6 +6,7 @@
 #include "snes/cpu.h"
 #include "snes/snes.h"
 #include "snes/msu1.h"
+#include "snes/interp_bridge.h"
 #include "util.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
@@ -23,6 +24,21 @@ Cpu *g_snes_cpu;
 bool g_fail;
 const RtlGameInfo *g_rtl_game_info;
 
+/* Interp-coverage feedback manifest, written on process exit. The always-on
+ * tier-2 gap recorder in the interp bridge names every entry the interpreter
+ * had to resolve at runtime; this serializes that promotion worklist (schema
+ * "snesrecomp tier2 coverage v1") so tools/tier2_ingest.py can fold it back
+ * into the cfg and the next regen promotes those entries to AOT — the LLE-first
+ * burn-down loop. Path overridable via SNESRECOMP_TIER2_MANIFEST (default: CWD
+ * tier2_coverage.json). Empty discoveries on a fully-covered run is the
+ * expected dormant case. */
+static void rtl_write_tier2_coverage_manifest(void) {
+  const char *path = getenv("SNESRECOMP_TIER2_MANIFEST");
+  Tier2CoverageWriteManifest(path && *path ? path : "tier2_coverage.json",
+                             g_rtl_game_info ? g_rtl_game_info->title
+                                             : "unknown");
+}
+
 void RtlRegisterGame(const RtlGameInfo *info) {
   g_rtl_game_info = info;
   /* Arm MSU-1 from the environment for every game, with no per-game
@@ -30,6 +46,16 @@ void RtlRegisterGame(const RtlGameInfo *info) {
    * main.c may additionally call msu1_set_rom_path() to enable the
    * "auto" base-from-ROM-name mode. */
   msu1_init();
+  /* Harvest the interp-coverage manifest on exit for every game, same
+   * no-per-game-wiring policy as MSU-1 above. Registered once regardless of
+   * how many times a game re-registers (e.g. a reset path). */
+  {
+    static int coverage_atexit_registered = 0;
+    if (!coverage_atexit_registered) {
+      coverage_atexit_registered = 1;
+      atexit(rtl_write_tier2_coverage_manifest);
+    }
+  }
 }
 
 uint8_t *SnesRomPtr(uint32 v) {
@@ -285,14 +311,50 @@ const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
     return &g_recomp_snap_ring[slot];
 }
 
+/* Write-log scope: arm the shared write ring around the selected AOT body.
+ * SNESRECOMP_WLOG_FUNC_PREFIX overrides the historical
+ * "vram_payload_handler_M" default so the same first-divergence probe can be
+ * reused without rebuilding this file for every function. A zero-write
+ * scope (e.g. denied bounce) is not counted, keeping call indices aligned with
+ * a denied(interp) run. See cpu_state.c. */
+static int g_wlog_aot_slot = -1;
+
+static int wlog_func_matches(const char *name) {
+  static const char *prefix;
+  static size_t prefix_len;
+  static int initialized;
+  if (!initialized) {
+    prefix = getenv("SNESRECOMP_WLOG_FUNC_PREFIX");
+    if (!prefix || !*prefix) prefix = "vram_payload_handler_M";
+    prefix_len = strlen(prefix);
+    initialized = 1;
+  }
+  return name && strncmp(name, prefix, prefix_len) == 0;
+}
+
+void RecompStackDump(void);
+
 void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH) {
     int slot = g_recomp_stack_top++;
     g_recomp_stack[slot] = name;
+    if (g_wlog_aot_slot < 0 && wlog_func_matches(name)) {
+      g_wlog_aot_slot = slot;
+      wlog_scope_enter(name);
+    }
     g_cpu_entry_return_frame[slot] =
         (g_cpu.host_return_valid == 2 || g_cpu.host_return_valid == 3)
             ? g_cpu.host_return_valid
             : 0;
+  } else if (getenv("SNESRECOMP_STACK_CAP_ABORT")) {
+    /* Diagnostic-only: stop at the first host-call-depth overflow while the
+     * bounded attribution stack still contains the causal chain.  Letting C
+     * recursion continue loses that evidence to Windows 0xC00000FD. */
+    fprintf(stderr, "\n[recomp-stack-cap] next=%s depth=%d\n",
+            name ? name : "(null)", g_recomp_stack_top);
+    RecompStackDump();
+    fflush(stderr);
+    abort();
   }
   g_last_recomp_func = name;
   debug_server_profile_push(name);
@@ -416,6 +478,10 @@ void RecompStackPop(void) {
       if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
     }
     boundary_audit_record_exit(g_recomp_stack[g_recomp_stack_top - 1]);
+    if (g_wlog_aot_slot == g_recomp_stack_top - 1) {
+      wlog_scope_exit();
+      g_wlog_aot_slot = -1;
+    }
     g_recomp_stack_top--;
   }
   g_last_recomp_func = g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)";

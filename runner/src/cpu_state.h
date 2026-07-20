@@ -350,26 +350,29 @@ void   cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
 
 /* ── Interrupt-frame ABI (Option-1 cpu->S model) ────────────────────────── */
 
-/* Model the 65816 hardware interrupt-entry push so a handler invoked via a
- * plain host-C call (the game's rtl I_NMI / I_IRQ wrappers) leaves cpu->S in
- * the state the handler's RTI expects. Hardware pushes, in order (S
- * decreasing): native = PB, PCH, PCL, P (4 bytes); emulation = PCH, PCL, P
- * (3 bytes). The handler's RTI (codegen _emit_return op.interrupt) pops in
- * the mirror order: pull P (top), discard PC (2), native discard PB (1).
- * PC/PB are discarded on RTI (host-C return carries control), so only P must
- * be live — it is restored to the interrupted code. MUST be paired with that
- * RTI pop; without this push the RTI over-pops cpu->S. */
-static inline void cpu_push_interrupt_frame(CpuState *cpu) {
-    /* v2 CpuState has no runtime PC (control flow is host-C call structure),
-     * so the PC bytes are pushed as zero placeholders — RTI discards them.
-     * Only P is live; cpu_mirrors_to_p syncs it from the flag mirrors first. */
+/* Model the 65816 hardware interrupt-entry push. Hardware pushes, in order
+ * (S decreasing): native = PB, PCH, PCL, P (4 bytes); emulation = PCH, PCL,
+ * P (3 bytes). The interpreter/event-loop form preserves the real return PC.
+ * The generated host-C wrapper below uses only the bank and P because its RTI
+ * restores the frame before returning through the C call structure. */
+static inline void cpu_push_interrupt_frame_at(CpuState *cpu, uint32 pc24) {
+    /* Interpreter/event-loop callers provide the architectural 24-bit PC so
+     * RTI resumes the suspended instruction stream. Materialize P from the
+     * generated flag mirrors before placing the real frame on the stack. */
     cpu_mirrors_to_p(cpu);
     if (!cpu->emulation) {
-        cpu_write8(cpu, 0x00, cpu->S, cpu->PB); cpu->S = (uint16)(cpu->S - 1);
+        cpu_write8(cpu, 0x00, cpu->S, (uint8)(pc24 >> 16)); cpu->S = (uint16)(cpu->S - 1);
     }
-    cpu_write8(cpu, 0x00, cpu->S, 0x00); cpu->S = (uint16)(cpu->S - 1);  /* PCH */
-    cpu_write8(cpu, 0x00, cpu->S, 0x00); cpu->S = (uint16)(cpu->S - 1);  /* PCL */
+    cpu_write8(cpu, 0x00, cpu->S, (uint8)(pc24 >> 8)); cpu->S = (uint16)(cpu->S - 1);  /* PCH */
+    cpu_write8(cpu, 0x00, cpu->S, (uint8)pc24); cpu->S = (uint16)(cpu->S - 1);  /* PCL */
     cpu_write8(cpu, 0x00, cpu->S, cpu->P); cpu->S = (uint16)(cpu->S - 1);
+}
+
+/* Generated host-C control flow has no runtime PC offset. Its generated RTI
+ * pops this frame and returns through C, so the bank value and live P are the
+ * only meaningful fields in this wrapper. */
+static inline void cpu_push_interrupt_frame(CpuState *cpu) {
+    cpu_push_interrupt_frame_at(cpu, (uint32)cpu->PB << 16);
 }
 
 /* Model a 65816 hardware JSR's 2-byte return-frame push. Used by game glue
@@ -409,6 +412,14 @@ void cpu_state_init(CpuState *cpu, uint8 *ram);
  * common_rtl.c. v2-recompiled code passes &g_cpu when it doesn't
  * thread `cpu` explicitly. */
 extern CpuState g_cpu;
+
+/* Scoped write-log ring (dev, env SNESRECOMP_WLOG). g_wlog_active is the
+ * fast-path gate read at the top of cpu_write8/16; wlog_scope_enter/exit
+ * arm/disarm around a function scope (AOT body via RecompStackPush/Pop,
+ * interp via interp_tier_dispatch_balanced). See cpu_state.c. */
+extern int g_wlog_active;
+void wlog_scope_enter(const char *tag);
+void wlog_scope_exit(void);
 
 /* Live $420D FastROM (MEMSEL) bit, tracked in common_rtl.c WriteReg. Generated
  * blocks in the $80-$FF WS2 mirror banks reference it to weight their Axis-5
@@ -535,6 +546,10 @@ RecompReturn cpu_unresolved_abandon_balanced(CpuState *cpu, uint32 site_pc24,
  * falls back to cpu_unresolved_abandon_balanced(site,entry_s,hrv) so it is
  * never worse than the drop path and still records the site. */
 RecompReturn interp_tier_dispatch(CpuState *cpu, uint32 target_pc24);
+/* Debug bisection guard: true if this node's PC is in the
+ * SNESRECOMP_LLE_INTERP_TARGET_FILE deny set. Generated variant bodies emitted
+ * with the SNESRECOMP_EMIT_AOT_DENY_GATE codegen flag consult it at prologue. */
+int rtl_aot_node_denied(uint32 pc24);
 /* Host interrupt-vector fallback: run until the handler's RTI consumes the
  * cpu_push_interrupt_frame() frame, then return to the host scheduler. */
 RecompReturn interp_tier_dispatch_interrupt(CpuState *cpu,

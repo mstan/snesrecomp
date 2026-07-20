@@ -1,0 +1,82 @@
+name: Native analyzer
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            os: ubuntu-latest
+            artifact: linux-x86_64
+            executable: snesrecomp-analyze
+          - name: Windows x86-64
+            os: windows-latest
+            artifact: windows-x86_64
+            executable: snesrecomp-analyze.exe
+          - name: macOS arm64
+            os: macos-latest
+            artifact: macos-arm64
+            executable: snesrecomp-analyze
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Select pinned Rust toolchain
+        working-directory: recompiler-rs
+        run: rustup show active-toolchain
+      - name: Check Rust formatting and lints
+        if: runner.os == 'Linux'
+        working-directory: recompiler-rs
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --release --all-targets -- -D warnings
+      - name: Build and test native analyzer
+        run: python tools/build_native_analyzer.py --test
+      - name: Run v2 compatibility tests
+        if: runner.os == 'Linux'
+        run: python tests/v2/run_tests.py
+      - name: Package binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "recompiler-rs/target/release/${{ matrix.executable }}" dist/
+          $hash = (Get-FileHash "dist/${{ matrix.executable }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.executable }}" | Set-Content -Encoding ascii dist/SHA256SUMS
+          Compress-Archive -Path dist/* -DestinationPath "snesrecomp-analyzer-${{ matrix.artifact }}.zip"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: snesrecomp-analyzer-${{ matrix.artifact }}
+          path: snesrecomp-analyzer-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  publish-release-assets:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: snesrecomp-analyzer-*
+          merge-multiple: true
+      - name: Attach prebuilt analyzers to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" snesrecomp-analyzer-*.zip --clobber

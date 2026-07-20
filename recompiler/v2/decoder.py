@@ -28,6 +28,7 @@ Public API:
 """
 
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 import sys
@@ -748,6 +749,16 @@ class FunctionDecodeGraph:
     # (site_pc24, target_pc24, entry_m, entry_x).
     unknown_callee_exit_sites: List[Tuple[int, int, int, int]] = field(
         default_factory=list)
+    # Exact control-flow edges rejected only because they cross a declared
+    # function boundary.  The target remains a tail continuation of this
+    # function for reachability and exit-mode purposes.  Each tuple is
+    # (source_pc24, target DecodeKey).
+    boundary_exits: List[Tuple[int, DecodeKey]] = field(default_factory=list)
+    # PCs reached by control flow even though the decomp explicitly declares
+    # their bytes as data. Some anti-tamper paths deliberately execute an
+    # embedded BRK/COP trap; analysis can tier down exactly there without
+    # treating the surrounding routine as a wrong-width phantom.
+    data_region_exec_pcs: Set[int] = field(default_factory=set)
 
     def keys_at_pc(self, pc24: int) -> List[DecodeKey]:
         """Return all DecodeKeys with this 24-bit PC (across entry mode states)."""
@@ -803,7 +814,11 @@ def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
             tv = int(t)
             if tv > 0xFFFFFF:
                 return None
-            entries.append(tv if tv > 0xFFFF else ((bank << 16) | (tv & 0xFFFF)))
+            # Zero is a real null dispatch slot, not bank:$0000. Preserve it
+            # so every downstream consumer can skip the slot consistently.
+            entries.append(
+                0 if tv == 0 else (
+                    tv if tv > 0xFFFF else ((bank << 16) | (tv & 0xFFFF))))
         if len(entries) != count:
             return None
         return entries
@@ -1031,6 +1046,12 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
     # internal to its body. A well-balanced callee leaves the caller's
     # PHP/PLP stack untouched.
     if mnem in ('JSR', 'JSL'):
+        # Source-authoritative inline-return-address ABI.  This direct JSR's
+        # callee consumes the frame as table data and never resumes lexical
+        # fall-through, so it is terminal regardless of whether the callee has
+        # a conventional exit-mode fact.
+        if getattr(insn, 'terminal_jsr', False):
+            return []
         ret_m, ret_x = post_m, post_x
         target_pc24: Optional[int] = None
         if mnem == 'JSR' and insn.length == 3 and insn.mode != INDIR_X:
@@ -1096,7 +1117,12 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                 if tbank < 0x40 or 0x80 <= tbank < 0xC0:
                     mode_set = callee_exit_mx_modes.get(
                         (target_pc24 ^ 0x800000, post_m, post_x))
-            if mode_set:
+            if mode_set is not None:
+                if not mode_set:
+                    # Empty is a positive proof that this callee never
+                    # returns to the instruction after JSR/JSL. The call is a
+                    # terminal edge for this function, not an unknown exit.
+                    return []
                 seen = set()
                 succs = []
                 for em, ex in sorted((m & 1, x & 1) for (m, x) in mode_set):
@@ -1478,8 +1504,9 @@ def decode_function(rom: bytes, bank: int, start: int,
                     callee_exit_mx: Optional[Dict] = None,
                     callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
-                    inline_arg_map: Optional[Dict[int, int]] = None,
-                    stop_on_unknown_callee_exit: bool = False,
+                     inline_arg_map: Optional[Dict[int, int]] = None,
+                     terminal_jsr_sites: Optional[set] = None,
+                     stop_on_unknown_callee_exit: bool = False,
                     ) -> "FunctionDecodeGraph":
     """Public cached wrapper around `_decode_function_uncached`.
 
@@ -1502,6 +1529,7 @@ def decode_function(rom: bytes, bank: int, start: int,
             callee_exit_mx_modes=callee_exit_mx_modes,
             sibling_entry_pcs=sibling_entry_pcs,
             inline_arg_map=inline_arg_map,
+            terminal_jsr_sites=terminal_jsr_sites,
             stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
         )
 
@@ -1516,6 +1544,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         _identity(callee_exit_mx_modes),
         _identity(sibling_entry_pcs),
         _identity(inline_arg_map),
+        _identity(terminal_jsr_sites),
         bool(stop_on_unknown_callee_exit),
     )
     cached = _DECODE_CACHE.get(cache_key)
@@ -1538,6 +1567,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         callee_exit_mx_modes=callee_exit_mx_modes,
         sibling_entry_pcs=sibling_entry_pcs,
         inline_arg_map=inline_arg_map,
+        terminal_jsr_sites=terminal_jsr_sites,
         stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
     )
     _DECODE_CACHE[cache_key] = graph
@@ -1556,8 +1586,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     callee_exit_mx: Optional[Dict] = None,
                     callee_exit_mx_modes: Optional[Dict] = None,
                     sibling_entry_pcs: Optional[set] = None,
-                    inline_arg_map: Optional[Dict[int, int]] = None,
-                    stop_on_unknown_callee_exit: bool = False,
+                     inline_arg_map: Optional[Dict[int, int]] = None,
+                     terminal_jsr_sites: Optional[set] = None,
+                     stop_on_unknown_callee_exit: bool = False,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
 
@@ -1644,6 +1675,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                 and edge_kind == 'fall'
                 and pred_pc >= 0
                 and pred_pc < end):
+            boundary = ((bank << 16) | (pred_pc & 0xFFFF), key)
+            if boundary not in graph.boundary_exits:
+                graph.boundary_exits.append(boundary)
             continue
         # JUMP edge that lands on a named sibling function entry:
         # refuse the inline-import. emit_function's `_goto_or_return`
@@ -1669,11 +1703,17 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
         # aren't in `sibling_entry_pcs`.
         if (sibling_entry_pcs is not None
                 and edge_kind == 'jump'
+                and not getattr(graph, 'has_internal_stack_dispatch', False)
                 and pc in sibling_entry_pcs):
+            boundary = ((bank << 16) | (pred_pc & 0xFFFF), key)
+            if boundary not in graph.boundary_exits:
+                graph.boundary_exits.append(boundary)
             continue
         if not (0x8000 <= pc <= 0xFFFF):
             # Out-of-bank reference; surface upstream by skipping here.
             continue
+        if _addr_in_data_regions(data_regions, bank, pc):
+            graph.data_region_exec_pcs.add(key.pc & 0xFFFFFF)
 
         try:
             offset = lorom_offset(bank, pc)
@@ -1693,6 +1733,16 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
         # codegen) see the entry state without needing the DecodeKey.
         insn.m_flag = key.m
         insn.x_flag = key.x
+        insn.data_region_exec = (
+            (key.pc & 0xFFFFFF) in graph.data_region_exec_pcs)
+        if (terminal_jsr_sites
+                and (insn.addr & 0xFFFFFF) in terminal_jsr_sites):
+            if not (insn.mnem == 'JSR' and insn.mode != INDIR_X
+                    and insn.length == 3):
+                raise ValueError(
+                    f"terminal_jsr at ${insn.addr & 0xFFFFFF:06X} does not "
+                    f"name a direct three-byte JSR (decoded {insn.mnem})")
+            insn.terminal_jsr = True
 
         # JSL/JML dispatch-table detection: if the call target is a
         # registered dispatch helper, decode the bytes immediately
@@ -1839,6 +1889,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         'count': len(entries),
                         'idx_reg': 'X',
                         'table_bases': (),
+                        # Preserve tolerated null slots. Re-reading only the
+                        # count turned a raw $0000 into bank:$0000.
+                        'targets': tuple(entries),
                         '_autorecovered': True,
                     }
             # Auto-recovery for (abs) / [abs] DP-built-pointer form:
@@ -1922,13 +1975,24 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     rom, bank, insn, auth)
                 if entries is not None:
                     is_ptr_call = bool(auth.get('ptr_call'))
+                    is_pointer_match = bool(auth.get('pointer_match'))
                     is_local_goto = bool(auth.get('local_goto'))
                     insn.dispatch_entries = entries
                     insn.dispatch_kind = _dispatch_kind(
                         insn, auth.get('table_bases', ()))
                     insn.dispatch_idx_reg = auth['idx_reg']
                     insn.dispatch_local_goto = is_local_goto
-                    if is_ptr_call:
+                    insn.dispatch_pointer_match = is_pointer_match
+                    insn.dispatch_popped_call_frame = bool(
+                        auth.get('popped_call_frame'))
+                    if is_pointer_match:
+                        # Match the loaded runtime pointer against an explicit
+                        # decomp-enumerated target universe. For (abs,X), the
+                        # emitter includes the live X offset in the pointer
+                        # read; for [abs], it reads the full 24-bit value.
+                        insn.dispatch_table_bases = (insn.operand & 0xFFFF,)
+                        insn.dispatch_call = is_ptr_call
+                    elif is_ptr_call:
                         # Value-matched switch on the pointer loaded from the
                         # operand address (codegen INDIR path keys on a single
                         # table_base to read `cpu_read16(PB, operand)`).
@@ -1940,6 +2004,18 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         insn.dispatch_table_bases = (insn.operand & 0xFFFF,)
                     else:
                         insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
+                    if is_ptr_call:
+                        # The emitted dynamic call executes after an explicit
+                        # PEA return frame (plus PHK for the long form). Its
+                        # handler's RTS/RTL consumes that frame before the
+                        # decoded continuation resumes.
+                        # Opcode $DC is represented by the shared decoder as
+                        # mnemonic JMP plus a long-indirect addressing mode,
+                        # not as mnemonic JML.  Key the frame size off the
+                        # already-resolved dispatch width so PHK+PEA+JML
+                        # consumes all three synthetic return bytes.
+                        insn.dispatch_consumed_stack_bytes = (
+                            3 if insn.dispatch_kind == 'long' else 2)
                     # Register each in-bank target as a decode successor
                     # so reach-analysis + auto-promote pick up the handlers.
                     extra_succs = []
@@ -1966,7 +2042,12 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                             rom, bank, pc, (pc + insn.length) & 0xFFFF)
                         nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
                         succ = [nxt_key]
-                        decode_succs.append((nxt_key, 'fall'))
+                        # Candidate handlers are cross-function call demands,
+                        # not CFG successors of the enclosing caller. Decode
+                        # only the PEA-selected continuation here; otherwise
+                        # every explicit pointer target is inlined and also
+                        # mis-recorded as a boundary tail exit.
+                        decode_succs = [(nxt_key, 'fall')]
                     graph.insns[key] = DecodedInsn(key=key, insn=insn,
                                                    successors=succ)
                     for s, sk in decode_succs:
@@ -2016,6 +2097,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
                     insn.dispatch_pushed_call = True
                     insn.dispatch_pushed_call_frame_size = pushed_call_size
+                    insn.dispatch_consumed_stack_bytes = pushed_call_size
                     insn.dispatch_return_pc = nxt
                     insn.dispatch_return_m = site_m
                     insn.dispatch_return_x = site_x
@@ -2079,6 +2161,49 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                             worklist.append((s, sk, pc))
                     continue
 
+        # Explicit PEI;RTS internal computed transfer. DKC2's decompressor
+        # stores a return-address-minus-one in DP, PEI pushes it, and the next
+        # RTS consumes that synthetic frame to jump into one of a finite set
+        # of command handlers. Model the pair as a same-function goto: no
+        # architectural local-stack delta remains after the transfer, and the
+        # live M/X state is unchanged by the transfer itself.
+        if insn.mnem == 'PEI':
+            site_pc24 = (bank << 16) | pc
+            site_m = insn.m_flag & 1
+            site_x = insn.x_flag & 1
+            auth = (indirect_dispatch or {}).get(site_pc24)
+            if auth is not None and auth.get('rts_stack'):
+                entries = _resolve_indirect_dispatch_targets(
+                    rom, bank, insn, auth)
+                if entries is not None:
+                    insn.dispatch_entries = entries
+                    insn.dispatch_kind = 'short'
+                    insn.dispatch_idx_reg = 'X'  # unused by value dispatch
+                    insn.dispatch_table_bases = ()
+                    insn.dispatch_terminal = True
+                    insn.dispatch_local_goto = True
+                    insn.dispatch_stack_pointer = True
+                    insn.dispatch_forced_m = site_m
+                    insn.dispatch_forced_x = site_x
+                    graph.has_internal_stack_dispatch = True
+                    labeled_succ = []
+                    for e in entries:
+                        if e is None or e == 0:
+                            continue
+                        eb = (e >> 16) & 0xFF
+                        e16 = e & 0xFFFF
+                        if eb == bank and 0x8000 <= e16 <= 0xFFFF:
+                            labeled_succ.append(
+                                (DecodeKey(addr24(eb, e16), site_m, site_x, ()),
+                                 'dispatch'))
+                    graph.insns[key] = DecodedInsn(
+                        key=key, insn=insn,
+                        successors=[k for k, _ in labeled_succ])
+                    for s, sk in labeled_succ:
+                        if s not in graph.insns:
+                            worklist.append((s, sk, pc))
+                    continue
+
         # cfg-required-dispatch-or-kill for JSR (abs,X). See class
         # SuppressedIndirectCall above and the regression test at
         # tests/v2/test_decoder_smc_phantom_suppression.py.
@@ -2108,6 +2233,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         'count': len(entries),
                         'idx_reg': 'X',
                         'table_bases': (),
+                        # Preserve tolerated null slots. Re-reading only the
+                        # count turned a raw $0000 into bank:$0000.
+                        'targets': tuple(entries),
                         '_autorecovered': True,
                     }
             if ud_auth is not None:
@@ -2120,35 +2248,54 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn.dispatch_entries = entries
                     insn.dispatch_kind = kind
                     insn.dispatch_idx_reg = ud_auth['idx_reg']
+                    # JSR (abs,X) is always a call dispatch. Candidate
+                    # handlers are separate functions/demands; they are not
+                    # jump successors inside the caller's CFG.
+                    insn.dispatch_call = True
                     if is_ptr_call:
                         # Explicit target-list JSR (abs,X): X points at a
                         # runtime descriptor/pointer, not a contiguous ROM
                         # dispatch table. Codegen must switch on the loaded
                         # pointer value rather than X / entry_size.
                         insn.dispatch_table_bases = (insn.operand & 0xFFFF,)
-                        insn.dispatch_call = True
+                        insn.dispatch_pointer_match = True
                     else:
                         insn.dispatch_table_bases = tuple(ud_auth.get('table_bases', ()) or ())
-                    labeled_succ = _labeled_successors(
-                        insn, key, bank,
-                        callee_exit_mx=callee_exit_mx,
-                        callee_exit_mx_modes=callee_exit_mx_modes,
-                        rom=rom, inline_arg_map=inline_arg_map,
-                        stop_on_unknown_callee_exit=(
-                            stop_on_unknown_callee_exit),
-                        unknown_callee_exit_sites=(
-                            graph.unknown_callee_exit_sites))
                     site_m = insn.m_flag & 1
                     site_x = insn.x_flag & 1
+                    return_pc = (pc + insn.length) & 0xFFFF
+                    return_modes = set()
+                    missing_targets = []
                     for e in entries:
                         if e is None or e == 0:
                             continue
-                        eb = (e >> 16) & 0xFF
-                        e16 = e & 0xFFFF
-                        if eb == bank and 0x8000 <= e16 <= 0xFFFF:
-                            labeled_succ.append(
-                                (DecodeKey(addr24(eb, e16), site_m, site_x, ()),
-                                 'jump'))
+                        if kind == 'long':
+                            target_pc24 = e & 0xFFFFFF
+                        else:
+                            target_pc24 = addr24(bank, e & 0xFFFF)
+                        handler_modes = _lookup_exit_mx_mode_set(
+                            callee_exit_mx, callee_exit_mx_modes,
+                            target_pc24, site_m, site_x)
+                        if handler_modes is None:
+                            missing_targets.append(target_pc24)
+                        else:
+                            return_modes.update(handler_modes)
+                    if missing_targets and stop_on_unknown_callee_exit:
+                        for target_pc24 in missing_targets:
+                            item = (insn.addr & 0xFFFFFF, target_pc24,
+                                    site_m, site_x)
+                            if item not in graph.unknown_callee_exit_sites:
+                                graph.unknown_callee_exit_sites.append(item)
+                        labeled_succ = []
+                    else:
+                        if missing_targets or not return_modes:
+                            # Proof-probe mode only: preserve the site widths.
+                            return_modes.add((site_m, site_x))
+                        labeled_succ = [
+                            (DecodeKey(addr24(bank, return_pc), em & 1, ex & 1,
+                                       key.p_stack), 'fall')
+                            for em, ex in sorted(return_modes)
+                        ]
                     succ = [k for (k, _) in labeled_succ]
                     graph.insns[key] = DecodedInsn(key=key, insn=insn,
                                                    successors=succ)
@@ -2420,9 +2567,217 @@ def _lookup_exit_mx_mode_set(callee_exit_mx: Optional[Dict],
     if exact is not None and exact[0] is not None and exact[1] is not None:
         return {(exact[0] & 1, exact[1] & 1)}
     mode_set = _lookup_exit_mx(callee_exit_mx_modes, pc24, m, x)
-    if mode_set:
+    if mode_set is not None:
         return {(em & 1, ex & 1) for em, ex in mode_set}
     return None
+
+
+def _return_stack_delta_states(
+    graph: 'FunctionDecodeGraph',
+) -> Dict[int, Set[Optional[int]]]:
+    """Return local stack deltas reaching each RTS/RTL/RTI site.
+
+    v2 represents architectural call frames separately, so ordinary
+    JSR/JSL/RTS/RTL contribute zero here.  Explicit guest pushes and pulls do
+    contribute.  A return reached below the function-entry stack watermark is
+    therefore an internal computed transfer (DKC2's PHB;PHY;PEI;RTS
+    decompressor dispatcher is the canonical case), not evidence for the
+    function's architectural exit M/X state.
+
+    ``None`` denotes an indeterminate height after TCS/TXS.  Deltas are
+    clamped to keep malformed push loops finite while preserving realistic
+    local frames.
+    """
+    restoring_tcs = _entry_stack_restore_tcs_keys(graph)
+
+    def local_delta(ins) -> Optional[int]:
+        mnem = ins.mnem
+        consumed = int(getattr(ins, 'dispatch_consumed_stack_bytes', 0) or 0)
+        if consumed:
+            return -consumed
+        if (mnem == 'PEI'
+                and getattr(ins, 'dispatch_stack_pointer', False)):
+            # The authorized PEI is fused with its immediately following RTS;
+            # the synthetic two-byte frame is consumed by that transfer.
+            return 0
+        if mnem in ('PEA', 'PEI', 'PER', 'PHD'):
+            return 2
+        if mnem in ('PHP', 'PHB', 'PHK'):
+            return 1
+        if mnem == 'PHA':
+            return 1 if (ins.m_flag & 1) else 2
+        if mnem in ('PHX', 'PHY'):
+            return 1 if (ins.x_flag & 1) else 2
+        if mnem == 'PLD':
+            return -2
+        if mnem in ('PLP', 'PLB'):
+            return -1
+        if mnem == 'PLA':
+            return -(1 if (ins.m_flag & 1) else 2)
+        if mnem in ('PLX', 'PLY'):
+            return -(1 if (ins.x_flag & 1) else 2)
+        if mnem in ('TCS', 'TXS'):
+            return None
+        return 0
+
+    def clamp(value: int) -> int:
+        return max(-64, min(64, int(value)))
+
+    in_states: Dict[DecodeKey, Set[Optional[int]]] = {graph.entry: {0}}
+    worklist = [graph.entry]
+    returns: Dict[int, Set[Optional[int]]] = defaultdict(set)
+    while worklist:
+        key = worklist.pop()
+        di = graph.insns.get(key)
+        if di is None:
+            continue
+        states = set(in_states.get(key, ()))
+        if not states:
+            continue
+        ins = di.insn
+        if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            returns[ins.addr & 0xFFFFFF].update(states)
+            continue
+        delta = local_delta(ins)
+        next_states: Set[Optional[int]] = set()
+        if key in restoring_tcs:
+            # A source-verified TSC;STA scratch save at entry and matching
+            # LDA scratch;TCS restore makes the current dynamic stack value
+            # irrelevant: this instruction restores the exact entry S.
+            next_states.add(0)
+        else:
+            for state in states:
+                if state is None or delta is None:
+                    next_states.add(None)
+                else:
+                    next_states.add(clamp(state + delta))
+        for succ in di.successors:
+            if succ not in graph.insns:
+                continue
+            old = in_states.get(succ, set())
+            merged = old | next_states
+            if merged != old:
+                in_states[succ] = merged
+                worklist.append(succ)
+    return dict(returns)
+
+
+def _entry_stack_restore_tcs_keys(
+    graph: 'FunctionDecodeGraph',
+) -> Set[DecodeKey]:
+    """Prove the narrow ``TSC; STA dp ... LDA dp; TCS`` restore idiom.
+
+    DKC2's 3D background builder temporarily repurposes S as an arithmetic
+    cursor, but saves the entry stack pointer in scratch RAM first and restores
+    it immediately before RTS. Treating every TCS as permanently indeterminate
+    hides that real callable exit and poisons its callers.
+
+    This recognizer is deliberately strict: the save must be the function's
+    first two instructions in M=0, the scratch location/mode must match, no
+    call or D-register mutation may occur, and no other instruction may write
+    that scratch location. Anything less remains unknown.
+    """
+    entry_di = graph.insns.get(graph.entry)
+    if entry_di is None or entry_di.insn.mnem != 'TSC':
+        return set()
+    if len(entry_di.successors) != 1:
+        return set()
+    save_key = entry_di.successors[0]
+    save_di = graph.insns.get(save_key)
+    if save_di is None:
+        return set()
+    save = save_di.insn
+    if (save.mnem != 'STA' or (save.m_flag & 1) != 0
+            or save.mode == IMM):
+        return set()
+    scratch = save.operand & 0xFFFFFF
+    scratch_mode = save.mode
+
+    writers = {
+        'STA', 'STX', 'STY', 'STZ', 'INC', 'DEC', 'ASL', 'LSR',
+        'ROL', 'ROR', 'TRB', 'TSB',
+    }
+    for key, di in graph.insns.items():
+        ins = di.insn
+        if ins.mnem in ('JSR', 'JSL', 'PLD', 'TCD'):
+            return set()
+        if (ins.mnem in writers and ins.mode == scratch_mode
+                and (ins.operand & 0xFFFFFF) == scratch
+                and key != save_key):
+            return set()
+
+    predecessors: Dict[DecodeKey, Set[DecodeKey]] = defaultdict(set)
+    for key, di in graph.insns.items():
+        for succ in di.successors:
+            if succ in graph.insns:
+                predecessors[succ].add(key)
+
+    restores: Set[DecodeKey] = set()
+    for key, di in graph.insns.items():
+        if di.insn.mnem != 'TCS':
+            continue
+        preds = predecessors.get(key, set())
+        if len(preds) != 1:
+            continue
+        load = graph.insns[next(iter(preds))].insn
+        if (load.mnem == 'LDA' and (load.m_flag & 1) == 0
+                and load.mode == scratch_mode
+                and (load.operand & 0xFFFFFF) == scratch):
+            restores.add(key)
+    return restores
+
+
+def _return_frame_size(ins) -> Optional[int]:
+    if ins.mnem == 'RTS':
+        return 2
+    if ins.mnem == 'RTL':
+        return 3
+    # RTI depends on emulation state, which this local analysis does not
+    # model. Keep any unbalanced RTI conservative.
+    return None
+
+
+def _return_site_is_partial_nlr(graph: 'FunctionDecodeGraph', ins,
+                                states_by_pc=None) -> bool:
+    """Whether this site only performs a caller-crossing rewritten return.
+
+    With local delta ``d`` and return-frame size ``f``, ``0 < d < f`` means
+    the RTS/RTL consumes the remaining local bytes *and part of its caller's
+    frame*. It cannot resume the immediate compiled caller normally. Codegen
+    routes this runtime shape through the rewritten-return interpreter bridge,
+    so it is not a callable M/X exit fact.
+    """
+    frame = _return_frame_size(ins)
+    if frame is None:
+        return False
+    states = (states_by_pc or _return_stack_delta_states(graph)).get(
+        ins.addr & 0xFFFFFF, set())
+    return bool(states) and all(
+        state is not None and 0 < state < frame for state in states)
+
+
+def _has_unproven_nonlocal_return(graph: 'FunctionDecodeGraph') -> bool:
+    """Whether a return can enter an internal/synthetic stack frame.
+
+    A positive delta at least as large as the return frame leaves S at or below
+    the function-entry watermark after the pop. Control is still inside the
+    routine's dynamic component, so its eventual callable M/X exit remains
+    unknown until finite targets are modeled. ``None`` is equally unprovable.
+
+    Smaller positive deltas are caller-crossing rewritten returns and are
+    handled separately: they never resume this function's immediate caller.
+    """
+    states_by_pc = _return_stack_delta_states(graph)
+    for di in graph.insns.values():
+        ins = di.insn
+        if ins.mnem not in ('RTS', 'RTL', 'RTI'):
+            continue
+        frame = _return_frame_size(ins)
+        for state in states_by_pc.get(ins.addr & 0xFFFFFF, ()):
+            if state is None or (state > 0 and (
+                    frame is None or state >= frame)):
+                return True
+    return False
 
 
 def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
@@ -2440,11 +2795,17 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
     contributes every element of that set — exit sets compose through
     tail chains the same way exact facts do.
     """
+    if _has_unproven_nonlocal_return(graph):
+        return None
+
     modes: Set[Tuple[int, int]] = set()
+    return_states = _return_stack_delta_states(graph)
 
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            if _return_site_is_partial_nlr(graph, ins, return_states):
+                continue
             modes.add((ins.m_flag & 1, ins.x_flag & 1))
             continue
         tail_keys = _direct_tail_exit_keys(graph, di)
@@ -2481,7 +2842,86 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
                     return None
                 modes.update(handler_modes)
 
-    return modes if modes else None
+    for _site, target in graph.boundary_exits:
+        tail_modes = _lookup_exit_mx_mode_set(
+            callee_exit_mx, callee_exit_mx_modes,
+            target.pc, target.m, target.x)
+        if tail_modes is None:
+            return None
+        modes.update(tail_modes)
+
+    if (graph.unresolved_indirects or graph.suppressed_indirect_calls
+            or graph.unknown_callee_exit_sites):
+        return None
+    # Empty is a real fact: this closed graph has no architectural return
+    # path. Keep it distinct from None, which means unresolved.
+    return modes
+
+
+def function_exit_mx_equation(
+    graph: 'FunctionDecodeGraph',
+) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int, int]]]:
+    """Return this graph's local exits and exact tail-exit dependencies.
+
+    ``analyze_function_exit_mx_modes`` deliberately returns ``None`` when a
+    tail/dispatch target is not proven yet.  That one-function interface
+    cannot bootstrap a mutually recursive tail-dispatch component even when
+    the component has real local RTS/RTL exits.  This companion exposes the
+    same exit equation as ``local_modes U exits(dependency...)`` so the
+    whole-program analyzer can solve closed SCCs without guessing a width.
+
+    Direct calls are not represented here: callers with an unproven direct
+    callee are truncated and recorded in ``unknown_callee_exit_sites``.  The
+    caller must only publish this equation when that list is empty.
+    """
+    local_modes: Set[Tuple[int, int]] = set()
+    dependencies: Set[Tuple[int, int, int]] = set()
+
+    # Keep the public two-set equation shape while making an unbalanced return
+    # unsolvable until its finite dispatch targets are modeled.  The sentinel
+    # can never be a real 24-bit variant key, so the SCC solver treats it as an
+    # unresolved outgoing dependency instead of publishing the RTS site's
+    # transient M/X mode as a callable exit fact.
+    if _has_unproven_nonlocal_return(graph):
+        dependencies.add((0xFFFFFFFF, 0, 0))
+
+    return_states = _return_stack_delta_states(graph)
+
+    for di in graph.insns.values():
+        ins = di.insn
+        if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            if _return_site_is_partial_nlr(graph, ins, return_states):
+                continue
+            local_modes.add((ins.m_flag & 1, ins.x_flag & 1))
+            continue
+        tail_keys = _direct_tail_exit_keys(graph, di)
+        if tail_keys:
+            for target, site_m, site_x in tail_keys:
+                dependencies.add((target & 0xFFFFFF,
+                                  site_m & 1, site_x & 1))
+            continue
+        is_dispatch_term = (
+            getattr(ins, 'dispatch_entries', None) is not None
+            and len(di.successors) == 0
+            and ins.mnem in ('JSL', 'JMP')
+        )
+        if not is_dispatch_term:
+            continue
+        site_m = ins.m_flag & 1
+        site_x = ins.x_flag & 1
+        dispatcher_bank = (ins.addr >> 16) & 0xFF
+        kind = getattr(ins, 'dispatch_kind', None)
+        for entry in (ins.dispatch_entries or ()):
+            if entry == 0:
+                continue
+            target = ((entry & 0xFFFFFF) if kind == 'long'
+                      else ((dispatcher_bank << 16) | (entry & 0xFFFF)))
+            dependencies.add((target, site_m, site_x))
+
+    for _site, target in graph.boundary_exits:
+        dependencies.add((target.pc & 0xFFFFFF,
+                          target.m & 1, target.x & 1))
+    return local_modes, dependencies
 
 
 def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
@@ -2522,6 +2962,10 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
     Functions with no terminators (e.g. infinite loops, table-only)
     return `(None, None)` — no callable resume state to propagate.
     """
+    if _has_unproven_nonlocal_return(graph):
+        return (None, None)
+
+    return_states = _return_stack_delta_states(graph)
     exit_m: Optional[int] = None
     exit_x: Optional[int] = None
     have_any = False
@@ -2542,6 +2986,8 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            if _return_site_is_partial_nlr(graph, ins, return_states):
+                continue
             _accumulate(ins.m_flag & 1, ins.x_flag & 1)
             continue
         tail_keys = _direct_tail_exit_keys(graph, di)
@@ -2590,6 +3036,13 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
                     return (None, None)
                 _accumulate(handler_exit[0] & 1, handler_exit[1] & 1)
             continue
+
+    for _site, target in graph.boundary_exits:
+        tail_exit = _lookup_exit_mx(
+            callee_exit_mx, target.pc, target.m, target.x)
+        if tail_exit is None:
+            return (None, None)
+        _accumulate(tail_exit[0] & 1, tail_exit[1] & 1)
 
     if m_ambig:
         exit_m = None

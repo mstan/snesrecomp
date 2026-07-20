@@ -402,7 +402,8 @@ def _h_jsr(insn, vf):
     # already used it; populating here costs nothing for callers that
     # don't consult source_pc24.
     return [Call(target=target, long=False, entry_m=em, entry_x=ex,
-                 source_pc24=insn.addr & 0xFFFFFF)]
+                 source_pc24=insn.addr & 0xFFFFFF,
+                 terminal=bool(getattr(insn, 'terminal_jsr', False)))]
 
 
 def _h_jsl(insn, vf):
@@ -420,8 +421,12 @@ def _h_rti(insn, vf): return [Return(long=True,  interrupt=True, source_pc24=ins
 # Misc
 def _h_nop(insn, vf): return [Nop()]
 def _h_wdm(insn, vf): return [Nop()]
-def _h_brk(insn, vf): return [Break(cop=False)]
-def _h_cop(insn, vf): return [Break(cop=True)]
+def _h_brk(insn, vf): return [Break(
+    cop=False, source_pc24=insn.addr & 0xFFFFFF,
+    tier_to_lle=getattr(insn, 'data_region_exec', False))]
+def _h_cop(insn, vf): return [Break(
+    cop=True, source_pc24=insn.addr & 0xFFFFFF,
+    tier_to_lle=getattr(insn, 'data_region_exec', False))]
 def _h_stp(insn, vf): return [Stop(wait=False)]
 def _h_wai(insn, vf): return [Stop(wait=True)]
 

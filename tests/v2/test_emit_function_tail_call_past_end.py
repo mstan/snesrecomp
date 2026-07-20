@@ -335,6 +335,8 @@ def test_cross_bank_tail_call_keeps_positional_nlr_argument_out_of_prefix():
                             func_name='Caller')
 
     assert 'None{' not in src, src
+    assert ('extern RecompReturn CrossBankTail_M1X1(CpuState *cpu);'
+            in src), src
     assert 'CrossBankTail_M1X1(cpu)' in src, src
     assert 'cpu_tailcall_inherit_return_context(_entry_s, _hrv);' in src, src
 

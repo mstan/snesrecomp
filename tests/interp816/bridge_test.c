@@ -28,7 +28,12 @@ static int      g_aot_called;
 static int      g_aot_rewrites_return;
 static int      g_aot_nested_rewrite;
 static int      g_aot_interp_nlr;
+static int      g_aot_double_rewrite;
+static int      g_aot_tail_chain_probe;
+static int      g_tail_chain_direct;
+static int      g_nested_chain_direct;
 #define FAKE_AOT 0x008100u
+#define FAKE_AOT_2 0x008200u
 
 /* ── fakes the bridge links against (cpu_state.c provides these in prod) ── */
 /* The Phase-2 manifest recorder stamps the live frame counter on each
@@ -39,9 +44,20 @@ Snes *g_snes = &g_test_snes;
 uint64_t g_apu_last_sync_master;
 int g_interp_apu_driving;
 int g_recomp_stack_top;
+uint16_t g_cpu_entry_s[64];
+uint8 g_memsel;
+void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
+    (void)pc; (void)a; (void)x; (void)y;
+}
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 void snes_catchupApu(Snes *snes) { (void)snes; }
+void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
+    (void)snes; (void)master_clock;
+}
+void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
+    (void)cart; (void)master_clock;
+}
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
 }
@@ -57,6 +73,8 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     cpu_write8(cpu, bank, addr, (uint8)v);
     cpu_write8(cpu, bank, (uint16)(addr + 1), (uint8)(v >> 8));
 }
+void wlog_scope_enter(const char *tag) { (void)tag; }
+void wlog_scope_exit(void) {}
 int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv) {
     (void)entry_s; (void)hrv; return 0;
 }
@@ -67,7 +85,9 @@ uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24) {
     (void)pc24; return 0;
 }
 int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24) {
-    (void)cpu; return (pc24 & 0xFFFFFF) == FAKE_AOT;
+    (void)cpu;
+    pc24 &= 0xFFFFFF;
+    return pc24 == FAKE_AOT || (g_aot_double_rewrite && pc24 == FAKE_AOT_2);
 }
 static int g_abandon_called;
 static int g_post_return_skip;
@@ -93,6 +113,35 @@ RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24, uint16 miss_restore) {
 RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
                                     uint8 frame_size) {
     cpu->host_return_valid = frame_size;
+    if (g_aot_double_rewrite && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        /* Computed-RTS dispatcher shape: a synthetic handler address is
+         * pushed and immediately popped, so the interpreted caller's real
+         * JSR frame remains on the guest stack.  Continue at the selected
+         * handler through the rewritten-return bridge. */
+        g_aot_called++;
+        return interp_tier_dispatch_rewritten_return(cpu, 0x008300, 0x0081FE);
+    }
+    if (g_aot_double_rewrite && (pc24 & 0xFFFFFF) == FAKE_AOT_2) {
+        /* Later in that interpreted handler, a second AOT helper performs
+         * PLA; PLA; RTS: consume its own JSR frame plus the dispatcher's
+         * preserved caller frame, then resume the interpreted grandparent. */
+        g_aot_called++;
+        cpu->S = (uint16)(cpu->S + 4);
+        return interp_tier_dispatch_rewritten_return(cpu, 0x008003, 0x0082FE);
+    }
+    if (g_aot_tail_chain_probe && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        const int base = g_recomp_stack_top;
+        g_recomp_stack_top += 3;
+        g_cpu_entry_s[base] = 0x01FA;
+        g_cpu_entry_s[base + 1] = 0x01FA;
+        g_cpu_entry_s[base + 2] = 0x01FA;
+        g_tail_chain_direct = interp_bridge_has_direct_paired_bounce();
+        g_cpu_entry_s[base + 1] = 0x01F8; /* materialized nested JSR */
+        g_nested_chain_direct = interp_bridge_has_direct_paired_bounce();
+        g_recomp_stack_top = base;
+        cpu->S = (uint16)(cpu->S + frame_size);
+        return RECOMP_RETURN_NORMAL;
+    }
     if (g_aot_interp_nlr && (pc24 & 0xFFFFFF) == FAKE_AOT) {
         /* Model PLA; PLA; RTS in a direct AOT bounce: consume the AOT JSR
          * frame plus its interpreted caller's JSR frame, then continue in
@@ -109,6 +158,7 @@ RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
          * eventually returning normally to the bridge. */
         g_aot_called++;
         g_recomp_stack_top++;                 /* paired AOT root */
+        g_cpu_entry_s[g_recomp_stack_top - 1] = cpu->S;
 
         cpu_write8(cpu, 0, cpu->S, 0x00); cpu->S--; /* parent JSL bank */
         cpu_write8(cpu, 0, cpu->S, 0x81); cpu->S--; /* return high */
@@ -116,6 +166,8 @@ RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
         cpu_write8(cpu, 0, cpu->S, cpu->P); cpu->S--;  /* parent PHP */
         cpu_write8(cpu, 0, cpu->S, cpu->DB); cpu->S--; /* parent PHB */
         g_recomp_stack_top += 2;              /* parent + rewrite callee */
+        g_cpu_entry_s[g_recomp_stack_top - 2] = (uint16)(cpu->S + 2);
+        g_cpu_entry_s[g_recomp_stack_top - 1] = cpu->S;
 
         RecompReturn r = interp_tier_dispatch_rewritten_return(
             cpu, 0x008200, 0x0081FE);
@@ -281,6 +333,28 @@ int main(void) {
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (all frames balanced)", g_c.S);
       g_aot_interp_nlr = 0; }
 
+    /* S6c: LttP's sprite dispatch shape performs two rewritten AOT returns in
+     * one interpreted call chain.  The first computed RTS preserves the
+     * caller frame and selects an interpreted handler; a later AOT helper
+     * consumes its own frame plus that preserved frame.  Both continuations
+     * belong to the same owning interpreter.  The wrapper epilogue must run
+     * once, never once in a nested bridge and again in its owner. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_double_rewrite = 1;
+      uint8_t outer[] = {0x20,0x00,0x81, 0xA9,0x5A, 0x60};
+      uint8_t handler[] = {0x20,0x00,0x82, 0xA9,0xEE, 0x60};
+      load(0x8000, outer, sizeof outer);
+      load(0x8300, handler, sizeof handler);
+      cpu_push_jsr_return_frame(&g_c);
+      int rc = interp_bridge_run(&g_c, 0x008000);
+      printf("S6c consecutive rewritten AOT returns stay in one interpreter\n");
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_aot_called == 2, "aot_called=%d exp 2", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x5A,
+            "A.lo=%02X exp 5A (handler continuation skipped)", g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (all frames balanced)", g_c.S);
+      g_aot_double_rewrite = 0; }
+
     /* S7: an interrupt-owned stable-value poll must cooperatively yield at
      * CMP while the sampled WRAM byte is unchanged, then resume and return
      * normally after the next frame changes it. This is the canonical shape
@@ -307,6 +381,24 @@ int main(void) {
                                        0x008003, 0x0020, 0xFF);
       CHECK(rc2 == 1, "second rc=%d exp 1 (poll exits)", rc2);
       CHECK(g_c.S == 0x01FF, "return S=%04X exp 01FF (balanced)", g_c.S); }
+
+    /* S7b: host depth alone must not hide interpreter ownership across a
+     * pure architectural tail chain. Every tail callee inherits the paired
+     * root's entry-S watermark; a real nested JSR introduces a lower one. */
+    { memset(RAM, 0, MEMSZ); init_cpu();
+      g_aot_tail_chain_probe = 1;
+      g_tail_chain_direct = g_nested_chain_direct = -1;
+      uint8_t caller[] = {0x20,0x00,0x81, 0x60}; /* JSR fake AOT; RTS */
+      load(0x8000, caller, sizeof caller);
+      cpu_push_jsr_return_frame(&g_c);
+      int rc = interp_bridge_run(&g_c, 0x008000);
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_tail_chain_direct == 1,
+            "tail-chain direct=%d exp 1", g_tail_chain_direct);
+      CHECK(g_nested_chain_direct == 0,
+            "nested-chain direct=%d exp 0", g_nested_chain_direct);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF", g_c.S);
+      g_aot_tail_chain_probe = 0; }
 
     /* S8: when an AOT callee bounced from an LLE interpreter frame rewrites
      * its return address, the rewritten continuation belongs to that active

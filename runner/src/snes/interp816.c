@@ -1599,7 +1599,8 @@ restart:
       break;
     }
     case 0x80: { // bra rel
-      cpu->pc += (int8_t) interp816_readOpcode(cpu);
+      uint8_t offset = interp816_readOpcode(cpu);
+      cpu->pc += (int8_t) offset;
       break;
     }
     case 0x81: { // sta idx
@@ -1609,7 +1610,8 @@ restart:
       break;
     }
     case 0x82: { // brl rll
-      cpu->pc += (int16_t) interp816_readOpcodeWord(cpu);
+      uint16_t offset = interp816_readOpcodeWord(cpu);
+      cpu->pc += (int16_t) offset;
       break;
     }
     case 0x83: { // sta sr

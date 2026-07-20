@@ -1639,20 +1639,20 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     {16, 64}, {32, 64}, {16, 32}, {16, 32}
   };
 
-  // TODO: iterate over oam normally to determine in-range sprites,
-  //   then iterate those in-range sprites in reverse for tile-fetching
   // TODO: rectangular sprites, wierdness with sprites at -256
   uint8_t index = PPU_objPriority(ppu) ? (ppu->oamaddl & 0xfe) : 0;
   int spritesFound = 0;
   int tilesFound = 0;
+  uint8_t foundSprites[128];
+
+  // Range evaluation walks OAM forward, but tile fetching walks the accepted
+  // sprites backward. This is observable when the 34-sliver limit is reached.
   for(int i = 0; i < 128; i++) {
     uint8_t y = ppu->oam[index] >> 8;
-    // check if the sprite is on this line and get the sprite size
     uint8_t row = line - y;
     int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
     int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
     if(row < spriteHeight) {
-      // in y-range, get the x location, using the high bit as well
       int x = ppu->oam[index] & 0xff;
       x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
       // SNES OAM x is 9-bit; values >255 normally wrap to negative so sprites
@@ -1684,57 +1684,58 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       // gate below clips columns the same way). With extraLeftCur==0 this
       // is the authentic `x > -spriteSize`.
       if(x + spriteSize > -ppu->extraLeftCur) {
-        // break if we found 32 sprites already
         spritesFound++;
         if(spritesFound > 32 &&
            !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
           ppu->rangeOver = true;
+          spritesFound = 32;
           break;
         }
-        // update row according to obj-interlace
+        foundSprites[spritesFound - 1] = index;
+      }
+    }
+    index += 2;
+  }
+
+  for(int i = spritesFound; i > 0; i--) {
+    index = foundSprites[i - 1];
+    uint8_t row = line - (ppu->oam[index] >> 8);
+    int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    int x = ppu->oam[index] & 0xff;
+    x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+    if (x >= 256 + ppu->extraRightCur) x -= 512;
         if(PPU_objInterlace(ppu)) row = row * 2 + (ppu->evenFrame ? 0 : 1);
-        // get some data for the sprite and y-flip row if needed
         int oam1 = ppu->oam[index + 1];
-        int tile = oam1 & 0xff;
         int objAdr = (oam1 & 0x100) ? PPU_objTileAdr2(ppu) : PPU_objTileAdr1(ppu);
-        int palette = (oam1 & 0xe00) >> 9;
-        bool hFlipped = oam1 & 0x4000;
         if(oam1 & 0x8000) row = spriteSize - 1 - row;
-        // fetch all tiles in x-range
         int paletteBase = 0x80 + 16 * ((oam1 & 0xe00) >> 9);
         int prio = SPRITE_PRIO_TO_PRIO((oam1 & 0x3000) >> 12, (oam1 & 0x800) == 0);
         PpuZbufType z = paletteBase + (prio << 8);
 
         for(int col = 0; col < spriteSize; col += 8) {
-          if(col + x > -8 - ppu->extraLeftCur && col + x < 256 + ppu->extraRightCur) {
-            // break if we found 34 8*1 slivers already
+      if(col + x <= -8 - ppu->extraLeftCur ||
+         col + x >= 256 + ppu->extraRightCur)
+        continue;
             tilesFound++;
             if(tilesFound > 34 &&
                !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
               ppu->timeOver = true;
               break;
             }
-            // figure out which tile this uses, looping within 16x16 pages, and get it's data
             int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
-            int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) | (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
+      int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) |
+                     (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
             uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
             uint32 plane = addr[0] | addr[8] << 16;
-            // go over each pixel
             int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
             int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
             PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
-
-            // Host-overlay OBJ extraction: capture the pixels of a validated
-            // OAM slot range inside the capture rect into a separate surface,
-            // optionally removing them from the world object buffer. Inactive
-            // (capture_slot false) when no OBJ surface is bound, leaving the
-            // draw byte-identical.
             int slot = index >> 1;
             PpuOverlayCapture *obj_capture =
                 &ppu->overlayCaptures[kPpuOverlaySource_Obj];
             bool capture_slot = PpuOverlayActiveOnLine(
-                ppu, kPpuOverlaySource_Obj, line) &&
-                obj_capture->oamCount && slot >= obj_capture->oamFirst &&
+          ppu, kPpuOverlaySource_Obj, line) && obj_capture->oamCount &&
+          slot >= obj_capture->oamFirst &&
                 slot < obj_capture->oamFirst + obj_capture->oamCount;
             bool obj_remove = capture_slot &&
                 (obj_capture->flags & kPpuOverlayFlag_RemoveFromGame) != 0;
@@ -1742,34 +1743,26 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             for (int px = px_left; px < px_right; px++, dst++) {
               int shift = oam1 & 0x4000 ? px : 7 - px;
               uint32 bits = plane >> shift;
-              int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8;
-              if (pixel == 0)
-                continue;
+        int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 |
+                    (bits >> 14) & 4 | (bits >> 21) & 8;
+        if (pixel == 0) continue;
               if (capture_slot) {
                 int screen_x = col + x + px;
                 if (screen_x >= obj_capture->x0 && screen_x < obj_capture->x1) {
                   PpuZbufType *overlay =
                       &ppu->overlayBuffers[kPpuOverlaySource_Obj]
                            .data[dst - ppu->objBuffer.data];
-                  if ((*overlay & 0xff) == 0)
                     *overlay = z + pixel;
-                  if (obj_remove)
-                    continue;
+            if (obj_remove) continue;
                 }
               }
-              // draw it in the buffer if there is a pixel here, and the buffer there is still empty
-              if ((dst[0] & 0xff) == 0)
+        // Lower OAM indices are processed later and overwrite higher ones.
                 dst[0] = z + pixel;
             }
-
-          }
         }
         if(tilesFound > 34 &&
            !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
-          break; // break out of sprite-loop if max tiles found
-      }
-    }
-    index += 2;
+      break;
   }
   return tilesFound != 0;
 }

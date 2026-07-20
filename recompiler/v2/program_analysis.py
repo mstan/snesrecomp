@@ -12,7 +12,7 @@ the generated program before making this graph authoritative for emission.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import heapq
@@ -161,6 +161,72 @@ class ProgramManifest:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+    @classmethod
+    def from_dict(cls, value: Mapping) -> "ProgramManifest":
+        """Load the stable manifest wire format from any analyzer backend."""
+        version = int(value.get("format_version", 0))
+        if version != 3:
+            raise ValueError(
+                f"unsupported program manifest format_version={version}")
+
+        def parse_key(item) -> VariantKey:
+            return VariantKey(
+                int(item["pc24"]), int(item["m"]), int(item["x"]))
+
+        def parse_manifest_key(text: str) -> VariantKey:
+            try:
+                address, modes = text.split(":", 1)
+                return VariantKey(
+                    int(address, 16), int(modes[1]), int(modes[3]))
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid manifest variant key {text!r}") \
+                    from exc
+
+        nodes = {}
+        for text_key, item in value.get("nodes", {}).items():
+            key = parse_key(item["key"])
+            if key != parse_manifest_key(text_key):
+                raise ValueError(
+                    f"manifest node key mismatch for {text_key!r}")
+            demands = []
+            for edge in item.get("demands", ()):
+                demands.append(DemandEdge(
+                    site_pc24=int(edge["site_pc24"]),
+                    kind=EdgeKind(edge["kind"]),
+                    resolution=EdgeResolution(edge["resolution"]),
+                    target=(parse_key(edge["target"])
+                            if edge.get("target") is not None else None),
+                    detail=str(edge.get("detail", "")),
+                ))
+            nodes[key] = NodeSummary(
+                key=key,
+                disposition=NodeDisposition(item["disposition"]),
+                instruction_count=int(item["instruction_count"]),
+                min_pc24=int(item["min_pc24"]),
+                max_pc24=int(item["max_pc24"]),
+                demands=tuple(demands),
+                reasons=tuple(str(reason)
+                              for reason in item.get("reasons", ())),
+                digest=str(item.get("digest", "")),
+            )
+        exit_modes = {
+            parse_manifest_key(text_key): (int(item["m"]), int(item["x"]))
+            for text_key, item in value.get("exit_modes", {}).items()
+        }
+        exit_mode_sets = {
+            parse_manifest_key(text_key): frozenset(
+                (int(item["m"]), int(item["x"])) for item in mode_set)
+            for text_key, mode_set in value.get("exit_mode_sets", {}).items()
+        }
+        return cls(
+            roots=tuple(sorted(parse_key(item)
+                               for item in value.get("roots", ()))),
+            nodes=nodes,
+            exit_modes=exit_modes,
+            exit_mode_sets=exit_mode_sets,
+            format_version=version,
+        )
+
 
 def _target_key(site_pc24: int, raw_target: int, kind: str,
                 m: int, x: int) -> VariantKey:
@@ -174,23 +240,32 @@ def _target_key(site_pc24: int, raw_target: int, kind: str,
 def _stable_summary_digest(key: VariantKey, disposition: NodeDisposition,
                            instruction_rows: list, demands: Tuple[DemandEdge, ...],
                            reasons: Tuple[str, ...]) -> str:
-    payload = {
-        "key": asdict(key),
-        "disposition": disposition.value,
-        "instructions": instruction_rows,
-        "demands": [
-            {
-                "site": edge.site_pc24,
-                "kind": edge.kind.value,
-                "resolution": edge.resolution.value,
-                "target": asdict(edge.target) if edge.target else None,
-                "detail": edge.detail,
-            }
+    # This digest is an internal cache key, not a wire-format checksum.  The
+    # old implementation converted every dataclass into dictionaries and ran
+    # a full JSON encoder for every node in every exit-M/X fixed-point round.
+    # On MMX's --cfg-roots closure that consumed roughly 9% of total analysis
+    # CPU.  A tuple contains the same canonical, already-sorted facts without
+    # allocating dictionaries or sorting their keys.  repr() for these
+    # int/string/tuple/None-only values is deterministic across supported
+    # Python versions and platforms.
+    payload = (
+        (key.pc24, key.m, key.x),
+        disposition.value,
+        tuple(instruction_rows),
+        tuple(
+            (
+                edge.site_pc24,
+                edge.kind.value,
+                edge.resolution.value,
+                ((edge.target.pc24, edge.target.m, edge.target.x)
+                 if edge.target else None),
+                edge.detail,
+            )
             for edge in demands
-        ],
-        "reasons": reasons,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ),
+        tuple(reasons),
+    )
+    encoded = repr(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -220,7 +295,8 @@ def summarize_decode_graph(
                      insn.length, tuple(
                          (s.pc, s.m, s.x) for s in decoded.successors)))
 
-        if insn.mnem in ("BRK", "COP"):
+        if (insn.mnem in ("BRK", "COP")
+                and site not in graph.data_region_exec_pcs):
             poison_reasons.add(f"{insn.mnem.lower()}_at_{site:06X}")
 
         entries = getattr(insn, "dispatch_entries", None)
@@ -297,6 +373,15 @@ def summarize_decode_graph(
             item.site_pc24, EdgeKind.SUPPRESSED_INDIRECT_CALL,
             EdgeResolution.LLE_DYNAMIC,
             detail=f"table_base={item.table_base:04X}"))
+
+    for site, successor in getattr(graph, "boundary_exits", ()):
+        target = VariantKey(successor.pc, successor.m, successor.x)
+        resolution = (EdgeResolution.AOT_EXACT
+                      if target_is_code is None or target_is_code(target)
+                      else EdgeResolution.LLE_EXACT)
+        edges.add(DemandEdge(
+            site, EdgeKind.DIRECT_TAIL_CALL, resolution, target,
+            detail="declared_boundary"))
 
     reasons = set()
     if not graph.insns:

@@ -1,0 +1,22 @@
+[package]
+name = "snesrecomp-analyzer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Native whole-program analyzer for the snesrecomp v2 recompiler"
+license = "MIT"
+
+[lib]
+name = "snesrecomp_analyzer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snesrecomp-analyze"
+path = "src/bin/analyze.rs"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

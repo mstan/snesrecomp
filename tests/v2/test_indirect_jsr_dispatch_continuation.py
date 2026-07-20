@@ -135,7 +135,7 @@ def test_pea_jmp_ptrcall_resumes_at_pea_return_address():
 
 
 def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
-    """PEA+JMP [$dp] ptrcalls switch on a 24-bit runtime pointer."""
+    """PHK+PEA+JML [$dp] ptrcalls use a 3-byte RTL return frame."""
     rom = make_lorom_bank0({
         0x8000: bytes([
             0xC2, 0x30,        # REP #$30
@@ -145,12 +145,13 @@ def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
             0xA9, 0x00,        # LDA #$00
             0x85, 0x14,        # STA $14
             0xC2, 0x20,        # REP #$20
-            0xF4, 0x14, 0x80,  # PEA $8014 -> handler RTS returns to $8015
-            0xDC, 0x12, 0x00,  # JMP [$12]
+            0x4B,              # PHK supplies the return bank for RTL
+            0xF4, 0x15, 0x80,  # PEA $8015 -> handler RTL returns to $8016
+            0xDC, 0x12, 0x00,  # JML [$12] (decoder mnemonic is JMP)
             0xE6, 0x20,        # INC $20 ; continuation after handler RTS
-            0x60,              # RTS
+            0x6B,              # RTL
         ]),
-        0x9000: bytes([0x60]),  # RTS
+        0x9000: bytes([0x6B]),  # RTL
     })
 
     src = emit_function(
@@ -161,7 +162,7 @@ def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
         entry_x=1,
         func_name='PeaJmpLongPointerCall',
         indirect_dispatch={
-            0x008012: {
+            0x008013: {
                 'count': 1,
                 'idx_reg': 'X',
                 'ptr_call': True,
@@ -172,7 +173,7 @@ def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
 
     assert 'absolute long-indirect dispatch: switch on the loaded pointer' in src
     assert 'case 0x009000:' in src
-    assert 'PEA+JMP indirect call, 2-byte PEA frame' in src
+    assert 'PHK+PEA+JML indirect call, 3-byte frame' in src
     assert 'fall through to post-dispatch block' in src
     assert 'cpu->D + 0x0020' in src, src
 

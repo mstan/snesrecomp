@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -21,18 +22,30 @@ from v2.program_emit import (  # noqa: E402
     discover_profile_roots,
     emit_program,
 )
-from v2_analyze import _load_cfgs, build_manifest  # noqa: E402
+from v2_analyze import (  # noqa: E402
+    _load_cfgs,
+    _seed_auto_vectors,
+    build_manifest,
+    build_manifest_native,
+    native_analyzer_path,
+)
 
 
 def _tree_digest(paths) -> str:
     digest = hashlib.sha256()
     for path in sorted({pathlib.Path(p).resolve() for p in paths}):
         if path.is_dir():
-            files = sorted(p for p in path.rglob("*.py") if p.is_file())
+            files = sorted(
+                p for p in path.rglob("*")
+                if p.is_file() and p.suffix in (".py", ".rs", ".toml"))
         else:
             files = [path]
         for file in files:
-            digest.update(str(file.relative_to(REPO)).replace("\\", "/").encode())
+            try:
+                identity = str(file.relative_to(REPO)).replace("\\", "/")
+            except ValueError:
+                identity = f"external/{file.name}"
+            digest.update(identity.encode())
             digest.update(b"\0")
             digest.update(file.read_bytes())
             digest.update(b"\0")
@@ -60,6 +73,7 @@ def _config_digest(parsed) -> str:
 def _analysis_input_digest(*, rom: bytes, generator_digest: str,
                            config_digest: str, additional_roots,
                            cfg_roots: bool,
+                           analysis_backend: str,
                            enable_hle: bool, max_insns: int,
                            max_nodes: int, shard_threshold_bytes: int,
                            shard_pc_span: int) -> str:
@@ -72,6 +86,7 @@ def _analysis_input_digest(*, rom: bytes, generator_digest: str,
             (key.pc24, key.m, key.x) for key in sorted(additional_roots)
         ],
         "cfg_roots": bool(cfg_roots),
+        "analysis_backend": str(analysis_backend),
         "hle": bool(enable_hle),
         "max_insns": int(max_insns),
         "max_nodes": int(max_nodes),
@@ -137,6 +152,11 @@ def main() -> int:
     parser.add_argument("--max-insns", type=int, default=4096)
     parser.add_argument("--max-nodes", type=int, default=100_000)
     parser.add_argument(
+        "--analysis-backend", choices=("auto", "python", "native"),
+        default="auto",
+        help="whole-program analyzer (default: use the release native binary "
+             "when present, otherwise Python)")
+    parser.add_argument(
         "--bank-shard-threshold-kib", type=int, default=4096,
         help="shard generated banks at or above this source size into "
              "stable translation units (default: 4096 KiB; 0 shards every "
@@ -155,7 +175,10 @@ def main() -> int:
     out_dir = pathlib.Path(args.out_dir).resolve()
     rom = load_rom(args.rom)
     parsed = _load_cfgs(cfg_dir)
-
+    native_path = native_analyzer_path()
+    analysis_backend = args.analysis_backend
+    if analysis_backend == "auto":
+        analysis_backend = "native" if native_path.is_file() else "python"
     source_roots = [pathlib.Path(p).resolve() for p in args.source_root]
     if not source_roots and not args.no_host_root_scan:
         conventional = cfg_dir.parent / "src"
@@ -174,9 +197,27 @@ def main() -> int:
         parser.error(str(exc))
     additional_roots = tuple(sorted(set(host_roots) | set(profile_roots)))
 
-    generator_digest = _tree_digest((
-        REPO / "recompiler" / "v2", pathlib.Path(__file__).resolve(),
-        REPO / "tools" / "v2_analyze.py"))
+    def generator_digest_for(backend):
+        native_inputs = ()
+        if backend == "native":
+            native_inputs = (
+                REPO / "recompiler-rs" / "src",
+                REPO / "recompiler-rs" / "Cargo.toml",
+                REPO / "recompiler-rs" / "Cargo.lock",
+                native_path,
+            )
+        tree_digest = _tree_digest((
+            REPO / "recompiler" / "v2", pathlib.Path(__file__).resolve(),
+            REPO / "tools" / "v2_analyze.py", *native_inputs))
+        # This environment switch changes every emitted AOT body, so it must
+        # participate in the published-output cache key.  Treat any non-empty
+        # value as enabled to match emit_function.py's codegen guard.
+        deny_gate = bool(os.environ.get("SNESRECOMP_EMIT_AOT_DENY_GATE"))
+        return hashlib.sha256(
+            f"{tree_digest}\0aot_deny_gate={int(deny_gate)}".encode()
+        ).hexdigest()
+
+    generator_digest = generator_digest_for(analysis_backend)
     config_digest = _config_digest(parsed)
     analysis_input_digest = _analysis_input_digest(
         rom=rom,
@@ -184,6 +225,7 @@ def main() -> int:
         config_digest=config_digest,
         additional_roots=additional_roots,
         cfg_roots=args.cfg_roots,
+        analysis_backend=analysis_backend,
         enable_hle=not args.no_hle,
         max_insns=args.max_insns,
         max_nodes=args.max_nodes,
@@ -203,10 +245,45 @@ def main() -> int:
         print(f"v2_emit: reused verified published output {out_dir}")
         return 0
 
-    manifest, helpers, inline_args = build_manifest(
-        rom, parsed, max_insns=args.max_insns, max_nodes=args.max_nodes,
-        all_cfg_roots=args.cfg_roots,
-        additional_roots=additional_roots)
+    if analysis_backend == "native":
+        try:
+            # The Python analyzer normally materializes friendly vector
+            # entries as a side effect.  Native analysis owns a separate
+            # cfg model, so mirror that mutation before Python emission.
+            _seed_auto_vectors(parsed, rom)
+            manifest, helpers, inline_args, native_output = \
+                build_manifest_native(
+                    rom_path=args.rom, cfg_dir=cfg_dir,
+                    all_cfg_roots=args.cfg_roots,
+                    additional_roots=additional_roots,
+                    executable=native_path,
+                    max_insns=args.max_insns,
+                    max_nodes=args.max_nodes)
+            if native_output:
+                print(native_output)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if args.analysis_backend == "native":
+                parser.error(str(exc))
+            print(f"v2_emit: native analysis unavailable ({exc}); "
+                  "falling back to Python")
+            analysis_backend = "python"
+    if analysis_backend == "python":
+        # A failed auto-native attempt must not publish Python output under a
+        # native cache identity. The next successful native run must analyze.
+        if generator_digest != generator_digest_for("python"):
+            generator_digest = generator_digest_for("python")
+            analysis_input_digest = _analysis_input_digest(
+                rom=rom, generator_digest=generator_digest,
+                config_digest=config_digest,
+                additional_roots=additional_roots, cfg_roots=args.cfg_roots,
+                analysis_backend="python", enable_hle=not args.no_hle,
+                max_insns=args.max_insns, max_nodes=args.max_nodes,
+                shard_threshold_bytes=shard_threshold_bytes,
+                shard_pc_span=shard_pc_span)
+        manifest, helpers, inline_args = build_manifest(
+            rom, parsed, max_insns=args.max_insns, max_nodes=args.max_nodes,
+            all_cfg_roots=args.cfg_roots,
+            additional_roots=additional_roots)
     result = emit_program(
         rom=rom,
         parsed=parsed,

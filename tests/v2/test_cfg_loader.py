@@ -32,6 +32,19 @@ func SomeFunc 8000 sig:void()
         os.unlink(path)
 
 
+def test_terminal_jsr_call_site_contract_parses():
+    path = _write("""\
+bank = b3
+terminal_jsr 9dac
+func SpriteMain 9dac end:9db0 entry_mx:0,0
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.terminal_jsr == {0x9DAC}
+    finally:
+        os.unlink(path)
+
+
 def test_func_with_end_directive_parses_end():
     path = _write("""\
 bank = 00
@@ -172,6 +185,54 @@ func A 8000
         cfg = load_bank_cfg(path)
         auth = cfg.indirect_dispatch[0]
         assert auth['targets'] == (0x8569, 0xEB9F)
+    finally:
+        os.unlink(path)
+
+
+def test_ptrtail_targets_mark_value_matched_terminal_dispatch():
+    path = _write("""\
+bank = 00
+indirect_dispatch 8000 2 ptrtail targets:019000,029000
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['ptr_call'] is False
+        assert auth['pointer_match'] is True
+        assert auth['targets'] == (0x019000, 0x029000)
+    finally:
+        os.unlink(path)
+
+
+def test_ptrtail_popcall_marks_consumed_incoming_jsr_frame():
+    path = _write("""\
+bank = 00
+indirect_dispatch 8000 2 ptrtail_popcall targets:019000,029000
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['ptr_call'] is False
+        assert auth['pointer_match'] is True
+        assert auth['popped_call_frame'] is True
+    finally:
+        os.unlink(path)
+
+
+def test_rtsstack_targets_mark_internal_stack_dispatch():
+    path = _write("""\
+bank = bb
+indirect_dispatch 8e0d 2 rtsstack targets:BB8001,BB8005
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['rts_stack'] is True
+        assert auth['pointer_match'] is False
+        assert auth['targets'] == (0xBB8001, 0xBB8005)
     finally:
         os.unlink(path)
 

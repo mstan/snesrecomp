@@ -65,9 +65,34 @@ void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
   if (cart && cart->superfx) superfx_sync(cart->superfx, master_clock);
 }
 
+uint8_t *cart_getRomPtr(Cart *cart, uint8_t bank, uint16_t adr) {
+  if (!cart || !cart->rom || cart->romSize == 0) return NULL;
+  if (bank == 0x7e || bank == 0x7f) return NULL;
+  uint32_t off;
+  switch (cart->type) {
+    case CART_LOROM: {
+      if ((((bank >= 0x70 && bank < 0x7e) || bank >= 0xf0)) &&
+          adr < 0x8000 && cart->ramSize > 0) return NULL;
+      uint8_t canonical = bank & 0x7f;
+      if (adr < 0x8000 && canonical < 0x40) return NULL;
+      off = ((uint32_t)canonical << 15) | (adr & 0x7fff);
+      break;
+    }
+    case CART_HIROM: {
+      uint8_t canonical = bank & 0x7f;
+      if (adr < 0x8000 && canonical < 0x40) return NULL;
+      off = ((uint32_t)(canonical & 0x3f) << 16) | adr;
+      break;
+    }
+    default:
+      return NULL;
+  }
+  return &cart->rom[off % cart->romSize];
+}
+
 uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
   switch(cart->type) {
-    case 0: 
+    case 0:
       assert(0);
       return 0;
     case CART_LOROM: return cart_readLorom(cart, bank, adr);
@@ -116,11 +141,8 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
     // banks 70-7e and f0-ff, adr 0000-7fff
     return cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)];
   }
-  bank &= 0x7f;
-  if(adr >= 0x8000 || bank >= 0x40) {
-    // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
-    return cart->rom[((bank << 15) | (adr & 0x7fff)) & (cart->romSize - 1)];
-  }
+  uint8_t *rom = cart_getRomPtr(cart, bank, adr);
+  if (rom) return *rom;
   /* Out-of-range cart read. No printf — the ring buffer is the
    * channel. cpu_trace_offrails dumps trace at hit#1 + every 64th
    * so we see the chain WITHOUT million-line stderr floods. */
@@ -136,15 +158,13 @@ static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
 }
 
 static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
-  bank &= 0x7f;
-  if(bank < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
+  uint8_t canonical = bank & 0x7f;
+  if(canonical < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
     // banks 00-3f and 80-bf, adr 6000-7fff
-    return cart->ram[(((bank & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)];
+    return cart->ram[(((canonical & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)];
   }
-  if(adr >= 0x8000 || bank >= 0x40) {
-    // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
-    return cart->rom[(((bank & 0x3f) << 16) | adr) & (cart->romSize - 1)];
-  }
+  uint8_t *rom = cart_getRomPtr(cart, bank, adr);
+  if (rom) return *rom;
   assert(0);
   return 0;
 }
