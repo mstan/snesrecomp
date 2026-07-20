@@ -16,9 +16,8 @@ RECV_BUFFER = 262144
 class DebugClient:
     """Persistent connection to a single SNES debug server.
 
-    Maintains a single TCP socket across commands. The server sends a
-    {"connected":true,...} banner on accept; we consume it once and then
-    reuse the socket for all subsequent queries.
+    Maintains a single TCP socket across commands. Both bannered and
+    bannerless debug-server versions are supported.
     """
 
     def __init__(self, port, host='127.0.0.1', timeout=DEFAULT_TIMEOUT, name=''):
@@ -30,7 +29,7 @@ class DebugClient:
         self._buf = b''  # leftover bytes from previous recv
 
     def _ensure_connected(self):
-        """Connect if not already connected, consuming the banner."""
+        """Connect if not already connected."""
         if self._sock is not None:
             return
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -38,8 +37,7 @@ class DebugClient:
         s.connect((self.host, self.port))
         self._sock = s
         self._buf = b''
-        # Consume the {"connected":true,...}\n banner
-        self._recv_line()
+
 
     def _recv_line(self):
         """Read bytes until a complete \\n-terminated line is available."""
@@ -68,13 +66,24 @@ class DebugClient:
         try:
             self._ensure_connected()
             self._sock.sendall((cmd + '\n').encode())
-            return self._recv_line()
+            return self._recv_command_reply()
         except (ConnectionError, socket.timeout, OSError):
             # Connection lost — close and retry once
             self.close()
             self._ensure_connected()
             self._sock.sendall((cmd + '\n').encode())
-            return self._recv_line()
+            return self._recv_command_reply()
+
+    def _recv_command_reply(self):
+        """Read a reply, skipping an optional connection banner."""
+        line = self._recv_line()
+        try:
+            banner = json.loads(line)
+        except json.JSONDecodeError:
+            banner = None
+        if isinstance(banner, dict) and banner.get('connected') is True:
+            line = self._recv_line()
+        return line
 
     def query(self, cmd):
         """Send command, return parsed JSON dict."""
