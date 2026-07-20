@@ -33,6 +33,7 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
         sys.path.insert(0, p)
 
 from typing import Dict, List, Optional, Tuple  # noqa: E402
+from snes_cycles import region_speed  # noqa: E402
 
 # Resolver: 24-bit address (bank << 16 | pc) -> friendly C function name.
 # Populated by emit_bank before each bank emit (a process-wide map of every
@@ -2471,21 +2472,37 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
     delta = "+1" if op.direction == "mvn" else "-1"
     et = "CPU_TR_MVN" if op.direction == "mvn" else "CPU_TR_MVP"
     trace_pc = _trace_pc_arg()
+    slow_speed = region_speed(_CURRENT_SOURCE_PC24, 0)
+    fast_speed = region_speed(_CURRENT_SOURCE_PC24, 1)
+    speed_expr = (str(slow_speed) if slow_speed == fast_speed else
+                  f"(g_memsel ? {fast_speed} : {slow_speed})")
     return [
         "{",
         f"  uint8 _src_b = {op.src_bank:#04x};",
         f"  uint8 _dst_b = {op.dst_bank:#04x};",
         "  uint8 _old_db = cpu->DB;",
         f"  cpu_trace_event(cpu, 0, {et}, _src_b, _dst_b);",
-        "  while (cpu->A != 0xFFFF) {",
+        "  cpu->DB = _dst_b;",
+        f"  cpu_trace_db_change(cpu, {trace_pc}, _old_db, _dst_b, {et});",
+        "  /* MVN/MVP always transfer at least one byte. A is count-minus-one,",
+        "   * and an interrupt resumes at this same opcode with the updated",
+        "   * A/X/Y/DB state. The block's static charge covers the first byte;",
+        "   * each repeated byte costs another seven CPU cycles. */",
+        "  do {",
         "    uint8 _b = cpu_read8(cpu, _src_b, cpu->X);",
         "    cpu_write8(cpu, _dst_b, cpu->Y, _b);",
         f"    cpu->X = (uint16)(cpu->X {delta});",
         f"    cpu->Y = (uint16)(cpu->Y {delta});",
+        "    if (cpu->x_flag) { cpu->X &= 0x00FFu; cpu->Y &= 0x00FFu; }",
         "    cpu->A = (uint16)(cpu->A - 1);",
-        "  }",
-        "  cpu->DB = _dst_b;",
-        f"  cpu_trace_db_change(cpu, {trace_pc}, _old_db, _dst_b, {et});",
+        "    if (cpu->A != 0xFFFF) {",
+        "      if (interp_bridge_lle_master_deadline_reached(cpu)) {",
+        f"        return interp_bridge_lle_yield_unwind(cpu, {trace_pc});",
+        "      }",
+        "      cpu->cycles += 7;",
+        f"      cpu->master_cycles += 7 * {speed_expr};",
+        "    }",
+        "  } while (cpu->A != 0xFFFF);",
         "}",
     ]
 
