@@ -39,6 +39,36 @@ int main(void) {
   apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
   failures += check(apu.inPorts[2] == 0x00, "clear follows music observation");
 
+  /* The mixer can catch up past every queued timestamp in one callback.
+   * Timestamps alone must not collapse the transition into its final clear. */
+  memset(&apu, 0, sizeof(apu));
+  apu_clearPortQueue(&apu);
+  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
+  apu_schedulePortWrite(&apu, 2, 0x23, 1000);
+  apu_schedulePortWrite(&apu, 2, 0x00, 1000);
+  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
+  failures += check(apu.inPorts[2] == 0x80,
+                    "burst catch-up preserves fade until SPC observes it");
+  apu_noteSpcPortRead(&apu, 2, 0x80);
+  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
+  failures += check(apu.inPorts[2] == 0x23,
+                    "burst catch-up preserves music until SPC observes it");
+  apu_noteSpcPortRead(&apu, 2, 0x23);
+  apu_applyDuePortWrites(&apu, 1000 + 2 * APU_PORT_MIN_DWELL);
+  failures += check(apu.inPorts[2] == 0x00,
+                    "burst catch-up applies clear after music observation");
+
+  /* Overflow must not force-apply over a command the SPC has not read. */
+  memset(&apu, 0, sizeof(apu));
+  apu_clearPortQueue(&apu);
+  apu_schedulePortWrite(&apu, 2, 0x80, 1000);
+  apu_applyDuePortWrites(&apu, 1000);
+  for (uint32_t i = 0; i < APU_PORT_QUEUE_LEN; i++)
+    apu_schedulePortWrite(&apu, 2, 0x23, 1000);
+  apu_schedulePortWrite(&apu, 2, 0x00, 1000);
+  failures += check(apu.inPorts[2] == 0x80,
+                    "queue overflow cannot overwrite unread command");
+
   memset(&apu, 0, sizeof(apu));
   apu_clearPortQueue(&apu);
   apu_schedulePortWrite(&apu, 2, 0x80, 1000);

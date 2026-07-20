@@ -84,8 +84,11 @@ void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
       target_sample = floor;
   }
   if (apu->portQTail - apu->portQHead >= APU_PORT_QUEUE_LEN) {
-    /* Full — apply the oldest immediately so ordering survives. */
-    apu_applyPortWrite(apu, &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)]);
+    ApuPortWrite *oldest = &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
+    /* Preserve the unread command; a new write cannot bypass its read gate. */
+    if (apu->portAwaitingRead[oldest->port & 3])
+      return;
+    apu_applyPortWrite(apu, oldest);
     apu->portQHead++;
   }
   ApuPortWrite *w = &apu->portQueue[apu->portQTail & (APU_PORT_QUEUE_LEN - 1)];
@@ -103,6 +106,10 @@ void apu_applyDuePortWrites(Apu *apu, uint64_t produced_sample) {
   while (apu->portQHead != apu->portQTail) {
     ApuPortWrite *w = &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
     if (w->target_sample > produced_sample)
+      break;
+    /* Catch-up can pass several timestamps in one sample. Do not overwrite a
+     * command until the SPC has had a chance to observe it. */
+    if (apu->portAwaitingRead[w->port & 3])
       break;
     apu_applyPortWrite(apu, w);
     apu->portQHead++;
