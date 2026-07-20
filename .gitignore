@@ -1,5 +1,7 @@
 # Compiled output
 build/
+build-cli/
+dist/
 *.exe
 *.obj
 *.pdb
