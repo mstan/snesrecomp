@@ -60,11 +60,27 @@ def test_shard_embeds_only_referenced_variant_declarations():
     assert "bank_00_8000_M1X1(CpuState *cpu);" not in part1_preamble
 
 
-def test_small_bank_keeps_monolithic_filename_and_bytes():
+def test_small_bank_keeps_monolithic_filename_and_adds_call_declarations():
     parts = split_bank_translation_units(
         SOURCE, 0, SYMBOL_PCS, threshold_bytes=len(SOURCE) + 1,
         pc_span=0x800)
-    assert parts == {"bank00_v2.c": SOURCE}
+    assert set(parts) == {"bank00_v2.c"}
+    generated = parts["bank00_v2.c"]
+    body = generated.split(
+        "RecompReturn bank_00_8000_M1X1(CpuState *cpu) {", 1)[0]
+    assert "RecompReturn bank_00_8800_M1X1(CpuState *cpu);" in body
+
+
+def test_monolithic_bank_declares_cross_bank_dispatch_target():
+    source = SOURCE.replace(
+        "return bank_00_8800_M1X1(cpu);",
+        "return bank_82_80B4_M1X1(cpu);")
+    parts = split_bank_translation_units(
+        source, 0, SYMBOL_PCS, threshold_bytes=len(source) + 1,
+        pc_span=0x800)
+    body = parts["bank00_v2.c"].split(
+        "RecompReturn bank_00_8000_M1X1(CpuState *cpu) {", 1)[0]
+    assert "RecompReturn bank_82_80B4_M1X1(CpuState *cpu);" in body
 
 
 def test_writer_removes_stale_bank_shape():
