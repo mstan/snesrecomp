@@ -1149,6 +1149,24 @@ pub fn decode_function(
             let mut entries: Vec<u32> = Vec::new();
             let mut tbl_pc = (pc + insn.length as u32) & 0xFFFF;
             while entries.len() < 256 && tbl_pc + entry_size - 1 <= 0xFFFF {
+                // Bound the inline dispatch table at the next declared function
+                // entry. A sibling entry marks the start of the following
+                // routine, so its bytes cannot also be table data; without this
+                // bound the scan runs into that routine and misreads its opening
+                // instructions as extra table entries (e.g. SMW
+                // ProcessPlayerAnimation JSL ExecutePtr $00C595: 14 real entries
+                // $C599..$C5B4, otherwise 2 more are read from
+                // PlayerState0B_RescuedPeach $C5B5, corrupting the dispatch and
+                // fabricating targets $DE9C/$9C13). This can only tighten the
+                // scan; a spuriously short table simply routes uncovered indices
+                // to the interpreter.
+                if !entries.is_empty() {
+                    if let Some(sib) = env.sibling_entry_pcs {
+                        if sib.contains(&(tbl_pc & 0xFFFF)) {
+                            break;
+                        }
+                    }
+                }
                 let tbl_off = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
                     Some(o) => o,
                     None => break,
