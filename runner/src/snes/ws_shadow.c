@@ -11,6 +11,7 @@ typedef struct WsShadowLayer {
   bool registered;
   bool active;
   bool wide;
+  bool fold;      /* periodic-fold mode (vs world-keyed history mode) */
   uint32_t worldX;
   uint32_t worldY;
   uint16_t mapBaseWord;
@@ -18,6 +19,12 @@ typedef struct WsShadowLayer {
   uint8_t *valid;
   uint32_t validCount;
   int blankTilePlus1;
+  /* Fold mode: frame snapshot of the full 64x32 map plus the per-row
+   * period detected over the native window. period 0 = no exact period
+   * found -> that row keeps the plain map-wrap fallback. */
+  uint16_t foldSnap[64 * 32];
+  uint8_t foldPeriod[32];
+  uint8_t foldNatCol; /* leftmost native map column this frame */
 } WsShadowLayer;
 
 static WsShadowLayer s_layers[kLayers];
@@ -61,7 +68,17 @@ void WsShadowReset(void) {
     layer->validCount = 0;
     layer->registered = false;
     layer->active = false;
+    layer->fold = false;
+    memset(layer->foldPeriod, 0, sizeof(layer->foldPeriod));
   }
+}
+
+void WsShadowSetPeriodicFold(int layerIndex) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  layer->registered = true;
+  layer->fold = true;
 }
 
 void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
@@ -80,6 +97,7 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
     }
   }
   layer->registered = true;
+  layer->fold = false;
   layer->worldX = worldX;
   layer->worldY = worldY;
 }
@@ -100,17 +118,57 @@ void WsShadowPrefillTile(int layerIndex, uint32_t worldTileX,
     SetEntry(layer, worldTileX, worldTileY, entry);
 }
 
+/* Snapshot the live 64x32 map and detect each row's horizontal period
+ * over the native 32-column window. Only the natively displayed columns
+ * are trusted: they are correct-by-definition every frame, so a fold
+ * anchored there can never serve stale or unwritten map content. Periods
+ * must divide 64 so the renderer's mod-64 column wrap preserves
+ * congruence. */
+static void FoldFrame(WsShadowLayer *layer, const struct Ppu *ppu,
+                      int layerIndex) {
+  static const uint8_t kPeriods[] = {4, 8, 16};
+  layer->foldNatCol = (uint8_t)((ppu->hScroll[layerIndex] >> 3) & 63);
+  for (int row = 0; row < 32; row++) {
+    for (int col = 0; col < 64; col++) {
+      uint16_t word = (uint16_t)(layer->mapBaseWord +
+          (col >= 32 ? 0x400 : 0) + (row << 5) + (col & 31));
+      layer->foldSnap[row * 64 + col] = ppu->vram[word & 0x7fff];
+    }
+    const uint16_t *snap = &layer->foldSnap[row * 64];
+    int nat = layer->foldNatCol;
+    uint8_t period = 0;
+    for (size_t p = 0; p < sizeof(kPeriods); p++) {
+      int ok = 1;
+      for (int i = 0; i + kPeriods[p] < 32 && ok; i++)
+        ok = snap[(nat + i) & 63] ==
+             snap[(nat + i + kPeriods[p]) & 63];
+      if (ok) {
+        period = kPeriods[p];
+        break;
+      }
+    }
+    layer->foldPeriod[row] = period;
+  }
+}
+
 void WsShadowFrame(const struct Ppu *ppu) {
   for (int i = 0; i < kLayers; i++) {
     WsShadowLayer *layer = &s_layers[i];
     layer->active = layer->registered;
     layer->registered = false;
-    if (!layer->active || !layer->entries)
+    if (!layer->active)
       continue;
 
     layer->mapBaseWord = (uint16_t)PPU_bgTilemapAdr(ppu, i);
     layer->wide = PPU_bgTilemapWider(ppu, i) != 0;
     if (!layer->wide)
+      continue;
+
+    if (layer->fold) {
+      FoldFrame(layer, ppu, i);
+      continue;
+    }
+    if (!layer->entries)
       continue;
 
     uint32_t tx0 = layer->worldX >> 3;
@@ -131,11 +189,33 @@ void WsShadowFrame(const struct Ppu *ppu) {
 }
 
 uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
-                      uint16_t realTile) {
+                      uint16_t mapWordAdr, uint16_t realTile) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return realTile;
   const WsShadowLayer *layer = &s_layers[layerIndex];
-  if (!layer->active || !layer->entries || screenX >= 0 && screenX < 256)
+  if (!layer->active || screenX >= 0 && screenX < 256)
+    return realTile;
+
+  if (layer->fold) {
+    uint16_t off = (uint16_t)(mapWordAdr - layer->mapBaseWord);
+    if (off >= 0x800)
+      return realTile;  /* 64x64 map half not modeled: keep plain wrap */
+    int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
+    int row = (off >> 5) & 0x1f;
+    uint8_t period = layer->foldPeriod[row];
+    if (!period)
+      return realTile;
+    /* Fold to the congruent column inside the native window. 64 is a
+     * multiple of every accepted period, so the mod-64 column wrap the
+     * renderer already applied preserves the residue class. */
+    int rel = (col - layer->foldNatCol) & 63;
+    if (rel < 32)
+      return realTile;  /* native column (or margin overlapping it) */
+    return layer->foldSnap[row * 64 +
+                           ((layer->foldNatCol + rel % period) & 63)];
+  }
+
+  if (!layer->entries)
     return realTile;
 
   uint16_t miss = layer->blankTilePlus1
@@ -154,5 +234,5 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
 bool WsShadowLayerActive(int layerIndex) {
   return layerIndex >= 0 && layerIndex < kLayers &&
          s_layers[layerIndex].active && s_layers[layerIndex].wide &&
-         s_layers[layerIndex].entries;
+         (s_layers[layerIndex].fold || s_layers[layerIndex].entries);
 }
