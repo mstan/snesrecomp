@@ -37,9 +37,12 @@ void WsShadowFrame(const struct Ppu *ppu);
 
 // mapWordAdr = the VRAM word address the renderer fetched realTile from
 // (used by fold mode to recover the exact map row/column, independent of
-// scroll bias and window splits).
+// scroll bias and window splits). hScroll = the layer's live per-line
+// scroll: parallax strips change it mid-frame, so fold anchoring must
+// use the value the renderer used for THIS line, never a frame sample.
 uint16_t WsShadowTile(int layer, int screenX, uint32_t wrappedY,
-                      uint16_t mapWordAdr, uint16_t realTile);
+                      uint16_t hScroll, uint16_t mapWordAdr,
+                      uint16_t realTile);
 bool WsShadowLayerActive(int layer);
 
 #endif

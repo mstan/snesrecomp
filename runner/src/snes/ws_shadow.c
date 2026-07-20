@@ -19,12 +19,18 @@ typedef struct WsShadowLayer {
   uint8_t *valid;
   uint32_t validCount;
   int blankTilePlus1;
-  /* Fold mode: frame snapshot of the full 64x32 map plus the per-row
-   * period detected over the native window. period 0 = no exact period
-   * found -> that row keeps the plain map-wrap fallback. */
-  uint16_t foldSnap[64 * 32];
-  uint8_t foldPeriod[32];
-  uint8_t foldNatCol; /* leftmost native map column this frame */
+  /* Fold mode: reads the live map at render time. Parallax strips
+   * rewrite the layer's scroll mid-frame, so the fold anchor (the
+   * leftmost native column) is derived from the per-line hScroll the
+   * renderer used, never from a frame sample; the per-row period cache
+   * is keyed by that anchor. period 0 = no exact period found -> that
+   * (row, anchor) keeps the plain map-wrap fallback. */
+  const uint16_t *foldVram;
+  struct {
+    uint8_t set;
+    uint8_t natCol;
+    uint8_t period;
+  } foldRow[32];
 } WsShadowLayer;
 
 static WsShadowLayer s_layers[kLayers];
@@ -69,7 +75,7 @@ void WsShadowReset(void) {
     layer->registered = false;
     layer->active = false;
     layer->fold = false;
-    memset(layer->foldPeriod, 0, sizeof(layer->foldPeriod));
+    memset(layer->foldRow, 0, sizeof(layer->foldRow));
   }
 }
 
@@ -118,39 +124,6 @@ void WsShadowPrefillTile(int layerIndex, uint32_t worldTileX,
     SetEntry(layer, worldTileX, worldTileY, entry);
 }
 
-/* Snapshot the live 64x32 map and detect each row's horizontal period
- * over the native 32-column window. Only the natively displayed columns
- * are trusted: they are correct-by-definition every frame, so a fold
- * anchored there can never serve stale or unwritten map content. Periods
- * must divide 64 so the renderer's mod-64 column wrap preserves
- * congruence. */
-static void FoldFrame(WsShadowLayer *layer, const struct Ppu *ppu,
-                      int layerIndex) {
-  static const uint8_t kPeriods[] = {4, 8, 16};
-  layer->foldNatCol = (uint8_t)((ppu->hScroll[layerIndex] >> 3) & 63);
-  for (int row = 0; row < 32; row++) {
-    for (int col = 0; col < 64; col++) {
-      uint16_t word = (uint16_t)(layer->mapBaseWord +
-          (col >= 32 ? 0x400 : 0) + (row << 5) + (col & 31));
-      layer->foldSnap[row * 64 + col] = ppu->vram[word & 0x7fff];
-    }
-    const uint16_t *snap = &layer->foldSnap[row * 64];
-    int nat = layer->foldNatCol;
-    uint8_t period = 0;
-    for (size_t p = 0; p < sizeof(kPeriods); p++) {
-      int ok = 1;
-      for (int i = 0; i + kPeriods[p] < 32 && ok; i++)
-        ok = snap[(nat + i) & 63] ==
-             snap[(nat + i + kPeriods[p]) & 63];
-      if (ok) {
-        period = kPeriods[p];
-        break;
-      }
-    }
-    layer->foldPeriod[row] = period;
-  }
-}
-
 void WsShadowFrame(const struct Ppu *ppu) {
   for (int i = 0; i < kLayers; i++) {
     WsShadowLayer *layer = &s_layers[i];
@@ -165,7 +138,8 @@ void WsShadowFrame(const struct Ppu *ppu) {
       continue;
 
     if (layer->fold) {
-      FoldFrame(layer, ppu, i);
+      layer->foldVram = ppu->vram;
+      memset(layer->foldRow, 0, sizeof(layer->foldRow));
       continue;
     }
     if (!layer->entries)
@@ -188,31 +162,62 @@ void WsShadowFrame(const struct Ppu *ppu) {
   }
 }
 
+static uint16_t FoldMapEntry(const WsShadowLayer *layer, int row, int col) {
+  uint16_t word = (uint16_t)(layer->mapBaseWord +
+      (col >= 32 ? 0x400 : 0) + (row << 5) + (col & 31));
+  return layer->foldVram[word & 0x7fff];
+}
+
+/* Detect the row's horizontal period over the native 32-column window
+ * anchored at natCol. Only natively displayed columns are trusted: they
+ * are correct-by-definition on this very line, so a fold anchored there
+ * can never serve stale or unwritten map content. Periods must divide 64
+ * so the renderer's mod-64 column wrap preserves congruence. */
+static uint8_t FoldRowPeriod(WsShadowLayer *layer, int row, int natCol) {
+  static const uint8_t kPeriods[] = {4, 8, 16};
+  if (layer->foldRow[row].set && layer->foldRow[row].natCol == natCol)
+    return layer->foldRow[row].period;
+  uint8_t period = 0;
+  for (size_t p = 0; p < sizeof(kPeriods) && !period; p++) {
+    int ok = 1;
+    for (int i = 0; i + kPeriods[p] < 32 && ok; i++)
+      ok = FoldMapEntry(layer, row, (natCol + i) & 63) ==
+           FoldMapEntry(layer, row, (natCol + i + kPeriods[p]) & 63);
+    if (ok)
+      period = kPeriods[p];
+  }
+  layer->foldRow[row].set = 1;
+  layer->foldRow[row].natCol = (uint8_t)natCol;
+  layer->foldRow[row].period = period;
+  return period;
+}
+
 uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
-                      uint16_t mapWordAdr, uint16_t realTile) {
+                      uint16_t hScroll, uint16_t mapWordAdr,
+                      uint16_t realTile) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return realTile;
-  const WsShadowLayer *layer = &s_layers[layerIndex];
+  WsShadowLayer *layer = &s_layers[layerIndex];
   if (!layer->active || screenX >= 0 && screenX < 256)
     return realTile;
 
   if (layer->fold) {
+    if (!layer->foldVram)
+      return realTile;
     uint16_t off = (uint16_t)(mapWordAdr - layer->mapBaseWord);
     if (off >= 0x800)
       return realTile;  /* 64x64 map half not modeled: keep plain wrap */
     int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
     int row = (off >> 5) & 0x1f;
-    uint8_t period = layer->foldPeriod[row];
+    int natCol = (hScroll >> 3) & 63;
+    uint8_t period = FoldRowPeriod(layer, row, natCol);
     if (!period)
       return realTile;
-    /* Fold to the congruent column inside the native window. 64 is a
-     * multiple of every accepted period, so the mod-64 column wrap the
-     * renderer already applied preserves the residue class. */
-    int rel = (col - layer->foldNatCol) & 63;
+    /* Fold to the congruent column inside the native window. */
+    int rel = (col - natCol) & 63;
     if (rel < 32)
       return realTile;  /* native column (or margin overlapping it) */
-    return layer->foldSnap[row * 64 +
-                           ((layer->foldNatCol + rel % period) & 63)];
+    return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
   }
 
   if (!layer->entries)
