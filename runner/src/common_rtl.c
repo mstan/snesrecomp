@@ -462,11 +462,18 @@ bool RtlLoadSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, false, false };
   snes_saveload(g_snes, &fs.base);
-  /* v5+: game-specific chunk follows the guest blob. v4 files have none —
-   * the game's on_state_loaded hook (below) is told the version so it can
-   * fall back to legacy same-mode behavior. */
-  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra)
-    g_rtl_game_info->state_load_extra(&fs.base, hdr[1]);
+  /* v5+: optional game-specific chunk follows the guest blob. Only call
+   * state_load_extra when trailing bytes remain — older v5 files (and any
+   * game that leaves the hook unset) have none. v4 files never have a
+   * chunk; on_state_loaded still runs so the game can fall back. */
+  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra) {
+    long pos = ftell(f);
+    if (pos >= 0 && fseek(f, 0, SEEK_END) == 0) {
+      long end = ftell(f);
+      if (fseek(f, pos, SEEK_SET) == 0 && end > pos)
+        g_rtl_game_info->state_load_extra(&fs.base, hdr[1]);
+    }
+  }
   RtlApuUnlock();
   fclose(f);
   if (fs.error) {
@@ -524,14 +531,14 @@ uint8 *RomPtr(uint32_t addr) {
      * read floods stderr with millions of identical lines. */
     cpu_trace_offrails("RomPtr-invalid", addr);
   }
-  /* Compute LoROM offset, then mirror against ACTUAL ROM size. SMW is
-   * 512KB but the original `& 0x3fffff` mask assumed 4MB, so reads at
-   * high banks (e.g. $FF:0100 — bogus pointer values from data-as-code
-   * regions or unmapped ARAM) computed index 0x7F8100, FAR past
-   * g_rom's 0x80000 bytes — instant SIGSEGV. The right behaviour:
-   * mirror to actual ROM size, matching real SNES bank-mirroring. */
+  /* LoROM: banks $80-$FF mirror $00-$7F. Mask before shifting so HDMA
+   * tables / RomPtr consumers in FastROM banks hit the same bytes as
+   * cart_readLorom (which does bank &= 0x7f). Then mirror against the
+   * actual ROM size — SMW is 512KB; a 4MB-style & 0x3fffff overshot
+   * g_rom and SIGSEGV'd on high bogus pointers. */
   extern Snes *g_snes;
-  uint32_t off = (((addr >> 16) << 15) | (addr & 0x7fff));
+  uint32_t bank7 = (uint32_t)(bank & 0x7f);
+  uint32_t off = (bank7 << 15) | (addr & 0x7fff);
   uint32_t rom_size = g_snes && g_snes->cart ? (uint32_t)g_snes->cart->romSize : 0x80000;
   if (rom_size == 0) rom_size = 0x80000;
   return (uint8 *)&g_rom[off % rom_size];
@@ -546,8 +553,12 @@ uint8 *MvnPtr(uint8_t bank, uint16_t addr) {
   if (bank == 0x7F) return g_ram + 0x10000 + addr;
   if ((bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) && addr < 0x2000)
     return g_ram + addr;
-  uint32_t full = ((uint32_t)bank << 16) | addr;
-  return (uint8 *)&g_rom[(((full >> 16) << 15) | (full & 0x7fff)) & 0x3fffff];
+  uint32_t bank7 = (uint32_t)(bank & 0x7f);
+  uint32_t off = (bank7 << 15) | (addr & 0x7fff);
+  extern Snes *g_snes;
+  uint32_t rom_size = g_snes && g_snes->cart ? (uint32_t)g_snes->cart->romSize : 0x80000;
+  if (rom_size == 0) rom_size = 0x80000;
+  return (uint8 *)&g_rom[off % rom_size];
 }
 
 // Replay a DMA transfer into g_ppu after the emulator executed it into g_snes->ppu.
@@ -1252,9 +1263,10 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
         c->indir_ptr++;
       else
         c->table++;
-      uint16 addr = 0x2100 + c->ppu_addr + bAdrOffsets[c->mode & 7][j];
-      ppu_write(g_ppu, addr, v);
-      debug_server_on_reg_write(addr, v);
+      /* ppu_write takes the B-bus offset ($00-$3F), not a $21xx CPU addr. */
+      uint8 reg = (uint8)(c->ppu_addr + bAdrOffsets[c->mode & 7][j]);
+      ppu_write(g_ppu, reg, v);
+      debug_server_on_reg_write((uint16)(0x2100u + reg), v);
     }
   }
   c->rep_count--;

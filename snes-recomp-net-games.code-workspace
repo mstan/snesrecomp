@@ -1,0 +1,13 @@
+{
+  "folders": [
+    {
+      "path": ".",
+    },
+    {
+      "path": "../recomp-net",
+    },
+    {
+      "path": "../MetalWarriorsSNESRecomp",
+    },
+  ],
+}

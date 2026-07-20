@@ -81,6 +81,10 @@ To keep new games consistent and free of leftover game-specific naming:
   state, memory mapping, PPU/APU/DSP, debug server, always-on trace rings).
   Its PPU can also export arbitrary BG/OBJ rectangles for independent host
   composition; see [`docs/HOST_OVERLAY_EXTRACTION.md`](docs/HOST_OVERLAY_EXTRACTION.md).
+- `lib/recomp-net/` — git submodule with
+  [recomp-net](https://github.com/TechnicallyComputers/recomp-net) delay-sync
+  netcode. Opt-in for any game via `snesrecomp_enable_recomp_net(MyGame)`;
+  see [`docs/RECOMP_NET.md`](docs/RECOMP_NET.md).
 - `tests/` — framework tests (decoder, CFG, SSA placement, etc.) and
   L3 fixtures.
 - `fuzz/` — differential fuzzer over synthetic 65816 snippets.
@@ -89,6 +93,27 @@ To keep new games consistent and free of leftover game-specific naming:
   frontend that serves as the hardware-accurate timing/state reference for
   diffing the recompiled build (also published standalone as
   [`mstan/snesref`](https://github.com/mstan/snesref); formerly `mmxref`).
+
+## Netcode (recomp-net)
+
+Multiplayer delay-sync is available through the `lib/recomp-net` submodule.
+Initialize it, then from the game `CMakeLists.txt`:
+
+```sh
+git submodule update --init lib/recomp-net
+```
+
+```cmake
+include(${SNESRECOMP_ROOT}/runner/runner.cmake)
+add_executable(MyGame ${SNESRECOMP_RUNNER_SOURCES} ...)
+snesrecomp_enable_recomp_net(MyGame)
+```
+
+```c
+#include "recomp_net/recomp_net.h"
+```
+
+Full integration notes: [`docs/RECOMP_NET.md`](docs/RECOMP_NET.md).
 
 ## MSU-1 audio
 

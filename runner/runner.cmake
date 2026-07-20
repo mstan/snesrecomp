@@ -96,3 +96,8 @@ set(SNESRECOMP_RUNNER_INCLUDE_DIRS
     ${SNESRECOMP_RUNNER_ROOT}/src
     ${SNESRECOMP_RUNNER_ROOT}/src/snes
 )
+
+# Optional delay-sync netcode (lib/recomp-net submodule). See docs/RECOMP_NET.md.
+# Does nothing unless SNESRECOMP_ENABLE_NET=ON or the game calls
+# snesrecomp_enable_recomp_net(<target>).
+include(${SNESRECOMP_RUNNER_ROOT}/recomp_net.cmake)

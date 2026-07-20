@@ -199,6 +199,16 @@ struct Ppu {
   uint8_t wsRepeatY0[4], wsRepeatY1[4];
   // Skip offscreen staging columns before sampling a layer's side margins.
   uint8_t wsMarginGapL[4], wsMarginGapR[4];
+  // Strict decode of the ambiguous 9-bit OAM X band [256, 256+extraRightCur).
+  // A raw value there is either a genuine right-margin sprite (widescreen
+  // host emitted it on purpose) or a sprite the game parked off-screen-left
+  // at x-512 (invisible on hardware). When strict is set, only slots marked
+  // in wsOamRightHint keep the positive decode; unmarked slots wrap negative
+  // like hardware, so parked sprites don't ghost into the right margin.
+  // Default off preserves the legacy always-positive band (SMW relies on it).
+  // Games publish per NMI via PpuWsSetOamRightHints. 1 bit per OAM slot.
+  uint8_t wsOamRightHintStrict;
+  uint8_t wsOamRightHint[16];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -378,6 +388,13 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 // setters, callers re-apply per frame (ppu_reset zeroes the fields).
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start);
+
+// Publish this frame's OAM right-margin hints (see wsOamRightHintStrict).
+// `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or
+// NULL to disable strict decode and restore the legacy always-positive band.
+// Games that stage OAM CPU-side should call this each NMI, after the staging
+// buffer is final and before the frame is presented.
+void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints);
 
 // Let BG3 (layer 2) render into the widescreen side margins on scanlines
 // >= from_y, instead of being clamped to the authentic 256-wide region. Pass

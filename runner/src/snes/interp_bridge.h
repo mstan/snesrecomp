@@ -35,8 +35,10 @@
 /* Optional game policy invoked immediately before one interpreted opcode.
  * The bridge compares the live PC first, so ordinary interpreted instructions
  * pay only the address check. At a match it synchronizes registers into
- * CpuState, invokes the callback, then copies any changes back. NULL disables
- * it. */
+ * CpuState, invokes the callback, then copies any changes back.
+ *
+ * Up to 8 PCs may be armed (LoROM FastROM bit7 is masked). Calling with a
+ * non-NULL hook adds/replaces that PC; hook=NULL clears all slots. */
 typedef void (*InterpPreOpcodeHook)(CpuState *cpu, uint32_t pc24);
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook);
@@ -71,6 +73,11 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
  * game-address hint. */
 int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24);
 uint32_t interp_bridge_lle_resume_pc(void);
+
+/* True if the most recent auto-quiescent yield was a 65816 WAI. The host
+ * should deliver NMI/IRQ before resuming at interp_bridge_lle_resume_pc().
+ * Sticky until read (then cleared). */
+int interp_bridge_lle_took_wai(void);
 
 /* Optional whole-program LLE deadline.  When nonzero, the auto-quiescent
  * bridge yields at the first architectural instruction boundary whose master

@@ -205,6 +205,14 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     if (off >= 0) {
         uint8 old = cpu->ram[off];
         cpu->ram[off] = v;
+        /* Optional game hook (weak): Metal Warriors stage-window widen. */
+        if (off >= 0x1E72 && off <= 0x1E79) {
+            extern uint32_t g_interp816_cur_pc;
+            void MwOnStageWindowStore(uint32_t, uint32_t)
+                __attribute__((weak));
+            if (MwOnStageWindowStore)
+                MwOnStageWindowStore((uint32_t)off, g_interp816_cur_pc);
+        }
 #ifdef SNES_COSIM
         /* Exact per-write WRAM watchpoint (dev, env-gated): names the recompiled
          * function performing the store (not block-poll approximate). Set
@@ -261,6 +269,19 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
                    | ((uint16)cpu->ram[off + 1] << 8);
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
+        if ((off >= 0x1E72 && off <= 0x1E79) ||
+            (off + 1 >= 0x1E72 && off + 1 <= 0x1E79)) {
+            extern uint32_t g_interp816_cur_pc;
+            void MwOnStageWindowStore(uint32_t, uint32_t)
+                __attribute__((weak));
+            if (MwOnStageWindowStore) {
+                /* Word store: tip = odd byte so the hook's hi-byte gate fires. */
+                uint32_t tip = (uint32_t)off;
+                if (off == 0x1E74 || off == 0x1E78)
+                    tip = (uint32_t)off + 1u;
+                MwOnStageWindowStore(tip, g_interp816_cur_pc);
+            }
+        }
 #ifdef SNES_COSIM
         {
             extern const char *g_last_recomp_func;

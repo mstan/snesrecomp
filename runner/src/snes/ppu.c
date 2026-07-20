@@ -206,6 +206,16 @@ void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
 }
 
+void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints) {
+  if (hints) {
+    ppu->wsOamRightHintStrict = 1;
+    memcpy(ppu->wsOamRightHint, hints, sizeof(ppu->wsOamRightHint));
+  } else {
+    ppu->wsOamRightHintStrict = 0;
+    memset(ppu->wsOamRightHint, 0, sizeof(ppu->wsOamRightHint));
+  }
+}
+
 void PpuSetWidescreenLayerMask(Ppu *ppu, uint8_t bg_layer_mask) {
   ppu->wsLayerWidenMask = bg_layer_mask & 0x0f;
 }
@@ -659,6 +669,80 @@ static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer,
   }
 }
 
+/* Scalar renderer for 16x16-tile backgrounds (BGMODE bits 4-7). The fast
+ * mode-1 renderers assume 8x8 tiles and sample big-tile layers at the wrong
+ * stride (Metal Warriors arms $F1 — big tiles on every BG — for its intro,
+ * title logo, and dialogue portraits). Handles 2bpp and 4bpp, with optional
+ * mosaic; 256 scalar pixels per line is negligible next to the fast paths. */
+static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+                                 bool sub, uint layer, int bpp,
+                                 PpuZbufType zhi, PpuZbufType zlo,
+                                 bool mosaic) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y)
+                                      : PpuWindows_Clear(&win, ppu, layer, y);
+  const int sy = (int)(mosaic ? ppu->mosaicModulo[y] : y) + ppu->vScroll[layer];
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const int words = (bpp == 4) ? 16 : 8;          /* vram words per 8x8 char */
+  const unsigned pal_shift = (bpp == 4) ? 6 : 8;  /* palette * (1 << bpp) */
+
+  int sc_row = PPU_bgTilemapAdr(ppu, layer) + (((sy >> 4) & 31) << 5);
+  if (((sy >> 9) & 1) && PPU_bgTilemapHigher(ppu, layer))
+    sc_row += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    PpuZbufType *dstz = dstbuf->data + left + kPpuExtraLeftRight;
+    const bool ws_shadow = WsShadowLayerActive((int)layer);
+    for (int screen_x = left; screen_x < right; screen_x++, dstz++) {
+      const int mx = mosaic ? PpuMosaicAt(ppu, screen_x) : screen_x;
+      const int sx = mx + ppu->hScroll[layer];
+      int sc = sc_row;
+      if (((sx >> 9) & 1) && PPU_bgTilemapWider(ppu, layer))
+        sc += 0x400;
+      sc += (sx >> 4) & 31;
+      uint16 tile = ppu->vram[sc & 0x7fff];
+      unsigned px = (unsigned)sx & 15, py = (unsigned)sy & 15;
+      /* Margins: world-keyed shadow tile + matching world pixel phase.
+       * Using live hScroll/vScroll for px/py while the tile key used the
+       * NMI-latched world origin produced a persistent ~phase seam. */
+      if (ws_shadow && (screen_x < 0 || screen_x >= 256)) {
+        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy, tile);
+        const int32_t wpx =
+            (int32_t)WsShadowWorldX((int)layer) + screen_x;
+        const int32_t wpy =
+            (int32_t)WsShadowPresentWorldY((int)layer, screen_x) +
+            (int32_t)((sy - WsShadowScrollY((int)layer)) & 0x3ff);
+        if (wpx >= 0)
+          px = (unsigned)wpx & 15;
+        if (wpy >= 0)
+          py = (unsigned)wpy & 15;
+      }
+      if (tile & 0x4000) px = 15 - px;
+      if (tile & 0x8000) py = 15 - py;
+      const unsigned character =
+          ((tile & 0x3ff) + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned addr = (tileadr + character * words + (py & 7)) & 0x7fff;
+      const unsigned bit = 7 - (px & 7);
+      const uint16 p01 = ppu->vram[addr];
+      unsigned pixel = ((p01 >> bit) & 1) | (((p01 >> (8 + bit)) & 1) << 1);
+      if (bpp == 4) {
+        const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+        pixel |= (((p23 >> bit) & 1) << 2) | (((p23 >> (8 + bit)) & 1) << 3);
+      }
+      const PpuZbufType z =
+          ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> pal_shift);
+      if (pixel && z > *dstz)
+        *dstz = z + (PpuZbufType)pixel;
+    }
+  }
+}
+
 static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
   int addr = PPU_bgTilemapAdr(ppu, layer) + ((ty & 31) << 5) + (tx & 31);
   if (((ty >> 5) & 1) && PPU_bgTilemapHigher(ppu, layer))
@@ -1090,7 +1174,9 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
       ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
       y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
   if (!(padding & (1u << layer)) && !repeat_band) {
-    if (mosaic)
+    if (PPU_bigTiles(ppu, layer))
+      PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 4, zhi, zlo, mosaic);
+    else if (mosaic)
       PpuDrawBackground_4bpp_mosaic(ppu, dstbuf, y, sub,
                                     layer, zhi, zlo);
     else
@@ -1101,7 +1187,9 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 
   PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
-  if (mosaic)
+  if (PPU_bigTiles(ppu, layer))
+    PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
+  else if (mosaic)
     PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
@@ -1408,7 +1496,10 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
 
     uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
     layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 2);
-    if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
+    if (PPU_bigTiles(ppu, 2))
+      PpuDrawBackgroundBig(ppu, layerbuf, y, sub, 2, 2, bg3prio, 0x1200,
+                           mosaic_size && PPU_mosaicEnabled(ppu, 2));
+    else if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
       PpuDrawBackground_2bpp_mosaic(ppu, layerbuf, y, sub, 2, bg3prio, 0x1200);
     else
       PpuDrawBackground_2bpp(ppu, layerbuf, y, sub, 2, bg3prio, 0x1200);
@@ -1422,8 +1513,12 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
-    PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, 1,
-                           0xb100, 0x7100);
+    if (PPU_bigTiles(ppu, 1))
+      PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,
+                           0xb100, 0x7100, false);
+    else
+      PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, 1,
+                             0xb100, 0x7100);
   } else {
     // mode 7
     PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 0);
@@ -1569,7 +1664,21 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       // positive (right margin); [256+extraRightCur, 512) still wrap to the
       // left straddle range. With extraRightCur==0 this is the authentic
       // `if (x > 255) x -= 512`.
-      if (x >= 256 + ppu->extraRightCur) x -= 512;
+      //
+      // The band is ambiguous: raw 256..256+extra is also how hardware
+      // encodes sprites parked off-screen-left at x-512 (invisible on a
+      // 256-wide screen). With strict hints on, only slots the game host
+      // marked as intentional right-margin sprites stay positive; everything
+      // else wraps like hardware so parked sprites don't ghost into the
+      // right margin (Metal Warriors). Without hints, keep the legacy
+      // always-positive band (SMW's draw window never parks sprites there).
+      if (x >= 256 + ppu->extraRightCur) {
+        x -= 512;
+      } else if (x >= 256 && ppu->wsOamRightHintStrict) {
+        int slot = index >> 1;
+        if (!(ppu->wsOamRightHint[slot >> 3] & (1u << (slot & 7))))
+          x -= 512;
+      }
       // if in x-range: include sprites whose body pokes into the visible
       // area, which in widescreen starts at -extraLeftCur (the per-tile
       // gate below clips columns the same way). With extraLeftCur==0 this
