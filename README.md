@@ -19,6 +19,70 @@ as a normal binary rather than under interpretation.
 > the first tagged release — a working snapshot that all three games
 > build against, not a stability guarantee.
 
+## How to use snesrecomp
+
+snesrecomp takes a SNES ROM and creates a recompilation project containing C
+source and build scripts.
+
+### Generate a project with the released CLI
+
+1. Download `snesrecomp-cli-windows-x86_64.zip` from
+   [Releases](https://github.com/mstan/snesrecomp/releases/latest).
+2. Extract the whole zip to a folder. Keep its contents together.
+3. Open PowerShell in that folder and run:
+
+```powershell
+.\snesrecomp.exe build `
+  --rom "C:\Games\My Game\game.sfc" `
+  --output "C:\Projects\MyGameRecomp"
+```
+
+Both `.sfc` and `.smc` ROM images are accepted. The command detects standard
+LoROM and HiROM mapping automatically.
+
+The output folder contains:
+
+- automatically discovered recompiled C source;
+- a starter bank configuration under `config/`;
+- `CMakeLists.txt` and build scripts; and
+- the SNESRecomp runner source needed for further integration.
+
+The downloaded CLI is self-contained. You do not need Python, Rust, or a
+source checkout to generate a project.
+
+### Build the generated source
+
+Install CMake, Ninja, and a C compiler. Then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Projects\MyGameRecomp\build.ps1"
+```
+
+This builds a static library containing the generated code. An arbitrary SNES
+game still needs game-specific function boundaries, indirect-dispatch
+configuration, and a host application before it becomes a playable native
+port. The generated project is the starting point for that work.
+
+The ready-made CLI release is currently for 64-bit Windows. The generated
+project also includes `build.sh` for macOS and Linux.
+
+Use only a ROM image you obtained legally. SNESRecomp does not include ROM
+data and does not copy the original ROM into the output project. Generated C
+is derived from that ROM, so do not redistribute it without permission.
+
+### Build the CLI from source
+
+You need Git, Python 3.9 or newer, Rust 1.85 or newer, and PyInstaller:
+
+```sh
+git clone https://github.com/mstan/snesrecomp.git
+cd snesrecomp
+python -m pip install pyinstaller==6.21.0
+python tools/build_cli.py release
+```
+
+The ready-to-use ZIP is written to `dist/`.
+
 ## Per-game runner repos
 
 snesrecomp is the shared framework. Each game lives in its own

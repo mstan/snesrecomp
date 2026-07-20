@@ -20,7 +20,9 @@ import sys
 import tempfile
 
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
+REPO = pathlib.Path(
+    os.environ.get("SNESRECOMP_ROOT", pathlib.Path(__file__).resolve().parent.parent)
+).resolve()
 sys.path.insert(0, str(REPO / "recompiler"))
 
 from snes65816 import (  # noqa: E402
