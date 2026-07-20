@@ -202,6 +202,10 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
   ppu->wsHudRightStart = right_start;
 }
 
+void PpuSetWsHudOamShift(Ppu *ppu, uint8_t nslots) {
+  ppu->wsHudOamSlots = nslots > 128 ? 128 : nslots;
+}
+
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
 }
@@ -1538,6 +1542,16 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
 }
 
+static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, int x) {
+  if ((index >> 1) < ppu->wsHudOamSlots) {
+    if (x >= 0 && x <= 24)
+      x -= ppu->extraLeftCur;
+    else if (x >= 216 && x < 256)
+      x += ppu->extraRightCur;
+  }
+  return x;
+}
+
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   static const uint8 spriteSizes[8][2] = {
     {8, 16}, {8, 32}, {8, 64}, {16, 32},
@@ -1561,6 +1575,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       int x = ppu->oam[index] & 0xff;
       x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
       if (x >= 256 + ppu->extraRightCur) x -= 512;
+      x = PpuAdjustWidescreenHudOamX(ppu, index, x);
       if(x + spriteSize > -ppu->extraLeftCur) {
         spritesFound++;
         if(spritesFound > 32 &&
@@ -1582,6 +1597,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     int x = ppu->oam[index] & 0xff;
     x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
     if (x >= 256 + ppu->extraRightCur) x -= 512;
+    x = PpuAdjustWidescreenHudOamX(ppu, index, x);
         if(PPU_objInterlace(ppu)) row = row * 2 + (ppu->evenFrame ? 0 : 1);
         int oam1 = ppu->oam[index + 1];
         int objAdr = (oam1 & 0x100) ? PPU_objTileAdr2(ppu) : PPU_objTileAdr1(ppu);

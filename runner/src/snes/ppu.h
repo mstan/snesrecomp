@@ -176,6 +176,10 @@ struct Ppu {
   uint8_t extraLeftCur, extraRightCur, extraLeftRight, extraBottomCur;
   // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
+  // Widescreen HUD OAM anchor (see PpuSetWsHudOamShift): leading OAM slots
+  // near either native screen edge move outward with the live margins.
+  // 0 = off (authentic).
+  uint8_t wsHudOamSlots;
   // Widescreen BG3 widen (see PpuSetWidescreenBg3Widen). Scanlines >= this let
   // BG3 (layer 2) extend into the side margins like BG1/BG2 instead of staying
   // clamped to the authentic 256-wide region. 0 = off (BG3 clamped everywhere,
@@ -378,6 +382,10 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 // setters, callers re-apply per frame (ppu_reset zeroes the fields).
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start);
+
+// Shift edge-hugging HUD sprites in OAM slots [0, nslots) outward with the
+// live widescreen margins. Presentation-only; 0 disables the anchor.
+void PpuSetWsHudOamShift(Ppu *ppu, uint8_t nslots);
 
 // Let BG3 (layer 2) render into the widescreen side margins on scanlines
 // >= from_y, instead of being clamped to the authentic 256-wide region. Pass
