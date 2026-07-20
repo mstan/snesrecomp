@@ -331,7 +331,29 @@ static struct {
     VramTraceEntry *log;        /* heap-allocated; calloc'd at init */
 } s_vram_trace = {0};
 
+/* ── Always-on VRAM byte-write mini ring ─────────────────────────────
+ * Compiled into every build (the big REVERSE_DEBUG ring above is not).
+ * Records EVERY VRAM byte write — PIO ($2118/$2119, atomic word STA)
+ * and per-byte DMA both funnel through this hook — with the writing
+ * recomp function. Query backward via "vwring_get"; never armed. */
+#define VWRING_LEN (1u << 17)
+typedef struct {
+    int frame;
+    uint16_t adr_byte;
+    uint8_t  val;
+    const char *func;   /* g_last_recomp_func string literal */
+} VwRingEntry;
+static VwRingEntry s_vwring[VWRING_LEN];
+static uint64_t s_vwring_widx;
+
 void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) {
+    {
+        VwRingEntry *e = &s_vwring[s_vwring_widx++ & (VWRING_LEN - 1)];
+        e->frame = snes_frame_counter;
+        e->adr_byte = (uint16_t)(byte_addr & 0xFFFF);
+        e->val = value;
+        e->func = g_last_recomp_func;
+    }
     if (!s_vram_trace.active || !s_vram_trace.log) return;
     uint16_t adr_b = (uint16_t)(byte_addr & 0xFFFF);
     int hit = 0;
@@ -2445,6 +2467,37 @@ static void cmd_trace_vram(const char *args) {
     s_vram_trace.active = 1;
     send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
              lo, hi, s_vram_trace.nranges);
+}
+
+/* vwring_get <lo> <hi> [n] — newest n (default 256) always-on VRAM
+ * byte-write ring entries whose BYTE address lies in [lo,hi], oldest
+ * first. Works in every build; nothing to arm. */
+static void cmd_vwring_get(const char *args) {
+    unsigned int lo = 0, hi = 0xFFFF, n = 256;
+    if (args) sscanf(args, "%x %x %u", &lo, &hi, &n);
+    if (n > 4096) n = 4096;
+    static VwRingEntry sel[4096];
+    unsigned int found = 0;
+    uint64_t have = s_vwring_widx < VWRING_LEN ? s_vwring_widx : VWRING_LEN;
+    for (uint64_t back = 0; back < have && found < n; back++) {
+        const VwRingEntry *e =
+            &s_vwring[(s_vwring_widx - 1 - back) & (VWRING_LEN - 1)];
+        if (e->adr_byte >= lo && e->adr_byte <= hi)
+            sel[found++] = *e;
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"total_writes\":%llu,\"matched\":%u,\"log\":[",
+        (unsigned long long)s_vwring_widx, found);
+    for (unsigned int i = 0; i < found && pos < (int)sizeof(buf) - 256; i++) {
+        const VwRingEntry *e = &sel[found - 1 - i];  /* oldest first */
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"a\":\"0x%04x\",\"v\":\"0x%02x\",\"fn\":\"%s\"}",
+            i ? "," : "", e->frame, e->adr_byte, e->val,
+            e->func ? e->func : "(none)");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
 }
 
 static void cmd_trace_vram_reset(const char *args) {
@@ -7111,6 +7164,7 @@ static const CmdEntry s_commands[] = {
     {"trace_reg_reset", cmd_trace_reg_reset},
     {"get_reg_trace", cmd_get_reg_trace},
     {"trace_vram",    cmd_trace_vram},
+    {"vwring_get",    cmd_vwring_get},
     {"trace_vram_reset", cmd_trace_vram_reset},
     {"get_vram_trace", cmd_get_vram_trace},
     {"get_oracle_vram_trace", cmd_get_oracle_vram_trace},
@@ -7376,40 +7430,40 @@ static void try_recv_and_process(void) {
         s_recv_len += n;
         s_recv_buf[s_recv_len] = 0;
 
-        // Process complete lines
+        // Process every complete line and keep the connection open so one
+        // client can stream many commands. Leftover partial input is
+        // compacted to the front of the buffer for the next recv.
         char *nl;
         while ((nl = strchr(s_recv_buf, '\n')) != NULL) {
             *nl = 0;
             process_command(s_recv_buf);
+            if (s_client_sock == SOCKET_INVALID) return;  // handler closed us
+            int consumed = (int)(nl - s_recv_buf) + 1;
+            s_recv_len -= consumed;
+            memmove(s_recv_buf, nl + 1, s_recv_len + 1);  // include NUL
+        }
+        if (s_recv_len >= (int)sizeof(s_recv_buf) - 1) {
+            // Full buffer with no newline: not our protocol; drop the client.
+            fprintf(stderr, "[debug_server] Oversized command line; closing client\n");
             close_client_socket();
-            return;
         }
     } else if (n == 0) {
         // Client disconnected
         fprintf(stderr, "[debug_server] Client disconnected\n");
         close_client_socket();
-        /* Preserve pause state across short-lived TCP clients. Tooling often
-         * connects, sends one query, and disconnects; that must not resume the
-         * game behind the driver's back. */
+        /* Preserve pause state across TCP clients disconnecting: that must
+         * not resume the game behind the driver's back. */
     }
 #ifdef _WIN32
     else {
         int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) {
-            if (++s_client_idle_spins > 200) {
-                fprintf(stderr, "[debug_server] Closing idle client\n");
-                close_client_socket();
-            }
-            return;
-        }
+        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT)
+            return;  // idle is fine; a newer connection replaces us if needed
         close_client_socket();
     }
 #else
     else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        if (++s_client_idle_spins > 200) {
-            fprintf(stderr, "[debug_server] Closing idle client\n");
-            close_client_socket();
-        }
+        // idle is fine; a newer connection replaces us if needed
     } else {
         close_client_socket();
     }
@@ -7419,10 +7473,17 @@ static void try_recv_and_process(void) {
 // Internal poll function called by the network thread.
 // Must hold the mutex when accessing shared state.
 static void debug_server_poll_internal(void) {
-    // Accept new connections
-    if (s_client_sock == SOCKET_INVALID && s_listen_sock != SOCKET_INVALID) {
-        s_client_sock = accept(s_listen_sock, NULL, NULL);
-        if (s_client_sock != SOCKET_INVALID) {
+    // Accept new connections. Newest-wins: if a client is already attached,
+    // an incoming connection replaces it, so an abandoned/idle client can
+    // never wedge the single-client server.
+    if (s_listen_sock != SOCKET_INVALID) {
+        socket_t incoming = accept(s_listen_sock, NULL, NULL);
+        if (incoming != SOCKET_INVALID) {
+            if (s_client_sock != SOCKET_INVALID) {
+                fprintf(stderr, "[debug_server] New client; dropping previous\n");
+                close_client_socket();
+            }
+            s_client_sock = incoming;
             set_socket_timeouts(s_client_sock);
             set_nonblocking(s_client_sock);
             s_recv_len = 0;

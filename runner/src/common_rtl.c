@@ -11,6 +11,7 @@
 #include "snes/apu.h"
 #include "snes/cart.h"
 #include "snes/msu1.h"
+#include "snes/ws_shadow.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
@@ -735,6 +736,7 @@ static void WriteVramWord(Ppu *ppu, uint16 value) {
   uint32_t byte_addr = (uint32_t)(adr & 0x7fff) << 1;
   debug_server_on_vram_write(byte_addr,     (uint8_t)(value & 0xff));
   debug_server_on_vram_write(byte_addr + 1, (uint8_t)(value >> 8));
+  WsShadowOnVramWrite((uint16_t)(adr & 0x7fff), value);
   ppu->vramPointer += ppu->vramIncrement;
 }
 
