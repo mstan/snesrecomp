@@ -7379,40 +7379,40 @@ static void try_recv_and_process(void) {
         s_recv_len += n;
         s_recv_buf[s_recv_len] = 0;
 
-        // Process complete lines
+        // Process every complete line and keep the connection open so one
+        // client can stream many commands. Leftover partial input is
+        // compacted to the front of the buffer for the next recv.
         char *nl;
         while ((nl = strchr(s_recv_buf, '\n')) != NULL) {
             *nl = 0;
             process_command(s_recv_buf);
+            if (s_client_sock == SOCKET_INVALID) return;  // handler closed us
+            int consumed = (int)(nl - s_recv_buf) + 1;
+            s_recv_len -= consumed;
+            memmove(s_recv_buf, nl + 1, s_recv_len + 1);  // include NUL
+        }
+        if (s_recv_len >= (int)sizeof(s_recv_buf) - 1) {
+            // Full buffer with no newline: not our protocol; drop the client.
+            fprintf(stderr, "[debug_server] Oversized command line; closing client\n");
             close_client_socket();
-            return;
         }
     } else if (n == 0) {
         // Client disconnected
         fprintf(stderr, "[debug_server] Client disconnected\n");
         close_client_socket();
-        /* Preserve pause state across short-lived TCP clients. Tooling often
-         * connects, sends one query, and disconnects; that must not resume the
-         * game behind the driver's back. */
+        /* Preserve pause state across TCP clients disconnecting: that must
+         * not resume the game behind the driver's back. */
     }
 #ifdef _WIN32
     else {
         int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) {
-            if (++s_client_idle_spins > 200) {
-                fprintf(stderr, "[debug_server] Closing idle client\n");
-                close_client_socket();
-            }
-            return;
-        }
+        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT)
+            return;  // idle is fine; a newer connection replaces us if needed
         close_client_socket();
     }
 #else
     else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        if (++s_client_idle_spins > 200) {
-            fprintf(stderr, "[debug_server] Closing idle client\n");
-            close_client_socket();
-        }
+        // idle is fine; a newer connection replaces us if needed
     } else {
         close_client_socket();
     }
@@ -7422,10 +7422,17 @@ static void try_recv_and_process(void) {
 // Internal poll function called by the network thread.
 // Must hold the mutex when accessing shared state.
 static void debug_server_poll_internal(void) {
-    // Accept new connections
-    if (s_client_sock == SOCKET_INVALID && s_listen_sock != SOCKET_INVALID) {
-        s_client_sock = accept(s_listen_sock, NULL, NULL);
-        if (s_client_sock != SOCKET_INVALID) {
+    // Accept new connections. Newest-wins: if a client is already attached,
+    // an incoming connection replaces it, so an abandoned/idle client can
+    // never wedge the single-client server.
+    if (s_listen_sock != SOCKET_INVALID) {
+        socket_t incoming = accept(s_listen_sock, NULL, NULL);
+        if (incoming != SOCKET_INVALID) {
+            if (s_client_sock != SOCKET_INVALID) {
+                fprintf(stderr, "[debug_server] New client; dropping previous\n");
+                close_client_socket();
+            }
+            s_client_sock = incoming;
             set_socket_timeouts(s_client_sock);
             set_nonblocking(s_client_sock);
             s_recv_len = 0;
