@@ -13,6 +13,7 @@ typedef struct WsShadowLayer {
   bool wide;
   bool fold;      /* periodic fold enabled (composes with world history) */
   bool worldSet;  /* WsShadowSetWorld called this frame */
+  int dir;        /* last nonzero worldX motion: +1 right, -1 left */
   uint32_t worldX;
   uint32_t worldY;
   uint16_t mapBaseWord;
@@ -109,8 +110,44 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
   }
   layer->registered = true;
   layer->worldSet = true;
+  if (worldX != layer->worldX)
+    layer->dir = ((int32_t)(worldX - layer->worldX) > 0) ? 1 : -1;
   layer->worldX = worldX;
   layer->worldY = worldY;
+}
+
+/* World y-tile for a map row, using the anchor's 32-row wrap window. */
+static uint32_t WorldRowForMapRow(const WsShadowLayer *layer, int row) {
+  uint32_t wy0 = layer->worldY >> 3;
+  return wy0 + (uint32_t)((row - (int)(wy0 & 31)) & 31);
+}
+
+/* Capture the game's own tilemap uploads as they land, bound to the
+ * world chunk they were staged for. The map holds two 256px chunks with
+ * fixed half parity, so a written column's chunk is unambiguous when its
+ * half matches the camera chunk's parity; the other half is the chunk
+ * being staged ahead (or behind, per the last travel direction). This
+ * feeds freshly staged content - including first-visit world-anchored
+ * features - into the history the moment it exists in VRAM. */
+void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
+  for (int i = 0; i < kLayers; i++) {
+    WsShadowLayer *layer = &s_layers[i];
+    if (!layer->active || !layer->wide || !layer->entries)
+      continue;
+    uint16_t off = (uint16_t)(wordAdr - layer->mapBaseWord);
+    if (off >= 0x800)
+      continue;
+    int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
+    int row = (off >> 5) & 0x1f;
+    uint32_t k0 = layer->worldX >> 8;
+    uint32_t chunk;
+    if ((uint32_t)(col >> 5) == (k0 & 1))
+      chunk = k0;
+    else
+      chunk = layer->dir < 0 ? k0 - 1 : k0 + 1;
+    uint32_t tx = chunk * 32 + (uint32_t)(col & 31);
+    SetEntry(layer, tx, WorldRowForMapRow(layer, row), value);
+  }
 }
 
 void WsShadowSetBlankTile(int layerIndex, int blankEntry) {
@@ -207,10 +244,24 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
   if (!layer->active || screenX >= 0 && screenX < 256)
     return realTile;
 
-  /* Layered margin sources: (1) periodic fold for rows whose native
-   * window proves an exact period — always this-frame fresh; (2) the
-   * world-keyed history for the remaining (world-anchored) rows;
-   * (3) the renderer's plain map wrap as the final fallback. */
+  /* Layered margin sources, exact-first: (1) the world-keyed history —
+   * captured from the native view sweep AND from the game's own
+   * uploads at write time, it holds the exact world content whenever
+   * that content has ever existed in VRAM; (2) the periodic fold for
+   * cells never seen (stage start, beyond the populated span) on rows
+   * whose native window proves an exact period; (3) the renderer's
+   * plain map wrap. History-first keeps world-anchored features
+   * (towers) in the margins and stops fold/history flicker: a false
+   * period inferred from a feature-free native window can no longer
+   * paint filler over known feature cells. */
+  int32_t worldX = (int32_t)layer->worldX + screenX;
+  int32_t worldY = WorldFromWrapped(layer->worldY, wrappedY & 0x3ff);
+  if (layer->entries && worldX >= 0 && worldY >= 0) {
+    uint16_t entry;
+    if (GetEntry(layer, (uint32_t)worldX >> 3, (uint32_t)worldY >> 3, &entry))
+      return entry;
+  }
+
   if (layer->fold && layer->foldVram) {
     uint16_t off = (uint16_t)(mapWordAdr - layer->mapBaseWord);
     if (off < 0x800) {
@@ -220,28 +271,15 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
       uint8_t period = FoldRowPeriod(layer, row, natCol);
       if (period) {
         int rel = (col - natCol) & 63;
-        if (rel < 32)
-          return realTile;  /* native column (or margin overlapping it) */
-        return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
+        if (rel >= 32)
+          return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
+        return realTile;  /* native column (or margin overlapping it) */
       }
-      /* no exact period: fall through to the world-keyed history */
     }
   }
 
-  if (!layer->entries)
-    return realTile;
-
-  uint16_t miss = layer->blankTilePlus1
-                      ? (uint16_t)(layer->blankTilePlus1 - 1)
-                      : realTile;
-  int32_t worldX = (int32_t)layer->worldX + screenX;
-  int32_t worldY = WorldFromWrapped(layer->worldY, wrappedY & 0x3ff);
-  if (worldX < 0 || worldY < 0)
-    return miss;
-  uint16_t entry;
-  if (GetEntry(layer, (uint32_t)worldX >> 3, (uint32_t)worldY >> 3, &entry))
-    return entry;
-  return miss;
+  return layer->blankTilePlus1 ? (uint16_t)(layer->blankTilePlus1 - 1)
+                               : realTile;
 }
 
 bool WsShadowLayerActive(int layerIndex) {

@@ -1900,6 +1900,8 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+      WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
+                          ppu->vram[vramAdr & 0x7fff]);
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }
@@ -1908,6 +1910,8 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+      WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
+                          ppu->vram[vramAdr & 0x7fff]);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }

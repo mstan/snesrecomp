@@ -35,6 +35,13 @@ void WsShadowPrefillTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
 struct Ppu;
 void WsShadowFrame(const struct Ppu *ppu);
 
+// Feed a VRAM word write (post-merge value) from the emulation's write
+// paths. Writes landing inside a registered wide layer's tilemap are
+// captured into the world-keyed history, bound to the world chunk the
+// upload was staged for (half parity + travel direction). No-op for
+// inactive layers/addresses.
+void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value);
+
 // mapWordAdr = the VRAM word address the renderer fetched realTile from
 // (used by fold mode to recover the exact map row/column, independent of
 // scroll bias and window splits). hScroll = the layer's live per-line
