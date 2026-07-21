@@ -1,6 +1,11 @@
 # snesrecomp Launcher — Design
 
-Status: **DRAFT / in design** · Branch: `feature/launcher` (engine + each game) · 2026-06-13
+Status: **Phase 1 + netplay menu wired** (Metal Warriors first) · Branch: `feat/launcher-and-net` · updated 2026-07-19
+
+Offline RmlUi launcher is opt-in per game via `snesrecomp_enable_launcher()`
+(`runner/launcher.cmake`). Metal Warriors shows it by default. Netplay menu
+flow (home → lobbies → room) and MotK-style WebSocket lobby client are wired;
+the in-game `recomp-net` host loop is still a follow-up.
 
 A shared, RmlUi-based pre-boot launcher for every snesrecomp game, modeled on
 `psxrecomp/runtime/launcher` and `n64recomp/PokemonStadiumRecomp`. Shown inside
@@ -233,5 +238,14 @@ byte-identical guarantee still holds; confirm audio parity with no MSU pack.
 - **P4 — Single exe:** unify the build (WS-injected + MSU-patched gen), collapse
   `make_release.ps1` to one zip, run the byte-identical/audio-parity gates.
 - **P5 — Fan-out:** Zelda/MMX/Super Metroid adopt the shared launcher + GameInfo.
-</content>
-</invoke>
+- **P6 — Netplay menu + lobby client (done):** PSX-style flow
+  (`home` → Offline/Netplay → dashboard → `netplay_lobbies` → `netplay_room`)
+  keeping SNES purple chrome; `runner/src/lobby/snes_lobby_*` talks MotK WS to
+  `recomp-net-server` (`ws://netplay.technicallycomputers.ca:8765` /
+  `SNES_NET_LOBBY_URL`); launcher
+  exits with `SnesNetplayLaunch` handoff (session_id, slot, bind/peer, transport)
+  and keeps the lobby WebSocket across Launch for ICE signal relay / rematch.
+- **P7 — Netplay host loop (done):** `runner/src/netplay/snes_netplay.*` facade
+  over `rnet_session_*` (LAN or ICE); MW enables `snesrecomp_enable_recomp_net` +
+  `SNESRECOMP_NET_ICE`; main loop admit/stall + pad publish; lobby `op:signal`
+  for ICE. Override with `SNES_NET_TRANSPORT=lan|ice`.

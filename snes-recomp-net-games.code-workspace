@@ -9,5 +9,11 @@
     {
       "path": "../MetalWarriorsSNESRecomp",
     },
+    {
+      "path": "../recomp-net-server",
+    },
+    {
+      "path": "../psxrecomp",
+    },
   ],
 }

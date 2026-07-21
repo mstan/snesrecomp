@@ -19,13 +19,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 struct SDL_Window;
 
 namespace snes_launcher {
 
 enum class Result {
-    Launch,       // user pressed PLAY — boot with out_rom_path + the edited settings
+    Launch,       // user pressed PLAY / netplay launch — boot with out_rom_path
     Quit,         // user closed the window — caller should exit
     Unavailable,  // launcher could not initialise (assets/GL) — caller boots as if skipped
 };
@@ -35,6 +36,19 @@ enum class InputSource : int {
     None     = 0,
     Keyboard = 1,
     Gamepad  = 2,
+};
+
+// Filled on Result::Launch when a netplay lobby session is ready to boot.
+struct NetplayLaunch {
+    bool     enabled = false;
+    uint32_t session_id = 0;
+    int      local_slot = 0;
+    char     bind_hostport[64] = {0};
+    char     peer_hostport[64] = {0};
+    std::string display_name;
+    int      transport = 0; /* 0 auto, 1 ICE, 2 LAN */
+    int      input_delay = 2; /* recomp-net frames; from host match_caps */
+    int      ws_extra = -1;   /* from match_caps; -1 = unset (legacy Phase 2a) */
 };
 
 // The editable settings subset. Seeded by the caller from its Config, mutated in
@@ -59,6 +73,10 @@ struct SnesLauncherSettings {
 
     // --- Controllers (2 players) ---
     InputSource player_src[2] = { InputSource::Keyboard, InputSource::Gamepad };
+    // Per-player device token persisted across refresh / relaunch:
+    // "none", "keyboard", or an SDL joystick GUID hex string. Empty means
+    // "derive from player_src + first available pad" (legacy / first launch).
+    char player_device[2][40] = {{0}, {0}};
     int  deadzone[2]     = { 30, 30 };  // 0..100 percent of stick range
 
     // --- Launcher behaviour ---
@@ -70,6 +88,9 @@ struct SnesLauncherSettings {
     // --- MSU-1 ---
     bool msu1_enabled    = true;        // use streamed audio when a pack is present
     char msu1_dir[512]   = {0};         // directory holding <name>-N.pcm / <name>.msu
+
+    // --- Netplay ---
+    char netplay_player_name[64] = {0}; // lobby display name (config.ini NetplayPlayerName)
 };
 
 // Static facts about the game being configured. Drives the title, the ROM
@@ -95,6 +116,15 @@ struct GameInfo {
     // → Widescreen panel is hidden entirely (e.g. MMX, which has no widescreen).
     bool        widescreen_supported = true;
 
+    // Local controller rows on the offline dashboard (1 or 2). 1 hides Player 2
+    // (no local multiplayer). 0 = treat as 2.
+    int         num_players = 2;
+
+    // When set: widescreen is mandatory — Settings toggle hidden, expand forced
+    // on, and match_caps.ws_extra is always force_ws_extra (default 71).
+    bool        force_widescreen = false;
+    int         force_ws_extra = 71;
+
     // MSU-1. msu1_supported drives ALL MSU-1 UI: when false the dashboard flag
     // AND the Settings → Audio MSU-1 block are hidden entirely (e.g. a game with
     // no MSU-1 driver baked in). When true, msu1_note is shown under the MSU-1
@@ -109,15 +139,24 @@ struct GameInfo {
     const char* config_path      = nullptr;
 };
 
+struct RunOptions {
+    /* Re-open on the netplay room view after a soft return from a match
+     * (lobby WebSocket must still be connected). */
+    bool resume_netplay_room = false;
+};
+
 // Run the launcher loop to completion. `gl_context` is an SDL_GLContext (void*)
 // already created and current on `window`. `io` is seeded with the effective
 // settings and, on Result::Launch, updated in place. `assets_dir` holds
 // launcher.rml / fonts / img. On Result::Launch, `out_rom_path` receives the
 // ROM to boot (possibly the .msu1 patched copy). `initial_rom` may be a cached
 // path (rom.cfg) to pre-populate the dashboard, or null/empty.
+// When a netplay lobby launches, `out_net` (if non-null) is filled.
 Result run(SDL_Window* window, void* gl_context,
            SnesLauncherSettings& io, const GameInfo& game,
            const char* assets_dir, const char* initial_rom,
-           char* out_rom_path, size_t out_rom_path_len);
+           char* out_rom_path, size_t out_rom_path_len,
+           NetplayLaunch* out_net = nullptr,
+           const RunOptions& opts = RunOptions{});
 
 } // namespace snes_launcher

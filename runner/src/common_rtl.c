@@ -3,6 +3,12 @@
 #include <setjmp.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 #include "recomp_hw.h"
 #include "framedump.h"
 #include "util.h"
@@ -18,6 +24,9 @@
 #include "ppu_dma_trace.h"
 #include "host_report.h"
 #include "cosim.h"
+#if defined(SNESRECOMP_NET)
+#include "snes_netplay.h"
+#endif
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -26,6 +35,77 @@ const uint8 *g_rom;
 Ppu *g_ppu;
 Dma *g_dma;
 uint8 g_snesrecomp_last_hdmaen;
+
+/* Netplay: SPC is paced by a fixed samples/frame drain on the CPU thread
+ * (see RtlRunFrame). The audio device must not advance the APU. */
+static int rtl_netplay_locks_audio(void) {
+#if defined(SNESRECOMP_NET)
+  return snes_netplay_active();
+#else
+  return 0;
+#endif
+}
+
+static double s_netplay_audio_acc;
+
+/* Playback FIFO: CPU drain pushes 534-native stereo blocks; audio thread pops.
+ * Sized for ~250 ms so brief admit stalls don't underrun immediately. */
+#define NETPLAY_AUDIO_BLOCK 534
+#define NETPLAY_AUDIO_FIFO_BLOCKS 16
+static int16 s_np_pcm[NETPLAY_AUDIO_FIFO_BLOCKS * NETPLAY_AUDIO_BLOCK * 2];
+static uint32 s_np_blocks_r, s_np_blocks_w;
+
+void RtlNetplayAudioReset(void) {
+  s_netplay_audio_acc = 0.0;
+  s_np_blocks_r = s_np_blocks_w = 0;
+}
+
+static void rtl_netplay_drain_audio_frame(void);
+
+static uint32 rtl_np_fifo_count(void) {
+  return s_np_blocks_w - s_np_blocks_r;
+}
+
+static void rtl_np_fifo_push_block(const int16 *stereo534) {
+  if (rtl_np_fifo_count() >= NETPLAY_AUDIO_FIFO_BLOCKS)
+    s_np_blocks_r++; /* drop oldest — SPC already advanced */
+  {
+    uint32 slot = s_np_blocks_w % NETPLAY_AUDIO_FIFO_BLOCKS;
+    memcpy(&s_np_pcm[slot * NETPLAY_AUDIO_BLOCK * 2], stereo534,
+           (size_t)NETPLAY_AUDIO_BLOCK * 2u * sizeof(int16));
+    s_np_blocks_w++;
+  }
+}
+
+static int rtl_np_fifo_pop_block(int16 *stereo534) {
+  if (s_np_blocks_r == s_np_blocks_w) return 0;
+  {
+    uint32 slot = s_np_blocks_r % NETPLAY_AUDIO_FIFO_BLOCKS;
+    memcpy(stereo534, &s_np_pcm[slot * NETPLAY_AUDIO_BLOCK * 2],
+           (size_t)NETPLAY_AUDIO_BLOCK * 2u * sizeof(int16));
+    s_np_blocks_r++;
+  }
+  return 1;
+}
+
+static void rtl_np_resample_block(const int16 *native534, int16 *out, int samples) {
+  if (samples == NETPLAY_AUDIO_BLOCK) {
+    memcpy(out, native534, (size_t)NETPLAY_AUDIO_BLOCK * 2u * sizeof(int16));
+    return;
+  }
+  {
+    double adder = (double)NETPLAY_AUDIO_BLOCK / (double)samples;
+    double location = 0.0;
+    int i;
+    for (i = 0; i < samples; i++) {
+      uint32 idx = (uint32)location;
+      if (idx >= NETPLAY_AUDIO_BLOCK) idx = NETPLAY_AUDIO_BLOCK - 1;
+      out[i * 2] = native534[idx * 2];
+      out[i * 2 + 1] = native534[idx * 2 + 1];
+      location += adder;
+    }
+  }
+}
 
 // Main-CPU cycle estimate, incremented per RDB_BLOCK_HOOK in debug_on_block_enter.
 // Used to pace APU catchup realistically: real SNES is ~3.58 MHz main / ~1.024 MHz APU,
@@ -365,6 +445,10 @@ bool RtlRunFrame(uint32 inputs) {
   if (setjmp(g_watchdog_jmp) == 0) {
     g_rtl_game_info->run_frame();
   }
+  /* Netplay: frame-lock SPC like SNES_COSIM_AUDIO so peers share one APU clock
+   * (audio-thread / wall-clock pacing desyncs LLE at logo/music handshakes). */
+  if (rtl_netplay_locks_audio())
+    rtl_netplay_drain_audio_frame();
 #ifdef SNES_COSIM
   /* DETERMINISTIC AUDIO CONSUMER (SNES_COSIM_AUDIO=1). Production pins SPC tempo
    * to the audio device's consumption rate: RtlRenderAudio cycles the SPC only
@@ -379,7 +463,7 @@ bool RtlRunFrame(uint32 inputs) {
     static int s_audio = -1;
     if (s_audio < 0) { const char *e = getenv("SNES_COSIM_AUDIO");
                        s_audio = (e && e[0] && e[0] != '0') ? 1 : 0; }
-    if (s_audio) {
+    if (s_audio && !rtl_netplay_locks_audio()) {
       static double s_acc = 0.0;
       static int16 s_buf[1024 * 2];
       s_acc += 32040.0 / 60.0988;           /* SNES native audio samples per frame */
@@ -557,11 +641,8 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
 
 void RtlSaveLoad(int cmd, int slot) {
   char name[128];
-  const char *prefix = g_rtl_game_info->save_name_prefix;
-  if (prefix)
-    sprintf(name, "saves/%s%d.sav", prefix, slot);
-  else
-    sprintf(name, "saves/%s_save%d.sav", g_rtl_game_info->title, slot);
+  RtlEnsureSaveDir();
+  RtlSaveSlotPath(slot, name, sizeof(name));
   printf("*** %s slot %d: %s\n",
     cmd == kSaveLoad_Save ? "Saving" : "Loading", slot, name);
   /* Breadcrumb the operation: a crash shortly after a state load is a
@@ -868,6 +949,9 @@ void rtl_accumulate_apu_catchup(void) {
   // limit — handshake over-clock must stay possible (see above).
   // Consumer presence is inferred from sampleRead movement, so this is
   // automatic per game and per moment, no config.
+  //
+  // Netplay skips this: wall time differs per peer and desyncs LLE. SPC
+  // tempo comes from rtl_netplay_drain_audio_frame() instead.
   {
     static uint32_t last_sample_read;
     static uint64_t consume_seen_ms, wall_last_ms;
@@ -876,6 +960,11 @@ void rtl_accumulate_apu_catchup(void) {
      * (see audio_trace.c) — routes this baseline through the same source as the
      * port-write scheduler, so the whole APU-pacing path is deterministic. */
     uint64_t now_ms = audio_trace_wall_ms();
+    if (rtl_netplay_locks_audio()) {
+      wall_last_ms = now_ms;
+      audio_trace_on_pace(1, 0);
+      return;
+    }
     uint32_t rd = dsp->sampleRead;
     if (rd != last_sample_read) {
       last_sample_read = rd;
@@ -1143,8 +1232,24 @@ bool RtlHandleSpcUpload(CpuState *cpu) {
   return RtlUploadSpcImageFromDpInternal(cpu, true);
 }
 
-void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
+#define DSP_AVAIL(d) ((uint32_t)((d)->sampleWrite - (d)->sampleRead))
+
+/* allow_produce=0: pop netplay playback FIFO only. Never advance SPC. */
+static void rtl_render_audio_ex(int16 *audio_buffer, int samples, int channels,
+                                int allow_produce) {
   assert(channels == 2);
+
+  if (!allow_produce) {
+    int16 native[NETPLAY_AUDIO_BLOCK * 2];
+    RtlApuLock();
+    if (rtl_np_fifo_pop_block(native))
+      rtl_np_resample_block(native, audio_buffer, samples);
+    else
+      memset(audio_buffer, 0, (size_t)samples * (size_t)channels * sizeof(int16));
+    RtlApuUnlock();
+    return;
+  }
+
   /* Cycle the APU in small batches under the lock, releasing between
    * each so the CPU thread (RtlApuWrite / snes_readBBus) can make
    * progress. Earlier code held RtlApuLock for the entire 17 000-cycle
@@ -1164,7 +1269,6 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   // the CPU-thread catch-up (snes_catchupApu) hasn't already supplied, so
   // it self-balances: total SPC advance stays at the consumption rate and
   // bursty catch-up production is buffered, not dropped.
-  #define DSP_AVAIL(d) ((uint32_t)((d)->sampleWrite - (d)->sampleRead))
   while (DSP_AVAIL(g_snes->apu->dsp) < 534) {
     RtlApuLock();
     audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
@@ -1174,7 +1278,6 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
     audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
     RtlApuUnlock();
   }
-  #undef DSP_AVAIL
   RtlApuLock();
   dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
   /* Mix MSU-1 streaming audio on top of the S-DSP block. Inert (no-op)
@@ -1185,53 +1288,148 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   RtlApuUnlock();
 }
 
-/* The battery-backed SRAM lives at a fixed, game-agnostic path next to the exe
- * (each game has its own directory, so there is no collision). Older builds named
- * it after the game's internal title — which happened to be "smw" for every game
- * (a copy-paste leftover), so Mega Man X / Zelda also wrote saves/smw.srm.
- * RtlMigrateLegacySram copies any such legacy save forward the first time the new
- * generic path is used, so existing players keep their progress. */
-#define RTL_SRAM_FILE     "saves/save.srm"
-#define RTL_SRAM_BAK_FILE "saves/save.srm.bak"
+void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
+  /* Under netplay the audio callback only mixes drained blocks — SPC tempo
+   * is set by rtl_netplay_drain_audio_frame on the CPU thread. */
+  rtl_render_audio_ex(audio_buffer, samples, channels,
+                      rtl_netplay_locks_audio() ? 0 : 1);
+}
+
+static void rtl_netplay_drain_audio_frame(void) {
+  /* Cosim-style consumer: one (fractional) native block per host frame.
+   * Produce only the shortfall to 534 avail (0 if catchup already filled
+   * the DSP ring), then pull that block into the playback FIFO. Peers
+   * share the same catchup + shortfall rule → same SPC clock; BGM is not
+   * double-advanced on top of catchup. */
+  s_netplay_audio_acc += 32040.0 / 60.0988;
+  {
+    int want = (int)s_netplay_audio_acc;
+    s_netplay_audio_acc -= (double)want;
+    while (want > 0) {
+      int16 block[NETPLAY_AUDIO_BLOCK * 2];
+      while (DSP_AVAIL(g_snes->apu->dsp) < NETPLAY_AUDIO_BLOCK) {
+        RtlApuLock();
+        audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
+        {
+          int batch = 256;
+          while (batch-- > 0 &&
+                 DSP_AVAIL(g_snes->apu->dsp) < NETPLAY_AUDIO_BLOCK)
+            apu_cycle(g_snes->apu);
+        }
+        audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+        RtlApuUnlock();
+      }
+      RtlApuLock();
+      dsp_getSamples(g_snes->apu->dsp, block, NETPLAY_AUDIO_BLOCK);
+      msu1_mix(block, NETPLAY_AUDIO_BLOCK);
+      rtl_np_fifo_push_block(block);
+      RtlApuUnlock();
+      want -= (want > NETPLAY_AUDIO_BLOCK) ? NETPLAY_AUDIO_BLOCK : want;
+    }
+  }
+}
+
+#undef DSP_AVAIL
+
+/* Battery-backed SRAM + savestate slots live under RtlSaveRoot() (default
+ * "saves/"). Netplay guests switch the root to "saves/netplay/" so host sync
+ * cannot overwrite personal progress. Older builds named the SRAM after the
+ * game's internal title ("smw" for every title); RtlMigrateLegacySram copies
+ * that forward the first time the generic name is used under the main root. */
+static char s_save_root[96] = "saves";
+
+void RtlSetSaveRoot(const char *root) {
+  if (!root || !root[0])
+    snprintf(s_save_root, sizeof(s_save_root), "saves");
+  else {
+    snprintf(s_save_root, sizeof(s_save_root), "%s", root);
+    /* Trim trailing slash */
+    size_t n = strlen(s_save_root);
+    while (n > 1 && (s_save_root[n - 1] == '/' || s_save_root[n - 1] == '\\')) {
+      s_save_root[n - 1] = '\0';
+      n--;
+    }
+  }
+}
+
+const char *RtlSaveRoot(void) { return s_save_root; }
+
+void RtlEnsureSaveDir(void) {
+#ifdef _WIN32
+  _mkdir(s_save_root);
+  /* Also ensure parent "saves" when root is saves/netplay */
+  if (strncmp(s_save_root, "saves/", 6) == 0 || strncmp(s_save_root, "saves\\", 6) == 0)
+    _mkdir("saves");
+#else
+  mkdir(s_save_root, 0755);
+  if (strncmp(s_save_root, "saves/", 6) == 0)
+    mkdir("saves", 0755);
+#endif
+}
+
+void RtlSaveSlotPath(int slot, char *buf, size_t buflen) {
+  const char *prefix = g_rtl_game_info ? g_rtl_game_info->save_name_prefix : NULL;
+  if (prefix)
+    snprintf(buf, buflen, "%s/%s%d.sav", s_save_root, prefix, slot);
+  else if (g_rtl_game_info && g_rtl_game_info->title)
+    snprintf(buf, buflen, "%s/%s_save%d.sav", s_save_root, g_rtl_game_info->title, slot);
+  else
+    snprintf(buf, buflen, "%s/save%d.sav", s_save_root, slot);
+}
+
+void RtlSramFilePath(char *buf, size_t buflen) {
+  snprintf(buf, buflen, "%s/save.srm", s_save_root);
+}
 
 void RtlMigrateLegacySram(const char *legacy_title) {
+  /* Only migrate into the main offline root — never into a netplay sandbox. */
   if (!legacy_title || !*legacy_title) return;
-  FILE *cur = fopen(RTL_SRAM_FILE, "rb");
+  if (strcmp(s_save_root, "saves") != 0) return;
+  char cur_path[128];
+  RtlSramFilePath(cur_path, sizeof(cur_path));
+  FILE *cur = fopen(cur_path, "rb");
   if (cur) { fclose(cur); return; }   /* already on the generic name */
   char legacy[64];
   snprintf(legacy, sizeof(legacy), "saves/%s.srm", legacy_title);
-  if (strcmp(legacy, RTL_SRAM_FILE) == 0) return;  /* legacy name IS the generic one */
+  if (strcmp(legacy, cur_path) == 0) return;
   FILE *in = fopen(legacy, "rb");
-  if (!in) return;                    /* no legacy save to carry forward */
-  FILE *out = fopen(RTL_SRAM_FILE, "wb");
-  if (!out) { fclose(in); return; }   /* e.g. saves/ not writable */
+  if (!in) return;
+  RtlEnsureSaveDir();
+  FILE *out = fopen(cur_path, "wb");
+  if (!out) { fclose(in); return; }
   char buf[4096];
   size_t n;
   while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
     fwrite(buf, 1, n, out);
   fclose(in);
   fclose(out);
-  fprintf(stderr, "[saves] migrated legacy %s -> %s\n", legacy, RTL_SRAM_FILE);
+  fprintf(stderr, "[saves] migrated legacy %s -> %s\n", legacy, cur_path);
 }
 
 void RtlReadSram(void) {
+  char path[128];
   RtlMigrateLegacySram(g_rtl_game_info->title);
-  FILE *f = fopen(RTL_SRAM_FILE, "rb");
+  RtlSramFilePath(path, sizeof(path));
+  FILE *f = fopen(path, "rb");
   if (f) {
     if (fread(g_sram, 1, g_sram_size, f) != g_sram_size)
-      fprintf(stderr, "Error reading %s\n", RTL_SRAM_FILE);
+      fprintf(stderr, "Error reading %s\n", path);
     fclose(f);
   }
 }
 
 void RtlWriteSram(void) {
-  rename(RTL_SRAM_FILE, RTL_SRAM_BAK_FILE);
-  FILE *f = fopen(RTL_SRAM_FILE, "wb");
+  char path[128], bak[140];
+  RtlEnsureSaveDir();
+  RtlSramFilePath(path, sizeof(path));
+  snprintf(bak, sizeof(bak), "%s.bak", path);
+  rename(path, bak);
+  FILE *f = fopen(path, "wb");
   if (f) {
     fwrite(g_sram, 1, g_sram_size, f);
     fclose(f);
   } else {
-    fprintf(stderr, "Unable to write %s\n", RTL_SRAM_FILE);
+    fprintf(stderr, "Unable to write %s\n", path);
   }
 }
 

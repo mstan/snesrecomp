@@ -9,10 +9,19 @@ body {
 	font-size: 15dp;
 }
 #root { width: 100%; height: 100%; display: block; }
-/* border-box so height:100% INCLUDES the padding — otherwise the bottom pad +
-   footer overflow past the window edge and clip (the 4:3 settings view). */
-#frame { box-sizing: border-box; display: flex; flex-direction: column; height: 100%; padding: 16dp 20dp; }
-.grow { flex: 1 1 auto; display: block; }
+/* Absolute fill: RmlUi shrink-wraps flex children that have overflow set, which
+   collapsed settings panels to content width. Pin the footer; scroll the body. */
+#frame { box-sizing: border-box; display: block; position: relative; width: 100%; height: 100%; }
+.content {
+	position: absolute; top: 16dp; left: 20dp; right: 20dp; bottom: 78dp;
+	box-sizing: border-box; overflow-y: auto; display: block;
+}
+/* Minimal scrollbar so overflow-y:auto is usable (RmlUi has no default skin). */
+scrollbarvertical { width: 10dp; margin-left: 4dp; }
+scrollbarvertical slidertrack { background-color: #11151d; }
+scrollbarvertical sliderbar { background-color: #3b4252; border-radius: 5dp; }
+scrollbarvertical sliderbar:hover { background-color: #6e7781; }
+scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { display: none; }
 
 /* ---- title bar ---- */
 .titlebar { display: flex; flex-direction: row; align-items: center; margin-bottom: 14dp; }
@@ -28,6 +37,8 @@ body {
 
 .panel {
 	display: block;
+	width: 100%;
+	box-sizing: border-box;
 	background-color: #11151d;
 	border: 1dp #1c2230;
 	border-radius: 12dp;
@@ -96,6 +107,19 @@ button:hover { background-color: #222b3b; border-color: #7c3aed; }
 .dot { width: 9dp; height: 9dp; border-radius: 5dp; background-color: #3fb950; margin-right: 7dp; flex: 0 0 9dp; }
 .dot.off { background-color: #6e7781; }
 .ctrl-status .txt { color: #9aa4b2; font-size: 13dp; }
+.dev-refresh {
+	background-color: #1b2330; border: 1dp #2b3446; border-radius: 7dp;
+	color: #adbac7; font-size: 13dp; padding: 8dp 16dp; font-weight: bold;
+	min-width: 140dp; text-align: center;
+}
+.dev-refresh:hover { border-color: #7c3aed; color: #e6e9ef; }
+.dev-refresh:active { background-color: #5b21b6; border-color: #8b5cf6; color: #ffffff; }
+.dev-refresh.busy {
+	background-color: #2a2350; border-color: #a78bfa; color: #c4b5fd;
+}
+.dev-refresh.done {
+	background-color: #14532d; border-color: #22c55e; color: #bbf7d0;
+}
 
 /* ---- saves ---- */
 .rowline { display: flex; flex-direction: row; align-items: flex-start; }
@@ -107,8 +131,11 @@ button:hover { background-color: #222b3b; border-color: #7c3aed; }
 .help { display: block; color: #6e7781; font-size: 12dp; margin-top: 8dp; }
 
 /* ---- footer ---- */
-.footer { display: flex; flex-direction: row; align-items: center; margin-top: 4dp;
-	border-top: 1dp #1c2230; padding-top: 14dp; }
+.footer {
+	position: absolute; left: 20dp; right: 20dp; bottom: 16dp;
+	display: flex; flex-direction: row; align-items: center;
+	border-top: 1dp #1c2230; padding-top: 14dp;
+}
 .foot-left { display: flex; flex-direction: row; align-items: center; flex: 1 1 auto; }
 .console-icon { width: 58dp; height: 29dp; margin-right: 10dp; }
 .foot-name { color: #c9d1d9; font-weight: bold; margin-right: 8dp; }
@@ -116,7 +143,7 @@ button:hover { background-color: #222b3b; border-color: #7c3aed; }
 .foot-mid button { margin-right: 8dp; }
 #play {
 	background-color: #7c3aed; border-color: #8b5cf6; color: #ffffff; font-weight: bold;
-	font-size: 17dp; padding: 12dp 40dp; margin-left: 14dp;
+	font-size: 17dp; padding: 12dp 40dp;
 }
 #play:hover { background-color: #8b5cf6; }
 
@@ -169,18 +196,146 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 .modal-confirm { background-color: #7c3aed; border-color: #8b5cf6; color: #ffffff; font-weight: bold; }
 .modal-confirm:hover { background-color: #8b5cf6; }
 .modal-confirm:focus { background-color: #8b5cf6; border-color: #a78bfa; }
+.modal-spacer { flex: 1 1 auto; }
+
+/* ---- mode select (home) ---- */
+/* Side inset via button margins — RmlUi resolves width:100% against the
+   padding box, so padded parents + width:100% overflow off the right edge. */
+.home-wrap { display: block; box-sizing: border-box; padding: 48dp 0dp 20dp 0dp; }
+.home-title { display: block; font-size: 32dp; font-weight: bold; color: #ffffff;
+	margin: 0dp 40dp 8dp 40dp; }
+.home-sub { display: block; color: #8b93a7; font-size: 15dp; margin: 0dp 40dp 28dp 40dp; }
+.home-btn {
+	display: block; box-sizing: border-box; margin: 0dp 40dp 14dp 40dp; padding: 22dp 24dp;
+	background-color: #11151d; border: 1dp #1c2230; border-radius: 12dp;
+	color: #e6e9ef; font-size: 20dp; font-weight: bold; text-align: left;
+}
+.home-btn:hover { border-color: #7c3aed; background-color: #161d28; }
+.home-btn.net { border-color: #0d9488; background-color: #0f1f1c; }
+.home-btn.net:hover { border-color: #2dd4bf; background-color: #132824; }
+.home-btn.exit { color: #9aa4b2; font-size: 17dp; padding: 16dp 24dp; }
+.home-btn-desc { display: block; color: #6e7781; font-size: 13dp; font-weight: normal; margin-top: 4dp; }
+
+/* ---- netplay skin (teal, matches psxrecomp; offline stays purple) ---- */
+body.netplay-skin { background-color: #0a1210; }
+body.netplay-skin .panel { background-color: #0f1a17; border-color: #1a2e28; }
+body.netplay-skin .eyebrow { color: #2dd4bf; }
+body.netplay-skin .subpanel { border-color: #1a2e28; background-color: #0f1f1c; }
+body.netplay-skin .sub-title { color: #2dd4bf; }
+body.netplay-skin .switch.on { background-color: #0d9488; }
+body.netplay-skin .switch:focus { border-color: #2dd4bf; }
+body.netplay-skin button:hover { border-color: #14b8a6; }
+body.netplay-skin button:focus { border-color: #2dd4bf; }
+body.netplay-skin .ddbtn:hover { border-color: #14b8a6; }
+body.netplay-skin .ddsel:hover { border-color: #14b8a6; }
+body.netplay-skin .ddsel:focus { border-color: #2dd4bf; }
+body.netplay-skin .ddsel selectbox option:checked { background-color: #134e4a; }
+body.netplay-skin button.rb-chip.rb-chip--scan {
+	border-color: #14b8a6; background-color: #0f1f1c; color: #2dd4bf;
+}
+body.netplay-skin .dev-refresh:hover { border-color: #14b8a6; color: #e6e9ef; }
+body.netplay-skin .dev-refresh:active { background-color: #0f766e; border-color: #2dd4bf; color: #ffffff; }
+body.netplay-skin .dev-refresh.busy {
+	background-color: #134e4a; border-color: #2dd4bf; color: #5eead4;
+}
+body.netplay-skin .modal-confirm {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e;
+}
+body.netplay-skin .modal-confirm:hover { background-color: #14b8a6; }
+body.netplay-skin .modal-confirm:focus { background-color: #14b8a6; border-color: #2dd4bf; }
+body.netplay-skin #play-netlobbies {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e;
+}
+body.netplay-skin #play-netlobbies:hover { background-color: #14b8a6; }
+body.netplay-skin #play-netlobbies:focus { background-color: #14b8a6; border-color: #2dd4bf; }
+body.netplay-skin #switch-offline {
+	background-color: #132824; border-color: #1a2e28; color: #e6e9ef;
+}
+body.netplay-skin #switch-offline:hover {
+	background-color: #1a3530; border-color: #14b8a6; color: #e6e9ef;
+}
+body.netplay-skin #switch-offline:focus { border-color: #2dd4bf; }
+
+/* ---- lobby browser / room (teal chrome) ---- */
+.lobby-toolbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 12dp; }
+.lobby-status { display: block; color: #8b93a7; font-size: 13dp; flex: 1 1 auto; }
+.lobby-table {
+	display: block; background-color: #0f1a17; border: 1dp #1a2e28; border-radius: 10dp;
+	padding: 8dp; margin-bottom: 12dp; min-height: 220dp;
+}
+.lobby-head, .lobby-row {
+	display: flex; flex-direction: row; align-items: center; padding: 10dp 12dp;
+}
+.lobby-head { color: #7d8590; font-size: 12dp; font-weight: bold; border-bottom: 1dp #1a2e28; }
+.lobby-row { border-bottom: 1dp #15241f; }
+.lobby-row:hover { background-color: #132824; }
+.lobby-row.sel { background-color: #134e4a; border-radius: 6dp; }
+.lobby-c-name { flex: 1 1 auto; }
+.lobby-c-game { flex: 1 1 auto; color: #9aa4b2; font-size: 13dp; }
+.lobby-c-players { width: 70dp; text-align: center; }
+.lobby-c-lock { width: 40dp; text-align: center; font-size: 16dp; }
+.lobby-actions { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; }
+.lobby-actions button { margin-right: 10dp; margin-bottom: 6dp; padding: 12dp 18dp; font-weight: bold; }
+.lobby-actions button:hover { border-color: #2dd4bf; }
+.lobby-actions button.primary {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e;
+}
+.lobby-actions button.primary:hover { background-color: #14b8a6; }
+.lobby-actions button.disabled { opacity: 0.35; }
+.lobby-actions button.ready-on {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e;
+}
+.room-c-slot { width: 48dp; text-align: center; color: #9aa4b2; }
+.room-c-ready { width: 100dp; text-align: center; color: #6e7781; font-weight: bold; }
+.room-c-ready.on { color: #2dd4bf; }
+.field-row { display: flex; flex-direction: row; align-items: center; margin-bottom: 10dp; }
+.field-row .field-lbl { width: 140dp; color: #9aa4b2; }
+.field-row input {
+	flex: 1 1 auto; background-color: #0b1210; border: 1dp #1a2e28; border-radius: 6dp;
+	color: #e6e9ef; padding: 8dp 10dp;
+}
+#play-netlobbies {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e; font-weight: bold;
+	font-size: 17dp; padding: 12dp 28dp;
+}
+#play-netlobbies:hover { background-color: #14b8a6; }
+#play-netlobbies:focus { background-color: #14b8a6; border-color: #2dd4bf; }
+button.mode-switch {
+	font-size: 14dp; padding: 12dp 18dp; margin-left: 14dp; margin-right: 10dp;
+	color: #c9d1d9; border-color: #2b3446;
+}
+/* Offline dashboard: Switch to Netplay keeps purple hover accents. */
+#switch-netplay:hover { border-color: #7c3aed; color: #e6e9ef; }
+#switch-netplay:focus { border-color: #a78bfa; }
 </style>
 <link type="text/rcss" href="theme.rcss"/>
 </head>
 
-<body id="root" data-model="launcher">
+<body id="root" data-model="launcher" data-class-netplay-skin="netplay_mode">
 <div id="frame">
 
-	<div class="titlebar">
+	<div class="content">
+	<div class="titlebar" data-if="view != 'home'">
 		<img class="brand-icon" src="img/brand_mark.tga"/>
 		<span class="brand-name">{{game_name}}</span>
 		<span class="brand-sep">|</span>
-		<span class="brand-sub">Super Nintendo Launcher</span>
+		<span class="brand-sub" data-if="netplay_mode == false">Super Nintendo Launcher</span>
+		<span class="brand-sub" data-if="netplay_mode">Super Nintendo Netplay</span>
+	</div>
+
+	<!-- ================= HOME (mode select) ================= -->
+	<div data-if="view == 'home'">
+		<div class="home-wrap">
+			<span class="home-title">{{game_name}}</span>
+			<span class="home-sub">Choose how you want to play</span>
+			<button class="home-btn" data-event-click="mode_offline">Offline Mode
+				<span class="home-btn-desc">Classic launcher &#8212; local play, full controller setup</span>
+			</button>
+			<button class="home-btn net" data-event-click="mode_netplay">Netplay
+				<span class="home-btn-desc">Online lobbies &#8212; host or join a delay-sync session</span>
+			</button>
+			<button class="home-btn exit" data-event-click="quit">Exit</button>
+		</div>
 	</div>
 
 	<!-- ================= DASHBOARD ================= -->
@@ -236,13 +391,18 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 					</div>
 					<button data-event-click="config_p1">Configure</button>
 				</div>
-				<div class="ctrl-row">
+				<div class="ctrl-row" data-if="show_player2 && netplay_mode == false">
 					<img class="pad-art" src="img/snes_pad.tga"/>
 					<div class="ctrl-mid">
 						<select class="ddsel" id="p2src"></select>
 						<div class="ctrl-status"><span class="dot" data-class-off="p2_enabled == false"></span><span class="txt">{{p2_status}}</span></div>
 					</div>
 					<button data-event-click="config_p2">Configure</button>
+				</div>
+				<div class="btn-row">
+					<button class="dev-refresh" id="refresh-controllers"
+						data-class-busy="dev_refresh_busy" data-class-done="dev_refresh_done"
+						data-event-click="refresh_controllers">{{dev_refresh_label}}</button>
 				</div>
 			</div>
 
@@ -314,11 +474,57 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 		</div>
 	</div>
 
-	<!-- spacer pushes the footer to the bottom of the 4:3 window -->
-	<div class="grow"></div>
+	<!-- ================= NETPLAY LOBBIES ================= -->
+	<div data-if="view == 'netplay_lobbies'">
+		<div class="panel">
+			<div class="eyebrow">NETPLAY LOBBIES</div>
+			<div class="lobby-toolbar">
+				<span class="lobby-status">{{lobby_status}}</span>
+			</div>
+			<div class="lobby-table">
+				<div class="lobby-head">
+					<span class="lobby-c-name">LOBBY</span>
+					<span class="lobby-c-game">GAME</span>
+					<span class="lobby-c-players">PLAYERS</span>
+					<span class="lobby-c-lock"></span>
+				</div>
+				<div data-rml="lobby_table_html"></div>
+			</div>
+			<div class="lobby-actions">
+				<button data-event-click="show_dashboard">Return to Launcher</button>
+				<button data-event-click="lobby_change_name">Change Player Name</button>
+				<button class="primary" data-event-click="lobby_host_open">Host Game</button>
+				<button id="join-lobby-btn" data-class-disabled="lobby_join_enabled == false" data-event-click="lobby_join">Join Lobby</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- ================= NETPLAY LOBBY ROOM ================= -->
+	<div data-if="view == 'netplay_room'">
+		<div class="panel">
+			<div class="eyebrow">LOBBY ROOM</div>
+			<div class="lobby-toolbar">
+				<span class="lobby-status">{{room_lobby_title}} &#8212; {{lobby_status}}</span>
+			</div>
+			<div class="lobby-table">
+				<div class="lobby-head">
+					<span class="lobby-c-name">PLAYER</span>
+					<span class="room-c-slot">SLOT</span>
+					<span class="room-c-ready">STATUS</span>
+				</div>
+				<div data-rml="room_table_html"></div>
+			</div>
+			<div class="lobby-actions">
+				<button data-event-click="lobby_exit_room">Exit Lobby</button>
+				<button data-class-ready-on="lobby_local_ready" data-event-click="lobby_toggle_ready">Ready</button>
+				<button class="primary" data-if="lobby_is_host" data-class-disabled="lobby_can_launch == false" data-event-click="lobby_launch">Launch Game</button>
+			</div>
+		</div>
+	</div>
+	</div>
 
 	<!-- ================= FOOTER ================= -->
-	<div class="footer">
+	<div class="footer" data-if="show_footer">
 		<div class="foot-left">
 			<span class="switch" data-if="view == 'dashboard'" data-class-on="skip_launcher" data-event-click="toggle_skip_launcher"><span class="knob"></span></span>
 			<span class="skip-lbl" data-if="view == 'dashboard'">Skip Launcher on Boot</span>
@@ -327,7 +533,57 @@ button:focus { border-color: #a78bfa; background-color: #222b3b; }
 			<button class="backbtn" data-if="view != 'dashboard'" data-event-click="show_dashboard">&#8249; Back</button>
 			<button data-if="view == 'dashboard'" data-event-click="show_settings">Settings</button>
 		</div>
-		<button id="play" data-event-click="play">&#9654; PLAY</button>
+		<button id="switch-netplay" class="mode-switch" data-if="netplay_mode == false && netplay_available" data-event-click="mode_netplay">Switch to Netplay</button>
+		<button id="play" data-if="netplay_mode == false" data-event-click="play">&#9654; PLAY</button>
+		<button id="switch-offline" class="mode-switch" data-if="netplay_mode" data-event-click="mode_offline">Switch to Offline</button>
+		<button id="play-netlobbies" data-if="netplay_mode" data-event-click="show_netplay_lobbies">NETPLAY LOBBIES</button>
+	</div>
+
+	<!-- Player name modal -->
+	<div class="modal-backdrop" data-if="show_name_modal">
+		<div class="modal-box">
+			<span class="modal-title" data-if="name_modal_is_change == false">Choose a player name</span>
+			<span class="modal-title" data-if="name_modal_is_change">Change player name</span>
+			<div class="field-row"><span class="field-lbl">Player name</span>
+				<input type="text" data-value="name_draft"/></div>
+			<span class="modal-text">{{name_modal_hint}}</span>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-if="name_modal_is_change" data-event-click="lobby_name_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="lobby_name_confirm">Save</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Host lobby modal -->
+	<div class="modal-backdrop" data-if="show_host_modal">
+		<div class="modal-box">
+			<span class="modal-title">Host a lobby</span>
+			<div class="field-row"><span class="field-lbl">Lobby name</span>
+				<input id="host-lobby-name" type="text" data-value="host_lobby_name"/></div>
+			<div class="field-row"><span class="field-lbl">Password</span>
+				<input id="host-lobby-password" type="text" data-value="host_lobby_password"/></div>
+			<span class="modal-text">Leave password empty for an open lobby. Opponent joins over the lobby server; LAN UDP uses ports 7777/7778.</span>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-event-click="lobby_host_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="lobby_host_confirm">Create</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Join password modal -->
+	<div class="modal-backdrop" data-if="show_join_pw_modal">
+		<div class="modal-box">
+			<span class="modal-title">Lobby password</span>
+			<div class="field-row"><span class="field-lbl">Password</span>
+				<input id="join-lobby-password" type="text" data-value="join_lobby_password"/></div>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-event-click="lobby_join_pw_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="lobby_join_pw_confirm">Join</button>
+			</div>
+		</div>
 	</div>
 
 	<!-- ================= SKIP-LAUNCHER CONFIRM MODAL ================= -->

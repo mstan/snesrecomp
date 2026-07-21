@@ -68,6 +68,11 @@ function(snesrecomp_enable_recomp_net target)
     _snesrecomp_add_recomp_net()
     target_link_libraries(${target} PRIVATE recomp_net)
     target_compile_definitions(${target} PRIVATE SNESRECOMP_NET=1)
+    # SNES host facade (LAN + optional ICE via lobby signal relay).
+    target_sources(${target} PRIVATE
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c")
+    target_include_directories(${target} PRIVATE
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay")
 endfunction()
 
 # When SNESRECOMP_ENABLE_NET=ON at configure time, pull the library into the
