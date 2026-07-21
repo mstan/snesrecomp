@@ -556,6 +556,7 @@ bool RtlLoadSnapshot(const char *filename) {
     printf("Save read error: %s\n", filename);
     return false;
   }
+  g_snes->beamMasterLast = g_cpu.master_cycles;
   /* Post-load reconciliation: host-side execution state (fibers, HLE
    * scheduler bookkeeping) cannot live in the guest snapshot; give the
    * game one hook to rebuild it against the freshly restored WRAM. */
@@ -595,6 +596,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
     g_rtl_game_info->state_load_extra(&memory.base, hdr[1]);
   RtlApuUnlock();
   if (memory.error) return false;
+  g_snes->beamMasterLast = g_cpu.master_cycles;
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;

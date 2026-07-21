@@ -47,6 +47,17 @@ typedef struct PpuPixelPrioBufs {
   PpuZbufType data[kPpuBufWidth];
 } PpuPixelPrioBufs;
 
+static inline void PpuWidescreenAdjustPinnedWindowEdges(
+    int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,
+    int *w2r) {
+  if (screen_left == 0 && screen_right == kPpuXPixels)
+    return;
+  if (*w1l == 0) *w1l = screen_left;
+  if (*w1r == kPpuXPixels - 1) *w1r = screen_right - 1;
+  if (*w2l == 0) *w2l = screen_left;
+  if (*w2r == kPpuXPixels - 1) *w2r = screen_right - 1;
+}
+
 /* Renderer-neutral host-overlay extraction. BG source values deliberately
  * match the PPU layer indices; OBJ is the fifth screen layer. Each source can
  * own one screen-space capture rectangle and one full-frame ARGB destination
@@ -176,10 +187,10 @@ struct Ppu {
   uint8_t extraLeftCur, extraRightCur, extraLeftRight, extraBottomCur;
   // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
-  // Widescreen HUD OAM anchor (see PpuSetWsHudOamShift): leading OAM slots
-  // near either native screen edge move outward with the live margins.
-  // 0 = off (authentic).
-  uint8_t wsHudOamSlots;
+  // Widescreen HUD OAM anchor (see PpuSetWsHudOamShiftRange): an OAM slot
+  // range near either native screen edge can move outward with the live
+  // margins. 0 slots = off (authentic).
+  uint8_t wsHudOamFirstSlot, wsHudOamSlots;
   // Widescreen BG3 widen (see PpuSetWidescreenBg3Widen). Scanlines >= this let
   // BG3 (layer 2) extend into the side margins like BG1/BG2 instead of staying
   // clamped to the authentic 256-wide region. 0 = off (BG3 clamped everywhere,
@@ -201,6 +212,9 @@ struct Ppu {
   // Optional scanline bands: clamp or cyclically repeat only [y0,y1).
   uint8_t wsClampY0[4], wsClampY1[4];
   uint8_t wsRepeatY0[4], wsRepeatY1[4];
+  // Optional scanline bands: scale a native-width layer across the full
+  // widescreen budget. Used for full-screen liquid/effect planes.
+  uint8_t wsStretchY0[4], wsStretchY1[4];
   // Skip offscreen staging columns before sampling a layer's side margins.
   uint8_t wsMarginGapL[4], wsMarginGapR[4];
   uint8_t lastMosaicModulo;
@@ -291,6 +305,50 @@ extern uint8_t g_snes_ppu_dbg_layer_mask;
 #define PPU_overscan(ppu) ((ppu->setini & 0x4) != 0)
 #define PPU_pseudoHires(ppu) ((ppu->setini & 0x8) != 0)
 #define PPU_m7extBg(ppu) ((ppu->setini & 0x40) != 0)
+
+static inline bool PpuWidescreenLayerRepeatBandActive(
+    const Ppu *ppu, unsigned int layer, int y) {
+  return layer < 4 &&
+      ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
+      y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
+}
+
+static inline bool PpuWidescreenLayerStretchBandActive(
+    const Ppu *ppu, unsigned int layer, int y) {
+  return layer < 4 &&
+      ppu->wsStretchY1[layer] > ppu->wsStretchY0[layer] &&
+      y >= ppu->wsStretchY0[layer] && y < ppu->wsStretchY1[layer];
+}
+
+static inline bool PpuWidescreenLineRepeatBandActive(const Ppu *ppu, int y) {
+  for (unsigned int layer = 0; layer < 4; layer++) {
+    if (PpuWidescreenLayerRepeatBandActive(ppu, layer, y) ||
+        PpuWidescreenLayerStretchBandActive(ppu, layer, y))
+      return true;
+  }
+  return false;
+}
+
+static inline int PpuWidescreenLayerExtra(
+    const Ppu *ppu, unsigned int layer, int y, int extra) {
+  if (layer < 4) {
+    if (ppu->wsLayerWidenMask &&
+        !(ppu->wsLayerWidenMask & (1u << layer)))
+      return 0;
+    if ((ppu->wsLayerClamp | ppu->wsLayerMirror | ppu->wsLayerRepeat) &
+        (1u << layer))
+      return 0;
+    if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
+        y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
+      return 0;
+    if (PpuWidescreenLayerRepeatBandActive(ppu, layer, y) ||
+        PpuWidescreenLayerStretchBandActive(ppu, layer, y))
+      return 0;
+  }
+  if (layer != 2)
+    return extra;
+  return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
+}
 
 
 enum {
@@ -387,6 +445,10 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
 // live widescreen margins. Presentation-only; 0 disables the anchor.
 void PpuSetWsHudOamShift(Ppu *ppu, uint8_t nslots);
 
+// Shift edge-hugging HUD sprites in OAM slots [first_slot, first_slot+nslots)
+// outward with the live widescreen margins. Presentation-only.
+void PpuSetWsHudOamShiftRange(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
+
 // Let BG3 (layer 2) render into the widescreen side margins on scanlines
 // >= from_y, instead of being clamped to the authentic 256-wide region. Pass
 // the HUD band height so the status bar above it stays clamped (or split) while
@@ -411,18 +473,21 @@ const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu);
 // columns while other layers extend into the margins. Re-apply per frame.
 void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
 
-// Fill Mode-1 4bpp BG1/BG2 margins by reflecting or cyclically repeating the
+// Fill Mode-1 background margins by reflecting or cyclically repeating the
 // authentic rendered scanline. Rendering remains layer-, priority-, window-,
 // and color-math-correct. Repeat wins if both bits are set. Re-apply per frame.
 void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
 void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
 
-// Apply clamp or cyclic-repeat only on scanlines [y0,y1). y1<=y0 disables.
-// Repeat bands currently apply to the Mode-1 4bpp BG1/BG2 path.
+// Apply clamp, cyclic-repeat, or stretch only on scanlines [y0,y1).
+// y1<=y0 disables. Repeat/stretch bands apply to Mode-1 4bpp and 2bpp
+// background paths.
 void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                     uint8_t y1);
 void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                      uint8_t y1);
+void PpuSetWidescreenLayerStretchBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                      uint8_t y1);
 
 // Skip left_px/right_px offscreen tilemap pixels before sampling the margins
 // of BG(layer+1). This hides UI staging columns that hardware never displays.

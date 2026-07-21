@@ -39,11 +39,49 @@ void RtlWidescreenPresent(uint8_t *dst, size_t pitch, const uint8_t *src,
 
   static int dump_checked;
   static const char *dump_path;
+  static int dump_frame = -1;
+  static int dumped_target;
+  static const char *dump_dir;
+  static int dump_dir_next = -1;
+  static int dump_dir_end = -1;
+  static int dump_dir_step = 60;
   static unsigned present_count;
   if (!dump_checked) {
     dump_checked = 1;
     dump_path = getenv("SNESRECOMP_FRAME_BMP");
+    const char *frame = getenv("SNESRECOMP_FRAME_BMP_FRAME");
+    if (frame && *frame)
+      dump_frame = atoi(frame);
+    dump_dir = getenv("SNESRECOMP_FRAME_BMP_DIR");
+    if (dump_dir && *dump_dir) {
+      const char *start = getenv("SNESRECOMP_FRAME_BMP_START");
+      const char *end = getenv("SNESRECOMP_FRAME_BMP_END");
+      const char *step = getenv("SNESRECOMP_FRAME_BMP_STEP");
+      dump_dir_next = start && *start ? atoi(start) : 0;
+      dump_dir_end = end && *end ? atoi(end) : 0x7fffffff;
+      dump_dir_step = step && *step ? atoi(step) : 60;
+      if (dump_dir_step <= 0)
+        dump_dir_step = 60;
+    }
   }
-  if (dump_path && (++present_count % 60) == 0)
-    WsDebugDumpBmp(dump_path, src, snes_width, snes_height);
+  extern int snes_frame_counter;
+  if (dump_path) {
+    if (dump_frame >= 0 && !dumped_target &&
+        snes_frame_counter >= dump_frame) {
+      WsDebugDumpBmp(dump_path, src, snes_width, snes_height);
+      dumped_target = 1;
+    } else if (dump_frame < 0 && (++present_count % 60) == 0) {
+      WsDebugDumpBmp(dump_path, src, snes_width, snes_height);
+    }
+  }
+  if (dump_dir && *dump_dir && dump_dir_next >= 0) {
+    while (snes_frame_counter >= dump_dir_next &&
+           dump_dir_next <= dump_dir_end) {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/frame_%06d.bmp", dump_dir,
+               dump_dir_next);
+      WsDebugDumpBmp(path, src, snes_width, snes_height);
+      dump_dir_next += dump_dir_step;
+    }
+  }
 }

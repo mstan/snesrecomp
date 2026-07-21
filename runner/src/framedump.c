@@ -14,6 +14,8 @@
 FrameDumpCallback g_framedump_callback;
 
 static char g_framedump_dir[512];
+static uint32_t g_framedump_start;
+static uint32_t g_framedump_end = UINT32_MAX;
 
 // --- CRC32 (standard polynomial) ---
 static uint32_t s_crc32_table[256];
@@ -62,6 +64,7 @@ static void write_bin(const char *path, const uint8_t *wram) {
 
 static void framedump_callback(uint32_t frame, const uint8_t *wram) {
   if (!wram) return;
+  if (frame < g_framedump_start || frame > g_framedump_end) return;
   char path[768];
   snprintf(path, sizeof(path), "%s/frame_%06u.json", g_framedump_dir, frame);
   write_json(path, frame, wram);
@@ -71,7 +74,12 @@ static void framedump_callback(uint32_t frame, const uint8_t *wram) {
 
 void FrameDump_Init(const char *dir) {
   strncpy(g_framedump_dir, dir, sizeof(g_framedump_dir) - 1);
+  const char *start = getenv("SNESRECOMP_FRAMEDUMP_START");
+  const char *end = getenv("SNESRECOMP_FRAMEDUMP_END");
+  g_framedump_start = start && *start ? (uint32_t)strtoul(start, NULL, 0) : 0;
+  g_framedump_end = end && *end ? (uint32_t)strtoul(end, NULL, 0) : UINT32_MAX;
   MKDIR(dir);
   g_framedump_callback = framedump_callback;
-  fprintf(stderr, "framedump: writing to '%s'\n", dir);
+  fprintf(stderr, "framedump: writing to '%s' frames %u..%u\n", dir,
+          g_framedump_start, g_framedump_end);
 }
