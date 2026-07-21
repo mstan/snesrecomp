@@ -391,9 +391,28 @@ def build_emission_entries(manifest: ProgramManifest, parsed,
     }, name_for_pc, cfg_by_bank
 
 
+def _fnv1a_u32(data: bytes) -> int:
+    """FNV-1a over `data`, matching the runtime C `ram_routine_hash`
+    (runner/src/snes/interp_bridge.c) so the guard hashes agree."""
+    h = 2166136261
+    for b in data:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _collect_ram_routines(parsed):
+    """Deduplicate ram_routine declarations across banks by pc24 (first wins)."""
+    seen = {}
+    for _bank, _path, cfg in parsed:
+        for rr in getattr(cfg, "ram_routines", ()):  # noqa: B009
+            seen.setdefault(rr.pc24, rr)
+    return [seen[pc] for pc in sorted(seen)]
+
+
 def emit_dispatch_table(manifest: ProgramManifest, emitted_variants: Mapping,
                         name_for_pc: Mapping[int, str],
-                        inline_arg_map: Mapping[int, int]) -> str:
+                        inline_arg_map: Mapping[int, int],
+                        ram_routines=()) -> str:
     known_pcs = sorted({key.pc24 for key in manifest.nodes})
 
     def base_name(pc24):
@@ -427,6 +446,48 @@ def emit_dispatch_table(manifest: ProgramManifest, emitted_variants: Mapping,
         "",
         "const unsigned g_dispatch_table_count =",
         "    (unsigned)(sizeof(g_dispatch_table) / sizeof(g_dispatch_table[0]));",
+        "",
+    ])
+
+    # RAM-routine guards: for a WRAM-resident AOT body ($7E/$7F), runtime
+    # dispatch is allowed ONLY when the live WRAM bytes still hash-match the
+    # exact snapshot that was recompiled. Any mismatch -> the faithful
+    # interpreter floor runs the real bytes (loud fallback). A RAM dispatch row
+    # without a matching guard is never bounced to.
+    #
+    # A single ram_routine blob can expose more than one entry: a declared
+    # `ram_routine` seeds its entry, but the analyzer may also materialize an
+    # AOT body for a mid-routine resume PC that falls inside the same region
+    # (e.g. SMW's $7F812E, a partial OAM clear inside the $7F8000 routine). Emit
+    # a guard for EVERY emitted WRAM node, verifying it from its own entry to
+    # the end of the covering region (a suffix of the snapshot) so no populated
+    # WRAM dispatch row can ever be reached unguarded.
+    regions = sorted((rr.pc24, rr.pc24 + len(rr.data), rr.data)
+                     for rr in ram_routines)
+    guards = []
+    for pc24 in sorted(k for k in emitted_variants
+                       if ((k >> 16) & 0xFF) in (0x7E, 0x7F)):
+        covering = next(((b, e, d) for (b, e, d) in regions if b <= pc24 < e),
+                        None)
+        if covering is None:
+            # An emitted WRAM node with no covering ram_routine cannot have
+            # been decoded (no byte source); nothing to guard. Skip defensively.
+            continue
+        base, end, data = covering
+        guards.append((pc24, end - pc24, _fnv1a_u32(data[pc24 - base:])))
+    lines.append("const RamRoutineGuard g_ram_routine_guards[] = {")
+    if not guards:
+        lines.append("    { 0xFFFFFFFFu, 0u, 0u },")
+    for pc24, glen, ghash in guards:
+        lines.append(
+            f"    {{ 0x{pc24:06X}u, {glen}u, 0x{ghash:08X}u }},  "
+            f"/* {name_for_pc.get(pc24, '')} */")
+    lines.extend([
+        "};",
+        "",
+        "const unsigned g_ram_routine_guard_count =",
+        "    (unsigned)(sizeof(g_ram_routine_guards) /"
+        " sizeof(g_ram_routine_guards[0]));",
         "",
     ])
     return "\n".join(lines)
@@ -636,7 +697,8 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
 
         write_if_changed(
             staging / "dispatch_v2.c",
-            emit_dispatch_table(manifest, emitted, name_for_pc, inline_arg_map))
+            emit_dispatch_table(manifest, emitted, name_for_pc, inline_arg_map,
+                                ram_routines=_collect_ram_routines(parsed)))
         write_if_changed(
             staging / "unresolved_stubs_v2.c",
             "/* Manifest-driven generation: unresolved execution remains LLE. */\n")
