@@ -57,6 +57,21 @@ class NameDecl:
 
 
 @dataclass
+class RamRoutine:
+    """A `ram_routine <pc24> <MmXn> <hexbytes>` line: a deterministic
+    runtime-generated routine resident in WRAM ($7E/$7F) whose captured bytes
+    are literally recompiled (LLE) as an AOT body. The blob is appended to the
+    ROM image and reached via a synthetic reloc region so the standard decoder
+    path decodes it unchanged; runtime dispatch is guarded by a live byte-match
+    (g_ram_routine_guards). Source of truth: tier2_coverage.json ram_routines[]
+    (deterministic, terminated entries only)."""
+    pc24: int          # absolute 24-bit WRAM entry (bank $7E/$7F)
+    entry_m: int       # entry M flag to emit + gate on
+    entry_x: int       # entry X flag to emit + gate on
+    data: bytes        # captured snapshot (length = routine length)
+
+
+@dataclass
 class BankCfg:
     bank: int
     includes: List[str] = field(default_factory=list)
@@ -171,6 +186,8 @@ class BankCfg:
     # the JSR/JSL instruction's own address (the `insn.addr` of the
     # call), NOT the target. Map: site_pc24 -> (m, x).
     force_variant_at: dict = field(default_factory=dict)
+    # `ram_routine <pc24> <MmXn> <hexbytes>` directives — see RamRoutine.
+    ram_routines: List[RamRoutine] = field(default_factory=list)
 
 
 # Token regex helpers
@@ -181,6 +198,16 @@ def _parse_hex(token: str) -> int:
     if token.lower().startswith('0x'):
         return int(token, 16)
     return int(token, 16)
+
+
+def _parse_mx(token: str):
+    """Parse an `MmXn` variant token (e.g. 'M1X1') into (m, x). Returns None
+    on a malformed token. Case-insensitive."""
+    t = token.lower()
+    if (len(t) == 4 and t[0] == 'm' and t[2] == 'x'
+            and t[1] in '01' and t[3] in '01'):
+        return (int(t[1]), int(t[3]))
+    return None
 
 
 def _strip_comment(line: str) -> str:
@@ -660,6 +687,36 @@ def load_bank_cfg(path: str) -> BankCfg:
                 except ValueError:
                     continue
                 cfg.data_regions.append((b, s, e))
+                continue
+
+            # ram_routine <pc24> <MmXn> <hexbytes>
+            if head == 'ram_routine':
+                if len(tokens) != 4:
+                    raise ValueError(
+                        f"{path}: ram_routine needs <pc24> <MmXn> <hexbytes>, "
+                        f"got: {stripped!r}")
+                pc24 = _parse_hex(tokens[1]) & 0xFFFFFF
+                mx = _parse_mx(tokens[2])
+                if mx is None:
+                    raise ValueError(
+                        f"{path}: ram_routine bad variant {tokens[2]!r} "
+                        f"(want M0X0..M1X1)")
+                hexbytes = tokens[3]
+                if len(hexbytes) % 2 != 0 or not _HEX_RE.match(hexbytes):
+                    raise ValueError(
+                        f"{path}: ram_routine bad hexbytes {tokens[2]!r}")
+                data = bytes.fromhex(hexbytes)
+                if not data:
+                    raise ValueError(
+                        f"{path}: ram_routine {pc24:06X} has empty byte blob")
+                bank = (pc24 >> 16) & 0xFF
+                if bank not in (0x7E, 0x7F):
+                    raise ValueError(
+                        f"{path}: ram_routine {pc24:06X} not in WRAM bank "
+                        f"$7E/$7F")
+                cfg.ram_routines.append(
+                    RamRoutine(pc24=pc24, entry_m=mx[0], entry_x=mx[1],
+                               data=data))
                 continue
 
             # Anything else: silently ignore (v1-only directive or

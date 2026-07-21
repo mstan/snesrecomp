@@ -23,7 +23,9 @@ use snesrecomp_analyzer::decoder::{
     IndirectDispatchSite,
 };
 use snesrecomp_analyzer::insn::Mode;
-use snesrecomp_analyzer::rom::{detect_rom_mapping, load_rom, vector_table_offset, RomMapping};
+use snesrecomp_analyzer::rom::{
+    detect_rom_mapping, load_rom, vector_table_offset, RelocRegion, RomMapping,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct VariantKey {
@@ -112,6 +114,9 @@ struct Inputs {
     inline_skip: HashMap<u32, i32>,
     terminal_jsr_sites: BTreeSet<u32>,
     declared_exit_modes: HashMap<(u32, u8, u8), (u8, u8)>,
+    /// Synthetic reloc regions redirecting WRAM ram_routine entries to blob
+    /// bytes appended to the ROM image (plus any cfg `reloc` directives).
+    reloc_regions: Vec<RelocRegion>,
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
@@ -201,7 +206,7 @@ fn architectural_roots(rom: &[u8]) -> BTreeSet<VariantKey> {
     roots
 }
 
-fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs, String> {
+fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result<Inputs, String> {
     let mut paths: Vec<PathBuf> = fs::read_dir(cfg_dir)
         .map_err(|e| format!("{}: {e}", cfg_dir.display()))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -219,9 +224,9 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
         cfg.bank = bank as i32;
         cfgs.push(cfg);
     }
-    expand_auto_vectors(&mut cfgs, rom);
+    expand_auto_vectors(&mut cfgs, rom.as_slice());
 
-    let mut roots = architectural_roots(rom);
+    let mut roots = architectural_roots(rom.as_slice());
     let mut entries = HashMap::new();
     let mut sibling_entries: HashMap<u32, BTreeSet<u32>> = HashMap::new();
     let mut cfg_index = HashMap::new();
@@ -321,6 +326,45 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
         }
     }
 
+    // Reloc regions: any cfg `reloc` directives, plus a synthetic region per
+    // `ram_routine` whose blob bytes are appended to the ROM image at a
+    // $8000-aligned offset. Redirecting the WRAM entry to a plain LoROM
+    // (synth_bank,$8000) target lets the standard offset-based decoder path
+    // decode the blob unchanged; the WRAM entry is seeded as a root so its
+    // body is materialized even though target_is_code keeps RAM non-code (so
+    // callers route through the runtime-guarded dispatch, never a direct call).
+    let mut reloc_regions: Vec<RelocRegion> = Vec::new();
+    for cfg in &cfgs {
+        reloc_regions.extend(cfg.reloc_regions.iter().copied());
+    }
+    for cfg in &cfgs {
+        for rr in &cfg.ram_routines {
+            let ram_bank = (rr.pc24 >> 16) & 0xFF;
+            let ram_addr = rr.pc24 & 0xFFFF;
+            let aligned = (rom.len() + 0x7FFF) & !0x7FFFusize;
+            rom.resize(aligned, 0);
+            let synth_bank = (aligned / 0x8000) as u32;
+            if synth_bank >= 0x80 {
+                return Err(format!(
+                    "ram_routine {:06X}: synthetic ROM bank ${synth_bank:02X} exceeds LoROM range",
+                    rr.pc24
+                ));
+            }
+            rom.extend_from_slice(&rr.bytes);
+            // Guard pad (outside the reloc region) so a decoder tail over-read
+            // near the terminator can't index past the ROM vec.
+            rom.extend_from_slice(&[0u8; 8]);
+            reloc_regions.push(RelocRegion::new(
+                ram_bank,
+                ram_addr,
+                synth_bank,
+                0x8000,
+                rr.bytes.len() as u32,
+            ));
+            roots.insert(VariantKey::new(rr.pc24, rr.entry_m, rr.entry_x));
+        }
+    }
+
     Ok(Inputs {
         cfgs,
         roots,
@@ -334,6 +378,7 @@ fn load_inputs(cfg_dir: &Path, rom: &[u8], all_cfg_roots: bool) -> Result<Inputs
         inline_skip,
         terminal_jsr_sites,
         declared_exit_modes,
+        reloc_regions,
     })
 }
 
@@ -989,6 +1034,7 @@ fn analyze(
                 terminal_jsr_sites: Some(&inputs.terminal_jsr_sites),
                 global_inline_skip: Some(&inline_args),
                 stop_on_unknown_callee_exit: true,
+                reloc_regions: Some(&inputs.reloc_regions),
                 ..Default::default()
             };
             let decoded = catch_unwind(AssertUnwindSafe(|| {
@@ -1480,9 +1526,13 @@ fn main() {
         .map(|value| value.parse::<usize>().expect("invalid --max-nodes"))
         .unwrap_or(100_000);
     let started = Instant::now();
-    let rom = load_rom(&rom_path).expect("load rom");
-    let mut inputs = load_inputs(Path::new(&cfg_dir), &rom, has_arg(&args, "--all-cfg-roots"))
-        .expect("load cfgs");
+    let mut rom = load_rom(&rom_path).expect("load rom");
+    let mut inputs = load_inputs(
+        Path::new(&cfg_dir),
+        &mut rom,
+        has_arg(&args, "--all-cfg-roots"),
+    )
+    .expect("load cfgs");
     for value in arg_values(&args, "--root") {
         inputs
             .roots

@@ -59,6 +59,21 @@ pub struct NameDecl {
     pub name: String,
 }
 
+/// A `ram_routine <pc24> <MmXn> <hexbytes>` directive: a deterministic
+/// runtime-generated routine resident in WRAM ($7E/$7F) whose captured bytes
+/// are literally recompiled (LLE) as an AOT body. The bytes are appended to the
+/// ROM image and reached via a synthetic reloc region so the standard decoder
+/// path decodes them unchanged; runtime dispatch is guarded by a live byte-match
+/// (see `g_ram_routine_guards`). Source of truth: tier2_coverage.json
+/// ram_routines[] (deterministic, terminated entries only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RamRoutine {
+    pub pc24: u32,      // absolute 24-bit WRAM entry (bank $7E/$7F)
+    pub entry_m: u8,    // entry M flag to emit + gate on
+    pub entry_x: u8,    // entry X flag to emit + gate on
+    pub bytes: Vec<u8>, // captured snapshot (length = routine length)
+}
+
 /// An `indirect_dispatch` directive (authorises static recovery of an indirect
 /// JMP/JML/JSR's target list).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +105,7 @@ pub struct BankCfg {
     pub exclude_ranges: Vec<(u32, u32)>,
     pub data_regions: Vec<(u32, u32, u32)>, // (bank, start, end)
     pub reloc_regions: Vec<RelocRegion>,
+    pub ram_routines: Vec<RamRoutine>,
     pub exit_mx_at: Vec<(u8, u32, u8, u8)>, // (bank, addr16, m, x)
     pub exit_mx_at_per_variant: Vec<(u8, u32, u8, u8, u8, u8)>,
     pub auto_vectors: bool,
@@ -117,6 +133,42 @@ fn parse_hex(token: &str) -> Result<u32, String> {
         .or_else(|| token.strip_prefix("0X"))
         .unwrap_or(token);
     u32::from_str_radix(t, 16).map_err(|_| format!("bad hex {token:?}"))
+}
+
+/// Parse an `MmXn` variant token (e.g. "M1X1") into (m, x). Case-insensitive.
+fn parse_mx(token: &str) -> Option<(u8, u8)> {
+    let b = token.as_bytes();
+    if b.len() == 4
+        && (b[0] | 0x20) == b'm'
+        && (b[2] | 0x20) == b'x'
+        && (b[1] == b'0' || b[1] == b'1')
+        && (b[3] == b'0' || b[3] == b'1')
+    {
+        Some((b[1] - b'0', b[3] - b'0'))
+    } else {
+        None
+    }
+}
+
+/// Parse a contiguous hex-digit string into bytes (two hex digits per byte).
+fn parse_hex_bytes(token: &str) -> Result<Vec<u8>, String> {
+    if token.len() % 2 != 0 {
+        return Err(format!("odd hex length {}", token.len()));
+    }
+    let mut out = Vec::with_capacity(token.len() / 2);
+    let b = token.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit {:?}", b[i] as char))?;
+        let lo = (b[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit {:?}", b[i + 1] as char))?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
 }
 
 /// Strip a trailing `# ...` comment.
@@ -622,6 +674,37 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             ));
             continue;
         }
+        // ram_routine <pc24> <MmXn> <hexbytes>
+        if head == "ram_routine" {
+            if tokens.len() != 4 {
+                return Err(format!(
+                    "{path}: ram_routine needs <pc24> <MmXn> <hexbytes>, got: {stripped:?}"
+                ));
+            }
+            let pc24 = parse_hex(tokens[1])
+                .map_err(|e| format!("{path}: ram_routine bad pc24: {e}"))?
+                & 0xFFFFFF;
+            let (entry_m, entry_x) = parse_mx(tokens[2])
+                .ok_or_else(|| format!("{path}: ram_routine bad variant {:?} (want M0X0..M1X1)", tokens[2]))?;
+            let bytes = parse_hex_bytes(tokens[3])
+                .map_err(|e| format!("{path}: ram_routine bad hexbytes: {e}"))?;
+            if bytes.is_empty() {
+                return Err(format!("{path}: ram_routine {pc24:06X} has empty byte blob"));
+            }
+            let bank = (pc24 >> 16) & 0xFF;
+            if bank != 0x7E && bank != 0x7F {
+                return Err(format!(
+                    "{path}: ram_routine {pc24:06X} not in WRAM bank $7E/$7F"
+                ));
+            }
+            cfg.ram_routines.push(RamRoutine {
+                pc24,
+                entry_m,
+                entry_x,
+                bytes,
+            });
+            continue;
+        }
         // data_region <bank> <start> <end>
         if head == "data_region" && tokens.len() >= 4 {
             if let (Ok(b), Ok(s), Ok(e)) = (
@@ -749,6 +832,30 @@ mod tests {
             RelocRegion::new(0x7E, 0x321F, 0x02, 0x8000, 0x5C00)
         );
         assert_eq!(cfg.data_regions, vec![(0x03, 0xE000, 0xE100)]);
+    }
+
+    #[test]
+    fn ram_routine_parse() {
+        let cfg = parse_bank_cfg(
+            "bank = 00\nram_routine 7F8000 M1X1 A9F08D01026B\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(cfg.ram_routines.len(), 1);
+        let r = &cfg.ram_routines[0];
+        assert_eq!(r.pc24, 0x7F8000);
+        assert_eq!((r.entry_m, r.entry_x), (1, 1));
+        assert_eq!(r.bytes, vec![0xA9, 0xF0, 0x8D, 0x01, 0x02, 0x6B]);
+    }
+
+    #[test]
+    fn ram_routine_rejects_rom_bank() {
+        // Non-WRAM bank is rejected.
+        assert!(parse_bank_cfg("bank = 00\nram_routine 008000 M1X1 6B\n", "t").is_err());
+        // Odd hex length is rejected.
+        assert!(parse_bank_cfg("bank = 00\nram_routine 7F8000 M1X1 A9F0F\n", "t").is_err());
+        // Bad variant token is rejected.
+        assert!(parse_bank_cfg("bank = 00\nram_routine 7F8000 Q9Z9 6B\n", "t").is_err());
     }
 
     #[test]

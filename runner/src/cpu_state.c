@@ -595,6 +595,78 @@ void CpuDispatchLogDumpJson(FILE *f) {
     fprintf(f, "]},\n");
 }
 
+/* ── RAM-routine dispatch guard ────────────────────────────────────────────
+ * A WRAM-resident ($7E/$7F) AOT body is a literal recompilation of a snapshot
+ * of runtime-generated code. WRAM is mutable, so bouncing to that body is only
+ * faithful while the live bytes still equal the recompiled snapshot. Every
+ * dispatch-resolution path consults _ram_guard_blocks() for RAM targets; a
+ * mismatch (or a RAM body with no guard record — fail safe) suppresses the AOT
+ * bounce so the interpreter floor runs the real bytes, and logs loudly. */
+static const RamRoutineGuard *_ram_guard_find(uint32 pc24) {
+    unsigned lo = 0, hi = g_ram_routine_guard_count;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        uint32 m = g_ram_routine_guards[mid].pc24;
+        if (m == pc24) return &g_ram_routine_guards[mid];
+        if (m < pc24) lo = mid + 1;
+        else          hi = mid;
+    }
+    return NULL;
+}
+
+/* Rate-limited: log the first sight of each distinct pc24 and then on
+ * power-of-two counts, so a persistent mismatch stays visible without flooding
+ * the log. Returns the (post-increment) hit count for message context. */
+static uint64 _ram_guard_note(uint32 pc24) {
+    static struct { uint32 pc; uint64 n; } seen[32];
+    static int seen_n;
+    int i;
+    for (i = 0; i < seen_n; i++)
+        if (seen[i].pc == pc24) break;
+    if (i == seen_n) {
+        if (seen_n < 32) { seen[seen_n].pc = pc24; seen[seen_n].n = 0; i = seen_n++; }
+        else i = 0; /* table full: fold into slot 0 (loudness over precision) */
+    }
+    return ++seen[i].n;
+}
+
+static int _ram_guard_blocks(CpuState *cpu, uint32 pc24) {
+    pc24 &= 0xFFFFFFu;
+    uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+    if (bank != 0x7E && bank != 0x7F) return 0;   /* ROM target: never guarded */
+    const RamRoutineGuard *g = _ram_guard_find(pc24);
+    if (g == NULL) {
+        uint64 c = _ram_guard_note(pc24);
+        if ((c & (c - 1)) == 0) {
+            fprintf(stderr,
+                "[ram-guard] $%06X has an AOT body but no guard record; "
+                "refusing to bounce, running interpreter floor [x%llu]\n",
+                pc24, (unsigned long long)c);
+            fflush(stderr);
+        }
+        return 1;
+    }
+    uint32 h = 2166136261u;
+    uint16 addr = (uint16)(pc24 & 0xFFFF);
+    for (uint32 i = 0; i < g->len; i++) {
+        h ^= cpu_read8(cpu, bank, (uint16)(addr + i));
+        h *= 16777619u;
+    }
+    if (h != g->hash) {
+        uint64 c = _ram_guard_note(pc24);
+        if ((c & (c - 1)) == 0) {
+            fprintf(stderr,
+                "[ram-guard] $%06X live WRAM bytes no longer match the "
+                "recompiled snapshot (expected FNV %08X, got %08X); running "
+                "interpreter floor [x%llu]\n",
+                pc24, g->hash, h, (unsigned long long)c);
+            fflush(stderr);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static const DispatchEntry *_cpu_dispatch_find(uint32 pc24) {
     unsigned lo = 0;
     unsigned hi = g_dispatch_table_count;
@@ -612,7 +684,10 @@ static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState
     const DispatchEntry *row = _cpu_dispatch_find(pc24);
     if (row != NULL) {
         unsigned idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
-        return row->variant[idx];
+        RecompReturn (*fp)(CpuState *) = row->variant[idx];
+        /* A WRAM body may only run while its live bytes match the snapshot. */
+        if (fp != NULL && _ram_guard_blocks(cpu, pc24)) return NULL;
+        return fp;
     }
     return NULL;
 }
@@ -630,6 +705,10 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
     if (row != NULL) {
         known_entry = 1;
         fp = row->variant[mx_idx];
+        /* WRAM body: only if the live bytes still match the snapshot. On a
+         * mismatch fp drops to NULL but known_entry stays 1, so the popped-
+         * return interpreter floor below runs the real (current) bytes. */
+        if (fp != NULL && _ram_guard_blocks(cpu, pc24)) fp = NULL;
     }
     if (fp == NULL) {
         /* LoROM bank-mirror fallback: $00-$3F and $80-$BF share bytes.
