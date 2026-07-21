@@ -39,6 +39,10 @@ framedump_recomp/
 validate*.log
 regen.log
 cfg_audit_results/
+tier2_coverage.json
+writewatch*.log
+wramwatch.log
+_refprune_snap_*.json
 
 # launcher dep build artifacts (rebuilt via tools/build_launcher_deps.ps1)
 lib/_build/

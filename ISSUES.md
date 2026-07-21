@@ -25,8 +25,8 @@ ISSUES.md for the spawn/alignment/savestate ledger).
 
 ## OPEN: v2 regeneration mixes fixed-point analysis with full C emission
 
-**Status:** OPEN 2026-07-13. Immediate partial-regeneration link-root fix is
-implemented locally and pending cross-game validation. The architectural
+**Status:** OPEN 2026-07-13. The immediate partial-regeneration link-root
+correctness fix is implemented and regression-tested. The architectural
 redesign below remains future work.
 
 **Observed on ALttP:** a one-bank regeneration repeatedly emitted a roughly
@@ -37,15 +37,13 @@ roughly four minutes per pass. Stopping between passes left bank 02 without
 variants still referenced by preserved banks 00 and 1E, producing linker
 failures.
 
-**Immediate correctness defect:** partial regeneration used the semantic
-reference-taint graph as its link contract. That graph intentionally excludes
-alias wrappers, unknown synthetic callers, and runtime M/X dispatch cases,
-because those edges must not propagate semantic taint. They are nevertheless
-real C linker relocations. Consequently, a variant needed by a preserved bank
-could be absent from `skipped_link_targets` and then be pruned from the
-regenerated bank. Partial regeneration must scan every generated variant call
-in preserved source files, treat those targets as immutable roots, and fail
-immediately if a prune intersects that root set.
+**Resolved immediate correctness defect:** partial regeneration once used the
+semantic reference-taint graph as its link contract, omitting alias wrappers,
+unknown synthetic callers, and runtime M/X dispatch cases that still produce C
+linker relocations. `tools/v2_regen.py` now scans preserved generated sources
+for link targets, protects those targets from both prune paths, and fails
+immediately if a partial regeneration would prune one. Focused regression tests
+cover alias/synthetic references and the fail-fast guard.
 
 **Why the current design is slow:** analysis and materialization are coupled.
 Any newly discovered or newly pruned variant causes complete bank emission,
