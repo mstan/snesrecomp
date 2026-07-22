@@ -383,6 +383,11 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start);
 
+// Opt the split HUD into full-budget composition. Pixels outside the live
+// world margin remain black unless BG3 supplied an actual HUD pixel. A BG3
+// hardware window is ignored only inside the configured HUD scanline band.
+void PpuSetWidescreenHudAlwaysVisible(Ppu *ppu, bool enabled);
+
 // Shift edge-hugging HUD sprites in OAM slots [0, nslots) outward with the
 // live widescreen margins. Presentation-only; 0 disables the anchor.
 void PpuSetWsHudOamShift(Ppu *ppu, uint8_t nslots);
