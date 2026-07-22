@@ -450,10 +450,21 @@ static void flush_pending(void)
 static void fill_peer_bind_from_join(void)
 {
     SnesLobbyJoinInfo *j = &g_lc.join;
+    const char *port;
     memset(j->bind_hostport, 0, sizeof(j->bind_hostport));
     memset(j->peer_hostport, 0, sizeof(j->peer_hostport));
     if (g_lc.is_host) {
-        strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
+        /* host_endpoint is the address advertised to peers. It may be the
+         * router's public/NAT address and therefore cannot be bound on this
+         * machine. Listen on every local interface using the advertised port. */
+        port = strrchr(g_lc.my_bind, ':');
+        if (port && port[1]) {
+            snprintf(j->bind_hostport, sizeof(j->bind_hostport),
+                     "0.0.0.0:%s", port + 1);
+        } else {
+            strncpy(j->bind_hostport, g_lc.my_bind,
+                    sizeof(j->bind_hostport) - 1);
+        }
         strncpy(j->peer_hostport, j->guest_endpoint, sizeof(j->peer_hostport) - 1);
     } else {
         strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
