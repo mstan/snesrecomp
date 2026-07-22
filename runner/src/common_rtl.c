@@ -1298,14 +1298,14 @@ const char *RtlSaveRoot(void) { return s_save_root; }
 
 void RtlEnsureSaveDir(void) {
 #ifdef _WIN32
-  _mkdir(s_save_root);
   /* Also ensure parent "saves" when root is saves/netplay */
   if (strncmp(s_save_root, "saves/", 6) == 0 || strncmp(s_save_root, "saves\\", 6) == 0)
     _mkdir("saves");
+  _mkdir(s_save_root);
 #else
-  mkdir(s_save_root, 0755);
   if (strncmp(s_save_root, "saves/", 6) == 0)
     mkdir("saves", 0755);
+  mkdir(s_save_root, 0755);
 #endif
 }
 

@@ -28,6 +28,27 @@ bool WsShadowLayerActive(int layer) {
     return false;
 }
 
+uint32_t WsShadowWorldX(int layer) {
+    (void)layer;
+    return 0;
+}
+
+uint32_t WsShadowPresentWorldY(int layer, int screen_x) {
+    (void)layer;
+    (void)screen_x;
+    return 0;
+}
+
+uint32_t WsShadowScrollY(int layer) {
+    (void)layer;
+    return 0;
+}
+
+void WsShadowOnVramWrite(uint16_t word_adr, uint16_t value) {
+    (void)word_adr;
+    (void)value;
+}
+
 static int check(bool condition, const char *message) {
     if (!condition) fprintf(stderr, "FAIL: %s\n", message);
     return condition ? 0 : 1;

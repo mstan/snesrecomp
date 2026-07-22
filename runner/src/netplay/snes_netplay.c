@@ -70,6 +70,16 @@ void snes_netplay_apply_env(SnesNetplayConfig *cfg)
     }
 }
 
+static SnesNetplayCaptureSyncBytes g_capture_sync_bytes;
+static SnesNetplayApplySyncBytes g_apply_sync_bytes;
+
+void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
+                                      SnesNetplayApplySyncBytes apply)
+{
+    g_capture_sync_bytes = capture;
+    g_apply_sync_bytes = apply;
+}
+
 #if !defined(SNESRECOMP_NET)
 
 int  snes_netplay_active(void) { return 0; }
@@ -98,7 +108,7 @@ int  snes_netplay_peer_disconnected(uint32_t timeout_ms)
     return 0;
 }
 int  snes_netplay_poll_admit(void) { return 1; }
-void snes_netplay_apply_host_rng(void) {}
+void snes_netplay_apply_host_sync(void) {}
 void snes_netplay_finish_frame(void) {}
 uint32_t snes_netplay_published_inputs(void) { return 0; }
 uint32_t snes_netplay_active_mask(void) { return 0; }
@@ -134,8 +144,8 @@ typedef struct {
     int          latched_for_tick;
     uint32_t     latched_sim_tick;
     uint16_t     published[2];
-    uint8_t      host_rng[2];        /* slot0 pad[2..3] → DP $1A/$1B */
-    int          host_rng_valid;
+    uint8_t      host_sync[2];       /* game-defined slot-0 sync bytes */
+    int          host_sync_valid;
     int          use_ice;
     int          guest_sandbox;      /* save root redirected to saves/netplay */
     int          sram_sync_sent;     /* host: SRAM blob transfer started */
@@ -158,11 +168,16 @@ static void encode_pad(uint16_t buttons, RNetInputSample *out, rnet_u32 tick)
     out->size = SNES_NETPLAY_PAD_BYTES;
     out->bytes[0] = (rnet_u8)(buttons & 0xFFu);
     out->bytes[1] = (rnet_u8)((buttons >> 8) & 0xFFu);
-    /* Host-authoritative RNG seed (DP $1A/$1B). Both peers attach their
-     * local seed at sample time; only slot 0's bytes are applied. */
-    out->bytes[2] = g_ram[0x001A];
-    out->bytes[3] = g_ram[0x001B];
+    if (g_capture_sync_bytes)
+        g_capture_sync_bytes(&out->bytes[2]);
     out->valid = 1;
+}
+
+static void np_prime_after_hard_resync(void)
+{
+    RNetInputSample neutral;
+    encode_pad(0, &neutral, 0);
+    rnet_session_prime_delay_inputs(g_np.session, neutral.bytes, neutral.size);
 }
 
 static uint16_t decode_pad(const RNetInputSample *in)
@@ -186,24 +201,23 @@ static void host_publish(rnet_u32 tick, const RNetInputSample *by_slot, int slot
     (void)tick;
     st->published[0] = 0;
     st->published[1] = 0;
-    st->host_rng_valid = 0;
+    st->host_sync_valid = 0;
     if (!by_slot || slots <= 0) return;
     for (i = 0; i < slots && i < 2; ++i)
         st->published[i] = decode_pad(&by_slot[i]) & 0x0FFFu;
-    /* Slot 0 carries the shared RNG seed for this admitted tick. */
+    /* Slot 0 carries the authoritative game-defined sync bytes. */
     if (by_slot[0].valid && by_slot[0].size >= 4) {
-        st->host_rng[0] = by_slot[0].bytes[2];
-        st->host_rng[1] = by_slot[0].bytes[3];
-        st->host_rng_valid = 1;
+        st->host_sync[0] = by_slot[0].bytes[2];
+        st->host_sync[1] = by_slot[0].bytes[3];
+        st->host_sync_valid = 1;
     }
 }
 
-void snes_netplay_apply_host_rng(void)
+void snes_netplay_apply_host_sync(void)
 {
-    if (!snes_netplay_active() || !g_np.host_rng_valid)
+    if (!snes_netplay_active() || !g_np.host_sync_valid || !g_apply_sync_bytes)
         return;
-    g_ram[0x001A] = g_np.host_rng[0];
-    g_ram[0x001B] = g_np.host_rng[1];
+    g_apply_sync_bytes(g_np.host_sync);
 }
 
 #if defined(SNES_HAS_LOBBY_CLIENT) && defined(RNET_ENABLE_ICE)
@@ -422,8 +436,8 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.needs_advance = 0;
     g_np.latched_for_tick = 0;
     g_np.latched_sim_tick = 0;
-    g_np.host_rng_valid = 0;
-    g_np.host_rng[0] = g_np.host_rng[1] = 0;
+    g_np.host_sync_valid = 0;
+    g_np.host_sync[0] = g_np.host_sync[1] = 0;
     g_np.published[0] = g_np.published[1] = 0;
     g_np.use_ice = use_ice;
     g_np.sram_sync_sent = 0;
@@ -596,6 +610,7 @@ static void np_apply_ready_state(void)
         g_np.host_load_applied = 0;
     }
     rnet_session_state_finish(g_np.session, 1);
+    np_prime_after_hard_resync();
     RtlNetplayAudioReset();
     g_np.needs_advance = 0;
     g_np.latched_for_tick = 0;
@@ -700,7 +715,6 @@ int snes_netplay_request_load(int slot)
     }
     g_np.host_load_applied = 1;
     RtlNetplayAudioReset();
-    rnet_session_hard_resync(g_np.session);
     g_np.needs_advance = 0;
     g_np.latched_for_tick = 0;
     g_np.staged_valid = 0;
@@ -744,8 +758,8 @@ int snes_netplay_poll_admit(void)
     sim = rnet_session_sim_tick(g_np.session);
     if (rnet_session_try_admit(g_np.session, sim)) {
         g_np.needs_advance = 1;
-        /* Lock guest RNG to host before RtlRunFrame (scramble / battlefield). */
-        snes_netplay_apply_host_rng();
+        /* Apply game-defined slot-0 state before RtlRunFrame. */
+        snes_netplay_apply_host_sync();
         return 1;
     }
     return 0;

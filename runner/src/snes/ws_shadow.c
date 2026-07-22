@@ -176,7 +176,8 @@ void WsShadowSetScroll(int layerIndex, uint32_t scrollX, uint32_t scrollY) {
 
 /* World y-tile for a map row, using the anchor's 32-row wrap window. */
 static uint32_t WorldRowForMapRow(const WsShadowLayer *layer, int row) {
-  uint32_t wy0 = layer->worldY >> 3;
+  const unsigned sh = layer->tileShift ? layer->tileShift : 3;
+  uint32_t wy0 = layer->worldY >> sh;
   return wy0 + (uint32_t)((row - (int)(wy0 & 31)) & 31);
 }
 
@@ -197,7 +198,8 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
       continue;
     int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
     int row = (off >> 5) & 0x1f;
-    uint32_t k0 = layer->worldX >> 8;
+    const unsigned sh = layer->tileShift ? layer->tileShift : 3;
+    uint32_t k0 = layer->worldX >> (sh + 5);
     uint32_t chunk;
     if ((uint32_t)(col >> 5) == (k0 & 1))
       chunk = k0;
@@ -1129,7 +1131,7 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
     if (off < 0x800) {
       int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
       int row = (off >> 5) & 0x1f;
-      int natCol = (hScroll >> 3) & 63;
+      int natCol = (hScroll >> shift) & 63;
       uint8_t period = FoldRowPeriod(layer, row, natCol);
       if (period) {
         int rel = (col - natCol) & 63;
