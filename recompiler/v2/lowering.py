@@ -403,7 +403,8 @@ def _h_jsr(insn, vf):
     # don't consult source_pc24.
     return [Call(target=target, long=False, entry_m=em, entry_x=ex,
                  source_pc24=insn.addr & 0xFFFFFF,
-                 terminal=bool(getattr(insn, 'terminal_jsr', False)))]
+                 terminal=bool(getattr(insn, 'terminal_jsr', False)),
+                 noreturn=bool(getattr(insn, 'noreturn_jsr', False)))]
 
 
 def _h_jsl(insn, vf):

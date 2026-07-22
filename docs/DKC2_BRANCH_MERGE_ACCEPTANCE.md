@@ -59,6 +59,14 @@ variants and 42 interpreter fallbacks (98.79% AOT); Super Metroid's contains
 variant counts, not claims about the percentage of dynamically executed CPU
 instructions.
 
+Post-release update (2026-07-21): the original acceptance matrix below remains
+the evidence for candidate `79592db`. The current DKC2 consumer configuration,
+together with the later stack-reset dispatch and generic non-returning-JSR
+contracts, converges in both analyzers on 3,468/3,468 demanded exact variants
+AOT and zero LLE-only code nodes. Two documented dormant crash calls retain
+explicit interpreter edges to their exact non-code destinations; the
+interpreter remains the semantic fallback and has not been removed.
+
 | Game | Automated runtime/video | Automated audio | User gameplay |
 | --- | --- | --- | --- |
 | DKC2 | Pass: fresh Rust regeneration, 12,000-frame soak, two complete attract cycles, zero sequence errors, and inspected clean framebuffer | Pass: sustained nonzero SPC output, zero clipped samples, and bounded output deltas | Pass on the candidate line; the final shared delta is restricted to the independently checked DSP correction |

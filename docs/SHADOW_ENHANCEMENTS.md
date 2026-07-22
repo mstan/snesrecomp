@@ -30,7 +30,7 @@ thing being diffed. (Same rule now in `recomp-template/PRINCIPLES.md`,
 |---|---|---|
 | **`ShadowVerifier`** (envelope-correlation self-check, auto-gain, prove/strike/pause) | **DONE** — `runner/src/snes/audio_shadow.{c,h}`, re-implemented in C, compiles clean | Engine-agnostic; identical algorithm to gbarecomp |
 | Color-science core (xyY→XYZ, primaries→matrix, Bradford, sRGB OETF) | TODO | Lifts verbatim; reused for the screen LUT |
-| Present-path color LUT | **DONE (runner module)** — `runner/src/snes/color_lut.{c,h}`, in `runner.cmake`, compiles clean | CIE color core (C) + CRT models (SMPTE-C `crt`, `trinitron`) replacing GBA's LCD panels. Present-time `0x00RRGGBB`→graded map (5-bit recovered via >>3, like GBA), `SNESRECOMP_SCREEN={raw,crt,trinitron}`, default `raw`=passthrough (identity). Raw renderBuffer (frame-hashed oracle) untouched. **Present hook is game-side** (the SDL present lives in each game's `main.c`, outside this worktree) — see wiring note below |
+| Present-path color LUT | **DONE (runner module)** — `runner/src/snes/color_lut.{c,h}`, in `runner.cmake`, compiles clean | PSXRecomp-aligned CIE screen models: `raw`, SMPTE-C-like `crt`, `composite`, and near-sRGB `trinitron`. Present-time `0x00RRGGBB`→graded map (5-bit recovered via >>3), selected through `SNESRECOMP_SCREEN` or the programmatic API; default `raw` is identity. Raw renderBuffer (frame-hashed oracle) is untouched. **Present hook is game-side** (the presenter lives in each game, outside this worktree) — see wiring note below |
 | **S-DSP shadow render** | **DONE** — `runner/src/snes/dsp_shadow.{c,h}`, wired into `dsp_cycle`, in `runner.cmake`, compiles clean (`-Wall -Wextra`) | Cubic (Catmull-Rom) re-render of the BRR voices in float vs the hardware 4-tap Gaussian; substitutes the dry mix only when the verifier proves it, reverts loud. Opt-in `SNESRECOMP_AUDIO_SHADOW` (default off → byte-identical). Echo path unchanged (applies to the chosen dry). Verifier auto-gain absorbs scale, so only structure must match; a mis-phased render simply falls back to canon + logs DEGRADED (signal to refine the interpolation phase) |
 
 ## Integration points (found on `main`)
@@ -56,7 +56,9 @@ thing being diffed. (Same rule now in `recomp-template/PRINCIPLES.md`,
 1. ~~S-DSP shadow render~~ — **DONE** (see table; `dsp_shadow.{c,h}` wired).
 2. ~~Color LUT~~ — **DONE** as a runner module (`color_lut.{c,h}`). Game-side
    present wiring (each game's `main.c`, outside this worktree): at startup
-   call `snes_color_lut_setup()`; if `snes_color_lut_active()`, before the
+   call `snes_color_lut_setup()` (environment compatibility) or
+   `snes_color_lut_setup_kind()` (launcher/config selection); if
+   `snes_color_lut_active()`, before the
    SDL present run the finished `renderBuffer` through `snes_color_lut_map(raw,
    present_copy, w*h)` and upload the COPY (never modify the raw renderBuffer
    that gets frame-hashed). Identical shape to the GBC/Genesis present hooks.
@@ -70,3 +72,8 @@ thing being diffed. (Same rule now in `recomp-template/PRINCIPLES.md`,
 
 `ShadowVerifier` ported from JRickey/gba-recomp (`crates/gba-core/src/shadow.rs`)
 via the gbarecomp C++ port, © Jrickey, MIT OR Apache-2.0, used with permission.
+
+The screen-model parameterization is adapted from PSXRecomp. Exact revisions,
+local adaptations, and complete PolyForm Noncommercial 1.0.0, MIT, and
+Apache-2.0 notices are recorded in `third_party/psxrecomp_color_lut/` and
+`THIRD_PARTY_ATTRIBUTION.md`.

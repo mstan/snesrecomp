@@ -36,6 +36,10 @@ extern "C" {
  * SNESRECOMP_BUILD_VERSION); pass "dev" for local builds. */
 void host_report_init(const char *game_name, const char *build_version);
 
+/* Route crash artifacts into an existing host-owned directory. The default is
+ * the current directory. The path is copied and must not end in a separator. */
+void host_report_set_output_directory(const char *directory);
+
 /* Append a printf-style breadcrumb to the always-on ring (and echo to
  * stderr for console builds). Cheap; called at boot stages, device
  * setup, savestate events, and as a low-rate heartbeat. */

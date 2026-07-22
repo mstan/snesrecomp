@@ -480,6 +480,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                   hle_dispatch=None,
                   inline_arg_map=None,
                   terminal_jsr_sites=None,
+                  noreturn_jsr_sites=None,
                   entry_s_offset: int = 0) -> str:
     """Emit a complete v2 C function source for one 65816 function.
 
@@ -601,7 +602,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                             callee_exit_mx_modes=callee_exit_mx_modes,
                             sibling_entry_pcs=sibling_entry_pcs,
                             inline_arg_map=inline_arg_map,
-                            terminal_jsr_sites=terminal_jsr_sites)
+                            terminal_jsr_sites=terminal_jsr_sites,
+                            noreturn_jsr_sites=noreturn_jsr_sites)
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:

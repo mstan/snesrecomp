@@ -58,6 +58,19 @@ func Upload 8079
         os.unlink(path)
 
 
+def test_noreturn_jsr_call_site_contract_parses():
+    path = _write("""\
+bank = ba
+noreturn_jsr 9c36
+func FaultingOriginalPath 9c00 end:9c40 entry_mx:0,0
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.noreturn_jsr == {0x9C36}
+    finally:
+        os.unlink(path)
+
+
 def test_force_lle_absolute_boundary_parses():
     path = _write("""\
 bank = 00
@@ -68,6 +81,22 @@ force_lle 038DA0
         assert cfg.force_lle == {0x038DA0}
     finally:
         os.unlink(path)
+
+
+def test_noreturn_jsr_rejects_terminal_contract_at_same_site():
+    for directives in (
+            "terminal_jsr 9c36\nnoreturn_jsr 9c36",
+            "noreturn_jsr 9c36\nterminal_jsr 9c36"):
+        path = _write(f"bank = ba\n{directives}\n")
+        try:
+            try:
+                load_bank_cfg(path)
+            except ValueError as exc:
+                assert "cannot be both terminal_jsr and noreturn_jsr" in str(exc)
+            else:
+                raise AssertionError("conflicting JSR contracts were accepted")
+        finally:
+            os.unlink(path)
 
 
 def test_func_with_end_directive_parses_end():

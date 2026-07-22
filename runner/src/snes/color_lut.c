@@ -1,7 +1,9 @@
 // color_lut.c — see color_lut.h.
 //
-// Color-science core ported from gbarecomp (src/runtime/color_lut.cpp) via
-// JRickey/gba-recomp crates/screen, © Jrickey, MIT OR Apache-2.0.
+// Screen models aligned with mstan/psxrecomp revision
+// d7815862e18ef939e5e6e5c6947f8c29667982d5 (PolyForm Noncommercial
+// 1.0.0). Color-science lineage: JRickey/gba-recomp crates/screen,
+// © Jrickey, MIT OR Apache-2.0. See third_party/psxrecomp_color_lut/.
 
 #include "color_lut.h"
 
@@ -19,8 +21,8 @@ static const Primaries kSrgb = {{0.64, 0.33}, {0.30, 0.60}, {0.15, 0.06}, {0.312
 // SMPTE-C / NTSC consumer-CRT phosphors (the standard model — not a
 // per-console SNES measurement).
 static const Primaries kSmpteC = {{0.630, 0.340}, {0.310, 0.595}, {0.155, 0.070}, {0.3127, 0.3290}};
-// A cooler/wider Trinitron-ish set, also standard-derived.
-static const Primaries kTrinitron = {{0.621, 0.340}, {0.281, 0.606}, {0.152, 0.067}, {0.3127, 0.3290}};
+// A late near-sRGB Trinitron-class tube, matching PSXRecomp's shared model.
+static const Primaries kTrinitron = {{0.625, 0.340}, {0.280, 0.595}, {0.155, 0.070}, {0.3127, 0.3290}};
 
 static void mat_apply(const Mat3* a, const double v[3], double out[3]) {
   for (int i = 0; i < 3; ++i)
@@ -78,35 +80,100 @@ static uint8_t quant(double v) {
   return (uint8_t)(v * 255.0 + 0.5);
 }
 
+typedef struct {
+  Primaries primaries;
+  double gamma;
+  double luminance;
+  double black_floor;
+} PanelModel;
+
+static int panel_model(int kind, PanelModel* out) {
+  switch (kind) {
+    case SNES_SCREEN_CRT:
+      out->primaries = kSmpteC;
+      out->gamma = 2.4;
+      out->luminance = 0.92;
+      out->black_floor = 0.004;
+      return 1;
+    case SNES_SCREEN_COMPOSITE:
+      out->primaries = kSmpteC;
+      out->gamma = 2.5;
+      out->luminance = 0.90;
+      out->black_floor = 0.012;
+      return 1;
+    case SNES_SCREEN_TRINITRON:
+      out->primaries = kTrinitron;
+      out->gamma = 2.35;
+      out->luminance = 0.95;
+      out->black_floor = 0.002;
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 // ── State ──────────────────────────────────────────────────────────
 static uint32_t* g_lut = NULL;  // 32768 entries, BGR555 -> 0x00RRGGBB
 static int g_active = 0;
 
-static void build(const Primaries* panel, double gamma) {
+static int build(int kind) {
   if (!g_lut) g_lut = (uint32_t*)malloc(32768u * sizeof(uint32_t));
-  if (!g_lut) { g_active = 0; return; }
-  Mat3 to_disp = rgb_to_rgb(panel, &kSrgb);
+  if (!g_lut) { g_active = 0; return 0; }
+  PanelModel model;
+  if (!panel_model(kind, &model)) return 0;
+  Mat3 to_disp = rgb_to_rgb(&model.primaries, &kSrgb);
   for (int px = 0; px < 32768; ++px) {
     double c[3] = {(px & 31) / 31.0, ((px >> 5) & 31) / 31.0, ((px >> 10) & 31) / 31.0};
     double lin[3];
-    for (int i = 0; i < 3; ++i) lin[i] = pow(c[i], gamma);
+    for (int i = 0; i < 3; ++i) {
+      double v = pow(c[i], model.gamma) * model.luminance;
+      lin[i] = v > 1.0 ? 1.0 : v;
+    }
     double out[3]; mat_apply(&to_disp, lin, out);
-    uint8_t r = quant(srgb_oetf(out[0]));
-    uint8_t g = quant(srgb_oetf(out[1]));
-    uint8_t b = quant(srgb_oetf(out[2]));
+    for (int i = 0; i < 3; ++i) {
+      double v = out[i] < 0.0 ? 0.0 : (out[i] > 1.0 ? 1.0 : out[i]);
+      out[i] = srgb_oetf(model.black_floor +
+                         (1.0 - model.black_floor) * v);
+    }
+    uint8_t r = quant(out[0]);
+    uint8_t g = quant(out[1]);
+    uint8_t b = quant(out[2]);
     g_lut[px] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
   }
+  return 1;
+}
+
+int snes_color_lut_kind_from_name(const char* name, int* kind) {
+  if (!name || !kind) return 0;
+  if (strcmp(name, "raw") == 0) *kind = SNES_SCREEN_RAW;
+  else if (strcmp(name, "crt") == 0) *kind = SNES_SCREEN_CRT;
+  else if (strcmp(name, "composite") == 0) *kind = SNES_SCREEN_COMPOSITE;
+  else if (strcmp(name, "trinitron") == 0) *kind = SNES_SCREEN_TRINITRON;
+  else return 0;
+  return 1;
+}
+
+const char* snes_color_lut_kind_name(int kind) {
+  static const char* const names[SNES_SCREEN_KIND_COUNT] = {
+      "Raw", "CRT", "Composite", "Trinitron"};
+  return kind >= 0 && kind < SNES_SCREEN_KIND_COUNT ? names[kind] : names[0];
+}
+
+int snes_color_lut_setup_kind(int kind) {
+  g_active = 0;
+  if (kind == SNES_SCREEN_RAW) return 0;
+  if (kind <= SNES_SCREEN_RAW || kind >= SNES_SCREEN_KIND_COUNT) return -1;
+  if (!build(kind)) return -1;
+  g_active = 1;
+  return 1;
 }
 
 int snes_color_lut_setup(void) {
-  g_active = 0;
   const char* e = getenv("SNESRECOMP_SCREEN");
   if (!e || strcmp(e, "raw") == 0 || e[0] == '\0') return 0;  // passthrough
-  if (strcmp(e, "crt") == 0)            build(&kSmpteC, 2.2);
-  else if (strcmp(e, "trinitron") == 0) build(&kTrinitron, 2.2);
-  else return 0;  // unknown -> raw
-  g_active = (g_lut != NULL);
-  return g_active;
+  int kind = SNES_SCREEN_RAW;
+  if (!snes_color_lut_kind_from_name(e, &kind)) return 0;  // compatibility
+  return snes_color_lut_setup_kind(kind) > 0;
 }
 
 int snes_color_lut_active(void) { return g_active; }

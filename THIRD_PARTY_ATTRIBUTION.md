@@ -58,6 +58,22 @@ dependency's terms if someone distributes it; downstream packages must either
 comply with the selected dependency's license or continue to require developers
 to supply it separately.
 
+## PSXRecomp screen-color models
+
+`runner/src/snes/color_lut.{c,h}` adapts the present-time screen-color LUT from
+`mstan/psxrecomp` revision
+`d7815862e18ef939e5e6e5c6947f8c29667982d5`, pinned by
+`mstan/MegaManX6Recomp` when inspected on 2026-07-21. The relevant files were
+byte-identical at PSXRecomp revision
+`d2006e02a3001495b1eedf2c1cc965d23c0de38f`, pinned by
+`mstan/Tomba2Recomp` at that time.
+
+The C color-science lineage derives from JRickey/gba-recomp revision
+`de4edf59b872d887046d6a3b005e2df551b6d44c` and is licensed MIT OR
+Apache-2.0. PSXRecomp's C adaptation and screen-model parameters are licensed
+under PolyForm Noncommercial 1.0.0. Exact provenance, local adaptations, and
+complete license texts are under `third_party/psxrecomp_color_lut/`.
+
 ## Native analyzer performance inspiration
 
 Derrick Gold's independent Go port of the snesrecomp recompiler demonstrated

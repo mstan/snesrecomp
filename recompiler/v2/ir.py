@@ -368,6 +368,10 @@ class Call(IROp):
     # onward, so the caller has no lexical continuation.  The generated call
     # still pushes the real return address because the callee uses it as data.
     terminal: bool = False
+    # Source-authoritative no-return call.  Preserve the hardware JSR frame,
+    # but do not compile a lexical continuation; execute the exceptional path
+    # through the interpreter fallback if it is ever reached.
+    noreturn: bool = False
 
 
 @dataclass(frozen=True)

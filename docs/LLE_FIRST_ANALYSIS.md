@@ -153,6 +153,22 @@ width-preservation assumption. Interpreter fallbacks are retained in the
 bounded tier-2 coverage table and JSON manifest; runtime execution does not
 print per-gap diagnostics.
 
+## Explicit non-returning direct calls (2026-07-21)
+
+`noreturn_jsr <site_pc16>` describes a direct JSR which source evidence proves
+never returns to its lexical continuation. It is intentionally distinct from
+`terminal_jsr`: emission performs the architectural JSR push, preserves that
+guest stack frame, and transfers the target to authoritative LLE. Analysis does
+not demand or decode the post-call continuation and does not invent an exit
+M/X state for the callee.
+
+This directive is for exceptional original-program paths such as a dormant
+call into bytes known to be data/garbage. It must not be used merely to silence
+an unresolved callee. A normal non-returning routine with a statically proven
+tail target should instead model that target directly. A site cannot be both
+`terminal_jsr` and `noreturn_jsr`; both Python and Rust configuration parsers
+reject that contradiction.
+
 ## Acceptance
 
 - Deterministic full and partial generated manifests.
