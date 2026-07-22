@@ -1050,7 +1050,8 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
         # callee consumes the frame as table data and never resumes lexical
         # fall-through, so it is terminal regardless of whether the callee has
         # a conventional exit-mode fact.
-        if getattr(insn, 'terminal_jsr', False):
+        if (getattr(insn, 'terminal_jsr', False)
+                or getattr(insn, 'noreturn_jsr', False)):
             return []
         ret_m, ret_x = post_m, post_x
         target_pc24: Optional[int] = None
@@ -1571,6 +1572,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     sibling_entry_pcs: Optional[set] = None,
                      inline_arg_map: Optional[Dict[int, int]] = None,
                      terminal_jsr_sites: Optional[set] = None,
+                     noreturn_jsr_sites: Optional[set] = None,
                      stop_on_unknown_callee_exit: bool = False,
                     ) -> "FunctionDecodeGraph":
     """Public cached wrapper around `_decode_function_uncached`.
@@ -1595,6 +1597,7 @@ def decode_function(rom: bytes, bank: int, start: int,
             sibling_entry_pcs=sibling_entry_pcs,
             inline_arg_map=inline_arg_map,
             terminal_jsr_sites=terminal_jsr_sites,
+            noreturn_jsr_sites=noreturn_jsr_sites,
             stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
         )
 
@@ -1610,6 +1613,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         _identity(sibling_entry_pcs),
         _identity(inline_arg_map),
         _identity(terminal_jsr_sites),
+        _identity(noreturn_jsr_sites),
         bool(stop_on_unknown_callee_exit),
     )
     cached = _DECODE_CACHE.get(cache_key)
@@ -1633,6 +1637,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         sibling_entry_pcs=sibling_entry_pcs,
         inline_arg_map=inline_arg_map,
         terminal_jsr_sites=terminal_jsr_sites,
+        noreturn_jsr_sites=noreturn_jsr_sites,
         stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
     )
     _DECODE_CACHE[cache_key] = graph
@@ -1653,6 +1658,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     sibling_entry_pcs: Optional[set] = None,
                      inline_arg_map: Optional[Dict[int, int]] = None,
                      terminal_jsr_sites: Optional[set] = None,
+                     noreturn_jsr_sites: Optional[set] = None,
                      stop_on_unknown_callee_exit: bool = False,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
@@ -1808,6 +1814,18 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     f"terminal_jsr at ${insn.addr & 0xFFFFFF:06X} does not "
                     f"name a direct three-byte JSR (decoded {insn.mnem})")
             insn.terminal_jsr = True
+        if (noreturn_jsr_sites
+                and (insn.addr & 0xFFFFFF) in noreturn_jsr_sites):
+            if not (insn.mnem == 'JSR' and insn.mode != INDIR_X
+                    and insn.length == 3):
+                raise ValueError(
+                    f"noreturn_jsr at ${insn.addr & 0xFFFFFF:06X} does not "
+                    f"name a direct three-byte JSR (decoded {insn.mnem})")
+            if insn.terminal_jsr:
+                raise ValueError(
+                    f"JSR at ${insn.addr & 0xFFFFFF:06X} cannot be both "
+                    "terminal_jsr and noreturn_jsr")
+            insn.noreturn_jsr = True
 
         # JSL/JML dispatch-table detection: if the call target is a
         # registered dispatch helper, decode the bytes immediately

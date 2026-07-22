@@ -173,7 +173,7 @@ class Insn:
                   'dispatch_forced_x', 'dispatch_consumed_stack_bytes',
                   'dispatch_configured_stack_bytes',
                   'const_z_fold_unconditional', 'const_z_fold_dead_pc24',
-                  'data_region_exec', 'terminal_jsr')
+                  'data_region_exec', 'terminal_jsr', 'noreturn_jsr')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
         self.addr = addr
@@ -232,6 +232,10 @@ class Insn:
         # from assembly source as a call-site ABI contract; see cfg_loader's
         # `terminal_jsr` directive.
         self.terminal_jsr = False
+        # Direct JSR into a source-authoritatively no-return path.  This is
+        # distinct from terminal_jsr: the target does not consume its frame as
+        # inline data, and the exceptional target remains an LLE safety path.
+        self.noreturn_jsr = False
         self.m_flag = 1
         self.x_flag = 1
         # Constant-Z branch fold: when set on a BEQ/BNE, the preceding

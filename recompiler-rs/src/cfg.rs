@@ -119,6 +119,7 @@ pub struct BankCfg {
     pub indirect_dispatch: Vec<IndirectDispatch>,
     pub inline_dispatch_loops: BTreeSet<u32>,
     pub terminal_jsr: BTreeSet<u32>,
+    pub noreturn_jsr: BTreeSet<u32>,
     pub hle_spc_upload: Vec<u32>,
     pub hle_func: BTreeMap<u32, String>, // pc16 -> c_function_name
     pub hle_dispatch: BTreeMap<u32, String>, // site_pc16 -> c_function_name
@@ -548,9 +549,35 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             }
             let site_pc16 =
                 parse_hex(tokens[1]).map_err(|e| format!("{path}: terminal_jsr {e}"))? & 0xFFFF;
+            if cfg.noreturn_jsr.contains(&site_pc16) {
+                return Err(format!(
+                    "{path}: JSR site ${site_pc16:04X} cannot be both terminal_jsr and noreturn_jsr"
+                ));
+            }
             if !cfg.terminal_jsr.insert(site_pc16) {
                 return Err(format!(
                     "{path}: terminal_jsr duplicate site ${site_pc16:04X}"
+                ));
+            }
+            continue;
+        }
+        // noreturn_jsr <site_pc16>
+        if head == "noreturn_jsr" {
+            if tokens.len() != 2 {
+                return Err(format!(
+                    "{path}: noreturn_jsr needs exactly one <site_pc16>, got: {stripped:?}"
+                ));
+            }
+            let site_pc16 =
+                parse_hex(tokens[1]).map_err(|e| format!("{path}: noreturn_jsr {e}"))? & 0xFFFF;
+            if cfg.terminal_jsr.contains(&site_pc16) {
+                return Err(format!(
+                    "{path}: JSR site ${site_pc16:04X} cannot be both terminal_jsr and noreturn_jsr"
+                ));
+            }
+            if !cfg.noreturn_jsr.insert(site_pc16) {
+                return Err(format!(
+                    "{path}: noreturn_jsr duplicate site ${site_pc16:04X}"
                 ));
             }
             continue;
@@ -989,6 +1016,24 @@ mod tests {
     fn terminal_jsr_parse() {
         let cfg = parse_bank_cfg("bank = B3\nterminal_jsr A436\n", "test.cfg").unwrap();
         assert_eq!(cfg.terminal_jsr, BTreeSet::from([0xA436]));
+    }
+
+    #[test]
+    fn noreturn_jsr_parse() {
+        let cfg = parse_bank_cfg("bank = BA\nnoreturn_jsr 9C36\n", "test.cfg").unwrap();
+        assert_eq!(cfg.noreturn_jsr, BTreeSet::from([0x9C36]));
+    }
+
+    #[test]
+    fn noreturn_jsr_rejects_terminal_contract_at_same_site() {
+        for directives in [
+            "terminal_jsr 9C36\nnoreturn_jsr 9C36",
+            "noreturn_jsr 9C36\nterminal_jsr 9C36",
+        ] {
+            let text = format!("bank = BA\n{directives}\n");
+            let err = parse_bank_cfg(&text, "test.cfg").unwrap_err();
+            assert!(err.contains("cannot be both terminal_jsr and noreturn_jsr"));
+        }
     }
 
     #[test]

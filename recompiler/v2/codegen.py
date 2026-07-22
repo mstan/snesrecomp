@@ -2067,9 +2067,25 @@ def _emit_call(op: Call) -> List[str]:
     # the static analysis missed — EXCEPT variants pruned by the
     # emit-truth prune pass (valid_variant_list), which we must not
     # re-demand or auto-promote would resurrect the garbage body.
+    call_trace_pc = f"0x{((op.source_pc24 or 0) & 0xFFFFFF):06x}u"
+    if op.noreturn:
+        if op.long:
+            raise ValueError("noreturn call contract is only valid for direct JSR")
+        # Preserve the architectural JSR frame, but do not compile the lexical
+        # continuation.  This contract is reserved for source-authoritative
+        # exceptional paths (for example, an original-game call into data).
+        # LLE remains the exact safety implementation if that dormant path is
+        # ever reached; it owns any resulting crash/interrupt behavior.
+        lines = ["{ /* no-return JSR: preserve frame and enter exceptional LLE path */"]
+        lines += _emit_return_frame_push(op)
+        lines += [
+            f"  return interp_tier_dispatch_tail(cpu, 0x{addr:06x}u, "
+            f"{call_trace_pc}, _entry_s, _hrv);",
+            "}",
+        ]
+        return lines
     for em, ex in valid_variant_list(addr):
         _UNRESOLVED_CALL_TARGETS.add((addr, em, ex))
-    call_trace_pc = f"0x{((op.source_pc24 or 0) & 0xFFFFFF):06x}u"
     if op.terminal:
         if op.long:
             raise ValueError("terminal call contract is only valid for direct JSR")

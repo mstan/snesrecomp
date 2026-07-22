@@ -689,6 +689,12 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                     (bank << 16) | (site & 0xFFFF)
                     for site in cfg.terminal_jsr
                 }
+            noreturn_jsr_sites = None
+            if cfg is not None and getattr(cfg, "noreturn_jsr", None):
+                noreturn_jsr_sites = {
+                    (bank << 16) | (site & 0xFFFF)
+                    for site in cfg.noreturn_jsr
+                }
             if indirect_call_tables:
                 remapped_tables = dict(indirect_call_tables)
                 for site, value in indirect_call_tables.items():
@@ -710,6 +716,7 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                 indirect_call_tables=indirect_call_tables,
                 indirect_dispatch=indirect_dispatch or None,
                 terminal_jsr_sites=terminal_jsr_sites,
+                noreturn_jsr_sites=noreturn_jsr_sites,
                 data_regions=data_regions,
                 exclude_ranges=(getattr(cfg, "exclude_ranges", None)
                                 if cfg is not None else None),

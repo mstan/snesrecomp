@@ -291,6 +291,17 @@ def test_terminal_jsr_pushes_inline_frame_but_inherits_outer_context():
         set_valid_variants({})
 
 
+def test_noreturn_jsr_preserves_frame_and_uses_exceptional_lle_path():
+    op = Call(target=0x008100, long=False, source_pc24=0x008000,
+              entry_m=0, entry_x=0, noreturn=True)
+    s = _joined(emit_op(op))
+    assert "no-return JSR: preserve frame" in s
+    assert "JSR return frame -> cpu->S" in s
+    assert "interp_tier_dispatch_tail" in s
+    assert "interp_tier_run_call_frame" not in s
+    assert "cpu_tailcall_inherit_return_context" not in s
+
+
 def test_call_rejects_sub_8000_lorom_target():
     """Sub-$8000 LoROM addresses are RAM/registers, never ROM code. A
     Call decoded with such a target arose from the decoder following

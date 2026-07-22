@@ -11,8 +11,10 @@
 // framebuffer (5-bit recovered via >>3), matching the GBA approach; a future
 // hook at the CGRAM 15-bit level would be more precise.
 //
-// Color-science core ported from gbarecomp src/runtime/color_lut.cpp, itself
-// from JRickey/gba-recomp crates/screen, © Jrickey, MIT OR Apache-2.0.
+// Screen models aligned with mstan/psxrecomp revision
+// d7815862e18ef939e5e6e5c6947f8c29667982d5 (PolyForm Noncommercial
+// 1.0.0). Color-science lineage: JRickey/gba-recomp crates/screen,
+// © Jrickey, MIT OR Apache-2.0. See third_party/psxrecomp_color_lut/.
 
 #ifndef SNESRECOMP_COLOR_LUT_H
 #define SNESRECOMP_COLOR_LUT_H
@@ -24,9 +26,22 @@
 extern "C" {
 #endif
 
-// Build the LUT from SNESRECOMP_SCREEN (raw|crt|trinitron). Call once at
-// startup (re-callable). Returns 1 if a non-passthrough model is active.
+typedef enum SnesScreenKind {
+  SNES_SCREEN_RAW = 0,
+  SNES_SCREEN_CRT,
+  SNES_SCREEN_COMPOSITE,
+  SNES_SCREEN_TRINITRON,
+  SNES_SCREEN_KIND_COUNT,
+} SnesScreenKind;
+
+// Build the LUT from SNESRECOMP_SCREEN
+// (raw|crt|composite|trinitron). Call once at startup (re-callable). Returns
+// 1 if a non-passthrough model is active, 0 for Raw, or -1 for invalid input
+// or allocation failure.
 int snes_color_lut_setup(void);
+int snes_color_lut_setup_kind(int kind);
+int snes_color_lut_kind_from_name(const char* name, int* kind);
+const char* snes_color_lut_kind_name(int kind);
 int snes_color_lut_active(void);
 
 // Map `n` 0x00RRGGBB pixels from src into dst (graded). dst is for PRESENT

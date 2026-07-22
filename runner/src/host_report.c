@@ -78,6 +78,7 @@ static uint32_t g_bc_write_idx;          /* total writes; ring pos = idx % CAP *
 static char g_game_name[64]     = "unknown";
 static char g_build_version[64] = "dev";
 static char g_fatal_msg[512];
+static char g_output_directory[512] = ".";
 static int  g_has_fatal;
 
 /* ── Lock (lazy-init, same pattern as post_mortem.c) ────────────────── */
@@ -150,6 +151,11 @@ void host_report_init(const char *game_name, const char *build_version) {
     if (game_name)     snprintf(g_game_name, sizeof(g_game_name), "%s", game_name);
     if (build_version) snprintf(g_build_version, sizeof(g_build_version), "%s", build_version);
     host_report_breadcrumb("host_report: %s %s", g_game_name, g_build_version);
+}
+
+void host_report_set_output_directory(const char *directory) {
+    if (!directory || !directory[0]) return;
+    snprintf(g_output_directory, sizeof(g_output_directory), "%s", directory);
 }
 
 static void breadcrumb_v(const char *fmt, va_list ap) {
@@ -442,6 +448,10 @@ static void utc_stamp(char *out, size_t cap) {
     strftime(out, cap, "%Y%m%d_%H%M%S", &tmbuf);
 }
 
+static void artifact_path(char *out, size_t cap, const char *name) {
+    snprintf(out, cap, "%s/%s", g_output_directory, name);
+}
+
 const char *host_report_write_minidump(void *seh_info) {
 #ifdef _WIN32
     /* MiniDumpWriteDump prototype, resolved dynamically. */
@@ -467,10 +477,12 @@ const char *host_report_write_minidump(void *seh_info) {
     if (!pWrite)
         return NULL;
 
-    static char path[128];
+    static char path[768];
     char stamp[32];
+    char name[160];
     utc_stamp(stamp, sizeof(stamp));
-    snprintf(path, sizeof(path), "crash_minidump_%s.dmp", stamp);
+    snprintf(name, sizeof(name), "crash_minidump_%s.dmp", stamp);
+    artifact_path(path, sizeof(path), name);
 
     HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, NULL);
@@ -504,10 +516,12 @@ const char *host_report_write_minidump(void *seh_info) {
 }
 
 const char *host_report_preserve_crash_copy(const char *src_path) {
-    static char dst[128];
+    static char dst[768];
     char stamp[32];
+    char name[160];
     utc_stamp(stamp, sizeof(stamp));
-    snprintf(dst, sizeof(dst), "crash_report_%s.json", stamp);
+    snprintf(name, sizeof(name), "crash_report_%s.json", stamp);
+    artifact_path(dst, sizeof(dst), name);
 
     FILE *in = fopen(src_path, "rb");
     if (!in)

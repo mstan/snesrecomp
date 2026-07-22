@@ -354,6 +354,23 @@ def test_terminal_jsr_has_no_lexical_fallthrough_or_unknown_exit():
     assert graph.unknown_callee_exit_sites == []
 
 
+def test_noreturn_jsr_has_no_lexical_fallthrough_or_unknown_exit():
+    rom = make_lorom_bank0({
+        0x8000: bytes([0x20, 0x00, 0x81, 0xEA]),
+        0x8100: bytes([0x00, 0x00]),
+    })
+    graph = decode_function(
+        rom, bank=0, start=0x8000, entry_m=0, entry_x=0,
+        noreturn_jsr_sites={0x008000},
+        stop_on_unknown_callee_exit=True)
+
+    assert {key.pc for key in graph.insns} == {0x008000}
+    insn = next(iter(graph.insns.values())).insn
+    assert insn.noreturn_jsr
+    assert not insn.terminal_jsr
+    assert graph.unknown_callee_exit_sites == []
+
+
 def test_analyze_function_exit_mx_inherits_natural_boundary_fallthrough():
     """Falling through ``end:`` is a tail edge, not a missing exit."""
     rom = make_lorom_bank0({

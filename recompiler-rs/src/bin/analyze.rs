@@ -298,6 +298,15 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
                 terminal_jsr_sites.insert(mirror);
             }
         }
+        // Both contracts suppress lexical fall-through for fixed-point
+        // analysis.  Python emission keeps their distinct stack semantics.
+        for &site_pc16 in &cfg.noreturn_jsr {
+            let site = (bank << 16) | (site_pc16 & 0xFFFF);
+            terminal_jsr_sites.insert(site);
+            if let Some(mirror) = mirror_pc24(site) {
+                terminal_jsr_sites.insert(mirror);
+            }
+        }
         for site in &cfg.indirect_dispatch {
             let pc24 = (bank << 16) | (site.site_pc16 & 0xFFFF);
             let value = IndirectDispatchSite {

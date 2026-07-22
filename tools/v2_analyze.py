@@ -409,6 +409,19 @@ def _terminal_jsr_sites(parsed) -> set:
     return result
 
 
+def _noreturn_jsr_sites(parsed) -> set:
+    """Expand cfg-local no-return JSR sites to canonical + mirror PCs."""
+    result = set()
+    for bank, _path, cfg in parsed:
+        for site_pc16 in getattr(cfg, "noreturn_jsr", ()):
+            site = (bank << 16) | (site_pc16 & 0xFFFF)
+            result.add(site)
+            mirror = _lorom_mirror_pc24(site)
+            if mirror is not None:
+                result.add(mirror)
+    return result
+
+
 def _declared_exit_modes(parsed) -> dict:
     """Load explicit facts and the generic HLE boundary contract.
 
@@ -543,6 +556,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
     data_regions = tuple(all_data_regions)
     dispatch_map = _indirect_dispatch_map(parsed)
     terminal_jsr_sites = _terminal_jsr_sites(parsed)
+    noreturn_jsr_sites = _noreturn_jsr_sites(parsed)
     declared_exit_modes = _declared_exit_modes(parsed)
     active_exit_modes = dict(declared_exit_modes)
     unstable_exit_modes = set()
@@ -630,6 +644,7 @@ def build_manifest(rom: bytes, parsed, *, max_insns: int, max_nodes: int,
             "sibling_entry_pcs": siblings or None,
             "inline_arg_map": inline_arg_map or None,
             "terminal_jsr_sites": terminal_jsr_sites or None,
+            "noreturn_jsr_sites": noreturn_jsr_sites or None,
             # An unknown callee return width is not evidence that M/X is
             # preserved. Stop the speculative caller continuation at that
             # call; once the callee is proven, a later immutable round
