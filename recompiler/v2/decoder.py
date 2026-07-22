@@ -2014,8 +2014,11 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         # not as mnemonic JML.  Key the frame size off the
                         # already-resolved dispatch width so PHK+PEA+JML
                         # consumes all three synthetic return bytes.
+                        configured_frame_size = auth.get('frame_size')
+                        insn.dispatch_configured_stack_bytes = (
+                            configured_frame_size or 0)
                         insn.dispatch_consumed_stack_bytes = (
-                            auth.get('frame_size') or
+                            configured_frame_size or
                             (3 if insn.dispatch_kind == 'long' else 2))
                     # Register each in-bank target as a decode successor
                     # so reach-analysis + auto-promote pick up the handlers.

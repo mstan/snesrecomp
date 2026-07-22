@@ -197,6 +197,7 @@ def test_long_ptrcall_can_override_handler_frame_size():
     )
     assert 'host_return_valid = 2' in src
     assert '2-byte frame' in src
+    assert 'cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */' in src
     assert 'goto L_8100_M1X1' in src
 
 
@@ -240,6 +241,11 @@ def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
     assert 'absolute long-indirect dispatch: switch on the loaded pointer' in src
     assert 'case 0x009000:' in src
     assert 'PHK+PEA+JML indirect call, 3-byte frame' in src
+    # No frame: option means legacy behavior, including the historical
+    # two-byte cleanup on an unresolved target. The cfg extension must be
+    # inert for existing projects.
+    assert 'cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */' in src
+    assert 'cpu->S = (uint16)(cpu->S + 3);  /* unpop unconsumed call frame */' not in src
     assert 'fall through to post-dispatch block' in src
     assert 'cpu->D + 0x0020' in src, src
 
