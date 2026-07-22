@@ -265,11 +265,21 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
  * synchronization is automatic inside RtlRunFrame; clients only supply the
  * presentation policy needed to discard stale PCM after fast-forward. */
 void RtlAudioSetFastForward(bool active);
-  bool RtlUploadSpcImageFromDp(CpuState *cpu);
-  bool RtlUploadSpcImageFromDpLive(CpuState *cpu);
+/* Reset the netplay frame-locked SPC sample accumulator (call on session start). */
+void RtlNetplayAudioReset(void);
+bool RtlUploadSpcImageFromDp(CpuState *cpu);
+bool RtlUploadSpcImageFromDpLive(CpuState *cpu);
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
 void RtlWriteSram();
+/* Save-directory root for SRAM + savestate slots. Default "saves". Netplay
+ * guests use "saves/netplay" so host-driven sync cannot clobber personal files.
+ * Pass NULL/"" to restore the default. */
+void RtlSetSaveRoot(const char *root);
+const char *RtlSaveRoot(void);
+void RtlEnsureSaveDir(void);
+void RtlSaveSlotPath(int slot, char *buf, size_t buflen);
+void RtlSramFilePath(char *buf, size_t buflen);
 // Copy a legacy saves/<legacy_title>.srm forward to the generic saves/save.srm
 // (idempotent). Call before the launcher so its SAVES panel reflects the carried-
 // forward save; RtlReadSram also calls it on boot as a fallback.

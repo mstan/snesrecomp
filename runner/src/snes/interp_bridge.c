@@ -244,13 +244,45 @@ static void sync_interp_to_cpu(const Interp816 *in, CpuState *c) {
     cpu_mirrors_to_p(c);   /* keep packed P consistent for PHP/PLP/stack ops */
 }
 
-static InterpPreOpcodeHook s_pre_opcode_hook;
-static uint32_t s_pre_opcode_hook_pc24;
+/* Multi-PC pre-opcode hooks (Metal Warriors DMA widen + sprite draw-window
+ * sites use 16). Callbacks may mutate CpuState and live DMA/PPU MMIO mirrors;
+ * changes to CpuState are copied back into the interpreter before the opcode
+ * runs. */
+/* MW widescreen + H2H vert-widen alone registers ~125 unique PCs. */
+enum { kInterpPreOpcodeHookSlots = 192 };
+static struct {
+    uint32_t pc24;
+    InterpPreOpcodeHook hook;
+} s_pre_opcode_hooks[kInterpPreOpcodeHookSlots];
+static int s_pre_opcode_hook_count;
 
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook) {
-    s_pre_opcode_hook_pc24 = pc24 & 0x7FFFFFu;
-    s_pre_opcode_hook = hook;
+    if (!hook) {
+        s_pre_opcode_hook_count = 0;
+        return;
+    }
+    const uint32_t key = pc24 & 0x7FFFFFu;
+    for (int i = 0; i < s_pre_opcode_hook_count; i++) {
+        if (s_pre_opcode_hooks[i].pc24 == key) {
+            s_pre_opcode_hooks[i].hook = hook;
+            return;
+        }
+    }
+    if (s_pre_opcode_hook_count < kInterpPreOpcodeHookSlots) {
+        s_pre_opcode_hooks[s_pre_opcode_hook_count].pc24 = key;
+        s_pre_opcode_hooks[s_pre_opcode_hook_count].hook = hook;
+        s_pre_opcode_hook_count++;
+    } else {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "[interp_bridge] pre-opcode hook table full (%d); "
+                    "pc=$%06X ignored\n",
+                    kInterpPreOpcodeHookSlots, (unsigned)pc24);
+        }
+    }
 }
 
 /* BRK bridge seam. The bounce is via explicit JSR/JSL interception below, not
@@ -279,6 +311,7 @@ static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static int      s_lle_unwind_owner_depth = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+static int      s_lle_wai_yield     = 0;
 static uint64_t s_lle_master_deadline = 0;
 /* Depth of nested interpreter runs and the run that owns the current paired
  * AOT bounce. A rewritten/non-local return from that AOT root must resume the
@@ -359,6 +392,12 @@ int rtl_aot_node_denied(uint32 pc24) {
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
+
+int interp_bridge_lle_took_wai(void) {
+    const int v = s_lle_wai_yield;
+    s_lle_wai_yield = 0;
+    return v;
+}
 void interp_bridge_set_master_deadline(uint64_t master_clock) {
     s_lle_master_deadline = master_clock;
 }
@@ -683,11 +722,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
             qring[steps & 63]=now;
         }
-        if (s_pre_opcode_hook &&
-            (pc_before & 0x7FFFFFu) == s_pre_opcode_hook_pc24) {
-            sync_interp_to_cpu(&in, cpu);
-            s_pre_opcode_hook(cpu, pc_before);
-            sync_cpu_to_interp(cpu, &in);
+        if (s_pre_opcode_hook_count > 0) {
+            const uint32_t key = pc_before & 0x7FFFFFu;
+            for (int hi = 0; hi < s_pre_opcode_hook_count; hi++) {
+                if (s_pre_opcode_hooks[hi].pc24 == key) {
+                    sync_interp_to_cpu(&in, cpu);
+                    s_pre_opcode_hooks[hi].hook(cpu, pc_before);
+                    sync_cpu_to_interp(cpu, &in);
+                    break;
+                }
+            }
         }
         /* Opt-in control-flow tripwire: game code normally executes from the
          * LoROM $8000-$FFFF half of a bank.  If a return/jump crosses from ROM
@@ -1017,6 +1061,24 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             steps=0;
         }
 
+        /* WAI: halt until the host delivers NMI/IRQ. Without this yield the
+         * next opcode runs immediately (waiting is never consulted), so games
+         * that STZ $4200 / install a temp NMI hook / STA $4200=$81 / WAI
+         * restore the old hook before the custom NMI can run (Metal Warriors
+         * LucasArts logo at $00:B7A3). Resume PC is the instruction after WAI.
+         * Only yield from scheduler/quiescent runs — never from a host
+         * interrupt handler (stop_on_rti), where nested delivery isn't set up. */
+        if (in.waiting) {
+            in.waiting = false;
+            if (auto_quiescent || yield_pc) {
+                s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+                s_lle_wai_yield = 1;
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+        }
+
         /* A host-invoked architectural interrupt handler is paired with the
          * real interrupt frame pushed by cpu_push_interrupt_frame(). Its RTI
          * is the host boundary, just as RTS/RTL crossing the entry watermark
@@ -1208,7 +1270,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             continue;
         }
 
-        if (is_ret && !yield_pc) {
+        /* Host-invoked interrupt handlers (stop_on_rti) must NOT use the
+         * RTS/RTL-past-s_enter watermark. Games commonly switch to a private
+         * NMI/IRQ stack (TCS to a higher S) and JSR helpers there; the first
+         * RTS on that stack would look like "returned past entry" and abort
+         * the handler mid-flight — leaving re-entrancy guards stuck (Metal
+         * Warriors: TSB $12=#$8000, never TRB) and DMA queues unserviced.
+         * Interrupt runs exit only on the architectural RTI below. */
+        if (is_ret && !yield_pc && !stop_on_rti) {
             if (_ibrw)
                 fprintf(stderr, "[ibr] ret  op=$%02X pc=$%06X sp=$%04X "
                         "(s_enter=$%04X exit=%d)\n",

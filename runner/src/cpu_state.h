@@ -28,6 +28,12 @@
 extern "C" {
 #endif
 
+/* Optional game hook for title-specific WRAM window tracking. The interpreter
+ * updates g_interp816_cur_pc before each opcode; AOT writes leave it at zero. */
+typedef void (*CpuStageWindowStoreHook)(uint32_t ram_off, uint32_t pc24);
+extern uint32_t g_interp816_cur_pc;
+void cpu_set_stage_window_store_hook(CpuStageWindowStoreHook hook);
+
 /* ── Register / flag state ─────────────────────────────────────────────── */
 
 typedef struct CpuState {

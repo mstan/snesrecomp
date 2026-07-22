@@ -9,7 +9,15 @@
 
 #include "dma.h"
 #include "snes.h"
+#include "ppu.h"
 #include "../debug_server.h"
+
+extern Ppu *g_ppu;
+static DmaVramNotifyHook g_vram_notify_hook;
+
+void dma_set_vram_notify_hook(DmaVramNotifyHook hook) {
+  g_vram_notify_hook = hook;
+}
 
 static const int bAdrOffsets[8][4] = {
   {0, 0, 0, 0},
@@ -271,5 +279,16 @@ void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
   if(!hdma) {
     dma->dmaBusy = val;
     dma->dmaTimer += dma->dmaBusy ? 16 : 0; // 12-24 cycle overhead for entire dma transfer
+    if (val && g_ppu) {
+      for (int i = 0; i < 8; i++) {
+        if (!(val & (1 << i)))
+          continue;
+        const DmaChannel *ch = &dma->channel[i];
+        if (ch->bAdr != 0x18 && ch->bAdr != 0x19)
+          continue;
+        if (g_vram_notify_hook)
+          g_vram_notify_hook(ch->aBank, ch->aAdr, g_ppu->vramPointer, ch->size);
+      }
+    }
   }
 }

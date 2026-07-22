@@ -36,6 +36,11 @@
 extern Snes *g_snes;
 
 CpuState g_cpu;
+static CpuStageWindowStoreHook g_stage_window_store_hook;
+
+void cpu_set_stage_window_store_hook(CpuStageWindowStoreHook hook) {
+    g_stage_window_store_hook = hook;
+}
 
 /* ── Scoped write-log ring (dev, env-gated) ────────────────────────────────
  * Captures the exact guest write sequence (WRAM + hardware regs) performed
@@ -371,6 +376,11 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     if (off >= 0) {
         uint8 old = cpu->ram[off];
         cpu->ram[off] = v;
+        /* Optional title hook for game-specific stage-window tracking. */
+        if (off >= 0x1E72 && off <= 0x1E79) {
+            if (g_stage_window_store_hook)
+                g_stage_window_store_hook((uint32_t)off, g_interp816_cur_pc);
+        }
 #ifdef SNES_COSIM
         /* Exact per-write WRAM watchpoint (dev, env-gated): names the recompiled
          * function performing the store (not block-poll approximate). Set
@@ -441,6 +451,16 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
                    | ((uint16)cpu->ram[off + 1] << 8);
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
+        if ((off >= 0x1E72 && off <= 0x1E79) ||
+            (off + 1 >= 0x1E72 && off + 1 <= 0x1E79)) {
+            if (g_stage_window_store_hook) {
+                /* Word store: tip = odd byte so the hook's hi-byte gate fires. */
+                uint32_t tip = (uint32_t)off;
+                if (off == 0x1E74 || off == 0x1E78)
+                    tip = (uint32_t)off + 1u;
+                g_stage_window_store_hook(tip, g_interp816_cur_pc);
+            }
+        }
 #ifdef SNES_COSIM
         {
             extern const char *g_last_recomp_func;

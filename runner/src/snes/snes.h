@@ -31,10 +31,12 @@ struct Snes {
   uint32_t ramAdr;
   uint8_t *ram;
 
+  // Host timing anchor; excluded from savestates and reconciled after load.
+  uint64_t beamMasterLast;
+
   // --- saveload blob starts here (hPos .. divideResult) ---
   uint16_t hPos;
   uint16_t vPos;
-  uint64_t beamMasterLast;
   double apuCatchupCycles;
   // nmi / irq
   bool hIrqEnabled;
