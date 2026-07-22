@@ -108,19 +108,21 @@ void interp816_saveload(Interp816 *cpu, SaveLoadInfo *sli) {
   sli->func(sli, &cpu->a, offsetof(Interp816, cyclesUsed) - offsetof(Interp816, a));
 }
 
+/* Current opcode PC (PB:PC of the opcode byte). Updated every interpreted
+ * instruction so WRAM write-watches can name the store site under LLE. */
+uint32_t g_interp816_cur_pc = 0;
+
 #ifdef SNES_COSIM
 /* Always-on per-instruction ring (dev-only, cosim builds). Captures the exact
  * (pc, opcode, A-in/A-out, M-flag) trajectory so a codegen-vs-interp A-register
  * divergence can be localized to a single instruction by querying the window of
  * interest (ring-buffer discipline; never arm-then-step). Dumped via the cosim
- * server `itrace` command. Also exposes the interp's current PC so the
- * cpu_state write-watch can name an interpreted store. */
+ * server `itrace` command. */
 typedef struct { uint32_t pc; uint8_t op; uint8_t mf; uint8_t xf;
                  uint16_t a_in, a_out, x, y; } I816RingEnt;
 #define I816_RING_N (1u << 19)
 static I816RingEnt g_i816_ring[I816_RING_N];
 static uint64_t    g_i816_ring_head = 0;
-uint32_t           g_interp816_cur_pc = 0;   /* extern: cpu_state write-watch */
 void interp816_dump_ring(const char* path, long n) {
   FILE* f = fopen(path, "w");
   if (!f) return;
@@ -161,9 +163,9 @@ int interp816_runOpcode(Interp816* cpu) {
     }
   }
   uint8_t opcode = interp816_readOpcode(cpu);
-#ifdef SNES_COSIM
   uint32_t _pcb = ((uint32_t)cpu->k << 16) | (uint16_t)(cpu->pc - 1);
   g_interp816_cur_pc = _pcb;
+#ifdef SNES_COSIM
   uint16_t _ain = cpu->a; uint8_t _mf = cpu->mf ? 1 : 0, _xf = cpu->xf ? 1 : 0;
 #endif
   cpu->cyclesUsed = cyclesPerOpcode[opcode];
@@ -803,6 +805,7 @@ restart:
         break;
       case 2: // rtl
         cpu->pc = interp816_pullWord(cpu) + 1;
+        /* Keep full PB — bit 7 selects FastROM / $80-$BF reg mirrors. */
         cpu->k = interp816_pullByte(cpu);
         break;
       default:
@@ -1018,6 +1021,8 @@ restart:
       interp816_pushByte(cpu, cpu->k);
       interp816_pushWord(cpu, cpu->pc - 1);
       cpu->pc = value;
+      /* Do not mask PB to 7 bits. JSL $9E:xxxx must keep K=$9E so PHK/PLB
+       * sets DB into the $80-$BF register window (Metal Warriors Konami). */
       cpu->k = newK;
       break;
     }
