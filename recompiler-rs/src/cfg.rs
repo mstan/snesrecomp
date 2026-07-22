@@ -84,6 +84,11 @@ pub struct IndirectDispatch {
     pub table_bases: Vec<u32>, // 0..3 entries (see cfg_loader doc)
     /// Pointer-sourced call (`PEA <ret>; JMP (ptr)` / `JSR (ptr)`).
     pub ptr_call: bool,
+    /// Explicit local continuation for a ptrcall whose PEA frame was built
+    /// outside the dispatcher routine.
+    pub return_pc: Option<u32>,
+    /// Number of guest-stack bytes consumed by the selected handler.
+    pub frame_size: Option<u8>,
     /// Match an explicit runtime pointer value rather than indexing a ROM
     /// table. True for ptrcall/ptrtail/ptrtail_popcall.
     pub pointer_match: bool,
@@ -387,6 +392,8 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 }
                 let pointer_mode = pointer_modes[0];
                 let mut targets = Vec::new();
+                let mut return_pc = None;
+                let mut frame_size = None;
                 for t in &tokens[3..] {
                     if *t == pointer_mode {
                         continue;
@@ -399,6 +406,32 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                                 })? & 0xFFFFFF,
                             );
                         }
+                    } else if let Some(raw) = t.strip_prefix("return:") {
+                        if pointer_mode != "ptrcall" {
+                            return Err(format!(
+                                "{path}: indirect_dispatch return: is only valid with ptrcall"
+                            ));
+                        }
+                        return_pc = Some(
+                            parse_hex(raw)
+                                .map_err(|e| format!("{path}: indirect_dispatch return: {e}"))?
+                                & 0xFFFF,
+                        );
+                    } else if let Some(raw) = t.strip_prefix("frame:") {
+                        if pointer_mode != "ptrcall" {
+                            return Err(format!(
+                                "{path}: indirect_dispatch frame: is only valid with ptrcall"
+                            ));
+                        }
+                        let size = parse_int_auto(raw).map_err(|_| {
+                            format!("{path}: indirect_dispatch frame: bad size {raw:?}")
+                        })?;
+                        if size != 2 && size != 3 {
+                            return Err(format!(
+                                "{path}: indirect_dispatch frame: must be 2 or 3"
+                            ));
+                        }
+                        frame_size = Some(size as u8);
                     } else {
                         return Err(format!(
                             "{path}: indirect_dispatch {pointer_mode} unknown option {t:?}"
@@ -422,6 +455,8 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                     idx_reg: 'X',
                     table_bases: Vec::new(),
                     ptr_call: pointer_mode == "ptrcall",
+                    return_pc,
+                    frame_size,
                     pointer_match: pointer_mode != "rtsstack",
                     popped_call_frame: pointer_mode == "ptrtail_popcall",
                     rts_stack: pointer_mode == "rtsstack",
@@ -470,6 +505,8 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 idx_reg,
                 table_bases,
                 ptr_call: false,
+                return_pc: None,
+                frame_size: None,
                 pointer_match: false,
                 popped_call_frame: false,
                 rts_stack: false,
@@ -892,6 +929,27 @@ mod tests {
         assert!(dispatch.pointer_match);
         assert_eq!(dispatch.idx_reg, 'X');
         assert_eq!(dispatch.targets, vec![0x8569, 0x8884B8, 0x91D27F]);
+    }
+
+    #[test]
+    fn ptrcall_accepts_explicit_return_pc() {
+        let cfg = parse_bank_cfg(
+            "bank = 80\nindirect_dispatch 86f7 1 ptrcall return:84cf frame:2 targets:809391\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(cfg.indirect_dispatch[0].return_pc, Some(0x84CF));
+        assert_eq!(cfg.indirect_dispatch[0].frame_size, Some(2));
+    }
+
+    #[test]
+    fn ptrtail_rejects_explicit_return_pc() {
+        let err = parse_bank_cfg(
+            "bank = 80\nindirect_dispatch 86f7 1 ptrtail return:84cf targets:809391\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(err.contains("return: is only valid with ptrcall"));
     }
 
     #[test]

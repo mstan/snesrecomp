@@ -281,6 +281,8 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
                 idx_reg: site.idx_reg,
                 table_bases: site.table_bases.clone(),
                 ptr_call: site.ptr_call,
+                return_pc: site.return_pc,
+                frame_size: site.frame_size,
                 pointer_match: site.pointer_match,
                 popped_call_frame: site.popped_call_frame,
                 rts_stack: site.rts_stack,
