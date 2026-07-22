@@ -684,12 +684,18 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             let pc24 = parse_hex(tokens[1])
                 .map_err(|e| format!("{path}: ram_routine bad pc24: {e}"))?
                 & 0xFFFFFF;
-            let (entry_m, entry_x) = parse_mx(tokens[2])
-                .ok_or_else(|| format!("{path}: ram_routine bad variant {:?} (want M0X0..M1X1)", tokens[2]))?;
+            let (entry_m, entry_x) = parse_mx(tokens[2]).ok_or_else(|| {
+                format!(
+                    "{path}: ram_routine bad variant {:?} (want M0X0..M1X1)",
+                    tokens[2]
+                )
+            })?;
             let bytes = parse_hex_bytes(tokens[3])
                 .map_err(|e| format!("{path}: ram_routine bad hexbytes: {e}"))?;
             if bytes.is_empty() {
-                return Err(format!("{path}: ram_routine {pc24:06X} has empty byte blob"));
+                return Err(format!(
+                    "{path}: ram_routine {pc24:06X} has empty byte blob"
+                ));
             }
             let bank = (pc24 >> 16) & 0xFF;
             if bank != 0x7E && bank != 0x7F {
@@ -836,11 +842,7 @@ mod tests {
 
     #[test]
     fn ram_routine_parse() {
-        let cfg = parse_bank_cfg(
-            "bank = 00\nram_routine 7F8000 M1X1 A9F08D01026B\n",
-            "t",
-        )
-        .unwrap();
+        let cfg = parse_bank_cfg("bank = 00\nram_routine 7F8000 M1X1 A9F08D01026B\n", "t").unwrap();
         assert_eq!(cfg.ram_routines.len(), 1);
         let r = &cfg.ram_routines[0];
         assert_eq!(r.pc24, 0x7F8000);
