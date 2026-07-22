@@ -467,7 +467,7 @@ def load_bank_cfg(path: str) -> BankCfg:
                 # (sourced from the decomp's dispatcher switch). The dispatch
                 # is a CALL (the pushed PEA return resumes the next block),
                 # not a tail transfer.
-                #   indirect_dispatch <site_pc16> <count> ptrcall targets:<t1,t2,...>
+                #   indirect_dispatch <site_pc16> <count> ptrcall [return:<pc16>] [frame:<2|3>] targets:<t1,t2,...>
                 #
                 # Targets may be 16-bit local PCs or full 24-bit SNES
                 # pointers. Keep full-width values intact: long pointer
@@ -484,6 +484,8 @@ def load_bank_cfg(path: str) -> BankCfg:
                             f"{stripped!r}")
                     pointer_mode = next(iter(pointer_modes))
                     targets: Tuple[int, ...] = ()
+                    return_pc: Optional[int] = None
+                    frame_size: Optional[int] = None
                     for t in tokens[3:]:
                         if t == pointer_mode:
                             continue
@@ -494,6 +496,27 @@ def load_bank_cfg(path: str) -> BankCfg:
                             except ValueError as e:
                                 raise ValueError(
                                     f"{path}: indirect_dispatch targets: bad hex {t!r}: {e}")
+                        elif t.startswith('return:'):
+                            if pointer_mode != 'ptrcall':
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch return: is only valid with ptrcall")
+                            try:
+                                return_pc = _parse_hex(t[len('return:'):]) & 0xFFFF
+                            except ValueError as e:
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch return: bad hex {t!r}: {e}")
+                        elif t.startswith('frame:'):
+                            if pointer_mode != 'ptrcall':
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch frame: is only valid with ptrcall")
+                            try:
+                                frame_size = int(t[len('frame:'):], 0)
+                            except ValueError as e:
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch frame: bad size {t!r}: {e}")
+                            if frame_size not in (2, 3):
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch frame: must be 2 or 3")
                         else:
                             raise ValueError(
                                 f"{path}: indirect_dispatch {pointer_mode} "
@@ -511,6 +534,10 @@ def load_bank_cfg(path: str) -> BankCfg:
                         'idx_reg': 'X',          # unused (value-matched), kept for emit path
                         'table_bases': (),
                         'ptr_call': pointer_mode == 'ptrcall',
+                        # Optional explicit continuation for wrappers which
+                        # construct the PEA return frame away from this site.
+                        'return_pc': return_pc,
+                        'frame_size': frame_size,
                         'pointer_match': pointer_mode != 'rtsstack',
                         # The dispatcher has already PLA'd the two-byte JSR
                         # frame it entered with and hands control to a state

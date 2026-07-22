@@ -1334,6 +1334,9 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # sequential block. So it behaves like a JSR call (fall through, handler
     # host-returns) but WITHOUT synthesizing its own return frame.
     is_call = bool(getattr(insn, 'dispatch_call', False))
+    call_frame_size = int(getattr(
+        insn, 'dispatch_consumed_stack_bytes', 0) or
+        (3 if kind == 'long' else 2))
     is_pointer_match = bool(
         getattr(insn, 'dispatch_pointer_match', False))
     # Variant suffix for dispatched handlers follows the live width state
@@ -1384,7 +1387,6 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         # frame), then we fall through to the next block. The long form has
         # an immediately preceding PHK byte which the handler's RTL consumes
         # along with PEA's two-byte PC.
-        call_frame_size = 3 if kind == 'long' else 2
         lines.append(
             f"  cpu->host_return_valid = {call_frame_size};  "
             f"/* {'PHK+PEA+JML' if kind == 'long' else 'PEA+JMP'} indirect call, "
@@ -1603,7 +1605,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             lines.append(
                 f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
             lines.append(
-                "      cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */")
+                f"      cpu->S = (uint16)(cpu->S + {call_frame_size});  /* unpop unconsumed call frame */")
             lines.append("      break;")
         else:
             lines.append("    default: break;")
@@ -1658,7 +1660,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append(
             f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
         lines.append(
-            "    cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */")
+            f"    cpu->S = (uint16)(cpu->S + {call_frame_size});  /* unpop unconsumed call frame */")
     else:
         # Terminal tail dispatch with an OOB index: account the miss,
         # then abandon this invocation balanced (discard locals below
@@ -1684,7 +1686,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 lines.append(
                     f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
                 lines.append(
-                    "      cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */")
+                    f"      cpu->S = (uint16)(cpu->S + {call_frame_size});  /* unpop unconsumed call frame */")
                 lines.append("      break; /* null entry */")
             else:
                 # Null entry on a terminal tail dispatch: the bare

@@ -202,6 +202,38 @@ func A 8000
         os.unlink(path)
 
 
+def test_ptrcall_accepts_explicit_return_pc():
+    path = _write("""\
+bank = 80
+indirect_dispatch 86f7 1 ptrcall return:84cf frame:2 targets:809391
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['return_pc'] == 0x84CF
+        assert auth['frame_size'] == 2
+    finally:
+        os.unlink(path)
+
+
+def test_ptrtail_rejects_explicit_return_pc():
+    path = _write("""\
+bank = 80
+indirect_dispatch 86f7 1 ptrtail return:84cf targets:809391
+func A 8000
+""")
+    try:
+        try:
+            load_bank_cfg(path)
+        except ValueError as exc:
+            assert 'return: is only valid with ptrcall' in str(exc)
+        else:
+            raise AssertionError('ptrtail return: must be rejected')
+    finally:
+        os.unlink(path)
+
+
 def test_ptrtail_targets_mark_value_matched_terminal_dispatch():
     path = _write("""\
 bank = 00
