@@ -10,6 +10,10 @@
 
 typedef struct Dma Dma;
 
+typedef void (*DmaVramNotifyHook)(uint8_t aBank, uint16_t aAdr,
+                                  uint16_t vmadd, uint16_t size);
+void dma_set_vram_notify_hook(DmaVramNotifyHook hook);
+
 #include "snes.h"
 
 typedef struct DmaChannel {

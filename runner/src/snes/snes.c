@@ -456,6 +456,10 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420c: {
+      /* LLE (and AOT via recomp_write_internal_reg) both land here. Presentation
+       * draws (SimpleHdma) re-arm from this latch — without it, LLE games keep
+       * last_hdmaen at 0 and wipe channel hdmaActive before every present. */
+      g_snesrecomp_last_hdmaen = val;
       dma_startDma(snes->dma, val, true);
       break;
     }

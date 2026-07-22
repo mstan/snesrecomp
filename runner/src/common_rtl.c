@@ -3,6 +3,12 @@
 #include <setjmp.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 #include "recomp_hw.h"
 #include "framedump.h"
 #include "util.h"
@@ -19,6 +25,9 @@
 #include "ppu_dma_trace.h"
 #include "host_report.h"
 #include "cosim.h"
+#if defined(SNESRECOMP_NET)
+#include "snes_netplay.h"
+#endif
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -27,6 +36,23 @@ const uint8 *g_rom;
 Ppu *g_ppu;
 Dma *g_dma;
 uint8 g_snesrecomp_last_hdmaen;
+
+/* Netplay suppresses the pre-frame wall-clock fallback below. Once frames
+ * begin, every runner uses the same guest-frame/APU coupling, and the audio
+ * callback only consumes samples without advancing emulation. */
+static int rtl_netplay_locks_audio(void) {
+#if defined(SNESRECOMP_NET)
+  return snes_netplay_active();
+#else
+  return 0;
+#endif
+}
+
+void RtlNetplayAudioReset(void) {
+  /* Kept as a stable facade hook for recomp-net hosts. The current runner's
+   * audio callback is already consumer-only, so there is no separate
+   * wall-clock netplay accumulator to reset. */
+}
 
 // Main-CPU cycle estimate, incremented per RDB_BLOCK_HOOK in debug_on_block_enter.
 // Used to pace APU catchup realistically: real SNES is ~3.58 MHz main / ~1.024 MHz APU,
@@ -425,7 +451,7 @@ bool RtlRunFrame(uint32 inputs) {
     static int s_audio = -1;
     if (s_audio < 0) { const char *e = getenv("SNES_COSIM_AUDIO");
                        s_audio = (e && e[0] && e[0] != '0') ? 1 : 0; }
-    if (s_audio) {
+    if (s_audio && !rtl_netplay_locks_audio()) {
       static double s_acc = 0.0;
       static int16 s_buf[1024 * 2];
       s_acc += 32040.0 / 60.0988;           /* SNES native audio samples per frame */
@@ -545,11 +571,17 @@ bool RtlLoadSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, false, false };
   snes_saveload(g_snes, &fs.base);
-  /* v5+: game-specific chunk follows the guest blob. v4 files have none —
-   * the game's on_state_loaded hook (below) is told the version so it can
-   * fall back to legacy same-mode behavior. */
-  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra)
-    g_rtl_game_info->state_load_extra(&fs.base, hdr[1]);
+  /* v5+: an optional game-specific chunk follows the guest blob. Only call
+   * the loader when trailing bytes remain so older v5 snapshots created by
+   * games without an extra chunk remain readable. */
+  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra) {
+    long pos = ftell(f);
+    if (pos >= 0 && fseek(f, 0, SEEK_END) == 0) {
+      long end = ftell(f);
+      if (fseek(f, pos, SEEK_SET) == 0 && end > pos)
+        g_rtl_game_info->state_load_extra(&fs.base, hdr[1]);
+    }
+  }
   RtlApuUnlock();
   fclose(f);
   if (fs.error) {
@@ -604,11 +636,8 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
 
 void RtlSaveLoad(int cmd, int slot) {
   char name[128];
-  const char *prefix = g_rtl_game_info->save_name_prefix;
-  if (prefix)
-    sprintf(name, "saves/%s%d.sav", prefix, slot);
-  else
-    sprintf(name, "saves/%s_save%d.sav", g_rtl_game_info->title, slot);
+  RtlEnsureSaveDir();
+  RtlSaveSlotPath(slot, name, sizeof(name));
   printf("*** %s slot %d: %s\n",
     cmd == kSaveLoad_Save ? "Saving" : "Loading", slot, name);
   /* Breadcrumb the operation: a crash shortly after a state load is a
@@ -913,6 +942,9 @@ void rtl_accumulate_apu_catchup(void) {
   // limit — handshake over-clock must stay possible (see above).
   // Consumer presence is inferred from sampleRead movement, so this is
   // automatic per game and per moment, no config.
+  //
+  // Netplay skips this: wall time differs per peer and desyncs LLE. Once the
+  // frame loop starts, rtl_sync_apu_frame_boundary() is authoritative.
   {
     static uint32_t last_sample_read;
     static uint64_t consume_seen_ms, wall_last_ms;
@@ -921,6 +953,11 @@ void rtl_accumulate_apu_catchup(void) {
      * (see audio_trace.c) — routes this baseline through the same source as the
      * port-write scheduler, so the whole APU-pacing path is deterministic. */
     uint64_t now_ms = audio_trace_wall_ms();
+    if (rtl_netplay_locks_audio()) {
+      wall_last_ms = now_ms;
+      audio_trace_on_pace(1, 0);
+      return;
+    }
     uint32_t rd = dsp->sampleRead;
     if (rd != last_sample_read) {
       last_sample_read = rd;
@@ -1236,53 +1273,105 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   RtlApuUnlock();
 }
 
-/* The battery-backed SRAM lives at a fixed, game-agnostic path next to the exe
- * (each game has its own directory, so there is no collision). Older builds named
- * it after the game's internal title — which happened to be "smw" for every game
- * (a copy-paste leftover), so Mega Man X / Zelda also wrote saves/smw.srm.
- * RtlMigrateLegacySram copies any such legacy save forward the first time the new
- * generic path is used, so existing players keep their progress. */
-#define RTL_SRAM_FILE     "saves/save.srm"
-#define RTL_SRAM_BAK_FILE "saves/save.srm.bak"
+/* Battery-backed SRAM + savestate slots live under RtlSaveRoot() (default
+ * "saves/"). Netplay guests switch the root to "saves/netplay/" so host sync
+ * cannot overwrite personal progress. Older builds named the SRAM after the
+ * game's internal title ("smw" for every title); RtlMigrateLegacySram copies
+ * that forward the first time the generic name is used under the main root. */
+static char s_save_root[96] = "saves";
+
+void RtlSetSaveRoot(const char *root) {
+  if (!root || !root[0])
+    snprintf(s_save_root, sizeof(s_save_root), "saves");
+  else {
+    snprintf(s_save_root, sizeof(s_save_root), "%s", root);
+    /* Trim trailing slash */
+    size_t n = strlen(s_save_root);
+    while (n > 1 && (s_save_root[n - 1] == '/' || s_save_root[n - 1] == '\\')) {
+      s_save_root[n - 1] = '\0';
+      n--;
+    }
+  }
+}
+
+const char *RtlSaveRoot(void) { return s_save_root; }
+
+void RtlEnsureSaveDir(void) {
+#ifdef _WIN32
+  /* Also ensure parent "saves" when root is saves/netplay */
+  if (strncmp(s_save_root, "saves/", 6) == 0 || strncmp(s_save_root, "saves\\", 6) == 0)
+    _mkdir("saves");
+  _mkdir(s_save_root);
+#else
+  if (strncmp(s_save_root, "saves/", 6) == 0)
+    mkdir("saves", 0755);
+  mkdir(s_save_root, 0755);
+#endif
+}
+
+void RtlSaveSlotPath(int slot, char *buf, size_t buflen) {
+  const char *prefix = g_rtl_game_info ? g_rtl_game_info->save_name_prefix : NULL;
+  if (prefix)
+    snprintf(buf, buflen, "%s/%s%d.sav", s_save_root, prefix, slot);
+  else if (g_rtl_game_info && g_rtl_game_info->title)
+    snprintf(buf, buflen, "%s/%s_save%d.sav", s_save_root, g_rtl_game_info->title, slot);
+  else
+    snprintf(buf, buflen, "%s/save%d.sav", s_save_root, slot);
+}
+
+void RtlSramFilePath(char *buf, size_t buflen) {
+  snprintf(buf, buflen, "%s/save.srm", s_save_root);
+}
 
 void RtlMigrateLegacySram(const char *legacy_title) {
+  /* Only migrate into the main offline root — never into a netplay sandbox. */
   if (!legacy_title || !*legacy_title) return;
-  FILE *cur = fopen(RTL_SRAM_FILE, "rb");
+  if (strcmp(s_save_root, "saves") != 0) return;
+  char cur_path[128];
+  RtlSramFilePath(cur_path, sizeof(cur_path));
+  FILE *cur = fopen(cur_path, "rb");
   if (cur) { fclose(cur); return; }   /* already on the generic name */
   char legacy[64];
   snprintf(legacy, sizeof(legacy), "saves/%s.srm", legacy_title);
-  if (strcmp(legacy, RTL_SRAM_FILE) == 0) return;  /* legacy name IS the generic one */
+  if (strcmp(legacy, cur_path) == 0) return;
   FILE *in = fopen(legacy, "rb");
-  if (!in) return;                    /* no legacy save to carry forward */
-  FILE *out = fopen(RTL_SRAM_FILE, "wb");
-  if (!out) { fclose(in); return; }   /* e.g. saves/ not writable */
+  if (!in) return;
+  RtlEnsureSaveDir();
+  FILE *out = fopen(cur_path, "wb");
+  if (!out) { fclose(in); return; }
   char buf[4096];
   size_t n;
   while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
     fwrite(buf, 1, n, out);
   fclose(in);
   fclose(out);
-  fprintf(stderr, "[saves] migrated legacy %s -> %s\n", legacy, RTL_SRAM_FILE);
+  fprintf(stderr, "[saves] migrated legacy %s -> %s\n", legacy, cur_path);
 }
 
 void RtlReadSram(void) {
+  char path[128];
   RtlMigrateLegacySram(g_rtl_game_info->title);
-  FILE *f = fopen(RTL_SRAM_FILE, "rb");
+  RtlSramFilePath(path, sizeof(path));
+  FILE *f = fopen(path, "rb");
   if (f) {
     if (fread(g_sram, 1, g_sram_size, f) != g_sram_size)
-      fprintf(stderr, "Error reading %s\n", RTL_SRAM_FILE);
+      fprintf(stderr, "Error reading %s\n", path);
     fclose(f);
   }
 }
 
 void RtlWriteSram(void) {
-  rename(RTL_SRAM_FILE, RTL_SRAM_BAK_FILE);
-  FILE *f = fopen(RTL_SRAM_FILE, "wb");
+  char path[128], bak[140];
+  RtlEnsureSaveDir();
+  RtlSramFilePath(path, sizeof(path));
+  snprintf(bak, sizeof(bak), "%s.bak", path);
+  rename(path, bak);
+  FILE *f = fopen(path, "wb");
   if (f) {
     fwrite(g_sram, 1, g_sram_size, f);
     fclose(f);
   } else {
-    fprintf(stderr, "Unable to write %s\n", RTL_SRAM_FILE);
+    fprintf(stderr, "Unable to write %s\n", path);
   }
 }
 
@@ -1385,9 +1474,10 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
         c->indir_ptr++;
       else
         c->table++;
-      uint16 addr = 0x2100 + c->ppu_addr + bAdrOffsets[c->mode & 7][j];
-      ppu_write(g_ppu, addr, v);
-      debug_server_on_reg_write(addr, v);
+      /* ppu_write takes the B-bus offset ($00-$3F), not a $21xx CPU address. */
+      uint8 reg = (uint8)(c->ppu_addr + bAdrOffsets[c->mode & 7][j]);
+      ppu_write(g_ppu, reg, v);
+      debug_server_on_reg_write((uint16)(0x2100u + reg), v);
     }
   }
   c->rep_count--;

@@ -22,6 +22,8 @@
 #include "interp_bridge.h"   /* -> cpu_state.h (types, inline frame helpers) */
 #include "snes.h"            /* Snes storage for the bridge's APU clock hook */
 
+CpuState g_cpu;
+
 #define MEMSZ 0x1000000u
 static uint8_t *RAM;
 static int      g_aot_called;

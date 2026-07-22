@@ -13,6 +13,7 @@
  * production definition lives in interp_bridge.c, which this focused dispatch
  * harness intentionally does not link. */
 uint32_t g_interp_wlog_pc24 = 0;
+uint32_t g_interp816_cur_pc = 0;
 
 static int g_aot_calls;
 static int g_lle_calls;
@@ -27,6 +28,8 @@ int g_sram_size;
 uint64_t g_main_cpu_cycles_estimate;
 uint64_t g_apu_pace_cycles_estimate;
 Snes *g_snes;
+const RamRoutineGuard g_ram_routine_guards[] = {{0}};
+const unsigned g_ram_routine_guard_count = 0;
 
 static uint8 g_test_rom[0x400000];
 

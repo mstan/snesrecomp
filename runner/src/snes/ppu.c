@@ -223,6 +223,16 @@ void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
 }
 
+void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints) {
+  if (hints) {
+    ppu->wsOamRightHintStrict = 1;
+    memcpy(ppu->wsOamRightHint, hints, sizeof(ppu->wsOamRightHint));
+  } else {
+    ppu->wsOamRightHintStrict = 0;
+    memset(ppu->wsOamRightHint, 0, sizeof(ppu->wsOamRightHint));
+  }
+}
+
 void PpuSetWidescreenLayerMask(Ppu *ppu, uint8_t bg_layer_mask) {
   ppu->wsLayerWidenMask = bg_layer_mask & 0x0f;
 }
@@ -656,6 +666,82 @@ static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer,
       const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       if (pixel && z > *dstz)
         *dstz = z + pixel;
+    }
+  }
+}
+
+/* Scalar renderer for 16x16-tile backgrounds (BGMODE bits 4-7). The fast
+ * mode-1 renderers assume 8x8 tiles and sample big-tile layers at the wrong
+ * stride (Metal Warriors arms $F1 — big tiles on every BG — for its intro,
+ * title logo, and dialogue portraits). Handles 2bpp and 4bpp, with optional
+ * mosaic; 256 scalar pixels per line is negligible next to the fast paths. */
+static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+                                 bool sub, uint layer, int bpp,
+                                 PpuZbufType zhi, PpuZbufType zlo,
+                                 bool mosaic) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y)
+                                      : PpuWindows_Clear(&win, ppu, layer, y);
+  const int sy = (int)(mosaic ? ppu->mosaicModulo[y] : y) + ppu->vScroll[layer];
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const int words = (bpp == 4) ? 16 : 8;          /* vram words per 8x8 char */
+  const unsigned pal_shift = (bpp == 4) ? 6 : 8;  /* palette * (1 << bpp) */
+
+  int sc_row = PPU_bgTilemapAdr(ppu, layer) + (((sy >> 4) & 31) << 5);
+  if (((sy >> 9) & 1) && PPU_bgTilemapHigher(ppu, layer))
+    sc_row += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    PpuZbufType *dstz = dstbuf->data + left + kPpuExtraLeftRight;
+    const bool ws_shadow = WsShadowLayerActive((int)layer);
+    for (int screen_x = left; screen_x < right; screen_x++, dstz++) {
+      const int mx = mosaic ? PpuMosaicAt(ppu, screen_x) : screen_x;
+      const int sx = mx + ppu->hScroll[layer];
+      int sc = sc_row;
+      if (((sx >> 9) & 1) && PPU_bgTilemapWider(ppu, layer))
+        sc += 0x400;
+      sc += (sx >> 4) & 31;
+      uint16 tile = ppu->vram[sc & 0x7fff];
+      unsigned px = (unsigned)sx & 15, py = (unsigned)sy & 15;
+      /* Margins: world-keyed shadow tile + matching world pixel phase.
+       * Using live hScroll/vScroll for px/py while the tile key used the
+       * NMI-latched world origin produced a persistent ~phase seam. */
+      if (ws_shadow && (screen_x < 0 || screen_x >= 256)) {
+        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy,
+                            (uint16_t)ppu->hScroll[layer],
+                            (uint16_t)(sc & 0x7fff), tile);
+        const int32_t wpx =
+            (int32_t)WsShadowWorldX((int)layer) + screen_x;
+        const int32_t wpy =
+            (int32_t)WsShadowPresentWorldY((int)layer, screen_x) +
+            (int32_t)((sy - WsShadowScrollY((int)layer)) & 0x3ff);
+        if (wpx >= 0)
+          px = (unsigned)wpx & 15;
+        if (wpy >= 0)
+          py = (unsigned)wpy & 15;
+      }
+      if (tile & 0x4000) px = 15 - px;
+      if (tile & 0x8000) py = 15 - py;
+      const unsigned character =
+          ((tile & 0x3ff) + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned addr = (tileadr + character * words + (py & 7)) & 0x7fff;
+      const unsigned bit = 7 - (px & 7);
+      const uint16 p01 = ppu->vram[addr];
+      unsigned pixel = ((p01 >> bit) & 1) | (((p01 >> (8 + bit)) & 1) << 1);
+      if (bpp == 4) {
+        const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+        pixel |= (((p23 >> bit) & 1) << 2) | (((p23 >> (8 + bit)) & 1) << 3);
+      }
+      const PpuZbufType z =
+          ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> pal_shift);
+      if (pixel && z > *dstz)
+        *dstz = z + (PpuZbufType)pixel;
     }
   }
 }
@@ -1112,7 +1198,9 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
   bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
   if (!(padding & (1u << layer)) && !repeat_band && !stretch_band) {
-    if (mosaic)
+    if (PPU_bigTiles(ppu, layer))
+      PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 4, zhi, zlo, mosaic);
+    else if (mosaic)
       PpuDrawBackground_4bpp_mosaic(ppu, dstbuf, y, sub,
                                     layer, zhi, zlo);
     else
@@ -1123,7 +1211,9 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 
   PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
-  if (mosaic)
+  if (PPU_bigTiles(ppu, layer))
+    PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
+  else if (mosaic)
     PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
@@ -1149,7 +1239,9 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
   bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
   if (!(padding & (1u << layer)) && !repeat_band && !stretch_band) {
-    if (mosaic)
+    if (PPU_bigTiles(ppu, layer))
+      PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 2, zhi, zlo, mosaic);
+    else if (mosaic)
       PpuDrawBackground_2bpp_mosaic(ppu, dstbuf, y, sub, layer, zhi, zlo);
     else
       PpuDrawBackground_2bpp(ppu, dstbuf, y, sub, layer, zhi, zlo);
@@ -1158,7 +1250,9 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 
   PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
-  if (mosaic)
+  if (PPU_bigTiles(ppu, layer))
+    PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
+  else if (mosaic)
     PpuDrawBackground_2bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_2bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
@@ -1483,8 +1577,12 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
-    PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, 1,
-                           0xb100, 0x7100);
+    if (PPU_bigTiles(ppu, 1))
+      PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,
+                           0xb100, 0x7100, false);
+    else
+      PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, 1,
+                             0xb100, 0x7100);
   } else {
     // mode 7
     PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 0);
@@ -1627,6 +1725,19 @@ static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
   return x;
 }
 
+static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
+  int x = ppu->oam[index] & 0xff;
+  x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+  if (x >= 256 + ppu->extraRightCur) {
+    x -= 512;
+  } else if (x >= 256 && ppu->wsOamRightHintStrict) {
+    int slot = index >> 1;
+    if (!(ppu->wsOamRightHint[slot >> 3] & (1u << (slot & 7))))
+      x -= 512;
+  }
+  return x;
+}
+
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   static const uint8 spriteSizes[8][2] = {
     {8, 16}, {8, 32}, {8, 64}, {16, 32},
@@ -1647,9 +1758,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
     int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
     if(row < spriteHeight) {
-      int x = ppu->oam[index] & 0xff;
-      x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-      if (x >= 256 + ppu->extraRightCur) x -= 512;
+      int x = PpuDecodeOamX(ppu, index);
       x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
       if(x + spriteSize > -ppu->extraLeftCur) {
         spritesFound++;
@@ -1669,9 +1778,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     index = foundSprites[i - 1];
     uint8_t row = line - (ppu->oam[index] >> 8);
     int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
-    int x = ppu->oam[index] & 0xff;
-    x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-    if (x >= 256 + ppu->extraRightCur) x -= 512;
+    int x = PpuDecodeOamX(ppu, index);
     x = PpuAdjustWidescreenHudOamX(ppu, index, ppu->oam[index] >> 8, x);
         if(PPU_objInterlace(ppu)) row = row * 2 + (ppu->evenFrame ? 0 : 1);
         int oam1 = ppu->oam[index + 1];
