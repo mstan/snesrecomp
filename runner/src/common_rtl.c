@@ -163,8 +163,10 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  * v5: optional game-specific chunk appended after the snes_saveload blob
  *     (RtlGameInfo.state_save_extra/state_load_extra) — e.g. MMX task-slot
  *     resume contexts so a load can rebuild its scheduler fibers from any
- *     game mode or a fresh process. v4 files still load (no chunk). */
-#define RTL_SAV_VERSION 5u
+ *     game mode or a fresh process. v4 files still load (no chunk).
+ * v6: beamMasterLast removed from the snes_saveload region (host-only
+ *     timing anchor). v5 files still load via an 8-byte compat skip. */
+#define RTL_SAV_VERSION 6u
 #define RTL_SAV_VERSION_MIN 4u
 
 typedef struct FileSli {
@@ -544,8 +546,10 @@ bool RtlSaveSnapshot(const char *filename) {
   bool header_ok = fwrite(hdr, sizeof(hdr), 1, f) == 1;
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, true, !header_ok };
-  if (header_ok)
+  if (header_ok) {
+    snes_saveload_set_version(RTL_SAV_VERSION);
     snes_saveload(g_snes, &fs.base);
+  }
   /* v5: game-specific chunk (task-slot resume contexts etc.). Streamed
    * through the same FileSli so the format stays one linear blob. */
   if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
@@ -570,6 +574,7 @@ bool RtlLoadSnapshot(const char *filename) {
   }
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, false, false };
+  snes_saveload_set_version(hdr[1]);
   snes_saveload(g_snes, &fs.base);
   /* v5+: an optional game-specific chunk follows the guest blob. Only call
    * the loader when trailing bytes remain so older v5 snapshots created by
@@ -604,6 +609,7 @@ size_t RtlSaveSnapshotToMemory(void *data, size_t capacity) {
   uint32 hdr[2] = { RTL_SAV_MAGIC, RTL_SAV_VERSION };
   memory_sli_func(&memory.base, hdr, sizeof hdr);
   RtlApuLock();
+  snes_saveload_set_version(RTL_SAV_VERSION);
   snes_saveload(g_snes, &memory.base);
   if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
     g_rtl_game_info->state_save_extra(&memory.base);
@@ -623,8 +629,14 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
     { &memory_sli_func }, (uint8 *)data, size, sizeof hdr, false, false
   };
   RtlApuLock();
+  snes_saveload_set_version(hdr[1]);
   snes_saveload(g_snes, &memory.base);
-  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra)
+  /* Match file load: only consume a game chunk when trailing bytes remain.
+   * Always calling state_load_extra at EOF zero-fills the chunk (short-read
+   * sets error on MemorySli, but games that memset-then-read still see
+   * magic 0 and cold-boot into a hybrid WRAM/RESET state). */
+  if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra &&
+      memory.position < size && !memory.error)
     g_rtl_game_info->state_load_extra(&memory.base, hdr[1]);
   RtlApuUnlock();
   if (memory.error) return false;

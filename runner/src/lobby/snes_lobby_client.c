@@ -53,6 +53,7 @@ int  snes_lobby_set_ready(int ready) { (void)ready; return -1; }
 int  snes_lobby_request_start(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_launch_pending(void) { return 0; }
 void snes_lobby_clear_launch_pending(void) {}
+void snes_lobby_clear_last_error(void) {}
 int  snes_lobby_send_signal(int type, int flag, const char *text)
 {
     (void)type;
@@ -448,6 +449,21 @@ static void flush_pending(void)
     g_lc.pending_n = 0;
 }
 
+static int endpoint_has_usable_port(const char *endpoint)
+{
+    const char *colon;
+    unsigned port = 0;
+    if (!endpoint || !endpoint[0]) return 0;
+    colon = strrchr(endpoint, ':');
+    if (!colon || !colon[1]) return 0;
+    for (colon++; *colon; ++colon) {
+        if (*colon < '0' || *colon > '9') return 0;
+        port = port * 10u + (unsigned)(*colon - '0');
+        if (port > 65535u) return 0;
+    }
+    return port != 0;
+}
+
 static void fill_peer_bind_from_join(void)
 {
     SnesLobbyJoinInfo *j = &g_lc.join;
@@ -466,7 +482,11 @@ static void fill_peer_bind_from_join(void)
             strncpy(j->bind_hostport, g_lc.my_bind,
                     sizeof(j->bind_hostport) - 1);
         }
-        strncpy(j->peer_hostport, j->guest_endpoint, sizeof(j->peer_hostport) - 1);
+        /* guest_endpoint "ip:0" is unusable — leave peer empty so transport
+         * accept_first_peer learns the real source from the first UDP packet. */
+        if (endpoint_has_usable_port(j->guest_endpoint))
+            strncpy(j->peer_hostport, j->guest_endpoint,
+                    sizeof(j->peer_hostport) - 1);
     } else {
         strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
         strncpy(j->peer_hostport, j->host_endpoint, sizeof(j->peer_hostport) - 1);
@@ -700,6 +720,10 @@ static void handle_server_json(const char *json)
             g_lc.member_count = 1;
             g_lc.local_ready = 0;
         }
+        /* Ready UI is gone; auto-ready so older lobby servers that still gate
+         * start on all_ready accept host Play. */
+        queue_send("{\"op\":\"set_ready\",\"ready\":true}");
+        flush_pending();
         return;
     }
     if (strcmp(op, "joined") == 0) {
@@ -718,6 +742,9 @@ static void handle_server_json(const char *json)
         g_lc.join.last_error[0] = '\0';
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
+        parse_slots_array(json);
+        queue_send("{\"op\":\"set_ready\",\"ready\":true}");
+        flush_pending();
         return;
     }
     if (strcmp(op, "lobby_update") == 0) {
@@ -730,6 +757,12 @@ static void handle_server_json(const char *json)
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
         parse_slots_array(json);
+        /* Kick/move/start clear ready; re-arm so host Play keeps working on
+         * servers that still require all_ready. */
+        if (g_lc.in_lobby && !g_lc.local_ready) {
+            queue_send("{\"op\":\"set_ready\",\"ready\":true}");
+            flush_pending();
+        }
         return;
     }
     if (strcmp(op, "launch") == 0) {
@@ -741,14 +774,18 @@ static void handle_server_json(const char *json)
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
         parse_slots_array(json);
-        /* Rematch/join without a peer endpoint would hang forever in HELLO. */
-        if (!g_lc.join.peer_hostport[0] || !g_lc.join.host_endpoint[0] ||
-            (g_lc.is_host && !g_lc.join.guest_endpoint[0])) {
+        /* Guest must know the host. Host may leave peer empty to learn the
+         * guest from the first UDP packet (LAN / legacy guest_bind :0). */
+        if (!g_lc.join.host_endpoint[0] || !g_lc.join.bind_hostport[0] ||
+            (!g_lc.is_host && !g_lc.join.peer_hostport[0])) {
             strncpy(g_lc.join.last_error, "missing_endpoints",
                     sizeof(g_lc.join.last_error) - 1);
             g_lc.launch_pending = 0;
             return;
         }
+        /* A prior lobby error must not leave join.ok=0 or fill_launch will
+         * refuse the match forever while launch_pending stays sticky. */
+        g_lc.join.ok = 1;
         g_lc.join.last_error[0] = '\0';
         g_lc.launch_pending = 1;
         return;
@@ -764,7 +801,10 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "error") == 0) {
         json_get_str(json, "code", g_lc.join.last_error, sizeof(g_lc.join.last_error));
-        g_lc.join.ok = 0;
+        /* Keep seating valid: start/need_players/etc. must not block a later
+         * successful op:launch from filling netplay_launch. */
+        if (!g_lc.in_lobby)
+            g_lc.join.ok = 0;
         return;
     }
     if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
@@ -1250,6 +1290,11 @@ int snes_lobby_launch_pending(void)
 void snes_lobby_clear_launch_pending(void)
 {
     g_lc.launch_pending = 0;
+}
+
+void snes_lobby_clear_last_error(void)
+{
+    g_lc.join.last_error[0] = '\0';
 }
 
 int snes_lobby_send_signal(int type, int flag, const char *text)
