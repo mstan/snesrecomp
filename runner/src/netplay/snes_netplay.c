@@ -503,7 +503,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
             "delay=%u bind=%s peer=%s\n",
             use_ice ? "ice" : "lan", g_np.local_slot, g_np.input_player,
             (unsigned)rcfg.session_id, (unsigned)rcfg.input_delay,
-            cfg->bind_hostport, cfg->peer_hostport);
+            cfg->bind_hostport,
+            /* MotK rewrite peer is unused for ICE (candidates via lobby WS). */
+            use_ice ? "(ice)" : cfg->peer_hostport);
     return 0;
 }
 

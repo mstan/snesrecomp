@@ -320,7 +320,7 @@ another lobby copy:
 | ROM keep vs reload | Host loop | Title policy (free/`kRom` rematch path, CRC/SHA checks) |
 | Offline Play after soft-return | Host loop | `LAUNCH && !net.enabled` → disconnect + `session_reboot` |
 | Game CMake feature flag | CMake | e.g. `SMW_COOP_BUILD`, `snesrecomp_enable_recomp_net` |
-| Self-test AutoLaunch | Optional | SMW-only headless MotK path; not required for shipping UI |
+| Self-test AutoLaunch | Optional | `snes_host_lobby_auto_launch` (thin game wrapper OK) |
 
 Do **not** re-copy MotK create/join/`fill_launch` / LAN file-registry glue into
 games — that lives in `snes_host_lobby.c`.

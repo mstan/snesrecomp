@@ -63,6 +63,10 @@ typedef struct SnesHostBarrierHooks {
 int snes_host_barrier_admit(int from_lobby, int *running,
                             const SnesHostBarrierHooks *hooks);
 
+/* Shared connect-timeout copy for on_connect_timeout modals. */
+const char *snes_host_connect_timeout_error_code(int is_ice);
+const char *snes_host_connect_timeout_message(int is_ice);
+
 #ifdef __cplusplus
 }
 #endif

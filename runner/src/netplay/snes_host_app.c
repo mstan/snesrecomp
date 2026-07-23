@@ -57,6 +57,24 @@ void snes_host_app_begin_soft_return(RecompLauncherCGameInfo *gi,
 
 #endif /* RECOMP_LAUNCHER */
 
+const char *snes_host_connect_timeout_error_code(int is_ice)
+{
+  return is_ice ? "connect_timeout_ice" : "connect_timeout_lan";
+}
+
+const char *snes_host_connect_timeout_message(int is_ice)
+{
+  return is_ice
+             ? "Could not establish an online connection to the other "
+               "player within 30 seconds.\n\nAllow the game through the "
+               "Windows firewall, make sure both players are still in the "
+               "lobby, then rejoin and retry."
+             : "Could not establish a direct connection to the other "
+               "player within 30 seconds.\n\nCheck the lobby address, "
+               "firewall, and that both players are still connected, then "
+               "rejoin and retry.";
+}
+
 static void barrier_soft_exit(int from_lobby, int *running, const char *origin,
                               int *desync_logged, int *wait_logged)
 {

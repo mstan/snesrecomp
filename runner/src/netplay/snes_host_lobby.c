@@ -2,6 +2,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "recomp_net/lan_lobby.h"
 #include "recomp_net/address.h"
@@ -709,6 +717,162 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
 {
   return g_inited ? &g_callbacks : NULL;
+}
+
+static uint64_t auto_now_ms(void)
+{
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+static void auto_sleep_ms(unsigned ms)
+{
+#ifdef _WIN32
+  Sleep(ms);
+#else
+  struct timespec ts;
+  ts.tv_sec = (time_t)(ms / 1000u);
+  ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+  nanosleep(&ts, NULL);
+#endif
+}
+
+static void auto_log(const char *role, const char *stage)
+{
+  const RecompLauncherCNetplayCallbacks *cb = snes_host_lobby_callbacks();
+  const char *err = (cb && cb->last_error) ? cb->last_error(NULL) : "";
+  fprintf(stderr,
+          "[netplay selftest] role=%s stage=%s members=%d ready=%d "
+          "in_lobby=%d error=%s\n",
+          role, stage, snes_lobby_member_count(), snes_lobby_all_ready(),
+          snes_lobby_in_lobby(), err ? err : "");
+}
+
+int snes_host_lobby_auto_launch(const char *role, const char *player_name,
+                                const char *lobby_name, unsigned timeout_ms,
+                                RecompLauncherCNetplayLaunch *out)
+{
+  const RecompLauncherCNetplayCallbacks *cb;
+  RecompLauncherCSettings settings;
+  RecompLauncherCNetplayLobby row;
+  uint64_t deadline;
+  uint64_t next_list = 0;
+  int is_host;
+  int joined = 0;
+  int host_ready_sent = 0;
+  int start_sent = 0;
+  int i;
+
+  cb = snes_host_lobby_callbacks();
+  if (!cb || !g_inited)
+    return -1;
+  if (!role || !lobby_name || !lobby_name[0] || !out)
+    return -1;
+  is_host = strcmp(role, "host") == 0;
+  if (!is_host && strcmp(role, "guest") != 0)
+    return -1;
+  if (timeout_ms < 1000u)
+    timeout_ms = 60000u;
+  deadline = auto_now_ms() + timeout_ms;
+  memset(&settings, 0, sizeof(settings));
+  memset(out, 0, sizeof(*out));
+  cb->set_player_name(NULL, player_name && player_name[0]
+                                ? player_name
+                                : (is_host ? "HostTest" : "GuestTest"));
+  if (cb->connect(NULL) != 0) {
+    auto_log(role, "connect_failed");
+    return -2;
+  }
+
+  while (!snes_lobby_player_id()[0]) {
+    cb->pump(NULL);
+    if (!cb->connected(NULL)) {
+      auto_log(role, "handshake_disconnected");
+      return -3;
+    }
+    if (auto_now_ms() >= deadline) {
+      auto_log(role, "welcome_timeout");
+      return -4;
+    }
+    auto_sleep_ms(10);
+  }
+  auto_log(role, "connected");
+
+  if (is_host) {
+    char endpoint[64] = "0.0.0.0:7777";
+    if (cb->create(NULL, lobby_name, endpoint, "", &settings, 0) != 0) {
+      auto_log(role, "create_failed");
+      return -5;
+    }
+  }
+
+  while (!cb->launch_pending(NULL)) {
+    cb->pump(NULL);
+    if (!cb->connected(NULL)) {
+      auto_log(role, "lobby_disconnected");
+      return -6;
+    }
+
+    if (!is_host && !joined && auto_now_ms() >= next_list) {
+      cb->request_list(NULL);
+      next_list = auto_now_ms() + 500u;
+    }
+    if (!is_host && !joined) {
+      for (i = 0; i < cb->list_count(NULL); ++i) {
+        if (cb->list_get(NULL, i, &row) && strcmp(row.name, lobby_name) == 0 &&
+            strcmp(row.game_name, game_name()) == 0) {
+          char guest_bind[64];
+          guest_bind[0] = '\0';
+          if (cb->join(NULL, row.lobby_id, "", guest_bind) != 0) {
+            auto_log(role, "join_failed");
+            return -7;
+          }
+          joined = 1;
+          auto_log(role, "join_sent");
+          break;
+        }
+      }
+    }
+
+    if (is_host && cb->in_lobby(NULL) && cb->member_count(NULL) >= 2 &&
+        !host_ready_sent) {
+      if (cb->set_ready(NULL, 1) != 0) {
+        auto_log(role, "ready_failed");
+        return -8;
+      }
+      host_ready_sent = 1;
+      auto_log(role, "ready_sent");
+    }
+    if (is_host && host_ready_sent && cb->all_ready(NULL) && !start_sent) {
+      if (cb->request_start(NULL, &settings) != 0) {
+        auto_log(role, "start_failed");
+        return -9;
+      }
+      start_sent = 1;
+      auto_log(role, "start_sent");
+    }
+
+    if (auto_now_ms() >= deadline) {
+      auto_log(role, "launch_timeout");
+      return -10;
+    }
+    auto_sleep_ms(10);
+  }
+  if (!cb->fill_launch(NULL, out)) {
+    auto_log(role, "invalid_launch");
+    return -11;
+  }
+  fprintf(stderr,
+          "[netplay selftest] role=%s stage=launch slot=%d session=%u "
+          "bind=%s peer=%s\n",
+          role, out->local_slot, (unsigned)out->session_id, out->bind_hostport,
+          out->peer_hostport);
+  return 0;
 }
 
 #endif /* RECOMP_LAUNCHER || SNES_HOST_HAS_RECOMP_UI */

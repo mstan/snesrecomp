@@ -66,6 +66,17 @@ int snes_host_lobby_in_lan(void);
  * (prefer over inventing a second error channel in each title). */
 void snes_host_lobby_set_runtime_error(const char *error_code);
 
+#if defined(RECOMP_LAUNCHER) || defined(SNES_HOST_HAS_RECOMP_UI)
+/*
+ * Headless MotK self-test (no ImGui). Leaves the lobby WebSocket open after
+ * success so ICE signaling can continue. Requires snes_host_lobby_init first.
+ * Returns 0 on launch filled into *out; negative stage codes on failure.
+ */
+int snes_host_lobby_auto_launch(const char *role, const char *player_name,
+                                const char *lobby_name, unsigned timeout_ms,
+                                RecompLauncherCNetplayLaunch *out);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
