@@ -44,6 +44,10 @@ function(_snesrecomp_add_recomp_net)
     set(RNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     if(SNESRECOMP_NET_ICE)
         set(RNET_ENABLE_ICE ON CACHE BOOL "" FORCE)
+        # Ship static libjuice inside recomp_net so coop binaries run without a
+        # system libjuice.so (Fedora/remote hosts). Override with
+        # -DRNET_ICE_BUNDLE_STATIC=OFF if you intentionally link a shared juice.
+        set(RNET_ICE_BUNDLE_STATIC ON CACHE BOOL "" FORCE)
     else()
         set(RNET_ENABLE_ICE OFF CACHE BOOL "" FORCE)
     endif()

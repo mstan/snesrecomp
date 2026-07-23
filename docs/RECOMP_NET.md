@@ -90,11 +90,21 @@ for (;;) {
 
 Transport selection (`cfg.transport` / `SNES_NET_TRANSPORT`):
 
-- **LAN** — `rnet_session_start_lan` using lobby-rewritten bind/peer hostports.
+- **LAN** — `rnet_session_start_lan` (LAN file-registry / `SNES_NET_TRANSPORT=lan`).
 - **ICE** — `rnet_session_start_ice` + MotK lobby `op:signal` relay
   (`snes_lobby_send_signal` / `snes_lobby_poll_signal`). Requires
   `SNESRECOMP_NET_ICE=ON` and a live lobby WebSocket (launcher keeps it across
-  Launch). Auto picks ICE when the peer hostport is not private/loopback.
+  Launch).
+
+**Auto policy:** a seated MotK hosted room **always** uses ICE — even when
+MotK rewrites `0.0.0.0` binds to a private TCP peer IP. That rewrite is often
+wrong on hairpinned LAN paths (e.g. router `.1` instead of the peer NIC) and
+must not demote hosted play to direct UDP. Pure LAN file-registry (no MotK
+seat) stays on LAN.
+
+**libjuice bundling:** with `SNESRECOMP_NET_ICE=ON`, recomp-net defaults to
+`RNET_ICE_BUNDLE_STATIC=ON` (FetchContent static juice linked into
+`recomp_net`) so Linux game binaries do not need a distro `libjuice.so`.
 
 Rules that matter for SNES recomp hosts:
 

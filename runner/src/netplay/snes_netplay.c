@@ -280,53 +280,41 @@ static void drain_lobby_signals(void)
 static void drain_lobby_signals(void) {}
 #endif
 
-static int hostport_is_private(const char *hostport)
-{
-    char host[64];
-    const char *colon;
-    size_t n;
-    unsigned a = 0, b = 0;
-    if (!hostport || !hostport[0]) return 1;
-    colon = strrchr(hostport, ':');
-    n = colon ? (size_t)(colon - hostport) : strlen(hostport);
-    if (n >= sizeof(host)) n = sizeof(host) - 1;
-    memcpy(host, hostport, n);
-    host[n] = '\0';
-    if (host[0] == '[') return 0; /* IPv6: treat as public / use ICE */
-    if (strcmp(host, "localhost") == 0) return 1;
-    if (sscanf(host, "%u.%u", &a, &b) < 1) return 0;
-    if (a == 127) return 1;
-    if (a == 10) return 1;
-    if (a == 192 && b == 168) return 1;
-    if (a == 172 && b >= 16 && b <= 31) return 1;
-    return 0;
-}
-
 static int resolve_use_ice(const SnesNetplayConfig *cfg)
 {
+    int in_motk_room = 0;
+
     if (cfg->transport == 2) return 0; /* force LAN */
-#if defined(RNET_ENABLE_ICE) && defined(SNES_HAS_LOBBY_CLIENT)
-    if (!snes_lobby_connected() || !snes_lobby_in_lobby()) {
-        if (cfg->transport == 1)
-            fprintf(stderr, "snes_netplay: ICE requested but lobby not connected\n");
-        if (cfg->transport == 1)
-            return -1;
-        return 0;
-    }
-    if (cfg->transport == 1) return 1; /* force ICE */
-    return !hostport_is_private(cfg->peer_hostport);
-#else
-    int online_requested = cfg->transport == 1;
 #if defined(SNES_HAS_LOBBY_CLIENT)
-    if (cfg->transport == 0 && snes_lobby_connected() &&
-        snes_lobby_in_lobby() && !hostport_is_private(cfg->peer_hostport))
-        online_requested = 1;
+    in_motk_room = snes_lobby_connected() && snes_lobby_in_lobby();
 #endif
-    if (online_requested) {
-        fprintf(stderr,
-                "snes_netplay: online peer requires ICE, but ICE is not "
-                "available in this build\n");
-        return -1;
+
+#if defined(RNET_ENABLE_ICE) && defined(SNES_HAS_LOBBY_CLIENT)
+    if (cfg->transport == 1) {
+        if (!in_motk_room) {
+            fprintf(stderr,
+                    "snes_netplay: ICE requested but MotK lobby not connected\n");
+            return -1;
+        }
+        return 1;
+    }
+    /* Auto: hosted MotK room always uses ICE. Do not demote to LAN when the
+     * lobby rewrites 0.0.0.0 binds to a private TCP peer IP (often wrong —
+     * e.g. router .1). LAN file-registry (no MotK seat) stays on LAN UDP. */
+    if (in_motk_room)
+        return 1;
+    return 0;
+#else
+    {
+        int online_requested = cfg->transport == 1 ||
+                               (cfg->transport == 0 && in_motk_room);
+        if (online_requested) {
+            fprintf(stderr,
+                    "snes_netplay: hosted lobby requires ICE, but ICE is not "
+                    "available in this build (configure with "
+                    "SNESRECOMP_NET_ICE=ON)\n");
+            return -1;
+        }
     }
     return 0;
 #endif
