@@ -954,3 +954,17 @@ void cpu_state_init(CpuState *cpu, uint8 *ram) {
     /* NLR pending-skip is NOT on CpuState — it's a function-local in
      * each emitted v2 function. See cpu_state.h for design rationale. */
 }
+
+/* Default empty RAM-routine guard table for games whose generated
+ * dispatch_v2.c predates ram-routine AOT emission. Regenerated dispatch
+ * provides strong definitions that override these on ELF/Mach-O. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+const RamRoutineGuard g_ram_routine_guards[] = {
+    { 0xFFFFFFFFu, 0u, 0u },
+};
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+const unsigned g_ram_routine_guard_count = 0;

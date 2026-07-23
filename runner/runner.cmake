@@ -101,3 +101,7 @@ set(SNESRECOMP_RUNNER_INCLUDE_DIRS
 # Does nothing unless SNESRECOMP_ENABLE_NET=ON or the game calls
 # snesrecomp_enable_recomp_net(<target>).
 include(${SNESRECOMP_RUNNER_ROOT}/recomp_net.cmake)
+
+# Optional Dear ImGui pre-boot launcher (lib/recomp-ui submodule).
+# Games call snesrecomp_enable_launcher_ui(<target>) after add_executable.
+include(${SNESRECOMP_RUNNER_ROOT}/recomp_ui.cmake)
