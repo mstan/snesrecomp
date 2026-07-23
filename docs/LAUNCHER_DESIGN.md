@@ -45,7 +45,7 @@ Online lobby handoff: recomp-ui prepares `guest_bind` (prefer UDP 7778) before
 
 ## What was removed
 
-- RmlUi + FreeType submodules (`lib/RmlUi`, `lib/freetype`)
-- In-tree `runner/src/launcher/launcher_gui.*` and Rml markup/assets
+- Legacy GUI + FreeType submodules
+- In-tree `runner/src/launcher/launcher_gui.*` and legacy markup/assets
 - `tools/build_launcher_deps.ps1`
 - `lib/recomp-ui` submodule and `runner/recomp_ui.cmake` (games own the UI pin)

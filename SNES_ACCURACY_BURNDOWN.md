@@ -727,7 +727,7 @@ no comparable rendered scene without input injection.
   5 pre-existing stale RTS-ABI tests fail). **SMW builds + runs:** repointed the
   junction, full regen (multi-tier tier-down cleared the unresolved-IndirectGoto
   stubs → `interp_tier_dispatch_balanced`), synced funcs.h, inited the
-  RmlUi/freetype submodules + built their libs, added `ppu_dma_trace.c` to the
+  legacy GUI/font submodules + built their libs, added `ppu_dma_trace.c` to the
   vcxproj (SMW branch `reconcile/multitier-cycle-build`). **Production|x64
   built, 0 errors; soak = PASS:** ~130 s of attract (frames 59→7859) at a
   locked 60 fps (one 59 at first-second ramp), zero watchdog/abandon/stub-fire/
