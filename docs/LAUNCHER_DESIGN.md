@@ -1,18 +1,27 @@
 # snesrecomp Launcher — Design
 
-Status: **SHIPPED via recomp-ui** · 2026-07-22
+Status: **SHIPPED via recomp-ui** · 2026-07-23
 
-The pre-boot launcher is no longer an in-tree RmlUi UI. Every snesrecomp game
-uses the shared Dear ImGui launcher from the `lib/recomp-ui` submodule
-([mstan/recomp-ui](https://github.com/mstan/recomp-ui)).
+The pre-boot launcher is not part of the snesrecomp engine tree. Games that
+need the shared Dear ImGui launcher vendor
+[mstan/recomp-ui](https://github.com/mstan/recomp-ui) as a **repo-root**
+submodule and wire it themselves. snesrecomp keeps only recomp-net (and the
+lobby / netplay host facades that recomp-ui drives through callbacks).
 
 ## Integration
 
 ```cmake
+# In the game repo (not snesrecomp):
+#   git submodule add https://github.com/mstan/recomp-ui.git recomp-ui
+
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 add_executable(MyGame ...)
-snesrecomp_enable_launcher_ui(MyGame)   # runner/recomp_ui.cmake
-snesrecomp_enable_recomp_net(MyGame)    # optional lobby + delay-sync
+
+set(RECOMP_UI_ROOT "${CMAKE_SOURCE_DIR}/recomp-ui" CACHE PATH "" FORCE)
+include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
+recomp_target_launcher_ui(MyGame)
+
+snesrecomp_enable_recomp_net(MyGame)    # lobby + delay-sync (engine)
 ```
 
 Host `main()` calls `recomp_launcher_run_window()` behind `#ifdef RECOMP_LAUNCHER`
@@ -25,13 +34,12 @@ complete host.
 - `runner/src/launcher.c` / `launcher.h` — ROM resolve, CRC/SHA, `rom.cfg`
   (console-agnostic helpers used when the GUI is skipped with `--no-launcher`)
 - Lobby / netplay backends — `snes_lobby_client.*`, `snes_netplay.*`, consumed
-  by recomp-ui through host callbacks
+  by recomp-ui through host callbacks (`snesrecomp_enable_recomp_net`)
+- `lib/recomp-net` — delay-sync / ICE transport submodule
 
 ## What was removed
 
 - RmlUi + FreeType submodules (`lib/RmlUi`, `lib/freetype`)
 - In-tree `runner/src/launcher/launcher_gui.*` and Rml markup/assets
 - `tools/build_launcher_deps.ps1`
-
-Historical RmlUi notes below this line are obsolete; keep this file as the
-pointer to recomp-ui rather than a second design track.
+- `lib/recomp-ui` submodule and `runner/recomp_ui.cmake` (games own the UI pin)
