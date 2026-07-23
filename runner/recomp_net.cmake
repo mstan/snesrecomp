@@ -74,6 +74,8 @@ function(snesrecomp_enable_recomp_net target)
         target_sources(${target} PRIVATE
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_session.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_lobby.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_app.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_lobby_client.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_ws.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_sha1.c")
@@ -83,6 +85,11 @@ function(snesrecomp_enable_recomp_net target)
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws")
     endif()
     target_compile_definitions(${target} PRIVATE SNES_HAS_LOBBY_CLIENT=1)
+    # Host lobby adapter needs recomp-ui types when the launcher is linked.
+    if(DEFINED RECOMP_UI_ROOT AND EXISTS "${RECOMP_UI_ROOT}/src/recomp_launcher.h")
+        target_include_directories(${target} PRIVATE "${RECOMP_UI_ROOT}/src")
+        target_compile_definitions(${target} PRIVATE SNES_HOST_HAS_RECOMP_UI=1)
+    endif()
     if(WIN32)
         target_link_libraries(${target} PRIVATE ws2_32)
     endif()
@@ -96,6 +103,8 @@ if(SNESRECOMP_ENABLE_NET)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_session.c"
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_lobby.c"
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_app.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_lobby_client.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_ws.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_sha1.c")

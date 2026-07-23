@@ -247,6 +247,44 @@ if (!snes_lobby_try_fill_launch(&join)) return 0;
 /* copy join.bind_hostport / peer_hostport / session_id / local_slot → out */
 ```
 
+## Engine host scaffold (`snes_host_*`)
+
+Shared MotK + LAN lobby + rematch primitives live in the runner (linked by
+`snesrecomp_enable_recomp_net`). Games should **not** copy lobby callback
+tables or soft-return glue.
+
+| API | Role |
+|-----|------|
+| `snes_host_lobby_init` / `snes_host_lobby_callbacks` | MotK WS + LAN file-registry adapter for `RecompLauncherCGameInfo.netplay` |
+| `snes_host_lobby_prepare_rematch` / `snes_host_app_begin_soft_return` | Soft-return waiting-room prep |
+| `snes_host_app_apply_launch` | Map `RecompLauncherCNetplayLaunch` → `SnesNetplayConfig` |
+| `snes_host_ensure_sdl` / `snes_host_session_reset` | Rematch SDL + `RtlGameInfo.session_reset` |
+| `snes_netplay_soft_exit_to_lobby` | Escape / peer BYE → lobby |
+| `snes_host_barrier_admit` | Optional shared MotK admit loop (pad sample remains game-owned) |
+
+Minimal game wiring:
+
+```c
+SnesHostLobbyIdentity id = {
+  .game_name = "My Game",
+  .game_version = SNES_GAME_VERSION,
+  .lan_registry_path = "netplay_lan_lobby.txt",
+};
+SnesHostLobbyOpts opts = { .rematch_set_ready = 1, .fill_match_caps = MyCaps };
+snes_host_lobby_init(&id, &opts);
+gi.netplay = snes_host_lobby_callbacks();
+
+/* session_reboot: */
+snes_host_ensure_sdl();
+snes_host_session_reset(); /* → RtlGameInfo.session_reset */
+
+/* after match soft-return: */
+snes_host_app_begin_soft_return(&gi, /*set_resume_room=*/1);
+/* recomp_launcher_run_window(...); then snes_host_app_apply_launch(...) */
+```
+
+Reference consumer: MetalWarriorsSNESRecomp `src/main.c` (lobby table removed).
+
 ## Layering policy (prefer engine / UI over game trees)
 
 **Default:** put networking optimizations and launcher/netplay UX fixes in

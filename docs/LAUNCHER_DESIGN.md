@@ -50,8 +50,8 @@ related hooks) — see `docs/RECOMP_NET.md` → "Layering policy".
 - `runner/src/launcher.c` / `launcher.h` — ROM resolve, CRC/SHA, `rom.cfg`
   (console-agnostic helpers used when the GUI is skipped with `--no-launcher`)
 - Lobby / netplay backends — `snes_lobby_client.*`, `snes_netplay.*`,
-  `snes_host_session.*`, consumed by recomp-ui through host callbacks
-  (`snesrecomp_enable_recomp_net`)
+  `snes_host_session.*`, `snes_host_lobby.*`, `snes_host_app.*` (MotK+LAN
+  adapter + rematch helpers for recomp-ui via `snesrecomp_enable_recomp_net`)
 - `lib/recomp-net` — delay-sync / ICE transport submodule
 
 ## What was removed
