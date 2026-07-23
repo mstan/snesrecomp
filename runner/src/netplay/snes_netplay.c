@@ -84,6 +84,7 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
 
 int  snes_netplay_active(void) { return 0; }
 int  snes_netplay_is_running(void) { return 0; }
+const char *snes_netplay_transport_name(void) { return "none"; }
 int  snes_netplay_local_slot(void) { return -1; }
 int  snes_netplay_input_player(void) { return 0; }
 uint32_t snes_netplay_sim_tick(void) { return 0; }
@@ -279,15 +280,26 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
 #if defined(RNET_ENABLE_ICE) && defined(SNES_HAS_LOBBY_CLIENT)
     if (!snes_lobby_connected() || !snes_lobby_in_lobby()) {
         if (cfg->transport == 1)
-            fprintf(stderr, "snes_netplay: ICE requested but lobby not connected — LAN\n");
+            fprintf(stderr, "snes_netplay: ICE requested but lobby not connected\n");
+        if (cfg->transport == 1)
+            return -1;
         return 0;
     }
     if (cfg->transport == 1) return 1; /* force ICE */
     return !hostport_is_private(cfg->peer_hostport);
 #else
-    if (cfg->transport == 1)
-        fprintf(stderr, "snes_netplay: ICE not available in this build — LAN\n");
-    (void)cfg;
+    int online_requested = cfg->transport == 1;
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    if (cfg->transport == 0 && snes_lobby_connected() &&
+        snes_lobby_in_lobby() && !hostport_is_private(cfg->peer_hostport))
+        online_requested = 1;
+#endif
+    if (online_requested) {
+        fprintf(stderr,
+                "snes_netplay: online peer requires ICE, but ICE is not "
+                "available in this build\n");
+        return -1;
+    }
     return 0;
 #endif
 }
@@ -300,6 +312,12 @@ int snes_netplay_active(void)
 int snes_netplay_is_running(void)
 {
     return snes_netplay_active() && rnet_session_is_running(g_np.session);
+}
+
+const char *snes_netplay_transport_name(void)
+{
+    if (!snes_netplay_active()) return "none";
+    return g_np.use_ice ? "ice" : "lan";
 }
 
 int snes_netplay_local_slot(void)
@@ -388,6 +406,8 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     in_player = (cfg->input_player == 1) ? 1 : 0;
 
     use_ice = resolve_use_ice(cfg);
+    if (use_ice < 0)
+        return -4;
 
     memset(&host, 0, sizeof(host));
     host.sample_local = host_sample_local;
@@ -407,16 +427,18 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
         rnet_ice_config_init_defaults(&ice);
         ice.controlling = (rcfg.local_slot == 0) ? 1u : 0u;
         if (rnet_session_start_ice(g_np.session, &ice) != 0) {
-            fprintf(stderr, "snes_netplay: start_ice failed — falling back to LAN\n");
+            fprintf(stderr,
+                    "snes_netplay: start_ice failed; refusing unsafe LAN "
+                    "fallback for an online lobby\n");
             rnet_session_destroy(g_np.session);
-            host.on_signal = NULL;
-            g_np.session = rnet_session_create(&rcfg, &host);
-            if (!g_np.session) return -2;
-            use_ice = 0;
+            g_np.session = NULL;
+            return -4;
         }
 #else
-        fprintf(stderr, "snes_netplay: ICE requested but not built; using LAN\n");
-        use_ice = 0;
+        fprintf(stderr, "snes_netplay: ICE requested but not built\n");
+        rnet_session_destroy(g_np.session);
+        g_np.session = NULL;
+        return -4;
 #endif
     }
 
