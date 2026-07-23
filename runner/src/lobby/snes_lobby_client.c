@@ -32,8 +32,11 @@ int  snes_lobby_join(const char *a, const char *b, const char *c)
 { (void)a; (void)b; (void)c; return -1; }
 int  snes_lobby_leave(void) { return -1; }
 int  snes_lobby_kick(int slot) { (void)slot; return -1; }
+int  snes_lobby_move(int from_slot, int to_slot)
+{ (void)from_slot; (void)to_slot; return -1; }
 int  snes_lobby_in_lobby(void) { return 0; }
 int  snes_lobby_is_host(void) { return 0; }
+const char *snes_lobby_host_player_id(void) { return ""; }
 const SnesLobbyJoinInfo *snes_lobby_join_info(void)
 {
     static SnesLobbyJoinInfo z;
@@ -121,6 +124,7 @@ typedef struct {
     int list_count;
     int in_lobby;
     int is_host;
+    char host_player_id[SNES_LOBBY_ID_LEN];
     char my_bind[SNES_LOBBY_ENDPOINT_LEN];
     char filter_game_name[SNES_LOBBY_NAME_LEN];
     char filter_game_version[SNES_LOBBY_VERSION_LEN];
@@ -565,6 +569,9 @@ static void parse_slots_array(const char *json)
                 if (g_lc.player_id[0] &&
                     strcmp(g_lc.members[n].player_id, g_lc.player_id) == 0) {
                     g_lc.local_ready = g_lc.members[n].ready;
+                    /* Seat swaps only arrive via lobby_update slots — keep
+                     * join.local_slot in sync for launch / netplay_cfg. */
+                    g_lc.join.local_slot = g_lc.members[n].slot;
                 }
                 ++n;
                 p = end;
@@ -720,6 +727,11 @@ static void handle_server_json(const char *json)
         g_lc.join.local_slot = json_get_int(json, "local_slot", 0);
         json_get_str(json, "host_endpoint", g_lc.join.host_endpoint, sizeof(g_lc.join.host_endpoint));
         json_get_str(json, "guest_endpoint", g_lc.join.guest_endpoint, sizeof(g_lc.join.guest_endpoint));
+        json_get_str(json, "host_player_id", g_lc.host_player_id,
+                     sizeof(g_lc.host_player_id));
+        if (!g_lc.host_player_id[0])
+            strncpy(g_lc.host_player_id, g_lc.player_id,
+                    sizeof(g_lc.host_player_id) - 1);
         g_lc.join.player_count = 1;
         g_lc.join.max_slots = 2;
         g_lc.join.last_error[0] = '\0';
@@ -752,6 +764,8 @@ static void handle_server_json(const char *json)
         g_lc.join.local_slot = json_get_int(json, "local_slot", 1);
         json_get_str(json, "host_endpoint", g_lc.join.host_endpoint, sizeof(g_lc.join.host_endpoint));
         json_get_str(json, "guest_endpoint", g_lc.join.guest_endpoint, sizeof(g_lc.join.guest_endpoint));
+        json_get_str(json, "host_player_id", g_lc.host_player_id,
+                     sizeof(g_lc.host_player_id));
         g_lc.join.player_count = 2;
         g_lc.join.max_slots = 2;
         g_lc.join.last_error[0] = '\0';
@@ -765,6 +779,8 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "lobby_update") == 0) {
         json_get_str(json, "host_endpoint", g_lc.join.host_endpoint, sizeof(g_lc.join.host_endpoint));
         json_get_str(json, "guest_endpoint", g_lc.join.guest_endpoint, sizeof(g_lc.join.guest_endpoint));
+        json_get_str(json, "host_player_id", g_lc.host_player_id,
+                     sizeof(g_lc.host_player_id));
         g_lc.join.player_count = json_get_int(json, "player_count", g_lc.join.player_count);
         g_lc.join.max_slots = json_get_int(json, "max_slots", g_lc.join.max_slots);
         g_lc.join.session_id = (uint32_t)json_get_int(json, "session_id", (int)g_lc.join.session_id);
@@ -826,6 +842,7 @@ static void handle_server_json(const char *json)
         strcmp(op, "kicked") == 0) {
         g_lc.in_lobby = 0;
         g_lc.is_host = 0;
+        g_lc.host_player_id[0] = '\0';
         g_lc.member_count = 0;
         g_lc.local_ready = 0;
         g_lc.all_ready = 0;
@@ -1190,6 +1207,7 @@ int snes_lobby_leave(void)
     flush_pending();
     g_lc.in_lobby = 0;
     g_lc.is_host = 0;
+    g_lc.host_player_id[0] = '\0';
     g_lc.member_count = 0;
     g_lc.local_ready = 0;
     g_lc.all_ready = 0;
@@ -1211,6 +1229,23 @@ int snes_lobby_kick(int slot)
     return 0;
 }
 
+int snes_lobby_move(int from_slot, int to_slot)
+{
+    char msg[96];
+    if (!snes_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host)
+        return -1;
+    if (from_slot < 0 || from_slot >= SNES_LOBBY_MAX_MEMBERS ||
+        to_slot < 0 || to_slot >= SNES_LOBBY_MAX_MEMBERS ||
+        from_slot == to_slot)
+        return -1;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"move\",\"from_slot\":%d,\"to_slot\":%d}",
+             from_slot, to_slot);
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
 int snes_lobby_in_lobby(void)
 {
     return g_lc.in_lobby;
@@ -1219,6 +1254,11 @@ int snes_lobby_in_lobby(void)
 int snes_lobby_is_host(void)
 {
     return g_lc.is_host;
+}
+
+const char *snes_lobby_host_player_id(void)
+{
+    return g_lc.host_player_id;
 }
 
 const SnesLobbyJoinInfo *snes_lobby_join_info(void)

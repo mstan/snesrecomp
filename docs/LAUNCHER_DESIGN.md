@@ -35,6 +35,11 @@ Online lobby handoff: recomp-ui prepares `guest_bind` (prefer UDP 7778) before
 `snes_lobby_try_fill_launch()` from `fill_launch`. See
 `docs/RECOMP_NET.md` → "Lobby join / launch handoff".
 
+Soft-return rematch (peer quit / Escape → waiting room → Play again) has
+several host pitfalls — **SDL must be re-inited** after the launcher's
+`SDL_Quit()`, peer disconnect must not show a modal, and the emu session must
+cold-boot. Checklist: `docs/RECOMP_NET.md` → "Soft-return rematch checklist".
+
 ## What stayed in snesrecomp
 
 - `runner/src/launcher.c` / `launcher.h` — ROM resolve, CRC/SHA, `rom.cfg`

@@ -113,8 +113,14 @@ int  snes_lobby_leave(void);
 /* Host: remove the player seated in `slot` (not the host). Returns 0 if sent. */
 int  snes_lobby_kick(int slot);
 
+/* Host: swap (or move into empty) seats. Returns 0 if sent; server broadcasts
+ * lobby_update. LAN file-registry hosts handle seat flips in the game callback. */
+int  snes_lobby_move(int from_slot, int to_slot);
+
 int  snes_lobby_in_lobby(void);
 int  snes_lobby_is_host(void);
+/* Lobby host's player_id (stable across seat swaps); empty if unknown. */
+const char *snes_lobby_host_player_id(void);
 /* Filled after create/join/lobby_update; peer endpoints for PsxNetplayConfig. */
 const SnesLobbyJoinInfo *snes_lobby_join_info(void);
 

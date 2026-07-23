@@ -152,10 +152,12 @@ Rules that matter for SNES recomp hosts:
     forced to that camera (P1: `$1E16`/`$1E18`; P2: `$1E1A`/`$1E1C`). Stable
     half→full Y: OAM=BG `base+8`; present undoes unified emit `+$78`. Dual HDMA
     skipped. BG1 rebuild keys `$7F` from `$7E:42B3` at the **local** present
-    cam (not dual sticky/`$1E36`, which is one shared P1-oriented strip and
-    pinned both peers' floors to P1 with violent shake). Sticky/live is
-    fallback only when 42B3 is unset. Opt out with
-    `SNESRECOMP_MW_H2H_BG1_REBUILD=0` (regressive). BG2 `$7F` rebuild only when
+    cam. Dual sticky/`$1E36` is one shared strip — Y-walk it only when it
+    shares a `$7F` column with local 42B3 (column gate). Each cam keeps a
+    per-slot `$7F` snap (DMA-attributed + NMI); present prefers that cache
+    and skips void writes so the non-streamed peer does not blank floors
+    into sky. Opt out with `SNESRECOMP_MW_H2H_BG1_REBUILD=0` (regressive).
+    BG2 `$7F` rebuild only when
     streaming; narrow idle BG2 (elevators) uses the 1P `retainHistory` +
     west-ROM path and tracks the local camera when dual BG2 WRAM mirrors are
     `$0`.
@@ -267,3 +269,96 @@ cmake --build lib/_build --target recomp_net
 Hand-maintained `.vcxproj` games must add the include path
 `snesrecomp/lib/recomp-net/include` and link the resulting static library
 themselves (same pattern as other optional runner libs).
+
+## Soft-return rematch checklist (game hosts)
+
+Titles that soft-return to recomp-ui after a match (Escape / window close /
+peer leave) and then **Play** again share one process. The pitfalls below
+showed up in Super Mario World Co-op and Metal Warriors — bake them into every
+new netplay host.
+
+### 1. `join()` ABI — pass UI `guest_bind`
+
+```c
+int (*join)(void *ctx, const char *lobby_id, const char *password,
+            char *guest_bind /* in/out, capacity >= 64 */);
+```
+
+recomp-ui fills `guest_bind` (prefer `7778`..) before calling. Online hosts
+**must** pass that buffer to `snes_lobby_join(..., guest_bind)`. Passing
+`NULL`/ignoring it used to advertise `peer_ip:0`; the engine still normalizes
+that as a safety net, but the UI bind is the contract. LAN file-registry joins
+may ignore `guest_bind`.
+
+### 2. Peer disconnect → soft lobby return, no modal
+
+When `snes_netplay_peer_disconnected()` trips because the other player quit
+(or the link dropped mid-match):
+
+- Call the same soft-exit path as local Escape / `SDL_QUIT`
+  (`snes_netplay_shutdown` + `snes_netplay_request_return_to_lobby()`).
+- Do **not** show `SDL_ShowSimpleMessageBox` / zenity for that case — the
+  remaining peer should land back in the waiting room automatically.
+- Keep modals for **connect timeouts** (firewall / ICE hints are useful).
+
+Symptom if wrong: dialog *"The other player stopped responding"* then a
+manual OK before lobby resume.
+
+### 3. Re-init SDL after soft-return rematch
+
+recomp-ui's `launcher_platform_close()` calls **`SDL_Quit()`** (see
+[recomp-ui](https://github.com/mstan/recomp-ui) `launcher_platform_sdl2.c` /
+`sdl3.c`). That tears down video **and** audio.
+
+If the game's `session_reboot:` label sits *after* the one-time boot
+`SDL_Init`, a rematch `goto session_reboot` will create a window but fail
+audio with:
+
+```text
+Audio subsystem is not initialized
+Failed to open audio device
+```
+
+At the top of `session_reboot` (before creating the window / opening audio):
+
+```c
+if (!SDL_WasInit(SDL_INIT_VIDEO) || !SDL_WasInit(SDL_INIT_AUDIO) ||
+    !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0)
+    return 1;
+}
+```
+
+### 4. Cold-boot the emulation session on rematch
+
+Soft-return keeps lobby WebSocket state; the **emulation** session must still
+be a cold boot on both peers:
+
+- Free / recreate `Snes`, clear game-local sticky latches (e.g. LLE resume PC).
+- Skip autosave load/save around rematch so peers do not diverge.
+- Re-arm netplay from the new `RecompLauncherCNetplayLaunch` (bind/peer/
+  session_id/slot) before `snes_netplay_start`.
+
+Metal Warriors: `MwSessionReset()` before `SnesInit`. SMW Co-op:
+`SmwSessionReset()` before `SnesInit` (clears `g_did_reset` /
+`g_first_frame_done` so rematch re-runs `I_RESET`), plus zero pad/turbo/
+netplay-started flags at `session_reboot` and reload the ROM buffer if freed.
+
+### 5. Offline Play after soft-return must `session_reboot`
+
+The post-match `recomp_launcher_run_window` can return **LAUNCH** with
+`netplay_launch.enabled == 0` (user left the room / hit Play offline). That
+is still a launch — disconnect the lobby, clear `g_netplay_pending`, and
+`goto session_reboot`. Do **not** treat “LAUNCH && !net.enabled” as quit.
+
+Symptom if wrong: log `lobby closed after match; exiting` immediately after
+choosing offline Play.
+
+### Reference hosts
+
+| Title | Soft-return + rematch |
+|-------|------------------------|
+| MetalWarriorsSNESRecomp | `src/main.c` `session_reboot` + lobby resume |
+| SuperMarioWorldRecomp (`SMW_BUILD_COOP`) | `src/main.c` + `smw_netplay_lobby.c` |
+
+Also see `docs/LAUNCHER_DESIGN.md` and recomp-ui `docs/HOST_NETPLAY.md`.
