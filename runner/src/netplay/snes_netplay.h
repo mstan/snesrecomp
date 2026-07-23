@@ -26,9 +26,8 @@ extern "C" {
  *
  * Pad blob (4 bytes per slot):
  *   [0..1] LE uint16 — 12 SNES controller bits (RtlRunFrame low 12 / 12..23)
- *   [2..3] host RNG seed — DP $1A/$1B (Metal Warriors; copied from host slot 0
- *          into WRAM on every admitted tick so scramble / new-battlefield
- *          rolls match). Guest pad bytes are ignored for seed apply.
+ *   [2..3] optional game-defined deterministic sync bytes. Slot 0 is
+ *          authoritative and its bytes are applied before each admitted frame.
  *
  * Transport:
  *   LAN  — rnet_session_start_lan(bind, peer)
@@ -53,6 +52,15 @@ typedef struct SnesNetplayConfig {
 void snes_netplay_config_defaults(SnesNetplayConfig *cfg);
 void snes_netplay_apply_env(SnesNetplayConfig *cfg);
 
+/* Optional game-specific deterministic state carried in pad bytes 2..3.
+ * Games that need this (for example, for an RNG seed) register both callbacks
+ * before starting netplay. With no callbacks, these bytes stay zero and the
+ * generic runtime never touches game WRAM. */
+typedef void (*SnesNetplayCaptureSyncBytes)(uint8_t out[2]);
+typedef void (*SnesNetplayApplySyncBytes)(const uint8_t in[2]);
+void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
+                                      SnesNetplayApplySyncBytes apply);
+
 int  snes_netplay_active(void);
 int  snes_netplay_is_running(void);
 int  snes_netplay_local_slot(void);
@@ -73,15 +81,15 @@ int  snes_netplay_peer_disconnected(uint32_t timeout_ms);
 /*
  * Pump + try_admit. On success, published pads are ready via
  * snes_netplay_published_inputs(). Returns 1 if admitted, 0 if stall.
- * Also applies host RNG seed ($1A/$1B) from slot-0 pad bytes before sim.
+ * Also applies the optional slot-0 game sync bytes before simulation.
  */
 int  snes_netplay_poll_admit(void);
 
 /* Call after RtlRunFrame for an admitted tick. */
 void snes_netplay_finish_frame(void);
 
-/* Re-apply host RNG seed from the last admit (normally done inside poll_admit). */
-void snes_netplay_apply_host_rng(void);
+/* Re-apply the last slot-0 game sync bytes (normally done inside poll_admit). */
+void snes_netplay_apply_host_sync(void);
 
 /* P1 | (P2<<12) button bits from the last successful publish (0 if none). */
 uint32_t snes_netplay_published_inputs(void);

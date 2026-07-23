@@ -13,15 +13,10 @@
 #include "../debug_server.h"
 
 extern Ppu *g_ppu;
-/* Strong definition in game RTL (mw_rtl.c); weak no-op for standalone runner. */
-void MwNotifyBg2MapDma(uint8_t aBank, uint16_t aAdr, uint16_t vmadd,
-                       uint16_t size) __attribute__((weak));
-void MwNotifyBg2MapDma(uint8_t aBank, uint16_t aAdr, uint16_t vmadd,
-                       uint16_t size) {
-  (void)aBank;
-  (void)aAdr;
-  (void)vmadd;
-  (void)size;
+static DmaVramNotifyHook g_vram_notify_hook;
+
+void dma_set_vram_notify_hook(DmaVramNotifyHook hook) {
+  g_vram_notify_hook = hook;
 }
 
 static const int bAdrOffsets[8][4] = {
@@ -291,7 +286,8 @@ void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
         const DmaChannel *ch = &dma->channel[i];
         if (ch->bAdr != 0x18 && ch->bAdr != 0x19)
           continue;
-        MwNotifyBg2MapDma(ch->aBank, ch->aAdr, g_ppu->vramPointer, ch->size);
+        if (g_vram_notify_hook)
+          g_vram_notify_hook(ch->aBank, ch->aAdr, g_ppu->vramPointer, ch->size);
       }
     }
   }

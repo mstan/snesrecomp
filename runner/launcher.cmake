@@ -53,6 +53,45 @@ function(snesrecomp_ensure_launcher_libs)
                      "${CMAKE_BINARY_DIR}/_deps/RmlUi-build" EXCLUDE_FROM_ALL)
 endfunction()
 
+# MotK WebSocket lobby client (runner/src/lobby). Needed by snes_netplay ICE
+# signalling and by games that use recomp-ui (RECOMP_LAUNCHER) without the
+# legacy RmlUi snesrecomp_enable_launcher path.
+function(snesrecomp_enable_lobby target)
+    if(NOT TARGET ${target})
+        message(FATAL_ERROR
+            "snesrecomp_enable_lobby: '${target}' is not a CMake target. "
+            "Call this after add_executable(${target} ...).")
+    endif()
+    # Idempotent — RmlUi launcher and recomp-ui games may both request it.
+    get_target_property(_already ${target} SNESRECOMP_LOBBY_ENABLED)
+    if(_already)
+        return()
+    endif()
+    set_target_properties(${target} PROPERTIES SNESRECOMP_LOBBY_ENABLED 1)
+
+    set(_lobby_root "${SNESRECOMP_RUNNER_ROOT}/src/lobby")
+    set(_lobby_ws_dir "${_lobby_root}/ws")
+
+    target_sources(${target} PRIVATE ${_lobby_root}/snes_lobby_client.c)
+    target_include_directories(${target} PRIVATE ${_lobby_root})
+
+    if(EXISTS "${_lobby_ws_dir}/rnet_ws.c" AND EXISTS "${_lobby_ws_dir}/rnet_sha1.c")
+        target_sources(${target} PRIVATE
+            ${_lobby_ws_dir}/rnet_ws.c
+            ${_lobby_ws_dir}/rnet_sha1.c)
+        target_include_directories(${target} PRIVATE ${_lobby_ws_dir})
+        target_compile_definitions(${target} PRIVATE SNES_HAS_LOBBY_CLIENT=1)
+        message(STATUS "snesrecomp lobby client enabled (${target})")
+    else()
+        message(STATUS
+            "snesrecomp lobby stubs only for ${target} (ws helpers missing)")
+    endif()
+
+    if(WIN32 OR MINGW)
+        target_link_libraries(${target} PRIVATE ws2_32)
+    endif()
+endfunction()
+
 # Link the RmlUi launcher into a game executable.
 function(snesrecomp_enable_launcher target)
     if(NOT SNESRECOMP_LAUNCHER)
@@ -66,29 +105,15 @@ function(snesrecomp_enable_launcher target)
     endif()
 
     snesrecomp_ensure_launcher_libs()
+    snesrecomp_enable_lobby(${target})
 
     set(_launcher_root "${SNESRECOMP_RUNNER_ROOT}/src/launcher")
-    set(_lobby_root "${SNESRECOMP_RUNNER_ROOT}/src/lobby")
-    set(_lobby_ws_dir "${_lobby_root}/ws")
 
     target_sources(${target} PRIVATE
         ${_launcher_root}/launcher_gui.cpp
-        ${_lobby_root}/snes_lobby_client.c
         ${SNESRECOMP_LIB_ROOT}/RmlUi/Backends/RmlUi_Platform_SDL.cpp
         ${SNESRECOMP_LIB_ROOT}/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
     )
-
-    # MotK-style WebSocket lobby helpers (talk to recomp-net-server, not recomp-net).
-    if(EXISTS "${_lobby_ws_dir}/rnet_ws.c" AND EXISTS "${_lobby_ws_dir}/rnet_sha1.c")
-        target_sources(${target} PRIVATE
-            ${_lobby_ws_dir}/rnet_ws.c
-            ${_lobby_ws_dir}/rnet_sha1.c)
-        target_include_directories(${target} PRIVATE ${_lobby_ws_dir})
-        target_compile_definitions(${target} PRIVATE SNES_HAS_LOBBY_CLIENT=1)
-        message(STATUS "snesrecomp launcher: lobby client enabled")
-    else()
-        message(STATUS "snesrecomp launcher: lobby client stubs only (ws helpers missing)")
-    endif()
 
     # Vendored GL3 backend uses std::all_of without <algorithm> on some GCC.
     if(NOT MSVC)
@@ -99,7 +124,6 @@ function(snesrecomp_enable_launcher target)
 
     target_include_directories(${target} PRIVATE
         ${_launcher_root}
-        ${_lobby_root}
         ${SNESRECOMP_LIB_ROOT}/RmlUi/Include
         ${SNESRECOMP_LIB_ROOT}/RmlUi/Backends
     )

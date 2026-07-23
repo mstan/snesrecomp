@@ -102,6 +102,8 @@ set(SNESRECOMP_RUNNER_INCLUDE_DIRS
 # snesrecomp_enable_recomp_net(<target>).
 include(${SNESRECOMP_RUNNER_ROOT}/recomp_net.cmake)
 
-# Optional RmlUi pre-boot launcher. See docs/LAUNCHER_DESIGN.md.
-# Games opt in with snesrecomp_enable_launcher(<target>) after add_executable.
+# Optional RmlUi pre-boot launcher + MotK lobby client helper.
+# See docs/LAUNCHER_DESIGN.md.
+#   snesrecomp_enable_lobby(<target>)     — lobby client only (recomp-ui games)
+#   snesrecomp_enable_launcher(<target>)  — legacy RmlUi UI + lobby
 include(${SNESRECOMP_RUNNER_ROOT}/launcher.cmake)

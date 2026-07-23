@@ -112,6 +112,9 @@ int  snes_lobby_join(const char *lobby_id, const char *password,
 
 int  snes_lobby_leave(void);
 
+/* Host: remove the player seated in `slot` (not the host). Returns 0 if sent. */
+int  snes_lobby_kick(int slot);
+
 int  snes_lobby_in_lobby(void);
 int  snes_lobby_is_host(void);
 /* Filled after create/join/lobby_update; peer endpoints for PsxNetplayConfig. */

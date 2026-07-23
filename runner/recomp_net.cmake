@@ -80,9 +80,21 @@ endfunction()
 # pick it up without a separate helper call.
 if(SNESRECOMP_ENABLE_NET)
     _snesrecomp_add_recomp_net()
+    list(APPEND SNESRECOMP_RUNNER_SOURCES
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c"
+        "${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_lobby_client.c"
+        "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_ws.c"
+        "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_sha1.c")
     list(APPEND SNESRECOMP_RUNNER_LIBRARIES recomp_net)
     list(APPEND SNESRECOMP_RUNNER_INCLUDE_DIRS
-        "${SNESRECOMP_RECOMP_NET_ROOT}/include")
+        "${SNESRECOMP_RECOMP_NET_ROOT}/include"
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay"
+        "${SNESRECOMP_RUNNER_ROOT}/src/lobby"
+        "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws")
+    add_compile_definitions(SNESRECOMP_NET=1 SNES_HAS_LOBBY_CLIENT=1)
+    if(WIN32)
+        list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
+    endif()
     message(STATUS
         "SNESRECOMP_ENABLE_NET: recomp-net linked via SNESRECOMP_RUNNER_LIBRARIES"
         " (ICE=${SNESRECOMP_NET_ICE})")

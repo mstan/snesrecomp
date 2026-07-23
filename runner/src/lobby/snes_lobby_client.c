@@ -31,6 +31,7 @@ int  snes_lobby_create(const char *a, const char *b, const char *c, const char *
 int  snes_lobby_join(const char *a, const char *b, const char *c)
 { (void)a; (void)b; (void)c; return -1; }
 int  snes_lobby_leave(void) { return -1; }
+int  snes_lobby_kick(int slot) { (void)slot; return -1; }
 int  snes_lobby_in_lobby(void) { return 0; }
 int  snes_lobby_is_host(void) { return 0; }
 const SnesLobbyJoinInfo *snes_lobby_join_info(void)
@@ -767,7 +768,8 @@ static void handle_server_json(const char *json)
         g_lc.join.ok = 0;
         return;
     }
-    if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0) {
+    if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
+        strcmp(op, "kicked") == 0) {
         g_lc.in_lobby = 0;
         g_lc.is_host = 0;
         g_lc.member_count = 0;
@@ -1133,6 +1135,19 @@ int snes_lobby_leave(void)
     g_lc.all_ready = 0;
     g_lc.launch_pending = 0;
     match_caps_clear(&g_lc.match_caps);
+    return 0;
+}
+
+int snes_lobby_kick(int slot)
+{
+    char msg[64];
+    if (!snes_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host)
+        return -1;
+    if (slot < 0 || slot >= SNES_LOBBY_MAX_MEMBERS)
+        return -1;
+    snprintf(msg, sizeof(msg), "{\"op\":\"kick\",\"slot\":%d}", slot);
+    queue_send(msg);
+    flush_pending();
     return 0;
 }
 
