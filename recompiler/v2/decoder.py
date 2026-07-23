@@ -2014,8 +2014,12 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         # not as mnemonic JML.  Key the frame size off the
                         # already-resolved dispatch width so PHK+PEA+JML
                         # consumes all three synthetic return bytes.
+                        configured_frame_size = auth.get('frame_size')
+                        insn.dispatch_configured_stack_bytes = (
+                            configured_frame_size or 0)
                         insn.dispatch_consumed_stack_bytes = (
-                            3 if insn.dispatch_kind == 'long' else 2)
+                            configured_frame_size or
+                            (3 if insn.dispatch_kind == 'long' else 2))
                     # Register each in-bank target as a decode successor
                     # so reach-analysis + auto-promote pick up the handlers.
                     extra_succs = []
@@ -2038,8 +2042,12 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     succ = [k for (k, _) in extra_succs]
                     decode_succs = list(extra_succs)
                     if is_ptr_call:
-                        nxt = _pea_ptrcall_return_pc(
-                            rom, bank, pc, (pc + insn.length) & 0xFFFF)
+                        nxt = auth.get('return_pc')
+                        if nxt is None:
+                            nxt = _pea_ptrcall_return_pc(
+                                rom, bank, pc, (pc + insn.length) & 0xFFFF)
+                        nxt &= 0xFFFF
+                        insn.dispatch_return_pc = nxt
                         nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
                         succ = [nxt_key]
                         # Candidate handlers are cross-function call demands,

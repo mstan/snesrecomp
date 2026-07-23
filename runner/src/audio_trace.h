@@ -98,10 +98,14 @@ typedef struct AudioTraceStats {
                                * `dropped`; THIS counter going nonzero
                                * means audible music was discarded.      */
   uint64_t consumed;          /* total native samples read for output   */
+  uint64_t fast_forward_discarded; /* stale queued samples removed only
+                                    * on the fast-forward -> normal edge */
+  uint64_t output_underflows; /* callbacks with <1 guest-produced block */
   uint64_t consume_calls;     /* dsp_getSamples calls (audio callbacks) */
   uint64_t reg_writes;        /* DSP register writes                    */
   uint64_t kon_writes;        /* writes to $4C (KON)                    */
   uint32_t occupancy_highwater;
+  uint32_t occupancy_current;
   uint64_t event_count;       /* events recorded (monotonic)            */
   uint64_t snap_count;        /* snapshots recorded (monotonic)         */
   /* APU catch-up pacing (rtl_accumulate_apu_catchup):                  */
@@ -109,6 +113,8 @@ typedef struct AudioTraceStats {
                                   /* no consumer was draining the ring  */
   uint64_t pace_accumulate_calls; /* catch-up accumulations (APU touches)*/
   uint32_t pace_consumer_active;  /* consumer draining at last catch-up */
+  uint64_t guest_frame_sync_cycles;
+  uint64_t guest_read_sync_cycles;
   /* Port-traffic totals (appended; events themselves are in the ring). */
   uint64_t cpu_port_writes;       /* every CPU write to $2140-43        */
   uint64_t spc_port_reads_seen;   /* every SPC read of $F4-F7 (raw)     */
@@ -193,6 +199,10 @@ void audio_trace_on_echo_div(double d);
 /* Per catch-up accumulation: consumer state + wall-clock baseline cycles
  * injected (0 when a consumer is draining or no wall time elapsed). */
 void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles);
+void audio_trace_on_guest_sync(int frame_boundary, uint64_t cycles);
+void audio_trace_on_fast_forward_discard(uint32_t samples,
+                                         uint32_t occupancy_after);
+void audio_trace_on_output_underflow(uint32_t occupancy);
 /* CPU<->SPC port traffic. port = 0-3. All call sites hold RtlApuLock.
  * The SPC-read / CPU-read hooks gate internally (value change or fresh
  * counterpart write); callers pass every access unconditionally. */
@@ -232,7 +242,7 @@ uint32_t audio_trace_copy_snaps(uint64_t first_idx, uint32_t max,
 /* Write a 32 kHz stereo 16-bit WAV of PCM-ring samples
  * [start_idx, start_idx+count). start_idx<0 / count==0 mean "everything
  * still in the ring". Returns 0 on success, writes the actually-dumped
- * range to *out_start/*out_count. */
+ * range through out_start and out_count. */
 int audio_trace_dump_wav(const char *path, int64_t start_idx, uint64_t count,
                          uint64_t *out_start, uint64_t *out_count);
 

@@ -351,9 +351,26 @@ def test_return_short_emits_return_stmt():
 
 def test_blockmove_mvn_increments():
     op = BlockMove(direction='mvn', src_bank=0x7E, dst_bank=0x7F)
-    s = _joined(emit_op(op))
+    s = _joined(emit_op(op, source_pc24=0x808E7A))
     assert "cpu->X = (uint16)(cpu->X +1)" in s
     assert "cpu->Y = (uint16)(cpu->Y +1)" in s
+    assert "do {" in s
+    assert "while (cpu->A != 0xFFFF)" in s
+    assert "cpu->cycles += 7" in s
+    assert "cpu->master_cycles += 7 * (g_memsel ? 6 : 8)" in s
+    assert "interp_bridge_lle_master_deadline_reached(cpu)" in s
+    assert "interp_bridge_lle_yield_unwind(cpu, 0x808e7au)" in s
+    assert "cpu->X &= 0x00FFu" in s
+
+
+def test_blockmove_mvp_decrements_and_can_move_65536_bytes():
+    op = BlockMove(direction='mvp', src_bank=0x7F, dst_bank=0x7E)
+    s = _joined(emit_op(op, source_pc24=0x008000))
+    assert "cpu->X = (uint16)(cpu->X -1)" in s
+    assert "cpu->Y = (uint16)(cpu->Y -1)" in s
+    # A=$FFFF means 65,536 bytes, not zero bytes, so the first transfer must
+    # occur before the continuation test.
+    assert s.index("do {") < s.index("while (cpu->A != 0xFFFF)")
 
 
 def test_pea_pushes_immediate_onto_stack():

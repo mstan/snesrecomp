@@ -39,6 +39,14 @@ static void rtl_write_tier2_coverage_manifest(void) {
                                              : "unknown");
 }
 
+/* Registered game title (e.g. "mmx", "Rockman X (Japan v1.1)"), or "unknown"
+ * before registration. Lets framework code (debug_server tier2_dump) name
+ * per-variant coverage artifacts without pulling the whole struct. */
+const char *rtl_game_title(void) {
+  return (g_rtl_game_info && g_rtl_game_info->title) ? g_rtl_game_info->title
+                                                     : "unknown";
+}
+
 void RtlRegisterGame(const RtlGameInfo *info) {
   g_rtl_game_info = info;
   /* Arm MSU-1 from the environment for every game, with no per-game

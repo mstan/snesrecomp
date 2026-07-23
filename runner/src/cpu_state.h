@@ -470,6 +470,22 @@ typedef struct DispatchEntry {
 extern const DispatchEntry g_dispatch_table[];
 extern const unsigned       g_dispatch_table_count;
 
+/* RAM-routine guard: a WRAM-resident ($7E/$7F) AOT body is literal recompilation
+ * of a snapshot of runtime-generated code. Because WRAM is mutable, dispatch to
+ * such a body is permitted ONLY while the live bytes still hash-match the exact
+ * snapshot that was recompiled; on any mismatch the runtime falls back to the
+ * faithful interpreter floor (which runs whatever the real bytes now are) with
+ * a loud log. `hash` is FNV-1a over [pc24, pc24+len) matching the emitter and
+ * `ram_routine_hash` in interp_bridge.c. Sorted by pc24 for binary search. */
+typedef struct RamRoutineGuard {
+    uint32 pc24;
+    uint32 len;
+    uint32 hash;
+} RamRoutineGuard;
+
+extern const RamRoutineGuard g_ram_routine_guards[];
+extern const unsigned        g_ram_routine_guard_count;
+
 uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24);
 
 /* Dispatch on a popped trampoline target. A known row with no exact live M/X
@@ -626,6 +642,7 @@ RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32 addr_pc24,
  * host stack unwinds. */
 #define RECOMP_RETURN_LLE_UNWIND_BASE 0x40000000
 int interp_bridge_in_lle_scheduler(void);
+int interp_bridge_lle_master_deadline_reached(const CpuState *cpu);
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24);
 uint32 interp_bridge_lle_resume_pc(void);
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,

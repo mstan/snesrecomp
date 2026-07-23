@@ -7,7 +7,6 @@
 #include "launcher_gui.h"
 
 #include <RmlUi/Core.h>
-#include <RmlUi/Core/Elements/ElementFormControl.h>
 #include <RmlUi/Core/Elements/ElementFormControlSelect.h>
 #include "RmlUi_Renderer_GL3.h"
 #include "RmlUi_Platform_SDL.h"
@@ -29,7 +28,6 @@ extern "C" {
 #include "crc32.h"
 #include "sha256.h"
 #include "keybinds.h"
-#include "snes_lobby_client.h"
 }
 
 #ifdef _WIN32
@@ -147,72 +145,9 @@ void open_in_explorer(const char* path) {
     ShellExecuteA(nullptr, "open", path, nullptr, nullptr, SW_SHOWNORMAL);
 }
 #else
-// POSIX native dialogs via zenity / kdialog / qarma / osascript (MotK pattern).
-// Win32 double-null filters aren't portable; title is honored, extensions are not.
-namespace {
-std::string sh_squote(const std::string& s) {
-    std::string q = "'";
-    for (char c : s) { if (c == '\'') q += "'\\''"; else q += c; }
-    return q + "'";
-}
-std::string run_chooser(const std::string& cmd) {
-    std::string out;
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return out;
-    char buf[2048];
-    if (fgets(buf, sizeof(buf), p)) out = buf;
-    int rc = pclose(p);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
-    if (rc != 0) out.clear();
-    return out;
-}
-} // namespace
-
-bool pick_file(const char* title, const char*, char* out, size_t max_len) {
-    out[0] = '\0';
-    std::string t = sh_squote(title ? title : "Select file");
-    std::string r;
-    if (!(r = run_chooser("command -v zenity >/dev/null 2>&1 && "
-            "zenity --file-selection --title=" + t + " 2>/dev/null")).empty()) {
-        /* fall through */
-    } else if (!(r = run_chooser("command -v kdialog >/dev/null 2>&1 && "
-            "kdialog --getopenfilename \"${HOME:-/}\" 2>/dev/null")).empty()) {
-        /* fall through */
-    } else if (!(r = run_chooser("command -v qarma >/dev/null 2>&1 && "
-            "qarma --file-selection --title=" + t + " 2>/dev/null")).empty()) {
-        /* fall through */
-    } else {
-        r = run_chooser("command -v osascript >/dev/null 2>&1 && "
-            "osascript -e 'POSIX path of (choose file)' 2>/dev/null");
-    }
-    if (r.empty() || r.size() >= max_len) return false;
-    std::snprintf(out, max_len, "%s", r.c_str());
-    return true;
-}
-bool pick_folder(char* out, size_t max_len) {
-    out[0] = '\0';
-    std::string r;
-    if (!(r = run_chooser("command -v zenity >/dev/null 2>&1 && "
-            "zenity --file-selection --directory --title='Select folder' "
-            "2>/dev/null")).empty()) {
-        /* fall through */
-    } else if (!(r = run_chooser("command -v kdialog >/dev/null 2>&1 && "
-            "kdialog --getexistingdirectory \"${HOME:-/}\" 2>/dev/null")).empty()) {
-        /* fall through */
-    } else {
-        r = run_chooser("command -v osascript >/dev/null 2>&1 && "
-            "osascript -e 'POSIX path of (choose folder)' 2>/dev/null");
-    }
-    if (r.empty() || r.size() >= max_len) return false;
-    std::snprintf(out, max_len, "%s", r.c_str());
-    return true;
-}
-void open_in_explorer(const char* path) {
-    if (!path || !path[0]) return;
-    std::string p = sh_squote(path);
-    (void)run_chooser("command -v xdg-open >/dev/null 2>&1 && xdg-open " + p +
-                      " >/dev/null 2>&1 & echo ok");
-}
+bool pick_file(const char*, const char*, char* out, size_t) { out[0] = '\0'; return false; }
+bool pick_folder(char* out, size_t) { out[0] = '\0'; return false; }
+void open_in_explorer(const char*) {}
 #endif
 
 // Apply an IPS patch (classic 8-byte-offset format) from `patch` onto a copy of
@@ -456,24 +391,11 @@ std::string hotkey_capture_string(const SDL_Keysym& ks) {
 // ----------------------------------------------------------------------------
 
 struct Model {
-    // "home" | "dashboard" | "settings" | "controller" |
-    // "netplay_lobbies" | "netplay_room"
-    Rml::String view = "home";
-    bool show_footer = false;
-    bool netplay_mode = false;
-    // True when the binary was built with recomp-net (SNESRECOMP_NET).
-    bool netplay_available =
-#if defined(SNESRECOMP_NET)
-        true
-#else
-        false
-#endif
-        ;
+    Rml::String view = "dashboard";
 
     Rml::String game_name, game_region;
     bool has_boxart = false;            // a boxart.tga is bundled beside launcher.rml
     bool widescreen_supported = true;   // hide the Widescreen settings panel when false
-    bool show_player2 = true;           // offline P2 row; false for 1-player titles
 
     bool rom_loaded = false;
     Rml::String rom_file, rom_size, rom_header, rom_crc, rom_sha;
@@ -486,12 +408,10 @@ struct Model {
     Rml::String msu1_dir;
     bool msu1_pack_found = false;
 
-    // Connected SDL controllers (GUID + human name). Dropdown values use the
-    // GUID so a Refresh rematch keeps each player's selection stable.
-    struct PadInfo { std::string guid; std::string name; };
-    std::vector<PadInfo> pads;
-    // Selected pad index per player when source is Gamepad (-1 = saved GUID offline).
-    int player_pad[2] = {0, 0};
+    // Names of the SDL game controllers actually plugged in, index 0..N. Used to
+    // label the dropdowns with the real device ("DualShock 4 Controller") instead
+    // of a generic "Gamepad N".
+    std::vector<std::string> pad_names;
 
     Rml::String p1_src_label = "Keyboard", p2_src_label = "Gamepad";
     Rml::String p1_status = "Enabled", p2_status = "Enabled";
@@ -499,12 +419,6 @@ struct Model {
     // Real <select> dropdowns: per-player option lists + the selected token.
     std::vector<SrcOption> p1_options, p2_options;
     Rml::String p1_src_value = "kbd", p2_src_value = "none";
-
-    // Refresh-button pulse (shared by offline + netplay dashboard).
-    Rml::String dev_refresh_label = "Refresh";
-    bool        dev_refresh_busy  = false;
-    bool        dev_refresh_done  = false;
-    Uint32      dev_refresh_until = 0;
 
     // SAVES panel is hidden entirely for games with no battery SRAM
     // (gi.sram_path == NULL, e.g. MMX — a password game).
@@ -528,193 +442,56 @@ struct Model {
     int cfg_deadzone = 30;
 
     bool status_ready = false;
-
-    // Lobby browser / room
-    Rml::String lobby_status = "Not connected";
-    Rml::String lobby_table_html;
-    Rml::String room_table_html;
-    Rml::String room_lobby_title = "Lobby";
-    int  lobby_selected = -1;
-    bool lobby_join_enabled = false;
-    bool lobby_can_launch = false;
-    bool lobby_is_host = false;
-    bool lobby_local_ready = false;
-    bool show_host_modal = false;
-    bool show_join_pw_modal = false;
-    bool show_name_modal = false;
-    bool name_modal_is_change = false;
-    Rml::String name_modal_hint;
-    Rml::String host_display_name;
-    Rml::String name_draft;
-    Rml::String host_lobby_name = "My Lobby";
-    Rml::String host_lobby_password;
-    Rml::String join_lobby_password;
-    Rml::String selected_lobby_id;
-    bool selected_has_password = false;
-    bool netplay_launch_ready = false;
-    bool launch_requested = false;
 };
 
-using PadInfo = Model::PadInfo;
-
-// Enumerate connected SDL controllers (GUID + name). Prefers GameController
-// name, falls back to raw joystick name. Gamecontroller subsystem must be up.
-std::vector<PadInfo> enumerate_pads() {
-    std::vector<PadInfo> pads;
+// Enumerate the connected SDL controllers, returning their human names in
+// connection order. Prefers the GameController name, falls back to the raw
+// joystick name. SDL's gamecontroller subsystem must already be initialised.
+std::vector<std::string> enumerate_pads() {
+    std::vector<std::string> names;
     int n = SDL_NumJoysticks();
     for (int i = 0; i < n; i++) {
-        SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
-        char guid[40] = {0};
-        SDL_JoystickGetGUIDString(g, guid, sizeof(guid));
         const char* nm = SDL_IsGameController(i) ? SDL_GameControllerNameForIndex(i)
                                                  : SDL_JoystickNameForIndex(i);
-        pads.push_back({ guid, (nm && *nm) ? nm : "Controller" });
+        names.emplace_back(nm && *nm ? nm : "Controller");
     }
-    return pads;
+    return names;
 }
 
-int find_pad_index(const std::vector<PadInfo>& pads, const char* guid) {
-    if (!guid || !guid[0]) return -1;
-    for (int i = 0; i < (int)pads.size(); i++)
-        if (pads[i].guid == guid) return i;
-    return -1;
-}
-
-void set_player_device(SnesLauncherSettings& io, int p, const char* token) {
-    if (p < 0 || p > 1) return;
-    std::snprintf(io.player_device[p], sizeof(io.player_device[p]), "%s",
-                  token ? token : "");
-}
-
-// Seed empty player_device[] from player_src + pad list (first launch / legacy).
-void seed_player_devices(SnesLauncherSettings& io, const std::vector<PadInfo>& pads) {
-    for (int p = 0; p < 2; p++) {
-        if (io.player_device[p][0]) continue;
-        if (io.player_src[p] == InputSource::None) {
-            set_player_device(io, p, "none");
-        } else if (io.player_src[p] == InputSource::Keyboard) {
-            set_player_device(io, p, "keyboard");
-        } else if (!pads.empty()) {
-            int idx = (p < (int)pads.size()) ? p : 0;
-            set_player_device(io, p, pads[idx].guid.c_str());
-        } else {
-            /* Gamepad requested but nothing plugged — keep empty so sync can
-             * fall back to Keyboard/None without inventing a fake GUID. */
-        }
-    }
-}
-
-// Build dropdown options: None, Keyboard, every connected pad (GUID value),
-// plus a "(offline)" row when a saved GUID is not currently plugged in.
-void build_src_options(std::vector<SrcOption>& opts,
-                       const std::vector<PadInfo>& pads,
-                       const char* saved_device) {
+// Build a player's dropdown options: None, Keyboard, and that player's connected
+// controller (port p -> pad p) if present. value is the stable token the change
+// handler decodes back into an InputSource.
+void build_src_options(std::vector<SrcOption>& opts, int player,
+                       const std::vector<std::string>& pads) {
     opts.clear();
     opts.push_back({ "none", "None" });
     opts.push_back({ "kbd",  "Keyboard" });
-    for (int i = 0; i < (int)pads.size(); i++) {
-        std::string label = pads[i].name.empty() ? "Controller" : pads[i].name;
-        bool dup = false;
-        for (int j = 0; j < (int)pads.size(); j++) {
-            if (j != i && pads[j].name == pads[i].name) { dup = true; break; }
-        }
-        if (dup) {
-            char suff[24];
-            std::snprintf(suff, sizeof(suff), " (#%d)", i + 1);
-            label += suff;
-        }
-        opts.push_back({ pads[i].guid, label });
-    }
-    if (saved_device && saved_device[0] &&
-        std::strcmp(saved_device, "none") != 0 &&
-        std::strcmp(saved_device, "keyboard") != 0 &&
-        find_pad_index(pads, saved_device) < 0) {
-        opts.push_back({ saved_device, "Saved controller (offline)" });
-    }
+    if (player >= 0 && player < (int)pads.size())
+        opts.push_back({ "pad", pads[player] });
 }
 
-bool value_is_pad(const Rml::String& v) {
-    return v != "none" && v != "kbd" && v != "keyboard" && !v.empty();
-}
-Rml::String src_to_value(const SnesLauncherSettings& io, int p,
-                         const std::vector<PadInfo>& pads, int pad_idx) {
-    if (io.player_src[p] == InputSource::Keyboard) return "kbd";
-    if (io.player_src[p] == InputSource::None) return "none";
-    if (io.player_device[p][0] &&
-        std::strcmp(io.player_device[p], "none") != 0 &&
-        std::strcmp(io.player_device[p], "keyboard") != 0)
-        return io.player_device[p];
-    if (pad_idx >= 0 && pad_idx < (int)pads.size())
-        return pads[pad_idx].guid;
-    return "none";
+const char* src_to_value(InputSource s) {
+    return s == InputSource::Keyboard ? "kbd"
+         : s == InputSource::Gamepad  ? "pad"
+         : "none";
 }
 InputSource value_to_src(const Rml::String& v) {
-    if (v == "kbd" || v == "keyboard") return InputSource::Keyboard;
-    if (value_is_pad(v)) return InputSource::Gamepad;
+    if (v == "kbd") return InputSource::Keyboard;
+    if (v == "pad") return InputSource::Gamepad;
     return InputSource::None;
 }
 
-void apply_src_value(SnesLauncherSettings& io, Model& m, int p, const Rml::String& v) {
-    io.player_src[p] = value_to_src(v);
-    if (io.player_src[p] == InputSource::None) {
-        set_player_device(io, p, "none");
-        m.player_pad[p] = 0;
-    } else if (io.player_src[p] == InputSource::Keyboard) {
-        set_player_device(io, p, "keyboard");
-        m.player_pad[p] = 0;
-    } else {
-        set_player_device(io, p, v.c_str());
-        m.player_pad[p] = find_pad_index(m.pads, v.c_str());
-    }
-}
-
-std::string src_label(const SnesLauncherSettings& io, int p,
-                      const std::vector<PadInfo>& pads, int pad_idx) {
-    switch (io.player_src[p]) {
+std::string src_label(InputSource s, int player, const std::vector<std::string>& pads) {
+    switch (s) {
         case InputSource::None:     return "None";
         case InputSource::Keyboard: return "Keyboard";
         case InputSource::Gamepad:
-            if (pad_idx >= 0 && pad_idx < (int)pads.size() && !pads[pad_idx].name.empty())
-                return pads[pad_idx].name;
-            if (io.player_device[p][0])
-                return "Saved controller (offline)";
-            return "Gamepad (not connected)";
+            if (player >= 0 && player < (int)pads.size() && !pads[player].empty())
+                return pads[player];
+            return player == 0 ? "Gamepad 1 (not connected)"
+                               : "Gamepad 2 (not connected)";
     }
     return "None";
-}
-
-// Rematch Gamepad selections by GUID after a rescan. Preserves None/Keyboard.
-// A saved GUID that is temporarily unplugged stays selected (offline option).
-void sync_pad_selection(SnesLauncherSettings& io, Model& m) {
-    for (int p = 0; p < 2; p++) {
-        const char* d = io.player_device[p];
-        if (d[0] && std::strcmp(d, "none") == 0) {
-            io.player_src[p] = InputSource::None;
-            m.player_pad[p] = 0;
-            continue;
-        }
-        if (d[0] && (std::strcmp(d, "keyboard") == 0 || std::strcmp(d, "kbd") == 0)) {
-            io.player_src[p] = InputSource::Keyboard;
-            m.player_pad[p] = 0;
-            continue;
-        }
-        if (io.player_src[p] != InputSource::Gamepad && !(d[0] && value_is_pad(d)))
-            continue;
-        io.player_src[p] = InputSource::Gamepad;
-        int idx = find_pad_index(m.pads, d);
-        if (idx >= 0) {
-            m.player_pad[p] = idx;
-        } else if (d[0]) {
-            m.player_pad[p] = -1; /* offline — keep GUID */
-        } else if (m.pads.empty()) {
-            io.player_src[p] = (p == 0) ? InputSource::Keyboard : InputSource::None;
-            set_player_device(io, p, p == 0 ? "keyboard" : "none");
-            m.player_pad[p] = 0;
-        } else {
-            m.player_pad[p] = (p < (int)m.pads.size()) ? p : 0;
-            set_player_device(io, p, m.pads[m.player_pad[p]].guid.c_str());
-        }
-    }
 }
 
 void refresh_settings_labels(Model& m, const SnesLauncherSettings& s) {
@@ -735,10 +512,10 @@ void refresh_settings_labels(Model& m, const SnesLauncherSettings& s) {
     m.volume = s.volume;
     m.p1_enabled = s.player_src[0] != InputSource::None;
     m.p2_enabled = s.player_src[1] != InputSource::None;
-    m.p1_src_label = src_label(s, 0, m.pads, m.player_pad[0]);
-    m.p2_src_label = src_label(s, 1, m.pads, m.player_pad[1]);
-    m.p1_src_value = src_to_value(s, 0, m.pads, m.player_pad[0]);
-    m.p2_src_value = src_to_value(s, 1, m.pads, m.player_pad[1]);
+    m.p1_src_label = src_label(s.player_src[0], 0, m.pad_names);
+    m.p2_src_label = src_label(s.player_src[1], 1, m.pad_names);
+    m.p1_src_value = src_to_value(s.player_src[0]);
+    m.p2_src_value = src_to_value(s.player_src[1]);
     m.p1_status = m.p1_enabled ? "Enabled" : "Disabled";
     m.p2_status = m.p2_enabled ? "Enabled" : "Disabled";
     m.msu1_enabled = s.msu1_enabled;
@@ -804,250 +581,13 @@ bool load_fonts(const fs::path& assets) {
     if (!any) {
         if (Rml::LoadFontFace("C:/Windows/Fonts/segoeui.ttf")) any = true;
     }
+    // Register a symbol fallback so glyphs missing from Lato (the check mark,
+    // chevron, play triangle, note, warning sign, minus, etc.) render instead of
+    // tofu boxes. fallback_face=true means it's only consulted for codepoints the
+    // primary faces lack.
+    Rml::LoadFontFace("C:/Windows/Fonts/seguisym.ttf", /*fallback_face=*/true);
 #endif
-    // Outline symbol fallback for glyphs LatoLatin lacks (▶, ✓, ‹, ♪, ⚠, 🔒,
-    // etc.). Prefer the bundled Noto Sans Symbols 2 (same as psxrecomp);
-    // color-emoji CBDT faces are a last resort. fallback_face=true means these
-    // are only consulted for missing codepoints.
-    bool symbols = false;
-    const char* symbol_bundled[] = {
-        "fonts/NotoSansSymbols2-Regular.ttf",
-        "NotoSansSymbols2-Regular.ttf",
-    };
-    for (const char* rel : symbol_bundled) {
-        fs::path p = assets / rel;
-        if (fs::exists(p) && Rml::LoadFontFace(p.generic_string(), /*fallback_face=*/true)) {
-            symbols = true;
-            break;
-        }
-    }
-    if (!symbols) {
-        const char* symbol_sys[] = {
-#ifdef _WIN32
-            "C:/Windows/Fonts/seguisym.ttf",
-            "C:/Windows/Fonts/seguiemj.ttf",
-#elif defined(__APPLE__)
-            "/System/Library/Fonts/Apple Symbols.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/Library/Fonts/Arial Unicode.ttf",
-#else
-            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-            "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-#endif
-        };
-        for (const char* path : symbol_sys) {
-            if (fs::exists(path) && Rml::LoadFontFace(path, /*fallback_face=*/true)) {
-                symbols = true;
-                break;
-            }
-        }
-    }
-    (void)symbols;
     return any;
-}
-
-std::string rml_escape(const std::string& s) {
-    std::string o;
-    for (char c : s) {
-        switch (c) {
-            case '&': o += "&amp;";  break;
-            case '<': o += "&lt;";   break;
-            case '>': o += "&gt;";   break;
-            case '"': o += "&quot;"; break;
-            case '\'':o += "&#39;";  break;
-            default:  o += c;        break;
-        }
-    }
-    return o;
-}
-
-void sync_footer_flag(Model& m) {
-    m.show_footer = (m.view == "dashboard" || m.view == "settings" || m.view == "controller");
-}
-
-void refresh_lobby_table(Model& m) {
-    std::string html;
-    const int n = snes_lobby_list_count();
-    for (int i = 0; i < n; ++i) {
-        SnesLobbyRow row{};
-        if (!snes_lobby_list_get(i, &row)) continue;
-        const bool sel = (i == m.lobby_selected);
-        char players[32];
-        std::snprintf(players, sizeof(players), "%d/%d", row.player_count, row.max_slots);
-        html += "<div class=\"lobby-row";
-        if (sel) html += " sel";
-        html += "\" data-event-click=\"lobby_select(";
-        html += std::to_string(i);
-        html += ")\">";
-        html += "<span class=\"lobby-c-name\">" + rml_escape(row.name) + "</span>";
-        {
-            std::string game_label = row.game_name;
-            if (row.game_version[0]) {
-                game_label += " (";
-                game_label += row.game_version;
-                game_label += ")";
-            }
-            html += "<span class=\"lobby-c-game\">" + rml_escape(game_label) + "</span>";
-        }
-        html += "<span class=\"lobby-c-players\">";
-        html += players;
-        html += "</span><span class=\"lobby-c-lock\">";
-        if (row.has_password) html += "&#128274;";
-        html += "</span></div>";
-    }
-    if (html.empty()) {
-        html = "<div class=\"lobby-row\"><span class=\"lobby-c-name\">No lobbies yet — host one.</span></div>";
-    }
-    m.lobby_table_html = html;
-    m.lobby_join_enabled = (m.lobby_selected >= 0 && m.lobby_selected < n);
-    if (snes_lobby_connected()) {
-        m.lobby_status = "Connected — select a lobby or host";
-    } else {
-        m.lobby_status = "Disconnected — is the lobby server running?";
-    }
-}
-
-void refresh_room_table(Model& m) {
-    std::string html;
-    const int n = snes_lobby_member_count();
-    for (int i = 0; i < n; ++i) {
-        SnesLobbyMember mem{};
-        if (!snes_lobby_member_get(i, &mem)) continue;
-        html += "<div class=\"lobby-row\">";
-        html += "<span class=\"lobby-c-name\">" + rml_escape(mem.display_name) + "</span>";
-        html += "<span class=\"room-c-slot\">P";
-        html += std::to_string(mem.slot + 1);
-        html += "</span><span class=\"room-c-ready";
-        if (mem.ready) html += " on";
-        html += "\">";
-        html += mem.ready ? "Ready" : "Not ready";
-        html += "</span></div>";
-    }
-    if (html.empty()) {
-        html = "<div class=\"lobby-row\"><span class=\"lobby-c-name\">Waiting for players…</span></div>";
-    }
-    m.room_table_html = html;
-    m.lobby_is_host = snes_lobby_is_host() != 0;
-    m.lobby_local_ready = snes_lobby_local_ready() != 0;
-    m.lobby_can_launch = m.lobby_is_host && snes_lobby_all_ready() != 0;
-    if (snes_lobby_in_lobby()) {
-        char st[160];
-        std::snprintf(st, sizeof(st), "%d / %d players%s",
-                      snes_lobby_join_info()->player_count,
-                      snes_lobby_join_info()->max_slots,
-                      m.lobby_can_launch ? " — all ready" : "");
-        m.lobby_status = st;
-        if (!m.host_lobby_name.empty())
-            m.room_lobby_title = m.host_lobby_name;
-    }
-}
-
-static bool peer_host_is_private(const char* hostport) {
-    if (!hostport || !hostport[0]) return true;
-    char host[64];
-    const char* colon = std::strrchr(hostport, ':');
-    size_t n = colon ? (size_t)(colon - hostport) : std::strlen(hostport);
-    if (n >= sizeof(host)) n = sizeof(host) - 1;
-    std::memcpy(host, hostport, n);
-    host[n] = '\0';
-    if (host[0] == '[') return false;
-    if (std::strcmp(host, "localhost") == 0) return true;
-    unsigned a = 0, b = 0;
-    if (std::sscanf(host, "%u.%u", &a, &b) < 1) return false;
-    if (a == 127) return true;
-    if (a == 10) return true;
-    if (a == 192 && b == 168) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    return false;
-}
-
-/* Host sim settings snapshot for lobby match_caps negotiation.
- * force_ws_extra >= 0: title-mandated expand (hide toggle / lock peers). */
-static SnesLobbyMatchCaps match_caps_from_settings(const SnesLauncherSettings& io,
-                                                   int force_ws_extra = -1) {
-    SnesLobbyMatchCaps c{};
-    c.valid = 1;
-    c.widescreen_hud = io.widescreen_hud ? 1 : 0;
-    c.ignore_aspect = io.ignore_aspect ? 1 : 0;
-    c.input_delay = 2;
-    if (const char* e = std::getenv("SNES_NET_INPUT_DELAY")) {
-        int d = std::atoi(e);
-        if (d < 0) d = 0;
-        if (d > 16) d = 16;
-        c.input_delay = d;
-    }
-    if (force_ws_extra >= 0) {
-        int w = force_ws_extra;
-        if (w > 95) w = 95;
-        c.widescreen = w > 0 ? 1 : 0;
-        c.ws_extra = w;
-        return c;
-    }
-    c.widescreen = io.widescreen ? 1 : 0;
-    /* Always send an explicit expand so guests never fall back to a different
-     * local default (71 vs 95 desync). 0 = widescreen off. */
-    c.ws_extra = 0;
-    if (const char* e = std::getenv("SNESRECOMP_MW_NETPLAY_WS_EXTRA")) {
-        int w = std::atoi(e);
-        if (w < 0) w = 0;
-        if (w > 95) w = 95;
-        c.ws_extra = w;
-        c.widescreen = w > 0 ? 1 : c.widescreen;
-    } else if (io.widescreen) {
-        c.ws_extra = 71; /* MotK-like 16:9 */
-    }
-    return c;
-}
-
-static void apply_match_caps_to_settings(SnesLauncherSettings& io,
-                                         const SnesLobbyMatchCaps& c) {
-    if (!c.valid) return;
-    io.widescreen = c.widescreen != 0;
-    io.widescreen_hud = c.widescreen_hud != 0;
-    io.ignore_aspect = c.ignore_aspect != 0;
-}
-
-bool fill_netplay_launch(NetplayLaunch* out, SnesLauncherSettings& io) {
-    if (!out) return false;
-    *out = NetplayLaunch{};
-    const SnesLobbyJoinInfo* ji = snes_lobby_join_info();
-    const char* bind = ji->bind_hostport[0] ? ji->bind_hostport :
-                       (ji->local_slot == 0 ? "0.0.0.0:7777" : "0.0.0.0:7778");
-    if (!ji->peer_hostport[0]) {
-        return false;
-    }
-    const SnesLobbyMatchCaps* mc = snes_lobby_match_caps();
-    if (mc && mc->valid)
-        apply_match_caps_to_settings(io, *mc);
-    out->enabled = true;
-    out->session_id = ji->session_id ? ji->session_id : 1u;
-    out->local_slot = ji->local_slot;
-    /* -1 ws_extra = no host caps (legacy Phase 2a default). */
-    out->input_delay = (mc && mc->valid) ? mc->input_delay : 2;
-    if (mc && mc->valid) {
-        out->ws_extra = mc->ws_extra;
-        /* Caps with widescreen on but ws_extra 0 → MotK-like 71 (never leave
-         * guests on a different local default). */
-        if (mc->widescreen && out->ws_extra <= 0)
-            out->ws_extra = 71;
-    } else {
-        out->ws_extra = -1;
-    }
-    std::snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s", bind);
-    std::snprintf(out->peer_hostport, sizeof(out->peer_hostport), "%s", ji->peer_hostport);
-    const char* dn = snes_lobby_display_name();
-    out->display_name = (dn && dn[0]) ? dn : snes_lobby_player_id();
-    /* Private/loopback peer → LAN; public peer with live lobby → ICE. */
-    out->transport = peer_host_is_private(out->peer_hostport) ? 2 : 1;
-    if (const char* t = std::getenv("SNES_NET_TRANSPORT")) {
-        if (std::strcmp(t, "ice") == 0 || std::strcmp(t, "ICE") == 0)
-            out->transport = 1;
-        else if (std::strcmp(t, "lan") == 0 || std::strcmp(t, "LAN") == 0)
-            out->transport = 2;
-    }
-    return true;
 }
 
 } // namespace
@@ -1059,12 +599,9 @@ bool fill_netplay_launch(NetplayLaunch* out, SnesLauncherSettings& io) {
 Result run(SDL_Window* window, void* /*gl_context*/,
            SnesLauncherSettings& io, const GameInfo& game,
            const char* assets_dir, const char* initial_rom,
-           char* out_rom_path, size_t out_rom_path_len,
-           NetplayLaunch* out_net,
-           const RunOptions& opts) {
+           char* out_rom_path, size_t out_rom_path_len) {
 
     if (out_rom_path && out_rom_path_len) out_rom_path[0] = '\0';
-    if (out_net) *out_net = NetplayLaunch{};
 
     Rml::String gl_msg;
     if (!RmlGL3::Initialize(&gl_msg)) {
@@ -1106,26 +643,12 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     m.game_name = game.name ? game.name : "SNES Game";
     m.game_region = game.region ? game.region : "";
     m.msu1_supported = game.msu1_supported;
-    m.widescreen_supported =
-        game.widescreen_supported && !game.force_widescreen;
-    m.show_player2 = (game.num_players != 1);
+    m.widescreen_supported = game.widescreen_supported;
     m.msu1_note = game.msu1_note ? game.msu1_note : "";
-    const int caps_force_ws =
-        game.force_widescreen
-            ? (game.force_ws_extra > 0 ? game.force_ws_extra : 71)
-            : -1;
-    if (game.force_widescreen) {
-        io.widescreen = true;
-        io.widescreen_hud = true;
-    }
-    if (!m.show_player2) {
-        io.player_src[1] = InputSource::None;
-        std::snprintf(io.player_device[1], sizeof(io.player_device[1]), "none");
-    }
     // Need the gamecontroller subsystem to read real device names for the
     // controller dropdowns (the shim only guarantees VIDEO is up).
     SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-    m.pads = enumerate_pads();
+    m.pad_names = enumerate_pads();
     // Open connected controllers so their button/axis events reach the loop —
     // required to navigate the launcher with a gamepad (issue: controller nav).
     std::vector<SDL_GameController*> open_pads;
@@ -1133,16 +656,18 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         if (SDL_IsGameController(i))
             if (SDL_GameController* gc = SDL_GameControllerOpen(i))
                 open_pads.push_back(gc);
-    // Restore saved device tokens (or seed from player_src on first launch).
-    // Refresh rematches by GUID so Keyboard/None/Gamepad choices survive.
-    seed_player_devices(io, m.pads);
-    if (!m.show_player2) {
-        io.player_src[1] = InputSource::None;
-        std::snprintf(io.player_device[1], sizeof(io.player_device[1]), "none");
+    // Keyboard is always active (mapped in keybinds.ini), so a "Gamepad" source
+    // only makes sense when a controller is actually plugged in. If a seeded
+    // Gamepad source has no device at its index (e.g. the games default
+    // EnableGamepad=true but nothing is connected), fall back to Keyboard (P1) /
+    // None (P2) instead of showing a phantom "Gamepad N (not connected)". A real
+    // connected pad keeps Gamepad and shows the device name.
+    for (int p = 0; p < 2; p++) {
+        if (io.player_src[p] == InputSource::Gamepad && p >= (int)m.pad_names.size())
+            io.player_src[p] = (p == 0) ? InputSource::Keyboard : InputSource::None;
     }
-    sync_pad_selection(io, m);
-    build_src_options(m.p1_options, m.pads, io.player_device[0]);
-    build_src_options(m.p2_options, m.pads, io.player_device[1]);
+    build_src_options(m.p1_options, 0, m.pad_names);
+    build_src_options(m.p2_options, 1, m.pad_names);
     // A game ships boxart by dropping boxart.tga next to launcher.rml; shown when present.
     m.has_boxart = fs::exists(assets / "boxart.tga");
 
@@ -1169,19 +694,6 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     m.saves_supported = !sram_path.empty();
     refresh_save_info(m, sram_path);
     m.skip_launcher = io.skip_launcher;
-    if (io.netplay_player_name[0])
-        m.host_display_name = io.netplay_player_name;
-    sync_footer_flag(m);
-
-    if (opts.resume_netplay_room && snes_lobby_in_lobby()) {
-        m.netplay_mode = true;
-        m.view = "netplay_room";
-        m.netplay_launch_ready = false;
-        snes_lobby_set_ready(0);
-        refresh_room_table(m);
-    }
-
-    std::string game_name_s = game.name ? game.name : "SNES Game";
 
     Rml::DataModelConstructor c = context->CreateDataModel("launcher");
     if (!c) {
@@ -1202,7 +714,6 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     c.Bind("game_region", &m.game_region);
     c.Bind("has_boxart", &m.has_boxart);
     c.Bind("widescreen_supported", &m.widescreen_supported);
-    c.Bind("show_player2", &m.show_player2);
     c.Bind("rom_loaded", &m.rom_loaded);
     c.Bind("rom_file", &m.rom_file);
     c.Bind("rom_size", &m.rom_size);
@@ -1227,36 +738,12 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     c.Bind("p2_status", &m.p2_status);
     c.Bind("p1_enabled", &m.p1_enabled);
     c.Bind("p2_enabled", &m.p2_enabled);
-    c.Bind("dev_refresh_label", &m.dev_refresh_label);
-    c.Bind("dev_refresh_busy", &m.dev_refresh_busy);
-    c.Bind("dev_refresh_done", &m.dev_refresh_done);
     c.Bind("saves_supported", &m.saves_supported);
     c.Bind("save_found", &m.save_found);
     c.Bind("save_file", &m.save_file);
     c.Bind("save_size", &m.save_size);
     c.Bind("skip_launcher", &m.skip_launcher);
     c.Bind("show_skip_modal", &m.show_skip_modal);
-    c.Bind("show_footer", &m.show_footer);
-    c.Bind("netplay_mode", &m.netplay_mode);
-    c.Bind("netplay_available", &m.netplay_available);
-    c.Bind("lobby_status", &m.lobby_status);
-    c.Bind("lobby_table_html", &m.lobby_table_html);
-    c.Bind("room_table_html", &m.room_table_html);
-    c.Bind("room_lobby_title", &m.room_lobby_title);
-    c.Bind("lobby_join_enabled", &m.lobby_join_enabled);
-    c.Bind("lobby_can_launch", &m.lobby_can_launch);
-    c.Bind("lobby_is_host", &m.lobby_is_host);
-    c.Bind("lobby_local_ready", &m.lobby_local_ready);
-    c.Bind("show_host_modal", &m.show_host_modal);
-    c.Bind("show_join_pw_modal", &m.show_join_pw_modal);
-    c.Bind("show_name_modal", &m.show_name_modal);
-    c.Bind("name_modal_is_change", &m.name_modal_is_change);
-    c.Bind("name_modal_hint", &m.name_modal_hint);
-    c.Bind("host_display_name", &m.host_display_name);
-    c.Bind("name_draft", &m.name_draft);
-    c.Bind("host_lobby_name", &m.host_lobby_name);
-    c.Bind("host_lobby_password", &m.host_lobby_password);
-    c.Bind("join_lobby_password", &m.join_lobby_password);
     c.Bind("renderer_label", &m.renderer_label);
     c.Bind("scale_label", &m.scale_label);
     c.Bind("fullscreen_label", &m.fullscreen_label);
@@ -1277,15 +764,7 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     Result result = Result::Quit;
     bool running = true;
 
-    auto dirty_all = [&]() {
-        sync_footer_flag(m);
-        handle.DirtyAllVariables();
-    };
-
-    // Assigned after the document loads (needs the <select> elements). Rescans
-    // SDL joysticks for every controller slot, rebuilds dropdowns, re-opens pads.
-    // with_feedback: pulse the Refresh button label/classes (button click only).
-    std::function<void(bool /*with_feedback*/)> rescan_controllers;
+    auto dirty_all = [&]() { handle.DirtyAllVariables(); };
 
     // ---- keybind rebinding (player buttons + hotkeys) ----
     // Player buttons edit keybinds.ini through the engine's keybinds module
@@ -1380,207 +859,7 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         }
     };
 
-    // ---- navigation / mode select / netplay lobbies ----
-    c.BindEventCallback("quit", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        result = Result::Quit; running = false;
-    });
-    c.BindEventCallback("mode_offline", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.netplay_mode = false;
-        m.view = "dashboard";
-        dirty_all();
-    });
-    c.BindEventCallback("mode_netplay", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.netplay_mode = true;
-        m.view = "dashboard";
-        dirty_all();
-    });
-    auto enter_lobby_browser = [&]() {
-        m.view = "netplay_lobbies";
-        snes_lobby_set_game_identity(game_name_s.c_str(), SNES_GAME_VERSION);
-        if (!snes_lobby_connected()) {
-            snes_lobby_set_display_name(m.host_display_name.c_str());
-            if (snes_lobby_connect(snes_lobby_default_url()) != 0) {
-                m.lobby_status = "Failed to connect — start the lobby server";
-            }
-        }
-        snes_lobby_request_list();
-        refresh_lobby_table(m);
-        dirty_all();
-    };
-    c.BindEventCallback("show_netplay_lobbies", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        if (m.host_display_name.empty()) {
-            m.name_draft = "";
-            m.name_modal_is_change = false;
-            m.name_modal_hint =
-                "Saved locally for next time. Shown to other players in lobbies.";
-            m.show_name_modal = true;
-            dirty_all();
-            return;
-        }
-        enter_lobby_browser();
-    });
-    c.BindEventCallback("lobby_change_name", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.name_draft = m.host_display_name;
-        m.name_modal_is_change = true;
-        m.name_modal_hint =
-            "Saved locally for next time. Shown to other players in lobbies.";
-        m.show_name_modal = true;
-        dirty_all();
-    });
-    c.BindEventCallback("lobby_name_cancel", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.show_name_modal = false; dirty_all();
-    });
-    c.BindEventCallback("lobby_name_confirm", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        Rml::String name = m.name_draft;
-        while (!name.empty() && (name.front() == ' ' || name.front() == '\t'))
-            name.erase(name.begin());
-        while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
-            name.pop_back();
-        if (name.empty()) {
-            m.name_modal_hint = "Enter a player name, then press Save.";
-            dirty_all();
-            return;
-        }
-        m.host_display_name = name;
-        m.show_name_modal = false;
-        std::snprintf(io.netplay_player_name, sizeof(io.netplay_player_name), "%s", name.c_str());
-        snes_lobby_set_display_name(name.c_str());
-        if (!m.name_modal_is_change)
-            enter_lobby_browser();
-        else
-            dirty_all();
-    });
-    auto join_selected_lobby = [&]() {
-        if (m.selected_lobby_id.empty()) {
-            m.lobby_status = "Select a lobby first";
-            dirty_all();
-            return;
-        }
-        snes_lobby_set_display_name(m.host_display_name.c_str());
-        if (m.selected_has_password) {
-            m.join_lobby_password.clear();
-            m.show_join_pw_modal = true;
-            dirty_all();
-            return;
-        }
-        if (snes_lobby_join(m.selected_lobby_id.c_str(), "", "0.0.0.0:7778") != 0) {
-            m.lobby_status = "Join failed — not connected to lobby server";
-            dirty_all();
-        }
-    };
-    // Row HTML is rebuilt on select, which replaces the element and kills RmlUi's
-    // native dblclick. Detect a second click on the same row within the window.
-    int last_lobby_click_idx = -1;
-    Uint32 last_lobby_click_ticks = 0;
-    c.BindEventCallback("lobby_select", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
-        if (args.empty()) return;
-        const int index = (int)args[0].Get<int>();
-        const Uint32 now = SDL_GetTicks();
-        const bool dblclick = (index == last_lobby_click_idx &&
-                               (now - last_lobby_click_ticks) < 400u);
-        last_lobby_click_idx = index;
-        last_lobby_click_ticks = now;
-
-        m.lobby_selected = index;
-        SnesLobbyRow row{};
-        if (snes_lobby_list_get(m.lobby_selected, &row)) {
-            m.selected_lobby_id = row.lobby_id;
-            m.selected_has_password = row.has_password != 0;
-        } else {
-            m.selected_lobby_id.clear();
-            m.selected_has_password = false;
-        }
-        refresh_lobby_table(m);
-        dirty_all();
-        if (dblclick)
-            join_selected_lobby();
-    });
-    c.BindEventCallback("lobby_host_open", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.show_host_modal = true; dirty_all();
-    });
-    c.BindEventCallback("lobby_host_cancel", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.show_host_modal = false; dirty_all();
-    });
-    // Read <input> values directly — RmlUi can fire click before data-value
-    // commits the model (see RmlUi#668), and our lobby refresh was DirtyAll'ing
-    // every frame which fought the text field.
-    auto read_input = [&](const char* id) -> Rml::String {
-        if (!doc) return {};
-        if (auto* fc = rmlui_dynamic_cast<Rml::ElementFormControl*>(doc->GetElementById(id)))
-            return fc->GetValue();
-        return {};
-    };
-    c.BindEventCallback("lobby_host_confirm", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        Rml::String name = read_input("host-lobby-name");
-        Rml::String pw = read_input("host-lobby-password");
-        if (!name.empty()) m.host_lobby_name = name;
-        m.host_lobby_password = pw;
-        m.show_host_modal = false;
-        m.room_lobby_title = m.host_lobby_name;
-        snes_lobby_set_display_name(m.host_display_name.c_str());
-        if (!snes_lobby_connected())
-            snes_lobby_connect(snes_lobby_default_url());
-        /* Sync live UI toggles into io before snapshotting match_caps. */
-        if (!game.force_widescreen)
-            io.widescreen = m.widescreen;
-        io.widescreen_hud = m.widescreen_hud;
-        io.ignore_aspect = m.aspect;
-        SnesLobbyMatchCaps caps = match_caps_from_settings(io, caps_force_ws);
-        snes_lobby_set_game_identity(game_name_s.c_str(), SNES_GAME_VERSION);
-        snes_lobby_create(m.host_lobby_name.c_str(), game_name_s.c_str(),
-                          SNES_GAME_VERSION,
-                          m.host_lobby_password.c_str(), "0.0.0.0:7777",
-                          &caps);
-        dirty_all();
-    });
-    c.BindEventCallback("lobby_join", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        if (!m.lobby_join_enabled) return;
-        join_selected_lobby();
-    });
-    c.BindEventCallback("lobby_join_pw_cancel", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        m.show_join_pw_modal = false; dirty_all();
-    });
-    c.BindEventCallback("lobby_join_pw_confirm", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        // Prefer live input value over the bound string (click-before-commit).
-        Rml::String pw = read_input("join-lobby-password");
-        if (pw.empty()) pw = m.join_lobby_password;
-        m.join_lobby_password = pw;
-        if (m.selected_lobby_id.empty()) {
-            m.show_join_pw_modal = false;
-            m.lobby_status = "Select a lobby first";
-            dirty_all();
-            return;
-        }
-        snes_lobby_set_display_name(m.host_display_name.c_str());
-        if (snes_lobby_join(m.selected_lobby_id.c_str(), pw.c_str(), "0.0.0.0:7778") != 0) {
-            m.lobby_status = "Join failed — not connected to lobby server";
-            // Keep the modal open so the user can retry.
-            dirty_all();
-            return;
-        }
-        m.show_join_pw_modal = false;
-        m.lobby_status = "Joining…";
-        dirty_all();
-    });
-    c.BindEventCallback("lobby_exit_room", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        snes_lobby_leave();
-        enter_lobby_browser();
-    });
-    c.BindEventCallback("lobby_toggle_ready", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        const int next = snes_lobby_local_ready() ? 0 : 1;
-        snes_lobby_set_ready(next);
-        m.lobby_local_ready = next != 0;
-        dirty_all();
-    });
-    c.BindEventCallback("lobby_launch", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        if (!snes_lobby_is_host() || !snes_lobby_all_ready()) return;
-        if (!game.force_widescreen)
-            io.widescreen = m.widescreen;
-        io.widescreen_hud = m.widescreen_hud;
-        io.ignore_aspect = m.aspect;
-        SnesLobbyMatchCaps caps = match_caps_from_settings(io, caps_force_ws);
-        snes_lobby_request_start(&caps);
-    });
+    // ---- navigation ----
     c.BindEventCallback("show_dashboard", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
         end_scan();
         m.view = "dashboard"; dirty_all();
@@ -1597,16 +876,13 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         end_scan();
         m.cfg_player = p;
         m.cfg_player_label = p == 0 ? "1" : "2";
-        m.cfg_src_label = src_label(io, p, m.pads, m.player_pad[p]);
+        m.cfg_src_label = src_label(io.player_src[p], p, m.pad_names);
         m.cfg_deadzone = io.deadzone[p];
         rebuild_players_pending = true;   // chips show this player's bindings
         m.view = "controller"; dirty_all();
     };
     c.BindEventCallback("config_p1", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { open_cfg(0); });
-    c.BindEventCallback("config_p2", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        if (!m.show_player2) return;
-        open_cfg(1);
-    });
+    c.BindEventCallback("config_p2", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { open_cfg(1); });
     // Reset the shown player's keyboard bindings to the built-in defaults
     // (Player 2's default is all-unbound) and persist.
     c.BindEventCallback("rebind_reset", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
@@ -1769,35 +1045,19 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     // The <select>'s data-value binding keeps m.pN_src_value current; the change
     // handler reads it and updates the live InputSource + status dot.
     auto src_changed = [&](int p) {
-        const Rml::String& v = (p == 0) ? m.p1_src_value : m.p2_src_value;
-        apply_src_value(io, m, p, v);
+        io.player_src[p] = value_to_src(p == 0 ? m.p1_src_value : m.p2_src_value);
         refresh_settings_labels(m, io); dirty_all();
     };
     c.BindEventCallback("p1_src_changed", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { src_changed(0); });
     c.BindEventCallback("p2_src_changed", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { src_changed(1); });
-    c.BindEventCallback("refresh_controllers", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-        if (rescan_controllers) rescan_controllers(true);
-    });
     c.BindEventCallback("cfg_cycle_src", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
         int p = m.cfg_player;
-        const bool has_pad = !m.pads.empty();
+        bool has_pad = p < (int)m.pad_names.size();
         int v = (int)io.player_src[p];
         do { v = (v + 1) % 3; }
         while (v == (int)InputSource::Gamepad && !has_pad);
         io.player_src[p] = (InputSource)v;
-        if (io.player_src[p] == InputSource::None) {
-            set_player_device(io, p, "none");
-            m.player_pad[p] = 0;
-        } else if (io.player_src[p] == InputSource::Keyboard) {
-            set_player_device(io, p, "keyboard");
-            m.player_pad[p] = 0;
-        } else {
-            if (m.player_pad[p] < 0 || m.player_pad[p] >= (int)m.pads.size())
-                m.player_pad[p] = (p < (int)m.pads.size()) ? p : 0;
-            if (!m.pads.empty())
-                set_player_device(io, p, m.pads[m.player_pad[p]].guid.c_str());
-        }
-        m.cfg_src_label = src_label(io, p, m.pads, m.player_pad[p]);
+        m.cfg_src_label = src_label(io.player_src[p], p, m.pad_names);
         refresh_settings_labels(m, io); dirty_all();
     });
     c.BindEventCallback("cfg_dz_up", [&](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
@@ -1926,92 +1186,29 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         void ProcessEvent(Rml::Event&) override { if (on_change) on_change(); }
     };
     std::vector<std::unique_ptr<SelListener>> sel_listeners;
-    // RemoveAll() clears the selection and fires Change with ""; ignore that so
-    // a rescan doesn't wipe the saved device GUID via apply_src_value.
-    bool ignore_src_change = false;
-    auto populate_select = [&](const char* id, int p) {
+    auto setup_select = [&](const char* id, int p) {
         auto* sel = rmlui_dynamic_cast<Rml::ElementFormControlSelect*>(doc->GetElementById(id));
         if (!sel) return;
-        const std::vector<SrcOption>& opts = (p == 0) ? m.p1_options : m.p2_options;
-        Rml::String cur = src_to_value(io, p, m.pads, m.player_pad[p]);
-        ignore_src_change = true;
         sel->RemoveAll();
+        const std::vector<SrcOption>& opts = (p == 0) ? m.p1_options : m.p2_options;
+        Rml::String cur = src_to_value(io.player_src[p]);
         int selected = 0;
         for (int i = 0; i < (int)opts.size(); i++) {
             sel->Add(opts[i].label, opts[i].value);
             if (opts[i].value == cur) selected = i;
         }
         sel->SetSelection(selected);
-        ignore_src_change = false;
-    };
-    auto attach_select_listener = [&](const char* id, int p) {
-        auto* sel = rmlui_dynamic_cast<Rml::ElementFormControlSelect*>(doc->GetElementById(id));
-        if (!sel) return;
         auto lis = std::make_unique<SelListener>();
         lis->on_change = [&, sel, p]() {
-            if (ignore_src_change) return;
-            apply_src_value(io, m, p, sel->GetValue());
+            io.player_src[p] = value_to_src(sel->GetValue());
             refresh_settings_labels(m, io);
             dirty_all();
         };
         sel->AddEventListener(Rml::EventId::Change, lis.get());
         sel_listeners.push_back(std::move(lis));
     };
-    populate_select("p1src", 0);
-    populate_select("p2src", 1);
-    attach_select_listener("p1src", 0);
-    attach_select_listener("p2src", 1);
-
-    rescan_controllers = [&](bool with_feedback) {
-        if (with_feedback) {
-            m.dev_refresh_busy = true;
-            m.dev_refresh_done = false;
-            m.dev_refresh_label = "Scanning…";
-            handle.DirtyVariable("dev_refresh_busy");
-            handle.DirtyVariable("dev_refresh_done");
-            handle.DirtyVariable("dev_refresh_label");
-        }
-
-        for (SDL_GameController* gc : open_pads) {
-            if (gc) SDL_GameControllerClose(gc);
-        }
-        open_pads.clear();
-        SDL_PumpEvents();
-        SDL_JoystickUpdate();
-        SDL_GameControllerUpdate();
-        m.pads = enumerate_pads();
-        for (int i = 0; i < SDL_NumJoysticks(); i++) {
-            if (SDL_IsGameController(i)) {
-                if (SDL_GameController* gc = SDL_GameControllerOpen(i))
-                    open_pads.push_back(gc);
-            }
-        }
-        sync_pad_selection(io, m);
-        /* Same full device list for every controller slot; keep offline rows. */
-        build_src_options(m.p1_options, m.pads, io.player_device[0]);
-        build_src_options(m.p2_options, m.pads, io.player_device[1]);
-        if (m.view == "controller")
-            m.cfg_src_label = src_label(io, m.cfg_player, m.pads,
-                                        m.player_pad[m.cfg_player]);
-        refresh_settings_labels(m, io);
-        populate_select("p1src", 0);
-        populate_select("p2src", 1);
-
-        if (with_feedback) {
-            const int pads = (int)m.pads.size();
-            char done[48];
-            std::snprintf(done, sizeof(done), "Updated · %d pad%s", pads,
-                          pads == 1 ? "" : "s");
-            m.dev_refresh_busy = false;
-            m.dev_refresh_done = true;
-            m.dev_refresh_label = done;
-            m.dev_refresh_until = SDL_GetTicks() + 1400u;
-            handle.DirtyVariable("dev_refresh_busy");
-            handle.DirtyVariable("dev_refresh_done");
-            handle.DirtyVariable("dev_refresh_label");
-        }
-        dirty_all();
-    };
+    setup_select("p1src", 0);
+    setup_select("p2src", 1);
 
     // Seed focus on PLAY so a gamepad/keyboard user always has a visible focus
     // ring and can confirm (A / Enter) or navigate (D-pad / Tab) from there.
@@ -2079,99 +1276,17 @@ Result run(SDL_Window* window, void* /*gl_context*/,
             } else if (ev.type == SDL_CONTROLLERBUTTONDOWN ||
                        ev.type == SDL_CONTROLLERAXISMOTION) {
                 handle_pad(ev);
-            } else if (ev.type == SDL_CONTROLLERDEVICEADDED ||
-                       ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-                /* Keep every slot's dropdown in sync with hotplug. */
-                if (rescan_controllers) rescan_controllers(false);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                if (SDL_GameController* gc = SDL_GameControllerOpen(ev.cdevice.which))
+                    open_pads.push_back(gc);
             } else {
                 RmlSDL::InputEventHandler(context, ev);
             }
         }
 
-        /* Lobby client pump + live browser / room views. */
-        snes_lobby_pump();
-        if (m.view == "netplay_lobbies" || m.view == "netplay_room") {
-            if (snes_lobby_in_lobby() && m.view != "netplay_room") {
-                m.view = "netplay_room";
-                refresh_room_table(m);
-                dirty_all();
-            }
-            if (!snes_lobby_in_lobby() && m.view == "netplay_room") {
-                m.view = "netplay_lobbies";
-                dirty_all();
-            }
-            if (snes_lobby_launch_pending() && !m.netplay_launch_ready) {
-                snes_lobby_clear_launch_pending();
-                if (rom_path.empty()) {
-                    m.lobby_status = "Launch aborted: select a ROM on the dashboard first";
-                    dirty_all();
-                } else if (out_net && fill_netplay_launch(out_net, io)) {
-                    if (out_rom_path && out_rom_path_len)
-                        std::snprintf(out_rom_path, out_rom_path_len, "%s", rom_path.c_str());
-                    m.netplay_launch_ready = true;
-                    m.launch_requested = true;
-                } else {
-                    m.lobby_status =
-                        "Launch aborted: missing peer LAN endpoint "
-                        "(rejoin lobby)";
-                    dirty_all();
-                }
-            }
-            if (snes_lobby_join_info()->last_error[0]) {
-                char st[128];
-                std::snprintf(st, sizeof(st), "Error: %s", snes_lobby_join_info()->last_error);
-                if (m.lobby_status != st) {
-                    m.lobby_status = st;
-                    // Re-open password modal on bad/missing password so Join can retry.
-                    if (std::strcmp(snes_lobby_join_info()->last_error, "need_password") == 0 ||
-                        std::strcmp(snes_lobby_join_info()->last_error, "bad_password") == 0) {
-                        m.show_join_pw_modal = true;
-                    }
-                    handle.DirtyVariable("lobby_status");
-                    handle.DirtyVariable("show_join_pw_modal");
-                }
-            }
-        }
-        if (m.view == "netplay_lobbies") {
-            static Uint32 last_list_req = 0;
-            const Uint32 now = SDL_GetTicks();
-            if (now - last_list_req > 1000) {
-                last_list_req = now;
-                if (snes_lobby_connected()) snes_lobby_request_list();
-            }
-            // Skip table rebuild while a text modal is open — DirtyAll was
-            // resetting <input data-value> every frame and Join saw an empty pw.
-            if (!m.show_join_pw_modal && !m.show_host_modal && !m.show_name_modal) {
-                refresh_lobby_table(m);
-                handle.DirtyVariable("lobby_status");
-                handle.DirtyVariable("lobby_table_html");
-                handle.DirtyVariable("lobby_join_enabled");
-            }
-        }
-        if (m.view == "netplay_room") {
-            refresh_room_table(m);
-            handle.DirtyVariable("lobby_status");
-            handle.DirtyVariable("room_table_html");
-            handle.DirtyVariable("lobby_is_host");
-            handle.DirtyVariable("lobby_local_ready");
-            handle.DirtyVariable("lobby_can_launch");
-            handle.DirtyVariable("room_lobby_title");
-        }
-        if (m.launch_requested) { result = Result::Launch; running = false; }
-
         // Deferred chip-list rebuilds (set from chip handlers / scan capture).
         if (rebuild_players_pending) { rebuild_players_pending = false; build_player_list(); }
         if (rebuild_hotkeys_pending) { rebuild_hotkeys_pending = false; build_hotkey_list(); }
-
-        if (m.dev_refresh_until != 0 && SDL_GetTicks() >= m.dev_refresh_until) {
-            m.dev_refresh_until = 0;
-            m.dev_refresh_busy = false;
-            m.dev_refresh_done = false;
-            m.dev_refresh_label = "Refresh";
-            handle.DirtyVariable("dev_refresh_busy");
-            handle.DirtyVariable("dev_refresh_done");
-            handle.DirtyVariable("dev_refresh_label");
-        }
 
         context->Update();
 
@@ -2184,13 +1299,6 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     }
 
     for (SDL_GameController* gc : open_pads) SDL_GameControllerClose(gc);
-
-    /* Keep the lobby WebSocket across a netplay Launch so both peers can return
-     * to the same room after the match. Offline launch / quit still disconnect. */
-    const bool keep_lobby =
-        (result == Result::Launch && out_net && out_net->enabled && snes_lobby_in_lobby());
-    if (!keep_lobby)
-        snes_lobby_disconnect();
 
     Rml::Shutdown();
     RmlGL3::Shutdown();
@@ -2211,12 +1319,9 @@ extern "C" int snes_launcher_run_window(const char* window_title,
                                         const char* assets_dir,
                                         const char* initial_rom,
                                         char* out_rom_path,
-                                        size_t out_rom_path_len,
-                                        SnesNetplayLaunch* out_net,
-                                        int resume_netplay_room) {
+                                        size_t out_rom_path_len) {
     using namespace snes_launcher;
     if (!io || !game) return 2;
-    if (out_net) std::memset(out_net, 0, sizeof(*out_net));
 
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "launcher: SDL video init failed: %s\n", SDL_GetError());
@@ -2259,15 +1364,11 @@ extern "C" int snes_launcher_run_window(const char* window_title,
     s.volume        = io->volume;
     s.player_src[0] = (InputSource)io->player_src[0];
     s.player_src[1] = (InputSource)io->player_src[1];
-    std::snprintf(s.player_device[0], sizeof(s.player_device[0]), "%s", io->player_device[0]);
-    std::snprintf(s.player_device[1], sizeof(s.player_device[1]), "%s", io->player_device[1]);
     s.deadzone[0]   = io->deadzone[0];
     s.deadzone[1]   = io->deadzone[1];
     s.skip_launcher = io->skip_launcher != 0;
     s.msu1_enabled  = io->msu1_enabled != 0;
     std::snprintf(s.msu1_dir, sizeof(s.msu1_dir), "%s", io->msu1_dir);
-    std::snprintf(s.netplay_player_name, sizeof(s.netplay_player_name), "%s",
-                  io->netplay_player_name);
 
     GameInfo g;
     g.name = game->name;
@@ -2277,21 +1378,14 @@ extern "C" int snes_launcher_run_window(const char* window_title,
     g.known_sha256 = game->known_sha256;
     g.num_known_sha256 = game->num_known_sha256;
     g.widescreen_supported = game->widescreen_supported != 0;
-    g.num_players = game->num_players > 0 ? game->num_players : 2;
-    g.force_widescreen = game->force_widescreen != 0;
-    g.force_ws_extra =
-        game->force_ws_extra > 0 ? game->force_ws_extra : 71;
     g.msu1_supported = game->msu1_supported != 0;
     g.msu1_note = game->msu1_note;
     g.msu1_patch_path = game->msu1_patch_path;
     g.sram_path = game->sram_path;
     g.config_path = game->config_path;
 
-    NetplayLaunch net{};
-    RunOptions ropts;
-    ropts.resume_netplay_room = resume_netplay_room != 0;
     Result r = run(win, ctx, s, g, assets_dir, initial_rom,
-                   out_rom_path, out_rom_path_len, &net, ropts);
+                   out_rom_path, out_rom_path_len);
 
     // map back
     io->output_method = s.output_method;
@@ -2306,30 +1400,11 @@ extern "C" int snes_launcher_run_window(const char* window_title,
     io->volume        = s.volume;
     io->player_src[0] = (int)s.player_src[0];
     io->player_src[1] = (int)s.player_src[1];
-    std::snprintf(io->player_device[0], sizeof(io->player_device[0]), "%s", s.player_device[0]);
-    std::snprintf(io->player_device[1], sizeof(io->player_device[1]), "%s", s.player_device[1]);
     io->deadzone[0]   = s.deadzone[0];
     io->deadzone[1]   = s.deadzone[1];
     io->skip_launcher = s.skip_launcher;
     io->msu1_enabled  = s.msu1_enabled;
     std::snprintf(io->msu1_dir, sizeof(io->msu1_dir), "%s", s.msu1_dir);
-    std::snprintf(io->netplay_player_name, sizeof(io->netplay_player_name), "%s",
-                  s.netplay_player_name);
-
-    if (out_net && net.enabled) {
-        out_net->enabled = 1;
-        out_net->session_id = net.session_id;
-        out_net->local_slot = net.local_slot;
-        out_net->transport = net.transport;
-        out_net->input_delay = net.input_delay;
-        out_net->ws_extra = net.ws_extra;
-        std::snprintf(out_net->bind_hostport, sizeof(out_net->bind_hostport), "%s",
-                      net.bind_hostport);
-        std::snprintf(out_net->peer_hostport, sizeof(out_net->peer_hostport), "%s",
-                      net.peer_hostport);
-        std::snprintf(out_net->display_name, sizeof(out_net->display_name), "%s",
-                      net.display_name.c_str());
-    }
 
     SDL_GL_DeleteContext(ctx);
     SDL_DestroyWindow(win);

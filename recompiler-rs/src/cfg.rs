@@ -59,6 +59,21 @@ pub struct NameDecl {
     pub name: String,
 }
 
+/// A `ram_routine <pc24> <MmXn> <hexbytes>` directive: a deterministic
+/// runtime-generated routine resident in WRAM ($7E/$7F) whose captured bytes
+/// are literally recompiled (LLE) as an AOT body. The bytes are appended to the
+/// ROM image and reached via a synthetic reloc region so the standard decoder
+/// path decodes them unchanged; runtime dispatch is guarded by a live byte-match
+/// (see `g_ram_routine_guards`). Source of truth: tier2_coverage.json
+/// ram_routines[] (deterministic, terminated entries only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RamRoutine {
+    pub pc24: u32,      // absolute 24-bit WRAM entry (bank $7E/$7F)
+    pub entry_m: u8,    // entry M flag to emit + gate on
+    pub entry_x: u8,    // entry X flag to emit + gate on
+    pub bytes: Vec<u8>, // captured snapshot (length = routine length)
+}
+
 /// An `indirect_dispatch` directive (authorises static recovery of an indirect
 /// JMP/JML/JSR's target list).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +84,11 @@ pub struct IndirectDispatch {
     pub table_bases: Vec<u32>, // 0..3 entries (see cfg_loader doc)
     /// Pointer-sourced call (`PEA <ret>; JMP (ptr)` / `JSR (ptr)`).
     pub ptr_call: bool,
+    /// Explicit local continuation for a ptrcall whose PEA frame was built
+    /// outside the dispatcher routine.
+    pub return_pc: Option<u32>,
+    /// Number of guest-stack bytes consumed by the selected handler.
+    pub frame_size: Option<u8>,
     /// Match an explicit runtime pointer value rather than indexing a ROM
     /// table. True for ptrcall/ptrtail/ptrtail_popcall.
     pub pointer_match: bool,
@@ -90,6 +110,7 @@ pub struct BankCfg {
     pub exclude_ranges: Vec<(u32, u32)>,
     pub data_regions: Vec<(u32, u32, u32)>, // (bank, start, end)
     pub reloc_regions: Vec<RelocRegion>,
+    pub ram_routines: Vec<RamRoutine>,
     pub exit_mx_at: Vec<(u8, u32, u8, u8)>, // (bank, addr16, m, x)
     pub exit_mx_at_per_variant: Vec<(u8, u32, u8, u8, u8, u8)>,
     pub auto_vectors: bool,
@@ -117,6 +138,42 @@ fn parse_hex(token: &str) -> Result<u32, String> {
         .or_else(|| token.strip_prefix("0X"))
         .unwrap_or(token);
     u32::from_str_radix(t, 16).map_err(|_| format!("bad hex {token:?}"))
+}
+
+/// Parse an `MmXn` variant token (e.g. "M1X1") into (m, x). Case-insensitive.
+fn parse_mx(token: &str) -> Option<(u8, u8)> {
+    let b = token.as_bytes();
+    if b.len() == 4
+        && (b[0] | 0x20) == b'm'
+        && (b[2] | 0x20) == b'x'
+        && (b[1] == b'0' || b[1] == b'1')
+        && (b[3] == b'0' || b[3] == b'1')
+    {
+        Some((b[1] - b'0', b[3] - b'0'))
+    } else {
+        None
+    }
+}
+
+/// Parse a contiguous hex-digit string into bytes (two hex digits per byte).
+fn parse_hex_bytes(token: &str) -> Result<Vec<u8>, String> {
+    if token.len() % 2 != 0 {
+        return Err(format!("odd hex length {}", token.len()));
+    }
+    let mut out = Vec::with_capacity(token.len() / 2);
+    let b = token.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit {:?}", b[i] as char))?;
+        let lo = (b[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit {:?}", b[i + 1] as char))?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
 }
 
 /// Strip a trailing `# ...` comment.
@@ -214,11 +271,19 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             end_at.insert(pc16, end);
             continue;
         }
-        // hle_spc_upload <hex_pc>
+        // hle_spc_upload <hex_pc> [legacy|live]
+        // The Rust analyzer only needs the entry address; the Python emitter
+        // retains the optional protocol mode when selecting the runtime helper.
         if head == "hle_spc_upload" {
-            if tokens.len() != 2 {
+            if tokens.len() < 2 || tokens.len() > 3 {
                 return Err(format!(
-                    "{path}: hle_spc_upload needs exactly one <pc> argument, got: {stripped:?}"
+                    "{path}: hle_spc_upload needs <pc> and optional [legacy|live], got: {stripped:?}"
+                ));
+            }
+            if tokens.len() == 3 && tokens[2] != "legacy" && tokens[2] != "live" {
+                return Err(format!(
+                    "{path}: hle_spc_upload mode must be legacy or live, got: {:?}",
+                    tokens[2]
                 ));
             }
             let pc16 =
@@ -327,6 +392,8 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 }
                 let pointer_mode = pointer_modes[0];
                 let mut targets = Vec::new();
+                let mut return_pc = None;
+                let mut frame_size = None;
                 for t in &tokens[3..] {
                     if *t == pointer_mode {
                         continue;
@@ -339,6 +406,32 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                                 })? & 0xFFFFFF,
                             );
                         }
+                    } else if let Some(raw) = t.strip_prefix("return:") {
+                        if pointer_mode != "ptrcall" {
+                            return Err(format!(
+                                "{path}: indirect_dispatch return: is only valid with ptrcall"
+                            ));
+                        }
+                        return_pc = Some(
+                            parse_hex(raw)
+                                .map_err(|e| format!("{path}: indirect_dispatch return: {e}"))?
+                                & 0xFFFF,
+                        );
+                    } else if let Some(raw) = t.strip_prefix("frame:") {
+                        if pointer_mode != "ptrcall" {
+                            return Err(format!(
+                                "{path}: indirect_dispatch frame: is only valid with ptrcall"
+                            ));
+                        }
+                        let size = parse_int_auto(raw).map_err(|_| {
+                            format!("{path}: indirect_dispatch frame: bad size {raw:?}")
+                        })?;
+                        if size != 2 && size != 3 {
+                            return Err(format!(
+                                "{path}: indirect_dispatch frame: must be 2 or 3"
+                            ));
+                        }
+                        frame_size = Some(size as u8);
                     } else {
                         return Err(format!(
                             "{path}: indirect_dispatch {pointer_mode} unknown option {t:?}"
@@ -362,6 +455,8 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                     idx_reg: 'X',
                     table_bases: Vec::new(),
                     ptr_call: pointer_mode == "ptrcall",
+                    return_pc,
+                    frame_size,
                     pointer_match: pointer_mode != "rtsstack",
                     popped_call_frame: pointer_mode == "ptrtail_popcall",
                     rts_stack: pointer_mode == "rtsstack",
@@ -410,6 +505,8 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 idx_reg,
                 table_bases,
                 ptr_call: false,
+                return_pc: None,
+                frame_size: None,
                 pointer_match: false,
                 popped_call_frame: false,
                 rts_stack: false,
@@ -614,6 +711,43 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             ));
             continue;
         }
+        // ram_routine <pc24> <MmXn> <hexbytes>
+        if head == "ram_routine" {
+            if tokens.len() != 4 {
+                return Err(format!(
+                    "{path}: ram_routine needs <pc24> <MmXn> <hexbytes>, got: {stripped:?}"
+                ));
+            }
+            let pc24 = parse_hex(tokens[1])
+                .map_err(|e| format!("{path}: ram_routine bad pc24: {e}"))?
+                & 0xFFFFFF;
+            let (entry_m, entry_x) = parse_mx(tokens[2]).ok_or_else(|| {
+                format!(
+                    "{path}: ram_routine bad variant {:?} (want M0X0..M1X1)",
+                    tokens[2]
+                )
+            })?;
+            let bytes = parse_hex_bytes(tokens[3])
+                .map_err(|e| format!("{path}: ram_routine bad hexbytes: {e}"))?;
+            if bytes.is_empty() {
+                return Err(format!(
+                    "{path}: ram_routine {pc24:06X} has empty byte blob"
+                ));
+            }
+            let bank = (pc24 >> 16) & 0xFF;
+            if bank != 0x7E && bank != 0x7F {
+                return Err(format!(
+                    "{path}: ram_routine {pc24:06X} not in WRAM bank $7E/$7F"
+                ));
+            }
+            cfg.ram_routines.push(RamRoutine {
+                pc24,
+                entry_m,
+                entry_x,
+                bytes,
+            });
+            continue;
+        }
         // data_region <bank> <start> <end>
         if head == "data_region" && tokens.len() >= 4 {
             if let (Ok(b), Ok(s), Ok(e)) = (
@@ -744,6 +878,26 @@ mod tests {
     }
 
     #[test]
+    fn ram_routine_parse() {
+        let cfg = parse_bank_cfg("bank = 00\nram_routine 7F8000 M1X1 A9F08D01026B\n", "t").unwrap();
+        assert_eq!(cfg.ram_routines.len(), 1);
+        let r = &cfg.ram_routines[0];
+        assert_eq!(r.pc24, 0x7F8000);
+        assert_eq!((r.entry_m, r.entry_x), (1, 1));
+        assert_eq!(r.bytes, vec![0xA9, 0xF0, 0x8D, 0x01, 0x02, 0x6B]);
+    }
+
+    #[test]
+    fn ram_routine_rejects_rom_bank() {
+        // Non-WRAM bank is rejected.
+        assert!(parse_bank_cfg("bank = 00\nram_routine 008000 M1X1 6B\n", "t").is_err());
+        // Odd hex length is rejected.
+        assert!(parse_bank_cfg("bank = 00\nram_routine 7F8000 M1X1 A9F0F\n", "t").is_err());
+        // Bad variant token is rejected.
+        assert!(parse_bank_cfg("bank = 00\nram_routine 7F8000 Q9Z9 6B\n", "t").is_err());
+    }
+
+    #[test]
     fn indirect_dispatch_parse() {
         let cfg = parse_bank_cfg(
             "bank = 03\nindirect_dispatch e19e 8 idx:X tables:9000,9100\n",
@@ -775,6 +929,27 @@ mod tests {
         assert!(dispatch.pointer_match);
         assert_eq!(dispatch.idx_reg, 'X');
         assert_eq!(dispatch.targets, vec![0x8569, 0x8884B8, 0x91D27F]);
+    }
+
+    #[test]
+    fn ptrcall_accepts_explicit_return_pc() {
+        let cfg = parse_bank_cfg(
+            "bank = 80\nindirect_dispatch 86f7 1 ptrcall return:84cf frame:2 targets:809391\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(cfg.indirect_dispatch[0].return_pc, Some(0x84CF));
+        assert_eq!(cfg.indirect_dispatch[0].frame_size, Some(2));
+    }
+
+    #[test]
+    fn ptrtail_rejects_explicit_return_pc() {
+        let err = parse_bank_cfg(
+            "bank = 80\nindirect_dispatch 86f7 1 ptrtail return:84cf targets:809391\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(err.contains("return: is only valid with ptrcall"));
     }
 
     #[test]

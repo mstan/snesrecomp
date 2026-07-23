@@ -11,11 +11,18 @@ import sys
 import time
 
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
+REPO = pathlib.Path(
+    os.environ.get("SNESRECOMP_ROOT", pathlib.Path(__file__).resolve().parent.parent)
+).resolve()
 sys.path.insert(0, str(REPO / "recompiler"))
 sys.path.insert(0, str(REPO / "tools"))
 
-from snes65816 import load_rom  # noqa: E402
+from snes65816 import (  # noqa: E402
+    clear_reloc_regions,
+    load_rom,
+    register_reloc_region,
+)
+from v2.program_analysis import VariantKey  # noqa: E402
 from v2.program_emit import (  # noqa: E402
     CACHE_FORMAT_VERSION,
     discover_host_roots,
@@ -129,6 +136,26 @@ def _verified_cached_stats(out_dir: pathlib.Path,
     return stats
 
 
+def _install_ram_routines(rom: bytes, parsed):
+    """Append each `ram_routine` blob to the ROM image and register a reloc
+    region redirecting its WRAM entry to the appended bytes, so the standard
+    offset-based Python decoder materializes an AOT body for it (matching the
+    native analyzer, which does the same against the ROM file). Returns
+    (extended_rom, tuple_of_VariantKey_roots)."""
+    clear_reloc_regions()
+    buf = bytearray(rom)
+    roots = []
+    for _bank, _path, cfg in parsed:
+        for rr in getattr(cfg, "ram_routines", ()):  # noqa: B009
+            base = len(buf)
+            buf += rr.data
+            buf += b"\x00" * 8   # guard pad (outside the reloc region)
+            register_reloc_region((rr.pc24 >> 16) & 0xFF, rr.pc24 & 0xFFFF,
+                                  len(rr.data), base)
+            roots.append(VariantKey(rr.pc24, rr.entry_m, rr.entry_x))
+    return bytes(buf), tuple(roots)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="manifest-driven LLE-first v2 generation")
@@ -175,6 +202,11 @@ def main() -> int:
     out_dir = pathlib.Path(args.out_dir).resolve()
     rom = load_rom(args.rom)
     parsed = _load_cfgs(cfg_dir)
+    # Materialize ram_routine blobs into the ROM image + reloc registry so
+    # their WRAM entries decode as ordinary AOT bodies. Their WRAM roots join
+    # additional_roots so the (Python-backend) manifest includes them; the
+    # native analyzer seeds the same roots from cfg independently.
+    rom, ram_routine_roots = _install_ram_routines(rom, parsed)
     native_path = native_analyzer_path()
     analysis_backend = args.analysis_backend
     if analysis_backend == "auto":
@@ -195,7 +227,8 @@ def main() -> int:
             args.profile_manifest, declared_entry_pcs)
     except ValueError as exc:
         parser.error(str(exc))
-    additional_roots = tuple(sorted(set(host_roots) | set(profile_roots)))
+    additional_roots = tuple(sorted(
+        set(host_roots) | set(profile_roots) | set(ram_routine_roots)))
 
     def generator_digest_for(backend):
         native_inputs = ()

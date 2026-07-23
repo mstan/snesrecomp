@@ -19,6 +19,9 @@ typedef struct WsShadowLayer {
   bool registered;
   bool active;
   bool wide;
+  bool fold;      /* periodic fold enabled (composes with world history) */
+  bool worldSet;  /* WsShadowSetWorld called this frame */
+  int dir;        /* last nonzero worldX motion: +1 right, -1 left */
   uint8_t tileShift; /* 3 = 8x8 map entries, 4 = 16x16 big tiles */
   uint32_t worldX;
   uint32_t worldY;
@@ -46,9 +49,28 @@ typedef struct WsShadowLayer {
   uint32_t prevLiveTx0;
   uint32_t prevScrollY;
   bool havePrevLive;
+  /* Fold mode: reads the live map at render time. Parallax strips
+   * rewrite the layer's scroll mid-frame, so the fold anchor (the
+   * leftmost native column) is derived from the per-line hScroll the
+   * renderer used, never from a frame sample; the per-row period cache
+   * is keyed by that anchor. period 0 = no exact period found -> that
+   * (row, anchor) keeps the plain map-wrap fallback. */
+  const uint16_t *foldVram;
+  struct {
+    uint8_t set;
+    uint8_t natCol;
+    uint8_t period;
+  } foldRow[32];
 } WsShadowLayer;
 
 static WsShadowLayer s_layers[kLayers];
+
+static int32_t WorldFromWrapped(uint32_t anchor, uint32_t coord) {
+  int32_t delta = (int32_t)((coord - anchor) & 0x3ff);
+  if (delta >= 512)
+    delta -= 1024;
+  return (int32_t)anchor + delta;
+}
 
 static bool InBounds(uint32_t tx, uint32_t ty) {
   return tx < kWsShadowXTiles && ty < kWsShadowYTiles;
@@ -95,12 +117,26 @@ void WsShadowReset(void) {
     layer->validCount = 0;
     layer->registered = false;
     layer->active = false;
+    layer->fold = false;
+    layer->worldSet = false;
     layer->haveLastOrigin = false;
     layer->haveRetainMapBase = false;
     layer->havePrevLive = false;
     layer->prevLiveCols = 0;
     layer->prevLiveRows = 0;
+    memset(layer->foldRow, 0, sizeof(layer->foldRow));
   }
+}
+
+void WsShadowSetPeriodicFold(int layerIndex) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  layer->registered = true;
+  layer->fold = true;
+  /* Composable with WsShadowSetWorld: rows with a detected period fold
+   * to fresh native columns; the remaining (world-anchored) rows fall
+   * through to the world-keyed history, then to the plain map wrap. */
 }
 
 void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
@@ -121,6 +157,9 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
     }
   }
   layer->registered = true;
+  layer->worldSet = true;
+  if (worldX != layer->worldX)
+    layer->dir = ((int32_t)(worldX - layer->worldX) > 0) ? 1 : -1;
   layer->worldX = worldX;
   layer->worldY = worldY;
   layer->scrollX = worldX;
@@ -133,6 +172,42 @@ void WsShadowSetScroll(int layerIndex, uint32_t scrollX, uint32_t scrollY) {
   WsShadowLayer *layer = &s_layers[layerIndex];
   layer->scrollX = scrollX;
   layer->scrollY = scrollY;
+}
+
+/* World y-tile for a map row, using the anchor's 32-row wrap window. */
+static uint32_t WorldRowForMapRow(const WsShadowLayer *layer, int row) {
+  const unsigned sh = layer->tileShift ? layer->tileShift : 3;
+  uint32_t wy0 = layer->worldY >> sh;
+  return wy0 + (uint32_t)((row - (int)(wy0 & 31)) & 31);
+}
+
+/* Capture the game's own tilemap uploads as they land, bound to the
+ * world chunk they were staged for. The map holds two 256px chunks with
+ * fixed half parity, so a written column's chunk is unambiguous when its
+ * half matches the camera chunk's parity; the other half is the chunk
+ * being staged ahead (or behind, per the last travel direction). This
+ * feeds freshly staged content - including first-visit world-anchored
+ * features - into the history the moment it exists in VRAM. */
+void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
+  for (int i = 0; i < kLayers; i++) {
+    WsShadowLayer *layer = &s_layers[i];
+    if (!layer->active || !layer->wide || !layer->entries)
+      continue;
+    uint16_t off = (uint16_t)(wordAdr - layer->mapBaseWord);
+    if (off >= 0x800)
+      continue;
+    int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
+    int row = (off >> 5) & 0x1f;
+    const unsigned sh = layer->tileShift ? layer->tileShift : 3;
+    uint32_t k0 = layer->worldX >> (sh + 5);
+    uint32_t chunk;
+    if ((uint32_t)(col >> 5) == (k0 & 1))
+      chunk = k0;
+    else
+      chunk = layer->dir < 0 ? k0 - 1 : k0 + 1;
+    uint32_t tx = chunk * 32 + (uint32_t)(col & 31);
+    SetEntry(layer, tx, WorldRowForMapRow(layer, row), value);
+  }
 }
 
 void WsShadowSetBlankTile(int layerIndex, int blankEntry) {
@@ -713,26 +788,42 @@ void WsShadowFrame(const struct Ppu *ppu) {
     WsShadowLayer *layer = &s_layers[i];
     layer->active = layer->registered;
     layer->registered = false;
-    if (!layer->active || !layer->entries)
+    if (!layer->active)
       continue;
 
     layer->wide = PPU_bgTilemapWider(ppu, i) != 0;
     layer->tileShift = PPU_bigTiles(ppu, i) ? 4 : 3;
+    layer->worldSet = false;
+    if (layer->fold) {
+      layer->foldVram = ppu->vram;
+      memset(layer->foldRow, 0, sizeof(layer->foldRow));
+    }
+    if (!layer->entries)
+      continue;
 
     const uint16_t map_base_now = (uint16_t)PPU_bgTilemapAdr(ppu, i);
-    const bool keep = layer->retainHistory && layer->haveRetainMapBase &&
-                      layer->retainMapBase == map_base_now;
-    if (!keep) {
-      if (layer->valid)
-        memset(layer->valid, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
-      if (layer->cooldown)
-        memset(layer->cooldown, 0, (size_t)kWsShadowXTiles * kWsShadowYTiles);
-      layer->validCount = 0;
-      layer->haveLastOrigin = false;
-      layer->havePrevLive = false;
+    if (layer->retainHistory) {
+      const bool keep = layer->haveRetainMapBase &&
+                        layer->retainMapBase == map_base_now;
+      if (!keep) {
+        if (layer->valid)
+          memset(layer->valid, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
+        if (layer->cooldown)
+          memset(layer->cooldown, 0,
+                 (size_t)kWsShadowXTiles * kWsShadowYTiles);
+        layer->validCount = 0;
+        layer->haveLastOrigin = false;
+        layer->havePrevLive = false;
+      }
+      layer->retainMapBase = map_base_now;
+      layer->haveRetainMapBase = true;
+    } else {
+      /* Ordinary world-keyed layers deliberately retain exact tiles across
+       * camera movement; that is the current engine's history-first margin
+       * contract. The specialized viewport-relative mode above resets on a
+       * tilemap-base scene change. */
+      layer->haveRetainMapBase = false;
     }
-    layer->retainMapBase = map_base_now;
-    layer->haveRetainMapBase = layer->retainHistory;
     layer->mapBaseWord = map_base_now;
 
     const unsigned sh = layer->tileShift;
@@ -970,42 +1061,95 @@ void WsShadowFrame(const struct Ppu *ppu) {
   }
 }
 
+static uint16_t FoldMapEntry(const WsShadowLayer *layer, int row, int col) {
+  uint16_t word = (uint16_t)(layer->mapBaseWord +
+      (col >= 32 ? 0x400 : 0) + (row << 5) + (col & 31));
+  return layer->foldVram[word & 0x7fff];
+}
+
+/* Detect the row's horizontal period over the native 32-column window
+ * anchored at natCol. Only natively displayed columns are trusted: they
+ * are correct-by-definition on this very line, so a fold anchored there
+ * can never serve stale or unwritten map content. Periods must divide 64
+ * so the renderer's mod-64 column wrap preserves congruence. */
+static uint8_t FoldRowPeriod(WsShadowLayer *layer, int row, int natCol) {
+  static const uint8_t kPeriods[] = {4, 8, 16};
+  if (layer->foldRow[row].set && layer->foldRow[row].natCol == natCol)
+    return layer->foldRow[row].period;
+  uint8_t period = 0;
+  for (size_t p = 0; p < sizeof(kPeriods) && !period; p++) {
+    int ok = 1;
+    for (int i = 0; i + kPeriods[p] < 32 && ok; i++)
+      ok = FoldMapEntry(layer, row, (natCol + i) & 63) ==
+           FoldMapEntry(layer, row, (natCol + i + kPeriods[p]) & 63);
+    if (ok)
+      period = kPeriods[p];
+  }
+  layer->foldRow[row].set = 1;
+  layer->foldRow[row].natCol = (uint8_t)natCol;
+  layer->foldRow[row].period = period;
+  return period;
+}
+
 uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
+                      uint16_t hScroll, uint16_t mapWordAdr,
                       uint16_t realTile) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return realTile;
-  const WsShadowLayer *layer = &s_layers[layerIndex];
-  if (!layer->active || !layer->entries || (screenX >= 0 && screenX < 256))
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  if (!layer->active || (screenX >= 0 && screenX < 256))
     return realTile;
 
-  uint16_t miss = layer->blankTilePlus1
-                      ? (uint16_t)(layer->blankTilePlus1 - 1)
-                      : realTile;
+  /* Layered margin sources, exact-first: (1) the world-keyed history —
+   * captured from the native view sweep AND from the game's own
+   * uploads at write time, it holds the exact world content whenever
+   * that content has ever existed in VRAM; (2) the periodic fold for
+   * cells never seen (stage start, beyond the populated span) on rows
+   * whose native window proves an exact period; (3) the renderer's
+   * plain map wrap. History-first keeps world-anchored features
+   * (towers) in the margins and stops fold/history flicker: a false
+   * period inferred from a feature-free native window can no longer
+   * paint filler over known feature cells. */
+  const uint32_t shift = layer->tileShift ? layer->tileShift : 3;
   int32_t worldX = (int32_t)layer->worldX + screenX;
-  const unsigned sh = layer->tileShift ? layer->tileShift : 3;
-  uint16_t entry;
-  uint32_t tx = worldX < 0 ? (layer->worldX >> sh) : (uint32_t)worldX >> sh;
-  uint32_t ty;
+  int32_t worldY;
   if (layer->retainHistory) {
-    const uint32_t y_in_view = (wrappedY - layer->scrollY) & 0x3ff;
-    const uint32_t fine = layer->scrollY & ((1u << sh) - 1u);
-    ty = (y_in_view + fine) >> sh;
+    worldY = (int32_t)(((wrappedY - layer->scrollY) & 0x3ff) +
+                       (layer->scrollY & ((1u << shift) - 1)));
   } else {
-    int32_t worldY =
-        (int32_t)layer->worldY +
-        (int32_t)((wrappedY - layer->scrollY) & 0x3ff);
-    if (worldY < 0)
-      return miss;
-    ty = (uint32_t)worldY >> sh;
+    worldY = WorldFromWrapped(layer->worldY, wrappedY & 0x3ff);
   }
-  if (GetEntry(layer, tx, ty, &entry))
-    return entry;
-  return miss;
+  if (layer->entries && worldX >= 0 && worldY >= 0) {
+    uint16_t entry;
+    if (GetEntry(layer, (uint32_t)worldX >> shift,
+                 (uint32_t)worldY >> shift, &entry))
+      return entry;
+  }
+
+  if (layer->fold && layer->foldVram) {
+    uint16_t off = (uint16_t)(mapWordAdr - layer->mapBaseWord);
+    if (off < 0x800) {
+      int col = (off & 0x1f) | (off & 0x400 ? 0x20 : 0);
+      int row = (off >> 5) & 0x1f;
+      int natCol = (hScroll >> shift) & 63;
+      uint8_t period = FoldRowPeriod(layer, row, natCol);
+      if (period) {
+        int rel = (col - natCol) & 63;
+        if (rel >= 32)
+          return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
+        return realTile;  /* native column (or margin overlapping it) */
+      }
+    }
+  }
+
+  return layer->blankTilePlus1 ? (uint16_t)(layer->blankTilePlus1 - 1)
+                               : realTile;
 }
 
 bool WsShadowLayerActive(int layerIndex) {
   return layerIndex >= 0 && layerIndex < kLayers &&
-         s_layers[layerIndex].active && s_layers[layerIndex].entries;
+         s_layers[layerIndex].active && s_layers[layerIndex].wide &&
+         (s_layers[layerIndex].fold || s_layers[layerIndex].entries);
 }
 
 uint32_t WsShadowWorldX(int layerIndex) {
@@ -1013,11 +1157,13 @@ uint32_t WsShadowWorldX(int layerIndex) {
     return 0;
   return s_layers[layerIndex].worldX;
 }
+
 uint32_t WsShadowWorldY(int layerIndex) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return 0;
   return s_layers[layerIndex].worldY;
 }
+
 uint32_t WsShadowPresentWorldY(int layerIndex, int screenX) {
   (void)screenX;
   if (layerIndex < 0 || layerIndex >= kLayers)
@@ -1026,11 +1172,13 @@ uint32_t WsShadowPresentWorldY(int layerIndex, int screenX) {
     return s_layers[layerIndex].scrollY;
   return s_layers[layerIndex].worldY;
 }
+
 uint32_t WsShadowScrollX(int layerIndex) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return 0;
   return s_layers[layerIndex].scrollX;
 }
+
 uint32_t WsShadowScrollY(int layerIndex) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return 0;

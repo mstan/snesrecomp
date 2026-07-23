@@ -26,7 +26,7 @@ int  snes_lobby_list_get(int index, SnesLobbyRow *out) { (void)index; (void)out;
 void snes_lobby_set_game_identity(const char *a, const char *b) { (void)a; (void)b; }
 const char *snes_lobby_game_version(void) { return SNES_GAME_VERSION; }
 int  snes_lobby_create(const char *a, const char *b, const char *c, const char *d,
-                      const char *e, const SnesLobbyMatchCaps *f)
+                       const char *e, const SnesLobbyMatchCaps *f)
 { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return -1; }
 int  snes_lobby_join(const char *a, const char *b, const char *c)
 { (void)a; (void)b; (void)c; return -1; }
@@ -135,18 +135,11 @@ static LobbyClient g_lc = {
 
 static const char *effective_game_version(const char *override_ver)
 {
-    if (override_ver && override_ver[0]) {
-        return override_ver;
-    }
-    if (g_lc.filter_game_version[0]) {
-        return g_lc.filter_game_version;
-    }
+    if (override_ver && override_ver[0]) return override_ver;
+    if (g_lc.filter_game_version[0]) return g_lc.filter_game_version;
     return SNES_GAME_VERSION;
 }
 
-/* Release builds pin the lobby browser to our exact game_version.
- * Non-release ("dev") shows all versions of our title so testers can see
- * unofficial / mismatched hosts; join still requires an exact version match. */
 static int list_filter_version_strict(void)
 {
     const char *gv = effective_game_version(NULL);
@@ -172,7 +165,6 @@ static void queue_list_request(void)
         queue_send("{\"op\":\"list\"}");
     }
 }
-
 
 static void match_caps_clear(SnesLobbyMatchCaps *c)
 {
@@ -459,10 +451,21 @@ static void flush_pending(void)
 static void fill_peer_bind_from_join(void)
 {
     SnesLobbyJoinInfo *j = &g_lc.join;
+    const char *port;
     memset(j->bind_hostport, 0, sizeof(j->bind_hostport));
     memset(j->peer_hostport, 0, sizeof(j->peer_hostport));
     if (g_lc.is_host) {
-        strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
+        /* host_endpoint is the address advertised to peers. It may be the
+         * router's public/NAT address and therefore cannot be bound on this
+         * machine. Listen on every local interface using the advertised port. */
+        port = strrchr(g_lc.my_bind, ':');
+        if (port && port[1]) {
+            snprintf(j->bind_hostport, sizeof(j->bind_hostport),
+                     "0.0.0.0:%s", port + 1);
+        } else {
+            strncpy(j->bind_hostport, g_lc.my_bind,
+                    sizeof(j->bind_hostport) - 1);
+        }
         strncpy(j->peer_hostport, j->guest_endpoint, sizeof(j->peer_hostport) - 1);
     } else {
         strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
@@ -592,7 +595,7 @@ static void handle_server_json(const char *json)
             snprintf(msg, sizeof(msg), "{\"op\":\"hello\",\"display_name\":\"%s\"}", g_lc.display_name);
             queue_send(msg);
         }
-        queue_list_request();
+        queue_send("{\"op\":\"list\"}");
         return;
     }
     if (strcmp(op, "lobby_list") == 0) {
@@ -644,13 +647,9 @@ static void handle_server_json(const char *json)
                     json_get_str(chunk, "game_name", g_lc.list[n].game_name, sizeof(g_lc.list[n].game_name));
                     json_get_str(chunk, "game_version", g_lc.list[n].game_version,
                                  sizeof(g_lc.list[n].game_version));
-                    if (!g_lc.list[n].game_version[0]) {
+                    if (!g_lc.list[n].game_version[0])
                         strncpy(g_lc.list[n].game_version, "dev",
                                 sizeof(g_lc.list[n].game_version) - 1);
-                    }
-                    /* Drop lobbies that don't match our title (broadcast list
-                     * is unfiltered). Release builds also pin game_version;
-                     * "dev" keeps other versions visible for testing. */
                     if (g_lc.filter_game_name[0] &&
                         strcmp(g_lc.list[n].game_name, g_lc.filter_game_name) != 0) {
                         p = end;
@@ -981,10 +980,8 @@ void snes_lobby_pump(void)
     drain_ws_pending();
     for (;;) {
         int closed = 0;
-        int fl;
 #if !defined(_WIN32)
-        fl = fcntl(g_lc.fd, F_GETFL, 0);
-        /* Non-blocking peek: if no data, EAGAIN from first recv inside read */
+        int fl = fcntl(g_lc.fd, F_GETFL, 0);
 #endif
         {
             uint8_t peek[1];
@@ -1019,16 +1016,19 @@ void snes_lobby_pump(void)
     }
 }
 
-void snes_lobby_set_game_identity(const char *game_name, const char *game_version)
+void snes_lobby_set_game_identity(const char *game_name,
+                                  const char *game_version)
 {
     if (game_name) {
-        strncpy(g_lc.filter_game_name, game_name, sizeof(g_lc.filter_game_name) - 1);
+        strncpy(g_lc.filter_game_name, game_name,
+                sizeof(g_lc.filter_game_name) - 1);
         g_lc.filter_game_name[sizeof(g_lc.filter_game_name) - 1] = '\0';
     } else {
         g_lc.filter_game_name[0] = '\0';
     }
     if (game_version && game_version[0]) {
-        strncpy(g_lc.filter_game_version, game_version, sizeof(g_lc.filter_game_version) - 1);
+        strncpy(g_lc.filter_game_version, game_version,
+                sizeof(g_lc.filter_game_version) - 1);
         g_lc.filter_game_version[sizeof(g_lc.filter_game_version) - 1] = '\0';
     } else {
         strncpy(g_lc.filter_game_version, SNES_GAME_VERSION,
@@ -1062,9 +1062,9 @@ int snes_lobby_list_get(int index, SnesLobbyRow *out)
     return 1;
 }
 
-int snes_lobby_create(const char *name, const char *game_name, const char *game_version,
-                     const char *password, const char *host_bind,
-                     const SnesLobbyMatchCaps *match_caps)
+int snes_lobby_create(const char *name, const char *game_name,
+                     const char *game_version, const char *password,
+                     const char *host_bind, const SnesLobbyMatchCaps *match_caps)
 {
     char msg[1536];
     char caps_json[512];
@@ -1077,9 +1077,8 @@ int snes_lobby_create(const char *name, const char *game_name, const char *game_
     gn = game_name && game_name[0] ? game_name
          : (g_lc.filter_game_name[0] ? g_lc.filter_game_name : "Game");
     gv = effective_game_version(game_version);
-    if (game_name && game_name[0]) {
+    if (game_name && game_name[0])
         snes_lobby_set_game_identity(game_name, gv);
-    }
     strncpy(g_lc.my_bind, host_bind && host_bind[0] ? host_bind : "0.0.0.0:7777",
             sizeof(g_lc.my_bind) - 1);
     g_lc.join.last_error[0] = '\0';
@@ -1089,8 +1088,8 @@ int snes_lobby_create(const char *name, const char *game_name, const char *game_
         append_match_caps_json(caps_json, sizeof(caps_json), match_caps);
     }
     n = snprintf(msg, sizeof(msg),
-                 "{\"op\":\"create\",\"name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\","
-                 "\"password\":\"%s\",\"max_slots\":2,\"host_bind\":\"%s\",\"display_name\":\"%s\"%s}",
+                 "{\"op\":\"create\",\"name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\",\"password\":\"%s\","
+                 "\"max_slots\":2,\"host_bind\":\"%s\",\"display_name\":\"%s\"%s}",
                  name && name[0] ? name : "Lobby", gn, gv,
                  password ? password : "", g_lc.my_bind,
                  g_lc.display_name[0] ? g_lc.display_name : "Host", caps_json);
@@ -1117,8 +1116,7 @@ int snes_lobby_join(const char *lobby_id, const char *password, const char *gues
              "{\"op\":\"join\",\"lobby_id\":\"%s\",\"password\":\"%s\",\"guest_bind\":\"%s\","
              "\"display_name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\"}",
              lobby_id, password ? password : "", g_lc.my_bind,
-             g_lc.display_name[0] ? g_lc.display_name : "Guest",
-             gn, gv);
+             g_lc.display_name[0] ? g_lc.display_name : "Guest", gn, gv);
     queue_send(msg);
     flush_pending();
     return 0;

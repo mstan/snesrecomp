@@ -1,8 +1,5 @@
 /* Optional per-game launcher theme.
  *
  * Game projects may stage their own theme.rcss after the shared launcher
- * assets. The no-op rule below keeps RmlUi happy when no skin is provided
- * (a comment-only stylesheet fails to load).
- */
-body {
-}
+ * assets. Keeping this default file empty preserves the standard snesrecomp
+ * appearance for projects that do not provide a skin. */

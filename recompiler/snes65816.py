@@ -15,6 +15,35 @@ ROM_MAP_LOROM = 'lorom'
 ROM_MAP_HIROM = 'hirom'
 _active_rom_mapping = ROM_MAP_LOROM
 
+# Reloc regions: WRAM-executed code whose bytes live elsewhere in the ROM image
+# (a decompressed/relocated copy, or a `ram_routine` blob appended to the image).
+# Each entry redirects a (ram_bank, ram_addr..+length) logical range to an
+# absolute ROM offset; the logical PC stays in WRAM. Mirrors the Rust analyzer's
+# RelocRegion + reintroduces the v1 process-global registry (v2 dropped it).
+# Each tuple: (ram_bank, ram_addr, length, rom_off_base).
+_reloc_regions: List[tuple] = []
+
+
+def register_reloc_region(ram_bank: int, ram_addr: int, length: int,
+                          rom_off_base: int) -> None:
+    _reloc_regions.append((ram_bank & 0xFF, ram_addr & 0xFFFF, length,
+                           rom_off_base))
+
+
+def clear_reloc_regions() -> None:
+    _reloc_regions.clear()
+
+
+def _reloc_lookup(bank: int, addr: int) -> Optional[int]:
+    """Return the absolute ROM offset for (bank, addr) if it falls in a
+    registered reloc region, else None."""
+    if not _reloc_regions:
+        return None
+    for ram_bank, ram_addr, length, rom_off_base in _reloc_regions:
+        if bank == ram_bank and ram_addr <= addr < ram_addr + length:
+            return rom_off_base + (addr - ram_addr)
+    return None
+
 
 def _header_score(data: bytes, base: int, expected_low_nibble: int) -> int:
     """Score a conventional 32-byte SNES header without trusting its title.
@@ -77,6 +106,9 @@ def lorom_offset(bank: int, addr: int) -> int:
 def rom_offset(bank: int, addr: int) -> int:
     bank &= 0xFF
     addr &= 0xFFFF
+    reloc = _reloc_lookup(bank, addr)
+    if reloc is not None:
+        return reloc
     assert bank not in (0x7E, 0x7F), (
         f"address ${bank:02X}:{addr:04X} is WRAM, not ROM")
     if _active_rom_mapping == ROM_MAP_HIROM:
@@ -92,6 +124,8 @@ def rom_offset(bank: int, addr: int) -> int:
 def is_rom_address(bank: int, addr: int) -> bool:
     bank &= 0xFF
     addr &= 0xFFFF
+    if _reloc_lookup(bank, addr) is not None:
+        return True
     if bank in (0x7E, 0x7F):
         return False
     if _active_rom_mapping == ROM_MAP_HIROM:
@@ -137,6 +171,7 @@ class Insn:
                   'dispatch_pointer_match', 'dispatch_popped_call_frame',
                   'dispatch_stack_pointer', 'dispatch_forced_m',
                   'dispatch_forced_x', 'dispatch_consumed_stack_bytes',
+                  'dispatch_configured_stack_bytes',
                   'const_z_fold_unconditional', 'const_z_fold_dead_pc24',
                   'data_region_exec', 'terminal_jsr')
 
@@ -191,6 +226,7 @@ class Insn:
         self.dispatch_forced_m = 1
         self.dispatch_forced_x = 1
         self.dispatch_consumed_stack_bytes = 0
+        self.dispatch_configured_stack_bytes = 0
         # Direct JSR whose callee consumes the two-byte return address as
         # inline data and never resumes the lexical fall-through.  Imported
         # from assembly source as a call-site ABI contract; see cfg_loader's

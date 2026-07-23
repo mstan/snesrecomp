@@ -11,6 +11,25 @@ file tracks the **engine** changes and the recompiler-side design decisions.
 
 ---
 
+## SHIPPED (2026-07-21): explicit continuation/frame for pointer calls
+
+`indirect_dispatch ... ptrcall` accepts two optional fields for ROM-hack
+wrappers that construct a handler return frame before jumping through a
+pointer:
+
+```text
+indirect_dispatch <site> <count> ptrcall return:<pc16> frame:<2|3> targets:<...>
+```
+
+`return:` selects the block resumed after the handler returns instead of the
+instruction's lexical fall-through. `frame:` selects the already-present
+hardware frame consumed by each handler (2 for RTS, 3 for RTL), independently
+of whether the dispatch instruction itself is JMP or JML. Both fields are
+optional and preserve the prior inferred behavior when omitted. The Python and
+native Rust cfg loaders, analyzers, and decoders implement the same contract.
+
+---
+
 ## Context: SM attract-demo bring-up
 
 The SM attract demo was pinned at `game_state` 40. **Root cause was a

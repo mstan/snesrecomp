@@ -17,6 +17,7 @@
 #include "snes/apu.h"
 #include "snes/cart.h"
 #include "snes/msu1.h"
+#include "snes/ws_shadow.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
 #include "debug_server.h"
@@ -36,8 +37,9 @@ Ppu *g_ppu;
 Dma *g_dma;
 uint8 g_snesrecomp_last_hdmaen;
 
-/* Netplay: SPC is paced by a fixed samples/frame drain on the CPU thread
- * (see RtlRunFrame). The audio device must not advance the APU. */
+/* Netplay suppresses the pre-frame wall-clock fallback below. Once frames
+ * begin, every runner uses the same guest-frame/APU coupling, and the audio
+ * callback only consumes samples without advancing emulation. */
 static int rtl_netplay_locks_audio(void) {
 #if defined(SNESRECOMP_NET)
   return snes_netplay_active();
@@ -46,65 +48,10 @@ static int rtl_netplay_locks_audio(void) {
 #endif
 }
 
-static double s_netplay_audio_acc;
-
-/* Playback FIFO: CPU drain pushes 534-native stereo blocks; audio thread pops.
- * Sized for ~250 ms so brief admit stalls don't underrun immediately. */
-#define NETPLAY_AUDIO_BLOCK 534
-#define NETPLAY_AUDIO_FIFO_BLOCKS 16
-static int16 s_np_pcm[NETPLAY_AUDIO_FIFO_BLOCKS * NETPLAY_AUDIO_BLOCK * 2];
-static uint32 s_np_blocks_r, s_np_blocks_w;
-
 void RtlNetplayAudioReset(void) {
-  s_netplay_audio_acc = 0.0;
-  s_np_blocks_r = s_np_blocks_w = 0;
-}
-
-static void rtl_netplay_drain_audio_frame(void);
-
-static uint32 rtl_np_fifo_count(void) {
-  return s_np_blocks_w - s_np_blocks_r;
-}
-
-static void rtl_np_fifo_push_block(const int16 *stereo534) {
-  if (rtl_np_fifo_count() >= NETPLAY_AUDIO_FIFO_BLOCKS)
-    s_np_blocks_r++; /* drop oldest — SPC already advanced */
-  {
-    uint32 slot = s_np_blocks_w % NETPLAY_AUDIO_FIFO_BLOCKS;
-    memcpy(&s_np_pcm[slot * NETPLAY_AUDIO_BLOCK * 2], stereo534,
-           (size_t)NETPLAY_AUDIO_BLOCK * 2u * sizeof(int16));
-    s_np_blocks_w++;
-  }
-}
-
-static int rtl_np_fifo_pop_block(int16 *stereo534) {
-  if (s_np_blocks_r == s_np_blocks_w) return 0;
-  {
-    uint32 slot = s_np_blocks_r % NETPLAY_AUDIO_FIFO_BLOCKS;
-    memcpy(stereo534, &s_np_pcm[slot * NETPLAY_AUDIO_BLOCK * 2],
-           (size_t)NETPLAY_AUDIO_BLOCK * 2u * sizeof(int16));
-    s_np_blocks_r++;
-  }
-  return 1;
-}
-
-static void rtl_np_resample_block(const int16 *native534, int16 *out, int samples) {
-  if (samples == NETPLAY_AUDIO_BLOCK) {
-    memcpy(out, native534, (size_t)NETPLAY_AUDIO_BLOCK * 2u * sizeof(int16));
-    return;
-  }
-  {
-    double adder = (double)NETPLAY_AUDIO_BLOCK / (double)samples;
-    double location = 0.0;
-    int i;
-    for (i = 0; i < samples; i++) {
-      uint32 idx = (uint32)location;
-      if (idx >= NETPLAY_AUDIO_BLOCK) idx = NETPLAY_AUDIO_BLOCK - 1;
-      out[i * 2] = native534[idx * 2];
-      out[i * 2 + 1] = native534[idx * 2 + 1];
-      location += adder;
-    }
-  }
+  /* Kept as a stable facade hook for recomp-net hosts. The current runner's
+   * audio callback is already consumer-only, so there is no separate
+   * wall-clock netplay accumulator to reset. */
 }
 
 // Main-CPU cycle estimate, incremented per RDB_BLOCK_HOOK in debug_on_block_enter.
@@ -156,6 +103,37 @@ int cosim_apu_shared_clock(void) {
 // synthetic estimate. g_apu_last_sync_master is the master-clock count at the
 // last APU sync; rtl_accumulate_apu_catchup() converts the delta to SPC cycles.
 uint64_t g_apu_last_sync_master = 0;
+/* Production's frame loop is the stable guest-time ruler: one frame is
+ * 357368 SNES master cycles and 17088 SPC cycles in this runtime's 60 Hz
+ * model. g_cpu.master_cycles supplies only the within-frame position because
+ * its total per frame varies with recompilation coverage. */
+#define RTL_MASTER_CYCLES_PER_FRAME 357368ull
+#define RTL_APU_CYCLES_PER_FRAME     17088ull
+static uint64_t g_apu_frame_start_master;
+static bool g_apu_frame_time_valid;
+
+/* Fast-forward advances the real SPC/DSP state faster than the host device can
+ * play it. On the transition back to realtime, buffered PCM represents stale
+ * guest time and must not become permanent A/V latency. The short ramp joins
+ * the last delivered sample to the first current sample without a hard edge. */
+#define RTL_AUDIO_RECOVERY_RAMP 128u
+static bool g_audio_fast_forward;
+static uint32_t g_audio_recovery_frames;
+static uint32_t g_audio_recovery_remaining;
+static int16 g_audio_recovery_anchor_l;
+static int16 g_audio_recovery_anchor_r;
+static int16 g_audio_last_output_l;
+static int16 g_audio_last_output_r;
+static void rtl_sync_apu_frame_boundary(void);
+
+static uint64_t rtl_apu_guest_cycle(void) {
+  uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
+  if (within >= RTL_MASTER_CYCLES_PER_FRAME)
+    within = RTL_MASTER_CYCLES_PER_FRAME - 1;
+  return (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME +
+         within * RTL_APU_CYCLES_PER_FRAME /
+             RTL_MASTER_CYCLES_PER_FRAME;
+}
 // $420D bit 0 (FastROM / MEMSEL): 1 => $80-$FF:$8000-$FFFF code runs fast (6
 // master clocks/access) instead of slow (8). Tracked here so emitted blocks in
 // the WS2 mirror banks weight their master-cycle charge correctly at runtime.
@@ -237,6 +215,8 @@ static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 
 void RtlReset(int mode) {
   snes_frame_counter = 0;
+  g_apu_frame_time_valid = false;
+  g_apu_frame_start_master = g_cpu.master_cycles;
   g_main_cpu_cycles_estimate = 0;
   g_apu_pace_cycles_estimate = 0;
   g_apu_last_sync_cycles = 0;
@@ -252,6 +232,13 @@ void RtlReset(int mode) {
     memset(g_sram, 0, g_sram_size);
 
   RtlApuLock();
+  g_audio_fast_forward = false;
+  g_audio_recovery_frames = 0;
+  g_audio_recovery_remaining = 0;
+  g_audio_recovery_anchor_l = 0;
+  g_audio_recovery_anchor_r = 0;
+  g_audio_last_output_l = 0;
+  g_audio_last_output_r = 0;
   g_spc_player->initialize(g_spc_player);
   RtlApuUnlock();
 }
@@ -437,6 +424,11 @@ bool RtlRunFrame(uint32 inputs) {
   g_snes->input1_currentState = inputs & 0xfff;
   g_snes->input2_currentState = (inputs >> 12) & 0xfff;
 
+  /* Establish the guest timestamp origin before any frame code can touch an
+   * APU port. Host turbo changes how quickly frames arrive, not their guest
+   * duration. */
+  g_apu_frame_start_master = g_cpu.master_cycles;
+  g_apu_frame_time_valid = true;
   WatchdogFrameStart();
   // Watchdog guard: WatchdogCheck() (called per-block in v2 gen) longjmps
   // here when a frame exceeds 5s, so an infinite loop in recompiled code
@@ -445,10 +437,6 @@ bool RtlRunFrame(uint32 inputs) {
   if (setjmp(g_watchdog_jmp) == 0) {
     g_rtl_game_info->run_frame();
   }
-  /* Netplay: frame-lock SPC like SNES_COSIM_AUDIO so peers share one APU clock
-   * (audio-thread / wall-clock pacing desyncs LLE at logo/music handshakes). */
-  if (rtl_netplay_locks_audio())
-    rtl_netplay_drain_audio_frame();
 #ifdef SNES_COSIM
   /* DETERMINISTIC AUDIO CONSUMER (SNES_COSIM_AUDIO=1). Production pins SPC tempo
    * to the audio device's consumption rate: RtlRenderAudio cycles the SPC only
@@ -515,6 +503,10 @@ bool RtlRunFrame(uint32 inputs) {
   g_fp_max_frame = (uint64_t)snes_frame_counter;
 
   snes_frame_counter++;
+  /* Every runner client gets the same guest-frame/APU coupling. Presentation
+   * code may opt into fast-forward PCM recovery separately, but cannot omit
+   * the emulation clock. */
+  rtl_sync_apu_frame_boundary();
 
 #ifdef SNES_COSIM
   /* Frame-keyed checkpoint: snapshot full state + park for the coordinator. */
@@ -542,24 +534,26 @@ bool RtlRunFrame(uint32 inputs) {
   return false;
 }
 
-void RtlSaveSnapshot(const char *filename) {
+bool RtlSaveSnapshot(const char *filename) {
   FILE *f = fopen(filename, "wb");
   if (!f) {
     printf("Failed fopen for save: %s\n", filename);
-    return;
+    return false;
   }
   uint32 hdr[2] = { RTL_SAV_MAGIC, RTL_SAV_VERSION };
-  fwrite(hdr, sizeof(hdr), 1, f);
+  bool header_ok = fwrite(hdr, sizeof(hdr), 1, f) == 1;
   RtlApuLock();
-  FileSli fs = { { &file_sli_func }, f, true, false };
-  snes_saveload(g_snes, &fs.base);
+  FileSli fs = { { &file_sli_func }, f, true, !header_ok };
+  if (header_ok)
+    snes_saveload(g_snes, &fs.base);
   /* v5: game-specific chunk (task-slot resume contexts etc.). Streamed
    * through the same FileSli so the format stays one linear blob. */
   if (g_rtl_game_info && g_rtl_game_info->state_save_extra)
     g_rtl_game_info->state_save_extra(&fs.base);
   RtlApuUnlock();
   if (fs.error) printf("Save write error: %s\n", filename);
-  fclose(f);
+  bool close_ok = fclose(f) == 0;
+  return !fs.error && close_ok;
 }
 
 bool RtlLoadSnapshot(const char *filename) {
@@ -577,10 +571,9 @@ bool RtlLoadSnapshot(const char *filename) {
   RtlApuLock();
   FileSli fs = { { &file_sli_func }, f, false, false };
   snes_saveload(g_snes, &fs.base);
-  /* v5+: optional game-specific chunk follows the guest blob. Only call
-   * state_load_extra when trailing bytes remain — older v5 files (and any
-   * game that leaves the hook unset) have none. v4 files never have a
-   * chunk; on_state_loaded still runs so the game can fall back. */
+  /* v5+: an optional game-specific chunk follows the guest blob. Only call
+   * the loader when trailing bytes remain so older v5 snapshots created by
+   * games without an extra chunk remain readable. */
   if (hdr[1] >= 5 && g_rtl_game_info && g_rtl_game_info->state_load_extra) {
     long pos = ftell(f);
     if (pos >= 0 && fseek(f, 0, SEEK_END) == 0) {
@@ -595,6 +588,7 @@ bool RtlLoadSnapshot(const char *filename) {
     printf("Save read error: %s\n", filename);
     return false;
   }
+  g_snes->beamMasterLast = g_cpu.master_cycles;
   /* Post-load reconciliation: host-side execution state (fibers, HLE
    * scheduler bookkeeping) cannot live in the guest snapshot; give the
    * game one hook to rebuild it against the freshly restored WRAM. */
@@ -634,6 +628,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
     g_rtl_game_info->state_load_extra(&memory.base, hdr[1]);
   RtlApuUnlock();
   if (memory.error) return false;
+  g_snes->beamMasterLast = g_cpu.master_cycles;
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
@@ -793,15 +788,12 @@ uint16 ReadRegWord(uint16 reg) {
   // snapshot. Two separate ReadReg calls would each catch the APU
   // up — between them the SPC could write only the LO byte (port 0)
   // before host has read HI (port 1), so host sees a torn value. Read
-  // both ports atomically (single catchup) for the APU-port range.
+  // both ports atomically (single guest-time sync) for the APU-port range.
   if (reg >= 0x2140 && reg <= 0x217F) {
-    extern void rtl_accumulate_apu_catchup(void);
     void RtlApuLock(void); void RtlApuUnlock(void);
-    void snes_catchupApu(Snes* snes);
     extern Snes *g_snes;
     RtlApuLock();
-    rtl_accumulate_apu_catchup();
-    snes_catchupApu(g_snes);
+    rtl_sync_apu_to_cpu_locked();
     uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
     uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
     RtlApuUnlock();
@@ -821,6 +813,7 @@ static void WriteVramWord(Ppu *ppu, uint16 value) {
   uint32_t byte_addr = (uint32_t)(adr & 0x7fff) << 1;
   debug_server_on_vram_write(byte_addr,     (uint8_t)(value & 0xff));
   debug_server_on_vram_write(byte_addr + 1, (uint8_t)(value >> 8));
+  WsShadowOnVramWrite((uint16_t)(adr & 0x7fff), value);
   ppu->vramPointer += ppu->vramIncrement;
 }
 
@@ -950,8 +943,8 @@ void rtl_accumulate_apu_catchup(void) {
   // Consumer presence is inferred from sampleRead movement, so this is
   // automatic per game and per moment, no config.
   //
-  // Netplay skips this: wall time differs per peer and desyncs LLE. SPC
-  // tempo comes from rtl_netplay_drain_audio_frame() instead.
+  // Netplay skips this: wall time differs per peer and desyncs LLE. Once the
+  // frame loop starts, rtl_sync_apu_frame_boundary() is authoritative.
   {
     static uint32_t last_sample_read;
     static uint64_t consume_seen_ms, wall_last_ms;
@@ -986,157 +979,60 @@ void rtl_accumulate_apu_catchup(void) {
 
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
+  uint8_t port = (uint8_t)(adr & 3);
+
 #ifdef SNES_COSIM
-  /* Shared APU clock (common_rtl.h): do NOT convert pending touch credit on a
-   * port WRITE — schedule the byte at the current produced clock and leave the
-   * credit for the next port READ. Rationale: the interp tier executes a guest
-   * word store to $2140/$2141 as two byte writes; converting credit between
-   * them runs the SPC ~73 cycles with the kick byte applied but the data byte
-   * not yet — the IPL latches stale data and the upload handshake wedges
-   * (measured: LLE-shared stuck at outPorts=AABB to frame 360+). On hardware
-   * the two bytes land ~2 SPC cycles apart — effectively atomic. Deferring
-   * write-side conversion makes byte pairs land at the SAME produced tick, in
-   * program order, for BOTH the interp (lo,hi) and compiled (hi,lo) models —
-   * which also makes word-write APU evolution identical across tiers. */
+  /* The shared-clock co-sim advances the SPC synchronously and compares two
+   * execution models instruction-for-instruction. Keep its bus mutation at
+   * the already-aligned current clock. */
   if (cosim_apu_shared_clock()) {
     RtlApuLock();
-    audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
-    uint64_t produced_now, consumed_now;
-    audio_trace_sample_clocks(&produced_now, &consumed_now);
-    apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
+    audio_trace_on_cpu_port_write(port, val);
+    apu_writePortNow(g_snes->apu, port, val);
     RtlApuUnlock();
     return;
   }
 #endif
-  // Catch the APU up to the current cycle, then SCHEDULE the port write
-  // in APU-sample time rather than mutating inPorts at wall time.
-  //
-  // Rationale (SMW missed-SFX root cause): the audio thread advances
-  // the SPC in whole-callback bursts, so a wall-time port mutation gives
-  // the value a lifetime of however many samples happen to be produced
-  // before the next mutation — measured ~9 samples (vs the 64 an engine
-  // poll needs) whenever the 60.0988 Hz NMI beats across the 60.00 Hz
-  // callback phase. Anchoring each write one callback quantum past the
-  // CONSUMED clock keeps successive frame writes a full frame apart in
-  // the SPC's own execution time, so the engine always polls every
-  // value, exactly as on hardware. Steady-state added latency is ~zero:
-  // consumed + quantum ~= produced, i.e. the next burst applies it.
-  // Serialise with the audio thread via RtlApuLock -- it holds the same
-  // lock while cycling the APU in RtlRenderAudio.
+
   RtlApuLock();
-  rtl_accumulate_apu_catchup();
-  snes_catchupApu(g_snes);
-  audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
-  {
-    /* Write clock: each target advances from the PREVIOUS write's target
-     * by the real wall-time gap between the two writes, converted to
-     * samples. This preserves hardware-faithful inter-write spacing in
-     * the SPC's execution timeline — frame-spaced NMI writes stay ~534
-     * samples apart, same-frame double writes keep their ms-scale gap —
-     * independent of where the audio thread's burst boundaries fall.
-     *
-     * (First attempt anchored targets at consumed+quantum; that fails
-     * because produced runs AHEAD of consumed by the output-ring fill,
-     * so every target was in the past and the floor collapsed
-     * consecutive writes onto the same sample — measured as +0-sample
-     * command lifetimes, i.e. the original race in a new costume.)
-     *
-     * Floor at produced: a target in the APU's past applies on the next
-     * executed sample. Ceiling at produced + 3 callback quanta bounds
-     * worst-case latency and sheds the slow forward drift from the
-     * NMI(60.0988 Hz)/callback(60.00 Hz) rate mismatch. Both caps scale
-     * with the observed burst granularity (audio_samples in config.ini
-     * is user-tunable): a ceiling smaller than the real burst would pin
-     * late-window writes to the same target and re-collapse spacing. */
-    static uint64_t s_port_clock;     /* previous write's target */
-    static uint64_t s_port_clock_ns;  /* wall_ns of previous write */
-    /* Per-port history for the minimum-dwell floor below. Statics, like
-     * s_port_clock: not reset across RtlReset/upload, which is benign —
-     * after a reset `produced` has advanced far past any stale target, so
-     * the floor (stale_target + dwell) is already in the past and never
-     * engages spuriously. */
-    static uint64_t s_port_last_target[4];
-    static uint8_t  s_port_last_val[4];
-    static uint8_t  s_port_last_valid[4];
-    /* Hardware visibility is the correctness default: a CPU port write lands
-     * at the APU's current execution point. Delaying it according to host wall
-     * time is not an LLE property and breaks real write -> echo -> poll
-     * protocols (MMX's runtime SPC upload used to spend >5 seconds in one
-     * faithfully recompiled polling loop). Keep the deferred scheduler below
-     * only as an explicit legacy/audio experiment selected with
-     * SNESRECOMP_APU_IMMEDIATE_PORTS=0; it must not be a per-game or per-region
-     * compile-time correctness hint. */
-    static int s_immediate = -1;
-    if (s_immediate < 0) {
-      const char *e = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
-      s_immediate = (e && e[0]) ? (e[0] != '0') : 1;
-#ifdef SNES_COSIM
-      /* Shared APU clock implies immediate ports: the deferred scheduler
-       * anchors targets to the co-sim virtual wall clock, which derives from
-       * master_cycles — a per-execution-model clock that would re-skew the
-       * A/B pair this mode aligns. */
-      if (cosim_apu_shared_clock()) s_immediate = 1;
-#endif
-    }
-    if (s_immediate) {
-      uint64_t produced_now, consumed_now;
-      audio_trace_sample_clocks(&produced_now, &consumed_now);
-      apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, produced_now);
-      RtlApuUnlock();
-      return;
-    }
-    uint64_t quantum = audio_trace_consume_quantum();
-    uint64_t now_ns = audio_trace_wall_ns();
-    uint64_t produced, consumed;
-    audio_trace_sample_clocks(&produced, &consumed);
-    uint64_t delta = 0;
-    if (s_port_clock_ns != 0)
-      delta = (now_ns - s_port_clock_ns) * 32040u / 1000000000u;
-    if (delta > 4u * quantum) delta = 4u * quantum;
-    uint64_t target = s_port_clock + delta;
-    if (target < produced) target = produced;
-    if (target > produced + 3u * quantum) target = produced + 3u * quantum;
+  if (!g_apu_frame_time_valid) {
+    rtl_accumulate_apu_catchup();
+    snes_catchupApu(g_snes);
+  }
+  audio_trace_on_cpu_port_write(port, val);
 
-    /* Minimum per-port dwell — the turbo audio-dropout fix. A level
-     * transition fires several DISTINCT values at the same APU port
-     * (fade, silence, the new song; or a one-shot command then the NMI's
-     * next-frame 0-clear) within a few frames. The wall-clock spacing
-     * computed above reproduces hardware timing faithfully at 1x, but
-     * turbo runs the game thread uncapped while the SPC still advances at
-     * 1x, compressing that spacing below the engine's ~64-sample poll
-     * period — so an earlier value is overwritten in inPorts before the
-     * engine ever reads it and the command is silently lost (music/SFX
-     * drop out; because a surviving fade can zero global output, they do
-     * not come back until the next track change, i.e. never within a
-     * level). Floor a DISTINCT value's target so the previous distinct
-     * value on that port holds the bus for at least APU_PORT_MIN_DWELL
-     * produced-samples — one guaranteed engine poll. The drain runs once
-     * per produced sample (apu_cycle), so this target spacing becomes
-     * apply spacing directly. Bounded by produced + 8*quantum so a
-     * pathological sustained burst degrades to today's bounded latency
-     * rather than unbounding it. Identical repeats (e.g. repeated
-     * 0-clears) need no spacing. No effect at 1x: frame-spaced writes are
-     * already ~534 samples apart, far above the floor. */
-    {
-      int p = (int)(adr & 0x3);
-      if (s_port_last_valid[p] && val != s_port_last_val[p]) {
-        uint64_t floor = s_port_last_target[p] + APU_PORT_MIN_DWELL;
-        uint64_t ceil  = produced + 8u * quantum;
-        if (target < floor) target = floor < ceil ? floor : ceil;
-      }
-      s_port_last_target[p] = target;
-      s_port_last_val[p]    = val;
-      s_port_last_valid[p]  = 1;
-    }
-
-    s_port_clock = target;
-    s_port_clock_ns = now_ns;
-    apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, target);
+  if (!g_apu_frame_time_valid) {
+    /* Reset/IPL handshakes actively advance the SPC through their poll loops;
+     * there is no host frame timeline yet, so current-cycle visibility is the
+     * faithful model. */
+    apu_writePortNow(g_snes->apu, port, val);
+  } else {
+    uint64_t guest_cycle = rtl_apu_guest_cycle();
+    while (!apu_schedulePortWrite(g_snes->apu, port, val, guest_cycle))
+      apu_cycle(g_snes->apu);
   }
   RtlApuUnlock();
 }
 
-static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_result) {
+void rtl_sync_apu_to_cpu_locked(void) {
+  if (!g_apu_frame_time_valid) {
+    rtl_accumulate_apu_catchup();
+    snes_catchupApu(g_snes);
+    return;
+  }
+  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
+  uint64_t before = g_snes->apu->portClock;
+  bool synced = apu_runToGuestCycle(g_snes->apu, rtl_apu_guest_cycle(),
+                                    1u << 20);
+  audio_trace_on_guest_sync(0, g_snes->apu->portClock - before);
+  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+  if (!synced)
+    fprintf(stderr, "[apu] CPU-port guest-clock sync timed out\n");
+}
+
+static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu,
+                                            bool update_cpu_result,
+                                            bool live_transfer) {
   uint16_t dp = cpu->D;
   uint16_t data_lo = (uint16_t)g_ram[(dp + 0) & 0xffff]
                    | ((uint16_t)g_ram[(dp + 1) & 0xffff] << 8);
@@ -1146,6 +1042,30 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
   int block_count = 0;
 
   RtlApuLock();
+  bool ipl_phase = g_snes->apu->romReadable;
+  /* The HLE routine takes ownership only after all earlier CPU bus events
+   * have reached the live SPC. For a running driver, honor its ready
+   * handshake before replacing the byte-by-byte payload copy. */
+  if (!apu_runUntilPortQueueEmpty(g_snes->apu, 1u << 22)) {
+    RtlApuUnlock();
+    fprintf(stderr, "[apu] queued port events did not reach upload boundary\n");
+    return false;
+  }
+  uint8_t transfer_request = g_snes->apu->inPorts[1];
+  if (live_transfer && !ipl_phase &&
+      !apu_waitForTransferReady(g_snes->apu, 1, transfer_request, 1u << 20)) {
+    fprintf(stderr,
+            "[apu] SPC transfer-ready timeout pc=%04x stopped=%d "
+            "in=%02x%02x out=%02x%02x edge=%02x%02x buf=%02x%02x\n",
+            g_snes->apu->spc->pc, g_snes->apu->spc->stopped,
+            g_snes->apu->inPorts[0], g_snes->apu->inPorts[1],
+            g_snes->apu->outPorts[0], g_snes->apu->outPorts[1],
+            g_snes->apu->ram[0], g_snes->apu->ram[1],
+            g_snes->apu->ram[4], g_snes->apu->ram[5]);
+    RtlApuUnlock();
+    return false;
+  }
+  apu_clearPortQueue(g_snes->apu);
   for (;;) {
     uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
     uint16_t target = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
@@ -1186,14 +1106,12 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
    * Detect "first upload" via apu->romReadable: it's reset to true by
    * apu_reset() and only flipped false here, so on the IPL-phase
    * upload it's still true. */
-  bool ipl_phase = g_snes->apu->romReadable;
-  /* The upload supersedes any not-yet-applied scheduled port writes;
-   * a stale pre-upload command landing on the freshly cleared ports
-   * would replay into the re-initialised engine. */
-  apu_clearPortQueue(g_snes->apu);
-  memset(g_snes->apu->inPorts, 0, sizeof(g_snes->apu->inPorts));
-  memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
   if (ipl_phase) {
+    /* The boot upload body was replaced wholesale, so this is the logical
+     * consumption of the request that selected it. */
+    audio_trace_on_spc_port_read(1, transfer_request);
+    memset(g_snes->apu->inPorts, 0, 4);
+    memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
     g_snes->apu->romReadable = false;
     g_snes->apuCatchupCycles = 0;
     g_snes->apu->cpuCyclesLeft = 0;
@@ -1205,6 +1123,18 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
         g_snes->apu->spc->sp = 0xef;
       g_snes->apu->spc->pc = final_pc;
     }
+  } else if (live_transfer) {
+    if (!apu_finishHleTransfer(g_snes->apu, final_pc, 1u << 20)) {
+      RtlApuUnlock();
+      fprintf(stderr, "[apu] SPC transfer terminator timed out\n");
+      return false;
+    }
+  } else {
+    /* Legacy HLE users have not declared a live driver protocol. Preserve
+     * their prior behavior instead of guessing that they speak SMW's
+     * AA/BB/CC transfer handshake. */
+    memset(g_snes->apu->inPorts, 0, 4);
+    memset(g_snes->apu->outPorts, 0, sizeof(g_snes->apu->outPorts));
   }
   g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   // Resync the master pointer too: an IPL-phase upload zeroes apuCatchupCycles,
@@ -1225,111 +1155,123 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
 }
 
 bool RtlUploadSpcImageFromDp(CpuState *cpu) {
-  return RtlUploadSpcImageFromDpInternal(cpu, false);
+  return RtlUploadSpcImageFromDpInternal(cpu, false, false);
+}
+
+bool RtlUploadSpcImageFromDpLive(CpuState *cpu) {
+  return RtlUploadSpcImageFromDpInternal(cpu, false, true);
 }
 
 bool RtlHandleSpcUpload(CpuState *cpu) {
-  return RtlUploadSpcImageFromDpInternal(cpu, true);
+  return RtlUploadSpcImageFromDpInternal(cpu, true, false);
 }
 
-#define DSP_AVAIL(d) ((uint32_t)((d)->sampleWrite - (d)->sampleRead))
-
-/* allow_produce=0: pop netplay playback FIFO only. Never advance SPC. */
-static void rtl_render_audio_ex(int16 *audio_buffer, int samples, int channels,
-                                int allow_produce) {
-  assert(channels == 2);
-
-  if (!allow_produce) {
-    int16 native[NETPLAY_AUDIO_BLOCK * 2];
-    RtlApuLock();
-    if (rtl_np_fifo_pop_block(native))
-      rtl_np_resample_block(native, audio_buffer, samples);
-    else
-      memset(audio_buffer, 0, (size_t)samples * (size_t)channels * sizeof(int16));
-    RtlApuUnlock();
-    return;
-  }
-
-  /* Cycle the APU in small batches under the lock, releasing between
-   * each so the CPU thread (RtlApuWrite / snes_readBBus) can make
-   * progress. Earlier code held RtlApuLock for the entire 17 000-cycle
-   * loop, which took ~4 ms host time per audio callback. With audio
-   * callbacks at ~60 Hz that pinned the CPU thread out of the lock for
-   * ~27 % of wall time, and the SMW IPL upload (which touches APU
-   * ports thousands of times) ran an order of magnitude slower than
-   * the watchdog allowed.
-   *
-   * 256 SPC cycles per batch is about 64 us host work per acquire, short
-   * enough that the CPU thread's RtlApuLock call almost never has to
-   * wait through a full audio batch. apu_cycle is single-threaded
-   * regardless -- the lock just serialises access to inPorts/outPorts
-   * shared with the CPU thread. */
-  // Ensure at least one block (534 native samples) is available in the
-  // ring, then consume it. The audio thread only produces the shortfall
-  // the CPU-thread catch-up (snes_catchupApu) hasn't already supplied, so
-  // it self-balances: total SPC advance stays at the consumption rate and
-  // bursty catch-up production is buffered, not dropped.
-  while (DSP_AVAIL(g_snes->apu->dsp) < 534) {
-    RtlApuLock();
-    audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
-    int batch = 256;
-    while (batch-- > 0 && DSP_AVAIL(g_snes->apu->dsp) < 534)
-      apu_cycle(g_snes->apu);
-    audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
-    RtlApuUnlock();
-  }
+static void rtl_sync_apu_frame_boundary(void) {
+  /* The game frame is the authoritative guest-time clock. The audio callback
+   * may fill a host scheduling shortfall, but CPU->APU events must never wait
+   * behind it: advance the real SPC through every event due by this completed
+   * frame at normal speed and turbo alike. */
   RtlApuLock();
-  dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
+  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
+  uint64_t before = g_snes->apu->portClock;
+  /* RtlRunFrame has already incremented snes_frame_counter. This is the exact
+   * boundary after the completed frame; adding its stale within-frame master
+   * offset here would count the frame body twice. */
+  uint64_t boundary = (uint64_t)snes_frame_counter *
+                      RTL_APU_CYCLES_PER_FRAME;
+  bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
+                                    1u << 20);
+  audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
+  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+  if (!synced)
+    fprintf(stderr, "[apu] frame-boundary guest-clock sync timed out\n");
+  RtlApuUnlock();
+}
+
+void RtlAudioSetFastForward(bool active) {
+  if (!active && !g_audio_fast_forward && g_audio_recovery_frames == 0)
+    return;
+  RtlApuLock();
+  if (active && !g_audio_fast_forward) {
+    /* A new fast-forward interval supersedes the prior continuity ramp. */
+    g_audio_recovery_frames = 0;
+    g_audio_recovery_remaining = 0;
+  } else if (!active && g_audio_fast_forward) {
+    g_audio_recovery_frames = 30;
+    g_audio_recovery_anchor_l = g_audio_last_output_l;
+    g_audio_recovery_anchor_r = g_audio_last_output_r;
+    g_audio_recovery_remaining = RTL_AUDIO_RECOVERY_RAMP;
+  }
+  if (!active && g_audio_recovery_frames != 0) {
+    uint32_t available = g_snes->apu->dsp->sampleWrite -
+                         g_snes->apu->dsp->sampleRead;
+    /* Keep two current blocks: one for the next callback and one scheduling
+     * cushion. Repeat at frame boundaries only while post-turbo CPU work is
+     * settling, then restore the ordinary FIFO unchanged. */
+    uint32_t discarded = dsp_trimSamples(g_snes->apu->dsp, 1068);
+    if (discarded != 0) {
+      audio_trace_on_fast_forward_discard(discarded,
+                                           available - discarded);
+      g_audio_recovery_anchor_l = g_audio_last_output_l;
+      g_audio_recovery_anchor_r = g_audio_last_output_r;
+      g_audio_recovery_remaining = RTL_AUDIO_RECOVERY_RAMP;
+      /* The host frame-delay clock may still be catching up after a long
+       * turbo interval. Require a full stable window after the most recent
+       * trim instead of expiring recovery after a fixed number of fast game
+       * frames. This makes release behavior independent of turbo duration. */
+      g_audio_recovery_frames = 30;
+    } else {
+      g_audio_recovery_frames--;
+    }
+  }
+  g_audio_fast_forward = active;
+  RtlApuUnlock();
+}
+
+void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
+  assert(channels == 2);
+  /* SPC state is guest-frame driven by RtlAudioSyncFrame. The host callback is
+   * a consumer only: allowing it to invent SPC cycles makes its wall-clock
+   * schedule a second, competing emulation clock and is what let audio drift
+   * behind visuals after turbo. */
+  RtlApuLock();
+  uint32_t available = g_snes->apu->dsp->sampleWrite -
+                       g_snes->apu->dsp->sampleRead;
+  if (available >= 534) {
+    dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
+  } else {
+    /* Do not advance guest state to hide host scheduling jitter. Preserve a
+     * partial block for the next callback and emit one block of silence. */
+    memset(audio_buffer, 0, (size_t)samples * 2 * sizeof(*audio_buffer));
+    audio_trace_on_output_underflow(available);
+  }
   /* Mix MSU-1 streaming audio on top of the S-DSP block. Inert (no-op)
    * unless a pack is armed and a track is playing. Runs under the APU
    * lock we already hold, which serialises it against MSU register
    * writes on the CPU thread (msu1_read/msu1_write take the same lock). */
   msu1_mix(audio_buffer, samples);
+  for (int i = 0; i < samples && g_audio_recovery_remaining != 0; i++) {
+    uint32_t progressed = RTL_AUDIO_RECOVERY_RAMP -
+                          g_audio_recovery_remaining + 1;
+    uint32_t old_weight = RTL_AUDIO_RECOVERY_RAMP - progressed;
+    audio_buffer[i * 2] = (int16)(((int32_t)g_audio_recovery_anchor_l *
+                                   (int32_t)old_weight +
+                                   (int32_t)audio_buffer[i * 2] *
+                                   (int32_t)progressed) /
+                                  (int32_t)RTL_AUDIO_RECOVERY_RAMP);
+    audio_buffer[i * 2 + 1] = (int16)(((int32_t)g_audio_recovery_anchor_r *
+                                       (int32_t)old_weight +
+                                       (int32_t)audio_buffer[i * 2 + 1] *
+                                       (int32_t)progressed) /
+                                      (int32_t)RTL_AUDIO_RECOVERY_RAMP);
+    g_audio_recovery_remaining--;
+  }
+  if (samples > 0) {
+    g_audio_last_output_l = audio_buffer[(samples - 1) * 2];
+    g_audio_last_output_r = audio_buffer[(samples - 1) * 2 + 1];
+  }
   RtlApuUnlock();
 }
-
-void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
-  /* Under netplay the audio callback only mixes drained blocks — SPC tempo
-   * is set by rtl_netplay_drain_audio_frame on the CPU thread. */
-  rtl_render_audio_ex(audio_buffer, samples, channels,
-                      rtl_netplay_locks_audio() ? 0 : 1);
-}
-
-static void rtl_netplay_drain_audio_frame(void) {
-  /* Cosim-style consumer: one (fractional) native block per host frame.
-   * Produce only the shortfall to 534 avail (0 if catchup already filled
-   * the DSP ring), then pull that block into the playback FIFO. Peers
-   * share the same catchup + shortfall rule → same SPC clock; BGM is not
-   * double-advanced on top of catchup. */
-  s_netplay_audio_acc += 32040.0 / 60.0988;
-  {
-    int want = (int)s_netplay_audio_acc;
-    s_netplay_audio_acc -= (double)want;
-    while (want > 0) {
-      int16 block[NETPLAY_AUDIO_BLOCK * 2];
-      while (DSP_AVAIL(g_snes->apu->dsp) < NETPLAY_AUDIO_BLOCK) {
-        RtlApuLock();
-        audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
-        {
-          int batch = 256;
-          while (batch-- > 0 &&
-                 DSP_AVAIL(g_snes->apu->dsp) < NETPLAY_AUDIO_BLOCK)
-            apu_cycle(g_snes->apu);
-        }
-        audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
-        RtlApuUnlock();
-      }
-      RtlApuLock();
-      dsp_getSamples(g_snes->apu->dsp, block, NETPLAY_AUDIO_BLOCK);
-      msu1_mix(block, NETPLAY_AUDIO_BLOCK);
-      rtl_np_fifo_push_block(block);
-      RtlApuUnlock();
-      want -= (want > NETPLAY_AUDIO_BLOCK) ? NETPLAY_AUDIO_BLOCK : want;
-    }
-  }
-}
-
-#undef DSP_AVAIL
 
 /* Battery-backed SRAM + savestate slots live under RtlSaveRoot() (default
  * "saves/"). Netplay guests switch the root to "saves/netplay/" so host sync
@@ -1356,14 +1298,14 @@ const char *RtlSaveRoot(void) { return s_save_root; }
 
 void RtlEnsureSaveDir(void) {
 #ifdef _WIN32
-  _mkdir(s_save_root);
   /* Also ensure parent "saves" when root is saves/netplay */
   if (strncmp(s_save_root, "saves/", 6) == 0 || strncmp(s_save_root, "saves\\", 6) == 0)
     _mkdir("saves");
+  _mkdir(s_save_root);
 #else
-  mkdir(s_save_root, 0755);
   if (strncmp(s_save_root, "saves/", 6) == 0)
     mkdir("saves", 0755);
+  mkdir(s_save_root, 0755);
 #endif
 }
 
@@ -1532,7 +1474,7 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
         c->indir_ptr++;
       else
         c->table++;
-      /* ppu_write takes the B-bus offset ($00-$3F), not a $21xx CPU addr. */
+      /* ppu_write takes the B-bus offset ($00-$3F), not a $21xx CPU address. */
       uint8 reg = (uint8)(c->ppu_addr + bAdrOffsets[c->mode & 7][j]);
       ppu_write(g_ppu, reg, v);
       debug_server_on_reg_write((uint16)(0x2100u + reg), v);

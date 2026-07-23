@@ -82,13 +82,9 @@ const char *snes_lobby_player_id(void);
 /* Non-blocking pump — call every frame from the launcher. */
 void snes_lobby_pump(void);
 
-/*
- * Title + release pin for create/join matching and list filters.
- * Defaults: empty name filter, version SNES_GAME_VERSION.
- * List: Release pins filter by exact game_version; "dev" lists all versions
- * of the title (join still requires an exact version match).
- */
-void snes_lobby_set_game_identity(const char *game_name, const char *game_version);
+/* Title + release pin used for create/join matching and list filters. */
+void snes_lobby_set_game_identity(const char *game_name,
+                                  const char *game_version);
 const char *snes_lobby_game_version(void);
 
 void snes_lobby_request_list(void);
@@ -97,14 +93,13 @@ int  snes_lobby_list_get(int index, SnesLobbyRow *out);
 
 /*
  * Create lobby. host_bind e.g. "0.0.0.0:7777". password may be NULL/empty.
- * game_version NULL/empty → identity / SNES_GAME_VERSION / "dev".
  * match_caps may be NULL (legacy); when non-NULL and valid, sent to the server
  * so guests join with the host's sim settings.
  * Returns 0 if request sent; poll snes_lobby_join_info() / in_lobby().
  */
 int  snes_lobby_create(const char *name, const char *game_name,
-                      const char *game_version,
-                      const char *password, const char *host_bind,
+                      const char *game_version, const char *password,
+                      const char *host_bind,
                       const SnesLobbyMatchCaps *match_caps);
 
 int  snes_lobby_join(const char *lobby_id, const char *password,

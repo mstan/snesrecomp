@@ -110,6 +110,10 @@ void dsp_cycle(Dsp* dsp);
 uint8_t dsp_read(Dsp* dsp, uint8_t adr);
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val);
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame);
+/* Drop queued host-output samples without rewinding SPC/DSP state. Used only
+ * when leaving fast-forward, where buffered samples describe obsolete guest
+ * time and retaining them would create persistent A/V latency. */
+uint32_t dsp_trimSamples(Dsp* dsp, uint32_t samples_to_keep);
 /* Per-voice Gaussian-interpolated sample (canon hardware math). Exposed for the
  * dev-only in-process faithful reference (dsp_shadow) to diff against blargg's
  * reference Gaussian. Pure: reads channel[ch].decodeBuffer[sampleNum..+3], no

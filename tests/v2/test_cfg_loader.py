@@ -45,6 +45,19 @@ func SpriteMain 9dac end:9db0 entry_mx:0,0
         os.unlink(path)
 
 
+def test_hle_spc_upload_protocol_mode_parses():
+    path = _write("""\
+bank = 00
+hle_spc_upload 8079 live
+func Upload 8079
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        assert cfg.hle_spc_upload == {0x8079: 'live'}
+    finally:
+        os.unlink(path)
+
+
 def test_func_with_end_directive_parses_end():
     path = _write("""\
 bank = 00
@@ -185,6 +198,38 @@ func A 8000
         cfg = load_bank_cfg(path)
         auth = cfg.indirect_dispatch[0]
         assert auth['targets'] == (0x8569, 0xEB9F)
+    finally:
+        os.unlink(path)
+
+
+def test_ptrcall_accepts_explicit_return_pc():
+    path = _write("""\
+bank = 80
+indirect_dispatch 86f7 1 ptrcall return:84cf frame:2 targets:809391
+func A 8000
+""")
+    try:
+        cfg = load_bank_cfg(path)
+        auth = cfg.indirect_dispatch[0]
+        assert auth['return_pc'] == 0x84CF
+        assert auth['frame_size'] == 2
+    finally:
+        os.unlink(path)
+
+
+def test_ptrtail_rejects_explicit_return_pc():
+    path = _write("""\
+bank = 80
+indirect_dispatch 86f7 1 ptrtail return:84cf targets:809391
+func A 8000
+""")
+    try:
+        try:
+            load_bank_cfg(path)
+        except ValueError as exc:
+            assert 'return: is only valid with ptrcall' in str(exc)
+        else:
+            raise AssertionError('ptrtail return: must be rejected')
     finally:
         os.unlink(path)
 

@@ -134,6 +134,73 @@ def test_pea_jmp_ptrcall_resumes_at_pea_return_address():
     assert 'goto L_9000_M0X0' not in snippet, src
 
 
+def test_ptrcall_explicit_return_supports_remote_wrapper_frame():
+    """A wrapper may push the handler's RTS destination before dispatch."""
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xEA,              # NOP: no adjacent PEA for auto-detection
+            0x6C, 0x12, 0x00,  # JMP ($12)
+            0xE6, 0x21,        # lexical fall-through (must not be used)
+            0x60,              # RTS
+        ]),
+        0x8100: bytes([
+            0xE6, 0x20,        # configured continuation
+            0x60,              # RTS
+        ]),
+        0x9000: bytes([0x60]),
+    })
+
+    src = emit_function(
+        rom=rom,
+        bank=0,
+        start=0x8000,
+        entry_m=1,
+        entry_x=1,
+        func_name='RemoteWrapperPointerCall',
+        indirect_dispatch={
+            0x008001: {
+                'count': 1,
+                'idx_reg': 'X',
+                'ptr_call': True,
+                'return_pc': 0x8100,
+                'targets': (0x9000,),
+            },
+        },
+    )
+
+    start = src.index('indirect dispatch ptr-call')
+    snippet = src[start:start + 2000]
+    assert 'goto L_8100_M1X1' in snippet, src
+    assert 'goto L_8004_M1X1' not in snippet, src
+
+
+def test_long_ptrcall_can_override_handler_frame_size():
+    """A long dispatcher can target an RTS handler after reshaping its frame."""
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xDC, 0x12, 0x00,  # JML [$12]
+            0x60,
+        ]),
+        0x8100: bytes([0x60]),
+        0x9000: bytes([0x60]),
+    })
+    src = emit_function(
+        rom=rom, bank=0, start=0x8000, entry_m=1, entry_x=1,
+        func_name='LongDispatchRtsHandler',
+        indirect_dispatch={
+            0x008000: {
+                'count': 1, 'idx_reg': 'X', 'ptr_call': True,
+                'return_pc': 0x8100, 'frame_size': 2,
+                'targets': (0x9000,),
+            },
+        },
+    )
+    assert 'host_return_valid = 2' in src
+    assert '2-byte frame' in src
+    assert 'cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */' in src
+    assert 'goto L_8100_M1X1' in src
+
+
 def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
     """PHK+PEA+JML [$dp] ptrcalls use a 3-byte RTL return frame."""
     rom = make_lorom_bank0({
@@ -174,6 +241,11 @@ def test_pea_jmp_long_ptrcall_switches_on_loaded_long_pointer():
     assert 'absolute long-indirect dispatch: switch on the loaded pointer' in src
     assert 'case 0x009000:' in src
     assert 'PHK+PEA+JML indirect call, 3-byte frame' in src
+    # No frame: option means legacy behavior, including the historical
+    # two-byte cleanup on an unresolved target. The cfg extension must be
+    # inert for existing projects.
+    assert 'cpu->S = (uint16)(cpu->S + 2);  /* unpop unconsumed call frame */' in src
+    assert 'cpu->S = (uint16)(cpu->S + 3);  /* unpop unconsumed call frame */' not in src
     assert 'fall through to post-dispatch block' in src
     assert 'cpu->D + 0x0020' in src, src
 

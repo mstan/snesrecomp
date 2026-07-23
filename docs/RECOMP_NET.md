@@ -104,10 +104,10 @@ Rules that matter for SNES recomp hosts:
   `[2..3]` carry host DP `$1A/$1B` (applied on admit) so Metal Warriors
   SCRAMBLE / NEW BATTLEFIELD rolls stay host-authoritative.
 - Prefer one thread owning `pump` + sim advance (API is not internally locked).
-- While `snes_netplay_active()`, SPC tempo is frame-locked inside `RtlRunFrame`
-  (cosim-style: shortfall-produce to one 534-sample block, then drain into a
-  playback FIFO). The audio callback only pops that FIFO; it must not advance
-  the APU. Wall-clock SPC catch-up is disabled for the same reason.
+- While `snes_netplay_active()`, the pre-frame wall-clock SPC catch-up is
+  disabled. Audio stays on the runner's normal deterministic guest-frame/APU
+  coupling, and the audio callback remains a consumer only; it never advances
+  emulation.
 - Metal Warriors netplay H2H: when dual-viewport WRAM `$1EB2` is set, each peer
   presents only its local half (slot 0 = top / P1, slot 1 = bottom / P2),
   scaled to the full window. Sim still renders the full split — present-only,

@@ -242,6 +242,8 @@ pub struct IndirectDispatchSite {
     pub idx_reg: char,         // 'X' | 'Y'
     pub table_bases: Vec<u32>, // 0..3 entries
     pub ptr_call: bool,
+    pub return_pc: Option<u32>,
+    pub frame_size: Option<u8>,
     pub pointer_match: bool,
     pub popped_call_frame: bool,
     pub rts_stack: bool,
@@ -373,6 +375,8 @@ struct Auth {
     idx_reg: char,
     table_bases: Vec<u32>,
     ptr_call: bool,
+    return_pc: Option<u32>,
+    frame_size: Option<u8>,
     pointer_match: bool,
     popped_call_frame: bool,
     targets: Vec<u32>,
@@ -1149,6 +1153,24 @@ pub fn decode_function(
             let mut entries: Vec<u32> = Vec::new();
             let mut tbl_pc = (pc + insn.length as u32) & 0xFFFF;
             while entries.len() < 256 && tbl_pc + entry_size - 1 <= 0xFFFF {
+                // Bound the inline dispatch table at the next declared function
+                // entry. A sibling entry marks the start of the following
+                // routine, so its bytes cannot also be table data; without this
+                // bound the scan runs into that routine and misreads its opening
+                // instructions as extra table entries (e.g. SMW
+                // ProcessPlayerAnimation JSL ExecutePtr $00C595: 14 real entries
+                // $C599..$C5B4, otherwise 2 more are read from
+                // PlayerState0B_RescuedPeach $C5B5, corrupting the dispatch and
+                // fabricating targets $DE9C/$9C13). This can only tighten the
+                // scan; a spuriously short table simply routes uncovered indices
+                // to the interpreter.
+                if !entries.is_empty() {
+                    if let Some(sib) = env.sibling_entry_pcs {
+                        if sib.contains(&(tbl_pc & 0xFFFF)) {
+                            break;
+                        }
+                    }
+                }
                 let tbl_off = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
                     Some(o) => o,
                     None => break,
@@ -1238,6 +1260,8 @@ pub fn decode_function(
                         idx_reg: s.idx_reg,
                         table_bases: s.table_bases.clone(),
                         ptr_call: s.ptr_call,
+                        return_pc: s.return_pc,
+                        frame_size: s.frame_size,
                         pointer_match: s.pointer_match,
                         popped_call_frame: s.popped_call_frame,
                         targets: s.targets.clone(),
@@ -1258,6 +1282,8 @@ pub fn decode_function(
                         idx_reg: 'X',
                         table_bases: vec![],
                         ptr_call: false,
+                        return_pc: None,
+                        frame_size: None,
                         pointer_match: false,
                         popped_call_frame: false,
                         // Preserve tolerated null slots; re-reading only the
@@ -1293,6 +1319,8 @@ pub fn decode_function(
                                 idx_reg,
                                 table_bases,
                                 ptr_call: false,
+                                return_pc: None,
+                                frame_size: None,
                                 pointer_match: false,
                                 popped_call_frame: false,
                                 targets: vec![],
@@ -1325,6 +1353,8 @@ pub fn decode_function(
                             idx_reg: 'X',
                             table_bases: vec![tbl_pc],
                             ptr_call: false,
+                            return_pc: None,
+                            frame_size: None,
                             pointer_match: false,
                             popped_call_frame: false,
                             targets: vec![],
@@ -1350,6 +1380,8 @@ pub fn decode_function(
                         idx_reg: 'X',
                         table_bases: vec![insn.operand & 0xFFFF],
                         ptr_call: false,
+                        return_pc: None,
+                        frame_size: None,
                         pointer_match: false,
                         popped_call_frame: false,
                         targets: entries,
@@ -1388,12 +1420,9 @@ pub fn decode_function(
                     insn.dispatch_pointer_match = auth.pointer_match;
                     insn.dispatch_popped_call_frame = auth.popped_call_frame;
                     if auth.ptr_call {
-                        insn.dispatch_consumed_stack_bytes =
-                            if is_long_dispatch(&insn, &auth.table_bases) {
-                                3
-                            } else {
-                                2
-                            };
+                        insn.dispatch_consumed_stack_bytes = auth.frame_size.unwrap_or_else(|| {
+                            if is_long_dispatch(&insn, &auth.table_bases) { 3 } else { 2 }
+                        });
                     }
                     if inline_loop_sites.contains(&pc) {
                         insn.inline_dispatch_loop = true;
@@ -1417,14 +1446,16 @@ pub fn decode_function(
                         }
                     }
                     let succ: Vec<DecodeKey> = if auth.ptr_call {
-                        let next_pc = pea_ptrcall_return_pc(
-                            rom,
-                            mapping,
-                            bank,
-                            pc,
-                            (pc + insn.length as u32) & 0xFFFF,
-                            reloc,
-                        );
+                        let next_pc = auth.return_pc.unwrap_or_else(|| {
+                            pea_ptrcall_return_pc(
+                                rom,
+                                mapping,
+                                bank,
+                                pc,
+                                (pc + insn.length as u32) & 0xFFFF,
+                                reloc,
+                            )
+                        }) & 0xFFFF;
                         let next = DecodeKey::new(addr24(bank, next_pc), site_m, site_x);
                         extra_succs.push((next.clone(), "fall"));
                         vec![next]
@@ -1604,6 +1635,8 @@ pub fn decode_function(
                     idx_reg: s.idx_reg,
                     table_bases: s.table_bases.clone(),
                     ptr_call: s.ptr_call,
+                    return_pc: s.return_pc,
+                    frame_size: s.frame_size,
                     pointer_match: s.pointer_match,
                     popped_call_frame: s.popped_call_frame,
                     targets: s.targets.clone(),
@@ -1624,6 +1657,8 @@ pub fn decode_function(
                         idx_reg: 'X',
                         table_bases: vec![],
                         ptr_call: false,
+                        return_pc: None,
+                        frame_size: None,
                         pointer_match: false,
                         popped_call_frame: false,
                         // Preserve tolerated null slots; re-reading only the
@@ -3305,6 +3340,8 @@ mod tests {
                 idx_reg: 'X',
                 table_bases: vec![],
                 ptr_call: true,
+                return_pc: None,
+                frame_size: None,
                 pointer_match: true,
                 popped_call_frame: false,
                 rts_stack: false,
@@ -3325,6 +3362,36 @@ mod tests {
     }
 
     #[test]
+    fn ptrcall_explicit_return_overrides_non_adjacent_pea_detection() {
+        let mut bytes = vec![0u8; 0x12];
+        bytes[0..4].copy_from_slice(&[0xEA, 0x6C, 0x10, 0x00]);
+        bytes[8] = 0x60;
+        bytes[0x10] = 0x60;
+        let rom = rom_at_8000(&bytes);
+        let dispatch = HashMap::from([(
+            0x008001,
+            IndirectDispatchSite {
+                count: 1,
+                idx_reg: 'X',
+                table_bases: vec![],
+                ptr_call: true,
+                return_pc: Some(0x8008),
+                frame_size: Some(2),
+                pointer_match: true,
+                popped_call_frame: false,
+                rts_stack: false,
+                targets: vec![0x8010],
+            },
+        )]);
+        let env = DecodeEnv {
+            indirect_dispatch: Some(&dispatch),
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        assert_eq!(graph.get(&k(0x8001)).unwrap().successors, vec![k(0x8008)]);
+    }
+
+    #[test]
     fn indirect_jsr_decode_cache_depends_on_each_handler_exit() {
         let mut bytes = vec![0u8; 0x12];
         bytes[0..3].copy_from_slice(&[0xFC, 0x10, 0x80]);
@@ -3338,6 +3405,8 @@ mod tests {
                 idx_reg: 'X',
                 table_bases: vec![],
                 ptr_call: true,
+                return_pc: None,
+                frame_size: None,
                 pointer_match: true,
                 popped_call_frame: false,
                 rts_stack: false,

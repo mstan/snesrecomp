@@ -331,7 +331,29 @@ static struct {
     VramTraceEntry *log;        /* heap-allocated; calloc'd at init */
 } s_vram_trace = {0};
 
+/* ── Always-on VRAM byte-write mini ring ─────────────────────────────
+ * Compiled into every build (the big REVERSE_DEBUG ring above is not).
+ * Records EVERY VRAM byte write — PIO ($2118/$2119, atomic word STA)
+ * and per-byte DMA both funnel through this hook — with the writing
+ * recomp function. Query backward via "vwring_get"; never armed. */
+#define VWRING_LEN (1u << 17)
+typedef struct {
+    int frame;
+    uint16_t adr_byte;
+    uint8_t  val;
+    const char *func;   /* g_last_recomp_func string literal */
+} VwRingEntry;
+static VwRingEntry s_vwring[VWRING_LEN];
+static uint64_t s_vwring_widx;
+
 void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) {
+    {
+        VwRingEntry *e = &s_vwring[s_vwring_widx++ & (VWRING_LEN - 1)];
+        e->frame = snes_frame_counter;
+        e->adr_byte = (uint16_t)(byte_addr & 0xFFFF);
+        e->val = value;
+        e->func = g_last_recomp_func;
+    }
     if (!s_vram_trace.active || !s_vram_trace.log) return;
     uint16_t adr_b = (uint16_t)(byte_addr & 0xFFFF);
     int hit = 0;
@@ -2445,6 +2467,37 @@ static void cmd_trace_vram(const char *args) {
     s_vram_trace.active = 1;
     send_fmt("{\"ok\":true,\"lo\":\"0x%04x\",\"hi\":\"0x%04x\",\"nranges\":%d}",
              lo, hi, s_vram_trace.nranges);
+}
+
+/* vwring_get <lo> <hi> [n] — newest n (default 256) always-on VRAM
+ * byte-write ring entries whose BYTE address lies in [lo,hi], oldest
+ * first. Works in every build; nothing to arm. */
+static void cmd_vwring_get(const char *args) {
+    unsigned int lo = 0, hi = 0xFFFF, n = 256;
+    if (args) sscanf(args, "%x %x %u", &lo, &hi, &n);
+    if (n > 4096) n = 4096;
+    static VwRingEntry sel[4096];
+    unsigned int found = 0;
+    uint64_t have = s_vwring_widx < VWRING_LEN ? s_vwring_widx : VWRING_LEN;
+    for (uint64_t back = 0; back < have && found < n; back++) {
+        const VwRingEntry *e =
+            &s_vwring[(s_vwring_widx - 1 - back) & (VWRING_LEN - 1)];
+        if (e->adr_byte >= lo && e->adr_byte <= hi)
+            sel[found++] = *e;
+    }
+    static char buf[524288];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"total_writes\":%llu,\"matched\":%u,\"log\":[",
+        (unsigned long long)s_vwring_widx, found);
+    for (unsigned int i = 0; i < found && pos < (int)sizeof(buf) - 256; i++) {
+        const VwRingEntry *e = &sel[found - 1 - i];  /* oldest first */
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"f\":%d,\"a\":\"0x%04x\",\"v\":\"0x%02x\",\"fn\":\"%s\"}",
+            i ? "," : "", e->frame, e->adr_byte, e->val,
+            e->func ? e->func : "(none)");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
 }
 
 static void cmd_trace_vram_reset(const char *args) {
@@ -5021,6 +5074,101 @@ static void cmd_dispatch_log_get(const char *args) {
     send_line(buf);
 }
 
+/* interp_stats
+ *   Whole-run AOT-vs-interpreter execution split. Answers "is this game
+ *   mostly statically recompiled, or silently interpreting?" without
+ *   pausing — all counters are always-on aggregates.
+ *     dispatch_total : all runtime indirect dispatches
+ *     found1/found0  : hit an exact AOT body / fell to the interp tier
+ *     found0_pct     : found0 as % of dispatch_total (interp-fallback rate)
+ *     tier_hits      : total interp tier-down invocations
+ *     tier2_sites    : distinct (site,target,m/x) interp gaps
+ *     tier2_clean/bail : summed clean vs bail (bail = interp step-cap = risk)
+ */
+extern unsigned cpu_dispatch_log_count(void);
+extern void cpu_dispatch_found_totals(uint64_t *found1, uint64_t *found0);
+extern long interp_tier_hit_count(void);
+extern void interp_tier2_stats(int *sites, unsigned long long *clean,
+                               unsigned long long *bail);
+extern uint64_t interp816_insns_total(void);
+extern uint64_t interp816_cycles_total(void);
+static void cmd_interp_stats(const char *args) {
+    (void)args;
+    uint64_t f1 = 0, f0 = 0;
+    cpu_dispatch_found_totals(&f1, &f0);
+    unsigned total = cpu_dispatch_log_count();
+    int sites = 0;
+    unsigned long long clean = 0, bail = 0;
+    interp_tier2_stats(&sites, &clean, &bail);
+    double pct = total ? (100.0 * (double)f0 / (double)total) : 0.0;
+    /* Mode-independent truth: guest cycles run by the 65816 interpreter vs
+     * total guest cycles (AOT+interp). 100 - interp_cycle_pct == the fraction
+     * of execution that ran as statically-recompiled C, in HLE OR LLE. */
+    uint64_t icyc = interp816_cycles_total();
+    uint64_t iins = interp816_insns_total();
+    uint64_t mcyc = g_cpu.master_cycles;
+    double icyc_pct = mcyc ? (100.0 * (double)icyc / (double)mcyc) : 0.0;
+    send_fmt("{\"ok\":true,\"dispatch_total\":%u,"
+             "\"found1\":%llu,\"found0\":%llu,\"found0_pct\":%.3f,"
+             "\"tier_hits\":%ld,\"tier2_sites\":%d,"
+             "\"tier2_clean\":%llu,\"tier2_bail\":%llu,"
+             "\"interp_insns\":%llu,\"interp_cycles\":%llu,"
+             "\"master_cycles\":%llu,\"interp_cycle_pct\":%.4f}",
+             total, (unsigned long long)f1, (unsigned long long)f0, pct,
+             interp_tier_hit_count(), sites, clean, bail,
+             (unsigned long long)iins, (unsigned long long)icyc,
+             (unsigned long long)mcyc, icyc_pct);
+}
+
+/* tier2_dump [path]
+ *   Write the tier-2 interp-coverage manifest ON DEMAND from the always-on
+ *   in-memory table — no clean exit required (the atexit path is skipped by
+ *   a force-kill; this never is). With no arg, the filename is auto-built as
+ *   tier2_<romid>_<UTCstamp>.json so every run and every variant lands in its
+ *   OWN file (Mega Man X vs Rockman X never collide, nothing overwrites).
+ *   romid derives from the registered game title. Optional explicit path arg
+ *   overrides the auto name. */
+extern void Tier2CoverageWriteManifest(const char *path, const char *rom_title);
+extern const char *rtl_game_title(void);
+static void cmd_tier2_dump(const char *args) {
+    const char *title = rtl_game_title();
+    /* sanitize title -> filesystem-safe lowercase romid */
+    char romid[64];
+    int j = 0;
+    for (const char *p = title; *p && j < 63; ++p) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        romid[j++] = ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+                         ? c : '_';
+    }
+    romid[j] = '\0';
+
+    char path[300];
+    /* explicit path arg (skip leading spaces) overrides the auto name */
+    const char *a = args;
+    while (a && (*a == ' ' || *a == '\t')) a++;
+    if (a && *a) {
+        snprintf(path, sizeof path, "%s", a);
+    } else {
+        time_t t = time(NULL);
+        struct tm tmv;
+#ifdef _WIN32
+        localtime_s(&tmv, &t);
+#else
+        localtime_r(&t, &tmv);
+#endif
+        char stamp[24];
+        strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &tmv);
+        /* per-run sequence guarantees a distinct file even for multiple dumps
+         * within the same wall-clock second. */
+        static unsigned s_tier2_dump_seq = 0;
+        snprintf(path, sizeof path, "tier2_%s_%s_%03u.json",
+                 romid, stamp, s_tier2_dump_seq++);
+    }
+    Tier2CoverageWriteManifest(path, title);
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"title\":\"%s\"}", path, title);
+}
+
 static void cmd_db_trip_arm(const char *args) {
 #if SNESRECOMP_TRACE
     unsigned int target = 0xC0;
@@ -6558,26 +6706,47 @@ static void cmd_audio_stats(const char *args) {
     if (want > 256) want = 256;
     AudioTraceStats st;
     audio_trace_get_stats(&st);
+    uint32_t apu_port_queue_depth = 0;
+    uint64_t apu_port_queue_lag = 0;
+    RtlApuLock();
+    if (g_snes && g_snes->apu) {
+        apu_port_queue_depth = apu_portQueueDepth(g_snes->apu);
+        if (apu_port_queue_depth != 0 &&
+            g_snes->apu->portLastTarget > g_snes->apu->portClock)
+            apu_port_queue_lag = g_snes->apu->portLastTarget -
+                                 g_snes->apu->portClock;
+    }
+    RtlApuUnlock();
     static char buf[65536];
     int pos = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"produced\":%llu,\"produced_cpu\":%llu,\"produced_audio\":%llu,"
-        "\"dropped\":%llu,\"dropped_audible\":%llu,\"drop_runs\":%llu,\"consumed\":%llu,\"consume_calls\":%llu,"
+        "\"dropped\":%llu,\"dropped_audible\":%llu,\"drop_runs\":%llu,\"consumed\":%llu,"
+        "\"fast_forward_discarded\":%llu,\"output_underflows\":%llu,"
+        "\"consume_calls\":%llu,"
         "\"reg_writes\":%llu,\"kon_writes\":%llu,\"occupancy_highwater\":%u,"
+        "\"occupancy_current\":%u,"
         "\"pace_baseline_cycles\":%llu,\"pace_accumulate_calls\":%llu,"
         "\"pace_consumer_active\":%u,"
+        "\"guest_frame_sync_cycles\":%llu,\"guest_read_sync_cycles\":%llu,"
         "\"cpu_port_writes\":%llu,\"spc_port_reads_seen\":%llu,"
         "\"spc_port_reads_logged\":%llu,\"spc_port_writes\":%llu,"
         "\"cpu_port_reads_logged\":%llu,"
         "\"cpu_port_overwrites\":[%llu,%llu,%llu,%llu],"
+        "\"apu_port_queue_depth\":%u,\"apu_port_queue_lag\":%llu,"
         "\"event_count\":%llu,\"snap_count\":%llu,\"snaps\":[",
         (unsigned long long)st.produced, (unsigned long long)st.produced_cpu,
         (unsigned long long)st.produced_audio, (unsigned long long)st.dropped,
         (unsigned long long)st.dropped_audible,
         (unsigned long long)st.drop_runs, (unsigned long long)st.consumed,
+        (unsigned long long)st.fast_forward_discarded,
+        (unsigned long long)st.output_underflows,
         (unsigned long long)st.consume_calls, (unsigned long long)st.reg_writes,
         (unsigned long long)st.kon_writes, st.occupancy_highwater,
+        st.occupancy_current,
         (unsigned long long)st.pace_baseline_cycles,
         (unsigned long long)st.pace_accumulate_calls, st.pace_consumer_active,
+        (unsigned long long)st.guest_frame_sync_cycles,
+        (unsigned long long)st.guest_read_sync_cycles,
         (unsigned long long)st.cpu_port_writes,
         (unsigned long long)st.spc_port_reads_seen,
         (unsigned long long)st.spc_port_reads_logged,
@@ -6587,6 +6756,7 @@ static void cmd_audio_stats(const char *args) {
         (unsigned long long)st.cpu_port_overwrites[1],
         (unsigned long long)st.cpu_port_overwrites[2],
         (unsigned long long)st.cpu_port_overwrites[3],
+        apu_port_queue_depth, (unsigned long long)apu_port_queue_lag,
         (unsigned long long)st.event_count, (unsigned long long)st.snap_count);
     uint64_t first = st.snap_count > (uint64_t)want ? st.snap_count - want : 0;
     static AudioTraceSnap snaps[256];
@@ -7033,6 +7203,8 @@ static const CmdEntry s_commands[] = {
     {"db_trip_arm",    cmd_db_trip_arm},
     {"db_trip_get",    cmd_db_trip_get},
     {"dispatch_log_get", cmd_dispatch_log_get},
+    {"interp_stats", cmd_interp_stats},
+    {"tier2_dump", cmd_tier2_dump},
     {"nlr_diag",       cmd_nlr_diag},
     {"stack_drift_get", cmd_stack_drift_get},
     {"stack_drift_arm", cmd_stack_drift_arm},
@@ -7111,6 +7283,7 @@ static const CmdEntry s_commands[] = {
     {"trace_reg_reset", cmd_trace_reg_reset},
     {"get_reg_trace", cmd_get_reg_trace},
     {"trace_vram",    cmd_trace_vram},
+    {"vwring_get",    cmd_vwring_get},
     {"trace_vram_reset", cmd_trace_vram_reset},
     {"get_vram_trace", cmd_get_vram_trace},
     {"get_oracle_vram_trace", cmd_get_oracle_vram_trace},
@@ -7376,40 +7549,40 @@ static void try_recv_and_process(void) {
         s_recv_len += n;
         s_recv_buf[s_recv_len] = 0;
 
-        // Process complete lines
+        // Process every complete line and keep the connection open so one
+        // client can stream many commands. Leftover partial input is
+        // compacted to the front of the buffer for the next recv.
         char *nl;
         while ((nl = strchr(s_recv_buf, '\n')) != NULL) {
             *nl = 0;
             process_command(s_recv_buf);
+            if (s_client_sock == SOCKET_INVALID) return;  // handler closed us
+            int consumed = (int)(nl - s_recv_buf) + 1;
+            s_recv_len -= consumed;
+            memmove(s_recv_buf, nl + 1, s_recv_len + 1);  // include NUL
+        }
+        if (s_recv_len >= (int)sizeof(s_recv_buf) - 1) {
+            // Full buffer with no newline: not our protocol; drop the client.
+            fprintf(stderr, "[debug_server] Oversized command line; closing client\n");
             close_client_socket();
-            return;
         }
     } else if (n == 0) {
         // Client disconnected
         fprintf(stderr, "[debug_server] Client disconnected\n");
         close_client_socket();
-        /* Preserve pause state across short-lived TCP clients. Tooling often
-         * connects, sends one query, and disconnects; that must not resume the
-         * game behind the driver's back. */
+        /* Preserve pause state across TCP clients disconnecting: that must
+         * not resume the game behind the driver's back. */
     }
 #ifdef _WIN32
     else {
         int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) {
-            if (++s_client_idle_spins > 200) {
-                fprintf(stderr, "[debug_server] Closing idle client\n");
-                close_client_socket();
-            }
-            return;
-        }
+        if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT)
+            return;  // idle is fine; a newer connection replaces us if needed
         close_client_socket();
     }
 #else
     else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        if (++s_client_idle_spins > 200) {
-            fprintf(stderr, "[debug_server] Closing idle client\n");
-            close_client_socket();
-        }
+        // idle is fine; a newer connection replaces us if needed
     } else {
         close_client_socket();
     }
@@ -7419,10 +7592,17 @@ static void try_recv_and_process(void) {
 // Internal poll function called by the network thread.
 // Must hold the mutex when accessing shared state.
 static void debug_server_poll_internal(void) {
-    // Accept new connections
-    if (s_client_sock == SOCKET_INVALID && s_listen_sock != SOCKET_INVALID) {
-        s_client_sock = accept(s_listen_sock, NULL, NULL);
-        if (s_client_sock != SOCKET_INVALID) {
+    // Accept new connections. Newest-wins: if a client is already attached,
+    // an incoming connection replaces it, so an abandoned/idle client can
+    // never wedge the single-client server.
+    if (s_listen_sock != SOCKET_INVALID) {
+        socket_t incoming = accept(s_listen_sock, NULL, NULL);
+        if (incoming != SOCKET_INVALID) {
+            if (s_client_sock != SOCKET_INVALID) {
+                fprintf(stderr, "[debug_server] New client; dropping previous\n");
+                close_client_socket();
+            }
+            s_client_sock = incoming;
             set_socket_timeouts(s_client_sock);
             set_nonblocking(s_client_sock);
             s_recv_len = 0;

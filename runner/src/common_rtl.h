@@ -44,6 +44,9 @@ extern uint64_t g_apu_last_sync_cycles;
 // it; it's defined alongside the pacing state in common_rtl.c.
 extern uint64_t g_apu_last_sync_master;
 void rtl_accumulate_apu_catchup(void);
+/* Caller holds RtlApuLock. Before the first frame, retain bootstrap synthetic
+ * pacing; afterward synchronize reads to the authoritative guest timestamp. */
+void rtl_sync_apu_to_cpu_locked(void);
 
 #ifdef SNES_COSIM
 // Co-sim shared APU clock (SNES_COSIM_APU_SHARED=1, dev-only): pace the SPC
@@ -258,9 +261,14 @@ void RtlSaveLoad(int cmd, int slot);
 void RtlApuLock();
 void RtlApuUnlock();
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
+/* Notify the shared audio runner of host fast-forward state. Guest-frame SPC
+ * synchronization is automatic inside RtlRunFrame; clients only supply the
+ * presentation policy needed to discard stale PCM after fast-forward. */
+void RtlAudioSetFastForward(bool active);
 /* Reset the netplay frame-locked SPC sample accumulator (call on session start). */
 void RtlNetplayAudioReset(void);
 bool RtlUploadSpcImageFromDp(CpuState *cpu);
+bool RtlUploadSpcImageFromDpLive(CpuState *cpu);
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
 void RtlWriteSram();
@@ -276,7 +284,7 @@ void RtlSramFilePath(char *buf, size_t buflen);
 // (idempotent). Call before the launcher so its SAVES panel reflects the carried-
 // forward save; RtlReadSram also calls it on boot as a fallback.
 void RtlMigrateLegacySram(const char *legacy_title);
-void RtlSaveSnapshot(const char *filename);
+bool RtlSaveSnapshot(const char *filename);
 bool RtlLoadSnapshot(const char *filename);
 size_t RtlSaveSnapshotToMemory(void *data, size_t capacity);
 bool RtlLoadSnapshotFromMemory(const void *data, size_t size);

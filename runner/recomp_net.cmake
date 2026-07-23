@@ -68,11 +68,23 @@ function(snesrecomp_enable_recomp_net target)
     _snesrecomp_add_recomp_net()
     target_link_libraries(${target} PRIVATE recomp_net)
     target_compile_definitions(${target} PRIVATE SNESRECOMP_NET=1)
-    # SNES host facade (LAN + optional ICE via lobby signal relay).
-    target_sources(${target} PRIVATE
-        "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c")
-    target_include_directories(${target} PRIVATE
-        "${SNESRECOMP_RUNNER_ROOT}/src/netplay")
+    # SNES host facade and launcher-facing lobby client. The lobby remains
+    # transport/UI agnostic; recomp-ui consumes it through game callbacks.
+    if(NOT SNESRECOMP_ENABLE_NET)
+        target_sources(${target} PRIVATE
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_lobby_client.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_ws.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_sha1.c")
+        target_include_directories(${target} PRIVATE
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay"
+            "${SNESRECOMP_RUNNER_ROOT}/src/lobby"
+            "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws")
+    endif()
+    target_compile_definitions(${target} PRIVATE SNES_HAS_LOBBY_CLIENT=1)
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE ws2_32)
+    endif()
 endfunction()
 
 # When SNESRECOMP_ENABLE_NET=ON at configure time, pull the library into the

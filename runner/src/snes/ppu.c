@@ -152,6 +152,8 @@ static inline void PpuResetLayerPolicies(Ppu *ppu) {
   memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
   memset(ppu->wsRepeatY0, 0, sizeof(ppu->wsRepeatY0));
   memset(ppu->wsRepeatY1, 0, sizeof(ppu->wsRepeatY1));
+  memset(ppu->wsStretchY0, 0, sizeof(ppu->wsStretchY0));
+  memset(ppu->wsStretchY1, 0, sizeof(ppu->wsStretchY1));
   memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
   memset(ppu->wsMarginGapR, 0, sizeof(ppu->wsMarginGapR));
 }
@@ -197,9 +199,32 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
   // See ppu.h. Chunk bounds must be ordered for the span construction in
   // PpuDrawBackground_2bpp (strictly ascending edges); disable otherwise.
   if (left_end == 0 || left_end >= right_start) height = 0;
-  ppu->wsHudSplitHeight = height;
+  // Bit 7 is host policy for PpuSetWidescreenHudAlwaysVisible. HUD bands are
+  // at most 127 lines, so keep the option in this existing host-only byte and
+  // avoid changing Ppu's layout/savestate ABI.
+  ppu->wsHudSplitHeight = (ppu->wsHudSplitHeight & 0x80) | (height & 0x7f);
   ppu->wsHudLeftEnd = left_end;
   ppu->wsHudRightStart = right_start;
+}
+
+void PpuSetWidescreenHudAlwaysVisible(Ppu *ppu, bool enabled) {
+  ppu->wsHudSplitHeight = (ppu->wsHudSplitHeight & 0x7f) |
+                          (enabled ? 0x80 : 0);
+}
+
+void PpuSetWsHudOamShift(Ppu *ppu, uint8_t nslots) {
+  PpuSetWsHudOamShiftRange(ppu, 0, nslots);
+}
+
+void PpuSetWsHudOamShiftRange(Ppu *ppu, uint8_t first_slot, uint8_t nslots) {
+  if (first_slot >= 128 || nslots == 0) {
+    ppu->wsHudOamFirstSlot = 0;
+    ppu->wsHudOamSlots = 0;
+    return;
+  }
+  ppu->wsHudOamFirstSlot = first_slot;
+  ppu->wsHudOamSlots =
+      nslots > 128 - first_slot ? (uint8_t)(128 - first_slot) : nslots;
 }
 
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
@@ -257,6 +282,14 @@ void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
   if (layer < 4) {
     ppu->wsRepeatY0[layer] = y0;
     ppu->wsRepeatY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerStretchBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                      uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsStretchY0[layer] = y0;
+    ppu->wsStretchY1[layer] = y1;
   }
 }
 
@@ -356,43 +389,24 @@ typedef struct PpuWindows {
 // clamped to the authentic 256-wide region so a BG3 status bar never tiles into
 // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
 // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
-static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
-  // This helper is also used for the color window (logical layer 5), so guard
-  // all four-entry BG policy arrays.
-  if (layer < 4) {
-    if (ppu->wsLayerWidenMask &&
-        !(ppu->wsLayerWidenMask & (1u << layer)))
-      return 0;
-    if ((ppu->wsLayerClamp | ppu->wsLayerMirror | ppu->wsLayerRepeat) &
-        (1u << layer))
-      return 0;
-    if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
-        y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
-      return 0;
-    if (ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
-        y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer])
-      return 0;
-  }
-  if (layer != 2)
-    return extra;
-  return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
-}
-
 static void PpuWindows_Clear(PpuWindows *win, Ppu *ppu, uint layer, int y) {
-  win->edges[0] = -PpuLayerExtra(ppu, layer, y, ppu->extraLeftCur);
-  win->edges[1] = 256 + PpuLayerExtra(ppu, layer, y, ppu->extraRightCur);
+  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, ppu->extraLeftCur);
+  win->edges[1] = 256 + PpuWidescreenLayerExtra(ppu, layer, y,
+                                                ppu->extraRightCur);
   win->nr = 1;
   win->bits = 0;
 }
 
-static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
+static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
+                                     int y, int extra_left, int extra_right) {
   // Evaluate which spans to render based on the window settings.
   // There are at most 5 windows.
   // Algorithm from Snes9x
   uint32 winflags = GET_WINDOW_FLAGS(ppu, layer);
   uint nr = 1;
-  int window_right = 256 + PpuLayerExtra(ppu, layer, y, ppu->extraRightCur);
-  win->edges[0] = -PpuLayerExtra(ppu, layer, y, ppu->extraLeftCur);
+  int window_right = 256 +
+      PpuWidescreenLayerExtra(ppu, layer, y, extra_right);
+  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, extra_left);
   win->edges[1] = window_right;
   uint i, j;
   int t;
@@ -401,12 +415,8 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   // from classifying otherwise valid side-margin pixels as outside.
   int w1l = ppu->window1left, w1r = ppu->window1right;
   int w2l = ppu->window2left, w2r = ppu->window2right;
-  if (win->edges[0] != 0 || window_right != 256) {
-    if (w1l == 0) w1l = win->edges[0];
-    if (w1r == 255) w1r = window_right - 1;
-    if (w2l == 0) w2l = win->edges[0];
-    if (w2r == 255) w2r = window_right - 1;
-  }
+  PpuWidescreenAdjustPinnedWindowEdges(win->edges[0], window_right, &w1l,
+                                       &w1r, &w2l, &w2r);
   bool w1_ena = (winflags & kWindow1Enabled) && w1l <= w1r;
   if (w1_ena) {
     if (w1l > win->edges[0]) {
@@ -455,6 +465,11 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
   if ((winflags & (kWindow2Enabled | kWindow2Inversed)) == (kWindow2Enabled | kWindow2Inversed))
     w2_bits = ~w2_bits;
   win->bits = w1_bits | w2_bits;
+}
+
+static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
+  PpuWindows_CalcWithExtra(win, ppu, layer, y,
+                           ppu->extraLeftCur, ppu->extraRightCur);
 }
 
 static void PpuWindowsSplit(PpuWindows *win, int16 *bias, int xpos) {
@@ -524,7 +539,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
   bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)(t)) : (uint32)(t))
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -712,7 +727,9 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
        * Using live hScroll/vScroll for px/py while the tile key used the
        * NMI-latched world origin produced a persistent ~phase seam. */
       if (ws_shadow && (screen_x < 0 || screen_x >= 256)) {
-        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy, tile);
+        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy,
+                            (uint16_t)ppu->hScroll[layer],
+                            (uint16_t)(sc & 0x7fff), tile);
         const int32_t wpx =
             (int32_t)WsShadowWorldX((int)layer) + screen_x;
         const int32_t wpy =
@@ -956,17 +973,18 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
   // border edge, a transparent gap, the centered chunk, a gap, and the
   // right chunk re-anchored to the right border edge. ws_bias shifts each
   // drawn span's source x so the chunks keep sampling their authentic
-  // tilemap columns. Applied only when the computed window set is one
-  // full drawn span: games (SMW) often enable screen-level window masking
-  // ($212E) with no window selected for the layer, which still routes
-  // through PpuWindows_Calc but degenerates to a single span. An actual
-  // window shape (e.g. the level-start iris) keeps the authentic centered
-  // HUD for those frames — split + real windows don't compose.
+  // tilemap columns. Normally applied only when the computed window set is
+  // one full drawn span: games (SMW) often enable screen-level window masking
+  // ($212E) with no window selected for the layer. Games opting into
+  // wsHudAlwaysVisible may override a real BG3 window inside this HUD band;
+  // content below the band keeps its authentic window.
   int16 ws_bias[8] = { 0 };
+  uint8 hud_height = ppu->wsHudSplitHeight & 0x7f;
+  bool hud_always_visible = (ppu->wsHudSplitHeight & 0x80) != 0;
   if (dstbuf == &ppu->bgBuffers[sub] &&
-      layer == 2 && y < ppu->wsHudSplitHeight &&
+      layer == 2 && y < hud_height &&
       ppu->extraLeftRight &&
-      win.nr == 1 && win.bits == 0) {
+      (hud_always_visible || (win.nr == 1 && win.bits == 0))) {
     win.nr = 5;
     win.bits = 0x0A;  // spans 1 and 3 are the gaps
     win.edges[0] = -ppu->extraLeftRight;
@@ -1096,7 +1114,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
   bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)(t)) : (uint32)(t))
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -1143,23 +1161,45 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
 // sprites. `repeat` selects cyclic continuation; otherwise reflect the edge.
 static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                      const PpuPixelPrioBufs *layerbuf,
-                                     bool repeat) {
+                                     bool repeat, bool full_budget) {
   PpuZbufType *dst = dstbuf->data;
   const PpuZbufType *src = layerbuf->data;
+  int left_extra = full_budget ? ppu->extraLeftRight : ppu->extraLeftCur;
+  int right_extra = full_budget ? ppu->extraLeftRight : ppu->extraRightCur;
   for (int x = 0; x < kPpuXPixels; x++) {
     int i = x + kPpuExtraLeftRight;
     if (src[i] > dst[i]) dst[i] = src[i];
   }
-  for (int x = -(int)ppu->extraLeftCur; x < 0; x++) {
+  for (int x = -left_extra; x < 0; x++) {
     int di = x + kPpuExtraLeftRight;
     int sx = repeat ? kPpuXPixels + x : -x;
     int si = sx + kPpuExtraLeftRight;
     if (src[si] > dst[di]) dst[di] = src[si];
   }
   for (int x = kPpuXPixels;
-       x < kPpuXPixels + (int)ppu->extraRightCur; x++) {
+       x < kPpuXPixels + right_extra; x++) {
     int di = x + kPpuExtraLeftRight;
     int sx = repeat ? x - kPpuXPixels : kPpuXPixels * 2 - 2 - x;
+    int si = sx + kPpuExtraLeftRight;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+}
+
+static void PpuMergeStretchedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                        const PpuPixelPrioBufs *layerbuf) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  const int left_extra = ppu->extraLeftRight;
+  const int right_extra = ppu->extraLeftRight;
+  const int out_width = kPpuXPixels + left_extra + right_extra;
+  if (out_width <= 0)
+    return;
+
+  for (int x = -left_extra; x < kPpuXPixels + right_extra; x++) {
+    int di = x + kPpuExtraLeftRight;
+    int sx = ((x + left_extra) * kPpuXPixels) / out_width;
+    if (sx < 0) sx = 0;
+    if (sx >= kPpuXPixels) sx = kPpuXPixels - 1;
     int si = sx + kPpuExtraLeftRight;
     if (src[si] > dst[di]) dst[di] = src[si];
   }
@@ -1170,10 +1210,9 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                           uint layer, PpuZbufType zhi,
                                           PpuZbufType zlo, bool mosaic) {
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
-  bool repeat_band = layer < 4 &&
-      ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
-      y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
-  if (!(padding & (1u << layer)) && !repeat_band) {
+  bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
+  bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
+  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band) {
     if (PPU_bigTiles(ppu, layer))
       PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 4, zhi, zlo, mosaic);
     else if (mosaic)
@@ -1193,9 +1232,53 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
-  PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
-                           repeat_band ||
-                           (ppu->wsLayerRepeat & (1u << layer)) != 0);
+  if (stretch_band) {
+    PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
+  } else {
+    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
+                             repeat_band ||
+                             (ppu->wsLayerRepeat & (1u << layer)) != 0,
+                             repeat_band);
+  }
+}
+
+static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                          int y, bool sub, uint layer,
+                                          PpuZbufType zhi, PpuZbufType zlo);
+
+static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                          uint y, bool sub,
+                                          uint layer, PpuZbufType zhi,
+                                          PpuZbufType zlo, bool mosaic) {
+  uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
+  bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
+  bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
+  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band) {
+    if (PPU_bigTiles(ppu, layer))
+      PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 2, zhi, zlo, mosaic);
+    else if (mosaic)
+      PpuDrawBackground_2bpp_mosaic(ppu, dstbuf, y, sub, layer, zhi, zlo);
+    else
+      PpuDrawBackground_2bpp(ppu, dstbuf, y, sub, layer, zhi, zlo);
+    return;
+  }
+
+  PpuPixelPrioBufs layerbuf;
+  ClearBackdrop(&layerbuf);
+  if (PPU_bigTiles(ppu, layer))
+    PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
+  else if (mosaic)
+    PpuDrawBackground_2bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  else
+    PpuDrawBackground_2bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  if (stretch_band) {
+    PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
+  } else {
+    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
+                             repeat_band ||
+                             (ppu->wsLayerRepeat & (1u << layer)) != 0,
+                             repeat_band);
+  }
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
@@ -1496,13 +1579,9 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
 
     uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
     layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 2);
-    if (PPU_bigTiles(ppu, 2))
-      PpuDrawBackgroundBig(ppu, layerbuf, y, sub, 2, 2, bg3prio, 0x1200,
-                           mosaic_size && PPU_mosaicEnabled(ppu, 2));
-    else if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
-      PpuDrawBackground_2bpp_mosaic(ppu, layerbuf, y, sub, 2, bg3prio, 0x1200);
-    else
-      PpuDrawBackground_2bpp(ppu, layerbuf, y, sub, 2, bg3prio, 0x1200);
+    PpuDrawBackground_2bpp_policy(
+        ppu, layerbuf, y, sub, 2, bg3prio, 0x1200,
+        mosaic_size && PPU_mosaicEnabled(ppu, 2));
     PpuFinishBackgroundOverlay(ppu, y, sub, 2, layerbuf);
   } else if (PPU_mode(ppu) == 2) {
     if (ppu->lineHasSprites)
@@ -1562,9 +1641,35 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     }
   }
 
+  // A game may clamp the world at a room boundary while still asking the
+  // split BG3 HUD to occupy the physical framebuffer edges. Composite the
+  // full centering budget on those scanlines; outside the live world span,
+  // only actual BG3 HUD pixels survive and everything else stays black.
+  uint8 hud_height = ppu->wsHudSplitHeight & 0x7f;
+  bool hud_full_width = (ppu->wsHudSplitHeight & 0x80) &&
+                        hud_height &&
+                        y < hud_height &&
+                        ppu->extraLeftRight;
+
   // Color window affects the drawing mode in each region
   PpuWindows cwin;
   PpuWindows_Calc(&cwin, ppu, 5, y);
+  bool compose_full_budget = false;
+  if (hud_full_width) {
+    PpuWindows_CalcWithExtra(&cwin, ppu, 5, y,
+                             ppu->extraLeftRight, ppu->extraLeftRight);
+    compose_full_budget = true;
+  } else if (hud_height && y < hud_height && ppu->extraLeftRight &&
+             cwin.nr == 1 && cwin.bits == 0) {
+    cwin.edges[0] = -(int16_t)ppu->extraLeftRight;
+    cwin.edges[1] = 256 + ppu->extraLeftRight;
+    compose_full_budget = true;
+  } else if (PpuWidescreenLineRepeatBandActive(ppu, y) &&
+             ppu->extraLeftRight && cwin.nr == 1 && cwin.bits == 0) {
+    cwin.edges[0] = -(int16_t)ppu->extraLeftRight;
+    cwin.edges[1] = 256 + ppu->extraLeftRight;
+    compose_full_budget = true;
+  }
   static const uint8 kCwBitsMod[8] = {
     0x00, 0xff, 0xff, 0x00,
     0xff, 0x00, 0xff, 0x00,
@@ -1574,7 +1679,10 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch], *dst_org = dst;
 
-  dst += (ppu->extraLeftRight - ppu->extraLeftCur);
+  dst += compose_full_budget ? 0 : (ppu->extraLeftRight - ppu->extraLeftCur);
+
+  uint32 hud_world_left = kPpuExtraLeftRight - ppu->extraLeftCur;
+  uint32 hud_world_right = kPpuExtraLeftRight + 256 + ppu->extraRightCur;
 
   uint32 windex = 0;
   do {
@@ -1587,10 +1695,16 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       // Math is disabled (or has no effect), so can avoid the per-pixel maths check
       uint32 i = left;
       do {
-        uint32 color = ppu->cgram[ppu->bgBuffers[0].data[i] & 0xff];
-        dst[0] = ppu->brightnessMult[color & clip_color_mask] << 16 |
-          ppu->brightnessMult[(color >> 5) & clip_color_mask] << 8 |
-          ppu->brightnessMult[(color >> 10) & clip_color_mask];
+        uint16 pixel = ppu->bgBuffers[0].data[i];
+        bool outside_world = i < hud_world_left || i >= hud_world_right;
+        if (hud_full_width && outside_world && ((pixel >> 8) & 0xf) != 2) {
+          dst[0] = 0;
+        } else {
+          uint32 color = ppu->cgram[pixel & 0xff];
+          dst[0] = ppu->brightnessMult[color & clip_color_mask] << 16 |
+            ppu->brightnessMult[(color >> 5) & clip_color_mask] << 8 |
+            ppu->brightnessMult[(color >> 10) & clip_color_mask];
+        }
       } while (dst++, ++i < right);
     } else {
       uint8 *half_color_map = PPU_halfColor(ppu) ? ppu->brightnessMultHalf : ppu->brightnessMult;
@@ -1599,38 +1713,73 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       // Need to check for each pixel whether to use math or not based on the main screen layer.
       uint32 i = left;
       do {
-        uint32 color = ppu->cgram[ppu->bgBuffers[0].data[i] & 0xff], color2;
-        uint8 main_layer = (ppu->bgBuffers[0].data[i] >> 8) & 0xf;
-        uint32 r = color & clip_color_mask;
-        uint32 g = (color >> 5) & clip_color_mask;
-        uint32 b = (color >> 10) & clip_color_mask;
-        uint8 *color_map = ppu->brightnessMult;
-        if (math_enabled_cur & (1 << main_layer)) {
-          if (math_enabled_cur & 0x100) {  // addSubscreen ?
-            if ((ppu->bgBuffers[1].data[i] & 0xff) != 0)
-              color2 = ppu->cgram[ppu->bgBuffers[1].data[i] & 0xff], color_map = half_color_map;
-            else  // Don't halve if PPU_addSubscreen(ppu) && backdrop
-              color2 = fixed_color;
-          } else {
-            color2 = fixed_color, color_map = half_color_map;
+        uint16 pixel = ppu->bgBuffers[0].data[i];
+        uint8 main_layer = (pixel >> 8) & 0xf;
+        bool outside_world = i < hud_world_left || i >= hud_world_right;
+        if (hud_full_width && outside_world && main_layer != 2) {
+          dst[0] = 0;
+        } else {
+          uint32 color = ppu->cgram[pixel & 0xff], color2;
+          uint32 r = color & clip_color_mask;
+          uint32 g = (color >> 5) & clip_color_mask;
+          uint32 b = (color >> 10) & clip_color_mask;
+          uint8 *color_map = ppu->brightnessMult;
+          if (math_enabled_cur & (1 << main_layer)) {
+            if (math_enabled_cur & 0x100) {  // addSubscreen ?
+              if ((ppu->bgBuffers[1].data[i] & 0xff) != 0)
+                color2 = ppu->cgram[ppu->bgBuffers[1].data[i] & 0xff], color_map = half_color_map;
+              else  // Don't halve if PPU_addSubscreen(ppu) && backdrop
+                color2 = fixed_color;
+            } else {
+              color2 = fixed_color, color_map = half_color_map;
+            }
+            uint32 r2 = (color2 & 0x1f), g2 = ((color2 >> 5) & 0x1f), b2 = ((color2 >> 10) & 0x1f);
+            if (math_enabled_cur & 0x200) {  // subtractColor?
+              r = (r >= r2) ? r - r2 : 0;
+              g = (g >= g2) ? g - g2 : 0;
+              b = (b >= b2) ? b - b2 : 0;
+            } else {
+              r += r2;
+              g += g2;
+              b += b2;
+            }
           }
-          uint32 r2 = (color2 & 0x1f), g2 = ((color2 >> 5) & 0x1f), b2 = ((color2 >> 10) & 0x1f);
-          if (math_enabled_cur & 0x200) {  // subtractColor?
-            r = (r >= r2) ? r - r2 : 0;
-            g = (g >= g2) ? g - g2 : 0;
-            b = (b >= b2) ? b - b2 : 0;
-          } else {
-            r += r2;
-            g += g2;
-            b += b2;
-          }
+          dst[0] = color_map[b] | color_map[g] << 8 | color_map[r] << 16;
         }
-        dst[0] = color_map[b] | color_map[g] << 8 | color_map[r] << 16;
       } while (dst++, ++i < right);
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
 
   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
+}
+
+static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
+                                      int x) {
+  uint8_t slot = index >> 1;
+  bool hud_y = ppu->wsHudSplitHeight &&
+      (y >= 224 || y < ppu->wsHudSplitHeight);
+  if (hud_y && ppu->wsHudOamSlots &&
+      slot >= ppu->wsHudOamFirstSlot &&
+      slot < ppu->wsHudOamFirstSlot + ppu->wsHudOamSlots) {
+    if (x >= 0 && x < ppu->wsHudLeftEnd)
+      x -= ppu->extraLeftCur;
+    else if (x >= ppu->wsHudRightStart && x < 256)
+      x += ppu->extraRightCur;
+  }
+  return x;
+}
+
+static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
+  int x = ppu->oam[index] & 0xff;
+  x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+  if (x >= 256 + ppu->extraRightCur) {
+    x -= 512;
+  } else if (x >= 256 && ppu->wsOamRightHintStrict) {
+    int slot = index >> 1;
+    if (!(ppu->wsOamRightHint[slot >> 3] & (1u << (slot & 7))))
+      x -= 512;
+  }
+  return x;
 }
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
@@ -1653,36 +1802,8 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
     int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
     if(row < spriteHeight) {
-      int x = ppu->oam[index] & 0xff;
-      x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-      // SNES OAM x is 9-bit; values >255 normally wrap to negative so sprites
-      // can straddle the LEFT edge. In widescreen that wrap would also pull
-      // legitimate right-margin sprites (screen x 256..) to the left, hiding
-      // them. SMW already emits OAM for sprites out to screen x ~320 (its
-      // GetDrawInfo draw window is [-64,320)), so push the wrap boundary past
-      // the active right border: values in [256, 256+extraRightCur) stay
-      // positive (right margin); [256+extraRightCur, 512) still wrap to the
-      // left straddle range. With extraRightCur==0 this is the authentic
-      // `if (x > 255) x -= 512`.
-      //
-      // The band is ambiguous: raw 256..256+extra is also how hardware
-      // encodes sprites parked off-screen-left at x-512 (invisible on a
-      // 256-wide screen). With strict hints on, only slots the game host
-      // marked as intentional right-margin sprites stay positive; everything
-      // else wraps like hardware so parked sprites don't ghost into the
-      // right margin (Metal Warriors). Without hints, keep the legacy
-      // always-positive band (SMW's draw window never parks sprites there).
-      if (x >= 256 + ppu->extraRightCur) {
-        x -= 512;
-      } else if (x >= 256 && ppu->wsOamRightHintStrict) {
-        int slot = index >> 1;
-        if (!(ppu->wsOamRightHint[slot >> 3] & (1u << (slot & 7))))
-          x -= 512;
-      }
-      // if in x-range: include sprites whose body pokes into the visible
-      // area, which in widescreen starts at -extraLeftCur (the per-tile
-      // gate below clips columns the same way). With extraLeftCur==0 this
-      // is the authentic `x > -spriteSize`.
+      int x = PpuDecodeOamX(ppu, index);
+      x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
       if(x + spriteSize > -ppu->extraLeftCur) {
         spritesFound++;
         if(spritesFound > 32 &&
@@ -1701,9 +1822,8 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     index = foundSprites[i - 1];
     uint8_t row = line - (ppu->oam[index] >> 8);
     int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
-    int x = ppu->oam[index] & 0xff;
-    x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-    if (x >= 256 + ppu->extraRightCur) x -= 512;
+    int x = PpuDecodeOamX(ppu, index);
+    x = PpuAdjustWidescreenHudOamX(ppu, index, ppu->oam[index] >> 8, x);
         if(PPU_objInterlace(ppu)) row = row * 2 + (ppu->evenFrame ? 0 : 1);
         int oam1 = ppu->oam[index + 1];
         int objAdr = (oam1 & 0x100) ? PPU_objTileAdr2(ppu) : PPU_objTileAdr1(ppu);
@@ -2002,6 +2122,8 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+      WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
+                          ppu->vram[vramAdr & 0x7fff]);
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }
@@ -2010,6 +2132,8 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+      WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
+                          ppu->vram[vramAdr & 0x7fff]);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }

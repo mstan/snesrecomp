@@ -57,6 +57,21 @@ class NameDecl:
 
 
 @dataclass
+class RamRoutine:
+    """A `ram_routine <pc24> <MmXn> <hexbytes>` line: a deterministic
+    runtime-generated routine resident in WRAM ($7E/$7F) whose captured bytes
+    are literally recompiled (LLE) as an AOT body. The blob is appended to the
+    ROM image and reached via a synthetic reloc region so the standard decoder
+    path decodes it unchanged; runtime dispatch is guarded by a live byte-match
+    (g_ram_routine_guards). Source of truth: tier2_coverage.json ram_routines[]
+    (deterministic, terminated entries only)."""
+    pc24: int          # absolute 24-bit WRAM entry (bank $7E/$7F)
+    entry_m: int       # entry M flag to emit + gate on
+    entry_x: int       # entry X flag to emit + gate on
+    data: bytes        # captured snapshot (length = routine length)
+
+
+@dataclass
 class BankCfg:
     bank: int
     includes: List[str] = field(default_factory=list)
@@ -133,7 +148,10 @@ class BankCfg:
     # Per-game: declare the SPC upload entry PC here. Works for SMW
     # (HandleSPCUploads_Inner / SPC700UploadLoop at $00:8079) and
     # ALttP (LoadSongBank at $00:8888) — both use the same protocol.
-    hle_spc_upload: List[int] = field(default_factory=list)
+    # Map entry PC to protocol ownership mode. `live` preserves the running
+    # driver's AA/BB-ready and CC-terminator handshake; `legacy` retains the
+    # direct state replacement required by older per-game declarations.
+    hle_spc_upload: dict = field(default_factory=dict)
     # `hle_func <pc16> <c_function_name>` — replace the recompiled body
     # of the function at <pc> with a single forwarding call to the named
     # C function. Used for hand-written HLE bodies that need to run
@@ -168,6 +186,8 @@ class BankCfg:
     # the JSR/JSL instruction's own address (the `insn.addr` of the
     # call), NOT the target. Map: site_pc24 -> (m, x).
     force_variant_at: dict = field(default_factory=dict)
+    # `ram_routine <pc24> <MmXn> <hexbytes>` directives — see RamRoutine.
+    ram_routines: List[RamRoutine] = field(default_factory=list)
 
 
 # Token regex helpers
@@ -178,6 +198,16 @@ def _parse_hex(token: str) -> int:
     if token.lower().startswith('0x'):
         return int(token, 16)
     return int(token, 16)
+
+
+def _parse_mx(token: str):
+    """Parse an `MmXn` variant token (e.g. 'M1X1') into (m, x). Returns None
+    on a malformed token. Case-insensitive."""
+    t = token.lower()
+    if (len(t) == 4 and t[0] == 'm' and t[2] == 'x'
+            and t[1] in '01' and t[3] in '01'):
+        return (int(t[1]), int(t[3]))
+    return None
 
 
 def _strip_comment(line: str) -> str:
@@ -286,16 +316,21 @@ def load_bank_cfg(path: str) -> BankCfg:
             # block stream pointed to by DP+0..2 and writes directly
             # into apu->ram. See BankCfg.hle_spc_upload comment.
             if head == 'hle_spc_upload':
-                if len(tokens) != 2:
+                if len(tokens) not in (2, 3):
                     raise ValueError(
-                        f"{path}: hle_spc_upload needs exactly one <pc> "
-                        f"argument, got: {stripped!r}")
+                        f"{path}: hle_spc_upload needs <pc> and optional "
+                        f"legacy|live mode, got: {stripped!r}")
                 try:
                     pc16 = _parse_hex(tokens[1]) & 0xFFFF
                 except ValueError as e:
                     raise ValueError(
                         f"{path}: hle_spc_upload bad pc {tokens[1]!r}: {e}")
-                cfg.hle_spc_upload.append(pc16)
+                mode = tokens[2].lower() if len(tokens) == 3 else 'legacy'
+                if mode not in ('legacy', 'live'):
+                    raise ValueError(
+                        f"{path}: hle_spc_upload bad mode {mode!r}; "
+                        "expected legacy or live")
+                cfg.hle_spc_upload[pc16] = mode
                 continue
 
             # hle_func <pc16> <c_function_name> — replace the decoded
@@ -432,7 +467,7 @@ def load_bank_cfg(path: str) -> BankCfg:
                 # (sourced from the decomp's dispatcher switch). The dispatch
                 # is a CALL (the pushed PEA return resumes the next block),
                 # not a tail transfer.
-                #   indirect_dispatch <site_pc16> <count> ptrcall targets:<t1,t2,...>
+                #   indirect_dispatch <site_pc16> <count> ptrcall [return:<pc16>] [frame:<2|3>] targets:<t1,t2,...>
                 #
                 # Targets may be 16-bit local PCs or full 24-bit SNES
                 # pointers. Keep full-width values intact: long pointer
@@ -449,6 +484,8 @@ def load_bank_cfg(path: str) -> BankCfg:
                             f"{stripped!r}")
                     pointer_mode = next(iter(pointer_modes))
                     targets: Tuple[int, ...] = ()
+                    return_pc: Optional[int] = None
+                    frame_size: Optional[int] = None
                     for t in tokens[3:]:
                         if t == pointer_mode:
                             continue
@@ -459,6 +496,27 @@ def load_bank_cfg(path: str) -> BankCfg:
                             except ValueError as e:
                                 raise ValueError(
                                     f"{path}: indirect_dispatch targets: bad hex {t!r}: {e}")
+                        elif t.startswith('return:'):
+                            if pointer_mode != 'ptrcall':
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch return: is only valid with ptrcall")
+                            try:
+                                return_pc = _parse_hex(t[len('return:'):]) & 0xFFFF
+                            except ValueError as e:
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch return: bad hex {t!r}: {e}")
+                        elif t.startswith('frame:'):
+                            if pointer_mode != 'ptrcall':
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch frame: is only valid with ptrcall")
+                            try:
+                                frame_size = int(t[len('frame:'):], 0)
+                            except ValueError as e:
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch frame: bad size {t!r}: {e}")
+                            if frame_size not in (2, 3):
+                                raise ValueError(
+                                    f"{path}: indirect_dispatch frame: must be 2 or 3")
                         else:
                             raise ValueError(
                                 f"{path}: indirect_dispatch {pointer_mode} "
@@ -476,6 +534,10 @@ def load_bank_cfg(path: str) -> BankCfg:
                         'idx_reg': 'X',          # unused (value-matched), kept for emit path
                         'table_bases': (),
                         'ptr_call': pointer_mode == 'ptrcall',
+                        # Optional explicit continuation for wrappers which
+                        # construct the PEA return frame away from this site.
+                        'return_pc': return_pc,
+                        'frame_size': frame_size,
                         'pointer_match': pointer_mode != 'rtsstack',
                         # The dispatcher has already PLA'd the two-byte JSR
                         # frame it entered with and hands control to a state
@@ -652,6 +714,36 @@ def load_bank_cfg(path: str) -> BankCfg:
                 except ValueError:
                     continue
                 cfg.data_regions.append((b, s, e))
+                continue
+
+            # ram_routine <pc24> <MmXn> <hexbytes>
+            if head == 'ram_routine':
+                if len(tokens) != 4:
+                    raise ValueError(
+                        f"{path}: ram_routine needs <pc24> <MmXn> <hexbytes>, "
+                        f"got: {stripped!r}")
+                pc24 = _parse_hex(tokens[1]) & 0xFFFFFF
+                mx = _parse_mx(tokens[2])
+                if mx is None:
+                    raise ValueError(
+                        f"{path}: ram_routine bad variant {tokens[2]!r} "
+                        f"(want M0X0..M1X1)")
+                hexbytes = tokens[3]
+                if len(hexbytes) % 2 != 0 or not _HEX_RE.match(hexbytes):
+                    raise ValueError(
+                        f"{path}: ram_routine bad hexbytes {tokens[2]!r}")
+                data = bytes.fromhex(hexbytes)
+                if not data:
+                    raise ValueError(
+                        f"{path}: ram_routine {pc24:06X} has empty byte blob")
+                bank = (pc24 >> 16) & 0xFF
+                if bank not in (0x7E, 0x7F):
+                    raise ValueError(
+                        f"{path}: ram_routine {pc24:06X} not in WRAM bank "
+                        f"$7E/$7F")
+                cfg.ram_routines.append(
+                    RamRoutine(pc24=pc24, entry_m=mx[0], entry_x=mx[1],
+                               data=data))
                 continue
 
             # Anything else: silently ignore (v1-only directive or

@@ -51,43 +51,139 @@ void apu_reset(Apu* apu) {
     apu->timer[i].enabled = false;
   }
   apu->cpuCyclesLeft = 7;
+  apu->portClock = 0;
   apu_clearPortQueue(apu);
 }
 
 void apu_clearPortQueue(Apu* apu) {
   apu->portQHead = apu->portQTail = 0;
+  apu->portGuestAnchor = 0;
+  apu->portTargetAnchor = 0;
+  apu->portLastGuest = 0;
+  apu->portLastTarget = 0;
+  apu->portTimeValid = false;
+}
+
+void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
+  port &= 3;
+  apu->inPorts[port] = val;
+  audio_trace_on_cpu_port_apply(port, val);
 }
 
 static void apu_applyPortWrite(Apu* apu, const ApuPortWrite *w) {
-  apu->inPorts[w->port & 3] = w->val;
-  audio_trace_on_cpu_port_apply(w->port, w->val);
+  apu_writePortNow(apu, w->port, w->val);
 }
 
-void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
-                           uint64_t target_sample) {
-  if (apu->portQTail - apu->portQHead >= APU_PORT_QUEUE_LEN) {
-    /* Full — apply the oldest immediately so ordering survives. */
-    apu_applyPortWrite(apu, &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)]);
-    apu->portQHead++;
+uint32_t apu_portQueueDepth(const Apu* apu) {
+  return apu->portQTail - apu->portQHead;
+}
+
+bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
+                           uint64_t guest_cycle) {
+  if (apu_portQueueDepth(apu) >= APU_PORT_QUEUE_LEN)
+    return false;
+
+  /* Establish a correspondence between guest time and wherever the
+   * callback-driven SPC is now. If the callback later runs ahead, rebase at
+   * the new current point; future guest deltas are still preserved. */
+  if (!apu->portTimeValid || guest_cycle < apu->portLastGuest) {
+    apu->portGuestAnchor = guest_cycle;
+    apu->portTargetAnchor = apu->portClock;
+    apu->portTimeValid = true;
   }
+
+  uint64_t target = apu->portTargetAnchor +
+                    (guest_cycle - apu->portGuestAnchor);
+  if (target < apu->portClock) {
+    apu->portGuestAnchor = guest_cycle;
+    apu->portTargetAnchor = apu->portClock;
+    target = apu->portClock;
+  }
+  if (target < apu->portLastTarget)
+    target = apu->portLastTarget;
+
   ApuPortWrite *w = &apu->portQueue[apu->portQTail & (APU_PORT_QUEUE_LEN - 1)];
-  w->target_sample = target_sample;
+  w->target_cycle = target;
   w->port = (uint8_t)(port & 3);
   w->val = val;
   apu->portQTail++;
+  apu->portLastGuest = guest_cycle;
+  apu->portLastTarget = target;
+  return true;
 }
 
-/* Apply every queued write whose target the produced-sample clock has
- * reached. Called at each DSP sample boundary inside apu_cycle. */
+/* Apply all CPU bus events due before this SPC cycle executes. */
 static void apu_drainPortQueue(Apu* apu) {
-  uint64_t produced;
-  audio_trace_sample_clocks(&produced, NULL);
   while (apu->portQHead != apu->portQTail) {
     ApuPortWrite *w = &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
-    if (w->target_sample > produced)
+    if (w->target_cycle > apu->portClock)
       break;
     apu_applyPortWrite(apu, w);
     apu->portQHead++;
+  }
+}
+
+bool apu_runUntilPortQueueEmpty(Apu* apu, uint32_t max_cycles) {
+  while (apu->portQHead != apu->portQTail) {
+    if (max_cycles-- == 0)
+      return false;
+    apu_cycle(apu);
+  }
+  return true;
+}
+
+bool apu_runToGuestCycle(Apu* apu, uint64_t guest_cycle,
+                         uint32_t max_cycles) {
+  if (!apu->portTimeValid || guest_cycle < apu->portGuestAnchor)
+    return true;
+
+  uint64_t target = apu->portTargetAnchor +
+                    (guest_cycle - apu->portGuestAnchor);
+  if (target < apu->portLastTarget)
+    target = apu->portLastTarget;
+
+  for (;;) {
+    bool due_event = false;
+    if (apu->portQHead != apu->portQTail) {
+      const ApuPortWrite *w =
+          &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
+      due_event = w->target_cycle <= target;
+    }
+    if (apu->portClock >= target && !due_event)
+      return true;
+    if (max_cycles-- == 0)
+      return false;
+    apu_cycle(apu);
+  }
+}
+
+bool apu_waitForTransferReady(Apu* apu, uint8_t request_port,
+                              uint8_t request_value, uint32_t max_cycles) {
+  for (;;) {
+    if (apu->outPorts[0] == 0xaa && apu->outPorts[1] == 0xbb)
+      return true;
+    if (apu->inPorts[request_port & 3] != request_value)
+      apu_writePortNow(apu, request_port, request_value);
+    if (max_cycles-- == 0)
+      return false;
+    apu_cycle(apu);
+  }
+}
+
+bool apu_finishHleTransfer(Apu* apu, uint16_t final_pc,
+                           uint32_t max_cycles) {
+  apu_writePortNow(apu, 2, (uint8_t)final_pc);
+  apu_writePortNow(apu, 3, (uint8_t)(final_pc >> 8));
+  apu_writePortNow(apu, 1, 0);
+  apu_writePortNow(apu, 0, 0xcc);
+  for (;;) {
+    if (apu->outPorts[0] == 0xcc) {
+      memset(apu->inPorts, 0, 4);
+      return true;
+    }
+    if (max_cycles-- == 0)
+      return false;
+    apu_cycle(apu);
   }
 }
 
@@ -101,6 +197,7 @@ extern uint64_t g_spc_pc_histogram[0x10000];
 extern int g_spc_pc_max_seen;
 
 void apu_cycle(Apu* apu) {
+  apu_drainPortQueue(apu);
   if(apu->cpuCyclesLeft == 0) {
     /* Sample PC right BEFORE running the opcode — so PC reflects the
      * instruction we're about to execute, not the post-opcode PC. */
@@ -112,7 +209,6 @@ void apu_cycle(Apu* apu) {
 
   if((apu->cycles & 0x1f) == 0) {
     // every 32 cycles
-    apu_drainPortQueue(apu);
     dsp_cycle(apu->dsp);
   }
 
@@ -135,6 +231,7 @@ void apu_cycle(Apu* apu) {
   }
 
   apu->cycles++;
+  apu->portClock++;
 }
 
 uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
