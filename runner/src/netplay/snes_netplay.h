@@ -63,6 +63,8 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
 
 int  snes_netplay_active(void);
 int  snes_netplay_is_running(void);
+/* "ice", "lan", or "none"; useful for user-facing connection diagnostics. */
+const char *snes_netplay_transport_name(void);
 int  snes_netplay_local_slot(void);
 /* Resolved host device index (0/1) used for local capture. */
 int  snes_netplay_input_player(void);
