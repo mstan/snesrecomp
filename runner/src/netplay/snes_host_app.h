@@ -45,11 +45,14 @@ void snes_host_app_begin_soft_return(RecompLauncherCGameInfo *gi,
 
 typedef struct SnesHostBarrierHooks {
   uint16_t (*capture_local_pad)(void *ctx);
-  /* Called each stall iteration; set *want_soft_exit nonzero to soft-exit. */
+  /*
+   * Called each stall iteration. *want_soft_exit:
+   *   0 = continue, 1 = Escape soft-exit, 2 = window-close (sdl_quit).
+   */
   void (*poll_events)(void *ctx, int *want_soft_exit);
   void *ctx;
   uint32_t peer_timeout_ms;    /* default 1500 if 0 */
-  uint32_t connect_timeout_ms; /* 0 = disabled */
+  uint32_t connect_timeout_ms; /* 0 = disabled; clock is snes_netplay-owned */
   void (*on_connect_timeout)(void *ctx);
 } SnesHostBarrierHooks;
 

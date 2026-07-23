@@ -73,6 +73,18 @@ uint32_t snes_netplay_sim_tick(void);
 int  snes_netplay_start(const SnesNetplayConfig *cfg);
 void snes_netplay_shutdown(void);
 
+/*
+ * Connect-wait clock (session-scoped). Reset on start / shutdown so rematch
+ * after Escape / soft-return cannot inherit a stale 30s timer from a prior
+ * wait. Used by snes_host_barrier_admit; games should not keep their own.
+ *
+ * snes_netplay_connect_timed_out: while active and transport not running,
+ * starts/continues the wait; returns 1 when timeout_ms elapsed (0 disables).
+ * Clears automatically once snes_netplay_is_running() is true.
+ */
+void snes_netplay_connect_wait_reset(void);
+int  snes_netplay_connect_timed_out(uint32_t timeout_ms);
+
 /* Stage local pad bits (12 SNES buttons) for the current sim tick. */
 void snes_netplay_stage_local(uint16_t buttons);
 

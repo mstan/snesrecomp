@@ -16,6 +16,7 @@
 #if defined(SNES_HAS_LOBBY_CLIENT)
 #include "snes_lobby_client.h"
 #endif
+#include <SDL.h>
 #endif
 
 void snes_netplay_config_defaults(SnesNetplayConfig *cfg)
@@ -94,6 +95,12 @@ int  snes_netplay_start(const SnesNetplayConfig *cfg)
     return -1;
 }
 void snes_netplay_shutdown(void) {}
+void snes_netplay_connect_wait_reset(void) {}
+int  snes_netplay_connect_timed_out(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return 0;
+}
 void snes_netplay_stage_local(uint16_t buttons) { (void)buttons; }
 int  snes_netplay_needs_local_sample(void) { return 0; }
 int  snes_netplay_input_desync(uint32_t *tick, uint32_t *local_hash, uint32_t *remote_hash)
@@ -157,10 +164,31 @@ typedef struct {
 
 static NetplayState g_np;
 static int g_return_to_lobby;
+static uint32_t g_connect_wait_started_ms;
 
 void snes_netplay_request_return_to_lobby(void) { g_return_to_lobby = 1; }
 int  snes_netplay_return_to_lobby_requested(void) { return g_return_to_lobby; }
 void snes_netplay_clear_return_to_lobby(void) { g_return_to_lobby = 0; }
+
+void snes_netplay_connect_wait_reset(void)
+{
+    g_connect_wait_started_ms = 0;
+}
+
+int snes_netplay_connect_timed_out(uint32_t timeout_ms)
+{
+    uint32_t now;
+    if (!timeout_ms || !snes_netplay_active())
+        return 0;
+    if (snes_netplay_is_running()) {
+        g_connect_wait_started_ms = 0;
+        return 0;
+    }
+    now = SDL_GetTicks();
+    if (!g_connect_wait_started_ms)
+        g_connect_wait_started_ms = now ? now : 1u;
+    return (uint32_t)(now - g_connect_wait_started_ms) >= timeout_ms;
+}
 
 static void encode_pad(uint16_t buttons, RNetInputSample *out, rnet_u32 tick)
 {
@@ -395,6 +423,7 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
     if (!cfg || !cfg->enabled) return -1;
     if (g_np.session) snes_netplay_shutdown();
+    snes_netplay_connect_wait_reset();
 
     rnet_config_init_defaults(&rcfg);
     rcfg.slot_count = 2;
@@ -506,6 +535,7 @@ void snes_netplay_shutdown(void)
                 RtlSaveRoot());
     }
     memset(&g_np, 0, sizeof(g_np));
+    snes_netplay_connect_wait_reset();
 }
 
 static int np_xfer_busy(void)

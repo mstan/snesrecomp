@@ -261,7 +261,8 @@ tables or soft-return glue.
 | `snes_host_app_apply_launch` | Map `RecompLauncherCNetplayLaunch` → `SnesNetplayConfig` |
 | `snes_host_ensure_sdl` / `snes_host_session_reset` | Rematch SDL + `RtlGameInfo.session_reset` |
 | `snes_netplay_soft_exit_to_lobby` | Escape / peer BYE → lobby |
-| `snes_host_barrier_admit` | Optional shared MotK admit loop (pad sample remains game-owned) |
+| `snes_host_barrier_admit` | Shared MotK admit loop (pad / SDL poll / modal remain game hooks) |
+| `snes_netplay_connect_wait_*` | Session-scoped connect-wait clock (reset on start / shutdown / soft-exit) |
 
 Minimal game wiring:
 
@@ -303,8 +304,8 @@ another lobby copy:
 | Soft-return reopen | After match | `snes_host_app_begin_soft_return(&gi, 1)` then `recomp_launcher_run_window` |
 | Rematch `session_reboot` | Host loop | `snes_host_ensure_sdl()` + `snes_host_session_reset()` |
 | `RtlGameInfo.session_reset` | CPU infra / RTL | Clear sticky LLE / frame gates / rematch latches (`MwSessionReset`, `SmwSessionReset`) |
-| Pad sample + `RtlRunFrame` gate | Host loop | Keep game-owned; optional `snes_host_barrier_admit` |
-| Connect-timeout modal | Host loop | `SDL_ShowSimpleMessageBox` (or equivalent) — peer BYE stays silent soft-return |
+| Pad sample + `RtlRunFrame` gate | Host loop | Prefer `snes_host_barrier_admit` + pad/event hooks — do not copy admit loops |
+| Connect-timeout modal | Host hook | `on_connect_timeout` only (message/UI). Clock is engine-owned — never a game `static` timer |
 | Runtime error into waiting room | Optional | `snes_host_lobby_set_runtime_error` (SMW uses this) |
 | ROM keep vs reload | Host loop | Title policy (free/`kRom` rematch path, CRC/SHA checks) |
 | Offline Play after soft-return | Host loop | `LAUNCH && !net.enabled` → disconnect + `session_reboot` |
@@ -395,9 +396,14 @@ Member rows: use `snes_lobby_member_is_host(&member)` (not `slot == 0`).
 snes_netplay_soft_exit_to_lobby("peer_disconnect", /*from_lobby=*/1);
 ```
 
-Same path as Escape / `SDL_QUIT`. Do **not** show
-`SDL_ShowSimpleMessageBox` for mid-match peer loss. Keep modals for
-**connect timeouts** (firewall / ICE hints).
+Same path as Escape / `SDL_QUIT` (via `snes_host_barrier_admit` hooks).
+Do **not** show `SDL_ShowSimpleMessageBox` for mid-match peer loss. Keep
+modals for **connect timeouts** (`on_connect_timeout` only).
+
+Connect-wait time lives in `snes_netplay_connect_timed_out` and is reset on
+`snes_netplay_start` / `shutdown` / soft-exit. Games must **not** keep a
+`static` wait clock across rematch — that caused instant false
+`connect_timeout_lan` after Escape → soft-return → Play.
 
 ### 3. Re-init SDL + session_reset on rematch
 
