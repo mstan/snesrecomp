@@ -225,12 +225,32 @@ Rules that matter for SNES recomp hosts:
 
 Low-level API: `lib/recomp-net/docs/host_integration.md`.
 
+## Lobby join / launch handoff (server-hosted)
+
+Port policy is split so games do not each reimplement it:
+
+| Step | Owner | Behavior |
+|------|--------|----------|
+| Host **create** UDP port | recomp-ui (`launcher_udp_port.*`) | LAN: exact port; online: scan preferred..+31 and rewrite endpoint before `create()` |
+| Guest **join** UDP bind | snesrecomp (`snes_lobby_join`) | NULL / empty / `host:0` → `0.0.0.0:<free>` (prefer 7778). Never advertise `:0` — the lobby would publish `peer_ip:0` and `rnet_session_start_lan` rejects it |
+| **fill_launch** | snesrecomp (`snes_lobby_try_fill_launch`) | Returns 1 only after `op:launch` with usable bind/peer; wire from `RecompLauncherCNetplayCallbacks.fill_launch` |
+
+```c
+/* Online join — guest_bind may be NULL; engine picks a free port. */
+snes_lobby_join(lobby_id, password, NULL);
+
+/* fill_launch callback: */
+SnesLobbyJoinInfo join;
+if (!snes_lobby_try_fill_launch(&join)) return 0;
+/* copy join.bind_hostport / peer_hostport / session_id / local_slot → out */
+```
+
 ## What snesrecomp does vs. what the game does
 
 | Layer                                                                          | Responsibility                                                                 |
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| snesrecomp (`lib/recomp-net`, `snes_netplay`, lobby client)                    | Vendors netcode, pad/admit facade, MotK WS + ICE signal relay                  |
-| Game runtime                                                                   | Launcher handoff → `snes_netplay_start`, gate `RtlRunFrame`, sample local pads |
+| snesrecomp (`lib/recomp-net`, `snes_netplay`, lobby client)                    | Vendors netcode, pad/admit facade, MotK WS + ICE signal relay; guest bind normalize + `try_fill_launch` |
+| Game runtime                                                                   | Launcher callbacks → `snes_netplay_start`, gate `RtlRunFrame`, sample local pads |
 | [recomp-net-server](https://github.com/TechnicallyComputers/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
 
 ## Windows MSBuild / `lib/` superbuild

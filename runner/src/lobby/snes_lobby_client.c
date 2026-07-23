@@ -54,6 +54,11 @@ int  snes_lobby_request_start(const SnesLobbyMatchCaps *c) { (void)c; return -1;
 int  snes_lobby_launch_pending(void) { return 0; }
 void snes_lobby_clear_launch_pending(void) {}
 void snes_lobby_clear_last_error(void) {}
+int  snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out)
+{
+    (void)out;
+    return 0;
+}
 int  snes_lobby_send_signal(int type, int flag, const char *text)
 {
     (void)type;
@@ -74,6 +79,7 @@ int  snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap)
 
 #include "rnet_ws.h"
 #include "rnet_sha1.h"
+#include "recomp_net/address.h"
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -1136,6 +1142,26 @@ int snes_lobby_create(const char *name, const char *game_name,
     return 0;
 }
 
+/* Prefer caller bind; never advertise :0 — lobby rewrites that to peer_ip:0
+ * and rnet_session_start_lan rejects port 0 (host falls offline, guest alone). */
+static void snes_lobby_normalize_guest_bind(const char *guest_bind, char *out,
+                                            size_t out_cap)
+{
+    int port;
+    if (!out || out_cap < 8)
+        return;
+    out[0] = '\0';
+    if (guest_bind && guest_bind[0] && endpoint_has_usable_port(guest_bind)) {
+        strncpy(out, guest_bind, out_cap - 1);
+        out[out_cap - 1] = '\0';
+        return;
+    }
+    port = rnet_udp_find_free_port(/*preferred=*/7778, 32);
+    if (port <= 0)
+        port = 7778;
+    snprintf(out, out_cap, "0.0.0.0:%d", port);
+}
+
 int snes_lobby_join(const char *lobby_id, const char *password, const char *guest_bind)
 {
     char msg[1024];
@@ -1146,8 +1172,7 @@ int snes_lobby_join(const char *lobby_id, const char *password, const char *gues
     }
     gn = g_lc.filter_game_name;
     gv = effective_game_version(NULL);
-    strncpy(g_lc.my_bind, guest_bind && guest_bind[0] ? guest_bind : "0.0.0.0:7778",
-            sizeof(g_lc.my_bind) - 1);
+    snes_lobby_normalize_guest_bind(guest_bind, g_lc.my_bind, sizeof(g_lc.my_bind));
     g_lc.join.last_error[0] = '\0';
     snprintf(msg, sizeof(msg),
              "{\"op\":\"join\",\"lobby_id\":\"%s\",\"password\":\"%s\",\"guest_bind\":\"%s\","
@@ -1292,6 +1317,22 @@ void snes_lobby_clear_launch_pending(void)
 void snes_lobby_clear_last_error(void)
 {
     g_lc.join.last_error[0] = '\0';
+}
+
+int snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out)
+{
+    const SnesLobbyJoinInfo *join;
+    if (!out || !g_lc.launch_pending)
+        return 0;
+    join = &g_lc.join;
+    if (!join->bind_hostport[0])
+        return 0;
+    /* Guests need a concrete host peer. Host may leave peer empty so transport
+     * learns the guest from the first UDP packet. */
+    if (join->local_slot != 0 && !join->peer_hostport[0])
+        return 0;
+    *out = *join;
+    return 1;
 }
 
 int snes_lobby_send_signal(int type, int flag, const char *text)

@@ -29,6 +29,10 @@ and supplies game facts through `RecompLauncherCGameInfo` /
 `launcher_profile_apply("snes", ...)`. See MetalWarriorsSNESRecomp for a
 complete host.
 
+Online lobby handoff: `snes_lobby_join(..., NULL)` (engine picks a free guest
+UDP port) and `snes_lobby_try_fill_launch()` from `fill_launch`. See
+`docs/RECOMP_NET.md` → "Lobby join / launch handoff".
+
 ## What stayed in snesrecomp
 
 - `runner/src/launcher.c` / `launcher.h` — ROM resolve, CRC/SHA, `rom.cfg`
