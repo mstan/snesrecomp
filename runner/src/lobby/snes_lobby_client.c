@@ -87,6 +87,15 @@ int  snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap)
 #include <unistd.h>
 #endif
 
+static int socket_would_block(void)
+{
+#if defined(_WIN32)
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
 typedef struct {
     int fd;
     int connected;
@@ -935,7 +944,7 @@ void snes_lobby_pump(void)
     if (!g_lc.handshake_done) {
         n = recv(g_lc.fd, buf, sizeof(buf), 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (socket_would_block()) {
                 return;
             }
             snes_lobby_disconnect();
@@ -979,40 +988,28 @@ void snes_lobby_pump(void)
     flush_pending();
     drain_ws_pending();
     for (;;) {
-        int closed = 0;
-#if !defined(_WIN32)
-        int fl = fcntl(g_lc.fd, F_GETFL, 0);
-#endif
-        {
-            uint8_t peek[1];
-            n = recv(g_lc.fd, (char *)peek, 1, MSG_PEEK);
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break;
-                }
-                snes_lobby_disconnect();
-                return;
-            }
-            if (n == 0) {
-                snes_lobby_disconnect();
-                return;
-            }
+        size_t available = sizeof(g_lc.ws_pending) - g_lc.ws_pending_len;
+        if (available == 0) {
+            snes_lobby_disconnect();
+            return;
         }
-#if !defined(_WIN32)
-        fcntl(g_lc.fd, F_SETFL, fl & ~O_NONBLOCK);
-#endif
-        n = rnet_ws_read_text(g_lc.fd, buf, sizeof(buf), &closed);
-#if !defined(_WIN32)
-        fcntl(g_lc.fd, F_SETFL, fl | O_NONBLOCK);
-#endif
-        if (closed || n < 0) {
+        n = recv(g_lc.fd,
+                 (char *)g_lc.ws_pending + g_lc.ws_pending_len,
+                 (int)available, 0);
+        if (n < 0) {
+            if (socket_would_block()) break;
             snes_lobby_disconnect();
             return;
         }
         if (n == 0) {
+            snes_lobby_disconnect();
+            return;
+        }
+        g_lc.ws_pending_len += (size_t)n;
+        drain_ws_pending();
+        if (!snes_lobby_connected()) {
             break;
         }
-        handle_server_json(buf);
     }
 }
 
