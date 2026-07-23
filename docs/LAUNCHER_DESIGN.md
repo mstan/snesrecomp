@@ -35,17 +35,23 @@ Online lobby handoff: recomp-ui prepares `guest_bind` (prefer UDP 7778) before
 `snes_lobby_try_fill_launch()` from `fill_launch`. See
 `docs/RECOMP_NET.md` → "Lobby join / launch handoff".
 
-Soft-return rematch (peer quit / Escape → waiting room → Play again) has
-several host pitfalls — **SDL must be re-inited** after the launcher's
-`SDL_Quit()`, peer disconnect must not show a modal, and the emu session must
-cold-boot. Checklist: `docs/RECOMP_NET.md` → "Soft-return rematch checklist".
+Soft-return rematch (peer quit / Escape → waiting room → Play again): call
+`snes_host_ensure_sdl()` + `snes_host_session_reset()` at `session_reboot`,
+and `snes_netplay_soft_exit_to_lobby()` on peer leave. Checklist:
+`docs/RECOMP_NET.md` → "Soft-return rematch checklist".
+
+**Policy:** netplay + launcher interaction fixes belong in snesrecomp or
+recomp-ui so every title benefits. Do not grow game `main.c` with shared
+networking UX. Per-title sticky state uses `RtlGameInfo.session_reset` (and
+related hooks) — see `docs/RECOMP_NET.md` → "Layering policy".
 
 ## What stayed in snesrecomp
 
 - `runner/src/launcher.c` / `launcher.h` — ROM resolve, CRC/SHA, `rom.cfg`
   (console-agnostic helpers used when the GUI is skipped with `--no-launcher`)
-- Lobby / netplay backends — `snes_lobby_client.*`, `snes_netplay.*`, consumed
-  by recomp-ui through host callbacks (`snesrecomp_enable_recomp_net`)
+- Lobby / netplay backends — `snes_lobby_client.*`, `snes_netplay.*`,
+  `snes_host_session.*`, consumed by recomp-ui through host callbacks
+  (`snesrecomp_enable_recomp_net`)
 - `lib/recomp-net` — delay-sync / ICE transport submodule
 
 ## What was removed
