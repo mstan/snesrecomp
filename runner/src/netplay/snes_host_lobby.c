@@ -21,6 +21,10 @@ int snes_host_lobby_leave(void) { return -1; }
 void snes_host_lobby_disconnect(void) {}
 const char *snes_host_lobby_resume_endpoint(void) { return ""; }
 int snes_host_lobby_in_lan(void) { return 0; }
+void snes_host_lobby_set_runtime_error(const char *error_code)
+{
+  (void)error_code;
+}
 
 #else
 
@@ -34,6 +38,7 @@ static int g_joined_lan;
 static RecompLauncherCNetplayLaunch g_lan_launch;
 static char g_lobby_url[256];
 static char g_resume_endpoint[64];
+static char g_runtime_error[64];
 static RNetIpv4Address g_local_addresses[kMaxLocalAddresses];
 static int g_local_address_count;
 static char g_external_ip[RNET_IPV4_ADDRESS_TEXT_MAX];
@@ -82,6 +87,8 @@ static int create_lan(const char *name, const char *endpoint,
                       const char *password)
 {
   RNetLanLobby state;
+  char advertised[RNET_LAN_LOBBY_ENDPOINT_MAX];
+  const char *stored_endpoint = endpoint;
   memset(&state, 0, sizeof(state));
   snprintf(state.name, sizeof(state.name), "%s",
            name && name[0]
@@ -90,8 +97,20 @@ static int create_lan(const char *name, const char *endpoint,
                                           : "LAN Lobby"));
   snprintf(state.game, sizeof(state.game), "%s", game_name());
   snprintf(state.game_version, sizeof(state.game_version), "%s", game_version());
+  /* Online hosts bind 0.0.0.0, but that wildcard is not a routable guest
+   * destination. Keep the bind; advertise a concrete local IPv4 in the LAN
+   * registry row when present. */
+  if (endpoint && strncmp(endpoint, "0.0.0.0:", 8) == 0) {
+    RNetIpv4Address address;
+    if (rnet_ipv4_enumerate(&address, 1) > 0 && address.address[0]) {
+      snprintf(advertised, sizeof(advertised), "%s:%s", address.address,
+               endpoint + 8);
+      stored_endpoint = advertised;
+    }
+  }
   snprintf(state.endpoint, sizeof(state.endpoint), "%s",
-           endpoint && endpoint[0] ? endpoint : "127.0.0.1:7777");
+           stored_endpoint && stored_endpoint[0] ? stored_endpoint
+                                                 : "127.0.0.1:7777");
   snprintf(state.host_name, sizeof(state.host_name), "%s",
            snes_lobby_display_name()[0] ? snes_lobby_display_name() : "Host");
   snprintf(state.password, sizeof(state.password), "%s",
@@ -202,6 +221,7 @@ int snes_host_lobby_init(const SnesHostLobbyIdentity *id,
   memset(&g_lan_launch, 0, sizeof(g_lan_launch));
   g_lobby_url[0] = '\0';
   g_resume_endpoint[0] = '\0';
+  g_runtime_error[0] = '\0';
   g_external_ip[0] = '\0';
   g_local_address_count = 0;
   g_inited = 1;
@@ -256,6 +276,12 @@ const char *snes_host_lobby_resume_endpoint(void)
 int snes_host_lobby_in_lan(void)
 {
   return g_hosting_lan || g_joined_lan;
+}
+
+void snes_host_lobby_set_runtime_error(const char *error_code)
+{
+  snprintf(g_runtime_error, sizeof(g_runtime_error), "%s",
+           error_code ? error_code : "");
 }
 
 static const char *cb_default_url(void *ctx)
@@ -605,6 +631,8 @@ static const char *cb_last_error(void *ctx)
 {
   const SnesLobbyJoinInfo *join;
   (void)ctx;
+  if (g_runtime_error[0])
+    return g_runtime_error;
   join = snes_lobby_join_info();
   return (join && join->last_error[0]) ? join->last_error : "";
 }
@@ -612,6 +640,7 @@ static const char *cb_last_error(void *ctx)
 static void cb_clear_last_error(void *ctx)
 {
   (void)ctx;
+  g_runtime_error[0] = '\0';
   snes_lobby_clear_last_error();
 }
 

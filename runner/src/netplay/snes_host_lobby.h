@@ -62,6 +62,10 @@ const char *snes_host_lobby_resume_endpoint(void);
 
 int snes_host_lobby_in_lan(void);
 
+/* Surface a game-session failure when recomp-ui resumes the waiting room
+ * (prefer over inventing a second error channel in each title). */
+void snes_host_lobby_set_runtime_error(const char *error_code);
+
 #ifdef __cplusplus
 }
 #endif

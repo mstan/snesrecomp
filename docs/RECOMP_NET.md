@@ -257,6 +257,7 @@ tables or soft-return glue.
 |-----|------|
 | `snes_host_lobby_init` / `snes_host_lobby_callbacks` | MotK WS + LAN file-registry adapter for `RecompLauncherCGameInfo.netplay` |
 | `snes_host_lobby_prepare_rematch` / `snes_host_app_begin_soft_return` | Soft-return waiting-room prep |
+| `snes_host_lobby_set_runtime_error` | Waiting-room error string after a failed session |
 | `snes_host_app_apply_launch` | Map `RecompLauncherCNetplayLaunch` → `SnesNetplayConfig` |
 | `snes_host_ensure_sdl` / `snes_host_session_reset` | Rematch SDL + `RtlGameInfo.session_reset` |
 | `snes_netplay_soft_exit_to_lobby` | Escape / peer BYE → lobby |
@@ -283,7 +284,35 @@ snes_host_app_begin_soft_return(&gi, /*set_resume_room=*/1);
 /* recomp_launcher_run_window(...); then snes_host_app_apply_launch(...) */
 ```
 
-Reference consumer: MetalWarriorsSNESRecomp `src/main.c` (lobby table removed).
+Reference consumers:
+- MetalWarriorsSNESRecomp `src/main.c` (lobby table removed)
+- SuperMarioWorldRecomp Co-op `src/smw_netplay_lobby.c` (thin identity + AutoLaunch only)
+
+### Per-game patches that stay in the title (checklist)
+
+Bump snesrecomp + recomp-ui first. Then each netplay host still needs these
+**small** game-side pieces — document new items here rather than growing
+another lobby copy:
+
+| Patch | Where | Notes |
+|-------|--------|-------|
+| `snes_host_lobby_init` identity | Game once | `game_name`, `game_version`, LAN path, `default_lobby_name` |
+| `SnesHostLobbyOpts` | Game once | `auto_ready_guests` (SMW=1), `rematch_set_ready` (MW=1 / SMW=0), `fill_match_caps` |
+| `fill_match_caps` | Game | Widescreen / `ws_extra` / delay policy (MW `ws_extra=71`; SMW forces WS off) |
+| `gi.netplay = snes_host_lobby_callbacks()` | Launcher open + soft-return | Prefer engine table; thin wrappers OK |
+| Soft-return reopen | After match | `snes_host_app_begin_soft_return(&gi, 1)` then `recomp_launcher_run_window` |
+| Rematch `session_reboot` | Host loop | `snes_host_ensure_sdl()` + `snes_host_session_reset()` |
+| `RtlGameInfo.session_reset` | CPU infra / RTL | Clear sticky LLE / frame gates / rematch latches (`MwSessionReset`, `SmwSessionReset`) |
+| Pad sample + `RtlRunFrame` gate | Host loop | Keep game-owned; optional `snes_host_barrier_admit` |
+| Connect-timeout modal | Host loop | `SDL_ShowSimpleMessageBox` (or equivalent) — peer BYE stays silent soft-return |
+| Runtime error into waiting room | Optional | `snes_host_lobby_set_runtime_error` (SMW uses this) |
+| ROM keep vs reload | Host loop | Title policy (free/`kRom` rematch path, CRC/SHA checks) |
+| Offline Play after soft-return | Host loop | `LAUNCH && !net.enabled` → disconnect + `session_reboot` |
+| Game CMake feature flag | CMake | e.g. `SMW_COOP_BUILD`, `snesrecomp_enable_recomp_net` |
+| Self-test AutoLaunch | Optional | SMW-only headless MotK path; not required for shipping UI |
+
+Do **not** re-copy MotK create/join/`fill_launch` / LAN file-registry glue into
+games — that lives in `snes_host_lobby.c`.
 
 ## Layering policy (prefer engine / UI over game trees)
 
@@ -413,7 +442,7 @@ clear `g_netplay_pending`, and `goto session_reboot`. Do **not** treat
 
 | Title | Soft-return + rematch |
 |-------|------------------------|
-| MetalWarriorsSNESRecomp | `session_reboot` + `MwSessionReset` via `RtlGameInfo` |
-| SuperMarioWorldRecomp (`SMW_COOP_BUILD`) | same pattern + `SmwSessionReset` |
+| MetalWarriorsSNESRecomp | `snes_host_lobby_*` + `session_reboot` + `MwSessionReset` |
+| SuperMarioWorldRecomp (`SMW_COOP_BUILD`) | thin `smw_netplay_lobby.c` → same helpers + `SmwSessionReset` |
 
 Also see `docs/LAUNCHER_DESIGN.md` and recomp-ui `docs/HOST_NETPLAY.md`.
