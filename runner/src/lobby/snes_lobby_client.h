@@ -10,14 +10,24 @@ extern "C" {
 
 #define SNES_LOBBY_ID_LEN 40
 #define SNES_LOBBY_NAME_LEN 64
+#define SNES_LOBBY_VERSION_LEN 32
 #define SNES_LOBBY_ENDPOINT_LEN 64
 #define SNES_LOBBY_MAX_LIST 32
 #define SNES_LOBBY_MAX_MEMBERS 4
+
+#ifndef SNES_GAME_VERSION
+#ifdef SNESRECOMP_BUILD_VERSION
+#define SNES_GAME_VERSION SNESRECOMP_BUILD_VERSION
+#else
+#define SNES_GAME_VERSION "dev"
+#endif
+#endif
 
 typedef struct SnesLobbyRow {
     char     lobby_id[SNES_LOBBY_ID_LEN];
     char     name[SNES_LOBBY_NAME_LEN];
     char     game_name[SNES_LOBBY_NAME_LEN];
+    char     game_version[SNES_LOBBY_VERSION_LEN];
     int      player_count;
     int      max_slots;
     int      has_password;
@@ -72,17 +82,28 @@ const char *snes_lobby_player_id(void);
 /* Non-blocking pump — call every frame from the launcher. */
 void snes_lobby_pump(void);
 
+/*
+ * Title + release pin for create/join matching and list filters.
+ * Defaults: empty name filter, version SNES_GAME_VERSION.
+ * List: Release pins filter by exact game_version; "dev" lists all versions
+ * of the title (join still requires an exact version match).
+ */
+void snes_lobby_set_game_identity(const char *game_name, const char *game_version);
+const char *snes_lobby_game_version(void);
+
 void snes_lobby_request_list(void);
 int  snes_lobby_list_count(void);
 int  snes_lobby_list_get(int index, SnesLobbyRow *out);
 
 /*
  * Create lobby. host_bind e.g. "0.0.0.0:7777". password may be NULL/empty.
+ * game_version NULL/empty → identity / SNES_GAME_VERSION / "dev".
  * match_caps may be NULL (legacy); when non-NULL and valid, sent to the server
  * so guests join with the host's sim settings.
  * Returns 0 if request sent; poll snes_lobby_join_info() / in_lobby().
  */
 int  snes_lobby_create(const char *name, const char *game_name,
+                      const char *game_version,
                       const char *password, const char *host_bind,
                       const SnesLobbyMatchCaps *match_caps);
 

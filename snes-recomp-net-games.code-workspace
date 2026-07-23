@@ -15,5 +15,8 @@
     {
       "path": "../psxrecomp",
     },
+    {
+      "path": "../recomp-ui",
+    },
   ],
 }

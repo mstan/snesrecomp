@@ -882,7 +882,15 @@ void refresh_lobby_table(Model& m) {
         html += std::to_string(i);
         html += ")\">";
         html += "<span class=\"lobby-c-name\">" + rml_escape(row.name) + "</span>";
-        html += "<span class=\"lobby-c-game\">" + rml_escape(row.game_name) + "</span>";
+        {
+            std::string game_label = row.game_name;
+            if (row.game_version[0]) {
+                game_label += " (";
+                game_label += row.game_version;
+                game_label += ")";
+            }
+            html += "<span class=\"lobby-c-game\">" + rml_escape(game_label) + "</span>";
+        }
         html += "<span class=\"lobby-c-players\">";
         html += players;
         html += "</span><span class=\"lobby-c-lock\">";
@@ -1388,6 +1396,7 @@ Result run(SDL_Window* window, void* /*gl_context*/,
     });
     auto enter_lobby_browser = [&]() {
         m.view = "netplay_lobbies";
+        snes_lobby_set_game_identity(game_name_s.c_str(), SNES_GAME_VERSION);
         if (!snes_lobby_connected()) {
             snes_lobby_set_display_name(m.host_display_name.c_str());
             if (snes_lobby_connect(snes_lobby_default_url()) != 0) {
@@ -1517,7 +1526,9 @@ Result run(SDL_Window* window, void* /*gl_context*/,
         io.widescreen_hud = m.widescreen_hud;
         io.ignore_aspect = m.aspect;
         SnesLobbyMatchCaps caps = match_caps_from_settings(io, caps_force_ws);
+        snes_lobby_set_game_identity(game_name_s.c_str(), SNES_GAME_VERSION);
         snes_lobby_create(m.host_lobby_name.c_str(), game_name_s.c_str(),
+                          SNES_GAME_VERSION,
                           m.host_lobby_password.c_str(), "0.0.0.0:7777",
                           &caps);
         dirty_all();

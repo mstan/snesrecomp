@@ -113,8 +113,28 @@ Rules that matter for SNES recomp hosts:
   scaled to the full window. Sim still renders the full split — present-only,
   so determinism is unchanged. Opt out with `SNESRECOMP_MW_H2H_LOCAL_VIEW=0`.
 - Metal Warriors H2H present: full-frame local defaults **ON** for netplay.
-  Offline uses native dual split (no local-full present). Opt out:
-  `SNESRECOMP_MW_H2H_FULL_FRAME=0` (legacy half-crop).
+  Offline uses native dual split (no local-full present). OAM `+$78` /
+  vert-widen defaults **ON** for netplay (`SNESRECOMP_MW_H2H_VERT_WIDEN=0`
+  to opt out); active-list Y `#$A8`→`#$E0` so tall sprites slide off instead
+  of popping when the anchor crosses 168. Spawn-Y widen stays opt-in
+  (`SNESRECOMP_MW_H2H_SPAWN_Y_WIDEN=1`). Both hard-off offline. BG2 stripe
+  row widen (default 12 / `SNESRECOMP_MW_BG2_ROWS`) is **netplay or
+  widescreen-expand only** — offline dual keeps native 8 rows so the HDMA
+  center seam HUD (direction arrows) is not stomped. Keep
+  `OAM_CULL` on (disabling corrupts isolated 1P/2P views). End-match results
+  OAM is owned by **OBJ priority 3** (`a34`/`a35` in dumps): when ≥8 such
+  sprites exist across cam buffers, present groups each cam's UI and pins by
+  mean-X (native left/wins → top, right/menu → bottom; no gameplay `y_shift`,
+  never cam-delta reproject). Glyph X-span split is wrong here — both
+  clusters are center-stacked. Mutual raw-XY is **not** used. Opt out
+  full-frame: `SNESRECOMP_MW_H2H_FULL_FRAME=0`.
+- Elevator / platform probe: `SNESRECOMP_MW_ELEV=1` logs `[mw_elev]` — walks
+  the `$1E14` object list (flags/X/heuristic Y + 0x20 raw bytes) plus BG1 `$7F`
+  tile-patch counters, BG2 ROM-idle mask, and OAM occupancy. Flags `vw` /
+  `syw` show OAM vert-widen vs spawn-Y widen. Elevator fingerprint:
+  `+$08=$D5B8`, family `+$0A=$00B1`.
+- End-match / results OAM probe: `SNESRECOMP_MW_RESULTS=1` logs `[mw_results]`
+  (~2 Hz, dual only). Adds `ui_prio3` count alongside mutual/reproject stats.
 - Metal Warriors netplay H2H Phase 2a (shared horizontal widescreen): netplay
   sessions **force** `g_ws_extra = 71` on every peer. Offline hard-disables
   widescreen for traditional split-screen local multiplayer. Lobby
@@ -127,24 +147,60 @@ Rules that matter for SNES recomp hosts:
   that, rematch resumes a stale WAI on a wiped chip (`nmiEn=0`, blank).
   Autosave load/save is skipped around lobby rematch so peers cold-boot alike.
 - Metal Warriors H2H Phase 2b (full-frame local): default ON for present.
-  - **Present:** rebuild BG1/BG2 strips from `$7F` for the **local** camera
-    into VRAM (save/restore so sim stays dual-deterministic). Present
-    scrolls are forced to that camera (P1: `$1E16`/`$1E18`; P2: `$1E1A`/
-    `$1E1C`).     Stable half→full Y: OAM=BG `base+8`; present undoes unified emit
-    `+$78` on both slots (P2 ROM `ADC`; P1 STA hook) so high tiles stay in
-    unsigned OAM Y.     Dual HDMA skipped. BG2 `$7F` rebuild only when streaming;
-    narrow idle BG2 (elevators) uses the 1P `retainHistory` + west-ROM path and
-    tracks the local camera when dual BG2 WRAM mirrors are `$0`.
-    OAM: **vert-widen** ROM-pokes drawer Y `CMP` (`#$68`/`#$70`→`#$E0`,
-    `#$FFF1`→`#$FF70`); active-list `#$A8` stays native (widening it listed
-    same-floor far objects into cam1 and sliced P1). Present uses the local
-    cam-capture buffer plus a **reprojected** pass of the other cam's
-    buffer (fixes small props dropped when dual P1-half fills OAM before
-    the P2-half emit).
-    Dual tile×2 staging wrap at `CPX #$0200` (`SNESRECOMP_MW_H2H_OAM_WRAP=0`
-    disables).
-    Needs `kInterpPreOpcodeHookSlots` ≥ ~130 (runner default 192).
-    `SNESRECOMP_MW_H2H_VERT_WIDEN=0` disables.
+  - **Present:** rebuild BG1 strips from `$7F` for the **local** camera into
+    VRAM (save/restore so sim stays dual-deterministic). Present scrolls are
+    forced to that camera (P1: `$1E16`/`$1E18`; P2: `$1E1A`/`$1E1C`). Stable
+    half→full Y: OAM=BG `base+8`; present undoes unified emit `+$78`. Dual HDMA
+    skipped. BG1 rebuild keys `$7F` from `$7E:42B3` at the **local** present
+    cam (not dual sticky/`$1E36`, which is one shared P1-oriented strip and
+    pinned both peers' floors to P1 with violent shake). Sticky/live is
+    fallback only when 42B3 is unset. Opt out with
+    `SNESRECOMP_MW_H2H_BG1_REBUILD=0` (regressive). BG2 `$7F` rebuild only when
+    streaming; narrow idle BG2 (elevators) uses the 1P `retainHistory` +
+    west-ROM path and tracks the local camera when dual BG2 WRAM mirrors are
+    `$0`.
+    OAM **vert-widen** (default ON; `VERT_WIDEN=0` opts out): ROM-pokes
+    drawer Y `CMP` (`#$68`/`#$70`→`#$E0`, `#$FFF1`→`#$FF70`), active-list
+    `#$A8`→`#$E0`, + staging `+$78` bias / cam-capture. Stage-prop anchors
+    at sy≈225 are forced onto the list via pre-CMP hooks at `$809280`/
+    `$8092A0` (prop-only — global `#$0100`/`#$0140` leaked P2-floor into
+    cam0). Present uses local cam-capture + reprojected other-cam buffer
+    (half-cull only when vert-widen is off). Capture buffer tag follows
+    drawer `ADC $86/$88` (cam0) vs `ADC $8A/$8C` (cam1). Family-`$00B1`
+    **mover** metas only (`$C382`/`$C39E`/`$C6A4`/`$C400`/`$C5F2`/
+    `$C3EC`/`$C3C4` — not every `$00B1`≠`$D5B8`; pickups like `$9FE2`
+    stay shared and are **mirrored into both cam-capture buffers** at
+    commit so dual-drawer OAM pressure cannot leave a half-culled
+    sprite): latch at `STA $86` /
+    dual `$8087xx`; `$80882F` (pre-`TAX`) reinforces only (never clears).
+    Commit recovers list object via `$96`→`$136E,Y` when tile emit
+    clobbered X. Cam rebucket / hi-byte owner force **converts** `sx/sy`
+    (`sy' = sy + oldCamY − newCamY`). World Y = `dest_cam+sy'` (not
+    `+$04`). Object `+$06` dual-slot is **hi-byte only** (`$01xx`→P1,
+    `$02xx`→P2); low-byte `$0002/$0004/$0006/$0008` on `$C382` are not
+    owners. Home = hi-byte `+$06`, else nearer dual-slot mech each frame
+    (4× hysteresis when both mechs exist). Unassigned (−1) until a mech
+    exists. Present OAM: home peer only; X = live ± commit meta. Y =
+    live+`y_shift` only (BG1-aligned — never drop `y_shift`). With
+    vert-widen ON, half→full `y_bg`/`y_oam` is **0** (VW already fills
+    ~224 vs `cam_raw`); a +64 recenter parked dual-bottom movers at
+    `ny≥224` (brown off-strip, stripe skip_y or ~64px sky gap). Sticky
+    last tile covers capture misses (sticky may default `meta_oy=−10`
+    when convert miss; present does **not** force `moy==0→−10`). No
+    `$7F` tile-grid OAM snap. Non-home movers blanked from local BG1 at
+    live + previous trail after rebuild and again after margin prefill.
+    Full-frame BG1 never falls back to `$1E36`. `$C382` = 1 OAM tile +
+    BG1 body. Do **not** XY-cull gameplay/reproject near `$00B1` props
+    (mechs on `$C6A4`/`$C382` vanished; A/B `OAM_CULL=0`). Commit
+    recovers movers by `$82` meta match only (no loose screen-XY
+    rebind). `SNESRECOMP_MW_ELEV=1`: `prop_lo`/`cap`, `bg_dy`, `skip_y`.
+    Present-only; no sim bbox / `$7F` gate. Dual staging wrap at
+    `CPX #$0200` needs vert-widen (`SNESRECOMP_MW_H2H_OAM_WRAP=0`
+    disables). **Spawn-Y widen**
+    (opt-in `SPAWN_Y_WIDEN=1`): `$82F709`/`$82F721`/`$82F733` top window +
+    `$8283AC` radius +160. Default **OFF** — playtest regressed object
+    lifetime and did not spawn `$D5B8` elevators. Needs
+    `kInterpPreOpcodeHookSlots` ≥ ~160 (runner default 192).
     `SNESRECOMP_MW_H2H_OAM_CULL=0` disables capture present/cull. Guest 1P
     object drawer remains opt-in only (`SNESRECOMP_MW_H2H_OBJ_OAM=1`).
   - **Sim taller HDMA/stripe** (`SNESRECOMP_MW_H2H_TALLER=1`) default
@@ -171,11 +227,11 @@ Low-level API: `lib/recomp-net/docs/host_integration.md`.
 
 ## What snesrecomp does vs. what the game does
 
-| Layer | Responsibility |
-|-------|----------------|
-| snesrecomp (`lib/recomp-net`, `snes_netplay`, lobby client) | Vendors netcode, pad/admit facade, MotK WS + ICE signal relay |
-| Game runtime | Launcher handoff → `snes_netplay_start`, gate `RtlRunFrame`, sample local pads |
-| [recomp-net-server](https://github.com/TechnicallyComputers/recomp-net-server) | Lobby membership, launch, ICE signal relay |
+| Layer                                                                          | Responsibility                                                                 |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| snesrecomp (`lib/recomp-net`, `snes_netplay`, lobby client)                    | Vendors netcode, pad/admit facade, MotK WS + ICE signal relay                  |
+| Game runtime                                                                   | Launcher handoff → `snes_netplay_start`, gate `RtlRunFrame`, sample local pads |
+| [recomp-net-server](https://github.com/TechnicallyComputers/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
 
 ## Windows MSBuild / `lib/` superbuild
 
