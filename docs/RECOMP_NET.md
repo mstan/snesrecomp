@@ -247,12 +247,42 @@ if (!snes_lobby_try_fill_launch(&join)) return 0;
 /* copy join.bind_hostport / peer_hostport / session_id / local_slot → out */
 ```
 
+## Layering policy (prefer engine / UI over game trees)
+
+**Default:** put networking optimizations and launcher/netplay UX fixes in
+**snesrecomp** (`snes_netplay_*`, `snes_lobby_*`, `snes_host_*`) or
+**[recomp-ui](https://github.com/mstan/recomp-ui)** (presentation, UDP port
+prep, waiting-room flow) — **not** as one-off patches in each game’s
+`main.c` / RTL. New titles then inherit the fix when they bump submodules.
+
+**Game trees stay thin:** wire callbacks, sample pads, gate `RtlRunFrame`, and
+register per-title hooks. Avoid copying soft-return / SDL rematch / guest-bind
+logic between Metal Warriors, SMW Co-op, etc.
+
+**Per-title behavior** uses existing snesrecomp extension points — do **not**
+fork the shared helpers for one ROM:
+
+| Mechanism | Use for |
+|-----------|---------|
+| `RtlGameInfo.session_reset` | Sticky LLE / frame gates / widescreen latches cleared on rematch (`MwSessionReset`, `SmwSessionReset`) |
+| `RtlGameInfo.state_*_extra` / `on_state_loaded` | Savestate LLE chunks and post-load reconcile |
+| `RtlGameInfo.title` + env / match_caps | Title-keyed policy already in lobby / host facades |
+| Game `CMakeLists` flags (e.g. `SMW_COOP_BUILD`) | Optional features that change which host binary links netplay |
+
+If a change is truly ROM-specific but still belongs in the engine (shared
+runner path), gate it on `g_rtl_game_info->title` or a small `RtlGameInfo`
+callback — same pattern as savestate extras — so it stays locked to that
+title without living in the game repo.
+
+recomp-ui policy mirror: `docs/HOST_NETPLAY.md` → “Where to put fixes”.
+
 ## What snesrecomp does vs. what the game does
 
 | Layer                                                                          | Responsibility                                                                 |
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| snesrecomp (`lib/recomp-net`, `snes_netplay`, lobby client)                    | Vendors netcode, pad/admit facade, MotK WS + ICE signal relay; guest bind normalize (fallback) + `try_fill_launch` |
-| Game runtime                                                                   | Launcher callbacks → `snes_netplay_start`, gate `RtlRunFrame`, sample local pads |
+| snesrecomp (`lib/recomp-net`, `snes_netplay`, `snes_host_session`, lobby)     | Vendors netcode, pad/admit facade, MotK WS + ICE; guest bind normalize; `try_fill_launch`; rematch SDL ensure + soft-exit + `session_reset` dispatch |
+| [recomp-ui](https://github.com/mstan/recomp-ui)                                | Waiting-room UI, UDP create/join port prep (`guest_bind`), resume-room flags   |
+| Game runtime                                                                   | Thin callbacks → helpers above; `RtlGameInfo` hooks; pad sample / `RtlRunFrame` |
 | [recomp-net-server](https://github.com/TechnicallyComputers/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
 
 ## Windows MSBuild / `lib/` superbuild
@@ -273,9 +303,9 @@ themselves (same pattern as other optional runner libs).
 ## Soft-return rematch checklist (game hosts)
 
 Titles that soft-return to recomp-ui after a match (Escape / window close /
-peer leave) and then **Play** again share one process. The pitfalls below
-showed up in Super Mario World Co-op and Metal Warriors — bake them into every
-new netplay host.
+peer leave) and then **Play** again share one process. Prefer the **shared
+helpers** below; only title sticky state stays in the game via
+`RtlGameInfo.session_reset`.
 
 ### 1. `join()` ABI — pass UI `guest_bind`
 
@@ -290,75 +320,62 @@ recomp-ui fills `guest_bind` (prefer `7778`..) before calling. Online hosts
 that as a safety net, but the UI bind is the contract. LAN file-registry joins
 may ignore `guest_bind`.
 
+Member rows: use `snes_lobby_member_is_host(&member)` (not `slot == 0`).
+
 ### 2. Peer disconnect → soft lobby return, no modal
 
-When `snes_netplay_peer_disconnected()` trips because the other player quit
-(or the link dropped mid-match):
-
-- Call the same soft-exit path as local Escape / `SDL_QUIT`
-  (`snes_netplay_shutdown` + `snes_netplay_request_return_to_lobby()`).
-- Do **not** show `SDL_ShowSimpleMessageBox` / zenity for that case — the
-  remaining peer should land back in the waiting room automatically.
-- Keep modals for **connect timeouts** (firewall / ICE hints are useful).
-
-Symptom if wrong: dialog *"The other player stopped responding"* then a
-manual OK before lobby resume.
-
-### 3. Re-init SDL after soft-return rematch
-
-recomp-ui's `launcher_platform_close()` calls **`SDL_Quit()`** (see
-[recomp-ui](https://github.com/mstan/recomp-ui) `launcher_platform_sdl2.c` /
-`sdl3.c`). That tears down video **and** audio.
-
-If the game's `session_reboot:` label sits *after* the one-time boot
-`SDL_Init`, a rematch `goto session_reboot` will create a window but fail
-audio with:
-
-```text
-Audio subsystem is not initialized
-Failed to open audio device
+```c
+snes_netplay_soft_exit_to_lobby("peer_disconnect", /*from_lobby=*/1);
 ```
 
-At the top of `session_reboot` (before creating the window / opening audio):
+Same path as Escape / `SDL_QUIT`. Do **not** show
+`SDL_ShowSimpleMessageBox` for mid-match peer loss. Keep modals for
+**connect timeouts** (firewall / ICE hints).
+
+### 3. Re-init SDL + session_reset on rematch
+
+recomp-ui's `launcher_platform_close()` calls **`SDL_Quit()`**. At
+`session_reboot:` (before window / audio):
 
 ```c
-if (!SDL_WasInit(SDL_INIT_VIDEO) || !SDL_WasInit(SDL_INIT_AUDIO) ||
-    !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0)
-    return 1;
-}
+if (snes_host_ensure_sdl() != 0)
+  return 1;
+snes_host_session_reset(); /* → RtlGameInfo.session_reset if set */
 ```
+
+Register the title hook once:
+
+```c
+const RtlGameInfo kGameInfo = {
+  /* ... */
+  .session_reset = &MyGameSessionReset, /* clears LLE / g_did_reset / etc. */
+};
+```
+
+Symptom without SDL ensure: `Audio subsystem is not initialized`.
 
 ### 4. Cold-boot the emulation session on rematch
 
 Soft-return keeps lobby WebSocket state; the **emulation** session must still
 be a cold boot on both peers:
 
-- Free / recreate `Snes`, clear game-local sticky latches (e.g. LLE resume PC).
+- Free / recreate `Snes`; sticky clears live in `session_reset` (above).
 - Skip autosave load/save around rematch so peers do not diverge.
-- Re-arm netplay from the new `RecompLauncherCNetplayLaunch` (bind/peer/
-  session_id/slot) before `snes_netplay_start`.
-
-Metal Warriors: `MwSessionReset()` before `SnesInit`. SMW Co-op:
-`SmwSessionReset()` before `SnesInit` (clears `g_did_reset` /
-`g_first_frame_done` so rematch re-runs `I_RESET`), plus zero pad/turbo/
-netplay-started flags at `session_reboot` and reload the ROM buffer if freed.
+- Re-arm netplay from the new `RecompLauncherCNetplayLaunch` before
+  `snes_netplay_start`.
 
 ### 5. Offline Play after soft-return must `session_reboot`
 
 The post-match `recomp_launcher_run_window` can return **LAUNCH** with
-`netplay_launch.enabled == 0` (user left the room / hit Play offline). That
-is still a launch — disconnect the lobby, clear `g_netplay_pending`, and
-`goto session_reboot`. Do **not** treat “LAUNCH && !net.enabled” as quit.
-
-Symptom if wrong: log `lobby closed after match; exiting` immediately after
-choosing offline Play.
+`netplay_launch.enabled == 0`. That is still a launch — disconnect the lobby,
+clear `g_netplay_pending`, and `goto session_reboot`. Do **not** treat
+“LAUNCH && !net.enabled” as quit.
 
 ### Reference hosts
 
 | Title | Soft-return + rematch |
 |-------|------------------------|
-| MetalWarriorsSNESRecomp | `src/main.c` `session_reboot` + lobby resume |
-| SuperMarioWorldRecomp (`SMW_BUILD_COOP`) | `src/main.c` + `smw_netplay_lobby.c` |
+| MetalWarriorsSNESRecomp | `session_reboot` + `MwSessionReset` via `RtlGameInfo` |
+| SuperMarioWorldRecomp (`SMW_COOP_BUILD`) | same pattern + `SmwSessionReset` |
 
 Also see `docs/LAUNCHER_DESIGN.md` and recomp-ui `docs/HOST_NETPLAY.md`.

@@ -73,6 +73,7 @@ function(snesrecomp_enable_recomp_net target)
     if(NOT SNESRECOMP_ENABLE_NET)
         target_sources(${target} PRIVATE
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_session.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_lobby_client.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_ws.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_sha1.c")
@@ -94,6 +95,7 @@ if(SNESRECOMP_ENABLE_NET)
     _snesrecomp_add_recomp_net()
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c"
+        "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_host_session.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_lobby_client.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_ws.c"
         "${SNESRECOMP_RUNNER_ROOT}/src/lobby/ws/rnet_sha1.c")

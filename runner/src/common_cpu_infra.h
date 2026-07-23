@@ -91,6 +91,11 @@ typedef struct RtlGameInfo {
   void (*state_save_extra)(struct SaveLoadInfo *sli);
   void (*state_load_extra)(struct SaveLoadInfo *sli, uint32_t version);
   void (*on_state_loaded)(uint32_t version);
+  /* Optional soft-return rematch hook — NULL-safe. Called from
+   * snes_host_session_reset() before SnesInit on lobby rematch so
+   * process-lifetime LLE / frame gates do not survive snes_free.
+   * Per-title sticky state belongs here (not scattered in main.c). */
+  void (*session_reset)(void);
 } RtlGameInfo;
 
 extern const RtlGameInfo *g_rtl_game_info;

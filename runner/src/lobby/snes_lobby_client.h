@@ -134,6 +134,10 @@ int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *caps);
 int  snes_lobby_member_count(void);
 int  snes_lobby_member_get(int index, SnesLobbyMember *out);
 
+/* True when member.player_id matches snes_lobby_host_player_id().
+ * Prefer this over `slot == 0` — seats can move. */
+int  snes_lobby_member_is_host(const SnesLobbyMember *member);
+
 /* Local ready flag (from last lobby_update matching our player_id). */
 int  snes_lobby_local_ready(void);
 /* True when every seated player is ready and player_count >= 2. */

@@ -50,6 +50,11 @@ const SnesLobbyMatchCaps *snes_lobby_match_caps(void)
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
 int  snes_lobby_member_get(int index, SnesLobbyMember *out) { (void)index; (void)out; return 0; }
+int  snes_lobby_member_is_host(const SnesLobbyMember *member)
+{
+    (void)member;
+    return 0;
+}
 int  snes_lobby_local_ready(void) { return 0; }
 int  snes_lobby_all_ready(void) { return 0; }
 int  snes_lobby_set_ready(int ready) { (void)ready; return -1; }
@@ -1300,6 +1305,15 @@ int snes_lobby_member_get(int index, SnesLobbyMember *out)
     }
     *out = g_lc.members[index];
     return 1;
+}
+
+int snes_lobby_member_is_host(const SnesLobbyMember *member)
+{
+    const char *host_id;
+    if (!member || !member->player_id[0])
+        return 0;
+    host_id = snes_lobby_host_player_id();
+    return host_id && host_id[0] && strcmp(member->player_id, host_id) == 0;
 }
 
 int snes_lobby_local_ready(void)
