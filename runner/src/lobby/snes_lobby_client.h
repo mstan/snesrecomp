@@ -102,6 +102,9 @@ int  snes_lobby_create(const char *name, const char *game_name,
                       const char *host_bind,
                       const SnesLobbyMatchCaps *match_caps);
 
+/* Join lobby. guest_bind may be NULL/empty/"host:0" — the client always
+ * advertises a concrete UDP bind (prefers 7778..) so server-hosted launches
+ * never hand the host peer_ip:0 (rnet_session_start_lan rejects port 0). */
 int  snes_lobby_join(const char *lobby_id, const char *password,
                     const char *guest_bind);
 
@@ -146,6 +149,11 @@ int  snes_lobby_request_start(const SnesLobbyMatchCaps *match_caps);
 int  snes_lobby_launch_pending(void);
 void snes_lobby_clear_launch_pending(void);
 void snes_lobby_clear_last_error(void);
+
+/* After op:launch: copy seating endpoints into *out when launch_pending and
+ * bind/peer are usable. Returns 1 if filled. Does not clear launch_pending.
+ * Games wire this from RecompLauncherCNetplayCallbacks.fill_launch. */
+int  snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out);
 
 /*
  * ICE signaling relay (MotK WS op:signal). text is SDP/candidate (max 2047).
