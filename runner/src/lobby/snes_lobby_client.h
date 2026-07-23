@@ -16,7 +16,11 @@ extern "C" {
 #define SNES_LOBBY_MAX_MEMBERS 4
 
 #ifndef SNES_GAME_VERSION
+#ifdef SNESRECOMP_BUILD_VERSION
+#define SNES_GAME_VERSION SNESRECOMP_BUILD_VERSION
+#else
 #define SNES_GAME_VERSION "dev"
+#endif
 #endif
 
 typedef struct SnesLobbyRow {
@@ -102,6 +106,9 @@ int  snes_lobby_join(const char *lobby_id, const char *password,
                     const char *guest_bind);
 
 int  snes_lobby_leave(void);
+
+/* Host: remove the player seated in `slot` (not the host). Returns 0 if sent. */
+int  snes_lobby_kick(int slot);
 
 int  snes_lobby_in_lobby(void);
 int  snes_lobby_is_host(void);
