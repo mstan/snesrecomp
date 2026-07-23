@@ -1421,7 +1421,11 @@ pub fn decode_function(
                     insn.dispatch_popped_call_frame = auth.popped_call_frame;
                     if auth.ptr_call {
                         insn.dispatch_consumed_stack_bytes = auth.frame_size.unwrap_or_else(|| {
-                            if is_long_dispatch(&insn, &auth.table_bases) { 3 } else { 2 }
+                            if is_long_dispatch(&insn, &auth.table_bases) {
+                                3
+                            } else {
+                                2
+                            }
                         });
                     }
                     if inline_loop_sites.contains(&pc) {

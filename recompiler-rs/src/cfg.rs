@@ -427,9 +427,7 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                             format!("{path}: indirect_dispatch frame: bad size {raw:?}")
                         })?;
                         if size != 2 && size != 3 {
-                            return Err(format!(
-                                "{path}: indirect_dispatch frame: must be 2 or 3"
-                            ));
+                            return Err(format!("{path}: indirect_dispatch frame: must be 2 or 3"));
                         }
                         frame_size = Some(size as u8);
                     } else {
