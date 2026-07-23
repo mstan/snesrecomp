@@ -101,3 +101,7 @@ set(SNESRECOMP_RUNNER_INCLUDE_DIRS
 # Does nothing unless SNESRECOMP_ENABLE_NET=ON or the game calls
 # snesrecomp_enable_recomp_net(<target>).
 include(${SNESRECOMP_RUNNER_ROOT}/recomp_net.cmake)
+
+# Dear ImGui pre-boot launcher is NOT vendored here. Games that need it add
+# mstan/recomp-ui as a repo-root submodule and call recomp_target_launcher_ui()
+# themselves (see docs/LAUNCHER_DESIGN.md).

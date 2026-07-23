@@ -58,6 +58,14 @@ void snes_free(Snes* snes) {
   free(snes);
 }
 
+/* RTLS v5 and earlier serialized beamMasterLast between vPos and
+ * apuCatchupCycles (+8 bytes). v6+ keeps it host-only (before hPos). */
+static uint32_t s_saveload_version = 6;
+
+void snes_saveload_set_version(uint32_t version) {
+  s_saveload_version = version ? version : 6;
+}
+
 void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   cpu_saveload(snes->cpu, sli);
   apu_saveload(snes->apu, sli);
@@ -65,7 +73,25 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   ppu_saveload(snes->ppu, sli);
   cart_saveload(snes->cart, sli);
 
-  sli->func(sli, &snes->hPos, sizeof(*snes) - offsetof(Snes, hPos));
+  if (s_saveload_version <= 5) {
+    /* Old layout: [hPos..vPos][pad][beamMasterLast][apuCatchup..divideResult].
+     * Read/write the legacy 48-byte tail and map into the current struct.
+     * Legacy size: 4 (hPos/vPos) + 4 pad + 8 beam + rest(=32) = 48. */
+    enum { kLegacySnesTail = 48 };
+    uint8_t blob[kLegacySnesTail];
+    const size_t new_tail = sizeof(*snes) - offsetof(Snes, hPos);
+    const size_t head = offsetof(Snes, apuCatchupCycles) - offsetof(Snes, hPos);
+    const size_t rest = new_tail - head; /* apuCatchupCycles .. end */
+    assert(new_tail == 40 && head == 8 && rest == 32);
+    memset(blob, 0, sizeof(blob));
+    memcpy(blob, &snes->hPos, 4);
+    memcpy(blob + 16, &snes->apuCatchupCycles, rest);
+    sli->func(sli, blob, kLegacySnesTail);
+    memcpy(&snes->hPos, blob, 4);
+    memcpy(&snes->apuCatchupCycles, blob + 16, rest);
+  } else {
+    sli->func(sli, &snes->hPos, sizeof(*snes) - offsetof(Snes, hPos));
+  }
   sli->func(sli, snes->ram, 0x20000);
   sli->func(sli, &snes->ramAdr, 4);
 

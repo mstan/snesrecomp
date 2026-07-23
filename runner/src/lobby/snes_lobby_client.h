@@ -145,6 +145,7 @@ int  snes_lobby_request_start(const SnesLobbyMatchCaps *match_caps);
  */
 int  snes_lobby_launch_pending(void);
 void snes_lobby_clear_launch_pending(void);
+void snes_lobby_clear_last_error(void);
 
 /*
  * ICE signaling relay (MotK WS op:signal). text is SDP/candidate (max 2047).

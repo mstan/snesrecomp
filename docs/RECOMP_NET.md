@@ -246,4 +246,4 @@ cmake --build lib/_build --target recomp_net
 
 Hand-maintained `.vcxproj` games must add the include path
 `snesrecomp/lib/recomp-net/include` and link the resulting static library
-themselves (same pattern as RmlUi/FreeType).
+themselves (same pattern as other optional runner libs).
