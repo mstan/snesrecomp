@@ -517,9 +517,15 @@ void snes_netplay_shutdown(void)
         g_np.session = NULL;
     }
     if (g_np.guest_sandbox) {
-        /* Flush session mirror into sandbox, then restore personal SRAM in RAM. */
+        /* Flush host-synced mirror into the sandbox only. Then switch back to
+         * personal saves/ and restore offline SRAM into RAM. RtlReadSram is a
+         * no-op when saves/save.srm is missing — without clearing first, host
+         * bytes would remain in g_sram and the game's post-shutdown
+         * RtlWriteSram() would leak them into personal storage. */
         RtlWriteSram();
         RtlSetSaveRoot(NULL);
+        if (g_sram && g_sram_size > 0)
+            memset(g_sram, 0, (size_t)g_sram_size);
         RtlReadSram();
         fprintf(stderr, "snes_netplay: guest restored personal save root -> %s\n",
                 RtlSaveRoot());
