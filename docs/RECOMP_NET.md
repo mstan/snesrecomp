@@ -231,7 +231,10 @@ Rules that matter for SNES recomp hosts:
     guest catches up; save does not stall the sim.
   - **Guest** redirects `RtlSaveRoot()` to `saves/netplay/` so host-driven
     mirrors never overwrite personal `saves/save.srm` / `saveN.sav`. On
-    session end the sandbox is flushed and the personal root is restored.
+    session end the sandbox is flushed, `g_sram` is cleared, then personal
+    SRAM is re-read (missing file → blank cart RAM). That prevents a later
+    `RtlWriteSram()` under `saves/` from leaking host progress into offline
+    storage when the guest had no prior save file.
   - On match start the host syncs live battery SRAM so both peers share the
     same cart RAM for the session.
 
