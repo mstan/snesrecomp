@@ -29,8 +29,10 @@ and supplies game facts through `RecompLauncherCGameInfo` /
 `launcher_profile_apply("snes", ...)`. See MetalWarriorsSNESRecomp for a
 complete host.
 
-Online lobby handoff: `snes_lobby_join(..., NULL)` (engine picks a free guest
-UDP port) and `snes_lobby_try_fill_launch()` from `fill_launch`. See
+Online lobby handoff: recomp-ui prepares `guest_bind` (prefer UDP 7778) before
+`join()`; the host passes it through to `snes_lobby_join(..., guest_bind)`
+(engine still normalizes NULL/empty as a fallback) and
+`snes_lobby_try_fill_launch()` from `fill_launch`. See
 `docs/RECOMP_NET.md` → "Lobby join / launch handoff".
 
 ## What stayed in snesrecomp
