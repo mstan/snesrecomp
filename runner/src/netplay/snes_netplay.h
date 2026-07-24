@@ -65,6 +65,8 @@ int  snes_netplay_active(void);
 int  snes_netplay_is_running(void);
 /* "ice", "lan", or "none"; useful for user-facing connection diagnostics. */
 const char *snes_netplay_transport_name(void);
+/* 1 when ICE transport reached FAILED (STUN/TURN path dead). */
+int  snes_netplay_ice_failed(void);
 int  snes_netplay_local_slot(void);
 /* Resolved host device index (0/1) used for local capture. */
 int  snes_netplay_input_player(void);

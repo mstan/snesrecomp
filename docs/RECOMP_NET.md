@@ -91,16 +91,34 @@ for (;;) {
 Transport selection (`cfg.transport` / `SNES_NET_TRANSPORT`):
 
 - **LAN** — `rnet_session_start_lan` (LAN file-registry / `SNES_NET_TRANSPORT=lan`).
-- **ICE** — `rnet_session_start_ice` + MotK lobby `op:signal` relay
+- **ICE** — `rnet_session_start_ice` + WS lobby `op:signal` relay
   (`snes_lobby_send_signal` / `snes_lobby_poll_signal`). Requires
   `SNESRECOMP_NET_ICE=ON` and a live lobby WebSocket (launcher keeps it across
   Launch).
 
-**Auto policy:** a seated MotK hosted room **always** uses ICE — even when
-MotK rewrites `0.0.0.0` binds to a private TCP peer IP. That rewrite is often
-wrong on hairpinned LAN paths (e.g. router `.1` instead of the peer NIC) and
-must not demote hosted play to direct UDP. Pure LAN file-registry (no MotK
+**Auto policy:** a seated online WS lobby room **always** uses ICE — even when
+the lobby rewrites `0.0.0.0` binds to a private TCP peer IP. That rewrite is
+often wrong on hairpinned LAN paths (e.g. router `.1` instead of the peer NIC)
+and must not demote hosted play to direct UDP. Pure LAN file-registry (no WS
 seat) stays on LAN.
+
+**STUN / TURN:** `snes_netplay_start` fills `RNetIceConfig` before gather:
+
+1. Defaults: Google STUN (`stun.l.google.com:19302`).
+2. WS lobby mint: after connect, client sends `get_turn_credentials`; server
+   replies with Coturn STUN/TURN hosts + time-limited user/pass (see
+   recomp-net-server `docs/WS_LOBBY.md` / `docs/COTURN.md`). Prefer Coturn
+   STUN when present.
+3. Env overrides: `SNES_NET_TURN_HOST` / `SNES_NET_TURN_USER` /
+   `SNES_NET_TURN_PASS` (optional `SNES_NET_TURN_PORT`, `SNES_NET_STUN_HOST`,
+   `SNES_NET_STUN_PORT`).
+4. If no TURN: log **STUN-only** and continue (remote NAT may hang after a few
+   frames).
+
+ICE still ranks **host > srflx > relay** — TURN is configured up front so
+libjuice can fall back to relay when hole punch is unstable (cannot add TURN
+after gather starts). Logs include selected candidates/addresses when ICE
+connects, and a concrete local IPv4 bind when `rnet_ipv4_enumerate` finds one.
 
 **libjuice bundling:** with `SNESRECOMP_NET_ICE=ON`, recomp-net defaults to
 `RNET_ICE_BUNDLE_STATIC=ON` (FetchContent static juice linked into

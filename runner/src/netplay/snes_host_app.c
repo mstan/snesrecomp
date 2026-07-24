@@ -93,6 +93,7 @@ int snes_host_barrier_admit(int from_lobby, int *running,
 {
   static int desync_logged;
   static int wait_logged;
+  static int ice_fail_logged;
   uint32_t peer_ms;
   uint32_t connect_ms;
 
@@ -113,6 +114,7 @@ int snes_host_barrier_admit(int from_lobby, int *running,
     if (snes_netplay_peer_disconnected(peer_ms)) {
       barrier_soft_exit(from_lobby, running, "peer_disconnect", &desync_logged,
                         &wait_logged);
+      ice_fail_logged = 0;
       return 0;
     }
 
@@ -123,15 +125,23 @@ int snes_host_barrier_admit(int from_lobby, int *running,
                 snes_netplay_transport_name(), (unsigned)connect_ms);
         wait_logged = 1;
       }
+      if (snes_netplay_ice_failed() && !ice_fail_logged) {
+        fprintf(stderr,
+                "snes_netplay: ICE FAILED while waiting for peer — "
+                "STUN/TURN path unusable (check Coturn / firewall)\n");
+        ice_fail_logged = 1;
+      }
       if (snes_netplay_connect_timed_out(connect_ms)) {
         if (hooks->on_connect_timeout)
           hooks->on_connect_timeout(hooks->ctx);
         barrier_soft_exit(from_lobby, running, "connect_timeout",
                           &desync_logged, &wait_logged);
+        ice_fail_logged = 0;
         return 0;
       }
     } else {
       wait_logged = 0;
+      ice_fail_logged = 0;
     }
 
     if (snes_netplay_input_desync(&dt, &lh, &rh)) {
