@@ -120,6 +120,19 @@ libjuice can fall back to relay when hole punch is unstable (cannot add TURN
 after gather starts). Logs include selected candidates/addresses when ICE
 connects, and a concrete local IPv4 bind when `rnet_ipv4_enumerate` finds one.
 
+**FORCE_TURN testing build** (relay-only; both peers must match):
+
+```bash
+cmake -S . -B build-force-turn \
+  -DSMW_BUILD_COOP=ON -DSMW_NETPLAY_ICE=ON \
+  -DSNESRECOMP_NET_FORCE_TURN=ON
+```
+
+Requires working Coturn mint (or `SNES_NET_TURN_*`). Refuses STUN-only ICE
+start, and filters candidates to `typ relay` so local LAN cannot short-circuit
+via host/srflx. Runtime override without rebuild: `SNES_NET_FORCE_TURN=1`
+(still needs a FORCE_TURN *library* build for relay filtering).
+
 **libjuice bundling:** with `SNESRECOMP_NET_ICE=ON`, recomp-net defaults to
 `RNET_ICE_BUNDLE_STATIC=ON` (FetchContent static juice linked into
 `recomp_net`) so Linux game binaries do not need a distro `libjuice.so`.
