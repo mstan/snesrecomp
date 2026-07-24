@@ -86,6 +86,7 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
 int  snes_netplay_active(void) { return 0; }
 int  snes_netplay_is_running(void) { return 0; }
 const char *snes_netplay_transport_name(void) { return "none"; }
+int  snes_netplay_ice_failed(void) { return 0; }
 int  snes_netplay_local_slot(void) { return -1; }
 int  snes_netplay_input_player(void) { return 0; }
 uint32_t snes_netplay_sim_tick(void) { return 0; }
@@ -160,6 +161,13 @@ typedef struct {
     int          sram_sync_done;     /* both: initial SRAM sync finished */
     int          host_load_applied;  /* host already applied LOAD locally */
     int          host_sram_applied;  /* host already has live SRAM */
+    /* Owned buffers for RNetIceConfig pointers (juice may retain them). */
+    char         ice_stun_host[128];
+    char         ice_turn_host[128];
+    char         ice_turn_user[192];
+    char         ice_turn_pass[128];
+    char         ice_bind_addr[RNET_IPV4_ADDRESS_TEXT_MAX];
+    int          ice_has_turn;
 } NetplayState;
 
 static NetplayState g_np;
@@ -336,6 +344,17 @@ const char *snes_netplay_transport_name(void)
     return g_np.use_ice ? "ice" : "lan";
 }
 
+int snes_netplay_ice_failed(void)
+{
+#if defined(RNET_ENABLE_ICE)
+    if (!snes_netplay_active() || !g_np.use_ice)
+        return 0;
+    return rnet_session_ice_state(g_np.session) == RNET_ICE_STATE_FAILED;
+#else
+    return 0;
+#endif
+}
+
 int snes_netplay_local_slot(void)
 {
     return snes_netplay_active() ? g_np.local_slot : -1;
@@ -441,8 +460,110 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     if (use_ice) {
 #if defined(RNET_ENABLE_ICE)
         RNetIceConfig ice;
+        RNetIpv4Address addrs[8];
+        int naddr;
+        const char *env_turn_host = getenv("SNES_NET_TURN_HOST");
+        const char *env_turn_user = getenv("SNES_NET_TURN_USER");
+        const char *env_turn_pass = getenv("SNES_NET_TURN_PASS");
+        const char *env_stun = getenv("SNES_NET_STUN_HOST");
+
+        g_np.ice_has_turn = 0;
+        g_np.ice_stun_host[0] = '\0';
+        g_np.ice_turn_host[0] = '\0';
+        g_np.ice_turn_user[0] = '\0';
+        g_np.ice_turn_pass[0] = '\0';
+        g_np.ice_bind_addr[0] = '\0';
+
         rnet_ice_config_init_defaults(&ice);
         ice.controlling = (rcfg.local_slot == 0) ? 1u : 0u;
+
+        /* Prefer a concrete LAN IPv4 for host candidates (not 0.0.0.0). */
+        naddr = rnet_ipv4_enumerate(addrs, sizeof(addrs) / sizeof(addrs[0]));
+        if (naddr > 0 && addrs[0].address[0]) {
+            snprintf(g_np.ice_bind_addr, sizeof(g_np.ice_bind_addr), "%s",
+                     addrs[0].address);
+            ice.bind_address = g_np.ice_bind_addr;
+        }
+
+#if defined(SNES_HAS_LOBBY_CLIENT)
+        /* Refresh lobby Coturn mint; pump briefly so welcome prefetch can land. */
+        if (snes_lobby_connected()) {
+            int i;
+            (void)snes_lobby_request_turn_credentials();
+            for (i = 0; i < 50; ++i) {
+                const SnesLobbyTurnCredentials *tc = snes_lobby_turn_credentials();
+                if (tc && tc->valid)
+                    break;
+                snes_lobby_pump();
+                SDL_Delay(10);
+            }
+        }
+        {
+            const SnesLobbyTurnCredentials *tc = snes_lobby_turn_credentials();
+            if (tc && tc->valid) {
+                if (tc->stun_host[0]) {
+                    snprintf(g_np.ice_stun_host, sizeof(g_np.ice_stun_host),
+                             "%s", tc->stun_host);
+                    ice.stun_host = g_np.ice_stun_host;
+                    ice.stun_port = (rnet_u16)(tc->stun_port > 0 ? tc->stun_port
+                                                                  : 3478);
+                }
+                snprintf(g_np.ice_turn_host, sizeof(g_np.ice_turn_host), "%s",
+                         tc->turn_host);
+                snprintf(g_np.ice_turn_user, sizeof(g_np.ice_turn_user), "%s",
+                         tc->username);
+                snprintf(g_np.ice_turn_pass, sizeof(g_np.ice_turn_pass), "%s",
+                         tc->password);
+                ice.turn_host = g_np.ice_turn_host;
+                ice.turn_user = g_np.ice_turn_user;
+                ice.turn_pass = g_np.ice_turn_pass;
+                ice.turn_port = (rnet_u16)(tc->turn_port > 0 ? tc->turn_port
+                                                              : 3478);
+                g_np.ice_has_turn = 1;
+            }
+        }
+#endif
+        /* Env overrides win (dev / private Coturn without lobby mint). */
+        if (env_stun && env_stun[0]) {
+            snprintf(g_np.ice_stun_host, sizeof(g_np.ice_stun_host), "%s",
+                     env_stun);
+            ice.stun_host = g_np.ice_stun_host;
+            ice.stun_port = (rnet_u16)env_u("SNES_NET_STUN_PORT", ice.stun_port
+                                                                     ? ice.stun_port
+                                                                     : 3478);
+        }
+        if (env_turn_host && env_turn_host[0] && env_turn_user &&
+            env_turn_user[0] && env_turn_pass && env_turn_pass[0]) {
+            snprintf(g_np.ice_turn_host, sizeof(g_np.ice_turn_host), "%s",
+                     env_turn_host);
+            snprintf(g_np.ice_turn_user, sizeof(g_np.ice_turn_user), "%s",
+                     env_turn_user);
+            snprintf(g_np.ice_turn_pass, sizeof(g_np.ice_turn_pass), "%s",
+                     env_turn_pass);
+            ice.turn_host = g_np.ice_turn_host;
+            ice.turn_user = g_np.ice_turn_user;
+            ice.turn_pass = g_np.ice_turn_pass;
+            ice.turn_port = (rnet_u16)env_u("SNES_NET_TURN_PORT", 3478);
+            g_np.ice_has_turn = 1;
+        }
+
+        if (g_np.ice_has_turn) {
+            fprintf(stderr,
+                    "snes_netplay: ICE stun=%s:%u turn=%s:%u user=%s bind=%s\n",
+                    ice.stun_host ? ice.stun_host : "(default)",
+                    (unsigned)ice.stun_port,
+                    ice.turn_host, (unsigned)ice.turn_port, ice.turn_user,
+                    ice.bind_address ? ice.bind_address : "(any)");
+        } else {
+            fprintf(stderr,
+                    "snes_netplay: ICE STUN-only (no TURN) stun=%s:%u "
+                    "bind=%s — remote NAT may hang after a few frames; "
+                    "configure Coturn on the lobby or SNES_NET_TURN_*\n",
+                    ice.stun_host ? ice.stun_host : "(default)",
+                    (unsigned)ice.stun_port,
+                    ice.bind_address ? ice.bind_address : "(any)");
+        }
+
         if (rnet_session_start_ice(g_np.session, &ice) != 0) {
             fprintf(stderr,
                     "snes_netplay: start_ice failed; refusing unsafe LAN "
@@ -504,7 +625,7 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
             use_ice ? "ice" : "lan", g_np.local_slot, g_np.input_player,
             (unsigned)rcfg.session_id, (unsigned)rcfg.input_delay,
             cfg->bind_hostport,
-            /* MotK rewrite peer is unused for ICE (candidates via lobby WS). */
+            /* Lobby peer rewrite is unused for ICE (candidates via WS). */
             use_ice ? "(ice)" : cfg->peer_hostport);
     return 0;
 }

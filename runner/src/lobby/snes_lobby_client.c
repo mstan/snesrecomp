@@ -82,6 +82,12 @@ int  snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap)
     (void)text_cap;
     return 0;
 }
+int  snes_lobby_request_turn_credentials(void) { return -1; }
+const SnesLobbyTurnCredentials *snes_lobby_turn_credentials(void)
+{
+    static SnesLobbyTurnCredentials z;
+    return &z;
+}
 
 #else /* SNES_HAS_LOBBY_CLIENT */
 
@@ -142,7 +148,7 @@ typedef struct {
     SnesLobbyMatchCaps match_caps;
     char pending_tx[8][2048];
     int pending_n;
-    /* Inbound ICE signals (MotK op:signal). */
+    /* Inbound ICE signals (WS op:signal). */
     struct {
         int type;
         int flag;
@@ -151,6 +157,10 @@ typedef struct {
     int sig_head;
     int sig_tail;
     int sig_count;
+    /* Coturn mint from WS get_turn_credentials. */
+    SnesLobbyTurnCredentials turn;
+    time_t turn_received_at;
+    int turn_request_pending;
 } LobbyClient;
 
 static LobbyClient g_lc = {
@@ -172,6 +182,24 @@ static int list_filter_version_strict(void)
 }
 
 static void queue_send(const char *json);
+static void clear_turn_credentials(void);
+static int queue_turn_credentials_request(void);
+
+static void clear_turn_credentials(void)
+{
+    memset(&g_lc.turn, 0, sizeof(g_lc.turn));
+    g_lc.turn_received_at = 0;
+    g_lc.turn_request_pending = 0;
+}
+
+static int queue_turn_credentials_request(void)
+{
+    if (!snes_lobby_connected())
+        return -1;
+    queue_send("{\"op\":\"get_turn_credentials\"}");
+    g_lc.turn_request_pending = 1;
+    return 0;
+}
 
 static void queue_list_request(void)
 {
@@ -643,6 +671,50 @@ static void handle_server_json(const char *json)
             queue_send(msg);
         }
         queue_send("{\"op\":\"list\"}");
+        /* Prefetch Coturn creds for ICE (no-op reply if server lacks COTURN_*). */
+        (void)queue_turn_credentials_request();
+        return;
+    }
+    if (strcmp(op, "turn_credentials") == 0) {
+        int ok = json_get_int(json, "ok", 0);
+        g_lc.turn_request_pending = 0;
+        memset(&g_lc.turn, 0, sizeof(g_lc.turn));
+        g_lc.turn_received_at = 0;
+        if (!ok) {
+            char err[64];
+            json_get_str(json, "error", err, sizeof(err));
+            fprintf(stderr,
+                    "snes_lobby: turn_credentials failed (%s) — ICE will be "
+                    "STUN-only unless SNES_NET_TURN_* is set\n",
+                    err[0] ? err : "unknown");
+            return;
+        }
+        json_get_str(json, "stun_host", g_lc.turn.stun_host,
+                     sizeof(g_lc.turn.stun_host));
+        json_get_str(json, "turn_host", g_lc.turn.turn_host,
+                     sizeof(g_lc.turn.turn_host));
+        json_get_str(json, "username", g_lc.turn.username,
+                     sizeof(g_lc.turn.username));
+        json_get_str(json, "password", g_lc.turn.password,
+                     sizeof(g_lc.turn.password));
+        g_lc.turn.stun_port = json_get_int(json, "stun_port", 3478);
+        g_lc.turn.turn_port = json_get_int(json, "turn_port", 3478);
+        g_lc.turn.ttl_secs = (uint32_t)json_get_int(json, "ttl_secs", 86400);
+        if (g_lc.turn.turn_host[0] && g_lc.turn.username[0] &&
+            g_lc.turn.password[0]) {
+            g_lc.turn.valid = 1;
+            g_lc.turn_received_at = time(NULL);
+            fprintf(stderr,
+                    "snes_lobby: turn_credentials ok stun=%s:%d turn=%s:%d "
+                    "user=%s ttl=%us\n",
+                    g_lc.turn.stun_host[0] ? g_lc.turn.stun_host : "(none)",
+                    g_lc.turn.stun_port,
+                    g_lc.turn.turn_host, g_lc.turn.turn_port,
+                    g_lc.turn.username, (unsigned)g_lc.turn.ttl_secs);
+        } else {
+            fprintf(stderr,
+                    "snes_lobby: turn_credentials ok but incomplete fields\n");
+        }
         return;
     }
     if (strcmp(op, "lobby_list") == 0) {
@@ -1429,6 +1501,33 @@ int snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap)
     g_lc.sig_head = (g_lc.sig_head + 1) % (int)(sizeof(g_lc.sig_q) / sizeof(g_lc.sig_q[0]));
     g_lc.sig_count--;
     return 1;
+}
+
+int snes_lobby_request_turn_credentials(void)
+{
+    if (!snes_lobby_connected())
+        return -1;
+    /* Refresh if missing, expired, or never requested. */
+    if (g_lc.turn.valid && g_lc.turn_received_at > 0 && g_lc.turn.ttl_secs > 0) {
+        time_t now = time(NULL);
+        if (now >= g_lc.turn_received_at &&
+            (uint32_t)(now - g_lc.turn_received_at) + 60u < g_lc.turn.ttl_secs) {
+            return 0; /* still fresh (60s skew margin) */
+        }
+    }
+    return queue_turn_credentials_request();
+}
+
+const SnesLobbyTurnCredentials *snes_lobby_turn_credentials(void)
+{
+    if (g_lc.turn.valid && g_lc.turn_received_at > 0 && g_lc.turn.ttl_secs > 0) {
+        time_t now = time(NULL);
+        if (now < g_lc.turn_received_at ||
+            (uint32_t)(now - g_lc.turn_received_at) >= g_lc.turn.ttl_secs) {
+            clear_turn_credentials();
+        }
+    }
+    return &g_lc.turn;
 }
 
 #endif /* SNES_HAS_LOBBY_CLIENT */

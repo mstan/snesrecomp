@@ -174,6 +174,28 @@ int  snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out);
 int  snes_lobby_send_signal(int type, int flag, const char *text);
 int  snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap);
 
+/*
+ * Coturn / ICE credentials minted by the WS lobby
+ * (`get_turn_credentials` → `turn_credentials`). Valid until disconnect or TTL.
+ * Strings are stable until the next successful mint or disconnect — safe to
+ * pass into RNetIceConfig for juice_create.
+ */
+typedef struct SnesLobbyTurnCredentials {
+    int      valid; /* 1 when ok mint cached and not expired */
+    char     stun_host[128];
+    int      stun_port;
+    char     turn_host[128];
+    int      turn_port;
+    char     username[192];
+    char     password[128];
+    uint32_t ttl_secs;
+} SnesLobbyTurnCredentials;
+
+/* Queue WS get_turn_credentials. Returns 0 if sent/queued. */
+int  snes_lobby_request_turn_credentials(void);
+/* Non-NULL; valid==0 when unavailable / expired / STUN-only. */
+const SnesLobbyTurnCredentials *snes_lobby_turn_credentials(void);
+
 #ifdef __cplusplus
 }
 #endif
