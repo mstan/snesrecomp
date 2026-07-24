@@ -676,7 +676,8 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "turn_credentials") == 0) {
-        int ok = json_get_int(json, "ok", 0);
+        /* Server sends JSON boolean "ok": true — not an integer. */
+        int ok = json_get_bool(json, "ok", 0);
         g_lc.turn_request_pending = 0;
         memset(&g_lc.turn, 0, sizeof(g_lc.turn));
         g_lc.turn_received_at = 0;

@@ -564,6 +564,31 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
                     ice.bind_address ? ice.bind_address : "(any)");
         }
 
+        {
+            int force_turn = 0;
+#if defined(SNESRECOMP_NET_FORCE_TURN)
+            force_turn = 1;
+#endif
+            {
+                const char *ft = getenv("SNES_NET_FORCE_TURN");
+                if (ft && ft[0] && ft[0] != '0')
+                    force_turn = 1;
+            }
+            if (force_turn && !g_np.ice_has_turn) {
+                fprintf(stderr,
+                        "snes_netplay: FORCE_TURN requires Coturn credentials "
+                        "(lobby get_turn_credentials or SNES_NET_TURN_*)\n");
+                rnet_session_destroy(g_np.session);
+                g_np.session = NULL;
+                return -4;
+            }
+            if (force_turn) {
+                fprintf(stderr,
+                        "snes_netplay: FORCE_TURN — ICE will use relay-only "
+                        "candidates (both peers must match)\n");
+            }
+        }
+
         if (rnet_session_start_ice(g_np.session, &ice) != 0) {
             fprintf(stderr,
                     "snes_netplay: start_ice failed; refusing unsafe LAN "

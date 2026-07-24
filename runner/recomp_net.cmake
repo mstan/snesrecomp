@@ -17,6 +17,8 @@
 # ICE / WAN (libjuice) — set before enabling:
 #   set(SNESRECOMP_NET_ICE ON CACHE BOOL "" FORCE)
 #   # or: cmake -DSNESRECOMP_NET_ICE=ON ...
+# TURN testing (require Coturn + relay-only candidates; both peers):
+#   cmake -DSNESRECOMP_NET_FORCE_TURN=ON -DSNESRECOMP_NET_ICE=ON ...
 
 if(NOT SNESRECOMP_RECOMP_NET_ROOT)
     get_filename_component(SNESRECOMP_RECOMP_NET_ROOT
@@ -27,6 +29,8 @@ option(SNESRECOMP_ENABLE_NET
     "Build and expose recomp-net (delay-sync netcode) for game targets" OFF)
 option(SNESRECOMP_NET_ICE
     "Enable ICE/libjuice transport in recomp-net (needs network at configure if libjuice is not vendored)" OFF)
+option(SNESRECOMP_NET_FORCE_TURN
+    "Testing: require Coturn TURN for ICE and only use typ relay candidates (both peers must match)" OFF)
 
 # Internal: add_subdirectory once; disable examples/tests when embedded.
 function(_snesrecomp_add_recomp_net)
@@ -42,12 +46,15 @@ function(_snesrecomp_add_recomp_net)
 
     set(RNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(RNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    if(SNESRECOMP_NET_ICE)
+    if(SNESRECOMP_NET_ICE OR SNESRECOMP_NET_FORCE_TURN)
         set(RNET_ENABLE_ICE ON CACHE BOOL "" FORCE)
         # Ship static libjuice inside recomp_net so coop binaries run without a
         # system libjuice.so (Fedora/remote hosts). Override with
         # -DRNET_ICE_BUNDLE_STATIC=OFF if you intentionally link a shared juice.
         set(RNET_ICE_BUNDLE_STATIC ON CACHE BOOL "" FORCE)
+        if(SNESRECOMP_NET_FORCE_TURN)
+            set(RNET_ICE_FORCE_TURN ON CACHE BOOL "" FORCE)
+        endif()
     else()
         set(RNET_ENABLE_ICE OFF CACHE BOOL "" FORCE)
     endif()
@@ -72,6 +79,16 @@ function(snesrecomp_enable_recomp_net target)
     _snesrecomp_add_recomp_net()
     target_link_libraries(${target} PRIVATE recomp_net)
     target_compile_definitions(${target} PRIVATE SNESRECOMP_NET=1)
+    if(SNESRECOMP_NET_FORCE_TURN)
+        if(NOT SNESRECOMP_NET_ICE AND NOT RNET_ENABLE_ICE)
+            message(FATAL_ERROR
+                "SNESRECOMP_NET_FORCE_TURN=ON requires ICE "
+                "(-DSNESRECOMP_NET_ICE=ON)")
+        endif()
+        target_compile_definitions(${target} PRIVATE SNESRECOMP_NET_FORCE_TURN=1)
+        message(STATUS
+            "SNESRECOMP_NET_FORCE_TURN: ICE requires TURN + relay-only candidates")
+    endif()
     # SNES host facade and launcher-facing lobby client. The lobby remains
     # transport/UI agnostic; recomp-ui consumes it through game callbacks.
     if(NOT SNESRECOMP_ENABLE_NET)
@@ -122,7 +139,10 @@ if(SNESRECOMP_ENABLE_NET)
     if(WIN32)
         list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
     endif()
+    if(SNESRECOMP_NET_FORCE_TURN)
+        add_compile_definitions(SNESRECOMP_NET_FORCE_TURN=1)
+    endif()
     message(STATUS
         "SNESRECOMP_ENABLE_NET: recomp-net linked via SNESRECOMP_RUNNER_LIBRARIES"
-        " (ICE=${SNESRECOMP_NET_ICE})")
+        " (ICE=${SNESRECOMP_NET_ICE} FORCE_TURN=${SNESRECOMP_NET_FORCE_TURN})")
 endif()
