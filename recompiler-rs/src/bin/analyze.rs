@@ -283,6 +283,14 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
             entries.entry(pc24).or_insert_with(|| entry.clone());
             if all_cfg_roots {
                 roots.insert(VariantKey::new(pc24, entry.entry_m, entry.entry_x));
+                if let Some(force_variants) = &entry.force_variants {
+                    for &(m, x) in force_variants {
+                        roots.insert(VariantKey::new(pc24, m, x));
+                        if let Some(mirror_pc24) = mirror_pc24(pc24) {
+                            roots.insert(VariantKey::new(mirror_pc24, m, x));
+                        }
+                    }
+                }
             }
             if let Some(skip) = entry.inline_skip {
                 inline_skip.insert(pc24, skip);
