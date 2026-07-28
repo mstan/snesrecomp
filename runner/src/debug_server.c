@@ -69,6 +69,8 @@ extern uint8 g_ram[0x20000];
 extern uint8 *g_sram;
 extern int g_sram_size;
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
+void RtlApuLock(void);
+void RtlApuUnlock(void);
 
 // Note: g_snes->ram == g_ram (same pointer, see snes_init). The dual-WRAM
 // pattern this file once bridged was phantom — both "sides" always pointed
@@ -7409,7 +7411,6 @@ static void cmd_spc_dump(const char *args) {
         return;
     }
     static uint8_t img[0x10200];
-    void RtlApuLock(void); void RtlApuUnlock(void);
     RtlApuLock();
     Apu *apu = g_snes->apu;
     Spc *spc = apu->spc;
