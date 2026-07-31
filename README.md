@@ -281,8 +281,11 @@ python snesrecomp_cli.py generate \
   --json-progress
 ```
 
-See [`docs/LOCAL_CODEGEN_SDK.md`](docs/LOCAL_CODEGEN_SDK.md) for exit codes and
-the JSONL progress event schema. `verify-rom` checks digests alone.
+See [`docs/LOCAL_CODEGEN_SDK.md`](docs/LOCAL_CODEGEN_SDK.md) for exit codes,
+the JSONL progress event schema, and the portable **recomp-ui host** under
+`host/` (`snesrecomp_codegen_host`) that other game repos can compile in for
+Generate → rebuild → relaunch (including the Windows deferred `.cmd` helper).
+`verify-rom` checks digests alone.
 
 ## Choosing SDL3 or SDL2 for a desktop game
 
