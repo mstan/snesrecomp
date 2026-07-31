@@ -263,6 +263,27 @@ python tools/build_cli.py release
 
 The ready-to-use ZIP is written to `dist/`.
 
+### Regenerate an existing game project (headless SDK)
+
+Game repositories that already ship `bank*.cfg` seeds should use the
+`generate` command instead of scaffolding a new tree. This is the stable
+contract for local UIs and launcher automation:
+
+```sh
+python snesrecomp_cli.py generate \
+  --rom "Metal Warriors (USA).sfc" \
+  --project-root /path/to/MetalWarriorsSNESRecomp \
+  --cfg-dir recomp \
+  --out-dir src/gen \
+  --funcs-h recomp/funcs.h \
+  --cfg-roots \
+  --expected-crc32 f2ab92d4 \
+  --json-progress
+```
+
+See [`docs/LOCAL_CODEGEN_SDK.md`](docs/LOCAL_CODEGEN_SDK.md) for exit codes and
+the JSONL progress event schema. `verify-rom` checks digests alone.
+
 ## Choosing SDL3 or SDL2 for a desktop game
 
 SDL3 is the default desktop backend for CMake game hosts. SDL2 remains a
