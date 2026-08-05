@@ -176,6 +176,13 @@ static int barrier_poll_admit(int enter_need)
   }
 
   g_starv.just_cleared = 0;
+  /* Save/load/SRAM probe+xfer freezes admit by design — do not treat as
+   * delay-sync input starvation (that latch held the post-load freeze). */
+  if (snes_netplay_state_barrier()) {
+    g_starv.enter_run = 0;
+    return 0;
+  }
+
   g_starv.enter_run++;
   if (g_starv.enter_run >= enter_need) {
     g_starv.latched = 1;
@@ -311,6 +318,15 @@ int snes_host_barrier_admit(int from_lobby, int *running,
 
     if (g_starv.latched) {
       snes_netplay_pump();
+      /* Drop a stale latch if we entered a deliberate state barrier (load). */
+      if (snes_netplay_state_barrier()) {
+        g_starv.latched = 0;
+        g_starv.exit_run = 0;
+        g_starv.enter_run = 0;
+        g_starv.latch_logged = 0;
+        g_starv.just_cleared = 0;
+        return 0;
+      }
       if (starv_runway_ok()) {
         g_starv.exit_run++;
         if (g_starv.exit_run >= exit_need) {
