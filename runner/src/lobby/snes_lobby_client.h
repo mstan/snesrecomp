@@ -70,7 +70,7 @@ typedef struct SnesLobbyJoinInfo {
 } SnesLobbyJoinInfo;
 
 /* Default URL when SNES_NET_LOBBY_URL unset:
- * ws://netplay.technicallycomputers.ca:8765 */
+ * ws://netplay.retcomm.net:8765 */
 const char *snes_lobby_default_url(void);
 
 int  snes_lobby_connect(const char *ws_url); /* 0 ok */
