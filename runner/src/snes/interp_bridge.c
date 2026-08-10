@@ -2025,12 +2025,14 @@ RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
  * ALREADY pushed the 2-byte JSR return frame, so:
  *   - watermark = current S (post-push): the target's own RTS pops that
  *     frame and lifts S strictly above the watermark, exiting the bridge.
- *   - post_call = S + 2: the balanced S after the frame is consumed.
- * On a clean return the target's RTS already left S == post_call; on a bail
- * (step cap) we restore post_call ourselves so the frame is discarded and
- * the caller still falls through balanced. Either way return NORMAL — this
- * is a CALL, not a tail dispatch, so it never abandons the caller. Recorded
- * in the tier-2 gap manifest (kind=dispatch) for the worklist. */
+ *   - post_call = S + frame_size: balanced S after the frame is consumed.
+ * On a normal clean return the target's RTS already left S == post_call. A
+ * clean return past post_call is a guest non-local return (for example, a
+ * 16-bit PLA followed by RTL consumes this JSR frame and an outer JSL frame);
+ * translate that post-return S into the existing SKIP_N host-unwind contract.
+ * On a bail (step cap) restore post_call ourselves so the unconsumed frame is
+ * discarded and the caller still falls through balanced. Recorded in the
+ * tier-2 gap manifest (kind=dispatch) for the worklist. */
 RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
                                         uint32_t source_pc24,
                                         uint8_t frame_size,
@@ -2051,8 +2053,15 @@ RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
     RecompReturn propagated;
     if (interp_run_propagated_return(ok, &propagated))
         return propagated;
-    if (!ok)
+    if (!ok) {
         cpu->S = post_call;  /* bail: discard the unconsumed JSR frame */
+        return RECOMP_RETURN_NORMAL;
+    }
+    if (cpu->S != post_call) {
+        int skip = cpu_resolve_post_return_skip(cpu->S);
+        if (skip < 1) skip = 1;
+        return (RecompReturn)skip;
+    }
     return RECOMP_RETURN_NORMAL;
 }
 
