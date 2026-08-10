@@ -95,6 +95,22 @@ Supported option types are `boolean`, `choice`, and bounded `integer`. The
 initial SNES runtime exposes options and persists them for plugins that add
 typed query services later; the first MMX integrations need only activation.
 
+## Trusted host PCM overlays
+
+Trusted static plugins may register bounded copied signed-16 PCM (16 MiB total)
+with `snes_mod_audio_register_pcm_s16`, then start overlap-safe one-shots with
+`snes_mod_audio_play`. Clips declare mono/stereo layout and source rate; the
+runner resamples them deterministically onto the actual output-device rate and
+mixes with integer gain (0-200%) and stereo saturation. Unregistering a clip
+stops its voices; reset and successful save-state loads stop every voice while
+keeping registrations available for the active trusted plugin plan.
+
+The mixer has no SDL device or callback of its own. In `RtlRenderAudio` it runs
+immediately after native S-DSP plus MSU-1 mixing and immediately before the
+existing recovery fade. This preserves the normal device clock and lets the
+fade smooth a discontinuity in the complete delivered mix. With no registered
+or playing clips the mix call is a no-op and native/MSU output is unchanged.
+
 ## Plugin registration
 
 Game code registers trusted behavior before `main()`:
