@@ -129,6 +129,27 @@ drillable to the exact opcode with `SNES_COSIM_SYNC_PC`. Gates:
 - SMW / Zelda / SM adopt the same pattern when their scheduler idioms are LLE'd
   (SM's single-fiber WaitForNMI HLE is the analogous seam).
 
+## LLE hardware timeline: HDMA
+
+The interpreter/LLE path advances the SNES beam from guest master cycles in
+`snes_sync_master_clock()` / `snes_advance_beam()`. HDMA is part of that hardware
+timeline, not a PPU draw-only effect:
+
+- `$420C` updates the persistent HDMA enable mask (`DmaChannel::hdmaActive`).
+- At the start of a new frame (`v=0, h=0` after the `261 -> 0` wrap), the DMA
+  core initializes each enabled channel from its current A address and clears
+  per-frame completion state.
+- On visible scanlines only, the beam step splits at `h=1024` and runs one HDMA
+  line transfer for every enabled, non-terminated channel.
+- Synthetic `$4212` polling advances only the reported beam position; it must
+  not run HDMA tables.
+
+Presentation-time game code can still replay HDMA with `SimpleHdma` immediately
+around `ppu_runLine()` so scanline rendering sees the correct per-line PPU
+registers. That path is separate from the bus-time LLE walker; do not move HDMA
+execution unconditionally into `ppu_runLine()` or existing game draw functions
+will double-apply their `SimpleHdma_DoLine()` calls.
+
 ---
 
 ## SMW interpret-EVERYTHING floor: the dead-scratch dispatcher gap (2026-07-04)
