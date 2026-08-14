@@ -680,15 +680,17 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     {
         extern int snes_frame_counter;
         static int _iw_init = 0;
-        static long _iw_lo = -1, _iw_hi = -1, _iw_frame = -1;
+        static int _iw_has_range = 0;
+        static unsigned long _iw_lo = 0, _iw_hi = 0;
+        static long _iw_frame = -1;
         if (!_iw_init) { _iw_init = 1;
             const char *_e = getenv("SNESRECOMP_IBRWATCH");
             const char *_f = getenv("SNESRECOMP_IBRWATCH_FRAME");
-            if (_e) sscanf(_e, "%lx-%lx", &_iw_lo, &_iw_hi);
+            if (_e) _iw_has_range = sscanf(_e, "%lx-%lx", &_iw_lo, &_iw_hi) == 2;
             if (_f && *_f) _iw_frame = strtol(_f, NULL, 0);
         }
-        if (_iw_lo >= 0 && (long)entry_pc24 >= _iw_lo &&
-            (long)entry_pc24 <= _iw_hi &&
+        if (_iw_has_range && (unsigned long)entry_pc24 >= _iw_lo &&
+            (unsigned long)entry_pc24 <= _iw_hi &&
             (_iw_frame < 0 || snes_frame_counter == _iw_frame)) {
             _ibrw = 1;
             fprintf(stderr,
@@ -2115,6 +2117,17 @@ static const char *tier2_kind_str(uint8_t k) {
     }
 }
 
+static int tier2_verbose(void) {
+    static int checked;
+    static int verbose;
+    if (!checked) {
+        const char *value = getenv("SNESRECOMP_TIER2_VERBOSE");
+        verbose = value && *value && *value != '0';
+        checked = 1;
+    }
+    return verbose;
+}
+
 /* Shared discovery-array body, used by both serializers. */
 static void tier2_emit_discoveries(FILE *f, const char *indent) {
     for (int i = 0; i < g_tier2_cov_count; i++) {
@@ -2213,5 +2226,6 @@ void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
 void Tier2CoverageWriteDefaultManifest(const char *rom_title) {
     const char *path = tier2_capture_manifest_path(rom_title);
     Tier2CoverageWriteManifest(path, rom_title);
-    fprintf(stderr, "[tier2] per-run coverage manifest: %s\n", path);
+    if (tier2_verbose())
+        fprintf(stderr, "[tier2] per-run coverage manifest: %s\n", path);
 }

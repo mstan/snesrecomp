@@ -22,6 +22,17 @@ static FILE *s_journal;
 static int s_paths_ready;
 static int s_close_registered;
 static int s_announced;
+static int s_verbose_checked;
+static int s_verbose;
+
+static int tier2_verbose(void) {
+    if (!s_verbose_checked) {
+        const char *value = getenv("SNESRECOMP_TIER2_VERBOSE");
+        s_verbose = value && *value && *value != '0';
+        s_verbose_checked = 1;
+    }
+    return s_verbose;
+}
 
 static void sanitize_romid(const char *title, char *out, size_t cap) {
     size_t n = 0;
@@ -133,8 +144,10 @@ int tier2_capture_append_discovery(const char *rom_title,
         }
         if (!s_announced) {
             s_announced = 1;
-            fprintf(stderr, "[tier2] append-only dispatch-miss journal: %s\n",
-                    s_journal_path);
+            if (tier2_verbose())
+                fprintf(stderr,
+                        "[tier2] append-only dispatch-miss journal: %s\n",
+                        s_journal_path);
         }
     }
 
