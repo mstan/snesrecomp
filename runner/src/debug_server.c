@@ -2548,14 +2548,23 @@ static void cmd_ws_shadow_stats(const char *args) {
             "\"worldX\":%u,\"worldY\":%u,\"scrollX\":%u,\"scrollY\":%u,"
             "\"westHit\":%llu,\"westMiss\":%llu,"
             "\"eastHit\":%llu,\"eastMiss\":%llu,"
-            "\"prefillSeed\":%llu,\"prefillRefresh\":%llu}",
+            "\"prefillSeed\":%llu,\"prefillRefresh\":%llu,"
+            "\"westFold\":%llu,\"eastFold\":%llu,"
+            "\"westBlank\":%llu,\"eastBlank\":%llu,"
+            "\"westRawFallback\":%llu,\"eastRawFallback\":%llu}",
             l ? "," : "", l, WsShadowLayerActive(l) ? "true" : "false",
             (unsigned)WsShadowWorldX(l), (unsigned)WsShadowWorldY(l),
             (unsigned)WsShadowScrollX(l), (unsigned)WsShadowScrollY(l),
             (unsigned long long)st.westHit, (unsigned long long)st.westMiss,
             (unsigned long long)st.eastHit, (unsigned long long)st.eastMiss,
             (unsigned long long)st.prefillSeed,
-            (unsigned long long)st.prefillRefresh);
+            (unsigned long long)st.prefillRefresh,
+            (unsigned long long)st.westFold,
+            (unsigned long long)st.eastFold,
+            (unsigned long long)st.westBlank,
+            (unsigned long long)st.eastBlank,
+            (unsigned long long)st.westRawFallback,
+            (unsigned long long)st.eastRawFallback);
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_line(buf);
