@@ -75,8 +75,21 @@ typedef struct WsShadowMarginStat {
    * nonzero refresh count is the signature of prefill racing a still-
    * streaming room map, e.g. on a clean-launch first widescreen frame). */
   uint64_t prefillSeed, prefillRefresh;
+  /* Source selected after a miss. rawFallback is the dangerous case for a
+   * rolling tilemap: the renderer consumed wrapped VRAM because no exact,
+   * folded, or verified-blank source was available. */
+  uint64_t westFold, eastFold;
+  uint64_t westBlank, eastBlank;
+  uint64_t westRawFallback, eastRawFallback;
 } WsShadowMarginStat;
 void WsShadowGetMarginStats(int layer, WsShadowMarginStat *out);
+
+/* Read-only diagnostic lookup in the world-keyed store. This does not alter
+ * hit/miss counters or renderer state. It lets offline route audits compare
+ * the exact tilemap entry served in a margin with the entry later captured
+ * when that same world cell reaches the native viewport. */
+bool WsShadowLookupWorldTile(int layer, uint32_t worldTileX,
+                             uint32_t worldTileY, uint16_t *entry);
 
 /* Debug/observability: read one shadow cell without touching stats.
  * Returns 0 = cell invalid, 1 = captured from real VRAM (authoritative),

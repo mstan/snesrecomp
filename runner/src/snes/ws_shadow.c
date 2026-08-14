@@ -81,6 +81,9 @@ static WsShadowLayer s_layers[kLayers];
 /* Always-on margin lookup accounting (see WsShadowTile). Never armed. */
 static WsShadowMarginStat s_marginStats[kLayers];
 
+static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
+                     uint16_t *entry);
+
 void WsShadowGetMarginStats(int layerIndex, WsShadowMarginStat *out) {
   if (!out)
     return;
@@ -90,6 +93,13 @@ void WsShadowGetMarginStats(int layerIndex, WsShadowMarginStat *out) {
     return;
   }
   *out = s_marginStats[layerIndex];
+}
+
+bool WsShadowLookupWorldTile(int layerIndex, uint32_t worldTileX,
+                             uint32_t worldTileY, uint16_t *entry) {
+  if (!entry || layerIndex < 0 || layerIndex >= kLayers)
+    return false;
+  return GetEntry(&s_layers[layerIndex], worldTileX, worldTileY, entry);
 }
 
 static bool InBounds(uint32_t tx, uint32_t ty) {
@@ -1324,15 +1334,30 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
       uint8_t period = FoldRowPeriod(layer, row, natCol);
       if (period) {
         int rel = (col - natCol) & 63;
-        if (rel >= 32)
+        if (rel >= 32) {
+          if (screenX < 0)
+            s_marginStats[layerIndex].westFold++;
+          else
+            s_marginStats[layerIndex].eastFold++;
           return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
+        }
         return realTile;  /* native column (or margin overlapping it) */
       }
     }
   }
 
-  return layer->blankTilePlus1 ? (uint16_t)(layer->blankTilePlus1 - 1)
-                               : realTile;
+  if (layer->blankTilePlus1) {
+    if (screenX < 0)
+      s_marginStats[layerIndex].westBlank++;
+    else
+      s_marginStats[layerIndex].eastBlank++;
+    return (uint16_t)(layer->blankTilePlus1 - 1);
+  }
+  if (screenX < 0)
+    s_marginStats[layerIndex].westRawFallback++;
+  else
+    s_marginStats[layerIndex].eastRawFallback++;
+  return realTile;
 }
 
 bool WsShadowLayerActive(int layerIndex) {
