@@ -37,6 +37,27 @@ echo "=== PPU sprite limits ==="
     -o "$OUT/ppu_sprite_limit_test"
 "$OUT/ppu_sprite_limit_test"
 
+echo "=== DMA / HDMA ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/dma/hdma_test.c" \
+    "$ROOT/runner/src/snes/dma.c" \
+    -o "$OUT/hdma_test"
+"$OUT/hdma_test"
+
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -Wno-error=parentheses -Wno-error=unused-variable \
+    -Wno-error=unused-const-variable \
+    -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -ffunction-sections -fdata-sections \
+    -I "$ROOT/tests/dma" -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/dma/hdma_timing_test.c" \
+    "$ROOT/runner/src/snes/dma.c" \
+    "$ROOT/runner/src/snes/snes.c" \
+    -Wl,--gc-sections -o "$OUT/hdma_timing_test"
+"$OUT/hdma_timing_test"
+
 echo "=== interpreter and bridge ==="
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -D_POSIX_C_SOURCE=200809L -I "$ROOT/runner/src/snes" \

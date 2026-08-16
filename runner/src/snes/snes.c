@@ -270,6 +270,8 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
   uint32_t v = snes->vPos;
   while (clocks) {
     uint32_t span = 1364u - h;
+    if (check_irq && v < 225u && h < 1024u && span > 1024u - h)
+      span = 1024u - h;
     if (span > clocks) span = clocks;
 
     /* Automatic joypad polling begins at vblank and keeps HVBJOY.0 asserted
@@ -292,10 +294,16 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
 
     h += span;
     clocks -= span;
+    if (check_irq && v < 225u && h == 1024u)
+      dma_doHdma(snes->dma);
     if (h >= 1364u) {
       h = 0;
       v++;
-      if (v >= 262u) v = 0;
+      if (v >= 262u) {
+        v = 0;
+        if (check_irq)
+          dma_initHdma(snes->dma);
+      }
     }
   }
   snes->hPos = (uint16_t)h;

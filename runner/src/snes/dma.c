@@ -247,6 +247,75 @@ void dma_doDma(Dma* dma) {
   }
 }
 
+void dma_initHdma(Dma* dma) {
+  for(int i = 0; i < 8; i++) {
+    DmaChannel *c = &dma->channel[i];
+    if(!c->hdmaActive) {
+      c->terminated = true;
+      c->doTransfer = false;
+      c->repCount = 0;
+      c->offIndex = 0;
+      continue;
+    }
+    c->tableAdr = c->aAdr;
+    c->repCount = 0;
+    c->offIndex = 0;
+    c->doTransfer = false;
+    c->terminated = false;
+  }
+}
+
+static uint8_t dma_hdmaRead(Dma* dma, DmaChannel *c) {
+  uint8_t val = snes_read(dma->snes, ((uint32_t)c->aBank << 16) | c->tableAdr);
+  c->tableAdr++;
+  return val;
+}
+
+static void dma_doHdmaChannel(Dma* dma, DmaChannel *c) {
+  c->doTransfer = false;
+  if(!c->hdmaActive || c->terminated) {
+    return;
+  }
+
+  bool doTransfer = false;
+  if((c->repCount & 0x7f) == 0) {
+    c->repCount = dma_hdmaRead(dma, c);
+    if(c->repCount == 0) {
+      c->terminated = true;
+      c->doTransfer = false;
+      return;
+    }
+    if(c->indirect) {
+      uint8_t lo = dma_hdmaRead(dma, c);
+      uint8_t hi = dma_hdmaRead(dma, c);
+      c->size = (uint16_t)lo | ((uint16_t)hi << 8);
+    }
+    doTransfer = true;
+  }
+
+  if(doTransfer || (c->repCount & 0x80)) {
+    c->doTransfer = true;
+    for(int j = 0, j_end = transferLength[c->mode & 7]; j < j_end; j++) {
+      uint16_t aAdr = c->indirect ? c->size : c->tableAdr;
+      uint8_t aBank = c->indirect ? c->indBank : c->aBank;
+      uint8_t bAdr = c->bAdr + bAdrOffsets[c->mode & 7][j];
+      dma_transferByte(dma, aAdr, aBank, bAdr, c->fromB);
+      if(c->indirect) {
+        c->size++;
+      } else {
+        c->tableAdr++;
+      }
+    }
+  }
+  c->repCount--;
+}
+
+void dma_doHdma(Dma* dma) {
+  for(int i = 0; i < 8; i++) {
+    dma_doHdmaChannel(dma, &dma->channel[i]);
+  }
+}
+
 static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bool fromB) {
   // TODO: invalid writes:
   //   accesing b-bus via a-bus gives open bus,
