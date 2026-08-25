@@ -58,6 +58,12 @@ void cart_saveload(Cart *cart, SaveLoadInfo *sli) { (void)cart; (void)sli; }
 void audio_trace_set_producer(int producer) { (void)producer; }
 void joypad_write_strobe(Snes *snes, uint8_t value) { (void)snes; (void)value; }
 uint8_t joypad_read_serial(Snes *snes, unsigned port) { (void)snes; (void)port; return 0; }
+uint16_t joypad_auto_read_word(uint16_t state) { return state; }
+uint8_t joypad_auto_read_reg(uint16_t state, unsigned reg) {
+    (void)state;
+    (void)reg;
+    return 0;
+}
 void ppudma_record_dma(int channel, int fromB, uint8_t aBank, uint16_t aAdr,
                        uint8_t bAdr, uint16_t size) {
     (void)channel;
@@ -119,6 +125,29 @@ int main(void) {
     failures += check(snes.vPos == 0 && snes.hPos == 0, "beam reached next frame");
     failures += check(dma->channel[0].tableAdr == 0x0100, "frame rollover reinitialized table pointer");
     failures += check(dma->channel[0].hdmaActive, "frame rollover preserved HDMAEN state");
+
+    dma_reset(dma);
+    memset(ram, 0, sizeof ram);
+    memset(ppu_regs, 0, sizeof ppu_regs);
+    snes.hPos = 0;
+    snes.vPos = 0;
+    snes.beamMasterLast = 0;
+
+    ram[0x0200] = 0x81;
+    ram[0x0201] = 0x66;
+    ram[0x0202] = 0x00;
+    dma_write(dma, 0x4300, 0x00);
+    dma_write(dma, 0x4301, 0x27);
+    dma_write(dma, 0x4302, 0x00);
+    dma_write(dma, 0x4303, 0x02);
+    dma_write(dma, 0x4304, 0x7e);
+    dma_startDma(dma, 0x01, true);
+
+    dma_initHdma(dma);
+    dma_doHdma(dma);
+    failures += check(ppu_regs[0x27] == 0x66, "external beam owner can run HDMA HBlank hook");
+    failures += check(dma->channel[0].tableAdr == 0x0202, "external beam owner advanced HDMA table");
+    failures += check(dma->channel[0].hdmaActive, "external beam owner preserves HDMAEN state");
 
     dma_free(dma);
     if (failures) return 1;

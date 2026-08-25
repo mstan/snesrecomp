@@ -144,6 +144,16 @@ timeline, not a PPU draw-only effect:
 - Synthetic `$4212` polling advances only the reported beam position; it must
   not run HDMA tables.
 
+Hosts that use `RtlRunFrame()` or otherwise let `snes_sync_master_clock()` own
+the beam get this automatically. A frame-model host that owns `hPos`/`vPos` and
+drives guest code through `interp_bridge_run_loop()` directly must call the same
+DMA entry points at the same hardware edges: `dma_initHdma(snes->dma)` at frame
+start, after the `261 -> 0` wrap has observed the current `$420C` enable mask,
+and `dma_doHdma(snes->dma)` once per visible scanline at HBlank (`h == 1024`).
+Do not call `dma_startDma(dma, 0, true)` for frame init; that writes `$420C=0`
+semantics and clears the persistent HDMA enable mask the frame init needs to
+latch.
+
 Presentation-time game code can still replay HDMA with `SimpleHdma` immediately
 around `ppu_runLine()` so scanline rendering sees the correct per-line PPU
 registers. That path is separate from the bus-time LLE walker; do not move HDMA
