@@ -188,6 +188,24 @@ game-integration details.
 
 ## How to use SNESRecomp
 
+### Scaffold a full project (source checkout)
+
+From a snesrecomp checkout, one command takes a ROM to a repository that
+builds, regenerates, packages, and publishes itself:
+
+```sh
+sh tools/new_project/setup_project.sh --rom ~/roms/game.sfc --dir ~/src
+```
+
+It probes the cartridge header, lays out the repo, wires the framework
+submodules, seeds the analysis config, writes CI and packaging, and can
+generate, build, and `gh repo create` in the same run. `--players 1-8` and
+`--rollback` configure multitap and netplay up front. See
+[docs/GAME_PROJECT_SETUP.md](docs/GAME_PROJECT_SETUP.md).
+
+The result builds a real executable, but it is not a working port: the frame
+driver in `src/game_rtl.c` is where the game-specific work starts.
+
 ### Generate a project with the released CLI
 
 1. Download `snesrecomp-cli-windows-x86_64.zip` from

@@ -1,0 +1,19 @@
+# Generated recompiler output — derived from a copyrighted ROM. Never commit.
+/src/gen/
+/recomp/funcs.h
+
+# The ROM itself, in every form. Players supply their own.
+*.sfc
+*.smc
+*.srm
+
+# Build trees and packaged output
+/build/
+/build-*/
+/dist/
+/saves/
+
+# Local probe output that names paths on one machine
+/rom_probe.json
+
+.DS_Store

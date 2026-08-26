@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Regenerate src/gen/*.c for @DISPLAY_NAME@ from a verified ROM.
+#
+# Generated C is derived from copyrighted ROM data and is never committed;
+# every developer regenerates from their own copy. The ROM digests below are
+# the same ones src/codegen_setup.c and the CI workflow use.
+#
+# Flags:
+#   --rom <path>  ROM to generate from. Defaults to a known filename at the
+#                 repo root, but the ROM does not have to live in the repo —
+#                 keeping it on your own drive is the better habit, and
+#                 SNESRECOMP_ROM sets it once for a shell.
+#   --no-verify   skip the ROM digest check (for a revision this project has
+#                 not been pinned to yet — expect the generated C to differ)
+#   --cfg-roots   seed analysis from every func declaration in recomp/*.cfg
+#   -h|--help     this message
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
+
+EXPECTED_CRC32="${SNESRECOMP_EXPECTED_CRC32:-@ROM_CRC32@}"
+EXPECTED_SHA256="${SNESRECOMP_EXPECTED_SHA256:-@ROM_SHA256@}"
+
+VERIFY=1
+CFG_ROOTS=0
+ROM="${SNESRECOMP_ROM:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rom) ROM=$2; shift 2 ;;
+    --no-verify) VERIFY=0; shift ;;
+    --cfg-roots) CFG_ROOTS=1; shift ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -n '/^# /p' | sed 's/^# //'; exit 0 ;;
+    *) echo "regen.sh: unknown flag: $1 (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+SNESRECOMP_ROOT="${SNESRECOMP_ROOT:-snesrecomp}"
+CLI="$SNESRECOMP_ROOT/snesrecomp_cli.py"
+if [ ! -f "$CLI" ]; then
+  echo "regen.sh: $CLI missing — run: git submodule update --init --recursive" >&2
+  exit 1
+fi
+
+PYTHON="${PYTHON:-$(command -v python3 || command -v python || true)}"
+if [ -z "$PYTHON" ]; then
+  echo "regen.sh: no python3 on PATH" >&2
+  exit 1
+fi
+
+# --rom / SNESRECOMP_ROM win; otherwise look for a known name at the root.
+if [ -z "$ROM" ]; then
+  for cand in "@ROM_FILE@" "@ROM_SLUG@.sfc" "@ROM_SLUG@.smc"; do
+    if [ -f "$cand" ]; then ROM="$cand"; break; fi
+  done
+fi
+if [ -z "$ROM" ] || [ ! -f "$ROM" ]; then
+  echo "regen.sh: no ROM found." >&2
+  echo "          Pass --rom /path/to/@ROM_FILE@, set SNESRECOMP_ROM, or put" >&2
+  echo "          it at the repo root. You must legally own a copy of" >&2
+  echo "          @DISPLAY_NAME@." >&2
+  exit 1
+fi
+
+VERIFY_ARGS=()
+if [ "$VERIFY" -eq 1 ]; then
+  VERIFY_ARGS=(--expected-crc32 "$EXPECTED_CRC32" --expected-sha256 "$EXPECTED_SHA256")
+  echo "== Verifying $ROM =="
+  "$PYTHON" "$CLI" verify-rom --rom "$ROM" "${VERIFY_ARGS[@]}"
+else
+  echo "== Skipping ROM verification (--no-verify) =="
+fi
+
+GEN_ARGS=(--rom "$ROM" --cfg-dir recomp --out-dir src/gen
+          --funcs-h recomp/funcs.h --project-root "$ROOT")
+if [ "$CFG_ROOTS" -eq 1 ]; then GEN_ARGS+=(--cfg-roots); fi
+if [ "$VERIFY" -eq 1 ]; then GEN_ARGS+=("${VERIFY_ARGS[@]}"); fi
+
+echo "== Generating src/gen =="
+"$PYTHON" "$CLI" generate "${GEN_ARGS[@]}"
+
+echo
+echo "Done. Build with:"
+echo "  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"

@@ -1,0 +1,170 @@
+/*
+ * @DISPLAY_NAME@ — desktop host.
+ *
+ * Deliberately small: a window, a texture, a keyboard map, and the frame
+ * loop the framework expects (capture input -> RtlRunFrame -> present).
+ * snesrecomp/runner/src/desktop/mmx23_host_main.inc is the fully-featured
+ * reference host — launcher, netplay barrier, shaders, save states, gamepad
+ * config — and is worth reading before growing this one.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common_rtl.h"
+#include "common_cpu_infra.h"
+#include "widescreen.h"
+#include "game_rtl.h"
+#include "snes/ppu.h"
+#include "desktop/sdl_compat.h"
+
+#define GAME_WIDTH  256
+#define GAME_HEIGHT 224
+
+extern Ppu *g_ppu;
+
+/* The framework calls this to hand the host a frame. renderBuffer is the
+ * PPU's composited output in the runner's native layout. */
+void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags)
+{
+    (void)render_flags;
+    if (!g_ppu || !g_ppu->renderBuffer)
+        return;
+    RtlWidescreenPresent(pixel_buffer, pitch, g_ppu->renderBuffer,
+                         GAME_WIDTH, GAME_HEIGHT);
+}
+
+/* Runner input word: 12 button bits per seat.
+ * B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R. */
+static uint16_t read_keyboard(void)
+{
+    const uint8_t *keys = snesrecomp_sdl_get_keyboard_state();
+    uint16_t pad = 0;
+    if (!keys)
+        return 0;
+    if (keys[SDL_SCANCODE_Z])      pad |= 1u << 0;   /* B */
+    if (keys[SDL_SCANCODE_A])      pad |= 1u << 1;   /* Y */
+    if (keys[SDL_SCANCODE_RSHIFT]) pad |= 1u << 2;   /* Select */
+    if (keys[SDL_SCANCODE_RETURN]) pad |= 1u << 3;   /* Start */
+    if (keys[SDL_SCANCODE_UP])     pad |= 1u << 4;
+    if (keys[SDL_SCANCODE_DOWN])   pad |= 1u << 5;
+    if (keys[SDL_SCANCODE_LEFT])   pad |= 1u << 6;
+    if (keys[SDL_SCANCODE_RIGHT])  pad |= 1u << 7;
+    if (keys[SDL_SCANCODE_X])      pad |= 1u << 8;   /* A */
+    if (keys[SDL_SCANCODE_S])      pad |= 1u << 9;   /* X */
+    if (keys[SDL_SCANCODE_C])      pad |= 1u << 10;  /* L */
+    if (keys[SDL_SCANCODE_V])      pad |= 1u << 11;  /* R */
+    return pad;
+}
+
+static uint8 *read_rom(const char *path, int *size_out)
+{
+    FILE *file = fopen(path, "rb");
+    long size;
+    uint8 *data;
+
+    if (!file) {
+        fprintf(stderr, "@PROJECT_NAME@: cannot open ROM: %s\n", path);
+        return NULL;
+    }
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0) {
+        fclose(file);
+        return NULL;
+    }
+    data = (uint8 *)malloc((size_t)size);
+    if (!data || fread(data, 1, (size_t)size, file) != (size_t)size) {
+        free(data);
+        fclose(file);
+        fprintf(stderr, "@PROJECT_NAME@: short read: %s\n", path);
+        return NULL;
+    }
+    fclose(file);
+    *size_out = (int)size;
+    return data;
+}
+
+int main(int argc, char **argv)
+{
+    const char *rom_path = argc > 1 ? argv[1] : "@ROM_FILE@";
+    int rom_size = 0;
+    uint8 *rom;
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+    int running = 1;
+
+    /* Players supply their own ROM; none is shipped with this build. */
+    rom = read_rom(rom_path, &rom_size);
+    if (!rom) {
+        fprintf(stderr,
+                "usage: %s [path-to-rom.sfc]\n"
+                "You must legally own a copy of @DISPLAY_NAME@.\n", argv[0]);
+        return 1;
+    }
+
+    RtlRegisterGame(&kGameInfo);
+    if (!SnesInit(rom, rom_size)) {
+        fprintf(stderr, "@PROJECT_NAME@: SnesInit failed\n");
+        return 1;
+    }
+
+    /* snesrecomp_sdl_* wrap the SDL2/SDL3 API differences, so this host
+     * builds against either backend (-DSNESRECOMP_SDL_BACKEND=SDL2|SDL3). */
+    if (!snesrecomp_sdl_init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    window = snesrecomp_sdl_create_window("@WINDOW_TITLE@", GAME_WIDTH * 3,
+                                          GAME_HEIGHT * 3, 0);
+    renderer = window ? snesrecomp_sdl_create_renderer(window, false, true)
+                      : NULL;
+    texture = renderer
+        ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING,
+                            GAME_WIDTH, GAME_HEIGHT)
+        : NULL;
+    if (!window || !renderer || !texture) {
+        fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    while (running) {
+        SDL_Event event;
+        void *pixels = NULL;
+        int pitch = 0;
+        uint32 inputs;
+
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT)
+                running = 0;
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
+                running = 0;
+        }
+
+        /* Seat 0 in the low 12 bits, seat 1 in the next 12. Seats 2..7 (with
+         * a multitap) go through RtlSetPadState — see
+         * snesrecomp/docs/MULTITAP.md. */
+        inputs = read_keyboard();
+        RtlRunFrame(inputs);
+
+        if (snesrecomp_sdl_lock_texture(texture, NULL, &pixels, &pitch)) {
+            RtlDrawPpuFrame((uint8 *)pixels, (size_t)pitch, 0);
+            SDL_UnlockTexture(texture);
+        }
+        SDL_RenderClear(renderer);
+        snesrecomp_sdl_render_texture(renderer, texture, NULL, NULL);
+        SDL_RenderPresent(renderer);
+    }
+
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    free(rom);
+    return 0;
+}

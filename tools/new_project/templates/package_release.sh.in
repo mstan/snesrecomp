@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Package a player-facing @DISPLAY_NAME@ release.
+#
+# The zip contains the built executable and its runtime assets. It never
+# contains the ROM, generated C, or anything else derived from copyrighted
+# data — players bring their own ROM and the binary reads it at launch.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
+
+BUILD_DIR="${BUILD_DIR:-build}"
+VERSION="$(tr -d '[:space:]' < VERSION)"
+PLATFORM="${PLATFORM:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}"
+STAGE="dist/@ZIP_PREFIX@-$VERSION-$PLATFORM"
+EXE="$BUILD_DIR/@PROJECT_NAME@"
+[ -f "$EXE.exe" ] && EXE="$EXE.exe"
+
+if [ ! -f "$EXE" ]; then
+  echo "package_release.sh: $EXE not found — build first:" >&2
+  echo "  cmake -S . -B $BUILD_DIR -DCMAKE_BUILD_TYPE=Release && cmake --build $BUILD_DIR -j" >&2
+  exit 1
+fi
+
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp "$EXE" "$STAGE/"
+cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+[ -d assets ] && cp -R assets "$STAGE/"
+
+# Guard the licensing rule mechanically rather than by memory: no ROM-derived
+# bytes leave this tree in a release zip.
+if find "$STAGE" \( -name '*.sfc' -o -name '*.smc' -o -name '*.srm' \) | grep -q .; then
+  echo "package_release.sh: refusing to package — ROM data found in $STAGE" >&2
+  exit 1
+fi
+
+( cd dist && zip -qr "$(basename "$STAGE").zip" "$(basename "$STAGE")" )
+echo "Packaged: dist/$(basename "$STAGE").zip"

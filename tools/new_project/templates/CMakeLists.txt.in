@@ -1,0 +1,75 @@
+cmake_minimum_required(VERSION 3.20)
+project(@PROJECT_NAME@ C CXX)
+
+set(CMAKE_C_STANDARD 11)
+
+# Release pin for lobby matching. Release builds stamp the VERSION file so two
+# peers can prove they are the same build; everything else stamps "dev".
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _GAME_VER_RAW)
+string(STRIP "${_GAME_VER_RAW}" GAME_RELEASE_VERSION)
+set(SNESRECOMP_BUILD_VERSION "" CACHE STRING
+    "Lobby release pin (empty = Release uses VERSION, else dev)")
+if(SNESRECOMP_BUILD_VERSION STREQUAL "")
+    get_property(_is_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_is_multi)
+        set(SNESRECOMP_BUILD_VERSION "$<IF:$<CONFIG:Release>,${GAME_RELEASE_VERSION},dev>")
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+        set(SNESRECOMP_BUILD_VERSION "${GAME_RELEASE_VERSION}")
+    else()
+        set(SNESRECOMP_BUILD_VERSION "dev")
+    endif()
+endif()
+
+set(SNESRECOMP_ROOT "${CMAKE_SOURCE_DIR}/snesrecomp" CACHE PATH
+    "Path to the snesrecomp checkout used by this game")
+if(NOT EXISTS "${SNESRECOMP_ROOT}/runner/runner.cmake")
+    message(FATAL_ERROR
+        "snesrecomp submodule missing at ${SNESRECOMP_ROOT}.\n"
+        "Run: git submodule update --init --recursive")
+endif()
+include(${SNESRECOMP_ROOT}/runner/runner.cmake)
+
+# Generated recompiler output. Not committed: it is derived from a copyrighted
+# ROM, so every developer regenerates it locally from their own copy.
+file(GLOB GAME_GEN_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/gen/*.c)
+if(NOT GAME_GEN_SOURCES)
+    message(FATAL_ERROR
+        "src/gen/ is empty — run `bash tools/regen.sh` with a verified "
+        "@ROM_FILE@ at the repo root before building.")
+endif()
+
+add_executable(@PROJECT_NAME@
+    ${SNESRECOMP_RUNNER_SOURCES}
+    src/main.c
+    src/host_contract.c
+    src/codegen_setup.c
+    src/game_rtl.c
+    src/gen_stubs.c
+    ${GAME_GEN_SOURCES}
+)
+
+target_include_directories(@PROJECT_NAME@ PRIVATE
+    ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
+    # common_rtl.c includes "config.h": the desktop key-map / Config contract
+    # a host is expected to supply. The framework's shared version is used
+    # here; copy it into src/ and drop this line once this game needs its own.
+    ${SNESRECOMP_ROOT}/runner/src/desktop
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/recomp
+)
+target_link_libraries(@PROJECT_NAME@ PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES})
+target_compile_definitions(@PROJECT_NAME@ PRIVATE
+    SNES_GAME_VERSION="${SNESRECOMP_BUILD_VERSION}"
+    SNES_GAME_TITLE="@WINDOW_TITLE@"
+)
+snesrecomp_target_sdl(@PROJECT_NAME@)
+
+# Generated C is machine output: it is not held to the runner's warning bar,
+# and treating it as such buries real warnings from hand-written host code.
+if(NOT MSVC)
+    set_source_files_properties(${GAME_GEN_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w")
+endif()
+
+@NETPLAY_BLOCK@
+@MULTITAP_BLOCK@

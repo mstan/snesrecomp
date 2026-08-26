@@ -1,0 +1,100 @@
+/*
+ * @DISPLAY_NAME@ — per-game runtime glue.
+ *
+ * THIS FILE IS THE PORT. Everything else the scaffold produced is layout,
+ * build wiring, and packaging; this is where the actual work happens.
+ *
+ * The framework does not, and cannot, drive an arbitrary SNES game on its
+ * own. Two responsibilities always land on the game host:
+ *
+ *   1. Deciding what "one frame" means for THIS title, and returning from
+ *      run_frame() at that boundary. A real ROM's reset vector never
+ *      returns — it enters a main loop that waits on vblank — so somebody
+ *      has to choose the yield point.
+ *   2. Delivering NMI/IRQ at the hardware edge. Nothing in the framework
+ *      pushes an interrupt frame for you (see snesrecomp/docs/FRAME_MODEL_HOSTS.md).
+ *
+ * What follows is the general LLE-first shape, built from documented bridge
+ * entry points: run until the interpreter reaches a deterministic read-only
+ * cycle (a real frame boundary, not a guessed address), then resume there
+ * next frame. It compiles and it is the right starting point. Whether it
+ * boots YOUR title is the porting work — expect to replace the body below
+ * with something that understands this game's main loop, the way
+ * MetalWarriorsSNESRecomp's src/mw_rtl.c does.
+ */
+
+#include "game_rtl.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "common_cpu_infra.h"
+#include "cpu_state.h"
+#include "snes/interp_bridge.h"
+#include "snes/ppu.h"
+#include "snes/snes.h"
+
+extern CpuState g_cpu;
+extern Ppu *g_ppu;
+
+/* One NTSC frame: 262 scanlines x 1364 master clocks. Bounds a productive
+ * MMIO loop so it cannot run across several vblanks atomically. */
+#define GAME_MASTER_CYCLES_PER_FRAME 357368ull
+
+/* 0 until the first frame has booted from the reset vector. */
+static uint32_t g_resume_pc;
+
+static uint32_t reset_vector(void)
+{
+    /* $FFFC/$FFFD in the current mapping, read through the guest bus so a
+     * mapper or coprocessor window resolves the same way the CPU sees it. */
+    uint32_t lo = snes_read(g_snes, 0x00FFFCu);
+    uint32_t hi = snes_read(g_snes, 0x00FFFDu);
+    return (hi << 8) | lo;
+}
+
+void GameRunOneFrame(void)
+{
+    uint32_t entry = g_resume_pc ? g_resume_pc : reset_vector();
+
+    interp_bridge_set_master_deadline(
+        g_cpu.master_cycles + GAME_MASTER_CYCLES_PER_FRAME);
+    interp_bridge_run_until_quiescent(&g_cpu, entry);
+    g_resume_pc = interp_bridge_lle_resume_pc();
+
+    if (interp_bridge_lle_took_wai()) {
+        /* The guest executed WAI and is waiting for an interrupt. A finished
+         * port pushes the interrupt frame and runs the handler here — see
+         * cpu_push_interrupt_frame_at() and interp_bridge_run_interrupt().
+         * Left undone on purpose: delivering NMI before this title's own
+         * vblank bookkeeping is ready tends to hang in a way that reads as a
+         * framework bug rather than an unfinished port. */
+    }
+}
+
+void GameDrawPpuFrame(void)
+{
+    int line;
+
+    /* Render the visible field. A title with mid-frame raster effects will
+     * need this driven from the beam instead of a single sweep. */
+    for (line = 1; line <= 224; line++)
+        ppu_runLine(g_ppu, line);
+}
+
+const RtlGameInfo kGameInfo = {
+    .title = "@CATALOG_SLUG@",
+    .initialize = NULL,
+    .run_frame = &GameRunOneFrame,
+    .draw_ppu_frame = &GameDrawPpuFrame,
+    .save_name_prefix = "save",
+};
+
+void GameSessionReset(void)
+{
+    /* Rematch / soft-return: clear anything that must not survive a new
+     * session. recomp-ai-rules/NETPLAY.md §3 — sticky state that "has always
+     * been fine" is the usual desync culprit, because single-player never
+     * re-enters the boot path twice in one process. */
+    g_resume_pc = 0;
+}
