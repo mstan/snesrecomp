@@ -1,11 +1,25 @@
 /*
  * @DISPLAY_NAME@ — desktop host.
  *
- * Deliberately small: a window, a texture, a keyboard map, and the frame
- * loop the framework expects (capture input -> RtlRunFrame -> present).
- * snesrecomp/runner/src/desktop/mmx23_host_main.inc is the fully-featured
- * reference host — launcher, netplay barrier, shaders, save states, gamepad
- * config — and is worth reading before growing this one.
+ * Deliberately small: ROM resolution, a window, a texture, a keyboard map,
+ * and the frame loop the framework expects (capture input -> RtlRunFrame ->
+ * present). snesrecomp/runner/src/desktop/mmx23_host_main.inc is the
+ * fully-featured reference host — netplay barrier, shaders, save states,
+ * gamepad config — and is worth reading before growing this one.
+ *
+ * Nothing here ever ships a ROM. The player supplies one, and the host's job
+ * is to make that easy rather than to exit with a usage line:
+ *
+ *   1. The recomp-ui GUI launcher (built when the project has the recomp-ui
+ *      submodule) picks and verifies one, alongside display/audio/input.
+ *   2. Otherwise snesrecomp_launcher_resolve_rom_sha256() takes the
+ *      positional argument, then a copy beside the executable, then the
+ *      <exe_dir>/rom.cfg cache, then a native file picker.
+ *
+ * Both check what they are handed against the digests in codegen_setup.c —
+ * the same ones tools/regen.sh generated this C from — so a ROM that cannot
+ * have produced this executable is caught at the door rather than as
+ * mis-execution ten frames in.
  */
 
 #include <stdio.h>
@@ -18,6 +32,18 @@
 #include "game_rtl.h"
 #include "snes/ppu.h"
 #include "desktop/sdl_compat.h"
+#include "host_paths.h"      /* snesrecomp_exe_dir_path */
+#include "launcher.h"        /* snesrecomp_launcher_resolve_rom_sha256 */
+#include "launcher_cache.h"  /* snesrecomp_rom_cache_read */
+#include "codegen_setup.h"   /* kGameCodegenIdentity - the ROM digests */
+
+#if defined(RECOMP_LAUNCHER)
+/* Defined by recomp_target_launcher_ui() in CMakeLists.txt. Absent when the
+ * project was scaffolded with --no-recomp-ui, and every launcher block in
+ * this file compiles out with it. */
+#include "recomp_launcher.h"
+#include "launcher_profile.h"
+#endif
 
 #define GAME_WIDTH  256
 #define GAME_HEIGHT 224
@@ -58,6 +84,14 @@ static uint16_t read_keyboard(void)
     return pad;
 }
 
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static uint8 *read_rom(const char *path, int *size_out)
 {
     FILE *file = fopen(path, "rb");
@@ -87,9 +121,140 @@ static uint8 *read_rom(const char *path, int *size_out)
     return data;
 }
 
+/* kGameCodegenIdentity carries the digests as text, because tools/regen.sh
+ * and the CI workflow read them from the same struct. The ROM checks want
+ * bytes. Returns NULL when the identity is unset or malformed, which the
+ * callers read as "cannot verify" rather than "verified". */
+static const uint8_t *expected_rom_sha256(uint8_t out[32])
+{
+    const char *hex = kGameCodegenIdentity.expected_sha256;
+    int i;
+
+    if (!hex || strlen(hex) != 64)
+        return NULL;
+    for (i = 0; i < 32; ++i) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return NULL;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return out;
+}
+
+static int expected_rom_crc32(uint32_t *out)
+{
+    const char *hex = kGameCodegenIdentity.expected_crc32;
+    uint32_t v = 0;
+    int i;
+
+    if (!hex || strlen(hex) != 8)
+        return 0;
+    for (i = 0; i < 8; ++i) {
+        int n = hex_nibble(hex[i]);
+        if (n < 0)
+            return 0;
+        v = (v << 4) | (uint32_t)n;
+    }
+    *out = v;
+    return 1;
+}
+
+/* The dump this project was generated from, if the player parked a copy next
+ * to the executable or in the working directory. Not a requirement — it is
+ * the habit `tools/regen.sh` documents, and skipping the prompt for someone
+ * who already followed it is the whole point. */
+static int find_rom_beside_exe(char *out, size_t cap)
+{
+    const char *name = kGameCodegenIdentity.rom_file;
+    FILE *f;
+
+    if (!name || !name[0])
+        return 0;
+    if (snesrecomp_exe_dir_path(name, out, cap)) {
+        f = fopen(out, "rb");
+        if (f) {
+            fclose(f);
+            return 1;
+        }
+    }
+    f = fopen(name, "rb");
+    if (f) {
+        fclose(f);
+        snprintf(out, cap, "%s", name);
+        return 1;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+#if defined(RECOMP_LAUNCHER)
+/* Pre-boot GUI: ROM picker, display/audio/input settings, verification status.
+ * Returns 1 when `out` holds a ROM to boot, 0 to fall through to the
+ * text-mode resolve below, and -1 when the player chose to quit. */
+static int run_gui_launcher(const char *initial_rom, char *out, size_t cap)
+{
+    RecompLauncherCSettings ls;
+    RecompLauncherCGameInfo gi;
+    uint8_t sha[32];
+    uint32_t crc;
+    char assets_dir[1024];
+    int lr;
+
+    /* recomp-ui resolves its staged assets (assets/fonts, assets/img) relative
+     * to the executable; the argument exists for hosts with other layouts. */
+    if (!snesrecomp_exe_dir_path(".", assets_dir, sizeof(assets_dir)))
+        snprintf(assets_dir, sizeof(assets_dir), ".");
+
+    memset(&ls, 0, sizeof(ls));
+    ls.output_method = 2;      /* OpenGL */
+    ls.window_scale  = 3;      /* matches the game window opened below */
+    ls.enable_audio  = 1;
+    ls.audio_freq    = 32000;
+    ls.volume        = 100;
+    ls.player_src[0] = 1;      /* keyboard */
+
+    memset(&gi, 0, sizeof(gi));
+    /* One profile call sets the whole SNES identity — theme, pad art, platform
+     * label, ROM noun, capability set — so those can never drift apart. */
+    launcher_profile_apply("snes", &gi);
+    gi.name        = "@DISPLAY_NAME@";
+    gi.region      = "(@REGION@)";
+    gi.num_players = @PLAYERS@;
+    /* `sha` outlives the run_window call below, which is the only consumer. */
+    if (expected_rom_sha256(sha)) {
+        gi.known_sha256     = (const uint8_t (*)[32])&sha;
+        gi.num_known_sha256 = 1;
+    }
+    if (expected_rom_crc32(&crc)) {
+        gi.expected_crc     = crc;
+        gi.has_expected_crc = 1;
+    }
+
+    out[0] = '\0';
+    lr = recomp_launcher_run_window("@WINDOW_TITLE@", &ls, &gi, assets_dir,
+                                    (initial_rom && initial_rom[0]) ? initial_rom
+                                                                    : NULL,
+                                    out, cap);
+    if (lr == RECOMP_LAUNCHER_RESULT_QUIT)
+        return -1;
+    if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && out[0])
+        return 1;
+    /* UNAVAILABLE (assets or GL missing) and RELAUNCH (only reachable once a
+     * host wires gi.rebuild_with_progress, which this scaffold does not) both
+     * mean "the GUI produced no ROM" — resolve one the text-mode way. */
+    out[0] = '\0';
+    return 0;
+}
+#endif /* RECOMP_LAUNCHER */
+
 int main(int argc, char **argv)
 {
-    const char *rom_path = argc > 1 ? argv[1] : "@ROM_FILE@";
+    char rom_path[1024] = "";
+    char beside_exe[1024] = "";
+    uint8_t sha[32];
+    const uint8_t *want_sha = expected_rom_sha256(sha);
+    int has_positional = (argc > 1 && argv[1] && argv[1][0] && argv[1][0] != '-');
     int rom_size = 0;
     uint8 *rom;
     SDL_Window *window;
@@ -97,14 +262,63 @@ int main(int argc, char **argv)
     SDL_Texture *texture;
     int running = 1;
 
-    /* Players supply their own ROM; none is shipped with this build. */
-    rom = read_rom(rom_path, &rom_size);
-    if (!rom) {
-        fprintf(stderr,
-                "usage: %s [path-to-rom.sfc]\n"
-                "You must legally own a copy of @DISPLAY_NAME@.\n", argv[0]);
-        return 1;
+    if (!has_positional)
+        find_rom_beside_exe(beside_exe, sizeof(beside_exe));
+
+#if defined(RECOMP_LAUNCHER)
+    /* A dummy video driver means CI or a screenshot harness: there is no one
+     * to answer a GUI, and blocking on one would hang the job. */
+    {
+        const char *vd = getenv("SDL_VIDEODRIVER");
+        int headless = (vd && strcmp(vd, "dummy") == 0);
+
+        if (!headless && !has_positional) {
+            /* Open on the ROM the player already has, so a second launch is
+             * PLAY rather than Change-ROM: the copy beside the executable
+             * first, else whatever the last run cached in rom.cfg. */
+            char hint[1024];
+
+            snprintf(hint, sizeof(hint), "%s", beside_exe);
+            if (!hint[0] && !snesrecomp_rom_cache_read(hint, sizeof(hint)))
+                hint[0] = '\0';
+            {
+                int lr = run_gui_launcher(hint, rom_path, sizeof(rom_path));
+                if (lr < 0)
+                    return 0;          /* player quit from the launcher */
+            }
+        }
     }
+#endif
+
+    /* Players supply their own ROM; none is shipped with this build. Without
+     * one from the GUI, resolve it the text-mode way: the positional argument,
+     * then the copy beside the executable, then <exe_dir>/rom.cfg, then a
+     * native file picker — each checked against the digests above. */
+    if (!rom_path[0]) {
+        char *resolve_argv[2];
+        int resolve_argc = 1;
+
+        resolve_argv[0] = argv[0];
+        if (has_positional) {
+            resolve_argv[1] = argv[1];
+            resolve_argc = 2;
+        } else if (beside_exe[0]) {
+            resolve_argv[1] = beside_exe;
+            resolve_argc = 2;
+        }
+        if (!snesrecomp_launcher_resolve_rom_sha256(resolve_argc, resolve_argv,
+                                                    rom_path, sizeof(rom_path),
+                                                    want_sha)) {
+            fprintf(stderr,
+                    "usage: %s [path-to-rom.sfc]\n"
+                    "You must legally own a copy of @DISPLAY_NAME@.\n", argv[0]);
+            return 1;
+        }
+    }
+
+    rom = read_rom(rom_path, &rom_size);
+    if (!rom)
+        return 1;
 
     RtlRegisterGame(&kGameInfo);
     if (!SnesInit(rom, rom_size)) {

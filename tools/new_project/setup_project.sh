@@ -27,6 +27,10 @@
 #   --netplay / --no-netplay        recomp-net delay-sync (default: off)
 #   --rollback / --no-rollback      retcomm-rbengine rollback (implies netplay)
 #   --ci / --no-ci                  .github/workflows/release.yml (default: on)
+#   --recomp-ui / --no-recomp-ui    Dear ImGui pre-boot launcher: ROM picker,
+#                                   verification, display/audio/input settings
+#                                   (default: on). Without it the host still
+#                                   resolves a ROM, just in text mode.
 #   --no-submodules                 skip submodule add/init (offline scaffold;
 #                                   the project will not build until you run
 #                                   git submodule update --init --recursive)
@@ -37,7 +41,7 @@
 #
 # Framework refs:
 #   --snesrecomp-ref <ref>    default: main
-#   --recomp-ui-ref <ref>     default: master (omit with --no-recomp-ui)
+#   --recomp-ui-ref <ref>     default: master (unused with --no-recomp-ui)
 #   --recomp-net-ref <ref>    override the nested pin inside snesrecomp
 #   --rbengine-ref <ref>      override the nested pin inside snesrecomp
 #   --snesrecomp-url / --recomp-ui-url
@@ -105,7 +109,7 @@ DESCRIPTION=""; PUBLISHER=""; YEAR=""; REGION_OVERRIDE=""
 SET_NETPLAY=0; SET_ROLLBACK=0; SET_CI=0; SET_RECOMP_UI=0
 SET_GENERATE=0; SET_BUILD=0; SET_GITHUB=0
 GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
-ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=0
+ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
 ADD_SUBMODULES=1
 DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
 # Default the framework ref to the branch this checkout is on, for the same
@@ -282,7 +286,7 @@ fi
 [ -z "$REGION_OVERRIDE" ] || REGION="$REGION_OVERRIDE"
 
 if [ "$SET_RECOMP_UI" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-    prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 0
+    prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 1
 fi
 
 if [ "$PLAYERS" -eq 1 ]; then
@@ -374,6 +378,31 @@ if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
     NETPLAY_BLOCK="$NETPLAY_BLOCK
 snesrecomp_enable_rollback($PROJECT_NAME)"
 fi
+# The pre-boot GUI launcher lives in recomp-ui, so it is wired only when that
+# submodule is present. Without it the host still resolves a ROM (positional ->
+# beside the exe -> rom.cfg -> native picker) — main.c compiles the GUI blocks
+# out on RECOMP_LAUNCHER, which this call is what defines.
+LAUNCHER_BLOCK="# No GUI launcher: this project was scaffolded with --no-recomp-ui.
+# Add the submodule and re-run this block to get one:
+#   git submodule add https://github.com/mstan/recomp-ui.git recomp-ui
+#   set(RECOMP_UI_ROOT \"\${CMAKE_SOURCE_DIR}/recomp-ui\" CACHE PATH \"\" FORCE)
+#   include(\${RECOMP_UI_ROOT}/recomp_ui.cmake)
+#   recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes)"
+if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    LAUNCHER_BLOCK="# Shared Dear ImGui pre-boot launcher (ROM picker, verification, display /
+# audio / input settings). Self-contained: it brings its own ImGui, GL link and
+# staged assets, and defines RECOMP_LAUNCHER so src/main.c compiles its GUI path.
+set(RECOMP_UI_ROOT \"\${CMAKE_SOURCE_DIR}/recomp-ui\" CACHE PATH
+    \"Root directory of the recomp-ui launcher repo\" FORCE)
+if(NOT EXISTS \"\${RECOMP_UI_ROOT}/recomp_ui.cmake\")
+    message(FATAL_ERROR
+        \"recomp-ui missing at \${RECOMP_UI_ROOT}.\\n\"
+        \"Run: git submodule update --init --recursive recomp-ui\")
+endif()
+include(\${RECOMP_UI_ROOT}/recomp_ui.cmake)
+recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes)"
+fi
+
 MULTITAP_BLOCK="# No multitap: two seats, one controller per port."
 if [ "$MULTITAP" != "off" ]; then
     MULTITAP_BLOCK="# Seats: $PLAYERS. Call RtlSetMultitap() at startup, or launch with
@@ -500,6 +529,7 @@ fill() {
         --set "PLAYERS=$PLAYERS" \
         --set "PLAYERS_NOTE=$PLAYERS_NOTE" \
         --set "NETPLAY_BLOCK=$NETPLAY_BLOCK" \
+        --set "LAUNCHER_BLOCK=$LAUNCHER_BLOCK" \
         --set "MULTITAP_BLOCK=$MULTITAP_BLOCK" \
         --set "SETUP_DATE=$SETUP_DATE" \
         --set "DESCRIPTION=$DESCRIPTION_MD" \

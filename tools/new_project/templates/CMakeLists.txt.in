@@ -64,6 +64,8 @@ target_compile_definitions(@PROJECT_NAME@ PRIVATE
 )
 snesrecomp_target_sdl(@PROJECT_NAME@)
 
+@LAUNCHER_BLOCK@
+
 # Generated C is machine output: it is not held to the runner's warning bar,
 # and treating it as such buries real warnings from hand-written host code.
 if(NOT MSVC)
