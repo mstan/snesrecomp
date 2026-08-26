@@ -65,6 +65,26 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
 }
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
+
+/* Attribution-scope stubs (common_cpu_infra.c in the real runner). The test
+ * doubles record what the bridge pushed so the interp scope is testable: the
+ * write rings copy g_last_recomp_func / the stack at write time, and if the
+ * bridge stops installing its interp@$ name, interpreted writes silently
+ * re-attribute to the stale enclosing AOT frame. */
+const char *g_last_recomp_func = "(none)";
+static const char *g_push_log[16];
+static int g_push_count = 0;
+static int g_push_depth = 0;
+static int g_pop_underflow = 0;
+void RecompStackPush(const char *name) {
+    if (g_push_count < 16) g_push_log[g_push_count] = name;
+    g_push_count++;
+    g_push_depth++;
+}
+void RecompStackPop(void) {
+    if (g_push_depth <= 0) g_pop_underflow = 1;
+    g_push_depth--;
+}
 void snes_catchupApu(Snes *snes) { (void)snes; }
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
     (void)snes; (void)master_clock;
@@ -332,12 +352,26 @@ int main(void) {
       uint8_t c[] = {0xA9,0x09, 0x60};
       load(0x8000, c, sizeof c);
       cpu_push_jsr_return_frame(&g_c);
+      g_push_count = 0; g_push_depth = 0; g_pop_underflow = 0;
+      const char *func_before = g_last_recomp_func;
       int rc = interp_bridge_run(&g_c, 0x008000);
       printf("S2 pure interp routine\n");
       CHECK(rc == 1, "rc=%d exp 1", rc);
       CHECK(g_aot_called == 0, "aot_called=%d exp 0", g_aot_called);
       CHECK((g_c.A & 0xFF) == 0x09, "A.lo=%02X exp 09", g_c.A & 0xFF);
-      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF", g_c.S); }
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF", g_c.S);
+      /* Attribution scope: the run pushed its interp@$ entry name, popped it
+       * on exit, and restored g_last_recomp_func. */
+      CHECK(g_push_count >= 1, "push_count=%d exp >=1 (interp scope pushed)",
+            g_push_count);
+      CHECK(g_push_count >= 1 && g_push_log[0] &&
+            strcmp(g_push_log[0], "interp@$008000") == 0,
+            "pushed name '%s' exp 'interp@$008000'",
+            g_push_count >= 1 && g_push_log[0] ? g_push_log[0] : "(null)");
+      CHECK(g_push_depth == 0, "push_depth=%d exp 0 (balanced)", g_push_depth);
+      CHECK(!g_pop_underflow, "pop underflow");
+      CHECK(g_last_recomp_func == func_before,
+            "g_last_recomp_func not restored after run"); }
 
     /* S3: JSR $8200 (NOT compiled) ; RTS  /  $8200: LDA #$33 ; RTS */
     { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;

@@ -1390,12 +1390,18 @@ typedef struct {
     uint8_t e;      // emulation mode
 } FrameCpuSnap;
 
-// Per-frame PPU register snapshot (32 bytes)
+// Per-frame PPU register snapshot
 typedef struct {
     uint8_t inidisp, bgmode, mosaic, obsel, setini;
     uint8_t screenEnabled[2], cgadsub, cgwsel, pad;
     uint16_t hScroll[4], vScroll[4];
     uint16_t fixedColor, vramPointer;
+    /* Decoder inputs (asset tooling): per-BG tilemap base/size ($210[7-A])
+     * and the packed BG char bases ($210B/C). Without these a frame-keyed
+     * VRAM snapshot cannot be decoded into layers — only the LIVE registers
+     * were queryable, which is the wrong frame by the time a tool asks. */
+    uint8_t bgXsc[4];
+    uint16_t bgTileAdr;
 } FramePpuSnap;
 
 // Per-frame interrupt/timing snapshot. Added 2026-04-23 after the tooling-
@@ -1600,6 +1606,8 @@ void debug_server_record_frame(int frame) {
         memcpy(r->ppu.vScroll, g_ppu->vScroll, sizeof(r->ppu.vScroll));
         r->ppu.fixedColor = g_ppu->fixedColor;
         r->ppu.vramPointer = g_ppu->vramPointer;
+        memcpy(r->ppu.bgXsc, g_ppu->bgXsc, sizeof(r->ppu.bgXsc));
+        r->ppu.bgTileAdr = g_ppu->bgTileAdr;
         // CGRAM + OAM snapshots
         memcpy(r->cgram, g_ppu->cgram, sizeof(r->cgram));
         memcpy(r->oam, g_ppu->oam, sizeof(r->oam));
@@ -4918,7 +4926,9 @@ static void cmd_get_frame_extended(const char *args) {
         "\"screenEnabled\":[\"0x%02x\",\"0x%02x\"],"
         "\"cgadsub\":\"0x%02x\",\"cgwsel\":\"0x%02x\","
         "\"hScroll\":[%d,%d,%d,%d],\"vScroll\":[%d,%d,%d,%d],"
-        "\"fixedColor\":\"0x%04x\",\"vramPointer\":\"0x%04x\"},",
+        "\"fixedColor\":\"0x%04x\",\"vramPointer\":\"0x%04x\","
+        "\"bgXsc\":[\"0x%02x\",\"0x%02x\",\"0x%02x\",\"0x%02x\"],"
+        "\"bgTileAdr\":\"0x%04x\"},",
         r->frame_number,
         r->cpu.a, r->cpu.x, r->cpu.y, r->cpu.sp, r->cpu.pc, r->cpu.dp,
         r->cpu.k, r->cpu.db, r->cpu.flags, r->cpu.e,
@@ -4928,7 +4938,9 @@ static void cmd_get_frame_extended(const char *args) {
         r->ppu.cgadsub, r->ppu.cgwsel,
         r->ppu.hScroll[0], r->ppu.hScroll[1], r->ppu.hScroll[2], r->ppu.hScroll[3],
         r->ppu.vScroll[0], r->ppu.vScroll[1], r->ppu.vScroll[2], r->ppu.vScroll[3],
-        r->ppu.fixedColor, r->ppu.vramPointer);
+        r->ppu.fixedColor, r->ppu.vramPointer,
+        r->ppu.bgXsc[0], r->ppu.bgXsc[1], r->ppu.bgXsc[2], r->ppu.bgXsc[3],
+        r->ppu.bgTileAdr);
     send(s_client_sock, buf, pos, 0);
 
     // DMA channels (incl. HDMA state fields captured per-frame)
