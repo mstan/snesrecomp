@@ -108,7 +108,14 @@ GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
 ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=0
 ADD_SUBMODULES=1
 DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
-SNESRECOMP_REF="main"; RECOMP_UI_REF="master"; RECOMP_NET_REF=""; RBENGINE_REF=""
+# Default the framework ref to the branch this checkout is on, for the same
+# reason the URL is derived: a scaffold cut from a checkout should pin the
+# framework that checkout actually has. Hard-coding "main" silently produced
+# projects that could not generate or build whenever the work lived on a
+# branch.
+SNESRECOMP_REF=$(git -C "$FRAMEWORK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+[ -n "$SNESRECOMP_REF" ] || SNESRECOMP_REF="main"
+RECOMP_UI_REF="master"; RECOMP_NET_REF=""; RBENGINE_REF=""
 # The framework URL comes from the checkout this script is running out of, so
 # it cannot drift from where snesrecomp actually lives. (It was hard-coded to
 # the wrong org once; deriving it removes the class.)
@@ -405,6 +412,7 @@ fi
 # Check the submodule remotes BEFORE creating anything. A URL that resolves to
 # nothing used to fail half way through and leave a partial project directory
 # behind, which is a worse outcome than not starting.
+FRAMEWORK_REF_UNPUSHED=0
 if [ "$ADD_SUBMODULES" -eq 1 ]; then
     echo "== Checking framework remotes =="
     for _pair in "snesrecomp|$SNESRECOMP_URL" "recomp-ui|$RECOMP_UI_URL"; do
@@ -416,6 +424,16 @@ if [ "$ADD_SUBMODULES" -eq 1 ]; then
         esac
         if git ls-remote --exit-code "$_url" HEAD >/dev/null 2>&1; then
             echo "  ok  $_what -> $_url"
+            if [ "$_what" = "snesrecomp" ] &&
+               ! git ls-remote --exit-code --heads "$_url" "$SNESRECOMP_REF" \
+                   >/dev/null 2>&1; then
+                echo "warning: the framework branch '$SNESRECOMP_REF' is not on" >&2
+                echo "         $_url yet." >&2
+                echo "         The scaffold will pin the commit you have locally," >&2
+                echo "         so it builds here but nobody else can clone it" >&2
+                echo "         until that branch is pushed." >&2
+                FRAMEWORK_REF_UNPUSHED=1
+            fi
         else
             echo "setup_project: cannot reach the $_what remote:" >&2
             echo "  $_url" >&2
@@ -528,7 +546,20 @@ if [ "$ADD_SUBMODULES" -eq 0 ]; then
     echo "snesrecomp=<not added>" > framework_pins.txt
 else
 echo "== Adding submodules =="
-git submodule add -q -b "$SNESRECOMP_REF" "$SNESRECOMP_URL" snesrecomp
+git submodule add -q -b "$SNESRECOMP_REF" "$SNESRECOMP_URL" snesrecomp 2>/dev/null ||
+    git submodule add -q "$SNESRECOMP_URL" snesrecomp
+if [ "$FRAMEWORK_REF_UNPUSHED" -eq 1 ]; then
+    # Take the commit from the local checkout so generate/build work now.
+    # The pin is recorded either way; pushing the branch later makes it
+    # resolvable for everyone else without changing this project.
+    echo "== Using the local framework commit ($SNESRECOMP_REF) =="
+    git -C snesrecomp fetch -q "$FRAMEWORK_ROOT" "$SNESRECOMP_REF"
+    git -C snesrecomp checkout --detach -q FETCH_HEAD
+    # Record the gitlink NOW. `submodule update` below restores each submodule
+    # to whatever the index says, so a checkout that is not staged first gets
+    # snapped straight back to the commit `submodule add` recorded.
+    git add snesrecomp
+fi
 if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     git submodule add -q -b "$RECOMP_UI_REF" "$RECOMP_UI_URL" recomp-ui
 fi
@@ -669,11 +700,14 @@ if [ "$DO_GENERATE" -eq 1 ]; then
 fi
 
 BUILT=0
+GAME_EXE=""
 if [ "$DO_BUILD" -eq 1 ] && [ "$GENERATED" -eq 1 ]; then
     echo "== Building =="
     if cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null &&
        cmake --build build -j >/dev/null; then
         BUILT=1
+        GAME_EXE="build/$PROJECT_NAME"
+        [ -f "$GAME_EXE.exe" ] && GAME_EXE="$GAME_EXE.exe"
     else
         echo "warning: build failed — see the output above." >&2
         echo "         A fresh scaffold is not expected to run yet; src/game_rtl.c" >&2
@@ -693,6 +727,17 @@ fi
 
 echo
 echo "Ready: $ROOT"
+if [ "$GENERATED" -eq 1 ]; then
+    echo "  generated: $(find src/gen -name '*.c' | wc -l | tr -d ' ') C files in src/gen"
+fi
+if [ "$BUILT" -eq 1 ] && [ -f "$GAME_EXE" ]; then
+    echo "  built:     $GAME_EXE ($(du -h "$GAME_EXE" | cut -f1))"
+    echo
+    echo "Run it:"
+    echo "  '$ROOT/$GAME_EXE' '$ROM_ABS'"
+    echo
+    echo "It will not play yet — src/game_rtl.c is where the port starts."
+fi
 echo
 echo "Next:"
 echo "  cd '$ROOT'"
