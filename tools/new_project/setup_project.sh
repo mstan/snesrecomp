@@ -501,7 +501,6 @@ fill() {
         --set "PLAYERS_NOTE=$PLAYERS_NOTE" \
         --set "NETPLAY_BLOCK=$NETPLAY_BLOCK" \
         --set "MULTITAP_BLOCK=$MULTITAP_BLOCK" \
-        --set "DEFAULT_BRANCH=$DEFAULT_BRANCH" \
         --set "SETUP_DATE=$SETUP_DATE" \
         --set "DESCRIPTION=$DESCRIPTION_MD" \
         --set "PUBLISHER=$PUBLISHER_DISP" \

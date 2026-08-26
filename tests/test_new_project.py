@@ -300,6 +300,48 @@ def test_framework_ref_defaults_to_this_checkouts_branch():
         "the gitlink must be staged before submodule update restores it"
 
 
+def test_ci_workflow_is_manual_only():
+    """Releases across the port set are driven from the studio bulk tool. A
+    per-repo workflow that also fires on every push competes with it: wasted
+    minutes, and an ambiguous answer to "did CI pass" when the two disagree."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        project = _scaffold(tmp, "--ci")
+        workflow = project / ".github" / "workflows" / "release.yml"
+        assert workflow.is_file(), "CI was requested but no workflow was written"
+        text = workflow.read_text(encoding="utf-8")
+
+        body = text[text.index("\non:"):text.index("\njobs:")]
+        assert "workflow_dispatch" in body, body
+        for trigger in ("push:", "pull_request:", "schedule:"):
+            assert trigger not in body, f"{trigger} must not trigger this workflow"
+
+        # Publishing is opt-in per run, and still refuses a non-tag ref.
+        assert "publish_release" in text
+        assert "Refuse to publish from a non-tag ref" in text
+
+
+def test_host_template_builds_against_both_sdl_backends():
+    """The scaffolded host must compile under SDL2 and SDL3.
+
+    sdl_compat.h defines SDL_ENABLE_OLD_NAMES for SDL3, so the SDL2 spellings
+    work on both; the SDL3-only names do not. This shipped broken because the
+    development machine had SDL3 and nothing compiled it against SDL2 until
+    the generated CI did.
+    """
+    import re
+    template = (REPO_ROOT / "tools" / "new_project" / "templates"
+                / "main.c.in").read_text(encoding="utf-8")
+    # Scan code only: the comment explaining this rule names the very
+    # identifiers it forbids.
+    code = re.sub(r"/\*.*?\*/", " ", template, flags=re.S)
+    code = re.sub(r"//[^\n]*", " ", code)
+    sdl3_only = [name for name in ("SDL_EVENT_QUIT", "SDL_EVENT_KEY_DOWN",
+                                   "SDL_EVENT_KEY_UP")
+                 if name in code]
+    assert not sdl3_only, f"SDL3-only names in the host template: {sdl3_only}"
+
+
 def test_scaffold_refuses_to_overwrite():
     with tempfile.TemporaryDirectory() as directory:
         tmp = pathlib.Path(directory)

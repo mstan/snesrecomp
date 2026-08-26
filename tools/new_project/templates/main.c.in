@@ -139,9 +139,12 @@ int main(int argc, char **argv)
         uint32 inputs;
 
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT)
+            /* SDL2 spellings: sdl_compat.h defines SDL_ENABLE_OLD_NAMES for
+             * SDL3, so these compile against either backend. The SDL3-only
+             * names (SDL_EVENT_QUIT, ...) do not. */
+            if (event.type == SDL_QUIT)
                 running = 0;
-            if (event.type == SDL_EVENT_KEY_DOWN &&
+            if (event.type == SDL_KEYDOWN &&
                 SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
                 running = 0;
         }
