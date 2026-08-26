@@ -9,6 +9,7 @@ import pathlib
 import re
 import shutil
 import sys
+import zlib
 
 
 def resource_root() -> pathlib.Path:
@@ -54,18 +55,151 @@ def run_tool(tool, arguments: list[str]) -> int:
         sys.argv = original
 
 
-def build_project(args: argparse.Namespace) -> int:
-    rom_path = pathlib.Path(args.rom).expanduser().resolve()
-    output = pathlib.Path(args.output).expanduser().resolve()
-    if not rom_path.is_file():
-        raise ValueError(f"ROM not found: {rom_path}")
-    if rom_path.suffix.lower() not in (".sfc", ".smc"):
+ROM_SUFFIXES = (".sfc", ".smc")
+
+
+def read_rom(path: pathlib.Path) -> bytes:
+    """Validate ROM shape and return its bytes, or raise ValueError."""
+    if not path.is_file():
+        raise ValueError(f"ROM not found: {path}")
+    if path.suffix.lower() not in ROM_SUFFIXES:
         raise ValueError("ROM must be an .sfc or .smc file")
-    raw = rom_path.read_bytes()
+    raw = path.read_bytes()
     if len(raw) < 32 * 1024 or len(raw) > 16 * 1024 * 1024:
         raise ValueError("ROM size is outside the supported 32 KiB to 16 MiB range")
     if len(raw) % 1024 not in (0, 512):
         raise ValueError("ROM size is not a standard SNES image size")
+    return raw
+
+
+def rom_digests(raw: bytes) -> tuple[str, str]:
+    """(crc32, sha256) as lowercase hex, over the file exactly as supplied."""
+    return ("%08x" % (zlib.crc32(raw) & 0xFFFFFFFF), hashlib.sha256(raw).hexdigest())
+
+
+def check_expected_digests(raw: bytes, expected_crc32: str | None,
+                           expected_sha256: str | None) -> None:
+    crc, sha = rom_digests(raw)
+    if expected_crc32 and crc.lower() != expected_crc32.strip().lower():
+        raise ValueError(
+            f"ROM CRC32 {crc} does not match the expected {expected_crc32.lower()}")
+    if expected_sha256 and sha.lower() != expected_sha256.strip().lower():
+        raise ValueError(
+            f"ROM SHA-256 {sha} does not match the expected {expected_sha256.lower()}")
+
+
+def resolve_analyzer(backend: str) -> str:
+    """Point the emitter at the native analyzer when one is available.
+
+    `auto` uses the native analyzer if it is built and the Python analyzer
+    otherwise; `native` insists and fails loudly when it is missing, because
+    silently dropping to a different analyzer would change what gets emitted.
+    """
+    analyzer = ROOT / "recompiler-rs" / "target" / "release" / (
+        "snesrecomp-analyze.exe" if os.name == "nt" else "snesrecomp-analyze")
+    if analyzer.is_file():
+        os.environ["SNESRECOMP_NATIVE_ANALYZER"] = str(analyzer)
+        return backend if backend != "auto" else "native"
+    if backend == "native":
+        raise RuntimeError(
+            "--analysis-backend native was requested but the analyzer is not "
+            f"built at {analyzer} (build it with "
+            "tools/build_native_analyzer.py)")
+    return "python" if backend == "auto" else backend
+
+
+def run_emit(rom: pathlib.Path, cfg_dir: pathlib.Path, out_dir: pathlib.Path,
+             *, backend: str = "auto", cfg_roots: bool = False,
+             no_host_root_scan: bool = False,
+             source_roots: list[str] | None = None) -> None:
+    """Generate C from a ROM plus its bank configs. Raises on failure."""
+    resolved = resolve_analyzer(backend)
+    arguments = [
+        "--rom", str(rom),
+        "--cfg-dir", str(cfg_dir),
+        "--out-dir", str(out_dir),
+        "--analysis-backend", resolved,
+    ]
+    if cfg_roots:
+        arguments.append("--cfg-roots")
+    if no_host_root_scan:
+        arguments.append("--no-host-root-scan")
+    for root in source_roots or []:
+        arguments.extend(["--source-root", root])
+    if run_tool(v2_emit, arguments):
+        raise RuntimeError("source generation failed")
+
+
+def generate_project(args: argparse.Namespace) -> int:
+    """Regenerate an existing project's C sources in place.
+
+    The contract (flag names and meanings) matches the local codegen SDK on
+    feat/local-codegen-sdk, so a project's tools/regen.sh works against either
+    without changing. That branch's richer implementation adds JSONL progress;
+    this one is the same pipeline without it.
+    """
+    base = pathlib.Path(args.project_root).expanduser().resolve() \
+        if args.project_root else pathlib.Path.cwd()
+
+    def under(value: str) -> pathlib.Path:
+        path = pathlib.Path(value).expanduser()
+        return path.resolve() if path.is_absolute() else (base / path).resolve()
+
+    rom = under(args.rom)
+    cfg_dir = under(args.cfg_dir)
+    out_dir = under(args.out_dir)
+
+    raw = read_rom(rom)
+    check_expected_digests(raw, args.expected_crc32, args.expected_sha256)
+    if not cfg_dir.is_dir():
+        raise ValueError(f"config directory not found: {cfg_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    crc, _ = rom_digests(raw)
+    print(f"snesrecomp: generating from {rom.name} (crc32 {crc})")
+    run_emit(rom, cfg_dir, out_dir,
+             backend=args.analysis_backend,
+             cfg_roots=args.cfg_roots,
+             no_host_root_scan=args.no_host_root_scan,
+             source_roots=args.source_root)
+
+    if args.funcs_h:
+        funcs_h = under(args.funcs_h)
+        try:
+            from tools import v2_sync_funcs_h
+        except ImportError:
+            print("snesrecomp: warning: v2_sync_funcs_h unavailable; "
+                  f"left {funcs_h} untouched", file=sys.stderr)
+        else:
+            funcs_h.parent.mkdir(parents=True, exist_ok=True)
+            if run_tool(v2_sync_funcs_h,
+                        ["--cfg-dir", str(cfg_dir), "--out", str(funcs_h)]):
+                raise RuntimeError(f"failed to sync {funcs_h}")
+            print(f"snesrecomp: synced {funcs_h}")
+    print(f"snesrecomp: generated {out_dir}")
+    return 0
+
+
+def verify_rom(args: argparse.Namespace) -> int:
+    """Check ROM shape, and digests when the caller states expectations."""
+    rom = pathlib.Path(args.rom).expanduser().resolve()
+    raw = read_rom(rom)
+    check_expected_digests(raw, args.expected_crc32, args.expected_sha256)
+    crc, sha = rom_digests(raw)
+    normalized = load_rom(str(rom))
+    print(f"rom={rom.name}")
+    print(f"size={len(raw)}")
+    print(f"normalized_size={len(normalized)}")
+    print(f"mapping={detect_rom_mapping(normalized)}")
+    print(f"crc32={crc}")
+    print(f"sha256={sha}")
+    return 0
+
+
+def build_project(args: argparse.Namespace) -> int:
+    rom_path = pathlib.Path(args.rom).expanduser().resolve()
+    output = pathlib.Path(args.output).expanduser().resolve()
+    raw = read_rom(rom_path)
     if output.exists():
         if not output.is_dir():
             raise ValueError(f"output path is not a directory: {output}")
@@ -88,21 +222,9 @@ def build_project(args: argparse.Namespace) -> int:
 
     print("[1/4] Created the starter bank configuration.")
 
-    analyzer = ROOT / "recompiler-rs" / "target" / "release" / (
-        "snesrecomp-analyze.exe" if os.name == "nt" else "snesrecomp-analyze")
-    if not analyzer.is_file():
-        raise RuntimeError("the packaged native analyzer is missing")
-    os.environ["SNESRECOMP_NATIVE_ANALYZER"] = str(analyzer)
-
     print("[2/4] Analyzing the ROM and generating C source...")
-    if run_tool(v2_emit, [
-        "--rom", str(rom_path),
-        "--cfg-dir", str(config_dir),
-        "--out-dir", str(generated_dir),
-        "--analysis-backend", "native",
-        "--no-host-root-scan",
-    ]):
-        raise RuntimeError("source generation failed")
+    run_emit(rom_path, config_dir, generated_dir,
+             backend="native", no_host_root_scan=True)
 
     print("[3/4] Copying the integration framework...")
     runner_source = ROOT / "framework" / "runner"
@@ -211,6 +333,43 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--output", "-o", required=True, help="new output directory")
     build.add_argument("--name", help="project title (defaults to the ROM filename)")
     build.set_defaults(handler=build_project)
+
+    def add_identity_args(sub):
+        sub.add_argument("--expected-crc32",
+                         help="fail unless the ROM CRC32 matches")
+        sub.add_argument("--expected-sha256",
+                         help="fail unless the ROM SHA-256 matches")
+
+    generate = commands.add_parser(
+        "generate",
+        help="regenerate C sources for an existing recomp project from a ROM")
+    generate.add_argument("--rom", required=True, help="path to a .sfc or .smc ROM")
+    generate.add_argument("--cfg-dir", required=True,
+                          help="directory containing bank*.cfg analysis seeds")
+    generate.add_argument("--out-dir", required=True,
+                          help="directory for generated C (created if missing)")
+    generate.add_argument("--project-root",
+                          help="resolve relative paths against this directory")
+    generate.add_argument("--funcs-h",
+                          help="optional header to re-sync with the generated C")
+    generate.add_argument("--cfg-roots", action="store_true",
+                          help="seed analysis from every cfg func declaration")
+    generate.add_argument("--no-host-root-scan", action="store_true",
+                          help="do not scan host sources for additional AOT roots")
+    generate.add_argument("--source-root", action="append", default=[],
+                          help="extra host source root for root discovery (repeatable)")
+    generate.add_argument("--analysis-backend",
+                          choices=("auto", "python", "native"), default="auto",
+                          help="whole-program analyzer (default: auto)")
+    add_identity_args(generate)
+    generate.set_defaults(handler=generate_project)
+
+    verify = commands.add_parser(
+        "verify-rom", help="check ROM shape and optional expected digests")
+    verify.add_argument("--rom", required=True, help="path to a .sfc or .smc ROM")
+    add_identity_args(verify)
+    verify.set_defaults(handler=verify_rom)
+
     return result
 
 

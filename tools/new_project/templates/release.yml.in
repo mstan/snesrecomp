@@ -1,0 +1,75 @@
+# Build @DISPLAY_NAME@ on Linux, and publish a release for v* tags.
+#
+# The ROM is never stored in CI and never shipped. This workflow therefore
+# builds the framework and the host, but CANNOT generate src/gen/*.c — that
+# needs a ROM. Two ways to make the build step real, both deliberate choices
+# for the project owner rather than defaults chosen here:
+#
+#   1. Publish prebuilt generated C to a private assets repo and fetch it
+#     with a token (the pattern MetalWarriorsSNESRecomp uses).
+#   2. Keep CI to the checks that need no ROM: submodule pins, framework
+#      tests, and a compile of the host sources.
+#
+# As shipped this does (2), so a fresh project has a green pipeline that
+# tells the truth about what it verified.
+
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [@DEFAULT_BRANCH@]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libsdl2-dev zip
+
+      - name: Record framework pins
+        run: |
+          echo "Framework pins this build used:"
+          cat framework_pins.txt
+          git submodule status --recursive
+
+      - name: Framework tests
+        run: bash snesrecomp/tests/run_c_tests.sh
+
+      - name: Verify the host compiles
+        run: |
+          # No ROM in CI, so src/gen/ is empty and the game target cannot
+          # link. Compile the host translation units on their own so a syntax
+          # or API break still fails the pipeline.
+          for src in src/main.c src/game_rtl.c src/codegen_setup.c; do
+            echo "  cc $src"
+            cc -fsyntax-only -I src -I recomp \
+               -I snesrecomp/runner/src -I snesrecomp/runner/src/snes \
+               $(pkg-config --cflags sdl2) "$src"
+          done
+
+      - name: Release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "@DISPLAY_NAME@ ${GITHUB_REF_NAME}" > notes.md
+          echo "" >> notes.md
+          echo "Players supply their own ROM. No ROM data is included." >> notes.md
+          cat framework_pins.txt >> notes.md
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
