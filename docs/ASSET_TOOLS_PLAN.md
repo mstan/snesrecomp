@@ -1,7 +1,18 @@
 # Asset dumping + function identification tools (plan)
 
-Status: **plan, not built** · target: `snesrecomp/tools/assetdump/` + a
-RetComM Studio SNES tab · written 2026-08-26
+Status: **phases 0–3 built** (2026-08-26) · tools live in
+**`retcomm-studio/tools/snes_analysis/`** (maintenance moved there by
+decision, mirroring `tools/psx_analysis/`; the architecture rule below is
+unchanged) · phase 4's Studio Assets tab remains open · phase 0 landed as
+snesrecomp `87c2109`
+
+Delivery notes against the plan: phase 0.1/0.3 turned out to already exist
+in-tree (the write rings carried func/stack stamps and a shared seq), so
+phase 0 reduced to the interpreter scope push and the FramePpuSnap decoder
+inputs. The live soak against MetalWarriorsSNESRecomp validated the whole
+chain — capture, decode, and an attribution draft at $00:8182 that the
+project's symbols already name I_NMI — and caught one capture bug (the
+history ring's newest frame is live−1).
 
 Goal: dump SNES assets **as composed** (tiles with the right palette, layers
 with the right scroll, sprites with the right size/palette, samples as audio)
