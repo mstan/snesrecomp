@@ -24,7 +24,7 @@ takes every default without asking.
 | Release zip / CI artifact prefix | slug of the name |
 | Description, publisher, year | blank (README metadata) |
 | Region | from the cartridge header |
-| Include the recomp-ui launcher submodule? | no |
+| Include the recomp-ui launcher submodule? | yes |
 | Enable netplay? | no — skipped entirely for a 1-player title |
 | Also build rollback? | yes, when netplay is on |
 | Add the GitHub Actions workflow? | yes |
@@ -95,6 +95,24 @@ The ROM is probed where it lies and is never copied in. `tools/regen.sh` takes
 `--rom` (or `SNESRECOMP_ROM`) so it can stay on your own drive, and the
 generated `.gitignore` blocks `*.sfc` / `*.smc` / `src/gen/` regardless.
 `scripts/package_release.sh` refuses to build a zip that contains ROM data.
+
+Which means the scaffolded host has to *ask* for one, and `src/main.c` does —
+in this order, each candidate checked against the digests in
+`src/codegen_setup.c`, the same ones the C was generated from:
+
+1. **The recomp-ui launcher** (`--recomp-ui`, on by default). A pre-boot GUI
+   with a ROM picker and verification badge, plus display / audio / input
+   settings, wired by one `recomp_target_launcher_ui(<target> CONSOLE snes)`
+   call. It is skipped when a ROM is passed on the command line, and when
+   `SDL_VIDEODRIVER=dummy` says nobody is there to answer it.
+2. **`snesrecomp_launcher_resolve_rom_sha256()`** — the positional argument,
+   then a copy beside the executable, then the `<exe_dir>/rom.cfg` cache, then
+   a native file picker (zenity / kdialog / qarma / osascript).
+
+Scaffolding with `--no-recomp-ui` keeps step 2 and compiles step 1 out; the
+generated `CMakeLists.txt` carries the block to paste back in. What no longer
+happens either way is the old behavior: printing a usage line and exiting 1
+because the ROM was not already sitting in the working directory.
 
 ## Failure handling
 

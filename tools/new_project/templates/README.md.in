@@ -49,6 +49,23 @@ prefer that; `.gitignore` blocks it from ever being committed either way.
 `tools/regen.sh` verifies the ROM, generates `src/gen/*.c`, and re-syncs
 `recomp/funcs.h`. Re-run it whenever you change anything under `recomp/`.
 
+## Run
+
+```sh
+./build/@PROJECT_NAME@                     # launcher picks the ROM
+./build/@PROJECT_NAME@ /path/to/@ROM_FILE@ # or name it and skip the launcher
+```
+
+With no ROM on the command line the build opens the recomp-ui launcher: a ROM
+picker with a verification badge, plus display / audio / input settings. Your
+choice is cached in `rom.cfg` beside the executable, so the next launch opens
+on it and "Skip launcher on boot" makes it immediate. If the launcher is not
+built in (`--no-recomp-ui`), the host falls back to a native file picker.
+
+Either way the ROM is checked against the digests above before anything boots
+— a dump that could not have produced this build is refused at the door rather
+than mis-executing ten frames in.
+
 ## Layout
 
 | Path | What lives there |
