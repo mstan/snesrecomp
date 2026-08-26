@@ -8,6 +8,15 @@ from the game main loop.
 recomp-net is **opt-in**. Shipping single-player builds are unchanged unless
 the game enables it.
 
+**Rollback:** this document covers the delay-sync path, which remains the
+default. The rollback admit path (`SNES_NET_MODE=rollback`, built on
+`lib/retcomm-rbengine`) is documented separately in
+[ROLLBACK.md](ROLLBACK.md) — including the two SNES-specific determinism
+constraints a rollback host must honour and delay-sync never notices.
+
+**More than two players:** both admit paths carry up to 8 seats when a Super
+Multitap is configured. See [MULTITAP.md](MULTITAP.md) §4.
+
 ## Init the submodule
 
 ```sh

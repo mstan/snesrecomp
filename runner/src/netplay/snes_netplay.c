@@ -11,6 +11,7 @@
 
 #if defined(SNESRECOMP_NET)
 #include "recomp_net/recomp_net.h"
+#include "snes_netplay_rb.h"
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #if defined(SNES_HAS_LOBBY_CLIENT)
@@ -24,6 +25,7 @@ void snes_netplay_config_defaults(SnesNetplayConfig *cfg)
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
     cfg->local_slot = 0;
+    cfg->slot_count = 2;
     cfg->input_player = -1; /* auto → resolve at start */
     cfg->input_delay = 2;
     cfg->session_id = 1;
@@ -47,6 +49,8 @@ void snes_netplay_apply_env(SnesNetplayConfig *cfg)
     if (v && v[0] && v[0] != '0') cfg->enabled = 1;
     v = getenv("SNES_NET_SLOT");
     if (v && v[0]) cfg->local_slot = (int)strtol(v, NULL, 10);
+    v = getenv("SNES_NET_SLOTS");
+    if (v && v[0]) cfg->slot_count = (int)strtol(v, NULL, 10);
     v = getenv("SNES_NET_INPUT_PLAYER");
     if (v && v[0]) cfg->input_player = (int)strtol(v, NULL, 10);
     v = getenv("SNES_NET_DELAY");
@@ -83,11 +87,14 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
 
 #if !defined(SNESRECOMP_NET)
 
+int  snes_netplay_rollback_active(void) { return 0; }
+
 int  snes_netplay_active(void) { return 0; }
 int  snes_netplay_is_running(void) { return 0; }
 const char *snes_netplay_transport_name(void) { return "none"; }
 int  snes_netplay_ice_failed(void) { return 0; }
 int  snes_netplay_local_slot(void) { return -1; }
+int  snes_netplay_slot_count(void) { return 2; }
 int  snes_netplay_input_player(void) { return 0; }
 uint32_t snes_netplay_sim_tick(void) { return 0; }
 uint32_t snes_netplay_frames_finished(void) { return 0; }
@@ -157,7 +164,7 @@ typedef struct {
     int          needs_advance;
     int          latched_for_tick;
     uint32_t     latched_sim_tick;
-    uint16_t     published[2];
+    uint16_t     published[SNES_NETPLAY_MAX_SLOTS];
     uint8_t      host_sync[2];       /* game-defined slot-0 sync bytes */
     int          host_sync_valid;
     int          use_ice;
@@ -190,6 +197,76 @@ typedef struct {
 } NetplayState;
 
 static NetplayState g_np;
+
+/*
+ * Apply one published row set to the runtime seats.
+ *
+ * Seats 0 and 1 stay in g_np.published for snes_netplay_published_inputs(),
+ * which every existing game reads and packs into RtlRunFrame. Seats 2..7
+ * cannot fit that word, so they go straight in through RtlSetPadState — the
+ * same entry point a local multitap game uses. A game therefore needs no
+ * netplay-specific code to gain seats beyond the second.
+ */
+static void np_apply_published(const uint16_t *buttons, int slots)
+{
+    int i;
+    for (i = 0; i < SNES_NETPLAY_MAX_SLOTS; ++i)
+        g_np.published[i] = 0;
+    if (!buttons || slots <= 0)
+        return;
+    if (slots > SNES_NETPLAY_MAX_SLOTS)
+        slots = SNES_NETPLAY_MAX_SLOTS;
+    for (i = 0; i < slots; ++i) {
+        g_np.published[i] = buttons[i] & 0x0FFFu;
+        if (i >= 2)
+            RtlSetPadState(i, g_np.published[i]);
+    }
+}
+/* 1 once snes_netplay_rb has taken over admit for this session. Set only
+ * after the rollback host starts cleanly, so a failed start falls back to
+ * delay-sync rather than leaving the session with no admit path at all. */
+static int g_np_rollback;
+
+/* Rollback resolves each seat's row itself (wire row or hold-last invent) and
+ * hands the result back here, so snes_netplay_published_inputs() reads the
+ * same way in both modes and games need no change. */
+static void np_rb_publish(uint32_t tick, const uint16_t *buttons, int slots)
+{
+    (void)tick;
+    np_apply_published(buttons, slots);
+}
+
+static void np_rb_apply_sync(const uint8_t in[2])
+{
+    if (g_apply_sync_bytes)
+        g_apply_sync_bytes(in);
+}
+
+static void np_rollback_try_start(void)
+{
+    SnesNetplayRbBindings b;
+
+    g_np_rollback = 0;
+    if (!snes_netplay_rb_enabled())
+        return;
+    memset(&b, 0, sizeof(b));
+    b.session = &g_np.session;
+    b.local_slot = &g_np.local_slot;
+    b.slot_count = &g_np.slot_count;
+    b.input_delay = &g_np.input_delay;
+    b.force_turn = 0;
+    b.publish = &np_rb_publish;
+    b.apply_sync_bytes = &np_rb_apply_sync;
+    snes_netplay_rb_bind(&b);
+    if (snes_netplay_rb_start()) {
+        g_np_rollback = 1;
+    } else {
+        fprintf(stderr,
+                "snes_netplay: rollback host failed to start — "
+                "falling back to delay-sync for this session\n");
+        snes_netplay_rb_bind(NULL);
+    }
+}
 static int g_return_to_lobby;
 static uint32_t g_connect_wait_started_ms;
 static FILE *g_diag_file;
@@ -258,14 +335,20 @@ static void host_sample_local(rnet_u32 tick, RNetInputSample *out, void *ctx)
 static void host_publish(rnet_u32 tick, const RNetInputSample *by_slot, int slots, void *ctx)
 {
     NetplayState *st = (NetplayState *)ctx;
+    uint16_t buttons[SNES_NETPLAY_MAX_SLOTS];
     int i;
+    int n = slots;
     (void)tick;
-    st->published[0] = 0;
-    st->published[1] = 0;
+    (void)st;
     st->host_sync_valid = 0;
-    if (!by_slot || slots <= 0) return;
-    for (i = 0; i < slots && i < 2; ++i)
-        st->published[i] = decode_pad(&by_slot[i]) & 0x0FFFu;
+    if (!by_slot || slots <= 0) {
+        np_apply_published(NULL, 0);
+        return;
+    }
+    if (n > SNES_NETPLAY_MAX_SLOTS) n = SNES_NETPLAY_MAX_SLOTS;
+    for (i = 0; i < n; ++i)
+        buttons[i] = decode_pad(&by_slot[i]) & 0x0FFFu;
+    np_apply_published(buttons, n);
     /* Slot 0 carries the authoritative game-defined sync bytes. */
     if (by_slot[0].valid && by_slot[0].size >= 4) {
         st->host_sync[0] = by_slot[0].bytes[2];
@@ -352,6 +435,11 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
 #endif
 }
 
+int snes_netplay_rollback_active(void)
+{
+    return g_np_rollback && g_np.active;
+}
+
 int snes_netplay_active(void)
 {
     return g_np.active && g_np.session != NULL;
@@ -392,6 +480,7 @@ int snes_netplay_input_player(void)
 uint32_t snes_netplay_sim_tick(void)
 {
     if (!snes_netplay_active()) return 0;
+    if (g_np_rollback) return snes_netplay_rb_sim_tick();
     return rnet_session_sim_tick(g_np.session);
 }
 
@@ -403,6 +492,12 @@ uint32_t snes_netplay_frames_finished(void)
 void snes_netplay_stage_local(uint16_t buttons)
 {
     buttons &= 0x0FFFu;
+    if (g_np_rollback) {
+        snes_netplay_rb_stage_local(buttons);
+        g_np.staged_buttons = buttons;
+        g_np.staged_valid = 1;
+        return;
+    }
     if (snes_netplay_active() && rnet_session_is_running(g_np.session)) {
         uint32_t t = rnet_session_sim_tick(g_np.session);
         if (g_np.latched_for_tick && g_np.latched_sim_tick == t)
@@ -420,6 +515,10 @@ void snes_netplay_stage_local(uint16_t buttons)
 int snes_netplay_needs_local_sample(void)
 {
     if (!snes_netplay_active()) return 0;
+    /* Rollback re-reads the live pad on every admit attempt: a stalled tick
+     * that later admits must carry the player's current input, not the pad
+     * they were holding when the stall began. */
+    if (g_np_rollback) return 1;
     if (!rnet_session_is_running(g_np.session)) return 1;
     {
         uint32_t t = rnet_session_sim_tick(g_np.session);
@@ -445,6 +544,11 @@ uint32_t snes_netplay_published_inputs(void)
     return (uint32_t)g_np.published[0] | ((uint32_t)g_np.published[1] << 12);
 }
 
+int snes_netplay_slot_count(void)
+{
+    return snes_netplay_active() && g_np.slot_count > 0 ? g_np.slot_count : 2;
+}
+
 uint32_t snes_netplay_active_mask(void)
 {
     return 3u << 30;
@@ -462,8 +566,29 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     snes_netplay_connect_wait_reset();
 
     rnet_config_init_defaults(&rcfg);
-    rcfg.slot_count = 2;
-    rcfg.local_slot = (rnet_u8)(cfg->local_slot < 0 ? 0 : (cfg->local_slot > 1 ? 1 : cfg->local_slot));
+    {
+        int seats = cfg->slot_count > 0 ? cfg->slot_count : 2;
+        int slot;
+        if (seats < 2) seats = 2;
+        if (seats > SNES_NETPLAY_MAX_SLOTS) seats = SNES_NETPLAY_MAX_SLOTS;
+        /* Seats past the second only exist behind a multitap. Refusing to
+         * open a wider session than the machine can route is the "abort
+         * rather than silently degrade" rule: a peer that quietly ran two
+         * seats while the other ran five would desync on input, not on
+         * anything that names itself. */
+        if (seats > 2 && RtlPlayerCount() < seats) {
+            fprintf(stderr,
+                    "snes_netplay: %d seats requested but the port "
+                    "configuration reaches only %d — enable a multitap "
+                    "(SNES_MULTITAP / RtlSetMultitap) on every peer\n",
+                    seats, RtlPlayerCount());
+            return -1;
+        }
+        rcfg.slot_count = (rnet_u8)seats;
+        slot = cfg->local_slot < 0 ? 0 : cfg->local_slot;
+        if (slot >= seats) slot = seats - 1;
+        rcfg.local_slot = (rnet_u8)slot;
+    }
     rcfg.input_delay = (rnet_u8)(cfg->input_delay < 0 ? 0
                                 : (cfg->input_delay > 20 ? 20 : cfg->input_delay));
     rcfg.session_id = cfg->session_id ? cfg->session_id : 1u;
@@ -661,7 +786,7 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.latched_sim_tick = 0;
     g_np.host_sync_valid = 0;
     g_np.host_sync[0] = g_np.host_sync[1] = 0;
-    g_np.published[0] = g_np.published[1] = 0;
+    memset(g_np.published, 0, sizeof(g_np.published));
     g_np.use_ice = use_ice;
     g_np.sram_sync_sent = 0;
     g_np.sram_sync_done = 0;
@@ -716,6 +841,8 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     /* Frame-locked SPC drain starts from a clean accumulator on both peers. */
     RtlNetplayAudioReset();
 
+    np_rollback_try_start();
+
     fprintf(stderr,
             "snes_netplay: started transport=%s slot=%d input_player=%d session=%u "
             "delay=%u force_input_relay=%d bind=%s peer=%s\n",
@@ -729,6 +856,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
 void snes_netplay_shutdown(void)
 {
+    snes_netplay_rb_shutdown();
+    snes_netplay_rb_bind(NULL);
+    g_np_rollback = 0;
     if (g_diag_file) {
         fclose(g_diag_file);
         g_diag_file = NULL;
@@ -1288,6 +1418,12 @@ int snes_netplay_poll_admit(void)
         return 0;
     }
 
+    if (g_np_rollback) {
+        int ok = snes_netplay_rb_poll_admit();
+        snes_netplay_diag_tick();
+        return ok;
+    }
+
     if (g_np.needs_advance) return 1;
 
     sim = rnet_session_sim_tick(g_np.session);
@@ -1303,6 +1439,11 @@ int snes_netplay_poll_admit(void)
 void snes_netplay_finish_frame(void)
 {
     if (!snes_netplay_active()) return;
+    if (g_np_rollback) {
+        snes_netplay_rb_finish_frame();
+        g_np.frames_finished++;
+        return;
+    }
     if (!g_np.needs_advance) return;
     rnet_session_advance(g_np.session);
     g_np.needs_advance = 0;

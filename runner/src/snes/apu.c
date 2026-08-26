@@ -187,6 +187,32 @@ bool apu_finishHleTransfer(Apu* apu, uint16_t final_pc,
   }
 }
 
+void apu_port_sched_save(const Apu *apu, ApuPortSched *out) {
+  if (!apu || !out) return;
+  memcpy(out->queue, apu->portQueue, sizeof(out->queue));
+  out->qHead = apu->portQHead;
+  out->qTail = apu->portQTail;
+  out->clock = apu->portClock;
+  out->guestAnchor = apu->portGuestAnchor;
+  out->targetAnchor = apu->portTargetAnchor;
+  out->lastGuest = apu->portLastGuest;
+  out->lastTarget = apu->portLastTarget;
+  out->timeValid = apu->portTimeValid;
+}
+
+void apu_port_sched_restore(Apu *apu, const ApuPortSched *in) {
+  if (!apu || !in) return;
+  memcpy(apu->portQueue, in->queue, sizeof(in->queue));
+  apu->portQHead = in->qHead;
+  apu->portQTail = in->qTail;
+  apu->portClock = in->clock;
+  apu->portGuestAnchor = in->guestAnchor;
+  apu->portTargetAnchor = in->targetAnchor;
+  apu->portLastGuest = in->lastGuest;
+  apu->portLastTarget = in->lastTarget;
+  apu->portTimeValid = in->timeValid;
+}
+
 void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
   sli->func(sli, apu->ram, offsetof(Apu, pad) + 6 - offsetof(Apu, ram));
   dsp_saveload(apu->dsp, sli);

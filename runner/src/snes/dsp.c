@@ -132,6 +132,33 @@ void dsp_reset(Dsp* dsp) {
   dsp->sampleRead = 0;
 }
 
+void dsp_output_ring_save(const Dsp *dsp, DspOutputRing *out) {
+  if (!dsp || !out) return;
+  memcpy(out->samples, dsp->sampleBuffer, sizeof(out->samples));
+  out->write = dsp->sampleWrite;
+  out->read = dsp->sampleRead;
+}
+
+void dsp_output_ring_restore(Dsp *dsp, const DspOutputRing *in) {
+  if (!dsp || !in) return;
+  memcpy(dsp->sampleBuffer, in->samples, sizeof(in->samples));
+  dsp->sampleWrite = in->write;
+  dsp->sampleRead = in->read;
+}
+
+void dsp_output_ring_set_write(Dsp *dsp, uint32_t write) {
+  if (!dsp) return;
+  /* Never pull the producer behind the consumer: the audio thread owns
+   * sampleRead and dsp_available() is an unsigned difference. */
+  if ((int32_t)(write - dsp->sampleRead) < 0)
+    write = dsp->sampleRead;
+  dsp->sampleWrite = write;
+}
+
+uint32_t dsp_output_ring_write(const Dsp *dsp) {
+  return dsp ? dsp->sampleWrite : 0u;
+}
+
 void dsp_saveload(Dsp *dsp, SaveLoadInfo *sli) {
   sli->func(sli, &dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
 }

@@ -15,6 +15,8 @@
 #include "config.h"
 #include "snes/snes.h"
 #include "snes/apu.h"
+#include "snes/joypad.h"
+#include "snes/dsp.h"
 #include "snes/cart.h"
 #include "snes/cx4.h"
 #include "snes/sa1.h"
@@ -178,8 +180,11 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  * v6: beamMasterLast removed from the snes_saveload region (host-only
  *     timing anchor). v5 files still load via an 8-byte compat skip.
  * v7: manual joypad latch/shift state appended after the existing SNES blob.
- *     Older files initialize that transient serial state to idle. */
-#define RTL_SAV_VERSION 7u
+ *     Older files initialize that transient serial state to idle.
+ * v8: multitap chunk (seats, IOBit lines, per-bank shift counters, latched
+ *     automatic-read words). Older files load with no multitap configured,
+ *     which is the pre-multitap two-pad machine exactly. */
+#define RTL_SAV_VERSION 8u
 #define RTL_SAV_VERSION_MIN 4u
 
 typedef struct FileSli {
@@ -421,6 +426,69 @@ static void recomp_dspout_capture(void) {
     prev_write = w;
 }
 
+/* ── Multiplayer seats ───────────────────────────────────────────────────
+ * See common_rtl.h. The device model lives in snes/joypad.c; this is the
+ * host-facing surface plus the launch-time environment override.
+ */
+
+/* Opposing directions cannot be held on a real d-pad, and guest code is
+ * entitled to assume it. RtlRunFrame has always filtered seats 0 and 1;
+ * every other seat gets the same treatment. */
+static uint16 rtl_filter_dpad(uint16 buttons) {
+  if ((buttons & 0x30u) == 0x30u) buttons ^= 0x30u;   /* up + down */
+  if ((buttons & 0xc0u) == 0xc0u) buttons ^= 0xc0u;   /* left + right */
+  return (uint16)(buttons & 0x0fffu);
+}
+
+void RtlSetPadState(int slot, uint16 buttons) {
+  buttons = rtl_filter_dpad(buttons);
+  joypad_set_pad(slot, buttons);
+  /* Seats 0 and 1 also live in the two fields the rest of the runtime reads
+   * directly, so a game may drive them through either door. */
+  if (g_snes && slot == 0) g_snes->input1_currentState = buttons;
+  if (g_snes && slot == 1) g_snes->input2_currentState = buttons;
+}
+
+uint16 RtlGetPadState(int slot) { return joypad_get_pad(slot); }
+void RtlSetPadConnected(int slot, int connected) {
+  joypad_set_connected(slot, connected);
+}
+int RtlGetPadConnected(int slot) { return joypad_get_connected(slot); }
+void RtlSetMultitap(int port, int enabled) {
+  joypad_set_multitap(port, enabled);
+}
+int RtlGetMultitap(int port) { return joypad_get_multitap(port); }
+int RtlPlayerCount(void) { return joypad_player_count(); }
+
+/* SNES_MULTITAP=port1|port2|both|off. Applied once, before the first frame,
+ * so a launcher or a soak script can turn a tap on without a rebuild. It
+ * overrides whatever the game asked for — an explicit launch flag outranks a
+ * built-in default. */
+static void RtlApplyMultitapEnv(void) {
+  static int applied = 0;
+  const char *v;
+  if (applied) return;
+  applied = 1;
+  v = getenv("SNES_MULTITAP");
+  if (!v || !v[0]) return;
+  if (!strcmp(v, "off") || !strcmp(v, "none") || !strcmp(v, "0")) {
+    RtlSetMultitap(0, 0); RtlSetMultitap(1, 0);
+  } else if (!strcmp(v, "port1") || !strcmp(v, "1")) {
+    RtlSetMultitap(0, 1); RtlSetMultitap(1, 0);
+  } else if (!strcmp(v, "port2") || !strcmp(v, "2")) {
+    RtlSetMultitap(0, 0); RtlSetMultitap(1, 1);
+  } else if (!strcmp(v, "both") || !strcmp(v, "8")) {
+    RtlSetMultitap(0, 1); RtlSetMultitap(1, 1);
+  } else {
+    fprintf(stderr,
+            "SNES_MULTITAP=%s not understood "
+            "(expected port1, port2, both, or off) — ignoring\n", v);
+    return;
+  }
+  fprintf(stderr, "snesrecomp: multitap port1=%d port2=%d (%d seats)\n",
+          RtlGetMultitap(0), RtlGetMultitap(1), RtlPlayerCount());
+}
+
 bool RtlRunFrame(uint32 inputs) {
 #ifdef SNES_COSIM
   /* Co-sim (dev/diagnostics only): connect the coordinator once, before the
@@ -436,8 +504,14 @@ bool RtlRunFrame(uint32 inputs) {
   if ((inputs & 0x30000) == 0x30000) inputs ^= 0x30000;
   if ((inputs & 0xc0000) == 0xc0000) inputs ^= 0xc0000;
 
+  RtlApplyMultitapEnv();
+
   g_snes->input1_currentState = inputs & 0xfff;
   g_snes->input2_currentState = (inputs >> 12) & 0xfff;
+  /* Seats 0 and 1 stay owned by the packed word; seats 2..7, when a multitap
+   * is configured, keep whatever RtlSetPadState last put there. */
+  joypad_set_pad(0, (uint16)(inputs & 0xfff));
+  joypad_set_pad(1, (uint16)((inputs >> 12) & 0xfff));
 
   /* Establish the guest timestamp origin before any frame code can touch an
    * APU port. Host turbo changes how quickly frames arrive, not their guest
@@ -664,6 +738,133 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
+}
+
+/* ── Rollback snapshots ──────────────────────────────────────────────────
+ * See common_rtl.h for why the guest blob alone is not a rollback snapshot.
+ */
+
+#define RTL_RB_RESIDUE_MAGIC 0x53524252u /* 'RBRS' */
+#define RTL_RB_RESIDUE_VERSION 1u
+
+typedef struct RtlRollbackResidue {
+  uint32 magic;
+  uint32 version;
+  CpuState cpu;              /* ram pointer is preserved, not restored */
+  ApuPortSched apu_port;
+  uint64_t beam_master_last;
+  uint64_t apu_pace_cycles_estimate;
+  uint64_t apu_last_sync_cycles;
+  uint64_t apu_last_sync_master;
+  uint64_t apu_frame_start_master;
+  uint64_t main_cpu_cycles_estimate;
+  int      frame_counter;
+  uint8    apu_frame_time_valid;
+  uint8    pad[3];
+} RtlRollbackResidue;
+
+size_t RtlRollbackSnapshotBound(void) {
+  /* Guest blob upper bound + residue. The guest blob is WRAM (128 KiB) +
+   * APU RAM (64 KiB) + DSP (incl. the 32 KiB output ring) + PPU VRAM/CGRAM/OAM
+   * (~64 KiB) + cart SRAM and coprocessor RAM; 1 MiB clears all of it with
+   * room for a game's state_save_extra chunk. */
+  return (1u << 20) + sizeof(RtlRollbackResidue);
+}
+
+static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
+  memset(r, 0, sizeof(*r));
+  r->magic = RTL_RB_RESIDUE_MAGIC;
+  r->version = RTL_RB_RESIDUE_VERSION;
+  r->cpu = g_cpu;
+  apu_port_sched_save(g_snes->apu, &r->apu_port);
+  r->beam_master_last = g_snes->beamMasterLast;
+  r->apu_pace_cycles_estimate = g_apu_pace_cycles_estimate;
+  r->apu_last_sync_cycles = g_apu_last_sync_cycles;
+  r->apu_last_sync_master = g_apu_last_sync_master;
+  r->apu_frame_start_master = g_apu_frame_start_master;
+  r->main_cpu_cycles_estimate = g_main_cpu_cycles_estimate;
+  r->frame_counter = snes_frame_counter;
+  r->apu_frame_time_valid = g_apu_frame_time_valid ? 1u : 0u;
+}
+
+static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
+  uint8 *ram_ptr = g_cpu.ram;
+  g_cpu = r->cpu;
+  g_cpu.ram = ram_ptr; /* host pointer, not simulation state */
+  apu_port_sched_restore(g_snes->apu, &r->apu_port);
+  g_snes->beamMasterLast = r->beam_master_last;
+  g_apu_pace_cycles_estimate = r->apu_pace_cycles_estimate;
+  g_apu_last_sync_cycles = r->apu_last_sync_cycles;
+  g_apu_last_sync_master = r->apu_last_sync_master;
+  g_apu_frame_start_master = r->apu_frame_start_master;
+  g_main_cpu_cycles_estimate = r->main_cpu_cycles_estimate;
+  snes_frame_counter = r->frame_counter;
+  g_apu_frame_time_valid = r->apu_frame_time_valid != 0;
+}
+
+size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {
+  size_t guest;
+  RtlRollbackResidue residue;
+
+  if (!data || !g_snes)
+    return 0;
+  guest = RtlSaveSnapshotToMemory(data, capacity);
+  if (guest == 0 || capacity - guest < sizeof(residue))
+    return 0;
+
+  RtlApuLock();
+  rtl_rb_residue_capture(&residue);
+  RtlApuUnlock();
+  memcpy((uint8 *)data + guest, &residue, sizeof(residue));
+  return guest + sizeof(residue);
+}
+
+bool RtlRollbackLoadFromMemory(const void *data, size_t size) {
+  RtlRollbackResidue residue;
+  DspOutputRing ring;
+  size_t guest;
+  bool ok;
+
+  if (!data || !g_snes || size <= sizeof(residue))
+    return false;
+  guest = size - sizeof(residue);
+  memcpy(&residue, (const uint8 *)data + guest, sizeof(residue));
+  if (residue.magic != RTL_RB_RESIDUE_MAGIC ||
+      residue.version != RTL_RB_RESIDUE_VERSION)
+    return false;
+
+  /* The audio output ring belongs to the live consumer, not to the tick we
+   * are rewinding to. Lift it out around the guest blob. */
+  RtlApuLock();
+  dsp_output_ring_save(g_snes->apu->dsp, &ring);
+  RtlApuUnlock();
+
+  ok = RtlLoadSnapshotFromMemory(data, guest);
+
+  RtlApuLock();
+  dsp_output_ring_restore(g_snes->apu->dsp, &ring);
+  if (ok)
+    rtl_rb_residue_apply(&residue);
+  RtlApuUnlock();
+  return ok;
+}
+
+uint32_t RtlAudioProducerCursor(void) {
+  uint32_t w;
+  if (!g_snes)
+    return 0u;
+  RtlApuLock();
+  w = dsp_output_ring_write(g_snes->apu->dsp);
+  RtlApuUnlock();
+  return w;
+}
+
+void RtlAudioRewindProducer(uint32_t cursor) {
+  if (!g_snes)
+    return;
+  RtlApuLock();
+  dsp_output_ring_set_write(g_snes->apu->dsp, cursor);
+  RtlApuUnlock();
 }
 
 void RtlSaveLoad(int cmd, int slot) {

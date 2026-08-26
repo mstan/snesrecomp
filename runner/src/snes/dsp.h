@@ -148,6 +148,58 @@ int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset);
  * gauss[512]); exposed so the dev faithful reference can apply blargg's exact
  * integer algorithm to it. */
 extern const uint16_t gaussValues[512];
+/*
+ * Output-ring save/restore for rollback.
+ *
+ * The ring lies inside the frozen dsp_saveload blob, but it is not guest
+ * state: the read cursor is advanced by the host audio thread at the audio
+ * device's rate. A rollback load must therefore restore the SIMULATION and
+ * leave the ring where the live consumer left it — rewinding sampleRead
+ * would replay already-played audio, and rewinding sampleWrite below a
+ * cursor the audio thread has already passed makes dsp_available() wrap to
+ * ~4 billion. Callers capture the ring before the guest blob goes in and
+ * put it back afterwards.
+ *
+ * Rewinding sampleWrite alone (with the buffer left as-is) is also how a
+ * resim discards the audio it re-produced for ticks the player already
+ * heard. Hold RtlApuLock across both calls.
+ */
+typedef struct DspOutputRing {
+  int16_t  samples[DSP_SAMPLE_RING * 2];
+  uint32_t write;
+  uint32_t read;
+} DspOutputRing;
+
+void dsp_output_ring_save(const Dsp *dsp, DspOutputRing *out);
+void dsp_output_ring_restore(Dsp *dsp, const DspOutputRing *in);
+/* Cursor-only rewind: drop everything produced past `write`. */
+void dsp_output_ring_set_write(Dsp *dsp, uint32_t write);
+uint32_t dsp_output_ring_write(const Dsp *dsp);
+/* Exact-consume block read at the native rate: copies `frames` natives 1:1 and
+ * retires exactly `frames`. Returns the count actually copied (< frames when
+ * the ring is short; the tail is left untouched for the caller to fill).
+ *
+ * This replaces a fixed-534-block sample-and-hold resampler inherited from
+ * upstream LakeSnes, which retired 534 natives per call regardless of how many
+ * frames were requested. Any caller not asking for exactly 534 therefore put
+ * the ring permanently out of balance: measured on Super Mario Kart at 33
+ * calls/s x 534 = 17.8 k natives/s consumed against 32.04 k/s produced, which
+ * pinned the ring at its 8192 cap and destroyed 43% of all samples (384 k of
+ * them carrying audible music) inside 33 s. */
+uint32_t dsp_getSamples(Dsp* dsp, int16_t* sampleData, int frames);
+/* Drop queued host-output samples without rewinding SPC/DSP state. Used only
+ * when leaving fast-forward, where buffered samples describe obsolete guest
+ * time and retaining them would create persistent A/V latency. */
+uint32_t dsp_trimSamples(Dsp* dsp, uint32_t samples_to_keep);
+/* Per-voice Gaussian-interpolated sample (canon hardware math). Exposed for the
+ * dev-only in-process faithful reference (dsp_shadow) to diff against blargg's
+ * reference Gaussian. Pure: reads channel[ch].decodeBuffer[sampleNum..+3], no
+ * state change. */
+int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset);
+/* Canonical SNES Gaussian table (byte-identical to blargg's snes9x/bsnes
+ * gauss[512]); exposed so the dev faithful reference can apply blargg's exact
+ * integer algorithm to it. */
+extern const uint16_t gaussValues[512];
 void dsp_saveload(Dsp *dsp, SaveLoadInfo *sli);
 
 #endif

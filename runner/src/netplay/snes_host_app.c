@@ -285,6 +285,17 @@ int snes_host_barrier_admit(int from_lobby, int *running,
     g_starv.pending_consume = 0;
   }
 
+  /*
+   * Rollback owns its own pacing. The starvation latch below is delay-sync
+   * policy: it stalls when remote_lead drops under D, which under rollback is
+   * the ordinary running state rather than a fault — inventing past missing
+   * remote input is the mechanism, and retcomm-rbengine's scheduler already
+   * decides when to wait instead. Leaving the latch armed would throttle
+   * rollback straight back into lockstep.
+   */
+  if (snes_netplay_rollback_active())
+    return snes_netplay_poll_admit();
+
   {
     uint32_t sim = snes_netplay_sim_tick();
     int enter_need = starv_env_int("SNES_NET_STARVATION_ENTER_FRAMES",
@@ -331,6 +342,10 @@ int snes_host_catchup_budget(void)
   int cap;
 
   if (!snes_netplay_active())
+    return 0;
+  /* No delay-sync catch-up burst under rollback: the scheduler paces admit,
+   * and a burst here would race it. */
+  if (snes_netplay_rollback_active())
     return 0;
   cap = starv_env_int("SNES_NET_CATCHUP_CAP", SNES_CATCHUP_CAP_DEFAULT);
   if (cap <= 0 && g_starv.recovery_amount <= 0)

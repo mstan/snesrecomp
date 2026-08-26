@@ -106,6 +106,13 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
     snes->joypad1Index = snes->joypad2Index = 0;
     snes->joypad1Latched = snes->joypad2Latched = 0;
   }
+  /* v8: multitap seats, IOBit lines, per-bank shift counters and the latched
+   * automatic-read words. A state saved between the two halves of a
+   * five-player read has to resume in the same bank at the same bit, so this
+   * is guest-visible state, not host configuration. Older states simply
+   * leave the two-pad defaults in place. */
+  if (s_saveload_version >= 8)
+    joypad_saveload(sli);
 
   snes->cpu->e = 0;
 }
@@ -135,6 +142,7 @@ void snes_reset(Snes* snes, bool hard) {
   snes->joypadStrobe = false;
   snes->joypad1Index = snes->joypad2Index = 0;
   snes->joypad1Latched = snes->joypad2Latched = 0;
+  joypad_reset_state();
   snes->ppuLatch = false;
   snes->multiplyA = 0xff;
   snes->multiplyResult = 0xfe01;
@@ -276,8 +284,14 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
      * for roughly 4224 master clocks.  The input registers are already backed
      * by the current controller snapshot; this timer supplies the missing
      * architectural start/busy/complete handshake. */
-    if (snes->autoJoyRead && v == 225u && h == 0u)
+    if (snes->autoJoyRead && v == 225u && h == 0u) {
       snes->autoJoyTimer = 4224;
+      /* The automatic read latches the pads and clocks them 16 times. With a
+       * multitap that is load-bearing: it leaves the selected bank's shift
+       * counter on the 17th (connection) bit, which is where the documented
+       * five-player sequence reads it from. */
+      joypad_auto_read(snes);
+    }
     if (snes->autoJoyTimer) {
       snes->autoJoyTimer = span >= snes->autoJoyTimer
                          ? 0 : (uint16_t)(snes->autoJoyTimer - span);
@@ -368,7 +382,9 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return val;
     }
     case 0x4213:
-      return snes->ppuLatch << 7; // IO-port
+      /* RDIO: readback of the $4201 output latch. Bit 6 is port 1's IOBit
+       * and bit 7 is port 2's (which doubles as the PPU counter latch). */
+      return joypad_read_iobit();
     case 0x4214:
       return snes->divideResult & 0xff;
     case 0x4215:
@@ -377,23 +393,24 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return snes->multiplyResult & 0xff;
     case 0x4217:
       return snes->multiplyResult >> 8;
-    case 0x4016:  /* JOYSER0 — manual joypad read for controller 1. */
-    case 0x4017:  /* JOYSER1 — manual joypad read for controller 2. */
-      /* $4016 bit 0 latches both pads; reads shift B through R, then 1s. */
-      return joypad_read_serial(snes, adr - 0x4016);
+    case 0x4016:  /* JOYSER0 — manual joypad read, port 1. */
+    case 0x4017:  /* JOYSER1 — manual joypad read, port 2. */
+      /* $4016 bit 0 latches both ports; reads shift B through R, then 1s.
+       * Bit 0 is Data1 and bit 1 is Data2 — a standard controller drives
+       * Data1 only, a multitap drives both. */
+      return joypad_read_port(snes, adr - 0x4016);
+    /* $4218/9 = port1 Data1, $421A/B = port2 Data1,
+     * $421C/D = port1 Data2, $421E/F = port2 Data2. The Data2 pair is only
+     * ever driven by a multitap; with none present they read 0 as before. */
     case 0x4218:
-      return joypad_auto_read_reg(snes->input1_currentState, adr);
     case 0x4219:
-      return joypad_auto_read_reg(snes->input1_currentState, adr);
     case 0x421a:
-      return joypad_auto_read_reg(snes->input2_currentState, adr);
     case 0x421b:
-      return joypad_auto_read_reg(snes->input2_currentState, adr);
     case 0x421c:
-    case 0x421e:
     case 0x421d:
+    case 0x421e:
     case 0x421f:
-      return 0;
+      return joypad_auto_read_reg_addr(snes, adr);
 
     default: {
       return 0;
@@ -425,6 +442,9 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
         ppu_read(g_ppu, 0x37);
       }
       snes->ppuLatch = val & 0x80;
+      /* Bit 6 -> port 1 IOBit, bit 7 -> port 2 IOBit. A multitap uses its
+       * port's line to select which pad pair it reports. */
+      joypad_write_iobit(snes, val);
       break;
     }
     case 0x4202: {

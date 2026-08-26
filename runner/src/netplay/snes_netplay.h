@@ -35,10 +35,18 @@ extern "C" {
  */
 
 #define SNES_NETPLAY_PAD_BYTES 4
+/* recomp-net carries up to RNET_MAX_SLOTS (8) seats; the SNES side reaches
+ * that many only with a Super Multitap in each port. See docs/MULTITAP.md. */
+#define SNES_NETPLAY_MAX_SLOTS 8
 
 typedef struct SnesNetplayConfig {
     int         enabled;
-    int         local_slot;    /* 0 or 1 — lobby / wire slot */
+    int         local_slot;    /* 0 .. slot_count-1 — lobby / wire slot */
+    /* Seats in this match, 2..SNES_NETPLAY_MAX_SLOTS. Anything above 2 needs
+     * a multitap configured on both peers, and every peer must agree: the
+     * seat count is part of the settled session requirement
+     * (recomp-ai-rules/NETPLAY.md §4). Env: SNES_NET_SLOTS. */
+    int         slot_count;
     int         input_player;  /* 0/1 host device index; -1 = auto */
     int         input_delay;   /* frames; default 2 */
     uint32_t    session_id;
@@ -67,6 +75,16 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
                                       SnesNetplayApplySyncBytes apply);
 
 int  snes_netplay_active(void);
+/*
+ * 1 while this session's admit path is ROLLBACK rather than delay-sync.
+ *
+ * Host scaffolding that reasons about input runway must branch on this: the
+ * delay-sync starvation latch stalls when remote_lead falls below D, which is
+ * the normal, intended condition under rollback (running ahead of confirmed
+ * remote input is the whole mechanism). Leaving that latch armed throttles
+ * rollback back into lockstep.
+ */
+int  snes_netplay_rollback_active(void);
 int  snes_netplay_is_running(void);
 /* "ice", "lan", or "none"; useful for user-facing connection diagnostics. */
 const char *snes_netplay_transport_name(void);
@@ -125,8 +143,15 @@ int  snes_netplay_input_delay(void);
 /* Re-apply the last slot-0 game sync bytes (normally done inside poll_admit). */
 void snes_netplay_apply_host_sync(void);
 
-/* P1 | (P2<<12) button bits from the last successful publish (0 if none). */
+/* P1 | (P2<<12) button bits from the last successful publish (0 if none).
+ * Seats 2..7 do not fit this word and are not carried by it: publish pushes
+ * them straight into the runtime through RtlSetPadState, the same door a
+ * local multitap game uses, so the game's frame loop is identical either
+ * way. */
 uint32_t snes_netplay_published_inputs(void);
+
+/* Seat count in the running session (2 when inactive). */
+int snes_netplay_slot_count(void);
 
 /* Both slots plugged: (3u << 30) for RtlRunFrame active-controller bits. */
 uint32_t snes_netplay_active_mask(void);

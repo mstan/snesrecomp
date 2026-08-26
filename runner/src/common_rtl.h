@@ -299,6 +299,73 @@ bool RtlLoadSnapshot(const char *filename);
 size_t RtlSaveSnapshotToMemory(void *data, size_t capacity);
 bool RtlLoadSnapshotFromMemory(const void *data, size_t size);
 
+/*
+ * Rollback snapshots (netplay ROLLBACK mode).
+ *
+ * Same guest blob as RtlSaveSnapshotToMemory plus a "sim residue" chunk: the
+ * host-side state that participates in deterministic simulation but that an
+ * ordinary savestate deliberately leaves out because a one-off load can just
+ * re-anchor it. Rollback cannot re-anchor — it rewinds tens of times a second,
+ * and any clock that does not rewind with the guest drifts the two peers apart:
+ *
+ *   - g_cpu (the recompiled CPU state, master_cycles above all). RtlLoadSnapshot
+ *     re-anchors beamMasterLast to the *current* master_cycles precisely because
+ *     that clock does not rewind.
+ *   - the APU catch-up accumulators and frame-timeline anchors.
+ *   - the CPU->APU port-write scheduler (see ApuPortSched in snes/apu.h).
+ *
+ * The load side subtracts one thing instead of adding it: the S-DSP output ring
+ * is left where the live audio thread has it, because that consumer is host
+ * state and does not rewind. See DspOutputRing in snes/dsp.h.
+ *
+ * These blobs are in-process and in-memory only — never a file, never a wire
+ * payload. They are not RTLS savestates and carry no version compatibility
+ * promise across builds.
+ */
+size_t RtlRollbackSaveToMemory(void *data, size_t capacity);
+bool RtlRollbackLoadFromMemory(const void *data, size_t size);
+/* Upper bound for one rollback snapshot; sizes the ring's allocations. */
+size_t RtlRollbackSnapshotBound(void);
+
+/* Read / rewind the DSP output-ring producer cursor, so a resim can discard
+ * the audio it re-produced for ticks the player has already heard. */
+uint32_t RtlAudioProducerCursor(void);
+void RtlAudioRewindProducer(uint32_t cursor);
+
+/*
+ * Multiplayer seats (Super Multitap).
+ *
+ * RtlRunFrame's packed word owns seats 0 and 1 and is unchanged. Seats 2..7
+ * are additive: a game that wants more than two players calls RtlSetPadState
+ * for those seats before RtlRunFrame, exactly the way psxrecomp's
+ * sio_set_pad_state_slot works, so no existing port has to change its frame
+ * loop to keep working.
+ *
+ * Seat numbering follows the port configuration (runner/src/snes/joypad.h):
+ *
+ *   no tap          seats 0..1
+ *   tap on port 1   tap = seats 0..3, port 2 pad = seat 4
+ *   tap on port 2   port 1 pad = seat 0, tap = seats 1..4   (5-player)
+ *   taps on both    port 1 tap = seats 0..3, port 2 tap = seats 4..7
+ *
+ * A seat marked disconnected reports 0 on the multitap's 17th bit, which is
+ * how a game tells an empty tap slot from a controller holding nothing.
+ *
+ * Multitap is off by default; enable it per game with RtlSetMultitap, or at
+ * launch with SNES_MULTITAP=port1|port2|both (off/none also accepted).
+ */
+#define RTL_MAX_PLAYERS 8
+
+void RtlSetPadState(int slot, uint16 buttons);
+uint16 RtlGetPadState(int slot);
+void RtlSetPadConnected(int slot, int connected);
+int  RtlGetPadConnected(int slot);
+/* port: 0 = console port 1, 1 = console port 2. */
+void RtlSetMultitap(int port, int enabled);
+int  RtlGetMultitap(int port);
+/* Seats reachable in the current configuration: 2, 5, or 8. */
+int  RtlPlayerCount(void);
+
 void RtlApuWrite(uint16 adr, uint8 val);
 
 
