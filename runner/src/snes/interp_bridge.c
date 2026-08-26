@@ -1506,6 +1506,50 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     return 0;
 }
 
+/* ── interpreter attribution scope ────────────────────────────────────────
+ *
+ * Every bridge run pushes a synthesized name (interp@$XXXXXX, the entry PC)
+ * onto the recomp call stack and installs it as g_last_recomp_func for the
+ * run's duration. The debug server's write rings (VramTraceEntry.func/stack,
+ * OamWriteEntry.func) copy those at write time, so without this an
+ * interpreted write is attributed to the stale enclosing AOT frame — or, in
+ * a whole-program-LLE port, to nothing at all. The entry PC is the useful
+ * identity: it is a real guest function entry, the exact address a
+ * symbols.toml [[func]] would name. Nested calls that bounce to compiled
+ * bodies push their own names over this one, so only still-interpreted
+ * depth stays attributed to the bridge entry.
+ *
+ * Names are interned in a fixed open-addressed table: RecompStackPush keeps
+ * the pointer, not a copy, so it must outlive the run. On table overflow a
+ * shared static name is returned rather than evicting — attribution degrades
+ * to "some interpreted code", never to a dangling pointer.
+ */
+extern const char *g_last_recomp_func; /* common_cpu_infra.c */
+
+#define INTERP_SCOPE_NAMES 4096u /* power of two; ~1400 tier sites seen in MMX */
+static char s_interp_scope_names[INTERP_SCOPE_NAMES][20];
+static uint32_t s_interp_scope_pc[INTERP_SCOPE_NAMES];
+static uint8_t s_interp_scope_used[INTERP_SCOPE_NAMES];
+
+static const char *interp_scope_name(uint32_t pc24) {
+    pc24 &= 0xFFFFFFu;
+    uint32_t h = (pc24 * 2654435761u) & (INTERP_SCOPE_NAMES - 1u);
+    for (uint32_t probe = 0; probe < INTERP_SCOPE_NAMES; probe++) {
+        uint32_t slot = (h + probe) & (INTERP_SCOPE_NAMES - 1u);
+        if (!s_interp_scope_used[slot]) {
+            s_interp_scope_used[slot] = 1;
+            s_interp_scope_pc[slot] = pc24;
+            snprintf(s_interp_scope_names[slot],
+                     sizeof(s_interp_scope_names[slot]),
+                     "interp@$%06X", (unsigned)pc24);
+            return s_interp_scope_names[slot];
+        }
+        if (s_interp_scope_pc[slot] == pc24)
+            return s_interp_scope_names[slot];
+    }
+    return "interp@(table full)";
+}
+
 /* Wrapper: mark the interp tier as APU-driving for the whole run (nesting-safe
  * save/restore) so rtl_accumulate_apu_catchup skips the per-touch synthetic
  * estimate — the core advances the SPC per opcode instead. */
@@ -1530,11 +1574,20 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     s_interp_owner_exit_s = s_exit;
     s_interp_owner_exit_valid = 1;
     s_interp_bridge_depth++;
+    /* Attribution scope (see interp_scope_name above). Saved/restored rather
+     * than assumed clean: a bounce chain re-enters this wrapper with an AOT
+     * name installed, and that name must come back on our exit. */
+    const char *_saved_func = g_last_recomp_func;
+    const char *_scope_name = interp_scope_name(entry_pc24);
+    g_last_recomp_func = _scope_name;
+    RecompStackPush(_scope_name);
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
+    RecompStackPop();
+    g_last_recomp_func = _saved_func;
     s_interp_bridge_depth--;
     s_interp_owner_exit_s = _saved_owner_exit_s;
     s_interp_owner_exit_valid = _saved_owner_exit_valid;
