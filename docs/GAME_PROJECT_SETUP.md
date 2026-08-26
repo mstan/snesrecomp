@@ -68,7 +68,9 @@ collides when the script is re-run.
    `tier_down_stubs`, plus a starter `recomp/symbols.toml` naming the reset
    and NMI vectors.
 5. **Add submodules**: `snesrecomp` (which owns `lib/recomp-net` and
-   `lib/retcomm-rbengine`), optionally `recomp-ui`.
+   `lib/retcomm-rbengine`), optionally `recomp-ui`. The URL and ref come from
+   the checkout the script runs out of, so the project pins the framework you
+   actually have; an unpushed branch is pinned by commit and reported.
 6. **Record pins** to `framework_pins.txt`.
 7. **CI workflow**, **commit**, optional **`gh repo create`**.
 8. **Generate** and **build** if asked.
@@ -78,7 +80,9 @@ collides when the script is re-run.
 
 You get a repository that **builds a real executable** — framework, generated
 C, and a working desktop host — plus a regeneration pipeline that verifies the
-ROM, CI, packaging, and a README that states what it is.
+ROM, CI, packaging, and a README that states what it is. With the defaults the
+wizard runs the whole pipeline itself: submodules, generate, `cmake`, and a
+Release build, then prints the binary it produced and how to run it.
 
 You do **not** get a working port. The scaffold stops exactly where
 game-specific work starts, and that boundary is `src/game_rtl.c`.

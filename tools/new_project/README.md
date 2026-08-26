@@ -102,9 +102,21 @@ The framework remotes are checked **before** anything is created, and a
 failure part way through removes the directory the script made rather than
 leaving a partial project the next run would refuse to overwrite.
 
-The framework URL is read from the checkout this script runs out of
-(`git remote get-url origin`) instead of being hard-coded, so it cannot drift
-from where snesrecomp actually lives.
+The framework **URL and ref** both come from the checkout this script runs out
+of, rather than being hard-coded — so a scaffold pins the framework that
+checkout actually has. Hard-coding `main` silently produced projects that
+could not generate or build whenever the work lived on a branch, which is the
+normal state while a feature is in progress.
+
+If that branch is not on the remote yet, the scaffolder says so, pins the
+local commit anyway, and carries on: the project generates and builds here,
+and pushing the branch later makes the pin resolvable for everyone else
+without touching the project.
+
+The pinned ref is then checked for the features the project asked for
+(`generate`, recomp-net, retcomm-rbengine, `snesrecomp_enable_rollback`), so a
+gap is reported up front instead of failing later with an argparse error that
+names nothing.
 
 ## Tests
 

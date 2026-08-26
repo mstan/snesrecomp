@@ -280,6 +280,26 @@ def test_github_creation_is_opt_in():
         assert "scaffold" in log, log
 
 
+def test_framework_ref_defaults_to_this_checkouts_branch():
+    """A scaffold cut from a checkout has to pin the framework that checkout
+    actually has. Hard-coding "main" silently produced projects that could
+    not generate or build whenever the work lived on a branch — which is the
+    normal state while a feature is in progress."""
+    text = SETUP.read_text(encoding="utf-8")
+    assert "symbolic-ref --quiet --short HEAD" in text
+    # and a branch the remote does not have must still yield a working tree
+    assert "FRAMEWORK_REF_UNPUSHED" in text
+    # The local commit has to be staged before `submodule update` runs, or it
+    # is snapped back to whatever `submodule add` recorded. Anchor on the
+    # submodule section: the flag documentation in the header mentions the
+    # same command and would otherwise match first.
+    section = text[text.index('echo "== Adding submodules =="'):]
+    add_at = section.index("git add snesrecomp")
+    update_at = section.index("git submodule update --init --recursive")
+    assert add_at < update_at, \
+        "the gitlink must be staged before submodule update restores it"
+
+
 def test_scaffold_refuses_to_overwrite():
     with tempfile.TemporaryDirectory() as directory:
         tmp = pathlib.Path(directory)
