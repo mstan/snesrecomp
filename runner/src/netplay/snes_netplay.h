@@ -165,13 +165,18 @@ void snes_netplay_request_return_to_lobby(void);
 int  snes_netplay_return_to_lobby_requested(void);
 void snes_netplay_clear_return_to_lobby(void);
 
-/* Host-only savestate sync (chunked over recomp-net). Host applies/writes
- * immediately; guest catch-up is async (load/SRAM stall admit until applied).
+/* Host-only savestate sync (chunked over recomp-net). Load uses hash-probe
+ * first (skip transfer when guest already has the blob), then a short ready
+ * rendezvous before hard_resync. SAVE still ships async after host write.
  * Guests use saves/netplay/ so personal saves/ is never overwritten.
  * Returns 1 if netplay handled the request, 0 if offline — caller may RtlSaveLoad. */
 int  snes_netplay_is_host(void);
 int  snes_netplay_request_save(int slot);
 int  snes_netplay_request_load(int slot);
+
+/* 1 while a save/load/SRAM probe or transfer is in flight (app + library).
+ * Host barrier must not count these stalls toward delay_sync_starvation. */
+int  snes_netplay_state_barrier(void);
 
 /*
  * Netplay diagnostics JSONL dump (saves/netplay/net_diag_slot{N}.jsonl).
