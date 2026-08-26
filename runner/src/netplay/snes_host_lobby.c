@@ -885,8 +885,12 @@ static int cb_input_delay_set(void *ctx, int delay_frames)
     g_lan_room.input_delay = g_lobby_input_delay;
     (void)publish_lan_room();
     if (g_direct_host && g_lan_room.joiner_name[0])
-      (void)rnet_lan_direct_host_notify_caps(g_direct_host,
-                                             g_lobby_input_delay);
+      /* notify_caps takes the room, not the delay. The delay it should carry
+       * was already written into g_lan_room two lines up, and passing the int
+       * here made the guest read an integer as a room pointer. Only a build
+       * with recomp-ui compiles this branch, which is why it survived: GCC 14
+       * turned int-conversion into an error and surfaced it. */
+      (void)rnet_lan_direct_host_notify_caps(g_direct_host, &g_lan_room);
     return 0;
   }
   if (g_joined_lan)

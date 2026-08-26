@@ -11,7 +11,27 @@
 
 #if defined(SNESRECOMP_NET)
 #include "recomp_net/recomp_net.h"
+/*
+ * Rollback is an optional build (snesrecomp_enable_rollback). A game that
+ * links netplay without it must still compile, so everything the rollback
+ * host provides is reached through the shims below rather than by including
+ * its header unconditionally — that header pulls in retcomm-rbengine, which
+ * is not on the include path unless rollback was enabled.
+ */
+#if defined(SNESRECOMP_NET_ROLLBACK)
 #include "snes_netplay_rb.h"
+#else
+#include <stdint.h>
+struct SnesNetplayRbBindings;
+static inline int  snes_netplay_rb_enabled(void) { return 0; }
+static inline void snes_netplay_rb_bind(const struct SnesNetplayRbBindings *b) { (void)b; }
+static inline int  snes_netplay_rb_start(void) { return 0; }
+static inline void snes_netplay_rb_shutdown(void) {}
+static inline int  snes_netplay_rb_poll_admit(void) { return 0; }
+static inline void snes_netplay_rb_finish_frame(void) {}
+static inline void snes_netplay_rb_stage_local(uint16_t buttons) { (void)buttons; }
+static inline uint32_t snes_netplay_rb_sim_tick(void) { return 0; }
+#endif
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #if defined(SNES_HAS_LOBBY_CLIENT)
@@ -261,6 +281,7 @@ static void np_rb_apply_sync(const uint8_t in[2])
 
 static void np_rollback_try_start(void)
 {
+#if defined(SNESRECOMP_NET_ROLLBACK)
     SnesNetplayRbBindings b;
 
     g_np_rollback = 0;
@@ -283,6 +304,10 @@ static void np_rollback_try_start(void)
                 "falling back to delay-sync for this session\n");
         snes_netplay_rb_bind(NULL);
     }
+#else
+    /* Not built with rollback: delay-sync is the only admit path. */
+    g_np_rollback = 0;
+#endif
 }
 static int g_return_to_lobby;
 static uint32_t g_connect_wait_started_ms;
@@ -877,7 +902,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 void snes_netplay_shutdown(void)
 {
     snes_netplay_rb_shutdown();
+#if defined(SNESRECOMP_NET_ROLLBACK)
     snes_netplay_rb_bind(NULL);
+#endif
     g_np_rollback = 0;
     if (g_diag_file) {
         fclose(g_diag_file);
