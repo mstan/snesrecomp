@@ -261,6 +261,74 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
   }
 }
 
+/* ── HDMA ────────────────────────────────────────────────────────────────
+ *
+ * dma_startDma(..., hdma=true) has always set channel[i].hdmaActive from
+ * $420C, and DmaChannel has carried tableAdr / repCount / doTransfer /
+ * terminated / indBank since forever — but nothing ever consumed any of it.
+ * There was no HDMA transfer engine in the tree at all, so a game's per-
+ * scanline register stream simply never happened.
+ *
+ * Measured on Gundam Wing Endless Duel: through the intro cutscene, channel 1
+ * is HDMA-active onto $212C (TM, main-screen layer enable), rewriting which
+ * BG layers are on per scanline. That is the letterbox — BG off on the top
+ * and bottom bands, on in the middle, with OBJ left enabled so the characters
+ * still draw over the bars. Without the engine every line got one TM value
+ * and the whole effect was lost.
+ *
+ * Standard algorithm: dma_initHdma() reloads each enabled channel's table
+ * pointer at the top of the field; dma_doHdma() runs once per scanline.
+ * `size` doubles as the indirect address, as the struct comment notes. */
+
+void dma_initHdma(Dma* dma) {
+  for(int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if(!ch->hdmaActive) continue;
+    ch->tableAdr = ch->aAdr;
+    ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+    ch->terminated = (ch->repCount == 0);
+    if(ch->indirect) {
+      ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+      ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
+    }
+    ch->doTransfer = true;
+    ch->offIndex = 0;
+  }
+}
+
+void dma_doHdma(Dma* dma) {
+  for(int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if(!ch->hdmaActive || ch->terminated) continue;
+
+    if(ch->doTransfer) {
+      int len = transferLength[ch->mode];
+      for(int j = 0; j < len; j++) {
+        uint8_t b = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode][j]);
+        if(ch->indirect) {
+          dma_transferByte(dma, ch->size++, ch->indBank, b, false);
+        } else {
+          dma_transferByte(dma, ch->tableAdr++, ch->aBank, b, false);
+        }
+      }
+    }
+
+    ch->repCount--;
+    /* Bit 7 of the line-count byte is the "continue" flag: keep transferring
+     * on each of the next (count & 0x7F) lines rather than only the first. */
+    ch->doTransfer = (ch->repCount & 0x80) != 0;
+    if((ch->repCount & 0x7f) == 0) {
+      ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+      if(ch->indirect) {
+        ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+        ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
+      }
+      ch->terminated = (ch->repCount == 0);
+      ch->doTransfer = true;
+    }
+  }
+}
+
 bool dma_cycle(Dma* dma) {
   if(dma->dmaBusy) {
     dma_doDma(dma);

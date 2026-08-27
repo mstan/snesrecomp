@@ -771,6 +771,28 @@ uint8 *RomPtr(uint32_t addr) {
 static int _writereg_ppu_count = 0;
 static int _writereg_dma_count = 0;
 void WriteReg(uint16 reg, uint8 value) {
+  /* Advance emulated beam time before the write lands.
+   *
+   * AOT-compiled code never advances the PPU beam — only a $2137 read did, in
+   * ReadRegOpenBus below — so a compiled routine executes in zero PPU time no
+   * matter how many cycles it costs. The interpreter does the opposite: it
+   * calls snes_sync_master_clock after every opcode. That asymmetry is what
+   * loses raster splits scheduled close together: snes_advance_beam's IRQ
+   * comparator is a WINDOW test (target inside [h, h+span)), so a beam that
+   * jumps in one lump can step straight over a target and produce no IRQ at
+   * all rather than a late one.
+   *
+   * Measured on Gundam Wing: $00:888E is the line-21 split handler, it writes
+   * INIDISP = shadow & $80 (brightness 0, deliberate) and schedules the split
+   * that RESTORES brightness only two scanlines later at line 23. That second
+   * split was missed in ~85% of frames, leaving the gameplay demo black for
+   * ~1100 consecutive frames.
+   *
+   * Syncing on every hardware touch keeps compiled and interpreted code on the
+   * same clock. It is bounded work: register accesses are rare next to RAM, and
+   * frequent syncing keeps each delta small. */
+  if (g_snes)
+    snes_sync_master_clock(g_snes, g_cpu.master_cycles);
   // Direct dispatch — bypass emulator bus
   // MSU-1 ($2000-$2007). Inert unless a pack is armed, so the open-bus
   // default (no-op + log) is preserved byte-for-byte when disabled.
@@ -795,6 +817,12 @@ void WriteReg(uint16 reg, uint8 value) {
     cart_write(g_snes->cart, 0, reg, value);
   } else if (reg >= 0x2100 && reg < 0x2140) {
     ppu_write(g_ppu, reg & 0xff, value);
+    /* Feed the raster journal: a mid-frame write to a display-state register
+     * is a per-line fact the frame-end render would otherwise discard. The
+     * beam line is exact here — during an IRQ handler the beam is held at the
+     * latch line. ppu_rasterRecord itself filters to the journaled set. */
+    if (g_snes)
+      ppu_rasterRecord(reg, g_snes->vPos, value);
   } else if (reg >= 0x2140 && reg < 0x2180) {
 #if SNESRECOMP_ENABLE_MODS
     if (snes_mod_runtime_filter_apu_write_c(reg, value)) {
@@ -806,8 +834,14 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x2180 && reg < 0x2184) {
     snes_writeBBus(g_snes, reg & 0xff, value);
   } else if (reg >= 0x4200 && reg < 0x4220) {
-    if (reg == 0x420C)
+    if (reg == 0x420C) {
       g_snesrecomp_last_hdmaen = value;
+      /* Per-line fact: this title switches the transition's HDMA
+       * channels on from the line-21 raster handler, and a frame-model
+       * host that samples the mask once at render time never sees them.
+       * See raster_reg_journaled() in ppu.c. */
+      if (g_snes) ppu_rasterRecord(reg, g_snes->vPos, value);
+    }
     if (reg == 0x420D)
       g_memsel = (uint8_t)(value & 1);  /* FastROM select; paces $80-FF code */
     recomp_write_internal_reg(reg, value);

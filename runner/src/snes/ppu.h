@@ -400,6 +400,17 @@ void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
+
+/* Raster journal — per-line replay of mid-frame INIDISP writes for frame-model
+ * hosts. See the block comment in ppu.c. Host calls Begin after its
+ * vblank-edge work and ApplyLine in its render loop; the register write path
+ * calls Record with the beam line. */
+void ppu_rasterBegin(Ppu *ppu);
+void ppu_rasterRenderBegin(Ppu *ppu);
+int  ppu_rasterTakeHdmaen(uint8_t *out);
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
+void ppu_rasterApplyLine(Ppu *ppu, int line);
+int  ppu_rasterDebugDump(char *out, int cap);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 

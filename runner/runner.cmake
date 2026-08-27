@@ -144,8 +144,19 @@ message(STATUS "Cx4: instruction-level HG51B S169 core (ares, ISC)")
 # a normal playable build; opt in with -DSNESRECOMP_ENABLE_TRACE=ON.
 option(SNESRECOMP_ENABLE_TRACE "Build the TCP debug server / observability rings" OFF)
 if(SNESRECOMP_ENABLE_TRACE)
+    # Compiling debug_server.c is only half of turning tracing on. The header
+    # keys off SNESRECOMP_TRACE, not off the option, and defaults it to 0 — so
+    # without this define every translation unit (debug_server.c included) sees
+    # the no-op stubs, and debug_server.c's real definitions collide with the
+    # stubs it just pulled in from its own header. The option was inert before
+    # this: -DSNESRECOMP_ENABLE_TRACE=ON did not build, it only failed.
+    add_compile_definitions(SNESRECOMP_TRACE=1)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         ${SNESRECOMP_RUNNER_ROOT}/src/debug_server.c
+        # debug_server.c's on-demand dump calls recomp_post_mortem_dump(), and
+        # this is the only translation unit that defines it. It is not in the
+        # base source list, so a trace build does not link without it.
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/post_mortem.c
     )
     if(EXISTS ${SNESRECOMP_RUNNER_ROOT}/src/emu_oracle_cmds.c)
         list(APPEND SNESRECOMP_RUNNER_SOURCES
