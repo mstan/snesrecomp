@@ -4585,6 +4585,19 @@ static void cmd_screenshot(const char *args) {
              path, w, h, (int)g_ppu->extraLeftRight, snes_frame_counter);
 }
 
+/* raster_journal — the per-line register waveform the renderer will replay.
+ * A frame-model host runs all of a frame's CPU work and only then draws its
+ * 224 lines, so "what the game wrote mid-frame" and "what the renderer saw"
+ * are different things. This is where the two can be compared. */
+static void cmd_raster_journal(const char *args) {
+    (void)args;
+    static char buf[65536];
+    int n = ppu_rasterDebugDump(buf, (int)sizeof(buf));
+    if (n <= 0) { send_fmt("{\"error\":\"journal unavailable\"}"); return; }
+    send_all_bounded(buf, n);
+    send_all_bounded("\n", 1);
+}
+
 static void cmd_get_ppu_state(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
     Ppu *p = g_ppu;
@@ -4636,7 +4649,11 @@ static void cmd_get_interrupt_state(const char *args) {
     send_fmt("{\"inNmi\":%s,\"inIrq\":%s,\"inVblank\":%s,"
              "\"nmiEnabled\":%s,\"hIrqEnabled\":%s,\"vIrqEnabled\":%s,"
              "\"autoJoyRead\":%s,\"hPos\":%u,\"vPos\":%u,"
-             "\"hTimer\":%u,\"vTimer\":%u,\"autoJoyTimer\":%u}",
+             "\"hTimer\":%u,\"vTimer\":%u,\"autoJoyTimer\":%u,"
+             "\"irqLatches\":%u,\"irqMissedFields\":%u,\"lastMissedLine\":%u,"
+             "\"irqOvershot\":%u,\"lastOvershotLine\":%u,\"lastOvershotBy\":%u,"
+             "\"targetInPast\":%u,\"lastPastTarget\":%u,\"lastPastBeam\":%u,"
+             "\"nmiBeamLine\":%u,\"nmiLateCount\":%u,\"beamLagAtNmi\":%llu}",
              s->inNmi       ? "true" : "false",
              s->inIrq       ? "true" : "false",
              s->inVblank    ? "true" : "false",
@@ -4644,7 +4661,12 @@ static void cmd_get_interrupt_state(const char *args) {
              s->hIrqEnabled ? "true" : "false",
              s->vIrqEnabled ? "true" : "false",
              s->autoJoyRead ? "true" : "false",
-             s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer);
+             s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer,
+             s->dbgIrqLatches, s->dbgIrqMissed, s->dbgLastMissedLine,
+             s->dbgIrqOvershot, s->dbgLastOvershotLine, s->dbgLastOvershotBy,
+             s->dbgTargetInPast, s->dbgLastPastTarget, s->dbgLastPastBeam,
+             s->dbgNmiBeamLine, s->dbgNmiLateCount,
+             (unsigned long long)s->dbgBeamLagAtNmi);
 }
 
 /* cx4_state [n] — instruction-level Cx4 (HG51B S169) status plus the always-on
@@ -7668,6 +7690,7 @@ static const CmdEntry s_commands[] = {
     {"dump_cgram",    cmd_dump_cgram},
     {"dump_oam",      cmd_dump_oam},
     {"get_ppu_state", cmd_get_ppu_state},
+    {"raster_journal", cmd_raster_journal},
     {"ppu_lines",     cmd_ppu_lines},
     {"ppu_window",    cmd_ppu_window},
     {"get_cpu_state", cmd_get_cpu_state},

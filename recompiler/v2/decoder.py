@@ -1172,8 +1172,8 @@ def _pea_ptrcall_return_pc(rom: Optional[bytes], bank: int, pc: int,
     return (pea_operand + 1) & 0xFFFF
 
 
-def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
-                            entry_m: int = 1, entry_x: int = 1):
+def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
+                                        entry_m: int = 1, entry_x: int = 1):
     """Detect whether the subroutine at (bank, addr) is a JSR/JSL
     INLINE-ARGUMENT routine, returning the inline byte count N (or None).
 
@@ -1347,6 +1347,148 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
     return None
 
 
+def _pulled_return_slots(insns) -> set:
+    """Addresses that received a byte pulled straight off the stack.
+
+    `PLA` immediately followed by `STA <dp/abs>` is how a routine copies its
+    own return address out of the stack frame. Two or more of those in a row,
+    into consecutive addresses, is a 16- or 24-bit return-address pointer.
+    Returns the base address of every such run.
+    """
+    got = []
+    pending = False
+    for ins in insns:
+        if ins.opcode == 0x68:            # PLA
+            pending = True
+            continue
+        if pending and ins.opcode in (0x85, 0x8D):   # STA dp / STA abs
+            got.append(ins.operand & 0xFFFF)
+        pending = False
+    bases = set()
+    run_start = None
+    for i, a in enumerate(got):
+        if run_start is None:
+            run_start = a
+        elif a != got[i - 1] + 1:
+            run_start = a
+        if run_start is not None and a - run_start >= 1:
+            bases.add(run_start)
+    return bases
+
+
+def _indirect_through_pulled_return(insns, last) -> bool:
+    """True when `last` is an indirect jump through a pulled return address."""
+    bases = _pulled_return_slots(insns)
+    if not bases:
+        return False
+    ptr = last.operand & 0xFFFF
+    return ptr in bases
+
+
+def detect_dp_return_inline_arg_bytes(rom: bytes, bank: int, addr: int):
+    """Inline-argument count for the PLA-into-direct-page return idiom.
+
+    `detect_inline_arg_bytes` above recognises the form that writes the
+    adjusted return address BACK TO THE STACK SLOT and leaves through RTS/RTL.
+    This is the other spelling: pull the 24-bit return address into consecutive
+    direct-page bytes, add the inline size to the low word, and leave through
+    `JML [dp]`. Gundam Wing Endless Duel's $00:8F2F is the canonical case and
+    has 37 call sites, so getting it wrong is not a local defect.
+
+        STA $E4              ; (the routine's own index argument)
+        SEP #$20
+        PLA / STA $E0        ; return address low
+        PLA / STA $E1        ;                high
+        PLA / STA $E2        ;                bank
+        ...
+        CLC / LDA $E0 / ADC #$0007 / STA $E0
+        JML [$00E0]          ; return, past 7 bytes of inline data
+
+    Returns N, or None when the shape does not match exactly.
+    """
+    from snes65816 import decode_insn, lorom_offset
+    pc = addr & 0xFFFF
+    m = x = 1
+    pulled = []          # dp addresses that received a PLA byte, in order
+    pending_pla = False
+    ret_base = None
+    armed = False        # LDA <ret_base> seen, tracking an ADC
+    added = 0
+    found_n = None
+    budget = 0
+    while budget < 160:
+        budget += 1
+        if not (0x8000 <= pc <= 0xFFFF):
+            return None
+        try:
+            off = lorom_offset(bank, pc)
+        except AssertionError:
+            return None
+        if off >= len(rom):
+            return None
+        try:
+            ins = decode_insn(rom, off, pc, bank, m=m, x=x)
+        except Exception:
+            return None
+        if ins is None:
+            return None
+        op = ins.opcode
+
+        if ins.mnem == 'REP':
+            if ins.operand & 0x20: m = 0
+            if ins.operand & 0x10: x = 0
+        elif ins.mnem == 'SEP':
+            if ins.operand & 0x20: m = 1
+            if ins.operand & 0x10: x = 1
+
+        if op == 0x68:                                  # PLA
+            pending_pla = True
+        elif pending_pla and op == 0x85:                # STA dp, right after PLA
+            pulled.append(ins.operand & 0xFF)
+            pending_pla = False
+            if len(pulled) >= 2 and pulled[-1] == pulled[-2] + 1:
+                ret_base = pulled[0]
+        else:
+            pending_pla = False
+            if ret_base is not None:
+                if op == 0xA5 and (ins.operand & 0xFF) == ret_base:   # LDA dp
+                    armed, added = True, 0
+                elif armed and op == 0x69:                            # ADC #imm
+                    added = (added + ins.operand) & 0xFFFF
+                elif armed and op == 0x85 and (ins.operand & 0xFF) == ret_base:
+                    if added:
+                        found_n = added                  # LDA/ADC/STA back to dp
+                    armed = False
+                elif op == 0xDC:                                      # JML [abs]
+                    ptr = ins.operand & 0xFFFF
+                    if (ptr & 0xFF) == ret_base and (ptr >> 8) == 0 and found_n:
+                        return found_n & 0xFF
+                    return None
+                elif ins.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'JML', 'STP'):
+                    return None
+        pc = (pc + ins.length) & 0xFFFF
+    return None
+
+
+def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
+                            entry_m: int = 1, entry_x: int = 1):
+    """Inline-argument byte count for the routine at (bank, addr), or None.
+
+    Two spellings of the same idiom, tried in order:
+      * stack-slot write-back, leaving through RTS/RTL
+        (`_detect_inline_arg_bytes_stack_slot`)
+      * pull into direct page, leaving through `JML [dp]`
+        (`detect_dp_return_inline_arg_bytes`)
+
+    The second cannot be folded into the first: that scanner returns None the
+    moment it meets a terminator, and `JML [dp]` IS this form's terminator.
+    """
+    n = _detect_inline_arg_bytes_stack_slot(rom, bank, addr, entry_m, entry_x)
+    if n is not None:
+        return n
+    return detect_dp_return_inline_arg_bytes(rom, bank, addr)
+
+
 def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     """Identify whether the subroutine at (bank, addr) is a JSL-jump-table
     dispatch helper. Returns 'short' (16-bit table entries), 'long'
@@ -1406,6 +1548,16 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     last = insns[-1]
     if not (last.mnem in ('JMP', 'JML') and
             last.mode in (INDIR, INDIR_X, INDIR_L)):
+        return None
+    # ...but an indirect jump THROUGH THE PULLED RETURN ADDRESS is a return,
+    # not a dispatch. The inline-argument idiom pulls its own 24-bit return
+    # address into consecutive direct-page bytes, advances it past the inline
+    # data, and leaves through `JML [dp]`. That matches every structural test
+    # above — PLA present, terminal indirect jump, and an `ASL A ... TAX` that
+    # is really indexing a DATA table (Gundam Wing's $00:8F2F indexes a bitmask
+    # table for TSB, not a jump table). Classifying it as a dispatch synthesises
+    # a jump table out of unrelated data and abandons every call site.
+    if _indirect_through_pulled_return(insns, last):
         return None
     # Width: ASL A ... TAY/TAX, with ADC in between → long.
     asl_seen = False

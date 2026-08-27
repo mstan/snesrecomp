@@ -1,4 +1,6 @@
 #include "ppu.h"
+
+extern unsigned char g_snesrecomp_last_hdmaen;
 #include "ppu_legacy.h"
 
 #include <stdio.h>
@@ -2223,6 +2225,192 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
       assert(0);
       return 0;
     }
+  }
+}
+
+/* ── raster journal ────────────────────────────────────────────────────────
+ * Per-line replay of mid-frame PPU writes, for frame-model hosts.
+ *
+ * Such a host runs the frame's CPU work first and renders all 224 lines
+ * afterwards, so the PPU register file at render time is the LAST-written
+ * state. A raster-split game turns these registers into per-line waveforms.
+ * Gundam Wing's IRQ chain (lines 21/23/71/72/215) writes INIDISP, BG1
+ * scroll, TM, TMW and CGADSUB per band: the HUD band at the top has its own
+ * scroll and layer set, the playfield another, the letterbox a third.
+ * Rendering the whole frame with the final state drew the demo black
+ * (measured: 61/61 frames rendered forcedBlank), and with INIDISP-only
+ * replay the HUD band drew black while the reference shows the health bars.
+ *
+ * Same defect class the HDMA engine solved (dma_initHdma/dma_doHdma):
+ * record during CPU time, replay per line at render time. The host brackets:
+ *   ppu_rasterBegin(ppu)              after its vblank-edge work — snapshots
+ *                                     line-0 state, including the write-twice
+ *                                     scroll latch
+ *   ppu_rasterApplyLine(ppu, line)    in the render loop before ppu_runLine
+ * The register-write path calls ppu_rasterRecord with the beam line.
+ *
+ * Registers journaled: the set the split handlers write. Data ports (VRAM/
+ * CGRAM/OAM) are deliberately excluded — those are uploads, not per-line
+ * display state, and replaying them would double-apply the data. */
+#define PPU_RASTER_MAX 256
+typedef struct { uint8_t line; uint16_t reg; uint8_t val; } PpuRasterEntry;
+static PpuRasterEntry s_raster[PPU_RASTER_MAX];
+static int s_raster_count;
+static int s_raster_armed;
+static int s_raster_next;
+static uint8_t s_raster_hdmaen;
+static int s_raster_hdmaen_pending;
+static struct {
+  uint8_t inidisp;
+  uint16_t hScroll0, vScroll0;
+  uint8_t tm, tmw, cgadsub, hdmaen;
+  uint8_t scrollPrev, scrollPrev2;
+} s_raster0;
+
+static int raster_reg_journaled(uint16_t reg) {
+  switch (reg) {
+    case 0x2100:                 /* INIDISP */
+    case 0x210D: case 0x210E:    /* BG1HOFS / BG1VOFS */
+    case 0x212C: case 0x212E:    /* TM / TMW */
+    case 0x2131:                 /* CGADSUB */
+    /* HDMAEN is a per-line fact as much as any PPU register. This title
+     * enables the transition's HDMA channels MID-FRAME from the line-21 raster
+     * handler ($00:888E writes $420C = 0x90, channels 4 and 7, channel 7
+     * driving $2128 = window 2 left for the shutter wipe). A frame-model host
+     * that reads the enable mask once at render time sees only the end-of-frame
+     * value, so a channel switched on at line 21 and off again later never runs
+     * at all — measured, the whole wipe was missing while the NMI-enabled
+     * letterbox on channel 1 rendered fine. */
+    case 0x420C:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+void ppu_rasterBegin(Ppu *ppu) {
+  s_raster_count = 0;
+  s_raster_next = 0;
+  s_raster_armed = 1;
+  s_raster0.inidisp = ppu->inidisp;      /* post-vblank state = line-0 state */
+  s_raster0.hScroll0 = ppu->hScroll[0];
+  s_raster0.vScroll0 = ppu->vScroll[0];
+  s_raster0.tm = ppu->screenEnabled[0];
+  s_raster0.tmw = ppu->screenWindowed[0];
+  s_raster0.cgadsub = ppu->cgadsub;
+  s_raster0.hdmaen = g_snesrecomp_last_hdmaen;
+  s_raster0.scrollPrev = ppu->scrollPrev;
+  s_raster0.scrollPrev2 = ppu->scrollPrev2;
+}
+
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
+  if (!s_raster_armed || !raster_reg_journaled(reg)) return;
+  if (line == 0 || line >= 225) {
+    /* A write outside active display is next frame's baseline, not a split.
+     * Track it in the snapshot so late-vblank writes are not lost. */
+    switch (reg) {
+      case 0x2100: s_raster0.inidisp = val; break;
+      case 0x210D:
+        s_raster0.hScroll0 =
+            (uint16_t)((val << 8 | s_raster0.scrollPrev) & 0x3FF);
+        s_raster0.scrollPrev = val;
+        s_raster0.scrollPrev2 = val;
+        break;
+      case 0x210E:
+        s_raster0.vScroll0 =
+            (uint16_t)((val << 8 | s_raster0.scrollPrev) & 0x3FF);
+        s_raster0.scrollPrev = val;
+        break;
+      case 0x212C: s_raster0.tm = val; break;
+      case 0x212E: s_raster0.tmw = val; break;
+      case 0x2131: s_raster0.cgadsub = val; break;
+      case 0x420C: s_raster0.hdmaen = val; break;
+    }
+    return;
+  }
+  if (s_raster_count < PPU_RASTER_MAX) {
+    s_raster[s_raster_count].line = (uint8_t)line;
+    s_raster[s_raster_count].reg = reg;
+    s_raster[s_raster_count].val = val;
+    s_raster_count++;
+  }
+}
+
+/* Restore the line-0 snapshot. Called by the host BEFORE its render loop —
+ * i.e. before dma_initHdma and the first dma_doHdma — never inside line 1:
+ * HDMA writes the same registers per line (this title's intro letterbox is an
+ * HDMA stream onto TM), and a restore after line 1's HDMA write would stomp
+ * it. Measured as exactly that regression: the intro's top black bar
+ * disappeared while the HDMA bars below survived. */
+int ppu_rasterTakeHdmaen(uint8_t *out) {
+  if (!s_raster_hdmaen_pending) return 0;
+  s_raster_hdmaen_pending = 0;
+  *out = s_raster_hdmaen;
+  return 1;
+}
+
+void ppu_rasterRenderBegin(Ppu *ppu) {
+  if (!s_raster_armed) return;
+  s_raster_hdmaen_pending = 0;
+  ppu->inidisp = s_raster0.inidisp;
+  ppu->hScroll[0] = s_raster0.hScroll0;
+  ppu->vScroll[0] = s_raster0.vScroll0;
+  ppu->screenEnabled[0] = s_raster0.tm;
+  ppu->screenWindowed[0] = s_raster0.tmw;
+  ppu->cgadsub = s_raster0.cgadsub;
+  ppu->scrollPrev = s_raster0.scrollPrev;
+  ppu->scrollPrev2 = s_raster0.scrollPrev2;
+  s_raster_next = 0;
+}
+
+/* Snapshot of the journal as the renderer will consume it, for the debug
+ * server. The journal is the difference between "what the game wrote" and
+ * "what got drawn", so when a frame looks wrong this is the only place the two
+ * can be compared. Format: one "line:reg=val" token per entry, in beam order,
+ * preceded by the line-0 baseline. */
+int ppu_rasterDebugDump(char *out, int cap) {
+  int pos = 0;
+  int i;
+  pos += snprintf(out + pos, cap - pos,
+                  "{\"count\":%d,\"armed\":%d,"
+                  "\"base\":{\"inidisp\":\"0x%02X\",\"tm\":\"0x%02X\","
+                  "\"tmw\":\"0x%02X\",\"cgadsub\":\"0x%02X\","
+                  "\"bg1h\":%u,\"bg1v\":%u},\"entries\":[",
+                  s_raster_count, s_raster_armed,
+                  s_raster0.inidisp, s_raster0.tm, s_raster0.tmw,
+                  s_raster0.cgadsub,
+                  (unsigned)s_raster0.hScroll0, (unsigned)s_raster0.vScroll0);
+  for (i = 0; i < s_raster_count && pos < cap - 64; i++) {
+    pos += snprintf(out + pos, cap - pos, "%s{\"l\":%u,\"r\":\"0x%04X\",\"v\":\"0x%02X\"}",
+                    i ? "," : "", (unsigned)s_raster[i].line,
+                    s_raster[i].reg, s_raster[i].val);
+  }
+  pos += snprintf(out + pos, cap - pos, "]}");
+  return pos;
+}
+
+void ppu_rasterApplyLine(Ppu *ppu, int line) {
+  if (!s_raster_armed) return;
+  /* Entries are appended in beam order (the host walks the beam forward), so
+   * a moving cursor is enough. A write at line L lands mid-line on hardware;
+   * whole-line granularity applies it from line L on. Replaying through
+   * ppu_write keeps the write-twice scroll latch semantics — the latch state
+   * was restored above to its frame-start value, and the handlers write the
+   * two bytes in pairs, so the pairing reproduces exactly. */
+  while (s_raster_next < s_raster_count &&
+         s_raster[s_raster_next].line <= (uint8_t)line) {
+    const uint16_t reg = s_raster[s_raster_next].reg;
+    const uint8_t val = s_raster[s_raster_next].val;
+    if (reg == 0x420C) {
+      /* Not ours to apply — HDMA lives in the DMA unit and enabling a channel
+       * mid-frame also has to (re)start its table. Hand it to the host, which
+       * owns the render loop and calls dma_initHdma/dma_doHdma. */
+      s_raster_hdmaen = val;
+      s_raster_hdmaen_pending = 1;
+    } else {
+      ppu_write(ppu, (uint8_t)(reg & 0xFF), val);
+    }
+    s_raster_next++;
   }
 }
 
