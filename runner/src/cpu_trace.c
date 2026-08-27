@@ -1808,6 +1808,14 @@ void cpu_trace_stack_op(CpuState *cpu, uint32_t pc24, uint8_t op_id,
      * for non-WRAM events, free to repurpose). */
     capture(cpu, pc24, CPU_TR_STACK_OP, op_id,
             (uint16_t)((uint16_t)(uint8_t)delta << 8));
+    /* capture() no-ops when the ring was never allocated — a trace-enabled
+     * binary that skipped cpu_trace_init(), which capture() documents as a
+     * supported configuration. Patching up "the event capture() just wrote"
+     * is only valid if it actually wrote one: otherwise g_cpu_trace_idx is
+     * still 0, just_idx underflows to UINT64_MAX, and the masked index runs
+     * off a NULL ring. Stack ops are on by default, so that is a guaranteed
+     * segfault on the first guest push rather than a rare one. */
+    if (!g_cpu_trace_ring || g_cpu_trace_capacity == 0) return;
     uint64_t just_idx = g_cpu_trace_idx - 1;
     CpuTraceEvent *just = &g_cpu_trace_ring[just_idx & (g_cpu_trace_capacity - 1)];
     just->addr16 = old_S;

@@ -51,6 +51,11 @@ void dma_reset(Dma* dma);
 uint8_t dma_read(Dma* dma, uint16_t adr); // 43x0-43xf
 void dma_write(Dma* dma, uint16_t adr, uint8_t val); // 43x0-43xf
 void dma_doDma(Dma* dma);
+/* Per-scanline HDMA. A frame-model host owns these edges: call dma_initHdma()
+ * once at the top of the visible field and dma_doHdma() before rendering each
+ * scanline (FRAME_MODEL_HOSTS.md). */
+void dma_initHdma(Dma* dma);
+void dma_doHdma(Dma* dma);
 bool dma_cycle(Dma* dma);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
 void dma_saveload(Dma *dma, SaveLoadInfo *sli);
