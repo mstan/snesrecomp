@@ -525,6 +525,20 @@ void ppu_runLine(Ppu* ppu, int line) {
     debug_server_on_oam_render();
   }
   PpuUpdateWidescreenOamHistory(ppu, line);
+  /* Snapshot the OAM the scanline renderer is about to consume, once per
+   * frame, on whichever line the host actually starts with.
+   *
+   * This used to sit inside the line == 0 block, which silently disabled it
+   * for every frame-model host: those render the visible field as lines
+   * 1..224 and never pass line 0 at all. The ring therefore stayed empty
+   * forever and oam_render_get answered {"count":0,"snaps":[]} -- "no
+   * sprites recorded" -- for a screen full of sprites. An instrument that
+   * reports nothing is indistinguishable from a subsystem that did nothing,
+   * which is the most expensive way for a probe to fail. */
+  if (s_oam_snap_frame != snes_frame_counter) {
+    s_oam_snap_frame = snes_frame_counter;
+    debug_server_on_oam_render();
+  }
   if(line == 0) {
     if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
       int mod = PPU_mosaicSize(ppu);
