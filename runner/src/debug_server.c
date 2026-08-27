@@ -1480,6 +1480,23 @@ static volatile int s_fdump_done   = -1;
 static volatile int s_fdump_errno  = 0;
 static char s_fdump_path[512];
 
+/* Burst capture of CONSECUTIVE frames (dump_frame_range).
+ *
+ * dump_frame_raw cannot do this. It returns at the moment frame N is
+ * recorded, but it polls s_fdump_done on a 10 ms tick, and a frame is
+ * 16.7 ms — so by the time the caller is woken, round-trips, and arms N+1,
+ * N+1 has usually already gone past. Every frame after the first times out.
+ * A one-frame animation glitch is exactly what needs consecutive frames, so
+ * the range is armed ONCE here and the emulation thread writes each frame as
+ * it passes. Still no pausing: same non-pausing capture path as the single
+ * shot, just left armed. */
+static volatile int s_frange_start   = -1;
+static volatile int s_frange_end     = -1;   /* exclusive */
+static volatile int s_frange_written = 0;
+static volatile int s_frange_errno   = 0;
+static volatile int s_frange_active  = 0;
+static char s_frange_dir[400];
+
 typedef struct DebugPpuHostState {
     uint8_t *render_buffer;
     uint32_t render_pitch, render_flags;
@@ -1566,6 +1583,64 @@ void debug_server_record_frame(int frame) {
         }
         s_fdump_target = -1;
         s_fdump_done = frame;
+    }
+
+    if (s_frange_active && frame >= s_frange_start && frame < s_frange_end
+        && g_ppu) {
+        static uint8_t frange_scr[256 * 4 * 240];
+        size_t want = (size_t)256 * 224 * 4;
+        char path[512];
+        FILE *f;
+        /* Copy the composite the host actually presented, rather than
+         * re-rendering the PPU.
+         *
+         * Re-rendering (DebugPpuRenderAuthentic, which dump_frame_raw uses)
+         * paints all 224 lines from the register state in force RIGHT NOW.
+         * This game draws through a per-line raster journal and ends every
+         * frame with INIDISP back at 0x80, so a re-render at this point
+         * paints the whole frame forced-blank: 120 byte-identical black
+         * frames captured off a game that was visibly rendering. Whatever
+         * mid-frame register changes make the picture -- raster splits,
+         * per-line HDMA -- are exactly what a re-render throws away, and
+         * they are exactly what a visual defect lives in.
+         *
+         * cmd_screenshot already takes this path and says why. This is the
+         * last frame the host finished compositing, so file fN.raw holds
+         * the picture presented for frame N-1; a consistent off-by-one is
+         * harmless for animation work and is stated in the reply. */
+        {
+            uint8_t *rb = g_ppu->renderBuffer;
+            uint32_t rp = g_ppu->renderPitch;
+            int rw = 256 + 2 * g_ppu->extraLeftRight;
+            int cols = rw < 256 ? rw : 256;
+            int y;
+            if (rb && rp >= (uint32_t)rw * 4) {
+                memset(frange_scr, 0, want);
+                for (y = 0; y < 224; y++)
+                    memcpy(frange_scr + (size_t)y * 256 * 4,
+                           rb + (size_t)y * rp, (size_t)cols * 4);
+            } else {
+                /* No composite to copy yet. Say so rather than writing a
+                 * black frame that reads as a rendering bug. */
+                if (!s_frange_errno) s_frange_errno = ENODATA;
+                s_frange_active = 0;
+                goto frange_done;
+            }
+        }
+        snprintf(path, sizeof(path), "%s/f%06d.raw", s_frange_dir, frame);
+        f = fopen(path, "wb");
+        if (!f) {
+            if (!s_frange_errno) s_frange_errno = errno ? errno : EIO;
+        } else {
+            if (fwrite(frange_scr, 1, want, f) != want && !s_frange_errno)
+                s_frange_errno = errno ? errno : EIO;
+            if (fclose(f) != 0 && !s_frange_errno)
+                s_frange_errno = errno ? errno : EIO;
+            s_frange_written++;
+        }
+        if (frame + 1 >= s_frange_end)
+            s_frange_active = 0;
+frange_done: ;
     }
 
     lock_mutex();
@@ -1851,7 +1926,13 @@ static struct {
     OamWriteEntry *log; /* calloc'd at init */
 } s_oam_wr = {0};
 
-typedef struct { uint8_t y, xlow, tile, attr, xhigh; } OamSlotSnap;
+/* `big` is high-OAM bit 1: the per-sprite size select, which picks
+ * between the two sizes OBSEL names. It was omitted here, and its
+ * absence is a blind spot rather than a detail: two frames whose
+ * y/x/tile/attr are byte-identical still draw at different sizes if
+ * this bit differs, so a size-swap bug looked like "OAM did not
+ * change" while the picture plainly did. */
+typedef struct { uint8_t y, xlow, tile, attr, xhigh, big; } OamSlotSnap;
 
 typedef struct {
     uint64_t    seq;
@@ -1899,6 +1980,7 @@ void debug_server_on_oam_render(void) {
         e->slot[s].tile  = (uint8_t)(w1 & 0xff);
         e->slot[s].attr  = (uint8_t)(w1 >> 8);
         e->slot[s].xhigh = (uint8_t)((g_ppu->highOam[s >> 2] >> ((s & 3) * 2)) & 1);
+        e->slot[s].big   = (uint8_t)((g_ppu->highOam[s >> 2] >> ((s & 3) * 2 + 1)) & 1);
         if (y < 0xE0) active++;
     }
     e->active = active;
@@ -2754,7 +2836,11 @@ static void cmd_oam_state(const char *args) {
              (unsigned long long)s_oam_rd.count, OAM_RENDER_RING_ENTRIES);
 }
 
-/* oam_write_get [count=64] — most recent N OAM write events, oldest-first.
+/* oam_render_get [snaps=4] [slots=16] — per-frame OAM snapshots, oldest-first.
+ * Each slot row is [y, xlow, xhigh, tile, attr, big] where `big` is the
+ * high-OAM size-select bit.
+ *
+ * oam_write_get [count=64] — most recent N OAM write events, oldest-first.
  * Each: seq, frame f, h=is_high, i=index, v=value (hex), func. The seq lets
  * you interleave these against oam_render_get to see whether the DMA burst
  * for a frame landed BEFORE the render-read that consumed it, and whether the
@@ -2813,9 +2899,9 @@ static void cmd_oam_render_get(const char *args) {
             k ? "," : "", (unsigned long long)e->seq, e->frame, e->active);
         for (unsigned s = 0; s < slots && pos < budget; s++)
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s[%u,%u,%u,%u,%u]", s ? "," : "",
+                "%s[%u,%u,%u,%u,%u,%u]", s ? "," : "",
                 e->slot[s].y, e->slot[s].xlow, e->slot[s].xhigh,
-                e->slot[s].tile, e->slot[s].attr);
+                e->slot[s].tile, e->slot[s].attr, e->slot[s].big);
         pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
@@ -7261,7 +7347,80 @@ static void cmd_audio_shadow_div(const char *args) {
              (unsigned long long)st.echo_div_count, erms_db, emax_db);
 }
 
-/* dump_frame_raw <frame> <path> — arm a non-pausing capture of frame N's pixels
+/* dump_frame_range <start> <count> <dir> — arm a non-pausing capture of
+ * `count` CONSECUTIVE frames beginning at `start`, one raw BGRX 256x224x4
+ * file per frame at <dir>/fNNNNNN.raw, and block until the range has passed.
+ * <dir> must already exist and is resolved against the RUNTIME's working
+ * directory, so pass it absolute. See the note beside s_frange_start for why
+ * repeated dump_frame_raw calls cannot do this. */
+static void cmd_dump_frame_range(const char *args) {
+    char dir[400] = {0};
+    int start = -1, count = 0, i;
+    int budget_ticks;
+
+    if (sscanf(args, "%d %d %399s", &start, &count, dir) < 3
+        || start < 0 || count < 1) {
+        send_fmt("{\"error\":\"usage: dump_frame_range <start> <count> <dir>\"}");
+        return;
+    }
+    if (count > 4096) count = 4096;
+    if (s_frange_active) {
+        send_fmt("{\"error\":\"a range capture is already armed\"}");
+        return;
+    }
+    strncpy(s_frange_dir, dir, sizeof(s_frange_dir) - 1);
+    s_frange_dir[sizeof(s_frange_dir) - 1] = 0;
+    s_frange_written = 0;
+    s_frange_errno = 0;
+    s_frange_start = start;
+    s_frange_end = start + count;
+    s_frange_active = 1;
+
+    /* Wait for the range to pass, with headroom: the frames themselves plus
+     * the wait for `start` to arrive. Ticks are 10 ms. */
+    budget_ticks = 1500 + count * 4;
+    for (i = 0; i < budget_ticks && s_frange_active; i++) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+    if (s_frange_active) {
+        s_frange_active = 0;
+        send_fmt("{\"error\":\"timeout waiting for frames %d..%d "
+                 "(already passed?)\",\"written\":%d}",
+                 start, start + count - 1, s_frange_written);
+        return;
+    }
+    if (s_frange_errno == ENODATA) {
+        send_fmt("{\"error\":\"the host has not composited a frame yet "
+                 "(renderBuffer unset) -- nothing to capture\",\"written\":%d}",
+                 s_frange_written);
+        return;
+    }
+    if (s_frange_errno) {
+        send_fmt("{\"error\":\"writing into %s failed: %s\",\"written\":%d,"
+                 "\"hint\":\"the directory must exist and is relative to the "
+                 "runtime's working directory\"}",
+                 dir, strerror(s_frange_errno), s_frange_written);
+        return;
+    }
+    send_fmt("{\"ok\":true,\"start\":%d,\"count\":%d,\"written\":%d,"
+             "\"dir\":\"%s\",\"width\":256,\"height\":224,"
+             "\"source\":\"presented-composite\",\"lag\":1}",
+             start, count, s_frange_written, dir);
+}
+
+/* dump_frame_raw <frame> <path> — RE-RENDERS the PPU rather than copying the
+ * presented composite, so it drops every mid-frame effect: raster splits,
+ * per-line HDMA, anything the host's per-line loop applied. On a game that
+ * ends its frame in forced blank the result is an all-black image of a
+ * perfectly good picture. Kept as-is for the bsnes framebuffer diff, which
+ * wants the register-authentic render; use dump_frame_range for what the
+ * player actually sees.
+ *
+ * dump_frame_raw <frame> <path> — arm a non-pausing capture of frame N's pixels
  * (debug_server_record_frame writes raw BGRX 256x224x4 when the frame passes) and
  * block until done. For the PPU framebuffer diff vs the bsnes oracle. */
 static void cmd_dump_frame_raw(const char *args) {
@@ -7644,6 +7803,7 @@ static const CmdEntry s_commands[] = {
     {"get_spc_pc_hist", cmd_get_spc_pc_hist},
     {"get_apu_misc",   cmd_get_apu_misc},
     {"frame",         cmd_frame},
+    {"dump_frame_range", cmd_dump_frame_range},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
     {"read_sram",     cmd_read_sram},
