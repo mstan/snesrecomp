@@ -1,4 +1,6 @@
 #include "ppu.h"
+
+extern unsigned char g_snesrecomp_last_hdmaen;
 #include "ppu_legacy.h"
 
 #include <stdio.h>

@@ -1116,6 +1116,10 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x4200 && reg < 0x4220) {
     if (reg == 0x420C) {
       g_snesrecomp_last_hdmaen = value;
+      /* Per-line fact: this title switches the transition's HDMA
+       * channels on from the line-21 raster handler, and a frame-model
+       * host that samples the mask once at render time never sees them.
+       * See raster_reg_journaled() in ppu.c. */
       if (g_snes)
         ppu_rasterRecord(reg, g_snes->vPos, value);
     }
