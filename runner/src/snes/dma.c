@@ -446,6 +446,8 @@ void dma_initHdma(Dma* dma) {
   for(int i = 0; i < 8; i++) {
     DmaChannel* ch = &dma->channel[i];
     if(!ch->hdmaActive) continue;
+    /* A start-of-frame init supersedes any pending mid-frame one. */
+    dma->hdmaPendingInit &= (uint8_t)~(1u << i);
     ch->tableAdr = ch->aAdr;
     ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
     ch->terminated = (ch->repCount == 0);
@@ -461,7 +463,32 @@ void dma_initHdma(Dma* dma) {
 void dma_doHdma(Dma* dma) {
   for(int i = 0; i < 8; i++) {
     DmaChannel* ch = &dma->channel[i];
-    if(!ch->hdmaActive || ch->terminated) continue;
+    if(!ch->hdmaActive) continue;
+
+    /* A channel switched on part-way through a frame spends its first HDMA
+     * slot loading the table header, and only transfers from the slot after.
+     * Measured against Mesen on Gundam Wing's pre-fight screen, which enables
+     * $420C at line 21 and whose first HDMA write of $212C lands on line 23:
+     *
+     *     enable L21  ->  init L22  ->  first transfer L23
+     *
+     * Initializing and transferring in the same slot put every band edge one
+     * scanline early (L22/54/102/134/182 against hardware's
+     * L23/55/103/135/183) -- the whole raster split shifted up a pixel. */
+    if(dma->hdmaPendingInit & (1u << i)) {
+      dma->hdmaPendingInit &= (uint8_t)~(1u << i);
+      ch->tableAdr = ch->aAdr;
+      ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+      ch->terminated = (ch->repCount == 0);
+      if(ch->indirect) {
+        ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+        ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
+      }
+      ch->doTransfer = true;
+      ch->offIndex = 0;
+      continue;             /* this slot was the init; no transfer yet */
+    }
+    if(ch->terminated) continue;
 
     if(ch->doTransfer) {
       int len = transferLength[ch->mode];
@@ -502,6 +529,8 @@ bool dma_cycle(Dma* dma) {
 void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
   for(int i = 0; i < 8; i++) {
     if(hdma) {
+      /* Only a channel going from off to on owes an initialization; rewriting
+       * $420C with a channel already running must not restart its table. */
       bool now_on = (val & (1 << i)) != 0;
       if(now_on && !dma->channel[i].hdmaActive)
         dma->hdmaPendingInit |= (uint8_t)(1u << i);
