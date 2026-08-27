@@ -2635,19 +2635,46 @@ static void cmd_get_vram_trace(const char *args) {
     }
     int nostack = args && strstr(args, "nostack") != NULL;
     static char buf[524288];
+    /* Pagination. Without it this walked from the OLDEST entry and stopped when
+     * the buffer filled, so a long-lived ring answered with its first few
+     * thousand rows and silently dropped everything recent — a capture taken on
+     * frame 4384 came back holding nothing but frame 46. That reads as "nothing
+     * wrote here", which is a false negative, not a truncation anyone notices.
+     *
+     * So the DEFAULT is now the NEWEST window that fits, and `idx_from` /
+     * `idx_lim` (indices into the live ring, oldest = 0) select explicitly.
+     * The reply says which slice it actually returned. */
+    int budget = (int)sizeof(buf) - 4096;
+    uint64_t cap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
+    uint64_t avail = s_vram_trace.count < cap ? s_vram_trace.count : cap;
+    /* Conservative bytes-per-row so the window we promise actually fits. */
+    uint64_t rows_fit = (uint64_t)(budget / (nostack ? 180 : 260));
+    if (rows_fit < 1) rows_fit = 1;
+    uint64_t want = rows_fit;
+    uint64_t from = avail > want ? avail - want : 0;
+    if (args) {
+        const char *p2 = strstr(args, "idx_from=");
+        if (p2) { unsigned long long v = 0; sscanf(p2 + 9, "%llu", &v); from = (uint64_t)v; }
+        p2 = strstr(args, "idx_lim=");
+        if (p2) { unsigned long long v = 0; sscanf(p2 + 8, "%llu", &v);
+                  if (v && v < want) want = (uint64_t)v; }
+    }
+    if (from > avail) from = avail;
+    if (from + want > avail) want = avail - from;
+
     int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
     for (int i = 0; i < s_vram_trace.nranges; i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
             s_vram_trace.ranges[i].lo, s_vram_trace.ranges[i].hi);
     pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "],\"entries\":%llu,\"log\":[",
-        (unsigned long long)s_vram_trace.count);
-    uint64_t cap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
-    uint64_t start = s_vram_trace.count < cap ?
-                     0 : s_vram_trace.write_idx - cap;
-    int budget = (int)sizeof(buf) - 4096;
-    for (uint64_t i = 0; i < s_vram_trace.count && pos < budget; i++) {
+        "],\"entries\":%llu,\"idx_from\":%llu,\"returned\":%llu,\"log\":[",
+        (unsigned long long)s_vram_trace.count,
+        (unsigned long long)from, (unsigned long long)want);
+    uint64_t base = s_vram_trace.count < cap ?
+                    0 : s_vram_trace.write_idx - cap;
+    uint64_t start = base + from;
+    for (uint64_t i = 0; i < want && pos < budget; i++) {
         uint64_t idx = (start + i) % cap;
         if (nostack) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,

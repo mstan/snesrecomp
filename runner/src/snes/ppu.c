@@ -1731,7 +1731,43 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   //  1: BG3 tiles with priority 0
   //  0: backdrop
 
-  if (PPU_mode(ppu) == 1) {
+  if (PPU_mode(ppu) == 0) {
+    /* Mode 0: four 2bpp layers, each with its OWN palette group.
+     *
+     * This branch did not exist. Modes 1/2/3 were handled and everything else
+     * fell through to the mode-7 path, so a mode-0 screen was rendered as
+     * mode 7 and produced nothing. Gundam Wing's OPTION menu is mode 0: its
+     * starfield (BG3) and menu text (BG2) decode perfectly from a captured
+     * frame yet never reached the screen, and with colour math bypassed the
+     * output was 100% black — the layers were contributing nothing at all.
+     *
+     * The palette split is what makes mode 0 more than "four 2bpp layers":
+     * BG1 uses CGRAM 0-31, BG2 32-63, BG3 64-95, BG4 96-127. The 2bpp drawer
+     * already folds the tile's palette field into the low bits of z
+     * (`z += (tile & 0x1c00) >> kPaletteShift`), so the group is a constant
+     * 32*layer added to that same field; the low byte of each z base is free.
+     *
+     * Priority order, front to back:
+     *   OBJ3, BG1.hi, BG2.hi, OBJ2, BG1.lo, BG2.lo,
+     *   OBJ1, BG3.hi, BG4.hi, OBJ0, BG3.lo, BG4.lo, backdrop
+     * BG1/BG2 reuse mode 1's bases; BG3 keeps its mode-1 band and BG4 sits one
+     * step below it at each priority. */
+    static const PpuZbufType kMode0Hi[4] = { 0xc000, 0xb100, 0x3200, 0x3100 };
+    static const PpuZbufType kMode0Lo[4] = { 0x8000, 0x7100, 0x1200, 0x1100 };
+    bool mosaic_size0 = PPU_mosaicSize(ppu) > 1;
+    uint layer0;
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    for (layer0 = 0; layer0 < 4; layer0++) {
+      PpuPixelPrioBufs *lb = PpuBeginBackgroundOverlay(ppu, y, sub, layer0);
+      PpuDrawBackground_2bpp_policy(
+          ppu, lb, y, sub, layer0,
+          (PpuZbufType)(kMode0Hi[layer0] + 32u * layer0),
+          (PpuZbufType)(kMode0Lo[layer0] + 32u * layer0),
+          mosaic_size0 && PPU_mosaicEnabled(ppu, layer0));
+      PpuFinishBackgroundOverlay(ppu, y, sub, layer0, lb);
+    }
+  } else if (PPU_mode(ppu) == 1) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
 
