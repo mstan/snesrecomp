@@ -149,7 +149,10 @@ uint64_t g_apu_timer0_total_ticks = 0;
 void snes_catchupApu(Snes* snes) {
   /* Upper cap is a guard against accumulator runaway after a long
    * stall; SPC runs at ~1 MHz so 10000 cycles is about 10 ms of real
-   * SPC time per catchup, plenty to absorb any spike. */
+   * SPC time per catchup, plenty to absorb any spike. This is a frequent
+   * catch-up API, not a frame-at-a-time pacing API; hosts that own their
+   * own frame model should catch up at smaller slices or use the guest-time
+   * frame runner path. See docs/FRAME_MODEL_HOSTS.md. */
   if (snes->apuCatchupCycles > 10000)
     snes->apuCatchupCycles = 10000;
 
