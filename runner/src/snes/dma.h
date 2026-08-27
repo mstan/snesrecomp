@@ -40,6 +40,14 @@ typedef struct DmaChannel {
 
 struct Dma {
   Snes* snes;
+  /* Bitmask of channels whose HDMA was switched on part-way through a frame
+   * and still owe their one-slot table initialization. See dma_doHdma().
+   *
+   * Declared BEFORE `channel` on purpose: dma_saveload() serializes from
+   * `channel` to the end of the struct, so putting it here leaves the
+   * savestate layout byte-identical. That is also the honest place for it --
+   * it is transient within-frame sequencing, not guest-visible state. */
+  uint8_t hdmaPendingInit;
   DmaChannel channel[8];
   uint32_t dmaTimer;
   bool dmaBusy;
