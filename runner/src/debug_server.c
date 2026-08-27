@@ -1477,6 +1477,7 @@ static int s_history_count = 0;
  * the live window or the run loop. */
 static volatile int s_fdump_target = -1;
 static volatile int s_fdump_done   = -1;
+static volatile int s_fdump_errno  = 0;
 static char s_fdump_path[512];
 
 typedef struct DebugPpuHostState {
@@ -1545,9 +1546,24 @@ void debug_server_record_frame(int frame) {
 
     if (s_fdump_target >= 0 && frame == s_fdump_target && g_ppu) {
         static uint8_t fdump_scr[256 * 4 * 240];
+        size_t want = (size_t)256 * 224 * 4;
         DebugPpuRenderAuthentic(fdump_scr);
         FILE *f = fopen(s_fdump_path, "wb");
-        if (f) { fwrite(fdump_scr, 1, 256 * 224 * 4, f); fclose(f); }
+        /* Report a failed write instead of swallowing it. This used to set
+         * s_fdump_done unconditionally, so a path the runtime could not open
+         * -- and a relative path here is relative to the RUNTIME's cwd, not
+         * the caller's, which is the usual way to get one -- answered
+         * {"ok":true} for a file that was never created. A probe that reads
+         * as a finding is worse than one that fails. */
+        s_fdump_errno = 0;
+        if (!f) {
+            s_fdump_errno = errno ? errno : EIO;
+        } else {
+            if (fwrite(fdump_scr, 1, want, f) != want)
+                s_fdump_errno = errno ? errno : EIO;
+            if (fclose(f) != 0 && !s_fdump_errno)
+                s_fdump_errno = errno ? errno : EIO;
+        }
         s_fdump_target = -1;
         s_fdump_done = frame;
     }
@@ -7266,9 +7282,14 @@ static void cmd_dump_frame_raw(const char *args) {
         usleep(10000);
 #endif
     }
-    if (s_fdump_done == n)
+    if (s_fdump_done == n && s_fdump_errno == 0)
         send_fmt("{\"ok\":true,\"frame\":%d,\"path\":\"%s\",\"width\":256,\"height\":224}",
                  n, path);
+    else if (s_fdump_done == n)
+        send_fmt("{\"error\":\"frame %d reached but writing %s failed: %s\","
+                 "\"hint\":\"a relative path resolves against the runtime's "
+                 "working directory, not yours\"}",
+                 n, path, strerror(s_fdump_errno));
     else {
         s_fdump_target = -1;
         send_fmt("{\"error\":\"timeout; frame %d not reached (already passed?)\"}", n);
