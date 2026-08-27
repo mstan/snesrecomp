@@ -75,22 +75,35 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   cart_saveload(snes->cart, sli);
 
   if (s_saveload_version <= 5) {
-    /* Old layout: [hPos..vPos][pad][beamMasterLast][apuCatchup..divideResult].
-     * Read/write the legacy 48-byte tail and map into the current struct.
-     * Legacy size: 4 (hPos/vPos) + 4 pad + 8 beam + rest(=32) = 48. */
-    enum { kLegacySnesTail = 48 };
-    uint8_t blob[kLegacySnesTail];
-    const size_t new_tail = sizeof(*snes) - offsetof(Snes, hPos);
-    const size_t head = offsetof(Snes, apuCatchupCycles) - offsetof(Snes, hPos);
-    const size_t rest = new_tail - head; /* apuCatchupCycles .. end */
-    assert(new_tail == 40 && head == 8 && rest == 32);
-    memset(blob, 0, sizeof(blob));
-    memcpy(blob, &snes->hPos, 4);
-    memcpy(blob + 16, &snes->apuCatchupCycles, rest);
-    sli->func(sli, blob, kLegacySnesTail);
-    memcpy(&snes->hPos, blob, 4);
-    memcpy(&snes->apuCatchupCycles, blob + 16, rest);
+    /* Format 4/5 can no longer be mapped onto this struct, so refuse it
+     * rather than mis-load it.
+     *
+     * The old layout was [hPos..vPos][pad][beamMasterLast][apuCatchup..
+     * divideResult], and the code here copied that trailing region as one
+     * 32-byte block on the assumption that it was still contiguous and still
+     * 32 bytes. Both stopped being true: the dbgIrq / dbgNmi counters were
+     * later inserted between the interrupt fields and inVblank, so
+     * the region now measures 88 bytes AND has different contents in the
+     * middle. The copy therefore overran a 48-byte stack buffer by 56 bytes
+     * (caught by -Wfortify-source), and had it been merely clamped it would
+     * have loaded the wrong bytes into hTimer/vTimer and the IRQ flags --
+     * a silent corruption, which is worse than a refusal.
+     *
+     * Reconstructing a correct v4/v5 mapping is possible but untestable here
+     * with no such file to verify against, so this states the limit instead
+     * of guessing at it. RTL_SAV_VERSION_MIN is raised to 6 to match, which
+     * means this branch is unreachable through RtlLoadSnapshot; it stays as
+     * the explanation for anyone who tries to lower that bound again. */
+    assert(!"savestate format 4/5 is no longer supported");
   } else {
+    /* The savestate format IS this byte range. Adding or reordering any field
+     * after hPos silently changes it and quietly invalidates every existing
+     * save, so pin the size: if this fires, bump RTL_SAV_VERSION rather than
+     * deleting the assertion. (The blob is raw struct memory, so it was never
+     * portable across differing layouts; pinning it here at least makes a
+     * change visible at compile time.) */
+    _Static_assert(sizeof(Snes) - offsetof(Snes, hPos) == 96,
+                   "Snes savestate tail changed size -- bump RTL_SAV_VERSION");
     sli->func(sli, &snes->hPos, sizeof(*snes) - offsetof(Snes, hPos));
   }
   sli->func(sli, snes->ram, 0x20000);

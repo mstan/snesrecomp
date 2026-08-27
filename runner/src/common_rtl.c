@@ -185,7 +185,10 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  *     automatic-read words). Older files load with no multitap configured,
  *     which is the pre-multitap two-pad machine exactly. */
 #define RTL_SAV_VERSION 8u
-#define RTL_SAV_VERSION_MIN 4u
+/* 4 and 5 described a Snes tail layout this struct no longer has; see
+ * snes_saveload(). Loading one would mis-map the interrupt fields, so
+ * they are rejected by the header check instead. */
+#define RTL_SAV_VERSION_MIN 6u
 
 typedef struct FileSli {
   SaveLoadInfo base;
