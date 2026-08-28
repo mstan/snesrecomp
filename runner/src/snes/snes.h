@@ -120,6 +120,19 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
 void snes_advance_master_cycles(Snes *snes, uint32_t clocks);
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock);
+/* Master clock at which the enabled H/V IRQ comparator next matches, starting
+ * from the live beam position (`now` is that position's master clock, normally
+ * g_cpu.master_cycles). Returns false when no comparator is armed.
+ *
+ * `snes->inIrq` is a single latch, so a host that lets the CPU run a whole
+ * frame per slice coalesces every raster IRQ in that frame into one delivery.
+ * That silently breaks chained raster splits - a handler that re-arms vTimer
+ * for the next band never sees its band, because the beam is already past it
+ * when the host next looks. (F-Zero chains four splits per frame at lines
+ * 18/28/47/86; only line 18 survived.) A frame-model host should cap each
+ * execution slice at this clock so every comparator edge is delivered at its
+ * own beam position. See docs/FRAME_MODEL_HOSTS.md. */
+bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out);
 
 /* Master clocks from the current beam position to the next programmed H/V IRQ
  * match, or 0 when none is scheduled (or one is already pending).

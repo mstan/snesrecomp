@@ -1260,6 +1260,54 @@ def _emit_indirect_goto(op: IndirectGoto) -> List[str]:
     return [f"/* IndirectGoto: target = ({bank}, {addr}) — caller dispatches */"]
 
 
+def _live_dispatch_target_expr(insn) -> Optional[str]:
+    """C expression for the pointer an indirect JMP/JML/JSR would actually
+    follow at run time, or None when the site's pointer is not recoverable.
+
+    An index-keyed dispatch switch can only cover the target list the analyzer
+    recovered. When the live index falls outside that list the site is NOT
+    unknowable: the hardware transfer reads a concrete pointer, and every
+    instruction that composed it has already executed. Handing that pointer to
+    the interpreter runs the real handler; abandoning the invocation instead
+    silently SKIPS it, which is guest-state corruption rather than a slow path.
+    (F-Zero's `LDA $AFEE,X : TAX : LDA $AFF8,X / $AFF9,X : STA $FE/$FF :
+    JMP ($00FE)` mode-7 dispatcher recovered only its index-0 target, so nine
+    of its ten screens were skipped outright and the frame garbled.)
+
+    Pointer-fetch banks follow the 65816, as implemented by the authoritative
+    interpreter (runner/src/snes/interp816.c):
+      $6C JMP (abs)    pointer from bank 0;         target bank = PB
+      $DC JML [abs]    pointer + bank from bank 0
+      $7C JMP (abs,X)  pointer from PB:(abs + X);   target bank = PB
+      $FC JSR (abs,X)  pointer from PB:(abs + X);   target bank = PB
+    """
+    mode = getattr(insn, 'mode', None)
+    if mode not in (INDIR, INDIR_X):
+        return None
+    # These forms rewrite the transfer entirely; their own emit paths already
+    # recover the live target and must not be second-guessed here.
+    if getattr(insn, 'dispatch_terminal', False):
+        return None
+    if getattr(insn, 'dispatch_local_goto', False):
+        return None
+    ptr = insn.operand & 0xFFFF
+    is_long = getattr(insn, 'dispatch_kind', 'short') == 'long'
+    if mode == INDIR:
+        if is_long:
+            return (f"(((uint32)cpu_read8(cpu, 0x00, (uint16)0x{(ptr + 2) & 0xFFFF:04x}) << 16) "
+                    f"| (uint32)cpu_read16(cpu, 0x00, (uint16)0x{ptr:04x}))")
+        return (f"(((uint32)cpu->PB << 16) "
+                f"| (uint32)cpu_read16(cpu, 0x00, (uint16)0x{ptr:04x}))")
+    idx_reg = getattr(insn, 'dispatch_idx_reg', 'X')
+    idx_field = 'Y' if idx_reg == 'Y' else 'X'
+    offset = f"(uint16)(0x{ptr:04x} + (cpu->{idx_field} & 0xFFFF))"
+    if is_long:
+        return (f"(((uint32)cpu_read8(cpu, cpu->PB, (uint16)({offset} + 2)) << 16) "
+                f"| (uint32)cpu_read16(cpu, cpu->PB, {offset}))")
+    return (f"(((uint32)cpu->PB << 16) "
+            f"| (uint32)cpu_read16(cpu, cpu->PB, {offset}))")
+
+
 def _emit_indirect_dispatch(insn) -> List[str]:
     """Emit a real switch for an indirect JMP/JML/JSR whose static
     target list the decoder recovered (via cfg `indirect_dispatch` or
@@ -1542,11 +1590,23 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 # one outer frame per state transition.
                 _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
                         if not (is_jsr or is_call) else None)
+                # LLE-fallback frame size must match the frame this site
+                # actually enters handlers with (== the hrv emitted above):
+                # a real JSR (abs,X) pushes a 2-byte frame; the PEA+JMP /
+                # PHK+PEA+JML ptr-call idioms enter with call_frame_size
+                # (3 for the long form — its handlers return via RTL).
+                # Hardcoding 2 here made interp_tier_run_call_frame's
+                # post_call watermark one byte short for long ptr-calls: a
+                # CLEAN handler RTL then read as a non-local return,
+                # manufactured SKIP_1, and the dispatcher abandoned its own
+                # tail — leaking 2 bytes of guest stack per occurrence
+                # (Super Metroid attract wedge, beads-8wg.6.2).
+                _lle_frame = 2 if is_jsr else call_frame_size
                 body += variant_dispatch_case_lines(
                     tgt_addr, base_name, indent="  ", pre_call=_pre,
                     lle_fallback=(
                         f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
-                        f"0x{site_pc24:06x}u, 2, NULL)"
+                        f"0x{site_pc24:06x}u, {_lle_frame}, NULL)"
                         if is_jsr or is_call else
                         f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                         f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
@@ -1629,56 +1689,57 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         for stmt in emitter_helpers.modify_p_via_mirrors(0x30, "sep"):
             lines.append(f"    {stmt}")
         lines.append("  }")
+    # An index outside the recovered target list is a coverage gap, not an
+    # unknowable transfer: the live pointer is still readable. Route it to the
+    # interpreter tier (which itself falls back to the balanced abandon on a
+    # bail, so this is never worse than the drop it replaces).
+    live_target = _live_dispatch_target_expr(insn)
+
+    def _unresolved_index_arms(indent: str, reason: str) -> List[str]:
+        out = [f"{indent}(void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);"]
+        if is_jsr or is_call:
+            if live_target:
+                out.append(
+                    f"{indent}(void)interp_tier_run_call_frame(cpu, {live_target}, "
+                    f"0x{site_pc24:06x}u, {call_frame_size}, NULL);"
+                    f"  /* {reason}: run the live pointer on the interpreter tier */")
+            else:
+                out.append(
+                    f"{indent}cpu->S = (uint16)(cpu->S + {miss_cleanup_size});"
+                    "  /* unpop unconsumed call frame */")
+        else:
+            if live_target:
+                out.append(
+                    f"{indent}return interp_tier_dispatch_tail(cpu, {live_target}, "
+                    f"0x{site_pc24:06x}u, _entry_s, _hrv);"
+                    f"  /* {reason}: run the live pointer on the interpreter tier */")
+            else:
+                out.append(
+                    f"{indent}return cpu_unresolved_abandon_balanced(cpu, "
+                    f"0x{site_pc24:06x}u, _entry_s, _hrv);")
+        return out
+
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append("  if (_idx >= _disp_n) {")
-    if is_jsr or is_call:
-        # Non-terminal CALL-form dispatch: account the OOB index, then
-        # unpop the unconsumed 2-byte call frame (the JSR form pushed it
-        # above; the PEA+JMP form's PEA pushed it) and fall through to
-        # the post-dispatch block balanced — as if the unreached handler
-        # had returned immediately. (The switch below falls out via its
-        # default arm.)
-        lines.append(
-            f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
-        lines.append(
-            f"    cpu->S = (uint16)(cpu->S + {miss_cleanup_size});  /* unpop unconsumed call frame */")
-    else:
-        # Terminal tail dispatch with an OOB index: account the miss,
-        # then abandon this invocation balanced (discard locals below
-        # _entry_s, pop the paired caller's frame per _hrv). The bare
-        # `return cpu_trace_dispatch_oob(...)` this replaces orphaned
-        # the caller's frame on every hit.
-        lines.append(
-            f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
-        lines.append(
-            f"    return cpu_unresolved_abandon_balanced(cpu, "
-            f"0x{site_pc24:06x}u, _entry_s, _hrv);")
+    # CALL-form: run the live pointer, then fall through to the post-dispatch
+    # block (interp_tier_run_call_frame is always balanced and always NORMAL).
+    # With no recoverable pointer it degrades to the historical behavior —
+    # unpop the unconsumed call frame, as if the handler returned immediately.
+    # Terminal form: tail-transfer to the live pointer, else abandon balanced.
+    lines.extend(_unresolved_index_arms("    ", "index outside recovered list"))
     lines.append("  }")
     lines.append("  switch (_idx) {")
     for i, e in enumerate(entries):
         if e is None or e == 0:
+            # Null slot: the analyzer could not resolve THIS index, but the
+            # hardware transfer still has a concrete pointer, so run it on the
+            # interpreter tier exactly like an index outside the list. A hit is
+            # still accounted as a dispatch miss so the site stays on the
+            # authorization worklist.
+            lines.append(f"    case {i}:")
+            lines.extend(_unresolved_index_arms("      ", "null table slot"))
             if is_jsr or is_call:
-                # Null entry on a CALL-form dispatch: no handler runs, so
-                # the call frame pushed above is never consumed — unpop it
-                # before falling through, same as the OOB arm. (A hit is
-                # still suspicious — real hw would JSR into $0000 — so
-                # account it like an OOB index.)
-                lines.append(f"    case {i}:")
-                lines.append(
-                    f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
-                lines.append(
-                    f"      cpu->S = (uint16)(cpu->S + {miss_cleanup_size});  /* unpop unconsumed call frame */")
                 lines.append("      break; /* null entry */")
-            else:
-                # Null entry on a terminal tail dispatch: the bare
-                # `return RECOMP_RETURN_NORMAL` this replaces orphaned
-                # the caller's frame exactly like the OOB arm.
-                lines.append(f"    case {i}:")
-                lines.append(
-                    f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
-                lines.append(
-                    f"      return cpu_unresolved_abandon_balanced(cpu, "
-                    f"0x{site_pc24:06x}u, _entry_s, _hrv); /* null entry */")
             continue
         target_bank = (e >> 16) & 0xFF
         local_pc = e & 0xFFFF
@@ -1734,11 +1795,15 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # misclassify its own balanced return.
             _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
                     if not (is_jsr or is_call) else None)
+            # Same frame-size contract as the pointer-matched arm above:
+            # 2 only for a real JSR (abs,X) push; call_frame_size for the
+            # PEA+JMP / PHK+PEA+JML ptr-call idioms (see beads-8wg.6.2).
+            _lle_frame = 2 if is_jsr else call_frame_size
             body += variant_dispatch_case_lines(
                 tgt_addr, base_name, indent="  ", pre_call=_pre,
                 lle_fallback=(
                     f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
-                    f"0x{site_pc24:06x}u, 2, NULL)"
+                    f"0x{site_pc24:06x}u, {_lle_frame}, NULL)"
                     if is_jsr or is_call else
                     f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                     f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
@@ -1779,12 +1844,8 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append("  /* fall through to post-JSR block */")
     else:
         # Unreachable (OOB gated above), kept as a defensive backstop —
-        # balanced like the gate arm.
-        lines.append(
-            f"  (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
-        lines.append(
-            f"  return cpu_unresolved_abandon_balanced(cpu, "
-            f"0x{site_pc24:06x}u, _entry_s, _hrv);")
+        # resolved the same way as the gate arm.
+        lines.extend(_unresolved_index_arms("  ", "defensive backstop"))
     lines.append("}")
     return lines
 

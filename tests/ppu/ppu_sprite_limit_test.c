@@ -9,6 +9,13 @@
 
 Snes *g_snes;
 
+/* ppu.c reaches two runtime globals that are defined in snes.c and
+ * common_rtl.c. This harness links ppu.c on its own, so define them here
+ * rather than drag the whole runtime in; neither participates in OBJ
+ * range/fetch evaluation. */
+int snes_frame_counter;
+unsigned char g_snesrecomp_last_hdmaen;
+
 uint16_t WsShadowTile(int layer, int screen_x, uint32_t wrapped_y,
                       uint16_t real_tile) {
     (void)layer;
@@ -53,6 +60,31 @@ static void no_op_line_enhancer(Ppu *ppu, uint y, bool sub, void *context) {
     (void)y;
     (void)sub;
     (void)context;
+}
+
+static void setup_solid_obj(Ppu *ppu, int slot, int x, int y) {
+    int high_index = slot >> 2;
+    int x_high_bit = (slot & 3) * 2;
+    ppu->oam[slot * 2] = (uint16_t)((y << 8) | (x & 0xff));
+    ppu->oam[slot * 2 + 1] = 0;
+    if (x & 0x100)
+        ppu->highOam[high_index] |= (uint8_t)(1u << x_high_bit);
+    else
+        ppu->highOam[high_index] &= (uint8_t)~(1u << x_high_bit);
+}
+
+static void setup_one_sprite_line(Ppu *ppu, int raw_x) {
+    ppu->inidisp = 0x0f;
+    ppu->screenEnabled[0] = 1 << 4;
+    memset(ppu->highOam, 0, sizeof ppu->highOam);
+    for (int slot = 0; slot < 128; slot++)
+        ppu->oam[slot * 2] = 0xf000;
+    setup_solid_obj(ppu, 0, raw_x, 0);
+    for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
+        ppu->vram[i] = 0xffff;
+    ppu->cgram[0] = 0;
+    for (size_t i = 1; i < sizeof ppu->cgram / sizeof ppu->cgram[0]; i++)
+        ppu->cgram[i] = 0x7fff;
 }
 
 int main(void) {
@@ -315,6 +347,97 @@ int main(void) {
         failures += check(wide_pixels[0] == 0 &&
                               wide_pixels[kExtra] != 0,
                           "unselected world OAM remains centered");
+    }
+
+    /* Strict OAM margin hints are symmetric. A raw negative X may be a parked
+     * hardware-hidden sprite or a genuine widened-world sprite. Hosts can mark
+     * the genuine slots; unmarked fully-offscreen-left slots stay clipped. */
+    {
+        enum { kExtra = 16, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t wide_pixels[kWidePixels];
+        uint8_t no_hints[16] = {0};
+        uint8_t slot0_hint[16] = {1};
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuWsSetOamLeftHints(ppu, no_hints);
+        setup_one_sprite_line(ppu, 0x1f8);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra - 1] == 0 &&
+                              wide_pixels[kExtra - 8] == 0,
+                          "unhinted fully-off-left OAM stays clipped");
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuWsSetOamLeftHints(ppu, slot0_hint);
+        setup_one_sprite_line(ppu, 0x1f8);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra - 1] != 0 &&
+                              wide_pixels[kExtra - 8] != 0,
+                          "hinted fully-off-left OAM renders in left margin");
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuWsSetOamLeftHints(ppu, no_hints);
+        setup_one_sprite_line(ppu, 0x1fc);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra] != 0 &&
+                              wide_pixels[kExtra + 3] != 0,
+                          "strict left hints keep native-edge OAM visible");
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuWsSetOamRightHints(ppu, no_hints);
+        setup_one_sprite_line(ppu, 0x108);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra + kPpuXPixels + 8] == 0,
+                          "unhinted right-band OAM wraps negative");
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuWsSetOamRightHints(ppu, slot0_hint);
+        setup_one_sprite_line(ppu, 0x108);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra + kPpuXPixels + 8] != 0,
+                          "hinted right-band OAM remains positive");
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuWsSetOamLeftHints(ppu, NULL);
+        setup_one_sprite_line(ppu, 0x1f8);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra - 1] != 0,
+                          "NULL left hints restore legacy margin behavior");
     }
 
     ppu_free(ppu);

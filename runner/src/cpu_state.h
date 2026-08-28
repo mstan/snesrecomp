@@ -449,6 +449,13 @@ extern CpuState g_cpu;
 extern int g_wlog_active;
 void wlog_scope_enter(const char *tag);
 void wlog_scope_exit(void);
+/* SNESRECOMP_WLOG_ADDR hook for direct-WRAM stores that bypass cpu_write8/16
+ * (DMA A-bus writes in snes_write, WMDATA $2180). wa = g_ram offset. */
+void wlog_addr_note_direct(uint32_t wa, uint8_t v, const char *via);
+/* Optional interp step-ring dump used by the WLOG_ADDR_HALT path; installed
+ * by interp_bridge.c at load when that TU is linked, NULL otherwise. */
+#include <stdio.h>
+extern void (*g_interp_recent_dump_hook)(int n, FILE *out);
 
 /* Live $420D FastROM (MEMSEL) bit, tracked in common_rtl.c WriteReg. Generated
  * blocks in the $80-$FF WS2 mirror banks reference it to weight their Axis-5

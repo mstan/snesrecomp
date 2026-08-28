@@ -118,6 +118,17 @@ static FILE  *g_wlog_addr_fp = NULL;
 static uint16 g_wlog_addr_lo = 0xFFFF, g_wlog_addr_hi = 0x0000;
 static long   g_wlog_addr_n = 0, g_wlog_addr_cap = 2000000;
 static int    g_wlog_addr_state = 0;
+/* Optional halt-on-write: SNESRECOMP_WLOG_ADDR_HALT="OFF:MINVAL" (hex).
+ * When a logged write lands a byte with value >= MINVAL at g_ram offset
+ * OFF, print a loud line and exit(42) so the game's atexit post-mortem
+ * dumps the trace rings ending exactly at the offending write. */
+static long   g_wlog_halt_off = -1;
+static unsigned g_wlog_halt_min = 0;
+/* Interp step-ring dump, installed by interp_bridge.c's constructor when
+ * that TU is linked (small C-test binaries link cpu_state.c alone — a
+ * direct extern call would break their link; PE weak symbols are a known
+ * trap here, so use an explicit hook). */
+void (*g_interp_recent_dump_hook)(int n, FILE *out) = NULL;
 
 static void wlog_addr_lazy(void) {
     g_wlog_addr_inited = 1;
@@ -138,19 +149,29 @@ static void wlog_addr_lazy(void) {
     const char *c = getenv("SNESRECOMP_WLOG_ADDR_CAP");
     if (c && c[0]) g_wlog_addr_cap = strtol(c, NULL, 0);
     g_wlog_addr_state = getenv("SNESRECOMP_WLOG_STATE") != NULL;
+    const char *h = getenv("SNESRECOMP_WLOG_ADDR_HALT");
+    if (h && h[0]) {
+        unsigned hoff = 0, hmin = 0;
+        if (sscanf(h, "%x:%x", &hoff, &hmin) == 2) {
+            g_wlog_halt_off = (long)hoff;
+            g_wlog_halt_min = hmin;
+        }
+    }
 }
 
-static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
+static void wlog_addr_note_via(uint8 bank, uint16 addr, uint16 v, int width,
+                               const char *via) {
     if (!g_wlog_addr_inited) wlog_addr_lazy();
     if (!g_wlog_addr_fp) return;
     if (addr < g_wlog_addr_lo || addr > g_wlog_addr_hi) return;
     if (g_wlog_addr_n++ >= g_wlog_addr_cap) return;
     extern int snes_frame_counter;
     extern const char *g_last_recomp_func;
-    fprintf(g_wlog_addr_fp, "f%-6d %02X:%04X=%0*X w%d %s",
+    fprintf(g_wlog_addr_fp, "f%-6d %02X:%04X=%0*X w%d %s%s%s",
             snes_frame_counter, bank, addr, width * 2,
             (unsigned)(v & (width == 1 ? 0xFF : 0xFFFF)), width,
-            g_last_recomp_func ? g_last_recomp_func : "?");
+            g_last_recomp_func ? g_last_recomp_func : "?",
+            via ? " via=" : "", via ? via : "");
     if (g_wlog_addr_state)
         {
         extern uint32_t g_interp_wlog_pc24;
@@ -179,6 +200,44 @@ static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) 
                 cpu_read8(&g_cpu, 0x00, (uint16)(g_cpu.D + 0x57)));
         }
     fputc('\n', g_wlog_addr_fp);
+    if (g_wlog_halt_off >= 0) {
+        int32_t off = cpu_wram_offset(bank, addr);
+        if (off >= 0) {
+            unsigned hit = 0, hv = 0;
+            if ((long)off == g_wlog_halt_off) { hv = (unsigned)(v & 0xFF); hit = 1; }
+            else if (width == 2 && (long)off + 1 == g_wlog_halt_off) { hv = (unsigned)((v >> 8) & 0xFF); hit = 1; }
+            if (hit && hv >= g_wlog_halt_min) {
+                extern int snes_frame_counter;
+                extern const char *g_last_recomp_func;
+                extern uint32_t g_interp_wlog_pc24;
+                fprintf(stderr,
+                        "[wlog_addr] HALT: write of %02X to g_ram[%04lX] at frame=%d "
+                        "func=%s IPC=%06X — exiting for post-mortem\n",
+                        hv, (unsigned long)g_wlog_halt_off, snes_frame_counter,
+                        g_last_recomp_func ? g_last_recomp_func : "?",
+                        (unsigned)(g_interp_wlog_pc24 & 0xFFFFFFu));
+                if (g_interp_recent_dump_hook)
+                    g_interp_recent_dump_hook(512, stderr);
+                fflush(NULL);
+                exit(42);
+            }
+        }
+    }
+}
+
+static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
+    wlog_addr_note_via(bank, addr, v, width, NULL);
+}
+
+/* Direct-WRAM-store variant for the write paths that bypass cpu_write8/16:
+ * snes_write's two WRAM stores (DMA A-bus writes land there) and the WMDATA
+ * ($2180) B-bus store. Same env gate / addr filter / output as the bus hook,
+ * tagged with `via` so the log distinguishes DMA-engine writes from CPU bus
+ * writes. `wa` is the g_ram offset (0..0x1FFFF). */
+void wlog_addr_note_direct(uint32 wa, uint8 v, const char *via) {
+    uint8  bank = (wa >= 0x10000u) ? 0x7F : 0x7E;
+    uint16 addr = (uint16)(wa & 0xFFFFu);
+    wlog_addr_note_via(bank, addr, v, 1, via);
 }
 
 static inline void wlog_note(uint8 bank, uint16 addr, uint16 v, int width) {

@@ -139,8 +139,38 @@ static void rtl_sync_apu_frame_boundary(void);
 
 static uint64_t rtl_apu_guest_cycle(void) {
   uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
-  if (within >= RTL_MASTER_CYCLES_PER_FRAME)
-    within = RTL_MASTER_CYCLES_PER_FRAME - 1;
+  /* `within` is deliberately NOT clamped to one frame.
+   *
+   * It used to be, which capped APU time at one frame per RtlRunFrame call
+   * because snes_frame_counter only advances when that call RETURNS. Any
+   * guest section that deliberately runs longer than a frame without
+   * returning to the host then deadlocked: the SPC stopped dead mid-section
+   * and could never answer.
+   *
+   * That is not a corner case. A game uploading its music/sample block
+   * writes $4200 = 0 first -- disabling NMI precisely so the upload runs
+   * uninterrupted -- then spins on $2140 waiting for the SPC to acknowledge
+   * each byte. One frame buys ~17,040 SPC cycles and the handshake costs
+   * ~73-200 cycles per byte, so a frame covers order-100 bytes of a multi-KB
+   * block; on hardware the transfer legitimately spans tens of frames.
+   * Donkey Kong Country does exactly this after its intro (the spin is at
+   * $8A:B512) and wedged permanently: the guest burned 14.3 billion master
+   * cycles inside one frame while `within` sat pinned at
+   * RTL_MASTER_CYCLES_PER_FRAME - 1, so the acknowledgement it waited on was
+   * unreachable by construction.
+   *
+   * Letting `within` grow makes APU time track the guest time actually
+   * executed. The frame counter stays the anchor, so host turbo still changes
+   * how quickly frames arrive rather than their guest duration, and a guest
+   * parked in WAI (which executes almost no master cycles) still gets a full
+   * frame of APU time per frame.
+   *
+   * Monotonicity is safe without a clamp here: after a long section this can
+   * fall behind the next frame boundary, and apu_runToGuestCycle (apu.c:135)
+   * absorbs that -- a target below portGuestAnchor is a no-op and it ratchets
+   * `target` up to portLastTarget. The SPC idles until the frame counter
+   * catches up, mirroring the wall time the transfer would have taken on
+   * hardware. */
   return (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME +
          within * RTL_APU_CYCLES_PER_FRAME /
              RTL_MASTER_CYCLES_PER_FRAME;
