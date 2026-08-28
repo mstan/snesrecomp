@@ -72,6 +72,19 @@ uint8_t joypad_auto_read_reg(uint16_t state, unsigned reg) {
     (void)reg;
     return 0;
 }
+/* Multitap-era joypad surface (feat/rollback-multitap-newproject): snes.c
+ * now routes $4016/$4017/$4218-$421F and WRIO through joypad.c. Same
+ * harness policy as the stubs above — none of it participates in HDMA
+ * timing. */
+void joypad_write_iobit(struct Snes *snes, uint8_t wrio) { (void)snes; (void)wrio; }
+uint8_t joypad_read_iobit(void) { return 0; }
+uint8_t joypad_read_port(struct Snes *snes, unsigned port) {
+    (void)snes; (void)port; return 0;
+}
+void joypad_auto_read(struct Snes *snes) { (void)snes; }
+uint8_t joypad_auto_read_reg_addr(struct Snes *snes, uint16_t reg) {
+    (void)snes; (void)reg; return 0;
+}
 void ppudma_record_dma(int channel, int fromB, uint8_t aBank, uint16_t aAdr,
                        uint8_t bAdr, uint16_t size) {
     (void)channel;
