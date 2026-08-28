@@ -1532,15 +1532,41 @@ static void DebugPpuRestoreHostState(Ppu *ppu,
                                  state->enhancer_context);
 }
 
+/* Render the way the HOST does, through the game's own draw_ppu_frame.
+ *
+ * This used to paint lines 0..224 with ppu_runLine and renderFlags 0, which
+ * was wrong twice over: flags 0 selects the legacy pixel-at-a-time
+ * compositor (ppu.h documents it ignoring several features) rather than the
+ * kPpuRenderFlags_NewRenderer path the host presents with, and a bare
+ * ppu_runLine loop replays no raster journal and steps no HDMA. On a title
+ * that raster-splits and drives TM per scanline by HDMA, that is a different
+ * picture: measured ~25,800 px off the presented composite, and with INIDISP
+ * left at 0x80 at end of frame it could paint the whole frame forced-blank.
+ * dump_frame_raw is built on this, so its images were misleading.
+ *
+ * The production path mutates more than pixels — ppu_rasterRenderBegin
+ * rewrites the line-0 register baseline, ppu_rasterApplyLine walks the
+ * journal cursor, dma_initHdma/dma_doHdma step every HDMA channel — so both
+ * structs are restored wholesale afterwards. An observer must leave nothing
+ * behind. */
 static void DebugPpuRenderAuthentic(uint8_t *pixels) {
-    DebugPpuHostState state;
-    DebugPpuSaveHostState(g_ppu, &state);
-    PpuBeginDrawing(g_ppu, pixels, 256 * 4, 0);
+    static Ppu save_ppu;
+    static uint8_t save_dma[sizeof(Dma)];
+    int have_dma = (g_snes && g_snes->dma) ? 1 : 0;
+    memcpy(&save_ppu, g_ppu, sizeof(Ppu));
+    if (have_dma) memcpy(save_dma, g_snes->dma, sizeof(Dma));
+
+    PpuBeginDrawing(g_ppu, pixels, 256 * 4, save_ppu.renderFlags);
     PpuSetExtraSpace(g_ppu, 0);
     PpuSetWidescreenLineEnhancer(g_ppu, NULL, NULL);
-    for (int i = 0; i <= 224; i++)
-        ppu_runLine(g_ppu, i);
-    DebugPpuRestoreHostState(g_ppu, &state);
+    if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+        g_rtl_game_info->draw_ppu_frame();
+    else
+        for (int i = 0; i <= 224; i++)
+            ppu_runLine(g_ppu, i);
+
+    memcpy(g_ppu, &save_ppu, sizeof(Ppu));
+    if (have_dma) memcpy(g_snes->dma, save_dma, sizeof(Dma));
 }
 
 void debug_server_record_frame(int frame) {
@@ -1595,15 +1621,16 @@ void debug_server_record_frame(int frame) {
         /* Copy the composite the host actually presented, rather than
          * re-rendering the PPU.
          *
-         * Re-rendering (DebugPpuRenderAuthentic, which dump_frame_raw uses)
-         * paints all 224 lines from the register state in force RIGHT NOW.
-         * This game draws through a per-line raster journal and ends every
-         * frame with INIDISP back at 0x80, so a re-render at this point
-         * paints the whole frame forced-blank: 120 byte-identical black
-         * frames captured off a game that was visibly rendering. Whatever
-         * mid-frame register changes make the picture -- raster splits,
-         * per-line HDMA -- are exactly what a re-render throws away, and
-         * they are exactly what a visual defect lives in.
+         * Historically DebugPpuRenderAuthentic painted all 224 lines from
+         * the register state in force RIGHT NOW, with no journal replay and
+         * no HDMA. This game draws through a per-line raster journal and ends
+         * every frame with INIDISP back at 0x80, so that re-render painted
+         * the whole frame forced-blank: 120 byte-identical black frames
+         * captured off a game that was visibly rendering. That helper now
+         * replays through the game's own draw_ppu_frame, so it no longer
+         * throws the splits away -- but copying the presented composite is
+         * still the cheaper and more literal answer to "what did the player
+         * see", so this path keeps doing it.
          *
          * cmd_screenshot already takes this path and says why. This is the
          * last frame the host finished compositing, so file fN.raw holds
@@ -4801,30 +4828,11 @@ static void cmd_render_inject(const char *args) {
     if (clen >= 512) memcpy((uint8_t *)g_ppu->cgram, cbuf, 512);
 
     static uint8_t px[256 * 4 * 240];
-    /* Render through the PRODUCTION draw path, not a bare ppu_runLine loop.
-     *
-     * DebugPpuRenderAuthentic renders lines 0..224 with renderFlags 0 and no
-     * raster-journal replay and no HDMA. For a title that raster-splits and
-     * drives TM per scanline by HDMA, that is not the same picture: a
-     * self-test that injected our OWN state and compared against our OWN
-     * recorded composite for the SAME frame missed by ~25,800 px, against
-     * every frame in the window. Flags 0 also selects the legacy compositor
-     * rather than the kPpuRenderFlags_NewRenderer path the host presents
-     * with. An instrument that cannot reproduce a picture from the state that
-     * produced it cannot testify about anybody else's state.
-     *
-     * draw_ppu_frame is the very function the host calls each frame, so this
-     * renders exactly what would have been presented. */
-    PpuBeginDrawing(g_ppu, px, 256 * 4, save_ppu.renderFlags);
-    PpuSetExtraSpace(g_ppu, 0);
-    PpuSetWidescreenLineEnhancer(g_ppu, NULL, NULL);
-    int used_production = 0;
-    if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) {
-        g_rtl_game_info->draw_ppu_frame();
-        used_production = 1;
-    } else {
-        for (int i = 0; i <= 224; i++) ppu_runLine(g_ppu, i);
-    }
+    /* DebugPpuRenderAuthentic now renders through the production path and
+     * restores Ppu/Dma itself; the outer save/restore here is what undoes the
+     * INJECTION. */
+    int used_production = (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) ? 1 : 0;
+    DebugPpuRenderAuthentic(px);
 
     memcpy(g_ppu, &save_ppu, sizeof(Ppu));
     if (have_dma) memcpy(g_snes->dma, save_dma, sizeof(Dma));
