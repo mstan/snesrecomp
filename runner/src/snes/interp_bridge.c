@@ -1198,6 +1198,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
+            /* DRAM refresh tax — shared watermark with the AOT tier's
+             * WatchdogCheck charge; see common_cpu_infra.c. */
+            snes_refresh_charge();
             cpu->coprocessor_master_cycles = cpu->master_cycles;
             if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
             if (g_snes && g_snes->cart)

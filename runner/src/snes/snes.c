@@ -678,6 +678,31 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
           ppudma_record_dma(ch, c->fromB, c->aBank, c->aAdr, c->bAdr, c->size);
         }
       }
+      /* Charge the transfer's guest time BEFORE running it. On hardware a
+       * general-purpose DMA halts the CPU for ~8 master clocks per byte plus
+       * small per-channel setup; this loop used to complete the whole
+       * transfer in ZERO guest time. That is not a rounding error: a scene
+       * load moves enough data that the free time let the loader finish its
+       * lag blocks measurably earlier than hardware (33/46/32 frames vs
+       * Mesen's 36/47/35 for the identical flow), which shifted the parity
+       * of the pass that spawns the mechs — and the sprite hover (gated on
+       * the pass counter) then paired with the wrong animation phase,
+       * publishing Y±1 sprite tables hardware never shows. See
+       * gundamwing-parity-root-cause. HDMA stays uncharged here (per-line,
+       * far smaller; out of scope for this fix). */
+      {
+        extern CpuState g_cpu;
+        uint64_t dma_master = 12;
+        for (int ch = 0; ch < 8; ch++) {
+          if (val & (1 << ch)) {
+            uint32_t n = snes->dma->channel[ch].size;
+            if (n == 0) n = 0x10000;
+            dma_master += 8 + (uint64_t)n * 8;
+          }
+        }
+        g_cpu.master_cycles += dma_master;
+        snes_sync_master_clock(snes, g_cpu.master_cycles);
+      }
       dma_startDma(snes->dma, val, false);
       while (dma_cycle(snes->dma)) {}
       break;
