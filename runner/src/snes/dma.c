@@ -329,6 +329,30 @@ void dma_initHdma(Dma* dma) {
   }
 }
 
+void dma_primeHdmaFirstLine(Dma* dma) {
+  for(int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if(!ch->hdmaActive || ch->terminated || !ch->doTransfer) continue;
+    /* One transfer's writes, then put the cursor state back: the render
+     * loop's per-line dma_doHdma cadence (validated to the pixel against
+     * Mesen at this title's band edges) must consume the table exactly as
+     * before. Row 0 and row 1 share a slot value this way, which matches
+     * hardware everywhere except a table whose first entry lasts a single
+     * line — none observed. */
+    DmaChannel save = *ch;
+    int len = transferLength[ch->mode];
+    for(int j = 0; j < len; j++) {
+      uint8_t b = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode][j]);
+      if(ch->indirect) {
+        dma_transferByte(dma, ch->size++, ch->indBank, b, false);
+      } else {
+        dma_transferByte(dma, ch->tableAdr++, ch->aBank, b, false);
+      }
+    }
+    *ch = save;
+  }
+}
+
 void dma_doHdma(Dma* dma) {
   for(int i = 0; i < 8; i++) {
     DmaChannel* ch = &dma->channel[i];

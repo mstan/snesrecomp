@@ -64,6 +64,14 @@ void dma_doDma(Dma* dma);
  * scanline (FRAME_MODEL_HOSTS.md). */
 void dma_initHdma(Dma* dma);
 void dma_doHdma(Dma* dma);
+/* Perform the first HDMA transfer's REGISTER WRITES only, leaving all channel
+ * state (table cursor, repCount, doTransfer) untouched. Hardware's vblank
+ * init transfers each channel's first value before any visible pixel; a
+ * frame-model render loop that steps dma_doHdma after each line otherwise
+ * leaves its first rendered row with the pre-HDMA register state — measured
+ * as a one-line bright strip above Gundam Wing's intro letterbox. Call
+ * between dma_initHdma and the first rendered line. */
+void dma_primeHdmaFirstLine(Dma* dma);
 uint64_t dma_hdmaMasterEstimate(Dma* dma); /* per-frame CPU-stall estimate */
 bool dma_cycle(Dma* dma);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
