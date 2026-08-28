@@ -9,6 +9,10 @@
 
 Snes *g_snes;
 
+/* ppu.c references these runtime globals, but this harness links ppu.c alone. */
+int snes_frame_counter;
+unsigned char g_snesrecomp_last_hdmaen;
+
 uint16_t WsShadowTile(int layer, int screen_x, uint32_t wrapped_y,
                       uint16_t real_tile) {
     (void)layer;

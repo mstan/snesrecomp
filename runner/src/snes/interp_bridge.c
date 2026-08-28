@@ -664,8 +664,22 @@ void interp_bridge_dump_recent_steps(int n, FILE *out) {
 
 /* Install the ring dump as cpu_state.c's halt-path hook (explicit hook, not
  * a PE weak symbol — see cpu_state.c). Constructor runs at image load. */
+static void itrace_install_dump_hook(void);
+#if defined(_MSC_VER)
+#  pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU"))
+void (*itrace_install_dump_hook_ctor)(void) = itrace_install_dump_hook;
+#  if defined(_M_IX86)
+#    pragma comment(linker, "/include:_itrace_install_dump_hook_ctor")
+#  else
+#    pragma comment(linker, "/include:itrace_install_dump_hook_ctor")
+#  endif
+static void itrace_install_dump_hook(void)
+#else
 __attribute__((constructor))
-static void itrace_install_dump_hook(void) {
+static void itrace_install_dump_hook(void)
+#endif
+{
     g_interp_recent_dump_hook = interp_bridge_dump_recent_steps;
 }
 
