@@ -64,6 +64,7 @@ void dma_doDma(Dma* dma);
  * scanline (FRAME_MODEL_HOSTS.md). */
 void dma_initHdma(Dma* dma);
 void dma_doHdma(Dma* dma);
+uint64_t dma_hdmaMasterEstimate(Dma* dma); /* per-frame CPU-stall estimate */
 bool dma_cycle(Dma* dma);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
 void dma_saveload(Dma *dma, SaveLoadInfo *sli);

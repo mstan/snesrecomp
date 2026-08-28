@@ -281,6 +281,36 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
  * pointer at the top of the field; dma_doHdma() runs once per scanline.
  * `size` doubles as the indirect address, as the struct comment notes. */
 
+/* Estimated master clocks one frame of HDMA steals from the CPU.
+ *
+ * Hardware pauses the CPU during every active channel's per-line transfer:
+ * ~18 clocks of per-line overhead when any channel is live, plus per channel
+ * 8 clocks of address work and 8 per byte moved (1/2/2/4/4/4/2/4 bytes for
+ * modes 0-7), plus 16 more when the channel reloads an indirect address.
+ * With the six-channel gradient/scroll setup this title runs on its menu and
+ * VS screens that is ~170 clocks x 224 lines = ~10.7%% of the frame -- more
+ * than DRAM refresh -- and it was never charged: measured, our menu lag
+ * blocks ran one frame short of Mesen's (7 vs 8) while the HDMA-off loading
+ * screens matched exactly. The phase error that mispairs the sprite-table
+ * and tile-art updates at scene entry rides on exactly that deficit.
+ *
+ * An estimate from the live channel state at frame start; terminated-early
+ * tables overcharge slightly, which is the conservative side. */
+uint64_t dma_hdmaMasterEstimate(Dma* dma) {
+  static const uint8_t bytesPerUnit[8] = {1, 2, 2, 4, 4, 4, 2, 4};
+  uint64_t perLine = 0;
+  int any = 0;
+  for (int i = 0; i < 8; i++) {
+    DmaChannel* c = &dma->channel[i];
+    if (!c->hdmaActive) continue;
+    any = 1;
+    perLine += 8u + 8u * bytesPerUnit[c->mode & 7];
+    if (c->indirect) perLine += 16u;
+  }
+  if (!any) return 0;
+  return (18u + perLine) * 224u + 128u /* per-frame init */;
+}
+
 void dma_initHdma(Dma* dma) {
   for(int i = 0; i < 8; i++) {
     DmaChannel* ch = &dma->channel[i];
