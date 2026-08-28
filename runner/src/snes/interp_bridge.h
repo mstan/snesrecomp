@@ -52,6 +52,10 @@ typedef void (*InterpPreOpcodeHook)(CpuState *cpu, uint32_t pc24);
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook);
 void interp_bridge_pre_opcode_redirect(uint32_t pc24);
+/* Dump the last n entries of the always-on global interp step ring
+ * (pc/op/sp/frame per interpreted opcode) to `out` (NULL = stderr). */
+#include <stdio.h>
+void interp_bridge_dump_recent_steps(int n, FILE *out);
 
 /*
  * Run the interpreter over guest code at entry_pc24, in the context of `cpu`.

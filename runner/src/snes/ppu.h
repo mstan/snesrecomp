@@ -234,14 +234,20 @@ struct Ppu {
   // margins. Layer bits use the PPU window layer numbering (BG1..BG4, OBJ,
   // color); window bits select W1/W2. Zero is the hardware-authentic default.
   uint8_t wsWindowExpandLayers, wsWindowExpandWindows;
-  // Strict decode of the ambiguous 9-bit OAM X band [256, 256+extraRightCur).
-  // A raw value there is either a genuine right-margin sprite (widescreen
-  // host emitted it on purpose) or a sprite the game parked off-screen-left
-  // at x-512 (invisible on hardware). When strict is set, only slots marked
-  // in wsOamRightHint keep the positive decode; unmarked slots wrap negative
-  // like hardware, so parked sprites don't ghost into the right margin.
-  // Default off preserves the legacy always-positive band (SMW relies on it).
-  // Games publish per NMI via PpuWsSetOamRightHints. 1 bit per OAM slot.
+  // Strict decode of ambiguous 9-bit OAM X margin bands. 1 bit per OAM slot.
+  // Left: sprites fully clipped by the authentic 256-wide viewport may become
+  // visible in [-extraLeftCur, 0). With strict left hints enabled, only marked
+  // slots render there; unmarked slots stay hardware-hidden.
+  // Right: raw X values in [256, 256+extraRightCur) are either genuine
+  // right-margin sprites or off-screen-left parked sprites wrapped through
+  // 9-bit OAM X. With strict right hints enabled, only marked slots keep the
+  // positive decode; unmarked slots wrap negative like hardware.
+  // Default off preserves the legacy margin behavior. Games publish hints per
+  // NMI after CPU-side OAM staging is final and before the frame is presented.
+  // A NULL hint pointer disables strict mode. Pass a zeroed array for strict
+  // mode with no slots marked.
+  uint8_t wsOamLeftHintStrict;
+  uint8_t wsOamLeftHint[16];
   uint8_t wsOamRightHintStrict;
   uint8_t wsOamRightHint[16];
   uint8_t lastMosaicModulo;
@@ -513,9 +519,16 @@ void PpuSetWsHudOamShiftRange(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
  * reserve. nslots 0 disables. Publish every frame like the first range. */
 void PpuSetWsHudOamShiftRange2(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
 
+// Publish this frame's OAM left-margin hints (see wsOamLeftHintStrict).
+// `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or
+// NULL to disable strict decode and restore the legacy left-margin behavior.
+// Pass a zeroed array for strict mode with no left-margin slots marked.
+void PpuWsSetOamLeftHints(Ppu *ppu, const uint8_t *hints);
+
 // Publish this frame's OAM right-margin hints (see wsOamRightHintStrict).
 // `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or
 // NULL to disable strict decode and restore the legacy always-positive band.
+// Pass a zeroed array for strict mode with no right-margin slots marked.
 // Games that stage OAM CPU-side should call this each NMI, after the staging
 // buffer is final and before the frame is presented.
 void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints);

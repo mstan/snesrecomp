@@ -270,6 +270,16 @@ void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
 }
 
+void PpuWsSetOamLeftHints(Ppu *ppu, const uint8_t *hints) {
+  if (hints) {
+    ppu->wsOamLeftHintStrict = 1;
+    memcpy(ppu->wsOamLeftHint, hints, sizeof(ppu->wsOamLeftHint));
+  } else {
+    ppu->wsOamLeftHintStrict = 0;
+    memset(ppu->wsOamLeftHint, 0, sizeof(ppu->wsOamLeftHint));
+  }
+}
+
 void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints) {
   if (hints) {
     ppu->wsOamRightHintStrict = 1;
@@ -2045,6 +2055,16 @@ static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
   return x;
 }
 
+static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
+                                           int sprite_size,
+                                           int left_extra) {
+  if (!ppu->wsOamLeftHintStrict || x >= 0 || x + sprite_size > 0 ||
+      x + sprite_size <= -left_extra)
+    return true;
+  int slot = index >> 1;
+  return (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) != 0;
+}
+
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   static const uint8 spriteSizes[8][2] = {
     {8, 16}, {8, 32}, {8, 64}, {16, 32},
@@ -2066,21 +2086,24 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
     if(row < spriteHeight) {
       int x = PpuDecodeOamX(ppu, index);
-      x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
       const int left_extra =
           PpuWidescreenHudOamSlot(ppu, index, y) &&
                   (ppu->wsHudSplitHeight & 0x80)
               ? ppu->extraLeftRight
               : ppu->extraLeftCur;
-      if(x + spriteSize > -left_extra) {
-        spritesFound++;
-        if(spritesFound > 32 &&
-           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
-          ppu->rangeOver = true;
-          spritesFound = 32;
-          break;
+      if (PpuWidescreenOamLeftHintAllows(ppu, index, x, spriteSize,
+                                          left_extra)) {
+        x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
+        if(x + spriteSize > -left_extra) {
+          spritesFound++;
+          if(spritesFound > 32 &&
+             !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
+            ppu->rangeOver = true;
+            spritesFound = 32;
+            break;
+          }
+          foundSprites[spritesFound - 1] = index;
         }
-        foundSprites[spritesFound - 1] = index;
       }
     }
     index += 2;

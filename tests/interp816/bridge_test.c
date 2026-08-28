@@ -37,6 +37,7 @@ static int      g_aot_interp_nlr;
 static int      g_aot_double_rewrite;
 static int      g_aot_crosses_interp_owner;
 static int      g_aot_skips_interp_owner;
+static int      g_aot_deadline_unwind;
 static int      g_owner_target_result;
 static int      g_aot_tail_chain_probe;
 static int      g_aot_skips_root;
@@ -91,6 +92,9 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
     (void)cart; (void)master_clock;
 }
+/* cpu_state.c isn't linked here; the bridge's constructor installs its
+ * step-ring dump into this hook, so provide the slot. */
+void (*g_interp_recent_dump_hook)(int n, FILE *out) = 0;
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
 }
@@ -167,6 +171,15 @@ RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
         g_recomp_stack_top = base;
         if (g_owner_target_result)
             return interp_bridge_lle_yield_unwind(cpu, 0x008003);
+        return RECOMP_RETURN_NORMAL;
+    }
+    if (g_aot_deadline_unwind && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        g_aot_called++;
+        cpu->master_cycles = 200;
+        if (interp_bridge_lle_master_deadline_reached(cpu))
+            return interp_bridge_lle_yield_unwind(cpu, 0x008100);
+        cpu->A = 0x0100;
+        cpu->S = (uint16)(cpu->S + frame_size);
         return RECOMP_RETURN_NORMAL;
     }
     if (g_aot_skips_root && (pc24 & 0xFFFFFF) == FAKE_AOT) {
@@ -594,6 +607,35 @@ int main(void) {
             "A.lo=%02X exp 5A (scheduler continuation executed)", g_c.A & 0xFF);
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (JSL frame consumed once)", g_c.S);
       g_aot_skips_root = 0; }
+
+    /* S8c: a compiled callee that reaches the host's master deadline while
+     * bounced from scheduler mode must return to the host. It must not be
+     * treated like a cooperative yield primitive, because that would continue
+     * interpreting past the host's expired bound. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_deadline_unwind = 1;
+      interp_bridge_set_master_deadline(100);
+      uint8_t scheduler[] = {
+          0x22,0x00,0x81,0x00,                 /* JSL fake compiled root */
+          0xA9,0x5A,                           /* must not execute */
+          0xAD,0x20,0x00, 0xD0,0xFB            /* cooperative wait loop */
+      };
+      load(0x8000, scheduler, sizeof scheduler);
+      RAM[0x20] = 0;
+      int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008006, 0x0020, 0);
+      printf("S8c scheduler deadline unwind returns to host\n");
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_aot_called == 1, "aot_called=%d exp 1", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x00,
+            "A.lo=%02X exp 00 (scheduler continuation not executed)",
+            g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FC,
+            "S=%04X exp 01FC (compiled JSL frame retained)", g_c.S);
+      CHECK(interp_bridge_lle_resume_pc() == 0x008100,
+            "resume=$%06X exp $008100 (compiled deadline resume)",
+            (unsigned)interp_bridge_lle_resume_pc());
+      interp_bridge_set_master_deadline(0);
+      g_aot_deadline_unwind = 0; }
 
     /* S9: the same rewrite below the paired AOT root belongs to a compiled
      * ancestor, not directly to the scheduler interpreter.  Finish that

@@ -348,6 +348,8 @@ static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static int      s_lle_unwind_owner_depth = 0;
+static int      s_lle_unwind_is_deadline = 0;
+static int      s_lle_next_unwind_is_deadline = 0;
 static uint32_t s_lle_resume_pc24   = 0;
 static int      s_lle_wai_yield     = 0;
 static uint64_t s_lle_master_deadline = 0;
@@ -446,9 +448,13 @@ void interp_bridge_set_master_deadline(uint64_t master_clock) {
 }
 
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
-    return cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
-           s_lle_master_deadline != 0 &&
-           cpu->master_cycles >= s_lle_master_deadline;
+    const int reached =
+        cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
+        s_lle_master_deadline != 0 &&
+        cpu->master_cycles >= s_lle_master_deadline;
+    if (reached)
+        s_lle_next_unwind_is_deadline = 1;
+    return reached;
 }
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
@@ -462,6 +468,8 @@ RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     s_lle_unwind_active = 1;
     s_lle_unwind_pc24   = resume_pc24 & 0xFFFFFFu;
     s_lle_unwind_owner_depth = s_interp_bounce_owner_depth;
+    s_lle_unwind_is_deadline = s_lle_next_unwind_is_deadline;
+    s_lle_next_unwind_is_deadline = 0;
     return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
 }
 
@@ -627,6 +635,38 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
         const ITraceEnt *e = &ring[i & 255];
         fprintf(stderr, "    $%06X op=$%02X\n", e->pc, e->op);
     }
+}
+
+/* ── Always-on global interp step ring ─────────────────────────────────
+ * The per-run head[]/ring[] above are stack locals — invisible to a
+ * post-mortem or halt fired mid-run. This ring records EVERY interpreted
+ * step (pc, op, sp, frame) continuously so a late observer can read the
+ * interpreter's recent control flow backward (ring-buffer doctrine: no
+ * arm-then-capture). 8192 entries ≈ several frames of pure-interp code. */
+#define ITRACE_RECENT_LEN 8192
+typedef struct { uint32_t pc; int32_t frame; uint16_t sp; uint8_t op; uint8_t pad; } ITraceRecentEnt;
+static ITraceRecentEnt g_itrace_recent[ITRACE_RECENT_LEN];
+static uint64_t g_itrace_recent_n = 0;
+
+void interp_bridge_dump_recent_steps(int n, FILE *out) {
+    if (!out) out = stderr;
+    if (n <= 0 || (uint64_t)n > g_itrace_recent_n) n = (int)(g_itrace_recent_n < ITRACE_RECENT_LEN
+                                                            ? g_itrace_recent_n : ITRACE_RECENT_LEN);
+    if ((uint64_t)n > g_itrace_recent_n) n = (int)g_itrace_recent_n;
+    fprintf(out, "[interp_recent] last %d interp steps (of %llu total):\n",
+            n, (unsigned long long)g_itrace_recent_n);
+    for (int i = n; i >= 1; i--) {
+        const ITraceRecentEnt *e =
+            &g_itrace_recent[(g_itrace_recent_n - (uint64_t)i) & (ITRACE_RECENT_LEN - 1)];
+        fprintf(out, "  f%-6d $%06X op=%02X sp=%04X\n", e->frame, e->pc, e->op, e->sp);
+    }
+}
+
+/* Install the ring dump as cpu_state.c's halt-path hook (explicit hook, not
+ * a PE weak symbol — see cpu_state.c). Constructor runs at image load. */
+__attribute__((constructor))
+static void itrace_install_dump_hook(void) {
+    g_interp_recent_dump_hook = interp_bridge_dump_recent_steps;
 }
 
 /* Tier-2 coverage table (definitions below, § gap manifest): shared by the
@@ -1091,6 +1131,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             if (itn < 8) head[itn] = _e;
             if (trace) ring[itn & 255] = _e;
             itn++;
+            extern int snes_frame_counter;
+            ITraceRecentEnt *_g =
+                &g_itrace_recent[g_itrace_recent_n++ & (ITRACE_RECENT_LEN - 1)];
+            _g->pc = pc_before; _g->frame = snes_frame_counter;
+            _g->sp = in.sp; _g->op = op; _g->pad = 0;
         }
 
         /* Subroutine calls: JSR abs (0x20, 3B), JSL (0x22, 4B),
@@ -1284,6 +1329,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 int _saved_bounce_owner = s_interp_bounce_owner_depth;
                 s_interp_bounce_recomp_base = g_recomp_stack_top;
                 s_interp_bounce_owner_depth = s_interp_bridge_depth;
+                s_lle_next_unwind_is_deadline = 0;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
                 s_interp_bounce_owner_depth = _saved_bounce_owner;
                 s_interp_bounce_recomp_base = _saved_bounce_base;
@@ -1309,6 +1355,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                         (unsigned)_sp_pre, (unsigned)in.sp,
                                         (unsigned)s_lle_unwind_pc24);
                             }
+                            if (s_lle_unwind_is_deadline) {
+                                s_lle_resume_pc24 = s_lle_unwind_pc24;
+                                s_lle_unwind_active = 0;
+                                s_lle_unwind_owner_depth = 0;
+                                s_lle_unwind_is_deadline = 0;
+                                sync_interp_to_cpu(&in, cpu);
+                                bridge_apu_flush(cpu);
+                                return 1;
+                            }
                             /* Fiber-free yield: the bounced body reached a
                              * yield primitive; its stub unwound the host
                              * stack to here. Consume the request and resume
@@ -1319,6 +1374,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                              * switch runs byte-exact. */
                             s_lle_unwind_active = 0;
                             s_lle_unwind_owner_depth = 0;
+                            s_lle_unwind_is_deadline = 0;
                             sync_cpu_to_interp(cpu, &in);
                             in.k  = (uint8)((s_lle_unwind_pc24 >> 16) & 0xFF);
                             in.pc = (uint16)(s_lle_unwind_pc24 & 0xFFFF);
@@ -1543,6 +1599,8 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
         if (s_lle_unwind_active) {
             s_lle_unwind_active = 0;
             s_lle_unwind_owner_depth = 0;
+            s_lle_unwind_is_deadline = 0;
+            s_lle_next_unwind_is_deadline = 0;
             fprintf(stderr, "[interp_bridge] stale LLE yield unwind cleared "
                     "at scheduler exit (pc=$%06X)\n",
                     (unsigned)s_lle_unwind_pc24);
