@@ -2327,6 +2327,8 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  * Registers journaled: the set the split handlers write. Data ports (VRAM/
  * CGRAM/OAM) are deliberately excluded — those are uploads, not per-line
  * display state, and replaying them would double-apply the data. */
+int g_ppu_scanout_latch_bypass = 0;
+
 #define PPU_RASTER_MAX 256
 typedef struct { uint8_t line; uint16_t reg; uint8_t val; } PpuRasterEntry;
 static PpuRasterEntry s_raster[PPU_RASTER_MAX];

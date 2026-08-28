@@ -4832,7 +4832,13 @@ static void cmd_render_inject(const char *args) {
      * restores Ppu/Dma itself; the outer save/restore here is what undoes the
      * INJECTION. */
     int used_production = (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) ? 1 : 0;
+    /* render_inject's contract is "render exactly the state given". A host
+     * with a scanout latch (OAM/CGRAM snapshotted at frame start) would
+     * otherwise render its latch instead of the injected arrays — measured
+     * as injected OAM having no effect at all. */
+    g_ppu_scanout_latch_bypass = 1;
     DebugPpuRenderAuthentic(px);
+    g_ppu_scanout_latch_bypass = 0;
 
     memcpy(g_ppu, &save_ppu, sizeof(Ppu));
     if (have_dma) memcpy(g_snes->dma, save_dma, sizeof(Dma));

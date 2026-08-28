@@ -410,6 +410,14 @@ void ppu_rasterRenderBegin(Ppu *ppu);
 int  ppu_rasterTakeHdmaen(uint8_t *out);
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
 void ppu_rasterApplyLine(Ppu *ppu, int line);
+
+/* Scanout latch bypass — set by the debug server around render_inject so an
+ * injected OAM/CGRAM state is rendered as given. A frame-model host that
+ * latches OAM/CGRAM at the frame's start (hardware scans out the state as of
+ * line 0; a mid-frame DMA below the sprites belongs to the NEXT scanout)
+ * must honor this flag in its draw_ppu_frame and render the LIVE state when
+ * it is set. Default 0. */
+extern int g_ppu_scanout_latch_bypass;
 int  ppu_rasterDebugDump(char *out, int cap);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
