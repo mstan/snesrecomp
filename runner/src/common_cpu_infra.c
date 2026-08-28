@@ -516,8 +516,48 @@ void WatchdogFrameStart(void) {
   g_interrupt_context_depth = 0;
 }
 
+/* ── DRAM refresh ──
+ * Hardware stalls the CPU ~40 master clocks once per scanline, vblank
+ * included — a ~2.9% tax on execution this runtime never paid. Unpaid, a
+ * scene load completes its lag blocks early (measured 33/46/32 frames vs
+ * Mesen's 36/47/35 before this and the DMA-time charge), shifting the parity
+ * of the pass that spawns objects; the sprite hover (gated on the pass
+ * counter) then pairs with the wrong animation phase and publishes sprite
+ * tables hardware never shows.
+ *
+ * One watermark serves both tiers: generated code charges from
+ * WatchdogCheck() per block, the interpreter from its per-opcode advance.
+ * The park path (idle-spin skip) exempts its own jumps — parked time
+ * displaces no work, and taxing it would drift IRQ latch points. A jump of
+ * more than 4096 lines is treated as a teleport (boot, savestate load) and
+ * exempted rather than charged. */
+uint64_t g_refresh_charged_upto;
+static uint64_t s_refresh_phase;
+void snes_refresh_exempt(void) { g_refresh_charged_upto = g_cpu.master_cycles; }
+void snes_refresh_charge(void) {
+  uint64_t m = g_cpu.master_cycles;
+  if (g_refresh_charged_upto == 0 || m < g_refresh_charged_upto) {
+    g_refresh_charged_upto = m;
+    return;
+  }
+  uint64_t delta = m - g_refresh_charged_upto;
+  s_refresh_phase += delta;
+  uint64_t lines = s_refresh_phase / 1364u;
+  if (lines > 4096u) {            /* teleport, not execution */
+    s_refresh_phase = 0;
+    g_refresh_charged_upto = m;
+    return;
+  }
+  if (lines) {
+    s_refresh_phase -= lines * 1364u;
+    g_cpu.master_cycles += 40u * lines;
+  }
+  g_refresh_charged_upto = g_cpu.master_cycles;
+}
+
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
+  snes_refresh_charge();
 #ifdef SNES_COSIM
   /* Co-sim WRAM watchpoint (dev, env-gated): name the recompiled function that
    * writes a given low-WRAM address. WatchdogCheck runs per-block with
