@@ -111,6 +111,11 @@ int interp_bridge_return_targets_owner(uint16 ret_s, uint16 post_s) {
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *c, uint32 pc) {
     (void)c; (void)pc; return RECOMP_RETURN_NORMAL;
 }
+int interp_bridge_lle_master_deadline_reached(const CpuState *c) {
+    (void)c; return 0;
+}
+void snes_refresh_charge(void) {}
+void snes_refresh_exempt(void) {}
 int interp816_opcode_hook(uint32_t addr) { (void)addr; return 0; }
 
 /* ── deterministic RNG (no Date/rand: reproducible) ── */
