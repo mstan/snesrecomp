@@ -49,6 +49,11 @@ const char *rtl_game_title(void) {
                                                      : "unknown";
 }
 
+static void rtl_snes_charge_master_cycles(Snes *snes, uint64_t clocks) {
+  g_cpu.master_cycles += clocks;
+  snes_sync_master_clock(snes, g_cpu.master_cycles);
+}
+
 void RtlRegisterGame(const RtlGameInfo *info) {
   g_rtl_game_info = info;
   tier2_capture_set_default_enabled(info && info->tier2_capture);
@@ -678,6 +683,8 @@ void WatchdogCheck(void) {
 
 Snes *SnesInit(const uint8 *data, int data_size) {
   g_snes = snes_init(g_ram);
+  snes_set_master_clock_charge_hook(rtl_snes_charge_master_cycles);
+  snes_set_wram_write_log_hook(wlog_addr_note_direct);
   cart_set_master_clock_source(g_snes->cart,
                                &g_cpu.coprocessor_master_cycles);
   g_snes_cpu = g_snes->cpu;

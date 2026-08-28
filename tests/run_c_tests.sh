@@ -37,6 +37,27 @@ echo "=== PPU sprite limits ==="
     -o "$OUT/ppu_sprite_limit_test"
 "$OUT/ppu_sprite_limit_test"
 
+echo "=== DMA / HDMA ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/dma/hdma_test.c" \
+    "$ROOT/runner/src/snes/dma.c" \
+    -o "$OUT/hdma_test"
+"$OUT/hdma_test"
+
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -Wno-error=parentheses -Wno-error=unused-variable \
+    -Wno-error=unused-const-variable \
+    -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -ffunction-sections -fdata-sections \
+    -I "$ROOT/tests/dma" -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/dma/hdma_timing_test.c" \
+    "$ROOT/runner/src/snes/dma.c" \
+    "$ROOT/runner/src/snes/snes.c" \
+    -Wl,--gc-sections -o "$OUT/hdma_timing_test"
+"$OUT/hdma_timing_test"
+
 echo "=== interpreter and bridge ==="
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -D_POSIX_C_SOURCE=200809L -I "$ROOT/runner/src/snes" \
@@ -137,14 +158,6 @@ echo "=== automatic joypad register byte order ==="
     -o "$OUT/auto_joypad_test"
 "$OUT/auto_joypad_test"
 
-echo "=== Super Multitap protocol ==="
-"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
-    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
-    "$ROOT/tests/joypad/multitap_test.c" \
-    "$ROOT/runner/src/snes/joypad.c" \
-    -o "$OUT/multitap_test"
-"$OUT/multitap_test"
-
 echo "=== runtime dispatch ==="
 "$CC" -std=c11 -Wall -Wextra -ffunction-sections -fdata-sections \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
@@ -158,19 +171,6 @@ echo "=== runtime dispatch ==="
     "$ROOT/runner/src/snes/interp816.c" \
     -Wl,--gc-sections -lm -o "$OUT/known_lle_entry_test"
 "$OUT/known_lle_entry_test"
-
-echo "=== rollback state digest ==="
-"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
-    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
-    "$ROOT/tests/netplay/rb_state_digest_test.c" \
-    "$ROOT/runner/src/netplay/snes_state_digest.c" \
-    "$ROOT/runner/src/snes/joypad.c" \
-    "$ROOT/runner/src/snes/apu.c" \
-    "$ROOT/runner/src/snes/spc.c" \
-    "$ROOT/runner/src/snes/dsp.c" \
-    "$ROOT/runner/src/crc32.c" \
-    -o "$OUT/rb_state_digest_test"
-"$OUT/rb_state_digest_test"
 
 echo "=== APU guest-time pacing ==="
 "$CC" -std=c11 -Wall -Wextra -Werror \

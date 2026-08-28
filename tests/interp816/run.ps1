@@ -28,10 +28,12 @@ if ($LASTEXITCODE -ne 0) { throw "interp816 core test failed" }
 $bridgeOut = Join-Path $outDir "bridge_test.exe"
 Build-BelowNormal @(
     "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-O1",
+    "-DSNESRECOMP_TIER2_TEST=1",
     "-I$root\runner\src", "-I$root\runner\src\snes",
     "$root\tests\interp816\bridge_test.c",
     "$root\runner\src\snes\interp816.c",
     "$root\runner\src\snes\interp_bridge.c",
+    "$root\runner\src\snes\tier2_capture.c",
     "$root\runner\src\snes\cx4.c",
     "-lm", "-o", $bridgeOut
 ) $bridgeOut

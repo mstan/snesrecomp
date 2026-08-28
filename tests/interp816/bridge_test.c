@@ -65,6 +65,7 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
 }
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
+void snes_refresh_charge(void) {}
 
 /* Attribution-scope stubs (common_cpu_infra.c in the real runner). The test
  * doubles record what the bridge pushed so the interp scope is testable: the

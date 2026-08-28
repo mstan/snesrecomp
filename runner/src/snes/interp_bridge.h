@@ -75,7 +75,12 @@ int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
 
 /* General infinite-loop driver.  This is the scheduler helper with an
  * explicit byte value for games whose vblank wait flag is asserted while
- * waiting (Super Metroid), rather than cleared after a slot walk (MMX). */
+ * waiting (Super Metroid), rather than cleared after a slot walk (MMX).
+ *
+ * This is not a CPU-only helper: interpreted opcodes advance the shared Snes
+ * beam through snes_sync_master_clock(). Frame-model hosts that also own a
+ * beam loop must integrate with that shared clock or manually reproduce the
+ * framework edges listed in docs/FRAME_MODEL_HOSTS.md. */
 int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
                            uint32_t yield_pc, uint16_t flag_addr,
                            uint8_t flag_value);
@@ -96,7 +101,9 @@ int interp_bridge_lle_took_wai(void);
 /* Optional whole-program LLE deadline.  When nonzero, the auto-quiescent
  * bridge yields at the first architectural instruction boundary whose master
  * clock reaches this value.  Event-driven game schedulers use this to prevent
- * a productive CPU/MMIO loop from running across multiple vblanks atomically. */
+ * a productive CPU/MMIO loop from running across multiple vblanks atomically.
+ * Combine with snes_next_irq_master() when raster IRQs can occur before the
+ * next frame boundary. */
 void interp_bridge_set_master_deadline(uint64_t master_clock);
 
 /* True only while a paired AOT bounce is executing inside an auto-quiescent
