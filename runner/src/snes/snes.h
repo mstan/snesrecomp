@@ -87,6 +87,14 @@ struct Snes {
   uint32_t dbgNmiLateCount;
   uint64_t dbgBeamLagAtNmi;
   bool inVblank;
+  /* Beam-timeline HDMA (upstream default): snes_advance_beam runs
+   * dma_doHdma at h=1024 of each visible line and dma_initHdma at the field
+   * wrap. A frame-model host whose render loop walks the REAL HDMA tables
+   * per line (dma_initHdma + dma_doHdma in its draw_ppu_frame) must turn
+   * this off via snes_set_hdma_beam_enabled(snes, false), or the tables are
+   * consumed twice per frame. Inverted storage so a zeroed struct (tests
+   * build Snes on the stack) gets the upstream default: 0 = enabled. */
+  bool hdmaBeamOff;
   // joypad
   bool autoJoyRead;
   uint16_t autoJoyTimer;
@@ -121,6 +129,7 @@ void snes_catchupApu(Snes *snes);
 void snes_advance_master_cycles(Snes *snes, uint32_t clocks);
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock);
 /* Next comparator edge for hosts that deliver each raster IRQ separately. */
+void snes_set_hdma_beam_enabled(Snes *snes, bool enabled);
 bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out);
 
 /* Master clocks from the current beam position to the next programmed H/V IRQ

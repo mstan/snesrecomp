@@ -63,9 +63,13 @@ static void snes_trace_direct_wram_write(uint32_t off, uint8_t old, uint8_t val)
 }
 #endif
 
+}
+
+void snes_set_hdma_beam_enabled(Snes *snes, bool enabled) {
+  snes->hdmaBeamOff = !enabled;
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = calloc(1, sizeof(Snes));  /* zero padding: saveload/co-sim hash determinism */
-  snes->ram = ram;
+    snes->ram = ram;
 
   snes->cpu = cpu_init();
   snes->apu = apu_init();
@@ -407,12 +411,19 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
     if (check_irq && v < 225u && h == 1024u)
       dma_doHdma(snes->dma);
     consumed += span;
+    /* Beam-timeline HDMA (upstream #16), gated: a frame-model host whose
+     * render loop walks the real HDMA tables per line clears
+     * hdmaBeamEnabled, or every table is consumed twice per frame. */
+    if (check_irq && !snes->hdmaBeamOff && v < 225u && h == 1024u)
+      dma_doHdma(snes->dma);
     if (h >= 1364u) {
       h = 0;
       v++;
       if (v >= 262u) {
         v = 0;
         if (check_irq)
+          dma_initHdma(snes->dma);
+        if (check_irq && !snes->hdmaBeamOff)
           dma_initHdma(snes->dma);
         /* End of field. Armed the whole way round and nothing latched means
          * the beam swept past the target without firing — a LOST interrupt,
