@@ -47,6 +47,8 @@ typedef RtlEnhancedRenderResult RtlEnhancedRenderFrameFunc(
     RtlEnhancedRendererFrame *frame);
 
 void WatchdogCheck(void);
+void snes_refresh_charge(void);   /* DRAM refresh tax; see common_cpu_infra.c */
+void snes_refresh_exempt(void);   /* mark a master-clock teleport (park, load) */
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
