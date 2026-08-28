@@ -320,11 +320,11 @@ void dma_initHdma(Dma* dma) {
     ch->tableAdr = ch->aAdr;
     ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
     ch->terminated = (ch->repCount == 0);
-    if(ch->indirect) {
+    if(ch->indirect && !ch->terminated) {
       ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
       ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
     }
-    ch->doTransfer = true;
+    ch->doTransfer = !ch->terminated;
     ch->offIndex = 0;
   }
 }
@@ -349,11 +349,11 @@ void dma_doHdma(Dma* dma) {
       ch->tableAdr = ch->aAdr;
       ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
       ch->terminated = (ch->repCount == 0);
-      if(ch->indirect) {
+      if(ch->indirect && !ch->terminated) {
         ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
         ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
       }
-      ch->doTransfer = true;
+      ch->doTransfer = !ch->terminated;
       ch->offIndex = 0;
       continue;             /* this slot was the init; no transfer yet */
     }
@@ -377,12 +377,12 @@ void dma_doHdma(Dma* dma) {
     ch->doTransfer = (ch->repCount & 0x80) != 0;
     if((ch->repCount & 0x7f) == 0) {
       ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
-      if(ch->indirect) {
+      ch->terminated = (ch->repCount == 0);
+      if(ch->indirect && !ch->terminated) {
         ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
         ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
       }
-      ch->terminated = (ch->repCount == 0);
-      ch->doTransfer = true;
+      ch->doTransfer = !ch->terminated;
     }
   }
 }

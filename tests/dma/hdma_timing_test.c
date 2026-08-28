@@ -6,11 +6,19 @@
 #include "snes/dma.h"
 #include "snes/ppu.h"
 #include "snes/snes.h"
+#include "cpu_state.h"
 
 Ppu *g_ppu;
 uint8_t g_snesrecomp_last_hdmaen;
 bool g_fail;
 int g_interp_apu_driving;
+CpuState g_cpu;
+
+void wlog_addr_note_direct(uint32_t wa, uint8_t v, const char *via) {
+    (void)wa;
+    (void)v;
+    (void)via;
+}
 
 static uint8_t ram[0x20000];
 static uint8_t ppu_regs[0x40];
@@ -119,11 +127,11 @@ int main(void) {
     failures += check(ppu_regs[0x26] == 0x00, "HDMA does not fire before HBlank");
     snes_advance_master_cycles(&snes, 1);
     failures += check(ppu_regs[0x26] == 0x44, "HDMA fires at HBlank");
-    failures += check(dma->channel[0].tableAdr == 0x0102, "HDMA advanced table at timing edge");
+    failures += check(dma->channel[0].tableAdr == 0x0103, "HDMA consumed terminator at timing edge");
 
     snes_advance_master_cycles(&snes, 1364u * 262u - 1024u);
     failures += check(snes.vPos == 0 && snes.hPos == 0, "beam reached next frame");
-    failures += check(dma->channel[0].tableAdr == 0x0100, "frame rollover reinitialized table pointer");
+    failures += check(dma->channel[0].tableAdr == 0x0101, "frame rollover reloaded line count");
     failures += check(dma->channel[0].hdmaActive, "frame rollover preserved HDMAEN state");
 
     dma_reset(dma);
@@ -146,7 +154,7 @@ int main(void) {
     dma_initHdma(dma);
     dma_doHdma(dma);
     failures += check(ppu_regs[0x27] == 0x66, "external beam owner can run HDMA HBlank hook");
-    failures += check(dma->channel[0].tableAdr == 0x0202, "external beam owner advanced HDMA table");
+    failures += check(dma->channel[0].tableAdr == 0x0203, "external beam owner consumed terminator");
     failures += check(dma->channel[0].hdmaActive, "external beam owner preserves HDMAEN state");
 
     dma_free(dma);

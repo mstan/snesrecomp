@@ -79,9 +79,10 @@ static int test_direct_hdma(void) {
 
     dma_doHdma(dma);
     failures += check(bbus[0x26] == 0x22, "direct line 2 wrote second table byte");
-    failures += check(dma->channel[0].tableAdr == 0x8003, "direct line 2 advanced table");
-    failures += check(dma->channel[0].repCount == 0x80, "direct line 2 decremented repeat count");
-    failures += check(dma->channel[0].doTransfer, "direct line 2 reports repeat transfer");
+    failures += check(dma->channel[0].tableAdr == 0x8004, "direct line 2 consumed terminator");
+    failures += check(dma->channel[0].repCount == 0x00, "direct line 2 loaded zero line count");
+    failures += check(dma->channel[0].terminated, "direct line 2 terminates channel");
+    failures += check(!dma->channel[0].doTransfer, "direct terminator reports no transfer");
 
     dma_doHdma(dma);
     failures += check(dma->channel[0].terminated, "zero line count terminates channel");
@@ -119,9 +120,10 @@ static int test_indirect_hdma(void) {
 
     failures += check(bbus[0x0d] == 0xaa, "indirect mode wrote first byte");
     failures += check(bbus[0x0e] == 0xbb, "indirect mode wrote offset byte");
-    failures += check(dma->channel[1].doTransfer, "indirect line reports transfer");
+    failures += check(dma->channel[1].terminated, "indirect line consumed terminator");
+    failures += check(!dma->channel[1].doTransfer, "indirect terminator reports no transfer");
     failures += check(dma->channel[1].size == 0x1236, "indirect pointer advanced by transfer length");
-    failures += check(dma->channel[1].tableAdr == 0x8103, "indirect table advanced past pointer");
+    failures += check(dma->channel[1].tableAdr == 0x8104, "indirect table consumed terminator");
 
     dma_free(dma);
     return failures;
@@ -151,14 +153,15 @@ static int test_repeat_skip_hdma(void) {
 
     dma_doHdma(dma);
     failures += check(bbus[0x2c] == 0x77, "non-repeat descriptor transfers first line");
-    failures += check(dma->channel[2].doTransfer, "non-repeat first line reports transfer");
+    failures += check(!dma->channel[2].doTransfer, "non-repeat first line arms skip");
     failures += check(dma->channel[2].repCount == 0x01, "non-repeat first line decremented count");
 
     dma_doHdma(dma);
     failures += check(bbus[0x2c] == 0x77, "non-repeat descriptor skips second line");
-    failures += check(!dma->channel[2].doTransfer, "non-repeat skipped line reports no transfer");
-    failures += check(dma->channel[2].tableAdr == 0x8202, "skipped line does not consume data byte");
-    failures += check(dma->channel[2].repCount == 0x00, "non-repeat second line reaches descriptor boundary");
+    failures += check(dma->channel[2].terminated, "non-repeat skipped line consumed terminator");
+    failures += check(!dma->channel[2].doTransfer, "non-repeat terminator reports no transfer");
+    failures += check(dma->channel[2].tableAdr == 0x8203, "skipped line consumed terminator only");
+    failures += check(dma->channel[2].repCount == 0x00, "non-repeat second line loaded zero line count");
 
     dma_doHdma(dma);
     failures += check(dma->channel[2].terminated, "non-repeat terminator reached after skipped line");
@@ -191,8 +194,10 @@ static int test_mid_frame_enable_disable(void) {
     dma_initHdma(dma);
     dma_startDma(dma, 0x08, true);
     dma_doHdma(dma);
-    failures += check(bbus_writes == 0, "mid-frame enable waits for next frame init");
-    failures += check(dma->channel[3].terminated, "mid-frame enabled channel remains terminated");
+    failures += check(bbus_writes == 0, "mid-frame enable spends first slot on init");
+    failures += check(!dma->channel[3].terminated, "mid-frame enabled channel initializes live");
+    failures += check(dma->channel[3].doTransfer, "mid-frame enabled channel arms transfer");
+    failures += check(dma->channel[3].tableAdr == 0x8301, "mid-frame init loaded table header");
 
     dma_initHdma(dma);
     dma_doHdma(dma);
