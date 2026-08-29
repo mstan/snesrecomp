@@ -27,7 +27,15 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp "$EXE" "$STAGE/"
 cp README.md LICENSE "$STAGE/" 2>/dev/null || true
-[ -d assets ] && cp -R assets "$STAGE/"
+# Launcher runtime assets (fonts, chrome, boxart) are staged into the BUILD
+# dir by recomp_ui.cmake POST_BUILD — that copy is the one beside the exe at
+# runtime, so it is the one that ships. Repo-root assets/ is the fallback for
+# builds without the launcher.
+if [ -d "$BUILD_DIR/assets" ]; then
+  cp -R "$BUILD_DIR/assets" "$STAGE/"
+elif [ -d assets ]; then
+  cp -R assets "$STAGE/"
+fi
 
 # Guard the licensing rule mechanically rather than by memory: no ROM-derived
 # bytes leave this tree in a release zip.

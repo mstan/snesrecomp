@@ -104,21 +104,28 @@ static int rb_env_int(const char *name, int def, int lo, int hi)
     return (int)n;
 }
 
+/* Game-declared default (snes_netplay_rb_set_default). The framework's own
+ * default stays delay-sync per recomp-ai-rules/NETPLAY.md §4; a TITLE that
+ * has soaked rollback opts its builds in here, visibly, in code that ships
+ * identically to every peer — which is what keeps the mode session-wide.
+ * SNES_NET_MODE remains the operator override in BOTH directions. */
+static int s_rb_default;
+
+void snes_netplay_rb_set_default(int on)
+{
+    s_rb_default = on ? 1 : 0;
+}
+
 int snes_netplay_rb_enabled(void)
 {
-    /* Function-local so it is genuinely tri-state: g_rb is zero-initialised
-     * static storage, where 0 is indistinguishable from "resolved to off". */
-    static int s_cached = -1;
-    if (s_cached < 0) {
-        const char *mode = getenv("SNES_NET_MODE");
-        /* Delay-sync stays the default until a soak says otherwise; rollback
-         * is opt-in per recomp-ai-rules/NETPLAY.md §4 ("abort rather than
-         * silently degrade" cuts both ways — do not silently upgrade either). */
-        s_cached =
-            (mode && (strcmp(mode, "rollback") == 0 || strcmp(mode, "rb") == 0))
-                ? 1 : 0;
+    const char *mode = getenv("SNES_NET_MODE");
+    if (mode && mode[0]) {
+        /* Explicit operator choice wins both ways: "rollback"/"rb" forces
+         * rollback, any other value (e.g. "delay") forces delay-sync. */
+        return (strcmp(mode, "rollback") == 0 || strcmp(mode, "rb") == 0)
+            ? 1 : 0;
     }
-    return s_cached;
+    return s_rb_default;
 }
 
 /* ── row helpers ─────────────────────────────────────────────────────── */
