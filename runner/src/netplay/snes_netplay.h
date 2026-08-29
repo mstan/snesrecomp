@@ -49,6 +49,11 @@ typedef struct SnesNetplayConfig {
     int         slot_count;
     int         input_player;  /* 0/1 host device index; -1 = auto */
     int         input_delay;   /* frames; default 2 */
+    /* Session mode: 1 = rollback (the framework default — recomp-ui's lobby
+     * settles it room-wide and defaults ON), 0 = delay-sync. Builds without
+     * the rollback host ignore it and run delay-sync. SNES_NET_MODE
+     * overrides both ways ("rollback"/"rb" or "delay"). */
+    int         rollback;
     uint32_t    session_id;
     char        bind_hostport[64];
     char        peer_hostport[64];

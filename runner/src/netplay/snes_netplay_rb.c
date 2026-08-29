@@ -104,11 +104,13 @@ static int rb_env_int(const char *name, int def, int lo, int hi)
     return (int)n;
 }
 
-/* Game-declared default (snes_netplay_rb_set_default). The framework's own
- * default stays delay-sync per recomp-ai-rules/NETPLAY.md §4; a TITLE that
- * has soaked rollback opts its builds in here, visibly, in code that ships
- * identically to every peer — which is what keeps the mode session-wide.
- * SNES_NET_MODE remains the operator override in BOTH directions. */
+/* The settled session mode, handed in by snes_netplay_start() from the
+ * config. ROLLBACK is the framework default (rolled out at scale
+ * 2026-08-29): snes_netplay_config_defaults() seeds rollback=1, recomp-ui's
+ * lobby settles the mode room-wide (its model also defaults on), and
+ * SNES_NET_MODE is the operator override in BOTH directions — all of which
+ * is folded into cfg->rollback before start() calls here. NETPLAY.md §4 is
+ * satisfied by the settlement being room-wide, not per-process. */
 static int s_rb_default;
 
 void snes_netplay_rb_set_default(int on)
@@ -118,13 +120,6 @@ void snes_netplay_rb_set_default(int on)
 
 int snes_netplay_rb_enabled(void)
 {
-    const char *mode = getenv("SNES_NET_MODE");
-    if (mode && mode[0]) {
-        /* Explicit operator choice wins both ways: "rollback"/"rb" forces
-         * rollback, any other value (e.g. "delay") forces delay-sync. */
-        return (strcmp(mode, "rollback") == 0 || strcmp(mode, "rb") == 0)
-            ? 1 : 0;
-    }
     return s_rb_default;
 }
 
