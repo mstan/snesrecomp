@@ -87,6 +87,46 @@ static void setup_one_sprite_line(Ppu *ppu, int raw_x) {
         ppu->cgram[i] = 0x7fff;
 }
 
+static void setup_mode2_offset_bg1(Ppu *ppu) {
+    ppu->inidisp = 0x0f;
+    ppu->bgmode = 2;
+    ppu->screenEnabled[1] = 1;
+    ppu->bgXsc[2] = 0x04;
+    ppu->bgTileAdr = 0x0001;
+    ppu->cgwsel = 0x02;
+    ppu->cgadsub = 0x60;
+    for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
+        ppu->vram[i] = 0;
+    ppu->cgram[0] = 0;
+    ppu->cgram[1] = 0x001f;
+    ppu->cgram[2] = 0x03e0;
+
+    for (int y = 0; y < 32; y++) {
+        for (int x = 0; x < 32; x++) {
+            ppu->vram[y * 32 + x] = x == 0 ? 0 : 1;
+            ppu->vram[0x400 + y * 32 + x] = 0x2010;
+        }
+    }
+    for (int row = 0; row < 8; row++) {
+        ppu->vram[0x1000 + row] = 0x00ff;
+        ppu->vram[0x1000 + 16 + row] = 0xff00;
+    }
+}
+
+static void render_one_line(Ppu *ppu) {
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
+}
+
+static unsigned count_argb_pixels(const uint32_t *pixels, size_t count) {
+    unsigned nonzero = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (pixels[i] != 0)
+            nonzero++;
+    }
+    return nonzero;
+}
+
 int main(void) {
     enum { kPitch = kPpuXPixels * 4 };
     uint8_t pixels[kPitch];
@@ -124,10 +164,101 @@ int main(void) {
     PpuBeginDrawing(ppu, pixels, kPitch,
                     kPpuRenderFlags_NewRenderer |
                     kPpuRenderFlags_NoSpriteLimits);
-    ppu_runLine(ppu, 0);
-    ppu_runLine(ppu, 1);
+    render_one_line(ppu);
     failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) != 0,
                       "disabling sprite limits renders the low slot");
+
+    /* Mode 2 OPT must still treat x=0 as the hardware left edge when
+     * widescreen margins are active. Otherwise backdrop + halved subscreen
+     * math samples offset BG columns and replaces authentic columns. */
+    {
+        enum { kExtra = 8, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t native_pixels[kPpuXPixels] = {0};
+        uint32_t wide_pixels[kWidePixels] = {0};
+        int mismatches = 0;
+
+        ppu_reset(ppu);
+        PpuBeginDrawing(ppu, (uint8_t *)native_pixels,
+                        sizeof(uint32_t) * kPpuXPixels,
+                        kPpuRenderFlags_NewRenderer);
+        setup_mode2_offset_bg1(ppu);
+        render_one_line(ppu);
+
+        ppu_reset(ppu);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        setup_mode2_offset_bg1(ppu);
+        render_one_line(ppu);
+
+        for (int x = 0; x < kPpuXPixels; x++) {
+            if (native_pixels[x] !=
+                wide_pixels[kExtra + x])
+                mismatches++;
+        }
+        failures += check(mismatches == 0,
+                          "Mode 2 half-color subscreen keeps authentic columns with extra space");
+        failures += check(wide_pixels[kExtra] != 0,
+                          "Mode 2 half-color subscreen draws widened first authentic column");
+    }
+
+    /* An armed OBJ overlay captures all OAM slots by default. Hosts may still
+     * narrow the slot range explicitly, but the default should not silently
+     * export an empty surface. */
+    {
+        uint32_t frame_pixels[kPpuBufWidth] = {0};
+        uint32_t obj_pixels[kPpuXPixels] = {0};
+
+        ppu_reset(ppu);
+        PpuBeginDrawing(ppu, (uint8_t *)frame_pixels,
+                        sizeof(uint32_t) * kPpuBufWidth,
+                        kPpuRenderFlags_NewRenderer);
+        failures += check(PpuBindOverlaySurface(
+                              ppu, kPpuOverlaySource_Obj,
+                              (uint8_t *)obj_pixels,
+                              sizeof(uint32_t) * kPpuXPixels),
+                          "OBJ overlay surface binds");
+        failures += check(PpuSetOverlayCapture(
+                              ppu, kPpuOverlaySource_Obj, 0, 0, 8, 1,
+                              kPpuOverlayFlag_RemoveFromGame),
+                          "OBJ overlay capture arms");
+        setup_one_sprite_line(ppu, 0);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(count_argb_pixels(obj_pixels, 8) == 8,
+                          "default OBJ capture exports selected pixels");
+        failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) == 0,
+                          "RemoveFromGame drops captured OBJ from frame");
+
+        memset(frame_pixels, 0, sizeof frame_pixels);
+        memset(obj_pixels, 0, sizeof obj_pixels);
+        ppu_reset(ppu);
+        PpuBeginDrawing(ppu, (uint8_t *)frame_pixels,
+                        sizeof(uint32_t) * kPpuBufWidth,
+                        kPpuRenderFlags_NewRenderer);
+        failures += check(PpuBindOverlaySurface(
+                              ppu, kPpuOverlaySource_Obj,
+                              (uint8_t *)obj_pixels,
+                              sizeof(uint32_t) * kPpuXPixels),
+                          "OBJ overlay surface rebinds");
+        failures += check(PpuSetOverlayCapture(
+                              ppu, kPpuOverlaySource_Obj, 0, 0, 8, 1,
+                              kPpuOverlayFlag_RemoveFromGame),
+                          "OBJ overlay capture rearms");
+        failures += check(PpuSetOverlayOamRange(ppu, 1, 1),
+                          "OBJ overlay range narrows capture");
+        setup_one_sprite_line(ppu, 0);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(count_argb_pixels(obj_pixels, 8) == 0,
+                          "narrowed OBJ capture excludes other slots");
+        failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) != 0,
+                          "excluded OBJ remains in frame");
+        failures += check(PpuBindOverlaySurface(
+                              ppu, kPpuOverlaySource_Obj, NULL, 0),
+                          "OBJ overlay surface unbinds");
+    }
 
     /* Existing line-enhancer users rely on BG1 staying inside its authentic
      * destination viewport. New title-specific source insets must be opt-in

@@ -87,8 +87,8 @@ typedef struct PpuOverlayCapture {
   int16_t x0, x1;
   int16_t y0, y1;
   uint8_t flags;
-  /* OBJ-only selector. A zero count captures no objects. Games validate any
-   * semantic identity (HUD icon, portrait, etc.) before supplying the range. */
+  /* OBJ-only selector. Arming an OBJ capture selects all OAM slots by default;
+   * games can narrow this when they know the semantic slot range to export. */
   uint8_t oamFirst, oamCount;
 } PpuOverlayCapture;
 

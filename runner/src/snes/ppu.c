@@ -129,8 +129,13 @@ bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
   capture->y0 = (int16_t)y0;
   capture->y1 = (int16_t)y1;
   capture->flags = flags & kPpuOverlayFlag_RemoveFromGame;
-  capture->oamFirst = 0;
-  capture->oamCount = 0;
+  if (source == kPpuOverlaySource_Obj) {
+    capture->oamFirst = 0;
+    capture->oamCount = 128;
+  } else {
+    capture->oamFirst = 0;
+    capture->oamCount = 0;
+  }
   return true;
 }
 
@@ -1071,22 +1076,19 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
     const int sample_bias = ws_bias[windex];
     PpuZbufType *dstz =
         ppu->bgBuffers[sub].data + left + kPpuExtraLeftRight;
-    bool left_edge = left < 8 - (hscroll & 7);
-
     /* OPT values apply to a rendered segment, not independently to every
      * screen pixel.  The selected horizontal offset determines where the
      * next eight-pixel source-tile boundary lies; only there does the PPU
      * fetch another BG3 offset-map entry. */
     for (int screen_x = left; screen_x < right;) {
+      const int source_screen_x = screen_x + sample_bias;
       unsigned hoffset = hscroll;
       unsigned voffset = vscroll;
-      if (left_edge) {
+      if (source_screen_x < 8 - (int)(hscroll & 7)) {
         /* The SNES cannot apply OPT to the leftmost source-tile column. */
-        left_edge = false;
       } else {
         const unsigned opt_pos =
-            (opt_hscroll + (unsigned)(screen_x + sample_bias) - 1) &
-            opt_coord_mask;
+            (opt_hscroll + (unsigned)source_screen_x - 1) & opt_coord_mask;
         const int opt_x = opt_pos >> opt_shift;
         const uint16 hcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_hrow);
         const uint16 vcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_vrow);
@@ -1097,7 +1099,7 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
       }
 
       const unsigned sx =
-          (hoffset + (unsigned)(screen_x + sample_bias)) & coord_mask;
+          (hoffset + (unsigned)source_screen_x) & coord_mask;
       const unsigned sy = (voffset + y) & coord_mask;
       unsigned width = 8 - (sx & 7);
       if (width > (unsigned)(right - screen_x))
@@ -1924,7 +1926,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   uint32 cw_clip_math = ((cwin.bits & kCwBitsMod[PPU_clipMode(ppu)]) ^ kCwBitsMod[PPU_clipMode(ppu) + 4]) |
     ((cwin.bits & kCwBitsMod[PPU_preventMathMode(ppu)]) ^ kCwBitsMod[PPU_preventMathMode(ppu) + 4]) << 8;
 
-  uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch], *dst_org = dst;
+  uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch];
 
   dst += compose_full_budget ? 0 : (ppu->extraLeftRight - ppu->extraLeftCur);
 
