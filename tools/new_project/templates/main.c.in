@@ -11,7 +11,10 @@
  * is to make that easy rather than to exit with a usage line:
  *
  *   1. The recomp-ui GUI launcher (built when the project has the recomp-ui
- *      submodule) picks and verifies one, alongside display/audio/input.
+ *      submodule) picks and verifies one, alongside display/audio/input. It
+ *      opens by default; a ROM on the command line preloads it rather than
+ *      skipping it. `--no-launcher` (or SDL_VIDEODRIVER=dummy) suppresses it
+ *      for scripted runs, `--launcher` forces it.
  *   2. Otherwise snesrecomp_launcher_resolve_rom_sha256() takes the
  *      positional argument, then a copy beside the executable, then the
  *      <exe_dir>/rom.cfg cache, then a native file picker.
@@ -255,6 +258,27 @@ int main(int argc, char **argv)
     uint8_t sha[32];
     const uint8_t *want_sha = expected_rom_sha256(sha);
     int has_positional = (argc > 1 && argv[1] && argv[1][0] && argv[1][0] != '-');
+    /* --launcher / --no-launcher, spelled as the reference host spells them
+     * (snesrecomp/runner/src/desktop/mmx23_host_main.inc).
+     *
+     * A positional ROM used to suppress the launcher outright, which was
+     * wrong in the one case that matters most: Studio ALWAYS knows the ROM
+     * and always passes it, so the launcher never appeared from the Build or
+     * Diagnostics tabs. A ROM on the command line says which ROM to use, not
+     * whether a human is present -- so it now preloads the launcher instead.
+     *
+     * Suppression stays explicit, because scripted harnesses launch as
+     * `<exe> <rom>` and expect to boot straight into the game; making the GUI
+     * unconditional would hang every one of them on a window nobody is
+     * watching. */
+    int force_launcher = 0, no_launcher = 0;
+    {
+        int i;
+        for (i = 1; i < argc; ++i) {
+            if (argv[i] && strcmp(argv[i], "--launcher") == 0) force_launcher = 1;
+            else if (argv[i] && strcmp(argv[i], "--no-launcher") == 0) no_launcher = 1;
+        }
+    }
     int rom_size = 0;
     uint8 *rom;
     SDL_Window *window;
@@ -272,13 +296,19 @@ int main(int argc, char **argv)
         const char *vd = getenv("SDL_VIDEODRIVER");
         int headless = (vd && strcmp(vd, "dummy") == 0);
 
-        if (!headless && !has_positional) {
+        if (!headless && !no_launcher && (force_launcher || !has_positional)) {
             /* Open on the ROM the player already has, so a second launch is
              * PLAY rather than Change-ROM: the copy beside the executable
              * first, else whatever the last run cached in rom.cfg. */
             char hint[1024];
 
-            snprintf(hint, sizeof(hint), "%s", beside_exe);
+            /* An explicit ROM outranks a copy beside the exe and the cache:
+             * --launcher with a ROM means "show me the launcher, loaded with
+             * THIS one". */
+            if (has_positional)
+                snprintf(hint, sizeof(hint), "%s", argv[1]);
+            else
+                snprintf(hint, sizeof(hint), "%s", beside_exe);
             if (!hint[0] && !snesrecomp_rom_cache_read(hint, sizeof(hint)))
                 hint[0] = '\0';
             {
@@ -310,7 +340,9 @@ int main(int argc, char **argv)
                                                     rom_path, sizeof(rom_path),
                                                     want_sha)) {
             fprintf(stderr,
-                    "usage: %s [path-to-rom.sfc]\n"
+                    "usage: %s [path-to-rom.sfc] [--launcher|--no-launcher]\n"
+                    "  --launcher     show the pre-boot launcher even with a ROM\n"
+                    "  --no-launcher  never show it (scripted runs)\n"
                     "You must legally own a copy of @DISPLAY_NAME@.\n", argv[0]);
             return 1;
         }
