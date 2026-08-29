@@ -31,6 +31,9 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
            net->bind_hostport);
   snprintf(out->net_cfg.peer_hostport, sizeof(out->net_cfg.peer_hostport), "%s",
            net->peer_hostport);
+  /* Room-settled mode from recomp-ui (its model defaults rollback ON).
+   * Before apply_env so SNES_NET_MODE stays the operator override. */
+  out->net_cfg.rollback = net->rollback ? 1 : 0;
   snes_netplay_apply_env(&out->net_cfg);
   if (net->input_delay >= 0 && net->input_delay <= 20)
     out->net_cfg.input_delay = net->input_delay;
@@ -42,6 +45,10 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
       out->caps_ws_extra = caps->ws_extra;
       if (caps->force_turn)
         out->net_cfg.force_turn = 1;
+      /* Host-published settlement outranks the local UI mirror; the env
+       * override was already applied above and is not revisited. */
+      if (!getenv("SNES_NET_MODE"))
+        out->net_cfg.rollback = caps->rollback ? 1 : 0;
     }
   }
 }

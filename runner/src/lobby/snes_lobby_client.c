@@ -510,6 +510,7 @@ static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
     if (out->ws_extra < 0) out->ws_extra = 0;
     out->force_turn = json_get_bool(obj, "force_turn", 0) ? 1 : 0;
     out->force_input_relay = json_get_bool(obj, "force_input_relay", 0) ? 1 : 0;
+    out->rollback = json_get_bool(obj, "rollback", 1) ? 1 : 0;
     out->valid = 1;
 }
 
@@ -526,13 +527,15 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
     return snprintf(dst, dst_cap,
                     ",\"match_caps\":{\"v\":1,\"widescreen\":%s,\"widescreen_hud\":%s,"
                     "\"ignore_aspect\":%s,\"input_delay\":%d,\"ws_extra\":%d,"
-                    "\"force_turn\":%s,\"force_input_relay\":%s}",
+                    "\"force_turn\":%s,\"force_input_relay\":%s,"
+                    "\"rollback\":%s}",
                     caps->widescreen ? "true" : "false",
                     caps->widescreen_hud ? "true" : "false",
                     caps->ignore_aspect ? "true" : "false",
                     caps->input_delay, caps->ws_extra,
                     caps->force_turn ? "true" : "false",
-                    caps->force_input_relay ? "true" : "false");
+                    caps->force_input_relay ? "true" : "false",
+                    caps->rollback ? "true" : "false");
 }
 
 static void queue_send(const char *json)

@@ -49,6 +49,11 @@ void snes_netplay_config_defaults(SnesNetplayConfig *cfg)
     cfg->slot_count = 2;
     cfg->input_player = -1; /* auto → resolve at start */
     cfg->input_delay = 2;
+    /* Framework default: ROLLBACK. recomp-ui's lobby settles the mode
+     * room-wide and also defaults it on; builds without the rollback host
+     * ignore the field. Rolled out at scale 2026-08-29 (Alex) after LAN
+     * delay-7 sessions validated the transport. */
+    cfg->rollback = 1;
     cfg->session_id = 1;
     cfg->transport = 0;
     strncpy(cfg->bind_hostport, "0.0.0.0:7777", sizeof(cfg->bind_hostport) - 1);
@@ -86,6 +91,13 @@ void snes_netplay_apply_env(SnesNetplayConfig *cfg)
     if (v && v[0]) {
         strncpy(cfg->peer_hostport, v, sizeof(cfg->peer_hostport) - 1);
         cfg->peer_hostport[sizeof(cfg->peer_hostport) - 1] = '\0';
+    }
+    v = getenv("SNES_NET_MODE");
+    if (v && v[0]) {
+        /* Operator override, both directions: "rollback"/"rb" force
+         * rollback, anything else ("delay", ...) forces delay-sync. */
+        cfg->rollback =
+            (strcmp(v, "rollback") == 0 || strcmp(v, "rb") == 0) ? 1 : 0;
     }
     v = getenv("SNES_NET_TRANSPORT");
     if (v && v[0]) {
@@ -607,6 +619,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     if (!cfg || !cfg->enabled) return -1;
     if (g_np.session) snes_netplay_shutdown();
     snes_netplay_connect_wait_reset();
+    /* Settled session mode (config default rollback; lobby launch and
+     * SNES_NET_MODE already folded in by the callers/apply_env). */
+    snes_netplay_rb_set_default(cfg->rollback);
 
     rnet_config_init_defaults(&rcfg);
     {

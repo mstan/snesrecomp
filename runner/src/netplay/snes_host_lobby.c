@@ -114,6 +114,7 @@ static SnesLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
   SnesLobbyMatchCaps caps;
   memset(&caps, 0, sizeof(caps));
   caps.valid = 1;
+  caps.rollback = 1;   /* framework default; fill_match_caps may override */
   caps.input_delay = clamp_input_delay(g_lobby_input_delay);
   if (settings) {
     caps.widescreen = settings->widescreen != 0;
