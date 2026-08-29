@@ -48,6 +48,61 @@
 #include "launcher_profile.h"
 #endif
 
+#if defined(SNES_HAS_LOBBY_CLIENT)
+/* Delay-sync netplay + MotK lobby. Defined by snesrecomp_enable_recomp_net()
+ * in CMakeLists.txt (scaffolded with --netplay); without it every netplay
+ * block compiles out and the launcher's netplay button stays hidden. The
+ * fully-featured reference (rematch, soft-return, dual viewport) is
+ * MetalWarriorsSNESRecomp's src/main.c. */
+#include "snes_netplay.h"
+#include "snes_host_lobby.h"
+#include "snes_host_app.h"
+
+static SnesNetplayConfig g_netplay_cfg;
+static int g_netplay_pending;    /* launcher armed a session; start after SnesInit */
+static int g_netplay_from_lobby; /* admit pump waits for the lobby peer */
+
+static void host_lobby_ensure_init(void)
+{
+    static int once;
+    SnesHostLobbyIdentity id;
+    SnesHostLobbyOpts opts;
+    if (once)
+        return;
+    once = 1;
+    memset(&id, 0, sizeof(id));
+    id.game_name = "@DISPLAY_NAME@";
+    id.game_version = SNES_GAME_VERSION;
+    id.lan_registry_path = "netplay_lan_lobby.txt";
+    id.default_lobby_name = "Netplay Lobby";
+    memset(&opts, 0, sizeof(opts));
+    opts.rematch_set_ready = 1;
+    if (snes_host_lobby_init(&id, &opts) != 0)
+        fprintf(stderr, "netplay: snes_host_lobby_init failed\n");
+}
+
+static uint16_t read_keyboard(void);
+
+static uint16_t netplay_capture_pad(void *ctx)
+{
+    (void)ctx;
+    return (uint16_t)(read_keyboard() & 0x0fffu);
+}
+
+static void netplay_poll_events(void *ctx, int *want_soft_exit)
+{
+    SDL_Event event;
+    (void)ctx;
+    while (SDL_PollEvent(&event)) {
+        if (event.type == SDL_QUIT)
+            *want_soft_exit = 2;
+        if (event.type == SDL_KEYDOWN &&
+            SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
+            *want_soft_exit = 1;
+    }
+}
+#endif /* SNES_HAS_LOBBY_CLIENT */
+
 #define GAME_WIDTH  256
 #define GAME_HEIGHT 224
 
@@ -233,12 +288,30 @@ static int run_gui_launcher(const char *initial_rom, char *out, size_t cap)
         gi.expected_crc     = crc;
         gi.has_expected_crc = 1;
     }
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    /* The netplay button is capability-gated: these two fields are what make
+     * the launcher show it. */
+    gi.netplay_supported = 1;
+    host_lobby_ensure_init();
+    gi.netplay = snes_host_lobby_callbacks();
+#endif
 
     out[0] = '\0';
     lr = recomp_launcher_run_window("@WINDOW_TITLE@", &ls, &gi, assets_dir,
                                     (initial_rom && initial_rom[0]) ? initial_rom
                                                                     : NULL,
                                     out, cap);
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    /* A lobby launch arms the session; snes_netplay_start() runs after
+     * SnesInit, once the guest exists. */
+    if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && ls.netplay_launch.enabled) {
+        SnesHostLaunchResult res;
+        snes_host_app_apply_launch(&ls.netplay_launch, &res);
+        g_netplay_cfg = res.net_cfg;
+        g_netplay_pending = 1;
+        g_netplay_from_lobby = 1;
+    }
+#endif
     if (lr == RECOMP_LAUNCHER_RESULT_QUIT)
         return -1;
     if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && out[0])
@@ -357,6 +430,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "@PROJECT_NAME@: SnesInit failed\n");
         return 1;
     }
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    if (g_netplay_pending) {
+        int nrc = snes_netplay_start(&g_netplay_cfg);
+        if (nrc != 0)
+            fprintf(stderr,
+                    "netplay: snes_netplay_start failed (%d) — continuing "
+                    "offline\n", nrc);
+        g_netplay_pending = 0;
+    }
+#endif
 
     /* snesrecomp_sdl_* wrap the SDL2/SDL3 API differences, so this host
      * builds against either backend (-DSNESRECOMP_SDL_BACKEND=SDL2|SDL3). */
@@ -394,6 +477,50 @@ int main(int argc, char **argv)
                 SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
                 running = 0;
         }
+
+#if defined(SNES_HAS_LOBBY_CLIENT)
+        /* Netplay session: the delay-sync admit pump owns the frame cadence.
+         * Both seats' inputs come back merged from the netcode; on a stall
+         * the held framebuffer is re-presented so the window stays live. */
+        if (snes_netplay_active()) {
+            SnesHostBarrierHooks hooks;
+            int run = running;
+            int admitted;
+            memset(&hooks, 0, sizeof(hooks));
+            hooks.capture_local_pad = &netplay_capture_pad;
+            hooks.poll_events = &netplay_poll_events;
+            admitted = snes_host_barrier_admit(g_netplay_from_lobby, &run,
+                                               &hooks);
+            running = run;
+            if (!running)
+                break;
+            if (admitted) {
+                int burst = 0;
+                for (;;) {
+                    inputs = snes_netplay_published_inputs() |
+                             snes_netplay_active_mask();
+                    RtlRunFrame(inputs);
+                    snes_netplay_finish_frame();
+                    if (burst >= snes_host_catchup_budget())
+                        break;
+                    snes_netplay_stage_local(netplay_capture_pad(NULL));
+                    if (!snes_netplay_poll_admit())
+                        break;
+                    burst++;
+                }
+                if (snesrecomp_sdl_lock_texture(texture, NULL, &pixels,
+                                                &pitch)) {
+                    RtlDrawPpuFrame((uint8 *)pixels, (size_t)pitch, 0);
+                    SDL_UnlockTexture(texture);
+                }
+            }
+            /* Stalled: present the texture as-is — the held frame. */
+            SDL_RenderClear(renderer);
+            snesrecomp_sdl_render_texture(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
+            continue;
+        }
+#endif /* SNES_HAS_LOBBY_CLIENT */
 
         /* Seat 0 in the low 12 bits, seat 1 in the next 12. Seats 2..7 (with
          * a multitap) go through RtlSetPadState — see
