@@ -24,6 +24,7 @@
 #include <stdint.h>
 struct SnesNetplayRbBindings;
 static inline int  snes_netplay_rb_enabled(void) { return 0; }
+static inline void snes_netplay_rb_set_default(int on) { (void)on; }
 static inline void snes_netplay_rb_bind(const struct SnesNetplayRbBindings *b) { (void)b; }
 static inline int  snes_netplay_rb_start(void) { return 0; }
 static inline void snes_netplay_rb_shutdown(void) {}

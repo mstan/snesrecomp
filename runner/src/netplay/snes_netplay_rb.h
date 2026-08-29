@@ -59,6 +59,8 @@ typedef struct SnesNetplayRbBindings {
 
 /* 1 when the build/env selected rollback for this session. */
 int  snes_netplay_rb_enabled(void);
+/* Title default when SNES_NET_MODE is unset (env overrides both ways). */
+void snes_netplay_rb_set_default(int on);
 
 void snes_netplay_rb_bind(const SnesNetplayRbBindings *b);
 int  snes_netplay_rb_start(void);
