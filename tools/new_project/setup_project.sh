@@ -27,6 +27,9 @@
 #   --netplay / --no-netplay        recomp-net delay-sync (default: off)
 #   --rollback / --no-rollback      retcomm-rbengine rollback (implies netplay)
 #   --ci / --no-ci                  .github/workflows/release.yml (default: on)
+#   --fetch-boxart / --no-fetch-boxart
+#                                   libretro Named_Boxarts art for the launcher
+#                                   (default: on; needs the network)
 #   --recomp-ui / --no-recomp-ui    Dear ImGui pre-boot launcher: ROM picker,
 #                                   verification, display/audio/input settings
 #                                   (default: on). Without it the host still
@@ -110,6 +113,7 @@ SET_NETPLAY=0; SET_ROLLBACK=0; SET_CI=0; SET_RECOMP_UI=0
 SET_GENERATE=0; SET_BUILD=0; SET_GITHUB=0
 GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
 ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
+FETCH_BOXART=1
 ADD_SUBMODULES=1
 DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
 # Default the framework ref to the branch this checkout is on, for the same
@@ -150,6 +154,8 @@ while [ $# -gt 0 ]; do
         --recomp-ui) ENABLE_RECOMP_UI=1; SET_RECOMP_UI=1; shift ;;
         --no-recomp-ui) ENABLE_RECOMP_UI=0; SET_RECOMP_UI=1; shift ;;
         --ci) ENABLE_CI=1; SET_CI=1; shift ;;
+        --fetch-boxart) FETCH_BOXART=1; shift ;;
+        --no-fetch-boxart) FETCH_BOXART=0; shift ;;
         --no-submodules) ADD_SUBMODULES=0; shift ;;
         --no-ci) ENABLE_CI=0; SET_CI=1; shift ;;
         --generate) DO_GENERATE=1; SET_GENERATE=1; shift ;;
@@ -400,7 +406,11 @@ if(NOT EXISTS \"\${RECOMP_UI_ROOT}/recomp_ui.cmake\")
         \"Run: git submodule update --init --recursive recomp-ui\")
 endif()
 include(\${RECOMP_UI_ROOT}/recomp_ui.cmake)
-recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes)"
+# BOXART stages launcher_assets/img/boxart.tga beside the exe; the launcher
+# shows assets/img/boxart.tga by default. EXISTS-guarded in recomp_ui.cmake,
+# so this configures cleanly before any art is fetched.
+recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes
+    BOXART \"\${CMAKE_SOURCE_DIR}/launcher_assets/img/boxart.tga\")"
 fi
 
 MULTITAP_BLOCK="# No multitap: two seats, one controller per port."
@@ -562,6 +572,24 @@ echo "== Seeding analysis config =="
     --write-seed-cfg "$ROOT/recomp/bank00.cfg" \
     --write-symbols "$ROOT/recomp/symbols.toml"
 cp "$FRAMEWORK_ROOT/LICENSE" "$ROOT/LICENSE" 2>/dev/null || true
+
+if [ "$FETCH_BOXART" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    echo "== Fetching boxart (libretro Named_Boxarts) =="
+    # Same flow as psxrecomp's wizard: TGA for the launcher + PNG for the
+    # README, sourced and attributed in BOXART_SOURCE.txt. A miss is a warning
+    # — CMake already carries the BOXART argument and stages the file the
+    # moment it exists.
+    ROM_STEM=${ROM_FILE%.*}
+    if "$PYTHON" "$SCRIPT_DIR/fetch_boxart.py" \
+        --out "$ROOT/launcher_assets/img/boxart.tga" \
+        --cue-stem "$ROM_STEM" \
+        --display-name "$NAME"; then
+        :
+    else
+        echo "warning: boxart fetch failed — launcher shows no art until" \
+             "launcher_assets/img/boxart.tga exists." >&2
+    fi
+fi
 
 if [ "$ENABLE_CI" -eq 1 ]; then
     echo "== CI workflow =="
