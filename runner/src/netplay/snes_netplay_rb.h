@@ -45,6 +45,11 @@ typedef struct SnesNetplayRbBindings {
     int          *local_slot;
     int          *slot_count;
     int          *input_delay;
+    /* Invent runway cap (P), live pointer like input_delay. NULL keeps the
+     * engine's own default. recomp-ui computes P = 4 + D and publishes it in
+     * the launch struct; honoring it is what keeps a relayed session from
+     * walking pred_depth into the cap and freezing. */
+    int          *input_prediction;
     int           force_turn;
     /* Publish resolved pads for a tick into the facade, so the game's
      * snes_netplay_published_inputs() sees them for the live frame. */

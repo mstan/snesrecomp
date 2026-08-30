@@ -92,6 +92,8 @@ void snes_netplay_apply_env(SnesNetplayConfig *cfg)
         strncpy(cfg->peer_hostport, v, sizeof(cfg->peer_hostport) - 1);
         cfg->peer_hostport[sizeof(cfg->peer_hostport) - 1] = '\0';
     }
+    v = getenv("SNES_RB_PREDICTION");
+    if (v && v[0]) cfg->input_prediction = (int)strtol(v, NULL, 10);
     v = getenv("SNES_NET_MODE");
     if (v && v[0]) {
         /* Operator override, both directions: "rollback"/"rb" force
@@ -237,6 +239,7 @@ typedef struct {
     char         bind_hostport[64];
     char         peer_hostport[64];
     int          input_delay;
+    int          input_prediction;   /* P; 0 = engine default */
     int          force_input_relay;
     uint32_t     session_id;
     int          is_host;
@@ -305,6 +308,7 @@ static void np_rollback_try_start(void)
     b.local_slot = &g_np.local_slot;
     b.slot_count = &g_np.slot_count;
     b.input_delay = &g_np.input_delay;
+    b.input_prediction = &g_np.input_prediction;
     b.force_turn = 0;
     b.publish = &np_rb_publish;
     b.apply_sync_bytes = &np_rb_apply_sync;
@@ -854,6 +858,13 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.load_applied_local = 0;
     g_np.load_cooldown_until_ms = 0;
     g_np.input_delay = (int)rcfg.input_delay;
+    /* Session-settled invent runway. Clamp to the engine's accepted band so
+     * a malformed lobby value cannot disable prediction outright. */
+    g_np.input_prediction = cfg->input_prediction;
+    if (g_np.input_prediction && g_np.input_prediction < 2)
+        g_np.input_prediction = 2;
+    if (g_np.input_prediction > 32)
+        g_np.input_prediction = 32;
     g_np.force_input_relay = cfg->force_input_relay ? 1 : 0;
     g_np.session_id = rcfg.session_id;
     g_np.is_host = (g_np.local_slot == 0) ? 1 : 0;

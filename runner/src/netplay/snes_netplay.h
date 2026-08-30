@@ -49,6 +49,10 @@ typedef struct SnesNetplayConfig {
     int         slot_count;
     int         input_player;  /* 0/1 host device index; -1 = auto */
     int         input_delay;   /* frames; default 2 */
+    /* Invent runway cap (P) for rollback; 0 = engine default. The lobby
+     * publishes P = 4 + D (RecompLauncherCNetplayLaunch.input_prediction).
+     * Env: SNES_RB_PREDICTION overrides. */
+    int         input_prediction;
     /* Session mode: 1 = rollback (the framework default — recomp-ui's lobby
      * settles it room-wide and defaults ON), 0 = delay-sync. Builds without
      * the rollback host ignore it and run delay-sync. SNES_NET_MODE
