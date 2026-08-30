@@ -315,6 +315,7 @@ unless you have permission.
 """)
     print("[4/4] Wrote project files.")
     print(f"\nReady: {output}")
+    print("Expected build result: generated-code static library only")
     print(f"Build with: {output / ('build.ps1' if os.name == 'nt' else 'build.sh')}")
     print("Expected build result: generated-code static library only.")
     print("A playable executable requires game-specific host integration; "
