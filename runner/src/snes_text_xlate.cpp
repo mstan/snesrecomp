@@ -39,6 +39,7 @@ struct State {
     std::string table_path;
     std::string default_lang = "en";
     std::string language = "off";
+    std::map<std::string, std::string> language_fallbacks;
     std::string error;
     std::vector<Glyph> glyphs;
     std::vector<Patch> rom_patches;
@@ -197,23 +198,66 @@ bool encode_text(const std::string& text, std::vector<uint8_t>& out,
     return true;
 }
 
+std::vector<std::string> language_chain(const std::string& requested) {
+    std::vector<std::string> chain;
+    std::string current = requested.empty() ? state().default_lang : requested;
+    for (int depth = 0; depth < 8; ++depth) {
+        if (current.empty() || current == "off")
+            break;
+        if (std::find(chain.begin(), chain.end(), current) != chain.end())
+            break;
+        chain.push_back(current);
+        const auto fallback = state().language_fallbacks.find(current);
+        if (fallback == state().language_fallbacks.end())
+            break;
+        current = fallback->second;
+    }
+    return chain;
+}
+
+std::string effective_language(const std::string& requested) {
+    const std::vector<std::string> chain = language_chain(requested);
+    if (chain.empty())
+        return requested.empty() ? state().default_lang : requested;
+    return chain.back();
+}
+
+std::string json_escape(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (const char c : value) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
 std::vector<uint8_t> patch_target(const Patch& patch,
                                   const std::string& language) {
     if (language.empty() || language == "off")
         return patch.source;
-    const auto hex = patch.target.find(language);
-    if (hex != patch.target.end())
-        return hex->second;
-    const auto text = patch.text.find(language);
-    if (text == patch.text.end())
-        return patch.source;
-    std::vector<uint8_t> encoded;
-    std::string error;
-    if (!encode_text(text->second, encoded, &error)) {
-        state().error = error;
-        return patch.source;
+    for (const std::string& candidate : language_chain(language)) {
+        const auto hex = patch.target.find(candidate);
+        if (hex != patch.target.end())
+            return hex->second;
+        const auto text = patch.text.find(candidate);
+        if (text == patch.text.end())
+            continue;
+        std::vector<uint8_t> encoded;
+        std::string error;
+        if (!encode_text(text->second, encoded, &error)) {
+            state().error = error;
+            continue;
+        }
+        return encoded;
     }
-    return encoded;
+    return patch.source;
 }
 
 bool patch_matches_any_target(const Patch& patch, const uint8_t* data,
@@ -385,6 +429,14 @@ bool parse_table(const fs::path& path, std::string* error) {
         if (section.empty()) {
             if (key == "default_lang" && parse_string(value, string_value)) {
                 state().default_lang = string_value;
+            } else if (key.rfind("fallback_", 0) == 0 &&
+                       parse_string(value, string_value)) {
+                state().language_fallbacks[key.substr(9)] = string_value;
+            } else if (key.size() > 9 &&
+                       key.substr(key.size() - 9) == "_fallback" &&
+                       parse_string(value, string_value)) {
+                state().language_fallbacks[key.substr(0, key.size() - 9)] =
+                    string_value;
             } else if (key == "schema") {
                 continue;
             }
@@ -493,15 +545,19 @@ extern "C" int snes_text_xlate_debug_json_c(const char* subcmd,
         return std::snprintf(out, static_cast<size_t>(cap),
             "{\"ok\":false,\"error\":\"unsupported xlate command\"}");
     }
+    const std::string language = json_escape(state().language);
+    const std::string effective = json_escape(effective_language(state().language));
+    const std::string table_path = json_escape(state().table_path);
     return std::snprintf(out, static_cast<size_t>(cap),
-        "{\"ok\":true,\"language\":\"%s\",\"table\":\"%s\","
+        "{\"ok\":true,\"language\":\"%s\",\"effective_language\":\"%s\","
+        "\"table\":\"%s\","
         "\"rom_patches\":%zu,\"ram_patches\":%zu,\"vram_patches\":%zu,"
-        "\"glyphs\":%zu,\"rom_applies\":%llu,\"ram_applies\":%llu,"
-        "\"vram_applies\":%llu}",
-        state().language.c_str(), state().table_path.c_str(),
+        "\"glyphs\":%zu,\"language_fallbacks\":%zu,"
+        "\"rom_applies\":%llu,\"ram_applies\":%llu,\"vram_applies\":%llu}",
+        language.c_str(), effective.c_str(), table_path.c_str(),
         state().rom_patches.size(), state().ram_patches.size(),
         state().vram_patches.size(),
-        state().glyphs.size(),
+        state().glyphs.size(), state().language_fallbacks.size(),
         static_cast<unsigned long long>(state().rom_applies),
         static_cast<unsigned long long>(state().ram_applies),
         static_cast<unsigned long long>(state().vram_applies));
