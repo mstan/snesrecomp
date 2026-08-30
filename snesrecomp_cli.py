@@ -265,6 +265,9 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 cmake -S $Root -B (Join-Path $Root 'build') -G Ninja -DCMAKE_BUILD_TYPE=Release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 cmake --build (Join-Path $Root 'build') --config Release --parallel
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'No playable executable was produced; this build creates the generated-code static library only.'
+}
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host ''
 Write-Host 'Built the generated-code static library.'
@@ -278,6 +281,7 @@ cmake -S "$ROOT" -B "$ROOT/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$ROOT/build" --config Release --parallel
 printf '\n%s\n' 'Built the generated-code static library.'
 printf '%s\n' 'No playable executable was produced; see README.md under "Continue the port".'
+echo "No playable executable was produced; this build creates the generated-code static library only."
 """)
     write_text(output / ".gitignore", "build/\ngenerated/\n")
     write_text(output / "project.txt", (
@@ -304,6 +308,8 @@ On macOS or Linux, run `sh build.sh`.
 **Expected build result:** a static library named `snesrecomp_game`, not a
 playable executable. The library contains the automatically discovered
 recompiled code. The original ROM is not copied into this project.
+
+Expected build result: generated-code static library only. No playable executable is produced by this starter project.
 
 ## Continue the port
 
