@@ -240,6 +240,8 @@ def build_project(args: argparse.Namespace) -> int:
     shutil.copy2(framework_root / "LICENSE", framework_output)
     shutil.copy2(
         framework_root / "THIRD_PARTY_ATTRIBUTION.md", framework_output)
+        if not source.is_file():
+            source = ROOT / "framework" / notice
 
     cmake = f"""cmake_minimum_required(VERSION 3.20)
 project({project_name} C)
