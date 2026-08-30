@@ -112,6 +112,8 @@ def build_project(args: argparse.Namespace) -> int:
     shutil.copytree(runner_source, framework_output / "runner")
     for notice in ("LICENSE", "THIRD_PARTY_ATTRIBUTION.md"):
         source = ROOT / notice
+        if not source.is_file():
+            source = ROOT / "framework" / notice
         if source.is_file():
             shutil.copy2(source, framework_output / notice)
 
