@@ -108,7 +108,12 @@ def build_project(args: argparse.Namespace) -> int:
         runner_source = ROOT / "runner"
     if not (runner_source / "runner.cmake").is_file():
         raise RuntimeError("the packaged runner framework is missing")
-    shutil.copytree(runner_source, output / "snesrecomp" / "runner")
+    framework_output = output / "snesrecomp"
+    shutil.copytree(runner_source, framework_output / "runner")
+    for notice in ("LICENSE", "THIRD_PARTY_ATTRIBUTION.md"):
+        source = ROOT / notice
+        if source.is_file():
+            shutil.copy2(source, framework_output / notice)
 
     cmake = f"""cmake_minimum_required(VERSION 3.20)
 project({project_name} C)
