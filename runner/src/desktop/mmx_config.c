@@ -285,6 +285,8 @@ static int GetIniSection(const char *s) {
     return 4;
   if (StringEqualsNoCase(s, "[GamepadMap]"))
     return 5;
+  if (StringEqualsNoCase(s, "[Netplay]"))
+    return 6;
   return -1;
 }
 
@@ -396,6 +398,12 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return ParseBool(value, &g_config.enable_snes9x_oracle);
     } else if (StringEqualsNoCase(key, "SkipLauncher")) {
       return ParseBool(value, &g_config.skip_launcher);
+    }
+  } else if (section == 6) {
+    if (StringEqualsNoCase(key, "PlayerName")) {
+      snprintf(g_config.netplay_player_name,
+               sizeof(g_config.netplay_player_name), "%s", value);
+      return true;
     }
   } else if (section == 4) {
   }
@@ -596,6 +604,7 @@ void WriteConfigFile(const char *filename) {
     { "GamepadMap", "EnableGamepad2" },
     { "General",    "SkipLauncher" },
     { "GamepadMap", "GamepadDeadzone" },
+    { "Netplay",    "PlayerName" },
   };
   const int N = (int)countof(kvs);
   static const char *const kDisplayAspectNames[kSnesDisplayAspect_Count] = {
@@ -617,6 +626,7 @@ void WriteConfigFile(const char *filename) {
   snprintf(kvs[9].val, sizeof(kvs[9].val), "%s", g_config.enable_gamepad[1] ? "true" : "false");
   snprintf(kvs[10].val, sizeof(kvs[10].val), "%d", g_config.skip_launcher ? 1 : 0);
   snprintf(kvs[11].val, sizeof(kvs[11].val), "%d", g_config.gamepad_deadzone);
+  snprintf(kvs[12].val, sizeof(kvs[12].val), "%s", g_config.netplay_player_name);
 
   char *data = NULL;
   long sz = 0;

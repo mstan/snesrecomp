@@ -68,6 +68,12 @@ typedef struct Config {
   // --launcher argument or by setting SkipLauncher = 0 in config.ini.
   bool skip_launcher;
 
+  /* Netplay display name, persisted so the lobby does not prompt on every
+   * launch. Framework-owned (config.ini [Netplay] PlayerName) so every SNES
+   * port inherits it — the alternative was a copy of this field in each
+   * game's own config, which is how MetalWarriors carried it. */
+  char netplay_player_name[64];
+
   /* Oracle-build only. When false, main.c skips snes_oracle_init_default
    * and calls snes_oracle_set_disabled_by_game so the dispatcher refuses
    * every emu_* command with a structured warning naming the reason. For

@@ -1,4 +1,5 @@
 #include "snes_host_lobby.h"
+#include "snes_netplay_identity.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -476,11 +477,26 @@ static void cb_set_player_name(void *ctx, const char *name)
 {
   (void)ctx;
   snes_lobby_set_display_name(name && name[0] ? name : "Player");
+  /* Persist immediately: the launcher may never reach PLAY (the player can
+   * set a name, browse the lobby and quit), and a name that only survives a
+   * successful launch still prompts on the next run. */
+  if (name && name[0])
+    (void)snes_netplay_identity_store(name);
 }
 
 static const char *cb_player_name(void *ctx)
 {
+  static char persisted[64];
   (void)ctx;
+  {
+    const char *live = snes_lobby_display_name();
+    if (live && live[0])
+      return live;
+  }
+  /* Nothing set this session: hand back what the last run stored, so the
+   * launcher opens with the name already filled in. */
+  if (snes_netplay_identity_load(persisted, sizeof(persisted)))
+    return persisted;
   return snes_lobby_display_name();
 }
 
