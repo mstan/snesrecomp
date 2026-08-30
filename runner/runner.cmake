@@ -198,7 +198,7 @@ if(NOT WIN32)
     list(APPEND SNESRECOMP_RUNNER_LIBRARIES m)
 endif()
 if(SNESRECOMP_ENABLE_TRACE AND WIN32)
-    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
+    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32 dbghelp)
 endif()
 
 # Differential co-simulation (SNES_COSIM.md): full-state first-divergence oracle.
