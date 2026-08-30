@@ -169,6 +169,10 @@ true-widescreen feature. See
 [`docs/MOD_PACKAGES.md`](docs/MOD_PACKAGES.md) for the package format and trust
 model.
 
+Runtime localization uses the same data-only mod boundary for language-gated
+ROM, RAM, and VRAM patches. See
+[`docs/RUNTIME_LOCALIZATION.md`](docs/RUNTIME_LOCALIZATION.md).
+
 ## MSU-1 audio
 
 The shared runner implements the MSU-1 registers, data channel, and 44.1 kHz
