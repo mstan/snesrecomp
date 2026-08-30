@@ -786,6 +786,7 @@ echo
 echo "Ready: $ROOT"
 if [ "$GENERATED" -eq 1 ]; then
     echo "  generated: $(find src/gen -name '*.c' | wc -l | tr -d ' ') C files in src/gen"
+    echo "  Expected build result: generated-code static library only"
 fi
 if [ "$BUILT" -eq 1 ] && [ -f "$GAME_EXE" ]; then
     echo "  built:     $GAME_EXE ($(du -h "$GAME_EXE" | cut -f1))"

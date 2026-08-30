@@ -60,6 +60,9 @@ extern int snes_frame_counter;
 #include "snes/interp_bridge.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
+#if SNESRECOMP_ENABLE_MODS
+#include "snes_text_xlate.h"
+#endif
 extern Ppu *g_ppu;
 extern Cpu *g_snes_cpu;
 extern Dma *g_dma;
@@ -2093,6 +2096,53 @@ static void cmd_dump_ram(const char *args) {
         send(s_client_sock, chunk, pos, 0);
     }
     send(s_client_sock, "\"}\n", 3, 0);
+}
+
+// dump_cart: compact hex dump of the live, in-memory cartridge ROM. This is
+// useful for validating runtime-only ROM patches without writing patched ROMs.
+// Usage: dump_cart <start_hex> <len_decimal>
+static void cmd_dump_cart(const char *args) {
+    unsigned int addr = 0, len = 256;
+    sscanf(args, "%x %u", &addr, &len);
+    if (!g_snes || !g_snes->cart || !g_snes->cart->rom) {
+        send_fmt("{\"error\":\"cart rom unavailable\"}");
+        return;
+    }
+    uint32_t rom_size = g_snes->cart->romSize;
+    if (len > rom_size) len = rom_size;
+    if (addr > rom_size || (uint64_t)addr + (uint64_t)len > (uint64_t)rom_size) {
+        send_fmt("{\"error\":\"out of range\",\"addr\":\"0x%x\",\"len\":%u,"
+                 "\"rom_size\":\"0x%x\"}", addr, len, rom_size);
+        return;
+    }
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "{\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"", addr, len);
+    if (s_client_sock == SOCKET_INVALID) return;
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x",
+                            g_snes->cart->rom[addr + i]);
+        send(s_client_sock, chunk, pos, 0);
+    }
+    send(s_client_sock, "\"}\n", 3, 0);
+}
+
+static void cmd_xlate_stats(const char *args) {
+#if SNESRECOMP_ENABLE_MODS
+    char buf[4096];
+    const char *subcmd = (args && args[0]) ? args : "stats";
+    if (snes_text_xlate_debug_json_c(subcmd, buf, (int)sizeof(buf)) < 0) {
+        send_fmt("{\"ok\":false,\"error\":\"xlate debug unavailable\"}");
+        return;
+    }
+    send_line(buf);
+#else
+    (void)args;
+    send_fmt("{\"ok\":false,\"error\":\"SNESRECOMP_ENABLE_MODS not enabled\"}");
+#endif
 }
 
 static void cmd_read_sram(const char *args) {
@@ -7959,6 +8009,8 @@ static const CmdEntry s_commands[] = {
     {"dump_frame_range", cmd_dump_frame_range},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
+    {"dump_cart",     cmd_dump_cart},
+    {"xlate_stats",   cmd_xlate_stats},
     {"read_sram",     cmd_read_sram},
     {"call_stack",    cmd_call_stack},
     {"watch",         cmd_watch},

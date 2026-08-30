@@ -177,6 +177,7 @@ option(SNESRECOMP_ENABLE_MODS
 if(SNESRECOMP_ENABLE_MODS)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         ${SNESRECOMP_RUNNER_ROOT}/src/mod_runtime.cpp
+        ${SNESRECOMP_RUNNER_ROOT}/src/snes_text_xlate.cpp
     )
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -197,7 +198,7 @@ if(NOT WIN32)
     list(APPEND SNESRECOMP_RUNNER_LIBRARIES m)
 endif()
 if(SNESRECOMP_ENABLE_TRACE AND WIN32)
-    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
+    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32 dbghelp)
 endif()
 
 # Differential co-simulation (SNES_COSIM.md): full-state first-divergence oracle.

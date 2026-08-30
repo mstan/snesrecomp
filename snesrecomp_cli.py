@@ -108,7 +108,14 @@ def build_project(args: argparse.Namespace) -> int:
         runner_source = ROOT / "runner"
     if not (runner_source / "runner.cmake").is_file():
         raise RuntimeError("the packaged runner framework is missing")
-    shutil.copytree(runner_source, output / "snesrecomp" / "runner")
+    framework_output = output / "snesrecomp"
+    shutil.copytree(runner_source, framework_output / "runner")
+    for notice in ("LICENSE", "THIRD_PARTY_ATTRIBUTION.md"):
+        source = ROOT / notice
+        if not source.is_file():
+            source = ROOT / "framework" / notice
+        if source.is_file():
+            shutil.copy2(source, framework_output / notice)
 
     cmake = f"""cmake_minimum_required(VERSION 3.20)
 project({project_name} C)
@@ -132,6 +139,9 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 cmake -S $Root -B (Join-Path $Root 'build') -G Ninja -DCMAKE_BUILD_TYPE=Release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 cmake --build (Join-Path $Root 'build') --config Release --parallel
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'No playable executable was produced; this build creates the generated-code static library only.'
+}
 exit $LASTEXITCODE
 """)
     write_text(output / "build.sh", """#!/usr/bin/env sh
@@ -139,6 +149,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cmake -S "$ROOT" -B "$ROOT/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$ROOT/build" --config Release --parallel
+echo "No playable executable was produced; this build creates the generated-code static library only."
 """)
     write_text(output / ".gitignore", "build/\ngenerated/\n")
     write_text(output / "project.txt", (
@@ -167,6 +178,8 @@ The result is a static library named `snesrecomp_game`. It contains the
 automatically discovered recompiled code. The original ROM is not copied into
 this project.
 
+Expected build result: generated-code static library only. No playable executable is produced by this starter project.
+
 ## Continue the port
 
 An arbitrary SNES game still needs game-specific function boundaries,
@@ -179,6 +192,7 @@ unless you have permission.
 """)
     print("[4/4] Wrote project files.")
     print(f"\nReady: {output}")
+    print("Expected build result: generated-code static library only")
     print(f"Build with: {output / ('build.ps1' if os.name == 'nt' else 'build.sh')}")
     return 0
 

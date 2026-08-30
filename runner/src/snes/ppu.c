@@ -12,6 +12,9 @@ extern unsigned char g_snesrecomp_last_hdmaen;
 
 #include "snes.h"
 #include "../debug_server.h"
+#if SNESRECOMP_ENABLE_MODS
+#include "../snes_text_xlate.h"
+#endif
 #include "snes_regs.h"
 #include "ws_shadow.h"
 
@@ -2611,6 +2614,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+#if SNESRECOMP_ENABLE_MODS
+      snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
+#endif
       WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
                           ppu->vram[vramAdr & 0x7fff]);
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
@@ -2621,6 +2627,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+#if SNESRECOMP_ENABLE_MODS
+      snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
+#endif
       WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
                           ppu->vram[vramAdr & 0x7fff]);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
