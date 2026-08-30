@@ -37,6 +37,14 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
   snes_netplay_apply_env(&out->net_cfg);
   if (net->input_delay >= 0 && net->input_delay <= 20)
     out->net_cfg.input_delay = net->input_delay;
+  /* Invent runway (P = 4 + D, computed by recomp-ui and published in the
+   * launch struct). This was being dropped on the floor: SNES fell back to
+   * the engine default of 8, so a session at D=9 ran with a runway SHORTER
+   * than its own delay — pred_depth walked to the cap on every relay stall
+   * and tripped pcap FREEZE. Measured over a hotspot/TURN session: 10
+   * RUNWAY_EMPTY events, one 209ms debt spike, mispredict never above 2. */
+  if (net->input_prediction >= 2 && net->input_prediction <= 32)
+    out->net_cfg.input_prediction = net->input_prediction;
   out->net_cfg.force_turn = 0;
   out->net_cfg.force_input_relay = net->force_input_relay ? 1 : 0;
   {

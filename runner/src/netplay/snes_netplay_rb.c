@@ -453,7 +453,30 @@ int snes_netplay_rb_start(void)
 
     snes_netplay_rb_shutdown();
 
-    g_rb.prediction_cap = rb_env_int("SNES_RB_PREDICTION", 8, 1, 32);
+    /* Session-settled P (recomp-ui: P = 4 + D) when the host bound one;
+     * SNES_RB_PREDICTION remains the operator override. A P below the delay
+     * it must cover is what produced the observed freezes: pred_depth walks
+     * to the cap during a relay stall, pcap FREEZE stops the sim, and the
+     * hitch shows as debt. */
+    {
+        /* Order: explicit session value (lobby publishes P = 4 + D), else the
+         * same 4 + D rule applied locally, clamped 6..16 exactly as
+         * recomp-ui's np_rb_prediction_frames_from_rtt_ms does. A fixed
+         * default of 8 was SHORTER than D on any relayed session (measured
+         * at D=9), so pred_depth walked to the cap during a stall and
+         * tripped pcap FREEZE — the hitch, with resims themselves healthy
+         * (mispredict_age_max=1). SNES_RB_PREDICTION still overrides. */
+        int bound = g_rb.b.input_prediction ? *g_rb.b.input_prediction : 0;
+        int dflt;
+        if (bound >= 2) {
+            dflt = bound;
+        } else {
+            dflt = 4 + rb_input_delay();
+            if (dflt < 6) dflt = 6;
+            if (dflt > 16) dflt = 16;
+        }
+        g_rb.prediction_cap = rb_env_int("SNES_RB_PREDICTION", dflt, 1, 32);
+    }
     g_rb.snap_interval = (uint32_t)rb_env_int("SNES_RB_SNAP_INTERVAL", 1, 1, 16);
     g_rb.seal_timeout_ms =
         (uint32_t)rb_env_int("SNES_RB_EPISODE_TIMEOUT_MS", 2000, 100, 30000);
