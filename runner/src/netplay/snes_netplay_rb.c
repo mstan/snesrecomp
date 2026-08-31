@@ -61,6 +61,16 @@ static struct {
     uint32_t         peer_post_digest;
     uint32_t         local_post_digest;
     int              peer_post_seen;
+    /* Baseline digest exchange. Both sides must digest the SAME tick, and a
+     * peer's digest routinely arrives before we have loaded our own baseline
+     * snapshot, so it is buffered until ours exists. */
+    SnesStateDigestParts local_base;
+    int              local_base_valid;
+    uint32_t         peer_base_epoch;
+    uint32_t         peer_base_tick;
+    uint32_t         peer_base_master, peer_base_wram;
+    uint32_t         peer_base_apu, peer_base_ppu;
+    int              peer_base_valid;
     uint32_t         cooldown_until_tick;
     uint32_t         stage_entered_ms;
     uint32_t         seal_timeout_ms;
@@ -87,6 +97,7 @@ static struct {
     const char *stall_tag;
     uint32_t snap_interval;
     int      prediction_cap;
+    int      force_invent_slot;  /* validation knob one-shot; -1 = idle */
 } g_rb;
 
 /* ── env ─────────────────────────────────────────────────────────────── */
@@ -286,6 +297,11 @@ static uint32_t rb_run_frame_inputs(void)
 
 /* Pull the row every seat should simulate at `tick` out of the sealed table.
  * Only used during resim: Live resolves from history/wire instead. */
+/* Set by rb_load_sealed_rows when a row is missing, so the abort can name the
+ * seat and tick instead of saying only that "a" row was absent. */
+static int      g_rb_missing_slot = -1;
+static uint32_t g_rb_missing_tick;
+
 static int rb_load_sealed_rows(uint32_t tick)
 {
     int slots = rb_slot_count();
@@ -293,8 +309,11 @@ static int rb_load_sealed_rows(uint32_t tick)
 
     for (i = 0; i < slots; ++i) {
         RNetRbFrame f;
-        if (!rnet_rb_get_sealed_frame(g_rb.rb, i, tick, &f))
+        if (!rnet_rb_get_sealed_frame(g_rb.rb, i, tick, &f)) {
+            g_rb_missing_slot = i;
+            g_rb_missing_tick = tick;
             return 0;
+        }
         rb_row_sanitize(&f);
         g_rb.resolved[i] = f.buttons;
     }
@@ -452,6 +471,7 @@ int snes_netplay_rb_start(void)
     int i;
 
     snes_netplay_rb_shutdown();
+    g_rb.force_invent_slot = -1;
 
     /* Session-settled P (recomp-ui: P = 4 + D) when the host bound one;
      * SNES_RB_PREDICTION remains the operator override. A P below the delay
@@ -594,6 +614,8 @@ static void rb_episode_clear(void)
     rb_stage_set(kRbIdle);
     g_rb.initiator = 0;
     g_rb.peer_post_seen = 0;
+    g_rb.local_base_valid = 0;
+    g_rb.peer_base_valid = 0;
     memset(&g_rb.corr, 0, sizeof(g_rb.corr));
     if (g_rb.rb)
         rnet_rb_session_reset(g_rb.rb);
@@ -618,33 +640,64 @@ static void rb_episode_abort(uint8_t abort_class, const char *why)
 
 /* ── seal-row exchange ───────────────────────────────────────────────── */
 
+/*
+ * Publish this peer's authoritative rows for the sealed span.
+ *
+ * Two wire fields here are NOT ticks, and sending ticks in them silently
+ * posted nothing at all:
+ *
+ *   row_begin  is an OFFSET into the sealed span, zero-based
+ *              (rnet_rb_export_seal_rows_chunk / rnet_rb_apply_peer_seal_rows
+ *              both index `sealed[offset]`; recomp-net's own episode test
+ *              passes 0, 3, 4). Passing load_tick made the very first export
+ *              take `row_begin >= sealed_span`, return count 0, and break the
+ *              loop before a single packet went out.
+ *
+ *   mismatch   carries seal_base_tick, which is the LOAD tick, not
+ *              corr.mismatch_tick. The receiver rejects the chunk outright
+ *              when it disagrees. The two are equal whenever the snapshot
+ *              floor lands on the mismatch itself, which is why this hid.
+ *
+ * The cost was invisible in a healthy match and total in an unhealthy one.
+ * A FOLLOWER never notices: rnet_rb_fill_local_row pre-seals a remote seat
+ * straight from wire-confirmed history, so its mask completes with no peer
+ * message. An INITIATOR cannot — the row that opened the episode is by
+ * definition predicted, so it is the one row that must come from the peer.
+ * Measured over a real LAN match: follower 12/12 episodes replayed, initiator
+ * 12/12 "timed out waiting for peer seal rows" after the full 2 s budget, one
+ * stall every 45 frames. No rollback correction had ever completed.
+ */
 static void rb_send_local_seal_rows(void)
 {
     RNetSession *s = rb_session();
     int slot = rb_local_slot();
-    uint32_t t = g_rb.corr.load_tick;
-    uint32_t end = g_rb.corr.target_tick;
+    uint32_t span = g_rb.corr.target_tick >= g_rb.corr.load_tick
+                        ? g_rb.corr.target_tick - g_rb.corr.load_tick + 1u
+                        : 0u;
+    uint32_t off = 0;
 
     if (!s || !g_rb.rb)
         return;
-    while (t <= end) {
+    while (off < span) {
         RNetRbFrame rows[RB_SEAL_CHUNK];
         uint32_t count = 0;
-        uint32_t want = end - t + 1u;
+        uint32_t want = span - off;
         if (want > RB_SEAL_CHUNK)
             want = RB_SEAL_CHUNK;
-        if (!rnet_rb_export_seal_rows_chunk(g_rb.rb, slot, t, want, rows,
+        if (!rnet_rb_export_seal_rows_chunk(g_rb.rb, slot, off, want, rows,
                                             &count) || count == 0)
             break;
         rnet_session_send_rb_seal_rows(s, g_rb.corr.epoch_id,
-                                       g_rb.corr.mismatch_tick,
-                                       g_rb.corr.target_tick, (rnet_u8)slot, t,
-                                       rows, (rnet_u16)count);
-        t += count;
+                                       g_rb.corr.load_tick,
+                                       g_rb.corr.target_tick, (rnet_u8)slot,
+                                       off, rows, (rnet_u16)count);
+        off += count;
     }
 }
 
 /* ── replay ──────────────────────────────────────────────────────────── */
+
+static void rb_baseline_try_compare(void);
 
 static void rb_send_baseline(void)
 {
@@ -653,8 +706,14 @@ static void rb_send_baseline(void)
     if (!s)
         return;
     snes_state_digest_parts(&p);
+    /* Ours is the digest of the tick we just loaded. Keep it: the peer's copy
+     * is compared against THIS, never against whatever the live machine
+     * happens to hold when the message lands. */
+    g_rb.local_base = p;
+    g_rb.local_base_valid = 1;
     rnet_session_send_rb_baseline(s, g_rb.corr.epoch_id, g_rb.corr.load_tick,
                                   p.master, p.wram, p.apu, p.ppu);
+    rb_baseline_try_compare();
 }
 
 /*
@@ -672,6 +731,12 @@ static int rb_run_replay(void)
         return 0;
     }
     rb_send_baseline();
+    /* rb_send_baseline compares digests and may abort the episode outright on
+     * a fork, which clears corr and resets the session. Carrying on into the
+     * loop below then re-aborted with "sealed row missing mid-replay" — one
+     * cause, two log lines, and a half-replayed timeline in between. */
+    if (g_rb.stage == kRbIdle)
+        return 0;
     rnet_rb_set_phase(g_rb.rb, nRNetRbPhaseReplay);
 
     rb_resim_begin();
@@ -680,9 +745,17 @@ static int rb_run_replay(void)
          * from here on must describe the corrected run, not the dead one. */
         rb_snap_take(t);
         if (!rb_advance_sim(NULL, t)) {
+            char why[128];
             rb_resim_end();
-            rb_episode_abort(RNET_RB_ABORT_CLASS_ABORT,
-                             "sealed row missing mid-replay");
+            snprintf(why, sizeof(why),
+                     "sealed row missing mid-replay: slot=%d tick=%u "
+                     "(span %u..%u, seal_base=%u span_len=%u)",
+                     g_rb_missing_slot, (unsigned)g_rb_missing_tick,
+                     (unsigned)g_rb.corr.load_tick,
+                     (unsigned)g_rb.corr.target_tick,
+                     (unsigned)rnet_rb_get_seal_base_tick(g_rb.rb),
+                     (unsigned)rnet_rb_get_seal_span(g_rb.rb));
+            rb_episode_abort(RNET_RB_ABORT_CLASS_ABORT, why);
             return 0;
         }
     }
@@ -769,6 +842,20 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
             return 0;
         }
         target = rnet_rb_suggest_target(g_rb.rb, mismatch_tick, sim_tip);
+        /* suggest_target adds tip_seal_slack (default 2) so the tick after the
+         * replay is already sealed. That only works if this host can hand the
+         * engine its own seat's rows for those ticks, and it cannot:
+         * rb_vt_get_input_row reads the admitted input history, which by
+         * definition stops at the tip. An initiator detects its mismatch on
+         * the very next tick, so the slack landed two ticks in its own future
+         * and the replay died on "sealed row missing mid-replay: slot=0
+         * tick=<tip+1>" — measured on episode #1 of every session, after
+         * which the peers were divergent and every later episode forked at
+         * the baseline instead. Replay only ticks we hold authoritative input
+         * for; the engine re-seals the tip normally, and rnet_rb_extend_target
+         * still grows the span when the peer advertises more. */
+        if (target > sim_tip)
+            target = sim_tip;
     } else {
         load = peer_load;
         target = peer_target;
@@ -832,35 +919,49 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
             as_initiator ? "initiator" : "follower", slot,
             (unsigned)mismatch_tick, (unsigned)load, (unsigned)target,
             (unsigned)(g_rb.sim > load ? g_rb.sim - load : 0u),
-            (unsigned)(target > load ? target - load : 0u));
+            /* load..target INCLUSIVE — a one-tick span replays 1 frame, not
+             * 0. The old "replay 0" read as "nothing was re-run". */
+            (unsigned)(target >= load ? target - load + 1u : 0u));
     return 1;
 }
 
 /* ── wire ingress ────────────────────────────────────────────────────── */
 
-static void rb_on_peer_baseline(uint32_t epoch, uint32_t load_tick,
-                                uint32_t master, uint32_t wram, uint32_t apu,
-                                uint32_t ppu)
+/*
+ * Compare the two baseline digests once BOTH exist. Ours only exists after
+ * rb_run_replay() has loaded the snapshot for corr.load_tick — until then the
+ * live machine is sitting on a later tick, and digesting it would compare two
+ * different instants. Doing exactly that was the defect: on a loopback pair
+ * the peer's BASELINE always beat our own load, so every single episode
+ * reported a fork and aborted (measured 83/83), the correction never ran, and
+ * the follower ended up blank on a genuinely divergent guest. Over a real
+ * link the race is merely usually lost, which is why it read as an occasional
+ * desync rather than a broken mechanism.
+ */
+static void rb_baseline_try_compare(void)
 {
-    SnesStateDigestParts mine;
+    const SnesStateDigestParts *mine = &g_rb.local_base;
 
-    if (g_rb.stage == kRbIdle || epoch != g_rb.corr.epoch_id ||
-        load_tick != g_rb.corr.load_tick)
+    if (!g_rb.local_base_valid || !g_rb.peer_base_valid)
         return;
-    snes_state_digest_parts(&mine);
-    if (mine.master == master)
+    if (g_rb.peer_base_epoch != g_rb.corr.epoch_id ||
+        g_rb.peer_base_tick != g_rb.corr.load_tick)
+        return;
+    g_rb.peer_base_valid = 0;   /* one verdict per exchange */
+
+    if (mine->master == g_rb.peer_base_master)
         return;
 
     /* The two peers do not agree on the state they are about to replay from,
      * so the replay is doomed before it starts. Name the subsystem that
      * moved — "the state differs" is not a diagnosis. */
     g_rb.fork_seen = 1;
-    g_rb.fork_tick = load_tick;
-    if (mine.wram != wram)
+    g_rb.fork_tick = g_rb.corr.load_tick;
+    if (mine->wram != g_rb.peer_base_wram)
         g_rb.fork_partition = snes_state_digest_part_name(SNES_DIGEST_PART_WRAM);
-    else if (mine.apu != apu)
+    else if (mine->apu != g_rb.peer_base_apu)
         g_rb.fork_partition = snes_state_digest_part_name(SNES_DIGEST_PART_APU);
-    else if (mine.ppu != ppu)
+    else if (mine->ppu != g_rb.peer_base_ppu)
         g_rb.fork_partition = snes_state_digest_part_name(SNES_DIGEST_PART_PPU);
     else
         g_rb.fork_partition = "other";
@@ -868,9 +969,26 @@ static void rb_on_peer_baseline(uint32_t epoch, uint32_t load_tick,
     fprintf(stderr,
             "snes_netplay: RB BASELINE FORK tick=%u partition=%s "
             "local=%08x peer=%08x\n",
-            (unsigned)load_tick, g_rb.fork_partition, (unsigned)mine.master,
-            (unsigned)master);
+            (unsigned)g_rb.corr.load_tick, g_rb.fork_partition,
+            (unsigned)mine->master, (unsigned)g_rb.peer_base_master);
     rb_episode_abort(RNET_RB_ABORT_CLASS_ABORT, "baseline digest fork");
+}
+
+static void rb_on_peer_baseline(uint32_t epoch, uint32_t load_tick,
+                                uint32_t master, uint32_t wram, uint32_t apu,
+                                uint32_t ppu)
+{
+    if (g_rb.stage == kRbIdle || epoch != g_rb.corr.epoch_id ||
+        load_tick != g_rb.corr.load_tick)
+        return;
+    g_rb.peer_base_epoch  = epoch;
+    g_rb.peer_base_tick   = load_tick;
+    g_rb.peer_base_master = master;
+    g_rb.peer_base_wram   = wram;
+    g_rb.peer_base_apu    = apu;
+    g_rb.peer_base_ppu    = ppu;
+    g_rb.peer_base_valid  = 1;
+    rb_baseline_try_compare();
 }
 
 static void rb_on_peer_post(uint32_t epoch, uint32_t target, uint32_t master)
@@ -1032,17 +1150,24 @@ static void rb_pump_episode(void)
     }
 }
 
-/* Validation knob (SNES_RB_FORCE_MISPREDICT=N): every Nth remote row is
- * stored deliberately WRONG and flagged predicted, so the reconcile pass
- * compares it against the true wire row, finds a mismatch, and must rewind
- * and replay. Prediction only — the authoritative rows both peers seal are
- * untouched, so a forced session must still converge; a desync under this
- * knob is a real resim bug, which is the point.
+/* Validation knob (SNES_RB_FORCE_MISPREDICT=N): every Nth tick, IGNORE the
+ * remote row that already arrived so the engine must invent one, and make
+ * that invented row deliberately wrong. The true row is still in the session
+ * and is consumed on a later tick, where reconcile compares it against the
+ * invention, finds the mismatch, and must rewind and replay.
  *
- * This exists because a HEALTHY session never exercises rollback at all:
- * with D covering the RTT the remote row is always already present
- * (measured: pred_depth=0 on ~85% of admits over a real match, zero invents
- * on loopback), so nothing is predicted and nothing is ever rewound. */
+ * This shape matters. An earlier version corrupted the ARRIVED row in place,
+ * which made the local sim run a frame on input it had already received
+ * correctly — an divergence the peer had no matching episode for, so a failed
+ * correction (measured: "timed out waiting for peer seal rows" on the very
+ * first episode) left the two sides permanently forked and the follower
+ * black. Withholding-then-inventing reproduces a REAL late-arrival instead,
+ * where the correction is the same one natural play would perform.
+ *
+ * Needed because a healthy session never exercises rollback at all: with D
+ * covering the RTT the remote row is always already present (measured:
+ * pred_depth=0 on ~85% of admits over a real match, zero invents on
+ * loopback), so nothing is predicted and nothing is ever rewound. */
 static int rb_force_mispredict_every(void)
 {
     static int cached = -1;
@@ -1214,25 +1339,29 @@ int snes_netplay_rb_poll_admit(void)
             continue;
         }
 
-        if (rnet_session_peek_remote_input(s, slot, wire, &sample) &&
+        {
+            /* Validation: withhold an arrived row so the engine must invent
+             * (see rb_force_mispredict_every). peek does not consume, so the
+             * true row is still there for the reconcile pass. */
+            const int every = rb_force_mispredict_every();
+            if (every > 0 && slot != rb_local_slot()) {
+                static unsigned long n;
+                if ((++n % (unsigned long)every) == 0ul) {
+                    g_rb.force_invent_slot = slot;
+                    fprintf(stderr,
+                            "rbe: forced late row slot=%d sim=%u "
+                            "(invent + corrupt)\n",
+                            slot, (unsigned)g_rb.sim);
+                }
+            }
+        }
+        if (g_rb.force_invent_slot != slot &&
+            rnet_session_peek_remote_input(s, slot, wire, &sample) &&
             sample.valid) {
             rb_row_make(&row, g_rb.sim,
                         (uint16_t)(sample.bytes[0] |
                                    ((uint16_t)sample.bytes[1] << 8)),
                         0);
-            {
-                const int every = rb_force_mispredict_every();
-                if (every > 0) {
-                    static unsigned long n;
-                    if ((++n % (unsigned long)every) == 0ul) {
-                        row.buttons ^= 0x0040u;   /* Left: never an idle bit */
-                        row.is_predicted = 1u;    /* so reconcile revisits it */
-                        fprintf(stderr,
-                                "rbe: forced mispredict slot=%d sim=%u\n",
-                                slot, (unsigned)g_rb.sim);
-                    }
-                }
-            }
             rbe_ih_put(&g_rb.ih, slot, &row);
             g_rb.resolved[slot] = row.buttons;
             rbe_sched_note_remote_hit();
@@ -1254,6 +1383,13 @@ int snes_netplay_rb_poll_admit(void)
             }
             if (!rbe_ih_invent_hold_last(&g_rb.ih, slot, g_rb.sim, &row))
                 return 0;
+            if (g_rb.force_invent_slot == slot) {
+                /* Guarantee the invention is WRONG: hold-last would otherwise
+                 * match a peer sitting on the same buttons, and a correct
+                 * prediction exercises nothing. */
+                row.buttons ^= 0x0040u;   /* Left: never an idle bit */
+                g_rb.force_invent_slot = -1;
+            }
             rb_row_sanitize(&row);
             /* Sanitise wrote through a copy; store the corrected row so the
              * PSX-shaped neutral can never reach the sim or a seal. */

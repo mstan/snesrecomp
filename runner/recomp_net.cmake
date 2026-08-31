@@ -116,6 +116,7 @@ function(snesrecomp_enable_rollback target)
     if(NOT SNESRECOMP_ENABLE_NET)
         target_sources(${target} PRIVATE
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay_rb.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_rb_probe.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_state_digest.c")
     endif()
     message(STATUS "SNESRECOMP_NET_ROLLBACK: ${target} links retcomm_rbengine")
@@ -181,6 +182,7 @@ if(SNESRECOMP_ENABLE_NET)
         _snesrecomp_add_rbengine()
         list(APPEND SNESRECOMP_RUNNER_SOURCES
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay_rb.c"
+            "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_rb_probe.c"
             "${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_state_digest.c")
         list(APPEND SNESRECOMP_RUNNER_LIBRARIES retcomm_rbengine)
         list(APPEND SNESRECOMP_RUNNER_INCLUDE_DIRS

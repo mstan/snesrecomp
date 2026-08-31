@@ -105,10 +105,20 @@ int rtl_apu_port_observers_filter(uint16 reg, uint8 value) {
   return consumed;
 }
 
+#include "snes/interp_bridge.h"
+#ifdef SNESRECOMP_NET_ROLLBACK
+#include "netplay/snes_rb_probe.h"
+#endif
+
 /* Netplay suppresses the pre-frame wall-clock fallback below. Once frames
  * begin, every runner uses the same guest-frame/APU coupling, and the audio
  * callback only consumes samples without advancing emulation. */
 static int rtl_netplay_locks_audio(void) {
+#if defined(SNESRECOMP_NET_ROLLBACK)
+  /* An armed rollback probe is held to the same rule: see snes_rb_probe.c. */
+  if (snes_rb_probe_armed())
+    return 1;
+#endif
 #if defined(SNESRECOMP_NET)
   return snes_netplay_active();
 #else
@@ -737,6 +747,12 @@ bool RtlRunFrame(uint32 inputs) {
     }
   }
 
+#ifdef SNESRECOMP_NET_ROLLBACK
+  /* Offline rollback self-check. No-op unless SNESRECOMP_RB_PROBE is set;
+   * see snes_rb_probe.c for why the runner needs one at all. */
+  snes_rb_probe_after_frame(inputs);
+#endif
+
   return false;
 }
 
@@ -859,7 +875,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
  */
 
 #define RTL_RB_RESIDUE_MAGIC 0x53524252u /* 'RBRS' */
-#define RTL_RB_RESIDUE_VERSION 1u
+#define RTL_RB_RESIDUE_VERSION 2u
 
 typedef struct RtlRollbackResidue {
   uint32 magic;
@@ -875,6 +891,10 @@ typedef struct RtlRollbackResidue {
   int      frame_counter;
   uint8    apu_frame_time_valid;
   uint8    pad[3];
+  /* v2: the interpreter bridge's cross-frame execution state. See
+   * interp_bridge.h — without it a replayed frame burns a different number of
+   * master cycles than the frame it replaces. */
+  uint8    interp[1024];   /* sized against interp_bridge_rb_state_size() */
 } RtlRollbackResidue;
 
 size_t RtlRollbackSnapshotBound(void) {
@@ -899,6 +919,8 @@ static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
   r->main_cpu_cycles_estimate = g_main_cpu_cycles_estimate;
   r->frame_counter = snes_frame_counter;
   r->apu_frame_time_valid = g_apu_frame_time_valid ? 1u : 0u;
+  assert(interp_bridge_rb_state_size() <= sizeof(r->interp));
+  interp_bridge_rb_state_save(r->interp);
 }
 
 static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
@@ -914,6 +936,7 @@ static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
   g_main_cpu_cycles_estimate = r->main_cpu_cycles_estimate;
   snes_frame_counter = r->frame_counter;
   g_apu_frame_time_valid = r->apu_frame_time_valid != 0;
+  interp_bridge_rb_state_load(r->interp);
 }
 
 size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {
@@ -1934,6 +1957,8 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
 
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   assert(channels == 2);
+
+
   /* SPC state is guest-frame driven by RtlAudioSyncFrame. The host callback is
    * a consumer only: allowing it to invent SPC cycles makes its wall-clock
    * schedule a second, competing emulation clock and is what let audio drift
