@@ -1036,6 +1036,18 @@ static void rb_drain_wire(void)
             break;
         case RNET_RB_SYNC_OP_ABORT:
             if (g_rb.stage != kRbIdle && epoch == g_rb.corr.epoch_id) {
+                /* Say so. Clearing silently made the two peers' logs disagree
+                 * about the same session — measured 9 aborts on the initiator
+                 * against 140 on the follower, because every episode the
+                 * follower killed vanished from the initiator's log and read
+                 * as a completion. An episode that did not commit must leave
+                 * a trace on BOTH sides. */
+                fprintf(stderr,
+                        "snes_netplay: RB episode dropped by peer epoch=%u "
+                        "load=%u target=%u class=%u (peer aborted)\n",
+                        (unsigned)g_rb.corr.epoch_id,
+                        (unsigned)g_rb.corr.load_tick,
+                        (unsigned)g_rb.corr.target_tick, (unsigned)a);
                 rb_episode_clear();
                 /* Mirror the sender's cooldown class so both peers re-arm on
                  * the same schedule. */
