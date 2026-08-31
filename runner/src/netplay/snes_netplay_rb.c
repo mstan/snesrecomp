@@ -821,6 +821,18 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
     g_rb.initiator = as_initiator;
     rb_stage_set(kRbSealing);
     g_rb.episode_count++;
+    /* A resim episode is the whole point of rollback and previously left no
+     * trace in the log — "mispredict=N" counts DETECTIONS (and one of its two
+     * call sites is the refusal path), so it could not answer "did we
+     * actually rewind and replay?". load..target is the replayed span. */
+    fprintf(stderr,
+            "rbe: RESIM episode #%u %s slot=%d mismatch=%u load=%u target=%u "
+            "(rewind %u frames, replay %u)\n",
+            (unsigned)g_rb.episode_count,
+            as_initiator ? "initiator" : "follower", slot,
+            (unsigned)mismatch_tick, (unsigned)load, (unsigned)target,
+            (unsigned)(g_rb.sim > load ? g_rb.sim - load : 0u),
+            (unsigned)(target > load ? target - load : 0u));
     return 1;
 }
 
@@ -1020,6 +1032,32 @@ static void rb_pump_episode(void)
     }
 }
 
+/* Validation knob (SNES_RB_FORCE_MISPREDICT=N): every Nth remote row is
+ * stored deliberately WRONG and flagged predicted, so the reconcile pass
+ * compares it against the true wire row, finds a mismatch, and must rewind
+ * and replay. Prediction only — the authoritative rows both peers seal are
+ * untouched, so a forced session must still converge; a desync under this
+ * knob is a real resim bug, which is the point.
+ *
+ * This exists because a HEALTHY session never exercises rollback at all:
+ * with D covering the RTT the remote row is always already present
+ * (measured: pred_depth=0 on ~85% of admits over a real match, zero invents
+ * on loopback), so nothing is predicted and nothing is ever rewound. */
+static int rb_force_mispredict_every(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("SNES_RB_FORCE_MISPREDICT");
+        cached = (v && v[0]) ? atoi(v) : 0;
+        if (cached < 0) cached = 0;
+        if (cached)
+            fprintf(stderr,
+                    "rbe: FORCE MISPREDICT every %d remote row "
+                    "(validation only)\n", cached);
+    }
+    return cached;
+}
+
 /* ── reconcile late wire against predicted history ───────────────────── */
 
 static void rb_reconcile_wire(void)
@@ -1182,6 +1220,19 @@ int snes_netplay_rb_poll_admit(void)
                         (uint16_t)(sample.bytes[0] |
                                    ((uint16_t)sample.bytes[1] << 8)),
                         0);
+            {
+                const int every = rb_force_mispredict_every();
+                if (every > 0) {
+                    static unsigned long n;
+                    if ((++n % (unsigned long)every) == 0ul) {
+                        row.buttons ^= 0x0040u;   /* Left: never an idle bit */
+                        row.is_predicted = 1u;    /* so reconcile revisits it */
+                        fprintf(stderr,
+                                "rbe: forced mispredict slot=%d sim=%u\n",
+                                slot, (unsigned)g_rb.sim);
+                    }
+                }
+            }
             rbe_ih_put(&g_rb.ih, slot, &row);
             g_rb.resolved[slot] = row.buttons;
             rbe_sched_note_remote_hit();
