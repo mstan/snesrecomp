@@ -93,6 +93,22 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
 int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24);
 uint32_t interp_bridge_lle_resume_pc(void);
 
+/*
+ * Rollback support: the bridge carries execution state across frames that no
+ * guest snapshot can hold — the LLE resume cursor, the batched APU debt, and
+ * the progress/livelock heuristic's per-address value cache and epochs. A
+ * rewind that restores WRAM and the CPU but leaves these on the discarded
+ * timeline makes the interpreter break out of a spin after a different number
+ * of iterations, so the replayed frame consumes a different number of master
+ * cycles: measured as hPos, apuCatchupCycles and autoJoyTimer diverging on
+ * the FIRST replayed frame in ~92% of probes, with guest memory identical
+ * (see snes_rb_probe.c). Opaque blob by design — its contents are the
+ * bridge's business, and the caller only has to store and hand it back.
+ */
+size_t interp_bridge_rb_state_size(void);
+void   interp_bridge_rb_state_save(void *out);
+void   interp_bridge_rb_state_load(const void *in);
+
 /* True if the most recent auto-quiescent yield was a 65816 WAI. The host
  * should deliver NMI/IRQ before resuming at interp_bridge_lle_resume_pc().
  * Sticky until read (then cleared). */

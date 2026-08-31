@@ -438,6 +438,64 @@ int rtl_aot_node_denied(uint32 pc24) {
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
 
+/* ── rollback state (see interp_bridge.h) ─────────────────────────────── */
+
+typedef struct {
+    uint32_t magic;
+    uint64_t apu_pending_master;
+    uint64_t write_epoch;
+    uint64_t continuous_read_epoch;
+    uint64_t dynamic_progress_epoch;
+    uint64_t bus_master;
+    unsigned bus_cycles;
+    int      bus_timing_active;
+    uint32_t lle_resume_pc24;
+    int      lle_wai_yield;
+    uint64_t lle_master_deadline;
+    BridgeDynamicValue dynamic_values[64];
+} InterpBridgeRbState;
+
+#define INTERP_BRIDGE_RB_MAGIC 0x49425253u /* 'IBRS' */
+
+size_t interp_bridge_rb_state_size(void) { return sizeof(InterpBridgeRbState); }
+
+void interp_bridge_rb_state_save(void *out) {
+    InterpBridgeRbState *s = (InterpBridgeRbState *)out;
+    if (!s) return;
+    memset(s, 0, sizeof(*s));
+    s->magic                  = INTERP_BRIDGE_RB_MAGIC;
+    s->apu_pending_master     = s_apu_pending_master;
+    s->write_epoch            = g_interp_bridge_write_epoch;
+    s->continuous_read_epoch  = s_interp_continuous_read_epoch;
+    s->dynamic_progress_epoch = s_interp_dynamic_progress_epoch;
+    s->bus_master             = s_interp_bus_master;
+    s->bus_cycles             = s_interp_bus_cycles;
+    s->bus_timing_active      = s_interp_bus_timing_active;
+    s->lle_resume_pc24        = s_lle_resume_pc24;
+    s->lle_wai_yield          = s_lle_wai_yield;
+    s->lle_master_deadline    = s_lle_master_deadline;
+    memcpy(s->dynamic_values, s_bridge_dynamic_values,
+           sizeof(s->dynamic_values));
+}
+
+void interp_bridge_rb_state_load(const void *in) {
+    const InterpBridgeRbState *s = (const InterpBridgeRbState *)in;
+    if (!s || s->magic != INTERP_BRIDGE_RB_MAGIC)
+        return;
+    s_apu_pending_master          = s->apu_pending_master;
+    g_interp_bridge_write_epoch   = s->write_epoch;
+    s_interp_continuous_read_epoch = s->continuous_read_epoch;
+    s_interp_dynamic_progress_epoch = s->dynamic_progress_epoch;
+    s_interp_bus_master           = s->bus_master;
+    s_interp_bus_cycles           = s->bus_cycles;
+    s_interp_bus_timing_active    = s->bus_timing_active;
+    s_lle_resume_pc24             = s->lle_resume_pc24;
+    s_lle_wai_yield               = s->lle_wai_yield;
+    s_lle_master_deadline         = s->lle_master_deadline;
+    memcpy(s_bridge_dynamic_values, s->dynamic_values,
+           sizeof(s_bridge_dynamic_values));
+}
+
 int interp_bridge_lle_took_wai(void) {
     const int v = s_lle_wai_yield;
     s_lle_wai_yield = 0;
