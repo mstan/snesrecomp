@@ -238,26 +238,37 @@ std::string json_escape(const std::string& value) {
     return out;
 }
 
-std::vector<uint8_t> patch_target(const Patch& patch,
-                                  const std::string& language) {
+/* Returns the payload the language chain natively supplies for this patch,
+ * or nullptr when the chain has none. `scratch` backs text-encoded payloads.
+ */
+const std::vector<uint8_t>* patch_native_target(const Patch& patch,
+                                                const std::string& language,
+                                                std::vector<uint8_t>& scratch) {
     if (language.empty() || language == "off")
-        return patch.source;
+        return nullptr;
     for (const std::string& candidate : language_chain(language)) {
         const auto hex = patch.target.find(candidate);
         if (hex != patch.target.end())
-            return hex->second;
+            return &hex->second;
         const auto text = patch.text.find(candidate);
         if (text == patch.text.end())
             continue;
-        std::vector<uint8_t> encoded;
         std::string error;
-        if (!encode_text(text->second, encoded, &error)) {
+        if (!encode_text(text->second, scratch, &error)) {
             state().error = error;
             continue;
         }
-        return encoded;
+        return &scratch;
     }
-    return patch.source;
+    return nullptr;
+}
+
+std::vector<uint8_t> patch_target(const Patch& patch,
+                                  const std::string& language) {
+    std::vector<uint8_t> scratch;
+    const std::vector<uint8_t>* native =
+        patch_native_target(patch, language, scratch);
+    return native ? *native : patch.source;
 }
 
 bool patch_matches_any_target(const Patch& patch, const uint8_t* data,
@@ -306,16 +317,21 @@ void apply_ram_patch(const Patch& patch) {
         off &= 0x1ffffu;
     if (off + patch.source.size() > 0x20000u)
         return;
-    const std::vector<uint8_t> target =
-        patch_target(patch, state().language.empty()
-                     ? state().default_lang : state().language);
-    if (target.size() != patch.source.size())
+    /* RAM is live game state: only write payloads the language chain
+     * natively supplies. Falling back to `source` here would restore
+     * bytes into regions the game may have deliberately rewritten. */
+    std::vector<uint8_t> scratch;
+    const std::vector<uint8_t>* target =
+        patch_native_target(patch, state().language.empty()
+                            ? state().default_lang : state().language,
+                            scratch);
+    if (!target || target->size() != patch.source.size())
         return;
     uint8_t* base = g_snes->ram + off;
     if (!patch_matches_any_target(patch, base, patch.source.size()))
         return;
-    if (!std::equal(target.begin(), target.end(), base)) {
-        std::copy(target.begin(), target.end(), base);
+    if (!std::equal(target->begin(), target->end(), base)) {
+        std::copy(target->begin(), target->end(), base);
         state().ram_applies++;
     }
 }
@@ -345,20 +361,29 @@ void apply_vram_patch(const Patch& patch) {
         return;
     if (patch.address + patch.source.size() > 0x10000u)
         return;
-    const std::vector<uint8_t> target =
-        patch_target(patch, state().language.empty()
-                     ? state().default_lang : state().language);
-    if (target.size() != patch.source.size())
+    /* VRAM is live game state: only write payloads the language chain
+     * natively supplies. Falling back to `source` would resurrect bytes
+     * into regions the game has since cleared or repurposed (e.g. an
+     * all-zero CJK blanking target matches the game's own cleared VRAM,
+     * and writing `source` back would stamp title tilemap fragments over
+     * an unrelated scene). */
+    std::vector<uint8_t> scratch;
+    const std::vector<uint8_t>* target =
+        patch_native_target(patch, state().language.empty()
+                            ? state().default_lang : state().language,
+                            scratch);
+    if (!target || target->size() != patch.source.size())
         return;
     std::vector<uint8_t> current(patch.source.size());
     for (size_t i = 0; i < current.size(); ++i)
         current[i] = vram_read_byte(patch.address + static_cast<uint32_t>(i));
     if (!patch_matches_any_target(patch, current.data(), current.size()))
         return;
-    if (std::equal(target.begin(), target.end(), current.begin()))
+    if (std::equal(target->begin(), target->end(), current.begin()))
         return;
-    for (size_t i = 0; i < target.size(); ++i)
-        vram_write_byte(patch.address + static_cast<uint32_t>(i), target[i]);
+    for (size_t i = 0; i < target->size(); ++i)
+        vram_write_byte(patch.address + static_cast<uint32_t>(i),
+                        (*target)[i]);
     state().vram_applies++;
 }
 
