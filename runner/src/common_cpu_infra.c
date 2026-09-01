@@ -66,8 +66,9 @@ void RtlRegisterGame(const RtlGameInfo *info) {
    * main.c may additionally call msu1_set_rom_path() to enable the
    * "auto" base-from-ROM-name mode. */
   msu1_init();
-  /* Register once when the title or developer opts into coverage capture.
-   * Normal release sessions do not create coverage artifacts. */
+  /* Harvest the interp-coverage manifest on exit only when the game or
+   * developer environment opts in. Registered once regardless of how many times
+   * a game re-registers (e.g. a reset path). */
   {
     static int coverage_atexit_registered = 0;
     if (tier2_capture_enabled() && !coverage_atexit_registered) {
@@ -702,6 +703,27 @@ void snes_refresh_charge(void) {
   g_refresh_charged_upto = g_cpu.master_cycles;
 }
 
+/*
+ * Rollback accessors. s_refresh_phase is the sub-scanline remainder and
+ * g_refresh_charged_upto the high-water mark; together they decide how much
+ * refresh tax the next block pays. Neither is in snes_saveload — they are host
+ * accounting, not guest memory — so a rewind used to leave them holding the
+ * discarded timeline's phase and the replayed frame was charged a different
+ * number of cycles than the frame it replaced. Measured as hPos,
+ * apuCatchupCycles and autoJoyTimer diverging on the first replayed tick with
+ * guest memory byte-identical, both offline and across a real Linux/Windows
+ * match (RB POST FORK on episode #1, same digests every run).
+ */
+void snes_refresh_state_get(uint64_t *phase, uint64_t *charged_upto) {
+  if (phase) *phase = s_refresh_phase;
+  if (charged_upto) *charged_upto = g_refresh_charged_upto;
+}
+
+void snes_refresh_state_set(uint64_t phase, uint64_t charged_upto) {
+  s_refresh_phase = phase;
+  g_refresh_charged_upto = charged_upto;
+}
+
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
   snes_refresh_charge();
@@ -861,3 +883,4 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   g_sram_size = g_snes->cart->ramSize;
   return g_snes;
 }
+
