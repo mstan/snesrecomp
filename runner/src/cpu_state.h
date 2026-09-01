@@ -47,6 +47,39 @@ static inline int32_t cpu_wram_offset(uint8 bank, uint16 addr) {
     return -1;
 }
 
+/*
+ * Is pc24 a plausible place to RESUME execution?
+ *
+ * A frame-model host keeps its own guest execution cursor between frames, and
+ * that cursor is host state no guest snapshot carries. When it is lost — a
+ * state load that skipped the game's extra chunk, a rollback restore before
+ * the residue carried it — the host resumes on whatever was left behind, and
+ * the guest wedges somewhere unrelated with no error. Measured in this port
+ * as a netplay follower sitting at reset PPU state (inidisp=$80) while its
+ * sim tick kept advancing. psxrecomp guards the same cursor with
+ * rb_resume_pc_ok(); this is the SNES shape of that test.
+ *
+ * Deliberately permissive: it rejects what CANNOT be code, not everything
+ * unusual. A false reject would refuse a legitimate resume, which is worse
+ * than the miss it is trying to catch.
+ */
+static inline int cpu_pc24_resumable(uint32_t pc24) {
+    uint8 bank = (uint8)((pc24 >> 16) & 0xFF);
+    uint16 addr = (uint16)(pc24 & 0xFFFF);
+    if (pc24 == 0)
+        return 0;                       /* the "never booted" sentinel */
+    if (cpu_wram_offset(bank, addr) >= 0)
+        return 1;                       /* WRAM and its low-bank mirrors */
+    /* MMIO / expansion window is readable but is not code. */
+    if (addr >= 0x2000 && addr < 0x6000 &&
+        (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)))
+        return 0;
+    /* The vector table itself is data; resuming there means executing it. */
+    if ((bank == 0x00 || bank == 0x80) && addr >= 0xFFE0)
+        return 0;
+    return 1;                           /* ROM window, SRAM window, HiROM */
+}
+
 /* ── Register / flag state ─────────────────────────────────────────────── */
 
 typedef struct CpuState {
