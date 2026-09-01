@@ -60,7 +60,7 @@ repositories are authoritative for supported ROM regions and revisions.
 | MSU-1 | **Supported, opt-in** | The extension's registers, data channel, and PCM audio are implemented, but a game must integrate an MSU-1 driver and pack selection. See [`docs/MSU1.md`](docs/MSU1.md). |
 | ExLoROM, ExHiROM, and other custom mappings | **Not supported yet** | The current mapper layer handles standard LoROM, HiROM, SA-1, Cx4, and Super FX layouts only. |
 | Nintendo DSP-2, DSP-3, and DSP-4 | **Not supported yet** | These cartridge DSP firmwares use the same NEC family interface but need per-title board/firmware validation before being advertised. |
-| S-DD1 | **Not supported yet** | No decompression chip or cartridge mapping support is present. |
+| S-DD1 | **Experimental** | Cartridge register/MMC mapping and decompression hooks are present for Star Ocean validation. Treat as title-gated until provenance, savestate, and cross-title behavior are reviewed. |
 | SPC7110 and SPC7110 RTC | **Not supported yet** | No data-decompression, mapping, or RTC model is present. |
 | OBC-1, ST010, ST011, ST018, and S-RTC | **Not supported yet** | Their register windows and coprocessor behavior are not modeled. |
 | BS-X, Sufami Turbo, and Super Game Boy cartridge adapters | **Not supported yet** | Their special cartridge or subsystem behavior is outside the current mapper model. |

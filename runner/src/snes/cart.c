@@ -10,6 +10,7 @@
 #include "cx4.h"
 #include "dsp1.h"
 #include "sa1.h"
+#include "sdd1.h"
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr);
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
@@ -33,6 +34,7 @@ void cart_free(Cart* cart) {
   cx4_destroy(cart->cx4);
   dsp1_destroy(cart->dsp1);
   sa1_destroy(cart->sa1);
+  sdd1_destroy(cart->sdd1);
   free(cart->rom);
   free(cart->ram);
   free(cart);
@@ -44,6 +46,7 @@ void cart_reset(Cart* cart) {
   if (cart->cx4) cx4_reset(cart->cx4);
   if (cart->dsp1) dsp1_reset(cart->dsp1);
   if (cart->sa1) sa1_reset(cart->sa1);
+  if (cart->sdd1) sdd1_reset(cart->sdd1);
 }
 
 void cart_saveload(Cart *cart, SaveLoadInfo *sli) {
@@ -53,6 +56,7 @@ void cart_saveload(Cart *cart, SaveLoadInfo *sli) {
    * mid-game state must carry. */
   if (cart->cx4) cx4_saveload(cart->cx4, sli);
   if (cart->dsp1) dsp1_saveload(cart->dsp1, sli);
+  if (cart->sdd1) sdd1_saveload(cart->sdd1, sli);
   if (cart->sa1) {
     sli->func(sli, &cart->cpuBusAddress, sizeof(cart->cpuBusAddress));
     sa1_saveload(cart->sa1, sli);
@@ -68,6 +72,8 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   cart->dsp1 = NULL;
   sa1_destroy(cart->sa1);
   cart->sa1 = NULL;
+  sdd1_destroy(cart->sdd1);
+  cart->sdd1 = NULL;
   cart->type = type;
   if(cart->rom != NULL) free(cart->rom);
   if(cart->ram != NULL) free(cart->ram);
@@ -97,6 +103,9 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   if (type == CART_SA1)
     cart->sa1 = sa1_create(cart->rom, cart->romSize,
                            cart->ram, cart->ramSize);
+  if (type == CART_SDD1)
+    cart->sdd1 = sdd1_create(cart->rom, cart->romSize,
+                             cart->ram, cart->ramSize);
 }
 
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
@@ -105,6 +114,7 @@ void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
    * up to the CPU's clock before anything observes its state. */
   if (cart && cart->cx4) cx4_sync(cart->cx4, master_clock);
   if (cart && cart->dsp1) dsp1_sync(cart->dsp1, master_clock);
+  if (cart && cart->sdd1) sdd1_sync(cart->sdd1, master_clock);
   if (cart && cart->sa1) {
     sa1_set_cpu_bus_address(cart->sa1, cart->cpuBusAddress);
     sa1_sync(cart->sa1, master_clock);
@@ -170,6 +180,22 @@ uint8_t *cart_getRomPtr(Cart *cart, uint8_t bank, uint16_t adr) {
       off = ((uint32_t)canonical << 15) | (adr & 0x7fff);
       break;
     }
+    case CART_SDD1: {
+      if (cart_is_sdd1_window(cart, bank, adr))
+        return NULL;
+      if (bank >= 0xc0) {
+        uint32_t mmc_off = sdd1_mmc_offset(cart->sdd1,
+            ((uint32_t)bank << 16) | adr);
+        return mmc_off == UINT32_MAX ? NULL : &cart->rom[mmc_off % cart->romSize];
+      }
+      uint32_t lorom_off = sdd1_lorom_window_offset(cart->sdd1, bank, adr);
+      if (lorom_off != UINT32_MAX)
+        return &cart->rom[lorom_off % cart->romSize];
+      uint8_t canonical = bank & 0x7f;
+      if (adr < 0x8000 && canonical < 0x40) return NULL;
+      off = ((uint32_t)canonical << 15) | (adr & 0x7fff);
+      break;
+    }
     case CART_SA1:
       return sa1_cpu_memory_ptr(cart->sa1, bank, adr);
     default:
@@ -206,6 +232,18 @@ uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
       if (cx4_owns_bus(cart->cx4) && (bank & 0x7f) == 0x00 &&
           adr >= 0xffc0)
         return cx4_read_vector_override(cart->cx4, adr);
+      return cart_readLorom(cart, bank, adr);
+    case CART_SDD1:
+      cart_sync_coprocessors(cart, cart_master_clock(cart));
+      if (cart_is_sdd1_window(cart, bank, adr))
+        return sdd1_read(cart->sdd1, adr);
+      if (bank >= 0xc0 && adr >= 0x8000 && cart->sdd1) {
+        uint8_t data;
+        if (sdd1_cpu_read(cart->sdd1, ((uint32_t)bank << 16) | adr, &data))
+          return data;
+      }
+      if (bank >= 0xc0 && cart->sdd1)
+        return sdd1_mmc_read(cart->sdd1, ((uint32_t)bank << 16) | adr);
       return cart_readLorom(cart, bank, adr);
     case CART_SUPERFX:
       if ((bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) &&
@@ -252,6 +290,13 @@ void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
       cart_sync_coprocessors(cart, cart_master_clock(cart));
       if (cart_is_cx4_window(cart, bank, adr))
         cx4_write(cart->cx4, adr, val);
+      else
+        cart_writeLorom(cart, bank, adr, val);
+      break;
+    case CART_SDD1:
+      cart_sync_coprocessors(cart, cart_master_clock(cart));
+      if (cart_is_sdd1_window(cart, bank, adr))
+        sdd1_write(cart->sdd1, adr, val);
       else
         cart_writeLorom(cart, bank, adr, val);
       break;

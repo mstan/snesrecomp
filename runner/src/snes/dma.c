@@ -10,6 +10,7 @@
 #include "dma.h"
 #include "snes.h"
 #include "ppu.h"
+#include "sdd1.h"
 #include "../debug_server.h"
 
 extern Ppu *g_ppu;
@@ -34,7 +35,8 @@ static const int transferLength[8] = {
   1, 2, 2, 4, 4, 4, 2, 4
 };
 
-static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bool fromB);
+static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank,
+                             uint8_t bAdr, bool fromB, int channel);
 
 Dma* dma_init(Snes* snes) {
   /* calloc (not malloc): dma_saveload hashes the raw struct region incl.
@@ -233,7 +235,8 @@ void dma_doDma(Dma* dma) {
   // do channel i
   dma_transferByte(
     dma, dma->channel[i].aAdr, dma->channel[i].aBank,
-    dma->channel[i].bAdr + bAdrOffsets[dma->channel[i].mode][dma->channel[i].offIndex++], dma->channel[i].fromB
+    dma->channel[i].bAdr + bAdrOffsets[dma->channel[i].mode][dma->channel[i].offIndex++],
+    dma->channel[i].fromB, i
   );
   dma->channel[i].offIndex &= 3;
   dma->dmaTimer += 6; // 8 cycles for each byte taken, -2 for this cycle
@@ -248,7 +251,8 @@ void dma_doDma(Dma* dma) {
   }
 }
 
-static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bool fromB) {
+static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank,
+                             uint8_t bAdr, bool fromB, int channel) {
   // TODO: invalid writes:
   //   accesing b-bus via a-bus gives open bus,
   //   $2180-$2183 while accessing ram via a-bus open busses $2180-$2183
@@ -256,7 +260,16 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
   if(fromB) {
     snes_write(dma->snes, (aBank << 16) | aAdr, snes_readBBus(dma->snes, bAdr));
   } else {
-    uint8_t val = snes_read(dma->snes, (aBank << 16) | aAdr);
+    uint8_t val;
+    Cart* cart = dma->snes->cart;
+    if (cart_has_sdd1(cart) && channel >= 0 && channel < 8 &&
+        sdd1_dma_active(cart->sdd1, channel)) {
+      val = sdd1_dma_get_byte(cart->sdd1, channel);
+      debug_server_on_reg_write((uint16_t)(0x2100u + bAdr), val);
+      snes_writeBBus(dma->snes, bAdr, val);
+      return;
+    }
+    val = snes_read(dma->snes, (aBank << 16) | aAdr);
     debug_server_on_reg_write((uint16_t)(0x2100u + bAdr), val);
     snes_writeBBus(dma->snes, bAdr, val);
   }
@@ -388,9 +401,9 @@ void dma_doHdma(Dma* dma) {
       for(int j = 0; j < len; j++) {
         uint8_t b = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode][j]);
         if(ch->indirect) {
-          dma_transferByte(dma, ch->size++, ch->indBank, b, false);
+          dma_transferByte(dma, ch->size++, ch->indBank, b, false, i);
         } else {
-          dma_transferByte(dma, ch->tableAdr++, ch->aBank, b, false);
+          dma_transferByte(dma, ch->tableAdr++, ch->aBank, b, false, i);
         }
       }
     }
@@ -437,6 +450,17 @@ void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
   if(!hdma) {
     dma->dmaBusy = val;
     dma->dmaTimer += dma->dmaBusy ? 16 : 0; // 12-24 cycle overhead for entire dma transfer
+    if (cart_has_sdd1(dma->snes ? dma->snes->cart : NULL)) {
+      for (int i = 0; i < 8; i++) {
+        if (!(val & (1 << i)))
+          continue;
+        const DmaChannel *ch = &dma->channel[i];
+        if (ch->fromB || ch->aBank < 0xc0)
+          continue;
+        sdd1_dma_init(dma->snes->cart->sdd1, i,
+                      ((uint32_t)ch->aBank << 16) | ch->aAdr, ch->size);
+      }
+    }
     if (val && g_ppu) {
       for (int i = 0; i < 8; i++) {
         if (!(val & (1 << i)))
