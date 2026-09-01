@@ -99,6 +99,8 @@ static struct {
     uint32_t snap_interval;
     int      prediction_cap;
     int      force_invent_slot;  /* validation knob one-shot; -1 = idle */
+    /* Poisoned-snapshot bound (psxrecomp g_bl_fork_cap, §83). 0 = none. */
+    uint32_t fork_cap;
 } g_rb;
 
 /* ── env ─────────────────────────────────────────────────────────────── */
@@ -252,6 +254,29 @@ static int rb_snap_floor(uint32_t want, uint32_t *out)
     if (!g_rb.snaps || rbe_snap_ring_count(g_rb.snaps) == 0)
         return 0;
     oldest = rbe_snap_ring_oldest_tick(g_rb.snaps);
+    /* A snapshot that already produced a baseline fork will produce the same
+     * fork every time it is loaded. psxrecomp bounds every later episode
+     * below it (g_bl_fork_cap, §83); without that bound one bad episode
+     * repeats forever — measured here as a single fork at tick 43 becoming
+     * 140 aborted episodes in one match, each reloading the same poison. */
+    if (g_rb.fork_cap > 0u) {
+        if (g_rb.fork_cap <= oldest) {
+            /* The poisoned snapshot has aged out of the ring, so there is
+             * nothing left to avoid. Keeping the cap here refuses every
+             * future episode FOREVER, because the only thing that lifts it
+             * is a commit and no episode can open to produce one — measured
+             * with a forced fork: 73 mispredicts, 0 episodes, rollback
+             * silently off for the rest of the match. A cap that outlives
+             * its subject is worse than no cap. */
+            fprintf(stderr,
+                    "snes_netplay: RB fork cap %u aged out (oldest snap %u) "
+                    "— lifted\n",
+                    (unsigned)g_rb.fork_cap, (unsigned)oldest);
+            g_rb.fork_cap = 0u;
+        } else if (want >= g_rb.fork_cap) {
+            want = g_rb.fork_cap - 1u;
+        }
+    }
     if (want < oldest)
         return 0;
     for (t = want; ; --t) {
@@ -473,6 +498,7 @@ int snes_netplay_rb_start(void)
 
     snes_netplay_rb_shutdown();
     g_rb.force_invent_slot = -1;
+    g_rb.fork_cap = 0u;
 
     /* Session-settled P (recomp-ui: P = 4 + D) when the host bound one;
      * SNES_RB_PREDICTION remains the operator override. A P below the delay
@@ -792,6 +818,17 @@ static void rb_commit_episode(void)
 
     rnet_rb_on_post_match(g_rb.rb);
     rnet_rb_commit_promote_sealed(g_rb.rb);
+    /* Both peers just agreed on a replayed span, and rb_run_replay re-keyed
+     * the ring onto that timeline. Whatever was poisoned before is gone, so
+     * the cap must lift — a ratchet that only ever tightens would walk the
+     * usable snapshot window down to nothing over a long match. */
+    if (g_rb.fork_cap) {
+        fprintf(stderr, "snes_netplay: RB fork cap lifted (episode %u "
+                "committed through %u)\n",
+                (unsigned)g_rb.corr.epoch_id,
+                (unsigned)g_rb.corr.target_tick);
+        g_rb.fork_cap = 0u;
+    }
     /* Ticks through the target are now agreed; drop the live-invent
      * FRAME_COMMITs that preceded the correction so the watermark restarts
      * from a tick both peers actually ran. */
@@ -873,6 +910,19 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
     if (target < mismatch_tick)
         target = mismatch_tick;
 
+    /* recomp-net tracks arrived seal rows in a 64-bit per-slot mask, so an
+     * offset of 64 or more can never be credited and the exchange could never
+     * complete. A fork cap can push `load` well behind the mismatch, so this
+     * is reachable in practice; refuse loudly rather than open an episode the
+     * protocol cannot finish. */
+    if (target >= load && (target - load) >= 64u) {
+        fprintf(stderr,
+                "snes_netplay: RB episode refused — span %u..%u exceeds the "
+                "64-row seal mask (fork_cap=%u)\n",
+                (unsigned)load, (unsigned)target, (unsigned)g_rb.fork_cap);
+        return 0;
+    }
+
     memset(&g_rb.corr, 0, sizeof(g_rb.corr));
     g_rb.corr.epoch_id = as_initiator
                              ? (((++g_rb.epoch_seq) << 1) |
@@ -940,9 +990,29 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
  * link the race is merely usually lost, which is why it read as an occasional
  * desync rather than a broken mechanism.
  */
+/* Validation knob (SNES_RB_FORCE_FORK=N): declare every Nth baseline exchange
+ * a fork even though the digests agree. The fork CAP and its recovery are
+ * otherwise unreachable in testing — real forks stopped happening once replay
+ * became deterministic — and an untested recovery path is the one that fails
+ * in a match. Nothing about the guest is touched; only the verdict is. */
+static int rb_force_fork_every(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("SNES_RB_FORCE_FORK");
+        cached = (v && v[0]) ? atoi(v) : 0;
+        if (cached < 0) cached = 0;
+        if (cached)
+            fprintf(stderr, "rbe: FORCE FORK every %d baseline exchange "
+                    "(validation only)\n", cached);
+    }
+    return cached;
+}
+
 static void rb_baseline_try_compare(void)
 {
     const SnesStateDigestParts *mine = &g_rb.local_base;
+    int forced = 0;
 
     if (!g_rb.local_base_valid || !g_rb.peer_base_valid)
         return;
@@ -951,7 +1021,20 @@ static void rb_baseline_try_compare(void)
         return;
     g_rb.peer_base_valid = 0;   /* one verdict per exchange */
 
-    if (mine->master == g_rb.peer_base_master)
+    {
+        const int every = rb_force_fork_every();
+        if (every > 0) {
+            static unsigned long n;
+            if ((++n % (unsigned long)every) == 0ul) {
+                forced = 1;
+                fprintf(stderr, "rbe: forced fork verdict at load=%u "
+                        "(digests actually agree)\n",
+                        (unsigned)g_rb.corr.load_tick);
+            }
+        }
+    }
+
+    if (mine->master == g_rb.peer_base_master && !forced)
         return;
 
     /* The two peers do not agree on the state they are about to replay from,
@@ -968,6 +1051,12 @@ static void rb_baseline_try_compare(void)
     else
         g_rb.fork_partition = "other";
     g_rb.desync_count++;
+    if (g_rb.fork_cap == 0u || g_rb.corr.load_tick < g_rb.fork_cap) {
+        g_rb.fork_cap = g_rb.corr.load_tick;
+        fprintf(stderr,
+                "snes_netplay: RB fork cap — next load must be < %u\n",
+                (unsigned)g_rb.fork_cap);
+    }
     fprintf(stderr,
             "snes_netplay: RB BASELINE FORK tick=%u partition=%s "
             "local=%08x peer=%08x\n",
@@ -1177,8 +1266,27 @@ static void rb_pump_episode(void)
         break;
     case kRbTipHold:
         if (g_rb.sim >
-            g_rb.corr.target_tick + rnet_rb_get_tip_runway(g_rb.rb))
+            g_rb.corr.target_tick + rnet_rb_get_tip_runway(g_rb.rb)) {
             rb_episode_clear();
+        } else if (rb_stage_expired()) {
+            /* Sealing and Verifying were the only stages with a watchdog, so
+             * a tip-hold that never met its exit condition wedged silently —
+             * and while the stage is not Idle rb_begin_episode refuses EVERY
+             * new episode, which disables rollback without a single line in
+             * the log. psxrecomp's equivalent is poll_replay_stall; the shape
+             * differs because a SNES replay runs inline, but the rule is the
+             * same: no non-idle stage may sit without a bound.
+             *
+             * Released, not aborted: this episode already committed, and the
+             * peer has moved on. Sending it an ABORT would retract work both
+             * sides agreed on. */
+            fprintf(stderr,
+                    "snes_netplay: RB tip-hold expired epoch=%u target=%u "
+                    "sim=%u — releasing\n",
+                    (unsigned)g_rb.corr.epoch_id,
+                    (unsigned)g_rb.corr.target_tick, (unsigned)g_rb.sim);
+            rb_episode_clear();
+        }
         break;
     default:
         break;
