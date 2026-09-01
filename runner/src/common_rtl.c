@@ -844,6 +844,74 @@ size_t RtlRollbackSnapshotBound(void) {
   return (1u << 20) + sizeof(RtlRollbackResidue);
 }
 
+/* ── resync hooks ─────────────────────────────────────────────────────────
+ * Each group of host state that a rollback restore must put back is owned by
+ * a named pair, in the file that owns the state. psxrecomp does the same with
+ * its *_resync_after_restore() family; the point is that a subsystem author
+ * has an obvious place to look, and the roll-call below reads as a list of
+ * subsystems rather than a pile of field assignments. */
+
+/* APU pacing: how much guest time the SPC has been credited. Host accounting,
+ * so snes_saveload never carried it, but the guest polls APU ports and
+ * branches on what it reads. */
+static void rtl_apu_pace_resync_get(uint64_t *pace, uint64_t *last_sync,
+                                    uint64_t *last_master, uint64_t *frame_start,
+                                    uint64_t *main_cycles, uint8 *time_valid) {
+  *pace = g_apu_pace_cycles_estimate;
+  *last_sync = g_apu_last_sync_cycles;
+  *last_master = g_apu_last_sync_master;
+  *frame_start = g_apu_frame_start_master;
+  *main_cycles = g_main_cpu_cycles_estimate;
+  *time_valid = g_apu_frame_time_valid ? 1u : 0u;
+}
+
+static void rtl_apu_pace_resync_set(uint64_t pace, uint64_t last_sync,
+                                    uint64_t last_master, uint64_t frame_start,
+                                    uint64_t main_cycles, uint8 time_valid) {
+  g_apu_pace_cycles_estimate = pace;
+  g_apu_last_sync_cycles = last_sync;
+  g_apu_last_sync_master = last_master;
+  g_apu_frame_start_master = frame_start;
+  g_main_cpu_cycles_estimate = main_cycles;
+  g_apu_frame_time_valid = time_valid != 0;
+}
+
+/* MMIO shadows: guest hardware state that happens to live in host globals
+ * rather than in the Snes struct, which is exactly why snes_saveload missed
+ * it. g_memsel ($420D FastROM) decides 6 vs 8 master clocks per bus access in
+ * banks $80-FF, so losing it re-runs identical code for a different number of
+ * cycles. cosim_state.c already hashes it as guest state. */
+static void rtl_mmio_shadow_resync_get(uint8 *memsel, uint8 *hdmaen,
+                                       uint8 *apu_driving) {
+  *memsel = g_memsel;
+  *hdmaen = g_snesrecomp_last_hdmaen;
+  *apu_driving = (uint8)(g_interp_apu_driving ? 1 : 0);
+}
+
+static void rtl_mmio_shadow_resync_set(uint8 memsel, uint8 hdmaen,
+                                       uint8 apu_driving) {
+  g_memsel = memsel;
+  g_snesrecomp_last_hdmaen = hdmaen;
+  g_interp_apu_driving = apu_driving ? 1 : 0;
+}
+
+/*
+ * THE CONTRACT. Everything a replayed frame reads must be restored here, or
+ * the replay burns different cycles than the frame it replaces and the peers
+ * fork. Guest memory is NOT the boundary: the defect that cost the most in
+ * this port was s_refresh_phase, a sub-scanline remainder in the DRAM refresh
+ * tax, with WRAM byte-identical throughout.
+ *
+ * Adding host state to the frame path? Add it to a resync pair above (or to
+ * the owning subsystem's header, as interp_bridge and common_cpu_infra do),
+ * then to BOTH functions below, then bump RTL_RB_RESIDUE_VERSION. The
+ * _Static_assert on sizeof exists to stop that being silent.
+ *
+ * The check is mechanical, not a code review: SNESRECOMP_RB_PROBE=25:3 runs
+ * save/replay/restore/replay in one process and reports the first divergence,
+ * and SNESRECOMP_RB_PROBE_STATICS=1 names the carrier by address when it
+ * finds one. Run it after touching anything in the frame path.
+ */
 static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
   memset(r, 0, sizeof(*r));
   r->magic = RTL_RB_RESIDUE_MAGIC;
@@ -851,19 +919,17 @@ static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
   r->cpu = g_cpu;
   apu_port_sched_save(g_snes->apu, &r->apu_port);
   r->beam_master_last = g_snes->beamMasterLast;
-  r->apu_pace_cycles_estimate = g_apu_pace_cycles_estimate;
-  r->apu_last_sync_cycles = g_apu_last_sync_cycles;
-  r->apu_last_sync_master = g_apu_last_sync_master;
-  r->apu_frame_start_master = g_apu_frame_start_master;
-  r->main_cpu_cycles_estimate = g_main_cpu_cycles_estimate;
   r->frame_counter = snes_frame_counter;
-  r->apu_frame_time_valid = g_apu_frame_time_valid ? 1u : 0u;
+  rtl_apu_pace_resync_get(&r->apu_pace_cycles_estimate,
+                          &r->apu_last_sync_cycles, &r->apu_last_sync_master,
+                          &r->apu_frame_start_master,
+                          &r->main_cpu_cycles_estimate,
+                          &r->apu_frame_time_valid);
+  rtl_mmio_shadow_resync_get(&r->memsel, &r->last_hdmaen,
+                             &r->interp_apu_driving);
+  snes_refresh_state_get(&r->refresh_phase, &r->refresh_charged_upto);
   assert(interp_bridge_rb_state_size() <= sizeof(r->interp));
   interp_bridge_rb_state_save(r->interp);
-  r->memsel = g_memsel;
-  r->last_hdmaen = g_snesrecomp_last_hdmaen;
-  r->interp_apu_driving = (uint8)(g_interp_apu_driving ? 1 : 0);
-  snes_refresh_state_get(&r->refresh_phase, &r->refresh_charged_upto);
 }
 
 static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
@@ -872,18 +938,14 @@ static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
   g_cpu.ram = ram_ptr; /* host pointer, not simulation state */
   apu_port_sched_restore(g_snes->apu, &r->apu_port);
   g_snes->beamMasterLast = r->beam_master_last;
-  g_apu_pace_cycles_estimate = r->apu_pace_cycles_estimate;
-  g_apu_last_sync_cycles = r->apu_last_sync_cycles;
-  g_apu_last_sync_master = r->apu_last_sync_master;
-  g_apu_frame_start_master = r->apu_frame_start_master;
-  g_main_cpu_cycles_estimate = r->main_cpu_cycles_estimate;
   snes_frame_counter = r->frame_counter;
-  g_apu_frame_time_valid = r->apu_frame_time_valid != 0;
-  interp_bridge_rb_state_load(r->interp);
-  g_memsel = r->memsel;
-  g_snesrecomp_last_hdmaen = r->last_hdmaen;
-  g_interp_apu_driving = r->interp_apu_driving ? 1 : 0;
+  rtl_apu_pace_resync_set(r->apu_pace_cycles_estimate, r->apu_last_sync_cycles,
+                          r->apu_last_sync_master, r->apu_frame_start_master,
+                          r->main_cpu_cycles_estimate, r->apu_frame_time_valid);
+  rtl_mmio_shadow_resync_set(r->memsel, r->last_hdmaen,
+                             r->interp_apu_driving);
   snes_refresh_state_set(r->refresh_phase, r->refresh_charged_upto);
+  interp_bridge_rb_state_load(r->interp);
 }
 
 size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {

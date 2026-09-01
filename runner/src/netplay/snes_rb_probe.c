@@ -192,7 +192,52 @@ void snes_rb_probe_after_frame(uint32_t inputs)
         return;
     }
 
-    /* Round-trip check first: if restoring the snapshot does not reproduce
+    /* Symmetry check (SNESRECOMP_RB_PROBE_SYMMETRY=1): re-saving immediately
+     * after a restore should reproduce the same bytes, so anything the
+     * capture side records and the apply side forgets shows up as a differing
+     * byte WITHOUT needing a replay to expose it — the mechanical enforcement
+     * of the resync contract in common_rtl.c, and the offset says whether the
+     * carrier sits in the guest blob or the host residue appended after it.
+     *
+     * Opt-in, because there is one INTENTIONAL asymmetry it cannot tell from
+     * a bug: RtlRollbackLoadFromMemory deliberately lifts the DSP output ring
+     * out and keeps the live one, since that ring belongs to the audio
+     * consumer and must not rewind. The consumer thread moves it between the
+     * two saves, so a hit inside the ring is expected and intermittent.
+     * Left on by default it would cry wolf, which is worse than not checking
+     * — read a guest-blob hit with that in mind, and trust a residue-tail hit
+     * completely. */
+    if (getenv("SNESRECOMP_RB_PROBE_SYMMETRY")) {
+        uint8_t *reblob = (uint8_t *)malloc(bound);
+        if (reblob) {
+            size_t relen = 0;
+            if (RtlRollbackLoadFromMemory(snap, len))
+                relen = RtlRollbackSaveToMemory(reblob, bound);
+            if (relen != len) {
+                fprintf(stderr, "rb_probe: ASYMMETRIC frame=%d — re-save is "
+                        "%zu bytes, original %zu\n",
+                        snes_frame_counter, relen, len);
+            } else {
+                size_t k;
+                for (k = 0; k < len; ++k) {
+                    if (snap[k] == reblob[k])
+                        continue;
+                    fprintf(stderr,
+                            "rb_probe: ASYMMETRIC frame=%d — byte +%zu of %zu "
+                            "differs after restore (%02X->%02X, %s). A field "
+                            "is captured but not applied; see the resync "
+                            "contract in common_rtl.c\n",
+                            snes_frame_counter, k, len, snap[k], reblob[k],
+                            (len - k) <= 1200u ? "host residue tail"
+                                               : "guest blob");
+                    break;
+                }
+            }
+            free(reblob);
+        }
+    }
+
+    /* Round-trip check: if restoring the snapshot does not reproduce
      * the state it was taken from, the replay experiment below is measuring
      * a lossy save, not a nondeterministic frame. */
     {
