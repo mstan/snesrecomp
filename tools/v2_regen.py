@@ -374,6 +374,16 @@ def _emit_dispatch_table(out_dir: pathlib.Path, parsed,
         f"(unsigned)(sizeof(g_dispatch_table) / sizeof(g_dispatch_table[0]));"
     )
     disp_lines.append('')
+    disp_lines.append('const RamRoutineGuard g_ram_routine_guards[] = {')
+    disp_lines.append('    { 0xFFFFFFFFu, 0u, 0u },')
+    disp_lines.append('};')
+    disp_lines.append('')
+    disp_lines.append(
+        'const unsigned g_ram_routine_guard_count = '
+        '(unsigned)(sizeof(g_ram_routine_guards) / '
+        'sizeof(g_ram_routine_guards[0]));'
+    )
+    disp_lines.append('')
     write_if_changed(disp_path, '\n'.join(disp_lines) + '\n')
     print(f"  emitted dispatch table with {len(sorted_pc24s)} entries -> {disp_path}")
 
