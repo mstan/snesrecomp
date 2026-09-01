@@ -101,6 +101,8 @@ static struct {
     int      force_invent_slot;  /* validation knob one-shot; -1 = idle */
     /* Poisoned-snapshot bound (psxrecomp g_bl_fork_cap, §83). 0 = none. */
     uint32_t fork_cap;
+    /* Degrade mode: stop predicting remote input until this tick. */
+    uint32_t lockstep_until;
 } g_rb;
 
 /* ── env ─────────────────────────────────────────────────────────────── */
@@ -456,6 +458,86 @@ static uint64_t rb_gate_replay_ticks(void *ctx)
     return g_rb.resim_ticks;
 }
 
+/*
+ * Degrade rather than desync (psxrecomp lockstep_no_invent).
+ *
+ * Predicting remote input is only worth doing while predictions are usually
+ * right. Once the peers have demonstrably forked, continuing to invent means
+ * simulating forward from a state we already know is wrong — so stop, wait
+ * for the real rows, and pay the latency instead. The engine already carries
+ * the gate; the SNES host simply never supplied it, and so had nothing
+ * between "keep predicting" and "abort".
+ *
+ * SNES_RB_LOCKSTEP=1 pins it on, which is the operator fallback for a title
+ * or a link that cannot hold prediction at all.
+ */
+#define RB_LOCKSTEP_TICKS_DEFAULT 60u
+
+static uint32_t rb_lockstep_ticks(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = rb_env_int("SNES_RB_LOCKSTEP_TICKS",
+                            (int)RB_LOCKSTEP_TICKS_DEFAULT, 0, 600);
+    return (uint32_t)cached;
+}
+
+static int rb_lockstep_pinned(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("SNES_RB_LOCKSTEP");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+        if (cached)
+            fprintf(stderr, "rbe: LOCKSTEP pinned on — remote input is never "
+                            "predicted (SNES_RB_LOCKSTEP)\n");
+    }
+    return cached;
+}
+
+/* Called wherever a fork is proven. Idempotent; extends an active window. */
+static void rb_enter_lockstep(const char *why)
+{
+    uint32_t until;
+    if (rb_lockstep_ticks() == 0u)
+        return;
+    until = g_rb.sim + rb_lockstep_ticks();
+    if (until <= g_rb.lockstep_until)
+        return;
+    fprintf(stderr,
+            "snes_netplay: RB lockstep for %u ticks (through %u) — %s\n",
+            (unsigned)rb_lockstep_ticks(), (unsigned)until, why);
+    g_rb.lockstep_until = until;
+}
+
+/* Pure: the scheduler only asks when it is about to invent, so expiry cannot
+ * live here — with no remote misses the window would lapse unobserved and the
+ * "released" line would never print. rb_lockstep_tick() owns the transition. */
+static uint8_t rb_gate_lockstep_no_invent(void *ctx)
+{
+    (void)ctx;
+    if (rb_lockstep_pinned())
+        return 1u;
+    return (g_rb.lockstep_until != 0u && g_rb.sim < g_rb.lockstep_until) ? 1u
+                                                                        : 0u;
+}
+
+/* Once per tick, so entry and release are symmetric and both always logged. */
+static void rb_lockstep_tick(void)
+{
+    if (g_rb.lockstep_until == 0u || g_rb.sim < g_rb.lockstep_until)
+        return;
+    fprintf(stderr, "snes_netplay: RB lockstep released at %u — predicting "
+            "again\n", (unsigned)g_rb.sim);
+    g_rb.lockstep_until = 0u;
+}
+
+static const char *rb_gate_lockstep_tag(void *ctx)
+{
+    (void)ctx;
+    return rb_lockstep_pinned() ? "lockstep_pinned" : "desync_cooldown";
+}
+
 static void rb_bind_sched(void)
 {
     RbeSchedBridge br;
@@ -473,8 +555,11 @@ static void rb_bind_sched(void)
     br.gates.tip_holding = &rb_gate_tip_holding;
     br.gates.episode_count = &rb_gate_episode_count;
     br.gates.replay_ticks_total = &rb_gate_replay_ticks;
-    /* Media / lockstep gates stay NULL: the SNES host has no FMV path, so
-     * invent is never held for media and auto-D always samples. */
+    br.gates.lockstep_no_invent = &rb_gate_lockstep_no_invent;
+    br.gates.lockstep_stall_tag = &rb_gate_lockstep_tag;
+    br.gates.desync_hold = &rb_gate_lockstep_no_invent;   /* tag only */
+    /* Media gates stay NULL: the SNES host has no FMV path, so invent is
+     * never held for media and auto-D always samples. */
     rbe_sched_bind(&br);
 }
 
@@ -499,6 +584,7 @@ int snes_netplay_rb_start(void)
     snes_netplay_rb_shutdown();
     g_rb.force_invent_slot = -1;
     g_rb.fork_cap = 0u;
+    g_rb.lockstep_until = 0u;
 
     /* Session-settled P (recomp-ui: P = 4 + D) when the host bound one;
      * SNES_RB_PREDICTION remains the operator override. A P below the delay
@@ -876,7 +962,19 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
         if (!rb_snap_floor(mismatch_tick, &load)) {
             /* No snapshot reaches back that far. Refusing is the honest
              * outcome — loading a different tick would resim a timeline
-             * neither peer ran. */
+             * neither peer ran — but refusing SILENTLY is not: this path
+             * swallowed every episode while the fork cap was wedged, and the
+             * only symptom was rollback quietly not happening. Say which
+             * bound stopped it. */
+            fprintf(stderr,
+                    "snes_netplay: RB episode refused at mismatch=%u — no "
+                    "snapshot in reach (ring oldest=%u, confirmed through=%u, "
+                    "fork_cap=%u)\n",
+                    (unsigned)mismatch_tick,
+                    (unsigned)(g_rb.snaps && rbe_snap_ring_count(g_rb.snaps)
+                                   ? rbe_snap_ring_oldest_tick(g_rb.snaps) : 0u),
+                    (unsigned)snes_netplay_rb_confirmed_through(),
+                    (unsigned)g_rb.fork_cap);
             rbe_sched_note_mispredict(g_rb.sim - mismatch_tick);
             return 0;
         }
@@ -1062,6 +1160,7 @@ static void rb_baseline_try_compare(void)
             "local=%08x peer=%08x\n",
             (unsigned)g_rb.corr.load_tick, g_rb.fork_partition,
             (unsigned)mine->master, (unsigned)g_rb.peer_base_master);
+    rb_enter_lockstep("baseline fork");
     rb_episode_abort(RNET_RB_ABORT_CLASS_ABORT, "baseline digest fork");
 }
 
@@ -1257,6 +1356,7 @@ static void rb_pump_episode(void)
                         (unsigned)g_rb.corr.target_tick, (unsigned)local,
                         (unsigned)g_rb.peer_post_digest);
                 rnet_rb_on_post_diverge(g_rb.rb);
+                rb_enter_lockstep("post fork");
                 rb_episode_abort(RNET_RB_ABORT_CLASS_ABORT, "post digest fork");
             }
         } else if (rb_stage_expired()) {
@@ -1567,6 +1667,7 @@ void snes_netplay_rb_finish_frame(void)
     g_rb.sim++;
     if (s)
         rnet_session_set_sim_tick(s, g_rb.sim);
+    rb_lockstep_tick();
 
     /* A stuck watermark whose next tick aged out of the ring is not a fork. */
     (void)rbe_hc_heal_stale_gap(&g_rb.hc);
@@ -1582,6 +1683,23 @@ uint32_t snes_netplay_rb_invent_count(void) { return g_rb.ih.invent_count; }
 uint32_t snes_netplay_rb_promote_count(void) { return g_rb.ih.promote_count; }
 uint64_t snes_netplay_rb_resim_ticks(void) { return g_rb.resim_ticks; }
 uint32_t snes_netplay_rb_desync_count(void) { return g_rb.desync_count; }
+
+/* psxrecomp exposes confirmed_frontier()/confirmed_remaining() over its input
+ * history: the last tick every seat has a wire-confirmed row for. snesrecomp
+ * already carries a STRONGER watermark and has all along — rnet_rb_resolved_
+ * through() is digest-agreed, not merely input-present — it simply was not
+ * exposed. These name it so the "how far back is it safe to rewind" question
+ * has an answer outside this file. */
+uint32_t snes_netplay_rb_confirmed_through(void)
+{
+    return g_rb.rb ? rnet_rb_resolved_through(g_rb.rb) : 0u;
+}
+
+uint32_t snes_netplay_rb_confirmed_remaining(void)
+{
+    uint32_t through = snes_netplay_rb_confirmed_through();
+    return (g_rb.sim > through) ? (g_rb.sim - through) : 0u;
+}
 
 int snes_netplay_rb_episode_active(void)
 {

@@ -46,8 +46,14 @@ env "${common[@]}" SNES_NET_SLOT=0 SNES_NET_INPUT_PLAYER=0 \
     SNES_RB_FORCE_FORK="${SNES_RB_FORCE_FORK:-0}" \
     "./$EXE_BIN" >"$OUT/initiator.log" 2>&1 &
 sleep 1
+# The validation knobs are pinned OFF here, not merely left unset: `env` does
+# not clear the caller's environment, so a knob exported for the initiator
+# would silently reach the follower too and both peers would inject. That
+# happened, and it made a lockstep test look like it had failed on the peer
+# being measured.
 env "${common[@]}" SNES_NET_SLOT=1 SNES_NET_INPUT_PLAYER=1 \
     SNES_NET_BIND=127.0.0.1:9701 SNES_NET_PEER=127.0.0.1:9700 \
+    SNES_RB_FORCE_MISPREDICT=0 SNES_RB_FORCE_FORK=0 \
     "./$EXE_BIN" >"$OUT/follower.log" 2>&1 &
 
 sleep "$SECS"

@@ -94,6 +94,14 @@ uint32_t snes_netplay_rb_invent_count(void);
 uint32_t snes_netplay_rb_promote_count(void);
 uint64_t snes_netplay_rb_resim_ticks(void);
 uint32_t snes_netplay_rb_desync_count(void);
+
+/* Last tick both peers have AGREED on (digest-confirmed), and how many ticks
+ * the local sim has run beyond it. The psxrecomp parity audit listed
+ * confirmed_frontier as absent here; it was not — this watermark existed and
+ * was already bounding the reconcile scan, it just had no name outside
+ * snes_netplay_rb.c. */
+uint32_t snes_netplay_rb_confirmed_through(void);
+uint32_t snes_netplay_rb_confirmed_remaining(void);
 int      snes_netplay_rb_episode_active(void);
 const char *snes_netplay_rb_stall_tag(void);
 /* Last observed digest fork: 1 if one has happened, with the partition name
