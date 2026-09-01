@@ -13,6 +13,7 @@
 #include "sdd1.h"
 
 extern uint32_t g_interp816_cur_pc;
+#include "sdd1.h"
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr);
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
@@ -107,6 +108,9 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   if (type == CART_SA1)
     cart->sa1 = sa1_create(cart->rom, cart->romSize,
                            cart->ram, cart->ramSize);
+  if (type == CART_SDD1)
+    cart->sdd1 = sdd1_create(cart->rom, cart->romSize,
+                             cart->ram, cart->ramSize);
 }
 
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
@@ -222,6 +226,22 @@ case CART_CX4: {
       off = ((uint32_t)canonical << 15) | (adr & 0x7fff);
       break;
     }
+    case CART_SDD1: {
+      if (cart_is_sdd1_window(cart, bank, adr))
+        return NULL;
+      if (bank >= 0xc0) {
+        uint32_t mmc_off = sdd1_mmc_offset(cart->sdd1,
+            ((uint32_t)bank << 16) | adr);
+        return mmc_off == UINT32_MAX ? NULL : &cart->rom[mmc_off % cart->romSize];
+      }
+      uint32_t lorom_off = sdd1_lorom_window_offset(cart->sdd1, bank, adr);
+      if (lorom_off != UINT32_MAX)
+        return &cart->rom[lorom_off % cart->romSize];
+      uint8_t canonical = bank & 0x7f;
+      if (adr < 0x8000 && canonical < 0x40) return NULL;
+      off = ((uint32_t)canonical << 15) | (adr & 0x7fff);
+      break;
+    }
     case CART_SA1:
       return sa1_cpu_memory_ptr(cart->sa1, bank, adr);
     default:
@@ -278,6 +298,18 @@ case CART_CX4:
        * for addresses below $8000 (e.g. bridge palette DMA source FD:5419
        * resolves to MMC offset $3D5419, not LoROM $1ED419) — using it corrupts
        * CGRAM palettes loaded from these banks. */
+      if (bank >= 0xc0 && cart->sdd1)
+        return sdd1_mmc_read(cart->sdd1, ((uint32_t)bank << 16) | adr);
+      return cart_readLorom(cart, bank, adr);
+    case CART_SDD1:
+      cart_sync_coprocessors(cart, cart_master_clock(cart));
+      if (cart_is_sdd1_window(cart, bank, adr))
+        return sdd1_read(cart->sdd1, adr);
+      if (bank >= 0xc0 && adr >= 0x8000 && cart->sdd1) {
+        uint8_t data;
+        if (sdd1_cpu_read(cart->sdd1, ((uint32_t)bank << 16) | adr, &data))
+          return data;
+      }
       if (bank >= 0xc0 && cart->sdd1)
         return sdd1_mmc_read(cart->sdd1, ((uint32_t)bank << 16) | adr);
       return cart_readLorom(cart, bank, adr);

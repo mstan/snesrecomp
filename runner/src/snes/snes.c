@@ -14,6 +14,7 @@
 #include "ppu.h"
 #include "cart.h"
 #include "joypad.h"
+#include "sdd1.h"
 #include "variables.h"
 #include "../common_rtl.h"
 #include "../debug_server.h"
@@ -854,6 +855,8 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
       dma_write(snes->dma, adr, val); // dma registers
       /* S-DD1 spies on DMA channel register writes */
       if (snes->cart && snes->cart->type == CART_SDD1 && snes->cart->sdd1)
+        sdd1_dma_channel_write(snes->cart->sdd1, adr, val);
+      if (cart_has_sdd1(snes->cart))
         sdd1_dma_channel_write(snes->cart->sdd1, adr, val);
     }
     if(adr >= 0x2100 && adr < 0x4400) {
