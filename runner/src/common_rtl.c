@@ -794,7 +794,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
  */
 
 #define RTL_RB_RESIDUE_MAGIC 0x53524252u /* 'RBRS' */
-#define RTL_RB_RESIDUE_VERSION 2u
+#define RTL_RB_RESIDUE_VERSION 4u
 
 typedef struct RtlRollbackResidue {
   uint32 magic;
@@ -814,6 +814,26 @@ typedef struct RtlRollbackResidue {
    * interp_bridge.h — without it a replayed frame burns a different number of
    * master cycles than the frame it replaces. */
   uint8    interp[1024];   /* sized against interp_bridge_rb_state_size() */
+  /* v3: guest hardware state that lives in host globals rather than in the
+   * Snes struct, so snes_saveload never carried it.
+   *   memsel        $420D FastROM select. bridge_region_speed charges 6 vs 8
+   *                 master clocks per bus access in banks $80-FF off this one
+   *                 bit, so a rewind that left it on the discarded timeline
+   *                 re-ran the identical code for a different number of
+   *                 cycles — which is exactly the observed divergence: hPos,
+   *                 apuCatchupCycles and autoJoyTimer move while guest memory
+   *                 stays byte-identical.
+   *   last_hdmaen   $420C shadow the raster journal reads.
+   *   interp_apu_driving  suppresses the per-touch APU catch-up.
+   * cosim_state.c already hashes g_memsel as guest state; the rollback path
+   * simply never did. */
+  uint8    memsel;
+  uint8    last_hdmaen;
+  uint8    interp_apu_driving;
+  uint8    pad_v3;
+  /* v4: the DRAM refresh tax's carry. See snes_refresh_state_get. */
+  uint64_t refresh_phase;
+  uint64_t refresh_charged_upto;
 } RtlRollbackResidue;
 
 size_t RtlRollbackSnapshotBound(void) {
@@ -840,6 +860,10 @@ static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
   r->apu_frame_time_valid = g_apu_frame_time_valid ? 1u : 0u;
   assert(interp_bridge_rb_state_size() <= sizeof(r->interp));
   interp_bridge_rb_state_save(r->interp);
+  r->memsel = g_memsel;
+  r->last_hdmaen = g_snesrecomp_last_hdmaen;
+  r->interp_apu_driving = (uint8)(g_interp_apu_driving ? 1 : 0);
+  snes_refresh_state_get(&r->refresh_phase, &r->refresh_charged_upto);
 }
 
 static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
@@ -856,6 +880,10 @@ static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
   snes_frame_counter = r->frame_counter;
   g_apu_frame_time_valid = r->apu_frame_time_valid != 0;
   interp_bridge_rb_state_load(r->interp);
+  g_memsel = r->memsel;
+  g_snesrecomp_last_hdmaen = r->last_hdmaen;
+  g_interp_apu_driving = r->interp_apu_driving ? 1 : 0;
+  snes_refresh_state_set(r->refresh_phase, r->refresh_charged_upto);
 }
 
 size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {

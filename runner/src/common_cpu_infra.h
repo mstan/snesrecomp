@@ -31,6 +31,12 @@ typedef void RunOneFrameOfGameFunc(void);
 void WatchdogCheck(void);
 void snes_refresh_charge(void);   /* DRAM refresh tax; see common_cpu_infra.c */
 void snes_refresh_exempt(void);   /* mark a master-clock teleport (park, load) */
+/* Rollback: the refresh tax carries a sub-scanline remainder and a high-water
+ * mark across frames, and both decide how many cycles the NEXT block is
+ * charged. A rewind that leaves them on the discarded timeline replays the
+ * same code for a different number of master cycles. See common_cpu_infra.c. */
+void snes_refresh_state_get(uint64_t *phase, uint64_t *charged_upto);
+void snes_refresh_state_set(uint64_t phase, uint64_t charged_upto);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);

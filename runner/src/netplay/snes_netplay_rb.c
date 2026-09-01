@@ -61,6 +61,7 @@ static struct {
     uint32_t         peer_post_digest;
     uint32_t         local_post_digest;
     int              peer_post_seen;
+    uint32_t         peer_post_target;
     /* Baseline digest exchange. Both sides must digest the SAME tick, and a
      * peer's digest routinely arrives before we have loaded our own baseline
      * snapshot, so it is buffered until ours exists. */
@@ -781,7 +782,8 @@ static void rb_enter_verify(void)
         rnet_session_send_rb_post(s, g_rb.corr.epoch_id, g_rb.corr.target_tick,
                                   master, 0u, 1u);
     rb_stage_set(kRbVerifying);
-    g_rb.peer_post_seen = 0;
+    /* Do NOT clear peer_post_seen here: the peer's POST may already have
+     * arrived and be waiting for us. rb_episode_clear owns the reset. */
 }
 
 static void rb_commit_episode(void)
@@ -991,15 +993,29 @@ static void rb_on_peer_baseline(uint32_t epoch, uint32_t load_tick,
     rb_baseline_try_compare();
 }
 
+/*
+ * Buffer the peer's POST rather than requiring us to already be verifying.
+ *
+ * Whoever finishes replaying first sends POST first, and that is normally the
+ * INITIATOR: it rewinds one frame (it detects its own mismatch on the very
+ * next tick) while the follower rewinds however far behind the initiator it
+ * was running — 8 or 9 frames in a real match. Insisting on kRbVerifying here
+ * threw the initiator's POST away, and the follower then burned the full 2 s
+ * episode budget waiting for a message that had already been delivered.
+ * Measured over a real Linux/Windows match: 8 of 8 follower episodes aborted
+ * "timed out waiting for peer POST", ~16 s of a 35 s session parked, which
+ * starved the initiator's wire and drove it into 8 pcap freezes.
+ *
+ * Same shape as the BASELINE fork this file already fixes: an exchange is not
+ * a stage, and a message that arrives early is still an answer. The tip check
+ * moves to the point of use, where corr.target_tick is final.
+ */
 static void rb_on_peer_post(uint32_t epoch, uint32_t target, uint32_t master)
 {
-    if (g_rb.stage != kRbVerifying || epoch != g_rb.corr.epoch_id)
-        return;
-    /* After a tip-extend the peer may still deliver a POST for the prior tip
-     * while we verify the new one; latching that digest is a false fork. */
-    if (!rbe_rb_peer_post_tip_ok(target, g_rb.corr.target_tick))
+    if (g_rb.stage == kRbIdle || epoch != g_rb.corr.epoch_id)
         return;
     g_rb.peer_post_digest = master;
+    g_rb.peer_post_target = target;
     g_rb.peer_post_seen = 1;
 }
 
@@ -1130,6 +1146,13 @@ static void rb_pump_episode(void)
         }
         break;
     case kRbVerifying:
+        /* After a tip-extend the peer may still hold a POST for the prior tip;
+         * treating that as this episode's answer is a false fork. Drop it and
+         * keep waiting for one that describes the tip we actually verified. */
+        if (g_rb.peer_post_seen &&
+            !rbe_rb_peer_post_tip_ok(g_rb.peer_post_target,
+                                     g_rb.corr.target_tick))
+            g_rb.peer_post_seen = 0;
         if (g_rb.peer_post_seen) {
             uint32_t local = g_rb.local_post_digest;
             if (local == g_rb.peer_post_digest) {

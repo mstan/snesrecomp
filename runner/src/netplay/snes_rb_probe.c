@@ -51,6 +51,61 @@ static void probe_cycles(ProbeCycles *c)
 
 #define RB_PROBE_WRAM_LEN 0x20000u
 
+/*
+ * Carrier hunt (SNESRECOMP_RB_PROBE_STATICS=1). The replay divergence is
+ * deterministic — the same two digests come back on a loopback pair and on a
+ * real Linux/Windows match — so the carrier is host state a frame mutates and
+ * the snapshot does not restore. Rather than guess which global, image the
+ * executable's whole .data+.bss at the identical starting point of two
+ * replays and diff. Addresses resolve to symbols with `nm`.
+ *
+ * GNU-ld only, and deliberately a bisection instrument, not a feature.
+ */
+#if defined(__linux__) && defined(__GNUC__)
+#define RB_PROBE_HAVE_STATICS 1
+extern char __data_start[], _edata[], __bss_start[], _end[];
+static uint8_t *rb_probe_statics_grab(void)
+{
+    size_t dn = (size_t)(_edata - __data_start);
+    size_t bn = (size_t)(_end - __bss_start);
+    uint8_t *b = (uint8_t *)malloc(dn + bn);
+    if (b) {
+        memcpy(b, __data_start, dn);
+        memcpy(b + dn, __bss_start, bn);
+    }
+    return b;
+}
+static void rb_probe_statics_diff(const uint8_t *was)
+{
+    size_t dn = (size_t)(_edata - __data_start);
+    size_t bn = (size_t)(_end - __bss_start);
+    size_t k, n = 0;
+    if (!was)
+        return;
+    fprintf(stderr, "rb_probe:   [statics base data=%p bss=%p]\n",
+            (void *)__data_start, (void *)__bss_start);
+    for (k = 0; k < dn; ++k)
+        if (was[k] != ((const uint8_t *)__data_start)[k]) {
+            if (n < 40)
+                fprintf(stderr, "rb_probe:   .data @%p %02X->%02X\n",
+                        (void *)(__data_start + k), was[k],
+                        ((const uint8_t *)__data_start)[k]);
+            n++;
+        }
+    for (k = 0; k < bn; ++k)
+        if (was[dn + k] != ((const uint8_t *)__bss_start)[k]) {
+            if (n < 40)
+                fprintf(stderr, "rb_probe:   .bss  @%p %02X->%02X\n",
+                        (void *)(__bss_start + k), was[dn + k],
+                        ((const uint8_t *)__bss_start)[k]);
+            n++;
+        }
+    fprintf(stderr, "rb_probe:   statics differing at replay entry: %zu\n", n);
+}
+#else
+#define RB_PROBE_HAVE_STATICS 0
+#endif
+
 #define RB_PROBE_MAX_DEPTH 16
 
 static int   s_period = -1;      /* -1 unread, 0 disarmed */
@@ -111,6 +166,7 @@ void snes_rb_probe_after_frame(uint32_t inputs)
     uint8_t *snap;
     uint8_t *wram1 = NULL;
     uint8_t *tail1 = NULL;
+    uint8_t *statics2 = NULL;
     size_t   tail_len = sizeof(Snes) - offsetof(Snes, hPos);
     size_t bound, len;
     int i, bad = -1;
@@ -193,6 +249,10 @@ void snes_rb_probe_after_frame(uint32_t inputs)
         free(tail1);
         return;
     }
+#if RB_PROBE_HAVE_STATICS
+    if (getenv("SNESRECOMP_RB_PROBE_STATICS"))
+        statics2 = rb_probe_statics_grab();
+#endif
     for (i = 0; i < s_depth; ++i) {
         RtlRunFrame(inputs);
         snes_state_digest_parts(&pass2[i]);
@@ -211,6 +271,10 @@ void snes_rb_probe_after_frame(uint32_t inputs)
         ProbeCycles c0, c1;
         int same23 = 1;
         if (RtlRollbackLoadFromMemory(snap, len)) {
+#if RB_PROBE_HAVE_STATICS
+            if (bad >= 0)
+                rb_probe_statics_diff(statics2);
+#endif
             probe_cycles(&c0);
             s_active = 1;
             for (i = 0; i < s_depth; ++i) {
@@ -305,4 +369,5 @@ void snes_rb_probe_after_frame(uint32_t inputs)
     free(snap);
     free(wram1);
     free(tail1);
+    free(statics2);
 }
