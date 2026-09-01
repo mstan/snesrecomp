@@ -13,7 +13,10 @@ pub enum RomMapping {
     #[default]
     LoRom,
     HiRom,
+    Sdd1ExLoRom,
 }
+
+const SDD1_MMC_DEFAULT_PAGES: [usize; 4] = [0, 1, 2, 3];
 
 fn header_score(data: &[u8], base: usize, expected_low_nibble: u8) -> i32 {
     if base + 0x40 > data.len() {
@@ -40,6 +43,8 @@ pub fn detect_rom_mapping(data: &[u8]) -> RomMapping {
     let hirom_score = header_score(data, 0xFFC0, 1);
     if hirom_score > lorom_score {
         RomMapping::HiRom
+    } else if data.len() > 0x400000 {
+        RomMapping::Sdd1ExLoRom
     } else {
         RomMapping::LoRom
     }
@@ -47,7 +52,7 @@ pub fn detect_rom_mapping(data: &[u8]) -> RomMapping {
 
 pub fn vector_table_offset(data: &[u8]) -> usize {
     match detect_rom_mapping(data) {
-        RomMapping::LoRom => 0x7FE0,
+        RomMapping::LoRom | RomMapping::Sdd1ExLoRom => 0x7FE0,
         RomMapping::HiRom => 0xFFE0,
     }
 }
@@ -83,7 +88,12 @@ pub fn rom_offset(mapping: RomMapping, bank: u32, addr: u32) -> usize {
         "WRAM address has no ROM offset"
     );
     match mapping {
-        RomMapping::LoRom => lorom_offset(bank, addr),
+        RomMapping::Sdd1ExLoRom if (0xC0..=0xFF).contains(&bank) => {
+            let page = SDD1_MMC_DEFAULT_PAGES[((bank >> 4) & 3) as usize];
+            let addr24 = ((bank as usize) << 16) | addr as usize;
+            (page << 20) | (addr24 & 0xFFFFF)
+        }
+        RomMapping::Sdd1ExLoRom | RomMapping::LoRom => lorom_offset(bank, addr),
         RomMapping::HiRom => {
             let canonical_bank = bank & 0x7F;
             assert!(
@@ -102,7 +112,10 @@ pub fn is_rom_address(mapping: RomMapping, bank: u32, addr: u32) -> bool {
         return false;
     }
     match mapping {
-        RomMapping::LoRom => addr >= 0x8000 && !(0x40..0x80).contains(&bank),
+        RomMapping::Sdd1ExLoRom if (0xC0..=0xFF).contains(&bank) => true,
+        RomMapping::Sdd1ExLoRom | RomMapping::LoRom => {
+            addr >= 0x8000 && !(0x40..0x80).contains(&bank)
+        }
         RomMapping::HiRom => (bank & 0x7F) >= 0x40 || addr >= 0x8000,
     }
 }
@@ -222,5 +235,25 @@ mod tests {
         assert_eq!(rom_offset(RomMapping::HiRom, 0x80, 0x84F8), 0x84F8);
         assert_eq!(rom_offset(RomMapping::HiRom, 0xC0, 0x1234), 0x1234);
         assert_eq!(rom_offset(RomMapping::HiRom, 0xFD, 0x819D), 0x3D819D);
+    }
+
+    #[test]
+    fn detects_and_maps_sdd1_exlorom_windows() {
+        let mut rom = vec![0u8; 0x600000];
+        rom[0x7FD5] = 0x32;
+        rom[0x7FFC..0x7FFE].copy_from_slice(&0xFEC1u16.to_le_bytes());
+        rom[0x7FDC..0x7FDE].copy_from_slice(&0xEC47u16.to_le_bytes());
+        rom[0x7FDE..0x7FE0].copy_from_slice(&0x13B8u16.to_le_bytes());
+        assert_eq!(detect_rom_mapping(&rom), RomMapping::Sdd1ExLoRom);
+        assert_eq!(vector_table_offset(&rom), 0x7FE0);
+        assert!(is_rom_address(RomMapping::Sdd1ExLoRom, 0xC0, 0x0000));
+        assert!(is_rom_address(RomMapping::Sdd1ExLoRom, 0xFF, 0xFFFF));
+        assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0xC0, 0x0000), 0);
+        assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0xD0, 0x0000), 0x100000);
+        assert_eq!(
+            rom_offset(RomMapping::Sdd1ExLoRom, 0xFF, 0xFFFF),
+            0x3FFFFF
+        );
+        assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0x80, 0x8000), 0);
     }
 }

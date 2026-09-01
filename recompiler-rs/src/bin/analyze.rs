@@ -24,7 +24,8 @@ use snesrecomp_analyzer::decoder::{
 };
 use snesrecomp_analyzer::insn::Mode;
 use snesrecomp_analyzer::rom::{
-    detect_rom_mapping, load_rom, vector_table_offset, RelocRegion, RomMapping,
+    addr_to_rom_offset, detect_rom_mapping, is_rom_address, load_rom, vector_table_offset,
+    RelocRegion, RomMapping,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -426,16 +427,16 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
     })
 }
 
-fn target_is_code(key: VariantKey, inputs: &Inputs, rom: &[u8]) -> bool {
+fn target_is_code(key: VariantKey, inputs: &Inputs, rom: &[u8], mapping: RomMapping) -> bool {
     if inputs.force_lle.contains(&key.pc24) {
         return false;
     }
     let bank = (key.pc24 >> 16) & 0xFF;
     let pc = key.pc24 & 0xFFFF;
-    if pc < 0x8000 || (0x40..0x80).contains(&bank) {
+    if !is_rom_address(mapping, bank, pc) {
         return false;
     }
-    let offset = ((bank & 0x7F) as usize) * 0x8000 + (pc as usize - 0x8000);
+    let offset = addr_to_rom_offset(mapping, bank, pc, &[]);
     if offset >= rom.len() {
         return false;
     }
@@ -476,6 +477,7 @@ fn summarize(
     graph: &FunctionDecodeGraph,
     inputs: &Inputs,
     rom: &[u8],
+    mapping: RomMapping,
     poisoned: &HashSet<(u32, u8, u8)>,
     unstable: bool,
 ) -> NodeSummary {
@@ -505,7 +507,7 @@ fn summarize(
                         insn.m_flag,
                         insn.x_flag,
                     );
-                    let resolution = if target_is_code(target, inputs, rom) {
+                    let resolution = if target_is_code(target, inputs, rom, mapping) {
                         "aot_exact"
                     } else {
                         "lle_exact"
@@ -544,7 +546,7 @@ fn summarize(
             None
         };
         if let Some((kind, target)) = direct {
-            let resolution = if target_is_code(target, inputs, rom) {
+            let resolution = if target_is_code(target, inputs, rom, mapping) {
                 "aot_exact"
             } else {
                 "lle_exact"
@@ -563,7 +565,7 @@ fn summarize(
                     continue;
                 }
                 let target = VariantKey::new(successor.pc, successor.m, successor.x);
-                let resolution = if target_is_code(target, inputs, rom) {
+                let resolution = if target_is_code(target, inputs, rom, mapping) {
                     "aot_exact"
                 } else {
                     "lle_exact"
@@ -590,7 +592,7 @@ fn summarize(
 
     for &(site, ref target_key) in &graph.boundary_exits {
         let target = VariantKey::new(target_key.pc, target_key.m, target_key.x);
-        let resolution = if target_is_code(target, inputs, rom) {
+        let resolution = if target_is_code(target, inputs, rom, mapping) {
             "aot_exact"
         } else {
             "lle_exact"
@@ -1218,7 +1220,7 @@ fn analyze(
                     summary.clone()
                 }
                 _ => {
-                    let summary = summarize(key, &graph, inputs, rom, &poisoned, unstable);
+                    let summary = summarize(key, &graph, inputs, rom, mapping, &poisoned, unstable);
                     summary_cache.insert(
                         key,
                         (
