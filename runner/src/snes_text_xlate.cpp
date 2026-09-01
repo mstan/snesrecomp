@@ -28,6 +28,15 @@ struct Patch {
     std::vector<uint8_t> source;
     std::map<std::string, std::vector<uint8_t>> target;
     std::map<std::string, std::string> text;
+    /* Optional explicit guard for vram_patches: when set, the patch fires
+     * iff the bytes at guard_address equal guard, replacing the implicit
+     * current==source-or-target content check at `address`. This is what
+     * makes per-screen asset paging possible: several patches can own the
+     * same payload region (e.g. a shared glyph page) and be selected by a
+     * screen-unique region elsewhere (e.g. one dialogue quote's tilemap
+     * row), which content guards at the payload address cannot express. */
+    uint32_t guard_address = 0;
+    std::vector<uint8_t> guard;
 };
 
 struct Glyph {
@@ -377,8 +386,21 @@ void apply_vram_patch(const Patch& patch) {
     std::vector<uint8_t> current(patch.source.size());
     for (size_t i = 0; i < current.size(); ++i)
         current[i] = vram_read_byte(patch.address + static_cast<uint32_t>(i));
-    if (!patch_matches_any_target(patch, current.data(), current.size()))
+    if (!patch.guard.empty()) {
+        /* Explicit guard: fire iff the bytes at guard_address match. This
+         * REPLACES the content check at `address`, because paged payload
+         * regions legitimately hold another patch's page at apply time. */
+        if (patch.guard_address + patch.guard.size() > 0x10000u)
+            return;
+        for (size_t i = 0; i < patch.guard.size(); ++i) {
+            if (vram_read_byte(patch.guard_address +
+                               static_cast<uint32_t>(i)) != patch.guard[i])
+                return;
+        }
+    } else if (!patch_matches_any_target(patch, current.data(),
+                                         current.size())) {
         return;
+    }
     if (std::equal(target->begin(), target->end(), current.begin()))
         return;
     for (size_t i = 0; i < target->size(); ++i)
@@ -488,6 +510,10 @@ bool parse_table(const fs::path& path, std::string* error) {
         } else if ((key == "source_hex" || key == "src_hex") &&
                    parse_hex(value, bytes)) {
             patch->source = bytes;
+        } else if (key == "guard_address" && parse_u32(value, int_value)) {
+            patch->guard_address = int_value;
+        } else if (key == "guard_hex" && parse_hex(value, bytes)) {
+            patch->guard = bytes;
         } else if (key.size() > 4 &&
                    key.substr(key.size() - 4) == "_hex" &&
                    parse_hex(value, bytes)) {
