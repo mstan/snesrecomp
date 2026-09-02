@@ -821,20 +821,54 @@ int snes_netplay_rb_start(void)
     int i;
 
     snes_netplay_rb_shutdown();
+
+    /*
+     * Rematch cold reset.
+     *
+     * A second match in the same process is a NEW agreement between the peers,
+     * and every scrap of the previous one is at best noise and at worst a lie:
+     * a fork cap naming a tick this session will never reach, a lockstep window
+     * measured against the old sim clock, a settled boot-digest latch that
+     * would skip the one check that catches two sides restarting differently.
+     *
+     * This used to be a hand-maintained list of fields, split across shutdown()
+     * and here, that had to track a 58-field struct. It reset about twenty of
+     * them. The rest were not reasoned about; they were simply never written
+     * down, and each new field was one more silent chance to carry state across
+     * a boundary that is supposed to be a clean break -- this session alone
+     * added nine.
+     *
+     * So wipe the struct and name what SURVIVES instead. The list of things
+     * that must persist is short, stable, and obvious at a glance; the list of
+     * things that must be cleared is neither. Forgetting an exception here is
+     * loud and immediate, where forgetting a field was quiet and rare.
+     *
+     * Order matters: shutdown() first, because it frees the scratch buffer and
+     * destroys the session and snapshot ring. Wiping before it would leak all
+     * three.
+     */
+    {
+        /* Re-established by snes_netplay_rb_bind() immediately before every
+         * start, but that call has already happened by the time we get here. */
+        SnesNetplayRbBindings keep_bindings = g_rb.b;
+        memset(&g_rb, 0, sizeof(g_rb));
+        g_rb.b = keep_bindings;
+    }
+    /* The only field whose cleared value is not zero. */
     g_rb.force_invent_slot = -1;
-    g_rb.fork_cap = 0u;
-    g_rb.lockstep_until = 0u;
-    /* A rematch is a new agreement. Carrying the latch across would skip the
-     * one check that catches two sides restarting from different state. */
-    g_rb.boot_dig_local = 0u;
-    g_rb.boot_dig_peer = 0u;
-    g_rb.boot_dig_hold_since_ms = 0u;
-    g_rb.boot_dig_local_valid = 0u;
-    g_rb.boot_dig_peer_valid = 0u;
-    g_rb.boot_dig_settled = 0u;
-    g_rb.boot_dig_waiting_logged = 0u;
-    g_rb.rtt_ema_ms = 0u;
-    g_rb.post_sent_ms = 0u;
+
+    /* The exception list is the whole risk of the wipe above, so check it
+     * rather than trust it. Bindings are set immediately before this call
+     * today; if that order is ever changed, the wipe would silently take them
+     * and the host would come up bound to nothing -- a dead rollback path with
+     * no error, which is the failure this file has spent the most time on. */
+    if (!g_rb.b.session) {
+        fprintf(stderr,
+                "snes_netplay: RB start with no session binding — the cold "
+                "reset cleared bindings that had not been re-established. "
+                "Call snes_netplay_rb_bind() before snes_netplay_rb_start().\n");
+        return 0;
+    }
 
     /* Session-settled P (recomp-ui: P = 4 + D) when the host bound one;
      * SNES_RB_PREDICTION remains the operator override. A P below the delay
