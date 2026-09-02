@@ -11,8 +11,15 @@
 #
 #   tools/rb_loopback.sh ./MyGameRecomp [seconds] [force-mispredict-interval]
 #
-# Env passthrough: set SNES_RB_FORCE_FORK=N to exercise the fork cap and its
-# recovery, which real forks no longer reach.
+# Env passthrough:
+#   SNES_RB_FORCE_FORK=N       exercise the fork cap and its recovery, which
+#                              real forks no longer reach.
+#   RNET_SIM_LATENCY_MS=N      add N ms one-way to EACH peer's receive path
+#                              (so ~2N ms of added RTT). Without this the run
+#                              is a zero-latency link and cannot reach the
+#                              paths that only exist under real RTT.
+#   RNET_SIM_JITTER_MS=N       uniform +/-N ms around that, reordering allowed.
+#   RNET_SIM_SEED=N            make a jittered run repeat.
 #
 # Exit status is the verdict: 0 = both peers agreed, non-zero = something to
 # look at. The logs are left behind either way.
@@ -33,10 +40,19 @@ mkdir -p "$OUT"
 pkill -f "^\./${EXE_BIN}\$" 2>/dev/null
 sleep 1
 
+# Loopback RTT is ~0, and several rollback paths only exist above it: with no
+# added latency the peer's OP_COMMIT lands before TipHold can ever receive a
+# late edge, so the tip-extend branch is unreachable and the soak reports PASS
+# on a machine it never ran. RNET_SIM_LATENCY_MS is per-process and one-way,
+# so the added round trip is DOUBLE this. Set explicitly for both peers rather
+# than exported and left to leak — that is how the force-knob bug happened.
 common=(SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
         SNES_NETPLAY=1 SNES_NET_SLOTS=2 SNES_NET_MODE=rollback
         SNES_NET_DELAY="${SNES_NET_DELAY:-8}"
         SNES_RB_PREDICTION="${SNES_RB_PREDICTION:-12}"
+        RNET_SIM_LATENCY_MS="${RNET_SIM_LATENCY_MS:-0}"
+        RNET_SIM_JITTER_MS="${RNET_SIM_JITTER_MS:-0}"
+        RNET_SIM_SEED="${RNET_SIM_SEED:-0}"
         SNES_NET_TRANSPORT=udp)
 
 cd "$EXE_DIR" || exit 2
@@ -78,20 +94,49 @@ for role in initiator follower; do
     [ "$ep" -gt 0 ] || rc=1          # no episodes means nothing was exercised
 done
 
-ep_i=$(count initiator 'RESIM episode'); ep_f=$(count follower 'RESIM episode')
+# Count by ROLE, not by process: an episode line says which role opened it,
+# and either process can initiate. Counting every line per process made a
+# spurious follow episode (a tip-extend mistaken for a fresh BEGIN) cancel out
+# against a real refusal instead of showing up.
+ep_i=$(count initiator 'RESIM episode.*initiator')
+ep_f=$(count follower 'RESIM episode.*follower')
 fk_i=$(count initiator 'FORK');          fk_f=$(count follower 'FORK')
+# NACK specifically, not all aborts: only a NACK stops the follower from
+# opening the episode at all. An initiator abort that lands AFTER the follower
+# opened (a POST timeout, say) leaves both counts equal and must not be
+# expected to show up as a gap — that miscount produced a residual of -1.
+# Refusals of a BEGIN, counted at the peer that made them and tagged alike
+# whatever the reason. NOT 'peer NACK' on the initiator: that also counts
+# declined tip-extends, which refuse an EXTENSION of an episode that already
+# opened and so must not appear in this ledger.
+nack_i=$(count follower 'RB follow refused')
 echo
-# An episode the peer never opened is normal (a NACK when it cannot reach the
-# load tick); a large gap is not, so compare rather than demand equality.
-gap=$(( ep_i > ep_f ? ep_i - ep_f : ep_f - ep_i ))
+# An episode the peer never opened is normal — it NACK'd before logging one,
+# and the initiator recorded an abort for it. So the counts are not meant to
+# be equal, they are meant to BALANCE:
+#
+#     initiated(A) - followed(B) == BEGINs B refused
+#
+# Measured exact across 14 runs spanning two builds, three link latencies and
+# both old verdicts. The tolerance this replaces ("gap no more than 10% + 2")
+# was tuned on a zero-latency link where the gap is always 0; at 60 ms RTT the
+# gap lands right on the threshold and the verdict flapped run to run, which
+# cost a real afternoon chasing a regression that was never there. A residual
+# is a genuine unaccounted-for episode; a tolerance is a coin flip.
+#
+# Only the initiator injects here (the follower's knobs are pinned off), so
+# the difference is one-directional by construction.
+gap=$(( ep_i - ep_f ))
+resid=$(( gap - nack_i ))
 if [ "$((fk_i + fk_f))" -ne 0 ]; then
     echo "FAIL: $((fk_i + fk_f)) fork(s) — the peers disagreed on state"; rc=1
-elif [ "$gap" -gt $(( (ep_i + 9) / 10 + 2 )) ]; then
-    echo "FAIL: episode counts diverge ($ep_i vs $ep_f)"; rc=1
+elif [ "$resid" -ne 0 ]; then
+    echo "FAIL: $resid episode(s) unaccounted for (initiator $ep_i, follower" \
+         "$ep_f, refused by follower $nack_i)"; rc=1
 elif [ "$rc" -ne 0 ]; then
     echo "FAIL: a peer opened no episodes — nothing was exercised"
 else
-    echo "PASS: $ep_i episodes, no forks, peers agree"
+    echo "PASS: $ep_i episodes, no forks, every episode accounted for"
 fi
 echo "logs: $OUT/initiator.log  $OUT/follower.log"
 exit $rc
