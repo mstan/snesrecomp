@@ -55,6 +55,17 @@ common=(SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
         RNET_SIM_SEED="${RNET_SIM_SEED:-0}"
         SNES_NET_TRANSPORT=udp)
 
+# Every validation knob, pinned OFF for the follower as a GROUP rather than
+# one at a time. `env` does not clear the caller's environment, so a knob
+# exported for the initiator silently reaches the follower too and both peers
+# inject. That has now happened twice: once making a lockstep test look like it
+# failed on the peer being measured, and once making a forced boot fork agree
+# with itself because both sides perturbed identically. Add new knobs HERE, not
+# to the follower's line.
+follower_off=(SNES_RB_FORCE_MISPREDICT=0
+              SNES_RB_FORCE_FORK=0
+              SNES_RB_FORCE_BOOT_FORK=0)
+
 cd "$EXE_DIR" || exit 2
 env "${common[@]}" SNES_NET_SLOT=0 SNES_NET_INPUT_PLAYER=0 \
     SNES_NET_BIND=127.0.0.1:9700 SNES_NET_PEER=127.0.0.1:9701 \
@@ -62,14 +73,9 @@ env "${common[@]}" SNES_NET_SLOT=0 SNES_NET_INPUT_PLAYER=0 \
     SNES_RB_FORCE_FORK="${SNES_RB_FORCE_FORK:-0}" \
     "./$EXE_BIN" >"$OUT/initiator.log" 2>&1 &
 sleep 1
-# The validation knobs are pinned OFF here, not merely left unset: `env` does
-# not clear the caller's environment, so a knob exported for the initiator
-# would silently reach the follower too and both peers would inject. That
-# happened, and it made a lockstep test look like it had failed on the peer
-# being measured.
 env "${common[@]}" SNES_NET_SLOT=1 SNES_NET_INPUT_PLAYER=1 \
     SNES_NET_BIND=127.0.0.1:9701 SNES_NET_PEER=127.0.0.1:9700 \
-    SNES_RB_FORCE_MISPREDICT=0 SNES_RB_FORCE_FORK=0 \
+    "${follower_off[@]}" \
     "./$EXE_BIN" >"$OUT/follower.log" 2>&1 &
 
 sleep "$SECS"
