@@ -1199,7 +1199,12 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
     resets the match — so a routine that merely reads its return address
     (e.g. a JSL dispatch helper) without adding a constant and storing it
     back is NOT flagged. Returns None on the first terminator or after a
-    short instruction budget."""
+    short instruction budget.
+
+    The routine is assumed to be entered in binary mode. SED and SEP #$08
+    set the decimal flag, CLD and REP #$08 clear it, and PHP/PLP carry it the
+    same way they carry M/X. ADC #imm in decimal mode is BCD and does not
+    yield a usable byte count, so it stops the match."""
     from snes65816 import decode_insn, lorom_offset, STK
     # Opcodes that PRESERVE A (may appear between the load and the
     # add/store-back): stores, flag set/clear, register transfers that
@@ -1218,10 +1223,11 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
         0xEA, 0x42,                                   # NOP / WDM
     }
     Y_MUTATING = {
-        0xA0, 0xA4, 0xB4, 0xAC, 0xBC, 0xC8, 0x88, 0x7A, 0xA8, 0x9B,
+        0x44, 0x54, 0xA0, 0xA4, 0xB4, 0xAC, 0xBC, 0xC8, 0x88, 0x7A, 0xA8, 0x9B,
     }
     X_MUTATING = {
-        0xA2, 0xA6, 0xB6, 0xAE, 0xBE, 0xE8, 0xCA, 0xFA, 0xAA, 0xBA, 0xBB,
+        0x44, 0x54, 0xA2, 0xA6, 0xB6, 0xAE, 0xBE, 0xE8, 0xCA, 0xFA, 0xAA, 0xBA,
+        0xBB,
     }
     CONTROL_TRANSFER = {
         0x00, 0x02, 0x10, 0x20, 0x22, 0x30, 0x40, 0x4C, 0x50, 0x5C, 0x60, 0x6B,
@@ -1265,6 +1271,10 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
     a_pulled = False
     a_pulled_size = 0
     a_added = 0
+    a_carry = None
+    # Decimal flag: 0 binary, 1 BCD, None unknown. ADC #imm only yields a
+    # usable constant in binary mode, so anything else stops the match.
+    decimal = 0
     y_slot = None
     y_slot_size = 0
     y_pulled = False
@@ -1301,6 +1311,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
                     a_pulled = False
                     a_pulled_size = 0
                     a_added = 0
+                    a_carry = None
             if ins.operand & 0x10:
                 changed = x != 0
                 x = 0
@@ -1313,6 +1324,10 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
                     x_pulled = False
                     x_pulled_size = 0
                     x_added = 0
+            if ins.operand & 0x01 and (a_slot is not None or a_pulled):
+                a_carry = 0
+            if ins.operand & 0x08:
+                decimal = 0
         elif mn == 'SEP':
             if ins.operand & 0x20:
                 changed = m != 1
@@ -1323,6 +1338,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
                     a_pulled = False
                     a_pulled_size = 0
                     a_added = 0
+                    a_carry = None
             if ins.operand & 0x10:
                 changed = x != 1
                 x = 1
@@ -1335,6 +1351,10 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
                     x_pulled = False
                     x_pulled_size = 0
                     x_added = 0
+            if ins.operand & 0x01 and (a_slot is not None or a_pulled):
+                a_carry = 1
+            if ins.operand & 0x08:
+                decimal = 1
         elif mn == 'LDA' and ins.mode == STK:
             slot = ins.operand & 0xFF
             size = 1 if m else 2
@@ -1344,6 +1364,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
         elif op == 0x68:                       # PLA
             size = 1 if m else 2
             a_slot = None
@@ -1351,6 +1372,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = return_bytes_valid(stack_depth + 1, size)
             a_pulled_size = size if a_pulled else 0
             a_added = 0
+            a_carry = None
             stack_depth += size
         elif op == 0xA8:                       # TAY
             if m == x and (a_slot is not None or a_pulled):
@@ -1372,14 +1394,31 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
                 a_pulled = y_pulled
                 a_pulled_size = y_pulled_size
                 a_added = y_added
+                a_carry = None
             else:
                 a_slot = None
                 a_slot_size = 0
                 a_pulled = False
                 a_pulled_size = 0
                 a_added = 0
+                a_carry = None
+        elif op == 0x18:                       # CLC
+            if a_slot is not None or a_pulled:
+                a_carry = 0
+        elif op == 0x38:                       # SEC
+            if a_slot is not None or a_pulled:
+                a_carry = 1
         elif op == 0x69 and (a_slot is not None or a_pulled):   # ADC #imm
-            a_added = (a_added + ins.operand) & 0xFFFF
+            if a_carry is None or decimal != 0:
+                a_slot = None
+                a_slot_size = 0
+                a_pulled = False
+                a_pulled_size = 0
+                a_added = 0
+            else:
+                width_mask = 0xFF if m else 0xFFFF
+                a_added = (a_added + ins.operand + a_carry) & width_mask
+            a_carry = None
         elif op == 0x83 and ins.mode == STK:      # STA $nn,S — return-addr write-back
             slot = ins.operand & 0xFF
             size = 1 if m else 2
@@ -1387,8 +1426,8 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             writeback = (a_slot is not None and slot == a_slot and
                          a_slot_size == size and start == 1)
             mask = return_mask(start, size)
-            if writeback and a_added and return_valid | mask == 0b11:
-                return a_added & 0xFF             # inline byte count
+            if writeback and a_added and (return_valid | mask) == 0b11:
+                return a_added if a_added <= 0xFF else None
             invalidate_stack_write(start, size)
             if writeback and not a_added:
                 return_valid |= mask
@@ -1398,13 +1437,10 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             if (a_pulled and a_pulled_size == size and
                     start == 1):
                 if a_added:
-                    if return_valid | return_mask(start, size) == 0b11:
-                        return a_added & 0xFF
+                    if (return_valid | return_mask(start, size)) == 0b11:
+                        return a_added if a_added <= 0xFF else None
                 else:
                     return_valid |= return_mask(start, size)
-            a_pulled = False
-            a_pulled_size = 0
-            a_added = 0
         elif op == 0xFA:                          # PLX
             size = 1 if x else 2
             x_pulled = return_bytes_valid(stack_depth + 1, size)
@@ -1419,20 +1455,14 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             if (x_pulled and x_pulled_size == size and
                     start == 1):
                 if x_added:
-                    if return_valid | return_mask(start, size) == 0b11:
+                    if (return_valid | return_mask(start, size)) == 0b11:
                         return x_added & 0xFF
                 else:
                     return_valid |= return_mask(start, size)
-            x_pulled = False
-            x_pulled_size = 0
-            x_added = 0
         elif op == 0x5A:                          # PHY
             push_bytes(1 if x else 2)
-            y_pulled = False
-            y_pulled_size = 0
-            y_added = 0
         elif op == 0x08:                          # PHP
-            status_slots[push_bytes(1)] = (m, x)
+            status_slots[push_bytes(1)] = (m, x, decimal)
         elif op in (0x8B, 0x4B):                 # PHB / PHK
             push_bytes(1)
         elif op == 0x0B:                          # PHD
@@ -1444,6 +1474,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
         elif op == 0x7A:                          # PLY
             stack_depth += 1 if x else 2
             a_slot = None
@@ -1451,7 +1482,9 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
             y_slot = None
+            y_slot_size = 0
             y_pulled = False
             y_pulled_size = 0
             y_added = 0
@@ -1462,6 +1495,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
         elif op == 0x2B:                          # PLD
             stack_depth += 2
             a_slot = None
@@ -1469,17 +1503,21 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
         elif op == 0x28:                          # PLP
             saved = status_slots.pop(stack_depth + 1, None)
             if saved is None:
                 return None
             stack_depth += 1
-            m, x = saved
+            # The pulled status byte carries D as well as M/X, so the matching
+            # PHP records all three.
+            m, x, decimal = saved
             a_slot = None
             a_slot_size = 0
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
             y_slot = None
             y_slot_size = 0
             y_pulled = False
@@ -1496,6 +1534,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
             y_slot = None
             y_slot_size = 0
             y_pulled = False
@@ -1505,6 +1544,12 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             x_pulled_size = 0
             x_added = 0
         elif op in A_PRESERVING:
+            if op in (0xE0, 0xE4, 0xEC, 0xC0, 0xC4, 0xCC):
+                a_carry = None
+            elif op == 0xD8:                      # CLD
+                decimal = 0
+            elif op == 0xF8:                      # SED
+                decimal = 1
             if op in Y_MUTATING:
                 y_slot = None
                 y_slot_size = 0
@@ -1522,6 +1567,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
             a_pulled = False
             a_pulled_size = 0
             a_added = 0
+            a_carry = None
             if op in Y_MUTATING:
                 y_slot = None
                 y_slot_size = 0

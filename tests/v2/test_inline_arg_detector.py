@@ -374,3 +374,241 @@ def test_y_carrier_is_invalidated_by_y_mutation():
     })
 
     assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_x_carrier_is_invalidated_by_block_move():
+    for opcode in (0x44, 0x54):  # MVP / MVN
+        rom = make_lorom_bank0({
+            0x8000: bytes([
+                0xC2, 0x10,       # REP #$10
+                0xFA,             # PLX
+                opcode, 0x00, 0x00,
+                0xE8,             # INX
+                0xDA,             # PHX
+                0x60,             # RTS
+            ]),
+        })
+
+        assert detect_inline_arg_bytes(
+            rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_y_carrier_is_invalidated_by_block_move():
+    for opcode in (0x44, 0x54):  # MVP / MVN
+        rom = make_lorom_bank0({
+            0x8000: bytes([
+                0xC2, 0x30,        # REP #$30
+                0xA3, 0x01,        # LDA $01,S
+                0xA8,              # TAY
+                opcode, 0x00, 0x00,
+                0x98,              # TYA
+                0x18,              # CLC
+                0x69, 0x01, 0x00,  # ADC #$0001
+                0x83, 0x01,        # STA $01,S
+                0x60,              # RTS
+            ]),
+        })
+
+        assert detect_inline_arg_bytes(
+            rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_detects_sec_adc_return_adjustment():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0x38,              # SEC
+            0x69, 0x01, 0x00,  # ADC #$0001
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 2
+
+
+def test_rejects_adc_with_unknown_carry():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0x69, 0x01, 0x00,  # ADC #$0001
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_detects_adjustment_after_known_zero_delta_restore():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0x18,              # CLC
+            0x69, 0x00, 0x00,  # ADC #$0000
+            0x48,              # PHA
+            0x68,              # PLA
+            0x18,              # CLC
+            0x69, 0x01, 0x00,  # ADC #$0001
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 1
+
+
+def test_8bit_adc_wrap_is_not_an_adjustment():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xE2, 0x20,  # SEP #$20
+            0x68,        # PLA
+            0x38,        # SEC
+            0x69, 0xFF,  # ADC #$FF
+            0x48,        # PHA
+            0x60,        # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_rejects_adjustment_larger_than_result_type():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0x18,              # CLC
+            0x69, 0x00, 0x01,  # ADC #$0100
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_a_carrier_survives_local_push():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0xA3, 0x01,        # LDA $01,S
+            0x18,              # CLC
+            0x69, 0x03, 0x00,  # ADC #$0003
+            0x48,              # PHA
+            0xFA,              # PLX
+            0x83, 0x01,        # STA $01,S
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 3
+
+
+def test_x_carrier_survives_local_push():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,  # REP #$30
+            0xFA,        # PLX
+            0xE8,        # INX
+            0x48,        # PHA
+            0xDA,        # PHX
+            0x7A,        # PLY
+            0x68,        # PLA
+            0xDA,        # PHX
+            0x60,        # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 1
+
+
+def test_y_carrier_survives_local_push():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0xA8,              # TAY
+            0x48,              # PHA
+            0x5A,              # PHY
+            0xFA,              # PLX
+            0x2B,              # PLD
+            0x98,              # TYA
+            0x18,              # CLC
+            0x69, 0x03, 0x00,  # ADC #$0003
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 3
+
+
+def test_rejects_adc_in_decimal_mode_after_sed():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0xF8,              # SED
+            0x18,              # CLC
+            0x69, 0x09, 0x00,  # ADC #$0009 - BCD, not a byte count
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_rejects_adc_in_decimal_mode_after_sep_08():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0xE2, 0x08,        # SEP #$08 - sets D
+            0x18,              # CLC
+            0x69, 0x09, 0x00,  # ADC #$0009
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) is None
+
+
+def test_php_plp_restores_the_decimal_flag():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x08,              # PHP - records binary mode
+            0xF8,              # SED
+            0x28,              # PLP - back to binary
+            0x68,              # PLA
+            0x18,              # CLC
+            0x69, 0x03, 0x00,  # ADC #$0003
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 3
+
+
+def test_accepts_adc_after_decimal_mode_is_cleared_again():
+    rom = make_lorom_bank0({
+        0x8000: bytes([
+            0xC2, 0x30,        # REP #$30
+            0x68,              # PLA
+            0xF8,              # SED
+            0xD8,              # CLD - back to binary before the add
+            0x18,              # CLC
+            0x69, 0x09, 0x00,  # ADC #$0009
+            0x48,              # PHA
+            0x60,              # RTS
+        ]),
+    })
+
+    assert detect_inline_arg_bytes(rom, 0, 0x8000, entry_m=1, entry_x=1) == 9
