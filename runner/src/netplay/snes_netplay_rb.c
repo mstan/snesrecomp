@@ -1271,7 +1271,15 @@ static int rb_tip_extend(uint32_t tick, int slot, int notify_peer)
     uint32_t new_target = tick > old_target ? tick : old_target;
     uint32_t gap = 0;
 
-    if (!g_rb.rb || g_rb.stage != kRbTipHold)
+    /* TipHold is the common case; Verifying is not. Measured at a 6-tick
+     * injector with a 24-tick runway: 13 of 17 peer extends arrived while we
+     * had already re-replayed and were awaiting POST, and declining them made
+     * the initiator abort REALIGN over and over -- one run ended in a baseline
+     * digest fork. The engine has always allowed extend from Verify (it drops
+     * the phase back to Replay), and psxrecomp accepts it in five phases; this
+     * host accepted one, which only showed under a dense edge rate. */
+    if (!g_rb.rb ||
+        (g_rb.stage != kRbTipHold && g_rb.stage != kRbVerifying))
         return 0;
     if (g_rb.tip_extends >= RB_MAX_TIP_EXTENDS) {
         fprintf(stderr,
@@ -1686,7 +1694,8 @@ static void rb_drain_wire(void)
                  * initiator's 36 — exactly the four extends less the one
                  * already NACK'd — and the two sides no longer agreed on how
                  * many episodes the match had contained. */
-                if (g_rb.stage == kRbTipHold && epoch == g_rb.corr.epoch_id) {
+                if ((g_rb.stage == kRbTipHold || g_rb.stage == kRbVerifying) &&
+                    epoch == g_rb.corr.epoch_id) {
                     if (!rb_tip_extend(c, (int)slot, 0))
                         rb_episode_abort(RNET_RB_ABORT_CLASS_REALIGN,
                                          "cannot follow peer tip-extend");
@@ -2135,7 +2144,15 @@ int snes_netplay_rb_poll_admit(void)
              * (see rb_force_mispredict_every). peek does not consume, so the
              * true row is still there for the reconcile pass. */
             const int every = rb_force_mispredict_every();
-            if (every > 0 && slot != rb_local_slot()) {
+            /* Never before the peers have agreed on tick 0. At a dense
+             * interval the injector otherwise corrupts the boot tick itself,
+             * the two sides legitimately start from different state, and every
+             * measurement after that is of a session that was never valid --
+             * observed as a BOOT DIGEST MISMATCH in the one sweep cell that
+             * used an interval of 6, and in none of the twelve that did not.
+             * A validation knob must perturb the thing under test, not the
+             * premise of the test. */
+            if (every > 0 && slot != rb_local_slot() && g_rb.boot_dig_settled) {
                 static unsigned long n;
                 if ((++n % (unsigned long)every) == 0ul) {
                     g_rb.force_invent_slot = slot;
