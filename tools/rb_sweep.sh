@@ -60,6 +60,25 @@ n_cold=$( ( cd "$(dirname "$EXE")" && timeout 20 env SDL_VIDEODRIVER=dummy SDL_A
 n_quiet=$( ( cd "$(dirname "$EXE")" && timeout 15 env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
     "./$(basename "$EXE")" ) 2>&1 | grep -c "implausible" || true )
 
+# Rewind determinism and the resync contract, one process, no peer. The
+# symmetry half of this had been opt-in and therefore off in every run; it is
+# on by default now, so the pre-flight is where it earns that.
+probe_out=$( ( cd "$(dirname "$EXE")" && timeout 40 env SDL_VIDEODRIVER=dummy \
+    SDL_AUDIODRIVER=dummy SNESRECOMP_RB_PROBE=25:2 SNESRECOMP_RB_PROBE_VERBOSE=1 \
+    "./$(basename "$EXE")" ) 2>&1 )
+n_sym=$(printf '%s' "$probe_out" | grep -c 'symmetric frame' || true)
+n_asym=$(printf '%s' "$probe_out" | grep -c 'ASYMMETRIC' || true)
+n_div=$(printf '%s' "$probe_out" | grep -c 'DIVERGE' || true)
+n_vol=$(printf '%s' "$probe_out" | grep -oE '\(([0-9]+) volatile' | grep -oE '[0-9]+' \
+        | sort -rn | head -1)
+if [ "$n_sym" -gt 0 ] && [ "$n_asym" -eq 0 ] && [ "$n_div" -eq 0 ]; then
+    echo "  rewind determinism       PASS  ($n_sym symmetric, 0 asymmetric, 0 divergent," \
+         "noise floor ${n_vol:-0} byte(s))"
+else
+    echo "  rewind determinism       FAIL  (symmetric=$n_sym asymmetric=$n_asym divergent=$n_div)"
+    fails=$((fails+1))
+fi
+
 if [ "$n_rec" -gt 0 ] && [ "$n_cold" -gt 0 ] && [ "$n_quiet" -eq 0 ]; then
     echo "  resume-PC recovery       PASS  ($n_rec recovered, $n_cold cold-booted, 0 when off)"
 else

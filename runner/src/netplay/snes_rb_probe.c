@@ -192,49 +192,88 @@ void snes_rb_probe_after_frame(uint32_t inputs)
         return;
     }
 
-    /* Symmetry check (SNESRECOMP_RB_PROBE_SYMMETRY=1): re-saving immediately
-     * after a restore should reproduce the same bytes, so anything the
-     * capture side records and the apply side forgets shows up as a differing
-     * byte WITHOUT needing a replay to expose it — the mechanical enforcement
-     * of the resync contract in common_rtl.c, and the offset says whether the
-     * carrier sits in the guest blob or the host residue appended after it.
+    /* Symmetry check: re-saving immediately after a restore should reproduce
+     * the same bytes, so anything the capture side records and the apply side
+     * forgets shows up as a differing byte WITHOUT needing a replay to expose
+     * it — mechanical enforcement of the resync contract in common_rtl.c, and
+     * the offset says whether the carrier sits in the guest blob or the host
+     * residue appended after it.
      *
-     * Opt-in, because there is one INTENTIONAL asymmetry it cannot tell from
-     * a bug: RtlRollbackLoadFromMemory deliberately lifts the DSP output ring
-     * out and keeps the live one, since that ring belongs to the audio
-     * consumer and must not rewind. The consumer thread moves it between the
-     * two saves, so a hit inside the ring is expected and intermittent.
-     * Left on by default it would cry wolf, which is worse than not checking
-     * — read a guest-blob hit with that in mind, and trust a residue-tail hit
-     * completely. */
-    if (getenv("SNESRECOMP_RB_PROBE_SYMMETRY")) {
+     * This used to be opt-in, and was therefore off in every run ever made,
+     * because of one INTENTIONAL asymmetry it could not tell from a bug:
+     * RtlRollbackLoadFromMemory deliberately lifts the DSP output ring out and
+     * keeps the LIVE one, since that ring belongs to the audio consumer and
+     * must not rewind. The consumer thread moves it between the two saves, so
+     * a hit inside the ring was expected and intermittent, and left on by
+     * default the check cried wolf — which is worse than not checking.
+     *
+     * That rationale turned out to be stale. Measured over 94 probe ticks
+     * against a live pulseaudio device (32040 Hz, 2ch, so a real consumer was
+     * running): zero asymmetries and, more to the point, zero bytes moving at
+     * all. Something already fixed it — most likely the audio lock the armed
+     * probe now forces. The check had been gated off for a hazard that no
+     * longer occurs, and being opt-in meant off in every run ever made.
+     *
+     * The control pair below is kept anyway, and is honest about what it is:
+     * two consecutive saves with no restore between them differ in exactly the
+     * bytes moving under us, so they are the noise floor and differences
+     * outside it are the only ones reported. It currently excludes NOTHING.
+     * Its value is that the floor becomes observable in every run instead of
+     * assumed — if the ring starts moving again, the count says so before the
+     * check starts crying wolf, rather than after.
+     *
+     * SNESRECOMP_RB_PROBE_NO_SYMMETRY=1 turns it off; nothing needs to turn it
+     * on any more. */
+    if (!getenv("SNESRECOMP_RB_PROBE_NO_SYMMETRY")) {
+        uint8_t *ctrl = (uint8_t *)malloc(bound);
         uint8_t *reblob = (uint8_t *)malloc(bound);
-        if (reblob) {
+        if (ctrl && reblob) {
+            size_t ctrl_len = RtlRollbackSaveToMemory(ctrl, bound);
             size_t relen = 0;
+            size_t volatile_n = 0;
             if (RtlRollbackLoadFromMemory(snap, len))
                 relen = RtlRollbackSaveToMemory(reblob, bound);
+            if (ctrl_len == len) {
+                size_t k;
+                for (k = 0; k < len; ++k)
+                    if (snap[k] != ctrl[k])
+                        volatile_n++;
+            }
             if (relen != len) {
                 fprintf(stderr, "rb_probe: ASYMMETRIC frame=%d — re-save is "
                         "%zu bytes, original %zu\n",
                         snes_frame_counter, relen, len);
             } else {
                 size_t k;
+                size_t hits = 0;
                 for (k = 0; k < len; ++k) {
                     if (snap[k] == reblob[k])
                         continue;
-                    fprintf(stderr,
-                            "rb_probe: ASYMMETRIC frame=%d — byte +%zu of %zu "
-                            "differs after restore (%02X->%02X, %s). A field "
-                            "is captured but not applied; see the resync "
-                            "contract in common_rtl.c\n",
-                            snes_frame_counter, k, len, snap[k], reblob[k],
-                            (len - k) <= 1200u ? "host residue tail"
-                                               : "guest blob");
-                    break;
+                    /* Moving under us in the control pair too: not a restore
+                     * asymmetry, just a field the consumer owns. */
+                    if (ctrl_len == len && snap[k] != ctrl[k])
+                        continue;
+                    if (hits++ == 0)
+                        fprintf(stderr,
+                                "rb_probe: ASYMMETRIC frame=%d — byte +%zu of "
+                                "%zu differs after restore (%02X->%02X, %s) "
+                                "and is NOT volatile (%zu volatile bytes were "
+                                "excluded). A field is captured but not "
+                                "applied; see the resync contract in "
+                                "common_rtl.c\n",
+                                snes_frame_counter, k, len, snap[k], reblob[k],
+                                (len - k) <= 1200u ? "host residue tail"
+                                                   : "guest blob",
+                                volatile_n);
                 }
+                if (hits == 0 && getenv("SNESRECOMP_RB_PROBE_VERBOSE"))
+                    fprintf(stderr, "rb_probe: symmetric frame=%d (%zu "
+                            "volatile bytes excluded)\n",
+                            snes_frame_counter, volatile_n);
             }
-            free(reblob);
         }
+        free(ctrl);
+        free(reblob);
     }
 
     /* Round-trip check: if restoring the snapshot does not reproduce
