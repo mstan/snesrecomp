@@ -121,6 +121,9 @@ static struct {
      * episode alive indefinitely, starving the fresh episode that would cover
      * the same ticks in a single span. */
     uint32_t tip_extends;
+    /* Link RTT, EMA'd from the POST handshake. See rb_gate_rtt_ms. */
+    uint32_t post_sent_ms;
+    uint32_t rtt_ema_ms;
     /* Degrade mode: stop predicting remote input until this tick. */
     uint32_t lockstep_until;
 } g_rb;
@@ -541,6 +544,28 @@ static uint8_t rb_gate_episode_active(void *ctx)
             g_rb.stage == kRbVerifying) ? 1u : 0u;
 }
 
+/*
+ * Measured link latency for the scheduler's invent-grace budget.
+ *
+ * retcomm-rbengine has always asked for this; psxrecomp has always answered;
+ * this host never bound the callback, so sched_rtt_ms() returned 0 and
+ * np_invent_rtt_ms() fell back to its synthetic D-scaled floor on every link.
+ * Across 18,325 invent-grace decisions logged at simulated round trips from 0
+ * to 300 ms, the estimate read rtt=24 rtt_raw=0 every single time: the budget,
+ * and tip_stale_ms at four times it, were sized from a constant.
+ *
+ * The sample is POST-out to POST-back, which is what psxrecomp uses and is not
+ * a pure transit time -- the peer sends its POST when its own replay finishes,
+ * so the peer's replay cost is inside the number. The engine is built for
+ * that: a raw estimate may only RAISE the synthetic floor, never lower it, so
+ * an over-estimate costs patience and an absent one costs correctness.
+ */
+static uint32_t rb_gate_rtt_ms(void *ctx)
+{
+    (void)ctx;
+    return g_rb.rtt_ema_ms;
+}
+
 static uint8_t rb_gate_tip_holding(void *ctx)
 {
     (void)ctx;
@@ -653,6 +678,7 @@ static void rb_bind_sched(void)
     br.rollback = &s_rollback;
     br.gates.now_ms = &rb_gate_now_ms;
     br.gates.episode_active = &rb_gate_episode_active;
+    br.gates.rtt_ms = &rb_gate_rtt_ms;
     br.gates.tip_holding = &rb_gate_tip_holding;
     br.gates.episode_count = &rb_gate_episode_count;
     br.gates.replay_ticks_total = &rb_gate_replay_ticks;
@@ -995,6 +1021,7 @@ static void rb_enter_verify(void)
     if (s)
         rnet_session_send_rb_post(s, g_rb.corr.epoch_id, g_rb.corr.target_tick,
                                   master, 0u, 1u);
+    g_rb.post_sent_ms = rbe_mono_ms();
     rb_stage_set(kRbVerifying);
     /* Do NOT clear peer_post_seen here: the peer's POST may already have
      * arrived and be waiting for us. rb_episode_clear owns the reset. */
@@ -1455,6 +1482,18 @@ static void rb_on_peer_post(uint32_t epoch, uint32_t target, uint32_t master)
 {
     if (g_rb.stage == kRbIdle || epoch != g_rb.corr.epoch_id)
         return;
+    /* Time from our POST going out to the peer's coming back. Sampled only
+     * while we are the one waiting, so a POST that arrived before we even
+     * entered Verify cannot be timed against a previous episode's clock. */
+    if (g_rb.stage == kRbVerifying && g_rb.post_sent_ms != 0u) {
+        uint32_t sample = rbe_mono_ms() - g_rb.post_sent_ms;
+        g_rb.post_sent_ms = 0u;
+        /* Anything past a second is a stalled peer, not a link measurement. */
+        if (sample <= 1000u)
+            g_rb.rtt_ema_ms = g_rb.rtt_ema_ms
+                                  ? (uint32_t)((3u * g_rb.rtt_ema_ms + sample) / 4u)
+                                  : sample;
+    }
     g_rb.peer_post_digest = master;
     g_rb.peer_post_target = target;
     g_rb.peer_post_seen = 1;
@@ -2039,6 +2078,11 @@ uint32_t snes_netplay_rb_desync_count(void) { return g_rb.desync_count; }
  * through() is digest-agreed, not merely input-present — it simply was not
  * exposed. These name it so the "how far back is it safe to rewind" question
  * has an answer outside this file. */
+uint32_t snes_netplay_rb_rtt_estimate_ms(void)
+{
+    return g_rb.rtt_ema_ms;
+}
+
 uint32_t snes_netplay_rb_confirmed_through(void)
 {
     return g_rb.rb ? rnet_rb_resolved_through(g_rb.rb) : 0u;
