@@ -38,6 +38,9 @@ enum {
   kPpuBufWidth = kPpuXPixels + kPpuExtraLeftRight * 2,
   // Split-screen games can assign distinct anchor layouts to each viewport.
   kPpuWsAnchorBands = 2,
+  // A layer may need more than one authored-world span per frame (e.g. an
+  // arena strip above a status bar and a second one below it).
+  kPpuWsWorldBands = 2,
 };
 
 typedef uint16_t PpuZbufType;
@@ -226,6 +229,11 @@ struct Ppu {
   uint8_t wsAnchorRightStart[kPpuWsAnchorBands][4];
   // Skip offscreen staging columns before sampling a layer's side margins.
   uint8_t wsMarginGapL[4], wsMarginGapR[4];
+  // Authored-world spans, in tilemap pixels, for the world-mirror bands (see
+  // PpuSetWidescreenLayerWorldMirrorBand). y1<=y0 or right<=left = off.
+  uint8_t wsWorldY0[kPpuWsWorldBands][4], wsWorldY1[kPpuWsWorldBands][4];
+  uint16_t wsWorldLeft[kPpuWsWorldBands][4];
+  uint16_t wsWorldRight[kPpuWsWorldBands][4];
   // Treat [left_px, 256-right_px) as a layer's authentic visible viewport
   // when a host line enhancer supplies the expanded scene. This lets the
   // layer's normally hidden/blank native edge columns reveal lower layers.
@@ -381,6 +389,31 @@ static inline int PpuWidescreenLayerExtra(
   if (layer != 2)
     return extra;
   return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
+}
+
+// Which world-mirror band, if any, governs BG(layer+1) on scanline y.
+// Returns the band slot, or -1 for natural (unreflected) tilemap rendering.
+// Deliberately inert unless a side margin is actually live, and every other
+// per-line policy wins over this one: on a line the layer does not widen
+// (layer mask, clamp, mirror, repeat, stretch, BG3-widen) there is no margin
+// to reflect into, and the line's hScroll may not even be the world camera --
+// a raster-split status bar pinned to hScroll 0 is the usual case.
+static inline int PpuWidescreenLayerWorldBandAt(
+    const Ppu *ppu, unsigned int layer, int y) {
+  if (layer >= 4 || !(ppu->extraLeftCur | ppu->extraRightCur))
+    return -1;
+  int widest = ppu->extraLeftCur > ppu->extraRightCur ? ppu->extraLeftCur
+                                                      : ppu->extraRightCur;
+  if (!PpuWidescreenLayerExtra(ppu, layer, y, widest))
+    return -1;
+  for (unsigned int slot = 0; slot < kPpuWsWorldBands; slot++) {
+    if (ppu->wsWorldY1[slot][layer] > ppu->wsWorldY0[slot][layer] &&
+        y >= ppu->wsWorldY0[slot][layer] &&
+        y < ppu->wsWorldY1[slot][layer] &&
+        ppu->wsWorldRight[slot][layer] > ppu->wsWorldLeft[slot][layer])
+      return (int)slot;
+  }
+  return -1;
 }
 
 
@@ -615,5 +648,42 @@ void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
 // framebuffer padding that was hidden on the original display.
 void PpuSetWidescreenLayerViewportInset(Ppu *ppu, uint8_t layer,
                                         uint8_t left_px, uint8_t right_px);
+
+// Reflect BG(layer+1) about the edges of its AUTHORED WORLD rather than about
+// the viewport edge, on scanlines [y0,y1).
+//
+// PpuSetWidescreenLayerMirror/RepeatBand fold the rendered native scanline
+// back at screen x=0/255. That is right for a layer whose content ends where
+// the original screen ends, and wrong for a bounded arena: mid-scroll the
+// margins of such a layer hold genuine authored tilemap art, and folding at
+// the viewport edge throws it away.
+//
+// This policy leaves those columns alone and only intervenes where the
+// tilemap runs out of authored content. Per pixel, with `x` the tilemap X
+// this line renders at (the line's own hScroll + screen x, in map pixels and
+// before the map's own wrap):
+//   x <  world_left_px   ->  sample 2*world_left_px  - 1 - x
+//   x >= world_right_px  ->  sample 2*world_right_px - 1 - x
+//   otherwise            ->  render naturally
+// A pixel whose reflection also lands outside [left,right) is left
+// transparent, so lower layers and the backdrop still fill it.
+//
+// The rule is applied uniformly to margin and authentic columns; in practice a
+// game clamps the camera so only margins can leave the world. Phase comes from
+// the scroll the PPU rendered the line with, never from a WRAM camera mirror
+// (WIDESCREEN_PATTERNS P1). Presentation-only: no emulated register is
+// touched, the fields live outside every savestate span, and the policy is
+// inert while the widescreen margin is 0.
+//
+// Applies to the Mode-1 policy-dispatched 4bpp/2bpp paths, including their
+// big-tile and mosaic variants. Requires kPpuRenderFlags_NewRenderer.
+// Re-apply per frame like the other widescreen setters; slot 0 is the band set
+// by the convenience function.
+void PpuSetWidescreenLayerWorldMirrorBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                          uint8_t y1, uint16_t world_left_px,
+                                          uint16_t world_right_px);
+void PpuSetWidescreenLayerWorldMirrorBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px);
 
 #endif

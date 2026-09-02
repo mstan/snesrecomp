@@ -4948,7 +4948,12 @@ static void cmd_get_ppu_state(const char *args) {
              "\"widescreen\":{\"budget\":%u,\"left\":%u,\"right\":%u,\"bottom\":%u,"
              "\"layerWiden\":\"0x%02x\",\"layerClamp\":\"0x%02x\","
              "\"layerMirror\":\"0x%02x\",\"layerRepeat\":\"0x%02x\","
-             "\"windowExpandLayers\":\"0x%02x\",\"windowExpandWindows\":\"0x%02x\"},"
+             "\"windowExpandLayers\":\"0x%02x\",\"windowExpandWindows\":\"0x%02x\","
+             "\"worldBands\":["
+               "{\"slot\":0,\"y0\":[%u,%u,%u,%u],\"y1\":[%u,%u,%u,%u],"
+                 "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]},"
+               "{\"slot\":1,\"y0\":[%u,%u,%u,%u],\"y1\":[%u,%u,%u,%u],"
+                 "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]}]},"
              "\"evenFrame\":%s}",
              p->inidisp, p->bgmode & 7, p->mosaic, p->obsel,
              p->setini,
@@ -4967,6 +4972,25 @@ static void cmd_get_ppu_state(const char *args) {
              p->extraBottomCur, p->wsLayerWidenMask, p->wsLayerClamp,
              p->wsLayerMirror, p->wsLayerRepeat,
              p->wsWindowExpandLayers, p->wsWindowExpandWindows,
+             /* worldBands: per-layer authored-world spans for the
+              * world-mirror policy (PpuSetWidescreenLayerWorldMirrorBand).
+              * y1<=y0 or right<=left on a layer means that slot is off. */
+             p->wsWorldY0[0][0], p->wsWorldY0[0][1], p->wsWorldY0[0][2],
+             p->wsWorldY0[0][3],
+             p->wsWorldY1[0][0], p->wsWorldY1[0][1], p->wsWorldY1[0][2],
+             p->wsWorldY1[0][3],
+             p->wsWorldLeft[0][0], p->wsWorldLeft[0][1],
+             p->wsWorldLeft[0][2], p->wsWorldLeft[0][3],
+             p->wsWorldRight[0][0], p->wsWorldRight[0][1],
+             p->wsWorldRight[0][2], p->wsWorldRight[0][3],
+             p->wsWorldY0[1][0], p->wsWorldY0[1][1], p->wsWorldY0[1][2],
+             p->wsWorldY0[1][3],
+             p->wsWorldY1[1][0], p->wsWorldY1[1][1], p->wsWorldY1[1][2],
+             p->wsWorldY1[1][3],
+             p->wsWorldLeft[1][0], p->wsWorldLeft[1][1],
+             p->wsWorldLeft[1][2], p->wsWorldLeft[1][3],
+             p->wsWorldRight[1][0], p->wsWorldRight[1][1],
+             p->wsWorldRight[1][2], p->wsWorldRight[1][3],
              p->evenFrame ? "true" : "false");
 }
 
