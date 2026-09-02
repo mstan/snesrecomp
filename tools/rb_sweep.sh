@@ -96,7 +96,7 @@ grid=(
   "loss 2%, fast link      |RNET_SIM_LOSS_PCT=2"
   "loss 5%, fast link      |RNET_SIM_LOSS_PCT=5"
   "loss 2% + rtt 200ms     |RNET_SIM_LATENCY_MS=100 RNET_SIM_JITTER_MS=25 RNET_SIM_LOSS_PCT=2"
-  "shallow ring (depth 8)  |SNES_RB_SNAP_DEPTH=8 RNET_SIM_LATENCY_MS=100"
+  "min ring (depth 16)     |SNES_RB_SNAP_DEPTH=16 RNET_SIM_LATENCY_MS=100"
   "deep ring (depth 240)   |SNES_RB_SNAP_DEPTH=240 RNET_SIM_LATENCY_MS=100"
   "runway 4 (below rtt)    |SNES_RB_TIP_RUNWAY=4 RNET_SIM_LATENCY_MS=100"
   "runway 24 (above rtt)   |SNES_RB_TIP_RUNWAY=24 RNET_SIM_LATENCY_MS=100"
