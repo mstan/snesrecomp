@@ -1490,6 +1490,19 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
     rnet_rb_begin_episode(g_rb.rb, &g_rb.corr);
     rnet_rb_seal_inputs(g_rb.rb, load, target, slot);
     if (!rnet_rb_inputs_sealed(g_rb.rb)) {
+        /* The last silent refusal in this function. Every other exit says why;
+         * this one cleared and returned, so an episode the peer had opened
+         * simply vanished on our side with nothing on either log to explain
+         * it. Chased three times as an intermittent "unaccounted episode" in
+         * the sweep ledger before the absence of a message was the clue: the
+         * follower had seen the epoch and the initiator had recorded no abort,
+         * which leaves only a refusal nobody printed. */
+        fprintf(stderr,
+                "snes_netplay: RB %s refused epoch=%u span=%u..%u slot=%d — "
+                "engine would not seal the span\n",
+                as_initiator ? "episode" : "follow",
+                (unsigned)g_rb.corr.epoch_id, (unsigned)load,
+                (unsigned)target, slot);
         rb_episode_clear();
         return 0;
     }
