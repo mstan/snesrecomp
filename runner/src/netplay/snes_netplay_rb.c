@@ -125,6 +125,9 @@ static struct {
     uint32_t post_sent_ms;
     uint32_t rtt_ema_ms;
     /* Boot-digest agreement at tick 0. See rb_boot_digest_gate. */
+    uint32_t chain_fork_tick;    /* last frame-commit fork reported */
+    uint32_t chain_pending_tick; /* mismatch under observation, 0 = none */
+    uint32_t chain_pending_ms;   /* when we first saw it */
     uint32_t boot_dig_local;
     uint32_t boot_dig_peer;
     uint32_t boot_dig_hold_since_ms;
@@ -2196,6 +2199,89 @@ int snes_netplay_rb_poll_admit(void)
     return 1;
 }
 
+/*
+ * The hash chain compares a per-tick state digest against the peer's. Nothing
+ * here had ever asked it whether the two disagreed.
+ *
+ * That mattered twice over. A live mismatch stops the watermark advancing --
+ * try_advance halts at the first tick where the digests differ -- and
+ * resolved_through is what bounds the reconcile scan and feeds peer
+ * convergence. So a genuine state fork degraded rollback QUIETLY: corrections
+ * kept being sought over a window that could no longer grow, with nothing in
+ * the log. The engine exports rbe_hc_peek_mismatch for exactly this and the
+ * host had never called it; psxrecomp calls it in two places.
+ *
+ * Checked only while idle, and only after the mismatch PERSISTS.
+ *
+ * Reporting on sight was measured wrong: healthy runs produced one to three
+ * "forks" apiece, and the giveaway was that the reported tick moved backwards
+ * between them -- 118, then 51, then 87. A real fork cannot do that, because
+ * the watermark is stuck at it. Those were in-flight FRAME_COMMITs describing
+ * the peer's pre-correction timeline, arriving after our own commit had primed
+ * the chain, and they cleared themselves as soon as the peer's corrected
+ * digest landed. Worse than noise: the false verdict capped the fork floor and
+ * entered lockstep, which suppressed real episodes for the rest of the run.
+ *
+ * That staleness is what psxrecomp handles with ignore_peer_frame_commit. The
+ * equivalent here is a settle window rather than a protocol rule, and it is
+ * the stronger test: a transient mismatch resolves within a round trip, while
+ * a genuine fork can never resolve at all. Sized from the measured RTT, which
+ * is only meaningful because that gate is now bound.
+ *
+ * ADVISORY ONLY, and that is a deliberate limit rather than a stopping point.
+ *
+ * A persistent mismatch is not yet proof of a state fork, because an episode
+ * that ABORTS mid-replay leaves our local digests describing a timeline we
+ * half-ran while the peer's describe theirs, and nothing re-primes the chain
+ * on that path the way a commit does. At 300 ms RTT, where POST timeouts are
+ * common, that artifact is common with them: wiring this to the fork cap and
+ * lockstep turned clean runs red and suppressed real episodes for the rest of
+ * the run. Separating the two needs the abort path to restore or re-prime,
+ * which is a change with its own evidence still to gather.
+ *
+ * So it reports and does nothing else. A diagnostic that cannot be trusted to
+ * act is still worth having when the alternative is a watermark that stalls
+ * with no explanation at all -- but it must not be able to damage a match on
+ * a verdict it cannot yet justify, and the wording says which it is.
+ */
+static void rb_check_chain_fork(void)
+{
+    uint32_t tick = 0u, local = 0u, peer = 0u;
+
+    uint32_t now, settle;
+
+    if (g_rb.stage != kRbIdle || !g_rb.rb)
+        return;
+    if (!rbe_hc_peek_mismatch(&g_rb.hc, &tick, &local, &peer)) {
+        g_rb.chain_pending_tick = 0u; /* cleared on its own: it was in flight */
+        return;
+    }
+    now = rbe_mono_ms();
+    if (g_rb.chain_pending_tick != tick) {
+        g_rb.chain_pending_tick = tick;
+        g_rb.chain_pending_ms = now;
+        return;
+    }
+    /* Two trips plus slack: one for the peer's correction to reach us, one for
+     * anything it had already sent to drain. */
+    settle = (g_rb.rtt_ema_ms * 2u) + 250u;
+    if (settle < 300u)
+        settle = 300u;
+    if ((uint32_t)(now - g_rb.chain_pending_ms) < settle)
+        return;
+    if (g_rb.chain_fork_tick == tick)
+        return; /* already reported; the watermark is stuck here */
+    g_rb.chain_fork_tick = tick;
+
+    fprintf(stderr,
+            "snes_netplay: RB chain stall tick=%u local=%08x peer=%08x "
+            "— unresolved for %ums (settle %ums). The confirmed watermark "
+            "cannot advance past this tick. ADVISORY: an aborted episode "
+            "leaves the same trace as a real fork, so this is not acted on.\n",
+            (unsigned)tick, (unsigned)local, (unsigned)peer,
+            (unsigned)(now - g_rb.chain_pending_ms), (unsigned)settle);
+}
+
 void snes_netplay_rb_finish_frame(void)
 {
     RNetSession *s = rb_session();
@@ -2227,6 +2313,8 @@ void snes_netplay_rb_finish_frame(void)
 
     /* A stuck watermark whose next tick aged out of the ring is not a fork. */
     (void)rbe_hc_heal_stale_gap(&g_rb.hc);
+    /* ...but one that is still stuck after healing may well be. */
+    rb_check_chain_fork();
     if (g_rb.rb)
         rnet_rb_set_peer_convergence(g_rb.rb, rbe_hc_resolved_through(&g_rb.hc));
 }
