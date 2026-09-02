@@ -38,11 +38,26 @@ typedef enum RbEpisodeStage {
     kRbTipHold       /* POST matched; Live runs while seals stay open */
 } RbEpisodeStage;
 
+static const char *rb_stage_name(RbEpisodeStage st)
+{
+    switch (st) {
+    case kRbIdle:      return "idle";
+    case kRbSealing:   return "sealing";
+    case kRbReplaying: return "replaying";
+    case kRbVerifying: return "verifying";
+    case kRbTipHold:   return "tiphold";
+    }
+    return "?";
+}
+
 static struct {
     SnesNetplayRbBindings b;
     RNetRbSession  *rb;
     RbeSnapRing    *snaps;
     RbeInputHist    ih;
+    /* Late-wire corrections that arrived while an episode was open and were
+     * therefore never resimulated, per stage. See rb_reconcile_wire. */
+    uint32_t        drop_stage_n[kRbTipHold + 1];
     RbeHashConfirm  hc;
 
     int      started;
@@ -101,6 +116,11 @@ static struct {
     int      force_invent_slot;  /* validation knob one-shot; -1 = idle */
     /* Poisoned-snapshot bound (psxrecomp g_bl_fork_cap, §83). 0 = none. */
     uint32_t fork_cap;
+    /* Tip-extends spent on the CURRENT episode. Capped: each one re-opens the
+     * seal/replay/verify cycle, and an edge storm could otherwise keep one
+     * episode alive indefinitely, starving the fresh episode that would cover
+     * the same ticks in a single span. */
+    uint32_t tip_extends;
     /* Degrade mode: stop predicting remote input until this tick. */
     uint32_t lockstep_until;
 } g_rb;
@@ -389,15 +409,96 @@ static uint8_t rb_vt_hash_confirm_through(void *ctx, uint32_t tick)
     return rbe_hc_confirm_through(&g_rb.hc, tick);
 }
 
+/*
+ * Hand the engine the row a seat simulates at `tick`.
+ *
+ * The admitted input history stops at our live tip, and for a REMOTE seat
+ * that is the end of the story: past the tip we hold predictions, and sealing
+ * a prediction as authoritative is how a resim converges on a timeline
+ * neither peer ran.
+ *
+ * Our OWN seat is different, and missing that cost us every episode where the
+ * peer ran ahead. Under real delay a guest tick T plays wire T while the local
+ * pad is sampled and PUBLISHED at T+D, so our authoritative input already
+ * exists for D ticks past the tip — the peer has it, and will seal the same
+ * values — it simply has not been copied into the history ring yet, because
+ * Live only writes a row as it steps onto it.
+ *
+ * Refusing there made the follower abort mid-replay whenever the initiator was
+ * a few ticks ahead. The initiator clamps its target to its own live tip, but
+ * it cannot clamp to ours, and the two tips only coincide on a zero-latency
+ * link. Measured at 200 ms RTT: follower at sim=225 handed the span 220..227,
+ * dying at "sealed row missing mid-replay: slot=1 tick=225" — seven times in
+ * sixty seconds, and never once on loopback.
+ *
+ * So read the published row instead of failing. This is not invention: it is
+ * the same value from the same ring the Live path would have read, and D
+ * exists precisely to make it available early.
+ */
 static uint8_t rb_vt_get_input_row(void *ctx, int32_t slot, uint32_t tick,
                                    RNetRbFrame *out)
 {
+    RNetSession *s;
+    RNetInputSample sample;
+
     (void)ctx;
     if (!out || slot < 0 || slot >= rb_slot_count())
         return 0;
-    if (!rbe_ih_get(&g_rb.ih, (int)slot, tick, out))
+    if (rbe_ih_get(&g_rb.ih, (int)slot, tick, out)) {
+        rb_row_sanitize(out);
+        return 1;
+    }
+    if ((int)slot != rb_local_slot())
         return 0;
+
+    s = rb_session();
+    if (!s)
+        return 0;
+    memset(&sample, 0, sizeof(sample));
+    if (!rnet_session_peek_input(s, (int)slot, rbe_sched_wire_for_sim(tick),
+                                 &sample) ||
+        !sample.valid)
+        return 0; /* past the published horizon — genuinely cannot cover it */
+
+    rb_row_make(out, tick, (uint16_t)(sample.bytes[0] |
+                                      ((uint16_t)sample.bytes[1] << 8)), 0);
+    /* Normal operation, not a warning — but say it, because "the seal read
+     * our own input from somewhere other than the history ring" is exactly
+     * the kind of quiet substitution that should never have to be inferred
+     * from a later symptom. Measured ~20 rows/minute at 200 ms RTT, none at
+     * all below ~120 ms, so it doubles as a read on how far ahead the peer
+     * is running. */
+    fprintf(stderr,
+            "snes_netplay: RB local row sealed from published input tick=%u "
+            "(our tip=%u) slot=%d buttons=%04x\n",
+            (unsigned)tick, (unsigned)(g_rb.sim ? g_rb.sim - 1u : 0u),
+            (int)slot, (unsigned)out->buttons);
+    /* Keep the history whole. The replay leaves sim at target+1, so Live will
+     * never step onto these ticks and fill them itself, and a later episode
+     * sealing back across them would find the same hole. */
+    rbe_ih_put(&g_rb.ih, (int)slot, out);
     rb_row_sanitize(out);
+    return 1;
+}
+
+/* Can we seal our own seat across every tick of [load, target]? Asked with the
+ * seal's own predicate rather than a tip comparison, so it also catches a tick
+ * that has aged out of the history ring at the low end. */
+static int rb_local_rows_cover(uint32_t load, uint32_t target, uint32_t *gap)
+{
+    uint32_t t;
+    int local = rb_local_slot();
+
+    if (local < 0 || target < load)
+        return 1;
+    for (t = load; t <= target; ++t) {
+        RNetRbFrame row;
+        if (!rb_vt_get_input_row(NULL, local, t, &row)) {
+            if (gap)
+                *gap = t;
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -724,6 +825,7 @@ static void rb_stage_set(RbEpisodeStage stage)
 
 static void rb_episode_clear(void)
 {
+
     rb_stage_set(kRbIdle);
     g_rb.initiator = 0;
     g_rb.peer_post_seen = 0;
@@ -902,7 +1004,21 @@ static void rb_commit_episode(void)
 {
     RNetSession *s = rb_session();
 
-    rnet_rb_on_post_match(g_rb.rb);
+    /*
+     * Do NOT call rnet_rb_on_post_match here. It sets the phase to Commit,
+     * and rnet_rb_enter_tip_hold below requires Verify — so calling it first
+     * made enter_tip_hold return 0 on EVERY episode and drop us into the
+     * else-branch clear. Measured: 0 tip-hold entries in 281 episodes across
+     * three link latencies. The stage, its watchdog, the runway check and the
+     * whole tip-extend branch in rb_reconcile_wire were unreachable code, and
+     * the parity matrix recorded tip-hold as "present" on the strength of the
+     * stage existing.
+     *
+     * The two are alternatives, not a sequence: entering tip-hold IS the
+     * post-match transition (it promotes the sealed rows itself), and
+     * on_post_match is what ends the quiet window later. It is called on the
+     * failure path below, which is the only place it belongs.
+     */
     rnet_rb_commit_promote_sealed(g_rb.rb);
     /* Both peers just agreed on a replayed span, and rb_run_replay re-keyed
      * the ring onto that timeline. Whatever was poisoned before is gone, so
@@ -923,6 +1039,7 @@ static void rb_commit_episode(void)
     if (rnet_rb_enter_tip_hold(g_rb.rb)) {
         rb_stage_set(kRbTipHold);
     } else {
+        rnet_rb_on_post_match(g_rb.rb);
         rb_episode_clear();
     }
     if (s) {
@@ -933,6 +1050,103 @@ static void rb_commit_episode(void)
                                   RNET_RB_SYNC_OP_COMMIT, 0u);
         rnet_session_send_rb_resolved(s, rnet_rb_resolved_through(g_rb.rb));
     }
+}
+
+/* ── tip-extend ──────────────────────────────────────────────────────── */
+
+#define RB_MAX_TIP_EXTENDS 4u
+
+/*
+ * A late edge landed past the sealed tip while we were tip-holding.
+ *
+ * The engine grows the span and re-seals our own rows, but it will not
+ * resimulate for us — rnet_rb_extend_target's contract says in as many words
+ * that TipHold stays TipHold and the host schedules the rereplay. This host
+ * never did, so the raise was inert: the tick stayed simulated with the
+ * predicted input, and reconcile had already promoted the true row, so
+ * nothing would ever look at it again. Measured 1-2 per minute at 200 ms RTT,
+ * but only once tip-hold was reachable at all — before that the branch could
+ * not run, which is why it read as clean for so long.
+ *
+ * Rather than add a separate rereplay path, re-enter the cycle the episode
+ * already knows how to run: grow the target, re-send our seal rows over the
+ * wider span, drop the POST handshake that named the old tip, and go back to
+ * kRbSealing. rb_pump_episode then replays and verifies exactly as it did the
+ * first time. That re-runs from the original load tick rather than from the
+ * old tip — more frames than psxrecomp re-runs — but the span is bounded by
+ * the runway and the 64-row seal mask, and reusing the proven path beats a
+ * second one that can rot independently of it.
+ */
+static int rb_tip_extend(uint32_t tick, int slot, int notify_peer)
+{
+    RNetSession *s = rb_session();
+    uint32_t old_target = g_rb.corr.target_tick;
+    uint32_t new_target = tick > old_target ? tick : old_target;
+    uint32_t gap = 0;
+
+    if (!g_rb.rb || g_rb.stage != kRbTipHold)
+        return 0;
+    if (g_rb.tip_extends >= RB_MAX_TIP_EXTENDS) {
+        fprintf(stderr,
+                "snes_netplay: RB tip-extend refused epoch=%u tick=%u — %u "
+                "already spent on this episode; let it commit so a fresh one "
+                "covers it\n",
+                (unsigned)g_rb.corr.epoch_id, (unsigned)tick,
+                (unsigned)g_rb.tip_extends);
+        return 0;
+    }
+    /* The replay re-runs from load, so we must still hold that snapshot, and
+     * we must be able to seal our own seat across the WHOLE grown span. */
+    if (!rbe_snap_ring_has(g_rb.snaps, g_rb.corr.load_tick)) {
+        fprintf(stderr,
+                "snes_netplay: RB tip-extend refused epoch=%u — load snapshot "
+                "%u has aged out of the ring\n",
+                (unsigned)g_rb.corr.epoch_id, (unsigned)g_rb.corr.load_tick);
+        return 0;
+    }
+    if (!rb_local_rows_cover(g_rb.corr.load_tick, new_target, &gap)) {
+        fprintf(stderr,
+                "snes_netplay: RB tip-extend refused epoch=%u span=%u..%u — "
+                "no local row at tick=%u\n",
+                (unsigned)g_rb.corr.epoch_id, (unsigned)g_rb.corr.load_tick,
+                (unsigned)new_target, (unsigned)gap);
+        return 0;
+    }
+    if (!rnet_rb_can_extend_target(g_rb.rb, new_target) ||
+        !rnet_rb_extend_target(g_rb.rb, new_target))
+        return 0;
+
+    g_rb.tip_extends++;
+    fprintf(stderr,
+            "snes_netplay: RB tip-extend epoch=%u %u→%u tick=%u slot=%d "
+            "(#%u, %s)\n",
+            (unsigned)g_rb.corr.epoch_id, (unsigned)old_target,
+            (unsigned)new_target, (unsigned)tick, slot,
+            (unsigned)g_rb.tip_extends, notify_peer ? "local" : "from peer");
+
+    /* Tell the peer BEFORE sending rows, so its span has grown by the time
+     * they land — an offset past the sealed span cannot be credited. */
+    if (notify_peer && s)
+        rnet_session_send_rb_sync(s, g_rb.corr.epoch_id, tick,
+                                  g_rb.corr.load_tick, new_target,
+                                  (rnet_u8)(slot < 0 ? 0 : slot),
+                                  RNET_RB_SYNC_OP_BEGIN,
+                                  RNET_RB_SYNC_FLAG_REREPLAY);
+
+    g_rb.corr.target_tick = new_target;
+    /* The POST pair named the old tip and the baseline verdict was already
+     * consumed; both must be re-established over the new span, or Verify
+     * would match on stale digests. */
+    g_rb.peer_post_seen = 0;
+    g_rb.peer_post_digest = 0;
+    g_rb.peer_post_target = 0;
+    g_rb.local_post_digest = 0;
+    g_rb.local_base_valid = 0;
+    g_rb.peer_base_valid = 0;
+    rnet_rb_set_phase(g_rb.rb, nRNetRbPhaseSealInputs);
+    rb_send_local_seal_rows();
+    rb_stage_set(kRbSealing);
+    return 1;
 }
 
 /* ── episode open ────────────────────────────────────────────────────── */
@@ -997,12 +1211,50 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
         load = peer_load;
         target = peer_target;
         if (!rbe_snap_ring_has(g_rb.snaps, load)) {
+            /* The only refusal path here that said nothing. Every BEGIN we
+             * turn down has to be countable, or the two peers' episode
+             * ledgers cannot be reconciled — which is exactly how a spurious
+             * follow episode hid in the counts. */
+            fprintf(stderr,
+                    "snes_netplay: RB follow refused epoch=%u span=%u..%u — "
+                    "no snapshot at load tick (ring oldest=%u)\n",
+                    (unsigned)peer_epoch, (unsigned)load, (unsigned)target,
+                    (unsigned)(g_rb.snaps && rbe_snap_ring_count(g_rb.snaps)
+                                   ? rbe_snap_ring_oldest_tick(g_rb.snaps) : 0u));
             if (s)
                 rnet_session_send_rb_sync(s, peer_epoch, mismatch_tick, load,
                                           rnet_rb_resolved_through(g_rb.rb),
                                           (rnet_u8)(slot < 0 ? 0 : slot),
                                           RNET_RB_SYNC_OP_NACK, 0u);
             return 0;
+        }
+        /* The published-input fallback in rb_vt_get_input_row covers the
+         * ordinary case where the initiator is a few ticks ahead of us, but it
+         * runs out D ticks past our tip. Beyond that we cannot seal our own
+         * seat at all, and discovering it inside rb_run_replay is the worst
+         * place to: by then a snapshot is loaded, frames have been re-run, and
+         * the abort leaves a half-replayed timeline behind. Refuse before
+         * touching any state. NACK carries our frontier, which the initiator
+         * demotes to and re-opens over a span we can actually seal. */
+        {
+            uint32_t gap = 0;
+            uint32_t probe = target < mismatch_tick ? mismatch_tick : target;
+            if (!rb_local_rows_cover(load, probe, &gap)) {
+                fprintf(stderr,
+                        "snes_netplay: RB follow refused epoch=%u span=%u..%u "
+                        "— no local row at tick=%u (our sim=%u); NACK at "
+                        "frontier=%u\n",
+                        (unsigned)peer_epoch, (unsigned)load, (unsigned)probe,
+                        (unsigned)gap, (unsigned)g_rb.sim,
+                        (unsigned)rnet_rb_resolved_through(g_rb.rb));
+                if (s)
+                    rnet_session_send_rb_sync(
+                        s, peer_epoch, mismatch_tick, load,
+                        rnet_rb_resolved_through(g_rb.rb),
+                        (rnet_u8)(slot < 0 ? 0 : slot),
+                        RNET_RB_SYNC_OP_NACK, 0u);
+                return 0;
+            }
         }
     }
     if (target < mismatch_tick)
@@ -1056,6 +1308,7 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
 
     rb_send_local_seal_rows();
     g_rb.initiator = as_initiator;
+    g_rb.tip_extends = 0;
     rb_stage_set(kRbSealing);
     g_rb.episode_count++;
     /* A resim episode is the whole point of rollback and previously left no
@@ -1219,14 +1472,83 @@ static void rb_drain_wire(void)
     while (rnet_session_take_rb_sync(s, &epoch, &a, &b, &c, &slot, &op, &flags)) {
         switch (op) {
         case RNET_RB_SYNC_OP_BEGIN:
+            /* A tip-extend for the episode we are already holding — not a new
+             * episode, so it must be recognised before the dual-initiation
+             * arbitration below, which would otherwise decline our own
+             * epoch back to the peer. Only the seat that PREDICTED the row
+             * detects the edge; the seat that owns that input never
+             * mispredicts it, so this message is the only way it learns the
+             * span moved. */
+            if (flags & RNET_RB_SYNC_FLAG_REREPLAY) {
+                /* Gate on the FLAG, not on our stage. A tip-extend is never a
+                 * new episode, and letting one fall through to the arbitration
+                 * below opened a follow episode for an epoch the peer believed
+                 * was mid-extend: the follower logged 39 episodes against the
+                 * initiator's 36 — exactly the four extends less the one
+                 * already NACK'd — and the two sides no longer agreed on how
+                 * many episodes the match had contained. */
+                if (g_rb.stage == kRbTipHold && epoch == g_rb.corr.epoch_id) {
+                    if (!rb_tip_extend(c, (int)slot, 0))
+                        rb_episode_abort(RNET_RB_ABORT_CLASS_REALIGN,
+                                         "cannot follow peer tip-extend");
+                } else {
+                    /* We already released that episode (our runway is shorter
+                     * than the round trip) or never held it. Refuse, so the
+                     * peer ends it and re-opens rather than waiting out a
+                     * handshake we are never going to answer. */
+                    fprintf(stderr,
+                            "snes_netplay: RB tip-extend declined epoch=%u "
+                            "target=%u — we are %s%s\n",
+                            (unsigned)epoch, (unsigned)c,
+                            rb_stage_name(g_rb.stage),
+                            epoch == g_rb.corr.epoch_id ? ""
+                                                        : " on another epoch");
+                    rnet_session_send_rb_sync(
+                        s, epoch, a, b, rnet_rb_resolved_through(g_rb.rb),
+                        slot, RNET_RB_SYNC_OP_NACK, 0u);
+                }
+                break;
+            }
             /* Concurrent dual initiation: lower initiator slot wins, the
              * loser yields and follows (recomp-net docs/rollback.md). */
             if (g_rb.stage != kRbIdle) {
                 int peer_slot = rb_local_slot() == 0 ? 1 : 0;
-                if (g_rb.initiator && peer_slot < rb_local_slot())
+                if (g_rb.initiator && peer_slot < rb_local_slot()) {
                     rb_episode_clear();
-                else
+                } else {
+                    /* We are busy — either mid-episode of our own, or we won
+                     * the dual-initiation race. Either way this BEGIN is not
+                     * going to be followed, and the peer has to be TOLD.
+                     *
+                     * Dropping it silently left the initiator sealed and
+                     * waiting on rows that could never arrive until its
+                     * watchdog fired, which freezes the sim for the whole
+                     * timeout. Measured at 300 ms RTT: two episodes per minute
+                     * that the follower had no record of at all, the initiator
+                     * reporting only "timed out waiting for peer POST".
+                     *
+                     * Enabling tip-hold made this materially worse by widening
+                     * the non-idle window up to a full runway per episode, so
+                     * it is a prerequisite for that rather than a follow-up.
+                     *
+                     * NACK is exactly the right reply and the initiator
+                     * already handles it: demote to our frontier and abort
+                     * REALIGN, whose cooldown is zero, so it re-opens at once
+                     * instead of waiting out a timeout. If we won the race our
+                     * own BEGIN is already in flight; should this NACK land
+                     * after the peer has yielded to it, the epoch no longer
+                     * matches theirs and it is ignored. Safe in either order. */
+                    fprintf(stderr,
+                            "snes_netplay: RB follow refused epoch=%u — busy "
+                            "in %s (ours epoch=%u); NACK at frontier=%u\n",
+                            (unsigned)epoch, rb_stage_name(g_rb.stage),
+                            (unsigned)g_rb.corr.epoch_id,
+                            (unsigned)rnet_rb_resolved_through(g_rb.rb));
+                    rnet_session_send_rb_sync(
+                        s, epoch, a, b, rnet_rb_resolved_through(g_rb.rb),
+                        slot, RNET_RB_SYNC_OP_NACK, 0u);
                     break;
+                }
             }
             rb_begin_episode(a, (int)slot, 0, b, c, epoch, flags);
             break;
@@ -1486,11 +1808,38 @@ static void rb_reconcile_wire(void)
             }
 
             rbe_sched_note_mispredict(g_rb.sim > t ? g_rb.sim - t : 0u);
-            if (g_rb.stage == kRbIdle)
+            if (g_rb.stage == kRbIdle) {
                 rb_begin_episode(t, slot, 1, 0u, 0u, 0u, 0u);
-            else if (g_rb.stage == kRbTipHold &&
-                     rnet_rb_can_extend_target(g_rb.rb, g_rb.sim))
-                rnet_rb_extend_target(g_rb.rb, g_rb.sim);
+            } else if (t >= g_rb.corr.load_tick &&
+                       t <= g_rb.corr.target_tick) {
+                /* Already covered. The open episode replays this tick, and
+                 * reconcile only ever runs on REMOTE slots, whose sealed rows
+                 * come from the peer's own authoritative export rather than
+                 * from our history — so the replay uses the true value even
+                 * though we did nothing here. Common: the injector corrupts a
+                 * run of ticks, the first opens an episode spanning the rest.
+                 * Counting these as drops reported 42 findings that were all
+                 * fine, which is worse than reporting none. */
+            } else {
+                /* Genuinely lost. rbe_ih_promote above already marked the row
+                 * authoritative, so the next scan skips it: this was the only
+                 * chance to act, the tick is outside every span we will
+                 * replay, and we do not resimulate it. kRbTipHold raises the
+                 * engine's target — which re-seals but schedules no rereplay,
+                 * the piece psxrecomp has and we do not — and the other
+                 * stages do nothing at all. */
+                if (g_rb.stage == kRbTipHold && rb_tip_extend(t, slot, 1))
+                    return; /* resimulated after all — not a loss */
+                g_rb.drop_stage_n[g_rb.stage]++;
+                fprintf(stderr,
+                        "snes_netplay: RB late wire UNAPPLIED stage=%s tick=%u "
+                        "slot=%d sim=%u span=%u..%u pub=%04x wire=%04x (n=%u)\n",
+                        rb_stage_name(g_rb.stage), (unsigned)t, slot,
+                        (unsigned)g_rb.sim, (unsigned)g_rb.corr.load_tick,
+                        (unsigned)g_rb.corr.target_tick,
+                        (unsigned)published.buttons, (unsigned)wire.buttons,
+                        (unsigned)g_rb.drop_stage_n[g_rb.stage]);
+            }
             return; /* one correction at a time; the rest follow next tick */
         }
     }
