@@ -185,7 +185,14 @@ echo
 # the difference is one-directional by construction.
 gap=$(( ep_i - ep_f ))
 resid=$(( gap - nack_i ))
-if [ "$KILL_AT" -gt 0 ] 2>/dev/null; then
+refused_boot=$(count initiator 'BOOT DIGEST MISMATCH')
+if [ "$refused_boot" -gt 0 ] && [ "$ep_i" -eq 0 ]; then
+    # The match was refused before it began, which is the CORRECT outcome for
+    # peers that booted differently. Without this the harness reported it as
+    # "a peer opened no episodes" -- grading the safety feature as a failure.
+    echo "PASS (refused): boot digests differed and the match did not start —" \
+         "0 episodes, which is the point"
+elif [ "$KILL_AT" -gt 0 ] 2>/dev/null; then
     # The ledger cannot balance against a peer that stopped answering, so the
     # question becomes survival: did the initiator keep simulating after the
     # follower vanished, and did it say why rather than freeze?

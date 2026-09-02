@@ -100,6 +100,14 @@ uint32_t snes_netplay_rb_desync_count(void);
  * confirmed_frontier as absent here; it was not — this watermark existed and
  * was already bounding the reconcile scan, it just had no name outside
  * snes_netplay_rb.c. */
+/* Identify this build and its content to the peer. Both values are opaque
+ * fingerprints compared only for equality; 0 means "not supplied". Call before
+ * snes_netplay_rb_start(). The pair is exchanged once at session start and, on
+ * a difference, named in the log alongside the boot-digest verdict -- so a
+ * desync says "these are different builds" rather than only "these states
+ * differ". */
+void snes_netplay_rb_set_identity(uint32_t build_fp, uint32_t content_fp);
+
 /* Link RTT in ms, EMA'd from the POST handshake; 0 until an episode has
  * round-tripped. Feeds the scheduler's invent-grace budget. */
 uint32_t snes_netplay_rb_rtt_estimate_ms(void);
