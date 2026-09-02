@@ -25,6 +25,49 @@ mkdir -p "$OUT"
 fails=0
 cells=0
 
+# ── pre-flight ────────────────────────────────────────────────────────────
+#
+# Two checks that need no peer, run first because they are fast and because a
+# failure here invalidates everything after it.
+#
+# Both exist because "present in the tree" and "has ever executed" are
+# different claims. The predicate's cases were quoted in an audit while living
+# only in a scratchpad, and the recovery path they guard had never once run in
+# any log we held.
+
+SNESRC=$(cd "$HERE/.." && pwd)
+echo "pre-flight"
+
+if cc -I "$SNESRC/runner/src" -I "$SNESRC/runner/src/snes" \
+      "$SNESRC/tests/cpu/pc24_resumable_test.c" -o "$OUT/pc24_test" 2>"$OUT/pc24_build.log"; then
+    if "$OUT/pc24_test" >"$OUT/pc24_test.log" 2>&1; then
+        echo "  resume-PC predicate      PASS  ($(grep -c '^  ok' "$OUT/pc24_test.log") cases)"
+    else
+        echo "  resume-PC predicate      FAIL  — see $OUT/pc24_test.log"; fails=$((fails+1))
+    fi
+else
+    echo "  resume-PC predicate      NO-BUILD — see $OUT/pc24_build.log"; fails=$((fails+1))
+fi
+
+# The recovery arms. Each must fire and the machine must keep running; with the
+# knob off the path must stay silent, or the check is measuring nothing.
+n_rec=$( ( cd "$(dirname "$EXE")" && timeout 20 env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    GAME_FORCE_BAD_RESUME_PC=120 "./$(basename "$EXE")" ) 2>&1 \
+    | grep -c "recovering to last good" || true )
+n_cold=$( ( cd "$(dirname "$EXE")" && timeout 20 env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    GAME_FORCE_BAD_RESUME_PC=120 GAME_FORCE_BAD_RESUME_STICKY=1 "./$(basename "$EXE")" ) 2>&1 \
+    | grep -c "cold booting" || true )
+n_quiet=$( ( cd "$(dirname "$EXE")" && timeout 15 env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    "./$(basename "$EXE")" ) 2>&1 | grep -c "implausible" || true )
+
+if [ "$n_rec" -gt 0 ] && [ "$n_cold" -gt 0 ] && [ "$n_quiet" -eq 0 ]; then
+    echo "  resume-PC recovery       PASS  ($n_rec recovered, $n_cold cold-booted, 0 when off)"
+else
+    echo "  resume-PC recovery       FAIL  (recovered=$n_rec cold=$n_cold when-off=$n_quiet)"
+    fails=$((fails+1))
+fi
+echo
+
 # name | env assignments | forced-mispredict interval (default 45)
 grid=(
   "baseline                |"
