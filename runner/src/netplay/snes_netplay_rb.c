@@ -124,6 +124,14 @@ static struct {
     /* Link RTT, EMA'd from the POST handshake. See rb_gate_rtt_ms. */
     uint32_t post_sent_ms;
     uint32_t rtt_ema_ms;
+    /* Boot-digest agreement at tick 0. See rb_boot_digest_gate. */
+    uint32_t boot_dig_local;
+    uint32_t boot_dig_peer;
+    uint32_t boot_dig_hold_since_ms;
+    uint8_t  boot_dig_local_valid;
+    uint8_t  boot_dig_peer_valid;
+    uint8_t  boot_dig_settled;
+    uint8_t  boot_dig_waiting_logged;
     /* Degrade mode: stop predicting remote input until this tick. */
     uint32_t lockstep_until;
 } g_rb;
@@ -545,6 +553,109 @@ static uint8_t rb_gate_episode_active(void *ctx)
 }
 
 /*
+ * Hold Live at the first tick until both peers agree on the state they are
+ * starting from.
+ *
+ * Rollback corrects a mispredicted INPUT. It cannot correct two machines that
+ * booted differently: every subsequent digest disagrees, every episode forks
+ * at its baseline, and the first evidence arrives minutes later as a fork on a
+ * tick that had nothing to do with the cause. The cheapest possible check is
+ * at tick 0, before either side has simulated anything worth losing.
+ *
+ * No new wire message. finish_frame already notes tick 0's digest into the
+ * hash chain and sends it as a FRAME_COMMIT before sim reaches 1, so by the
+ * time this gate can hold, our own digest is published and the peer's is in
+ * flight. Both peers hold symmetrically and both messages are already sent, so
+ * the wait is one trip, not a deadlock.
+ *
+ * The latch is sticky. The hash-chain ring ages tick 0 out, and re-deriving
+ * agreement from a ring that no longer holds the tick would re-stall a session
+ * that had already synced.
+ *
+ * Bounded, because an unbounded hold is the failure this codebase keeps
+ * outlawing: a wedged match with nothing in the log. On timeout it releases
+ * and says so, which is worse than agreeing and better than hanging.
+ */
+#define RB_BOOT_DIGEST_TIMEOUT_MS 4000u
+
+static int rb_boot_digest_gate(void)
+{
+    uint32_t local = 0u, peer = 0u;
+    uint32_t now;
+
+    if (g_rb.boot_dig_settled || !g_rb.started)
+        return 0;
+
+    if (g_rb.boot_dig_local_valid) {
+        local = g_rb.boot_dig_local;
+    } else if (rbe_hc_local_digest(&g_rb.hc, 0u, &local)) {
+        g_rb.boot_dig_local = local;
+        g_rb.boot_dig_local_valid = 1u;
+    } else {
+        return 1; /* our own tick 0 not published yet — nothing to compare */
+    }
+
+    if (g_rb.boot_dig_peer_valid) {
+        peer = g_rb.boot_dig_peer;
+    } else if (rbe_hc_peer_digest(&g_rb.hc, 0u, &peer)) {
+        g_rb.boot_dig_peer = peer;
+        g_rb.boot_dig_peer_valid = 1u;
+    } else {
+        now = rbe_mono_ms();
+        if (g_rb.boot_dig_hold_since_ms == 0u)
+            g_rb.boot_dig_hold_since_ms = now;
+        if (!g_rb.boot_dig_waiting_logged) {
+            g_rb.boot_dig_waiting_logged = 1u;
+            fprintf(stderr, "snes_netplay: RB boot digest wait — ours=%08x, "
+                    "peer tick 0 not in yet\n", (unsigned)local);
+        }
+        if ((uint32_t)(now - g_rb.boot_dig_hold_since_ms) >
+            RB_BOOT_DIGEST_TIMEOUT_MS) {
+            fprintf(stderr,
+                    "snes_netplay: RB boot digest TIMED OUT after %u ms — "
+                    "starting UNVERIFIED. If this match desyncs, suspect the "
+                    "starting state, not the netcode.\n",
+                    (unsigned)RB_BOOT_DIGEST_TIMEOUT_MS);
+            g_rb.boot_dig_settled = 1u;
+            return 0;
+        }
+        return 1;
+    }
+
+    g_rb.boot_dig_settled = 1u;
+    if (local != peer) {
+        /* Not recoverable here and not worth pretending otherwise: the peers
+         * are running different machines. Name it at the only moment where it
+         * is still cheap to attribute. */
+        fprintf(stderr,
+                "snes_netplay: RB BOOT DIGEST MISMATCH ours=%08x peer=%08x — "
+                "the two sides did not start from the same state. Rollback "
+                "cannot fix this; every episode from here will fork at its "
+                "baseline.\n",
+                (unsigned)local, (unsigned)peer);
+        return 0;
+    }
+    fprintf(stderr, "snes_netplay: RB boot digest agreed (%08x)\n",
+            (unsigned)local);
+    return 0;
+}
+
+static uint8_t rb_gate_pre_admit_hold(void *ctx, uint32_t sim, uint32_t wire,
+                                      const char **tag_out)
+{
+    (void)ctx;
+    (void)wire;
+    /* Only at the first tick, and never under an open episode — a replay owns
+     * the sim and must not be stalled by a boot check. */
+    if (sim == 1u && g_rb.stage == kRbIdle && rb_boot_digest_gate()) {
+        if (tag_out)
+            *tag_out = "boot_digest_wait";
+        return 1u;
+    }
+    return 0u;
+}
+
+/*
  * Measured link latency for the scheduler's invent-grace budget.
  *
  * retcomm-rbengine has always asked for this; psxrecomp has always answered;
@@ -679,6 +790,7 @@ static void rb_bind_sched(void)
     br.gates.now_ms = &rb_gate_now_ms;
     br.gates.episode_active = &rb_gate_episode_active;
     br.gates.rtt_ms = &rb_gate_rtt_ms;
+    br.gates.pre_admit_hold = &rb_gate_pre_admit_hold;
     br.gates.tip_holding = &rb_gate_tip_holding;
     br.gates.episode_count = &rb_gate_episode_count;
     br.gates.replay_ticks_total = &rb_gate_replay_ticks;
@@ -712,6 +824,17 @@ int snes_netplay_rb_start(void)
     g_rb.force_invent_slot = -1;
     g_rb.fork_cap = 0u;
     g_rb.lockstep_until = 0u;
+    /* A rematch is a new agreement. Carrying the latch across would skip the
+     * one check that catches two sides restarting from different state. */
+    g_rb.boot_dig_local = 0u;
+    g_rb.boot_dig_peer = 0u;
+    g_rb.boot_dig_hold_since_ms = 0u;
+    g_rb.boot_dig_local_valid = 0u;
+    g_rb.boot_dig_peer_valid = 0u;
+    g_rb.boot_dig_settled = 0u;
+    g_rb.boot_dig_waiting_logged = 0u;
+    g_rb.rtt_ema_ms = 0u;
+    g_rb.post_sent_ms = 0u;
 
     /* Session-settled P (recomp-ui: P = 4 + D) when the host bound one;
      * SNES_RB_PREDICTION remains the operator override. A P below the delay
@@ -2048,6 +2171,17 @@ void snes_netplay_rb_finish_frame(void)
         return;
 
     master = rb_digest(SNES_DIGEST_PART_MASTER);
+    /* Validation (SNES_RB_FORCE_BOOT_FORK=1): publish a wrong digest for tick
+     * 0 only, so the two peers genuinely disagree about the state they booted
+     * from. This is what proves rb_boot_digest_gate can fail — an agreement
+     * check that has only ever agreed has not been tested. The fork cascade
+     * that follows is not a bug in the knob; it is the thing the gate exists
+     * to name before it happens. Never set this in a real match. */
+    if (g_rb.sim == 0u && rb_env_int("SNES_RB_FORCE_BOOT_FORK", 0, 0, 1) > 0) {
+        master ^= 0xa5a5a5a5u;
+        fprintf(stderr, "rbe: forced boot fork — publishing %08x for tick 0\n",
+                (unsigned)master);
+    }
     rbe_hc_note_local(&g_rb.hc, g_rb.sim, master);
     if (s)
         rnet_session_send_rb_frame_commit(s, g_rb.sim, master);
