@@ -4933,6 +4933,46 @@ static void cmd_render_inject(const char *args) {
 static void cmd_get_ppu_state(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
     Ppu *p = g_ppu;
+    /* elasticBands: only the configured (layer, slot) pairs, since the full
+     * kPpuWsElasticBands x 4 x kPpuWsElasticSegs table would dwarf the rest
+     * of the reply. Each entry carries the band's scanline range and its
+     * piecewise map as [srcX0, srcX1, dstX0, dstX1] quads, which is exactly
+     * what a widescreen verdict needs to reproduce the mapping. */
+    char eb[3072];
+    size_t ebn = 0;
+    eb[ebn++] = '[';
+    for (unsigned slot = 0; slot < kPpuWsElasticBands; slot++) {
+        for (unsigned layer = 0; layer < 4; layer++) {
+            unsigned nseg = p->wsElasticNSeg[slot][layer];
+            if (!nseg || p->wsElasticY1[slot][layer] <= p->wsElasticY0[slot][layer])
+                continue;
+            int n = snprintf(eb + ebn, sizeof(eb) - ebn,
+                             "%s{\"slot\":%u,\"layer\":%u,\"y0\":%u,\"y1\":%u,\"segs\":[",
+                             ebn > 1 ? "," : "", slot, layer,
+                             p->wsElasticY0[slot][layer],
+                             p->wsElasticY1[slot][layer]);
+            if (n < 0 || (size_t)n >= sizeof(eb) - ebn) { ebn = sizeof(eb); break; }
+            ebn += (size_t)n;
+            for (unsigned i = 0; i < nseg; i++) {
+                const PpuWsElasticSeg *s = &p->wsElasticSeg[slot][layer][i];
+                n = snprintf(eb + ebn, sizeof(eb) - ebn, "%s[%d,%d,%d,%d]",
+                             i ? "," : "", s->srcX0, s->srcX1, s->dstX0, s->dstX1);
+                if (n < 0 || (size_t)n >= sizeof(eb) - ebn) { ebn = sizeof(eb); break; }
+                ebn += (size_t)n;
+            }
+            if (ebn >= sizeof(eb) - 4) break;
+            eb[ebn++] = ']';
+            eb[ebn++] = '}';
+        }
+        if (ebn >= sizeof(eb) - 4) break;
+    }
+    if (ebn >= sizeof(eb) - 4) {
+        /* Truncation would emit invalid JSON; report the overflow instead. */
+        snprintf(eb, sizeof(eb), "\"overflow\"");
+    } else {
+        eb[ebn++] = ']';
+        eb[ebn] = '\0';
+    }
     send_fmt("{\"inidisp\":\"0x%02x\",\"bgmode\":%d,\"mosaic\":\"0x%02x\",\"obsel\":\"0x%02x\","
              "\"setini\":\"0x%02x\","
              "\"bgXsc\":[\"0x%02x\",\"0x%02x\",\"0x%02x\",\"0x%02x\"],"
@@ -4953,7 +4993,8 @@ static void cmd_get_ppu_state(const char *args) {
                "{\"slot\":0,\"y0\":[%u,%u,%u,%u],\"y1\":[%u,%u,%u,%u],"
                  "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]},"
                "{\"slot\":1,\"y0\":[%u,%u,%u,%u],\"y1\":[%u,%u,%u,%u],"
-                 "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]}]},"
+                 "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]}],"
+             "\"elasticBands\":%s},"
              "\"evenFrame\":%s}",
              p->inidisp, p->bgmode & 7, p->mosaic, p->obsel,
              p->setini,
@@ -4991,6 +5032,7 @@ static void cmd_get_ppu_state(const char *args) {
              p->wsWorldLeft[1][2], p->wsWorldLeft[1][3],
              p->wsWorldRight[1][0], p->wsWorldRight[1][1],
              p->wsWorldRight[1][2], p->wsWorldRight[1][3],
+             eb,
              p->evenFrame ? "true" : "false");
 }
 

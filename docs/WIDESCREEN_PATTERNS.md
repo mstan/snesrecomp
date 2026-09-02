@@ -106,6 +106,92 @@ and must equal the reflected source column; mid-scroll the margin must equal
 what the tilemap authors there (i.e. must be byte-identical to the natural
 render), which is the assertion that catches a viewport-space fold.
 
+### P2c. A continuous status bar anchors its rigid groups and stretches only elastic material
+
+**Defect:** `PpuSetWidescreenLayerAnchorBand` moves a raster status bar's left
+and right groups out to the widened viewport edges and keeps its middle
+centered. That is the right *placement*, and it is only half an answer whenever
+the bar is **one continuous graphic** with no transparent column to hide the
+seam: anchoring then opens an `extra`-px transparent gap on each side of the
+centre group, through which lower layers and the backdrop show. The two
+existing ways out are both wrong here. `PpuSetWidescreenLayerStretchBand`
+closes the gap but scales the *whole* line, so every glyph on it -- names,
+digits, labels -- is resampled. `PpuSetWidescreenLayerClampBand` avoids both
+problems by giving up: the bar stays native-centered inside a 16:9 frame, with
+the widened world visible past both of its ends.
+
+**Invariant:** decide per *column group*, not per line. Measure which source
+spans are **rigid** (they carry glyphs, markers, or any shape whose proportions
+read as intentional) and which are **elastic** -- a run of columns identical to
+one another (plain chrome), or a gauge's interior. Then map the native 256
+columns onto `[-extraLeft, 256+extraRight)` piecewise: rigid segments copy 1:1
+at a shifted destination, elastic segments resample. Rigid segments are then
+byte-exact wherever they land, which is the property that keeps glyphs
+pixel-perfect while they move, and elastic segments absorb the whole margin.
+
+`PpuSetWidescreenLayerElasticBand(ppu, layer, y0, y1, segs, nseg)` takes the
+explicit segment list `{srcX0, srcX1, dstX0, dstX1}` (ascending and
+non-overlapping in destination space, or the band is rejected outright).
+`PpuSetWidescreenLayerElasticSplitBandSlot(ppu, slot, layer, y0, y1, lx0, lx1,
+rx0, rx1)` builds the symmetric five-segment layout from the two elastic runs
+alone, and with both runs empty installs an identity band -- i.e. a clamp --
+which is how a transitional scanline is expressed in the same vocabulary.
+
+Two properties do the work and both are asserted:
+
+- **the resample is centre-nearest**, `sx = srcX0 + ((2*o+1)*sw)/(2*dw)`. It is
+  exactly 1:1 when `sw == dw`, so a rigid segment needs no special case; it is
+  symmetric under reflection, so a **mirror-image pair of gauges stretches to
+  the same length**, which `floor(o*sw/dw)` does not (measured: 111 of 113 fill
+  levels came out 1px asymmetric with the floor form, 1 of 113 with the centre
+  form);
+- **fill fraction is preserved**: `k` filled of `n` source columns become
+  `round(k*dw/n)` of `dw` destination columns within a pixel, so a full gauge
+  stays full, an empty one stays empty, and 37% stays 37%. This is what makes
+  stretching a *gauge* legitimate at all -- the bar is longer, and it still
+  reads the same health.
+
+Implemented at the merge step of the Mode-1 policy dispatchers, so it covers
+the 4bpp, 2bpp, big-tile and mosaic paths at once, and only source columns
+`[0,256)` -- the picture the game actually authored -- are ever sampled. It
+shares the world band's precedence rule (clamp band, layer mask,
+mirror/repeat/stretch and the BG3-widen gate all win over it) and beats the
+world band where the two overlap, since it is the more specific statement about
+that scanline.
+
+**Case:** GWED (`GundamWingEndlessDuelSNESRecomp`). The fight HUD is BG1 map
+rows 58-63 on scanlines 24-71, mirror-symmetric about px 128, with **no fully
+transparent column anywhere in px 1..254** -- so anchoring alone would have
+opened two 43px holes. Four bands, one per distinct tile-row layout, each with
+its elastic runs measured as spans whose columns are identical in all three HUD
+scenes: row 58 (name plates + the `TIME` label) stretches the plain chrome at
+px [88,112) / [144,168); row 59 stretches the health bar interior [8,120) /
+[136,248); row 60 the boost bar [24,120) / [136,232); rows 61-63 a SINGLE
+column of chrome, px [62,63) / [193,194). Line 72 gets an identity band because
+its hScroll is the arena camera, not the HUD's pinned 0, and lines 22-23 keep a
+plain clamp.
+
+That single column is the sub-lesson worth carrying to the next title:
+**"identical in every scene recon captured" is not the same as "identical in
+every state the game can draw."** Recon measured px 62-67 as six identical
+columns in all three HUD scenes, and stretching those six 6 -> 49 px came out
+as six 8-9 px steps as soon as a multi-hit combo replaced the energy box with a
+wider readout whose right cap, charge arrow and shoulder land exactly there. A
+one-column elastic run can only ever be REPEATED, so it is flat in *every*
+state -- plain plate normally, the readout box's own interior during a combo.
+Prefer the widest run that is flat in every state you can enumerate, and fall
+back to one column rather than to a wider run that is only usually flat.
+Corollary: measure the runs on the layer **in isolation**
+(`SNESRECOMP_LAYER_MASK`), never on the composite, where the bar's transparent
+pixels show whatever is behind them and vary per column and per frame.
+
+**Check:** rigid segments byte-exact against the unpolicied render at their
+shifted destination; the centre group byte-identical to it; no destination
+column left unpainted; a uniform source run stretching to a uniform
+destination run; and the gauge sweep -- every `k` from 0 to `n`, both gauges,
+within 1px of `round(k*dw/n)` of each other and of the ideal.
+`tests/ppu/ppu_elastic_band_test.c`.
+
 ### P3. Periodic layers fold; world-anchored layers use history
 
 **Defect:** treating a horizontally periodic layer (sky, repeating city glow) as

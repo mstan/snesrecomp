@@ -41,6 +41,10 @@ echo "=== PPU widescreen world-mirror band ==="
 "$CC" -std=c11 -Wall -Wextra -O1     -DSNESRECOMP_REVERSE_DEBUG=0     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes"     "$ROOT/tests/ppu/ppu_world_mirror_test.c"     "$ROOT/runner/src/snes/ppu.c"     "$ROOT/runner/src/snes/ppu_legacy.c"     -o "$OUT/ppu_world_mirror_test"
 "$OUT/ppu_world_mirror_test"
 
+echo "=== PPU widescreen elastic anchor band ==="
+"$CC" -std=c11 -Wall -Wextra -O1     -DSNESRECOMP_REVERSE_DEBUG=0     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes"     "$ROOT/tests/ppu/ppu_elastic_band_test.c"     "$ROOT/runner/src/snes/ppu.c"     "$ROOT/runner/src/snes/ppu_legacy.c"     -o "$OUT/ppu_elastic_band_test"
+"$OUT/ppu_elastic_band_test"
+
 echo "=== DMA / HDMA ==="
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
