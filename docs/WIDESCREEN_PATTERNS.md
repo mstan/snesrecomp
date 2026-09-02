@@ -66,6 +66,46 @@ rolling-map bookkeeping. Read-only with respect to simulation.
 **Check:** enter a room moving left and right; the outermost margin column must be
 correct on the first frame it is visible.
 
+### P2b. Bounded arenas reflect about the authored world edge, not the viewport edge
+
+**Defect:** a single-screen arena (a fighter's stage) has a tilemap that is
+authored only over a fixed pixel span, with tile 0 either side, and a camera
+clamped so the native 256 view never leaves that span. Widening the view then
+has two distinct regimes, and the existing policies each get one of them wrong:
+
+- `PpuSetWidescreenLayerMirror`/`RepeatBand` fold the rendered scanline at
+  screen x=0/255, so **mid-scroll** they discard the genuine authored art that
+  the margins are now showing and replace it with a fold of the centre.
+- Natural rendering is right mid-scroll but **at the camera clamps** runs the
+  margins straight off the end of the authored span into tile 0 (or, on a
+  smaller map, into a wrapped copy of the opposite side).
+
+**Invariant:** reflect in *tilemap* space about the authored world's own edges,
+not in screen space about the viewport's. Per pixel, with `x` = this line's
+hScroll + screen x (map pixels, before the map's wrap): `x < left` samples
+`2*left-1-x`, `x >= right` samples `2*right-1-x`, everything else renders
+naturally. Columns the tilemap really authors — margin columns included —
+survive untouched, and synthesis happens only where content ran out.
+`PpuSetWidescreenLayerWorldMirrorBand(ppu, layer, y0, y1, left, right)`.
+
+The band is per-layer and per-scanline because a raster-split status bar
+re-points hScroll for its own lines, where a world bound is meaningless; every
+other per-line policy (clamp band, layer mask, mirror/repeat/stretch, BG3
+widen) therefore wins over this one, so a status band is excluded simply by
+clamping it.
+
+**Case:** GWED (`GundamWingEndlessDuelSNESRecomp`). BG1 is a 64x64 map authored
+only in map px [64,448); the camera X clamp is [64,192], so the native 256 view
+spans exactly [64,448) at the walls and the 43px margins are the only thing
+that can leave the world. Lines 22-72 are a raster-split HUD band pinned to
+hScroll 0 / vScroll 440 and are clamped instead. BG2 is a 256px skyline with
+hScroll pinned to 0, where the map's own wrap already is the right answer.
+
+**Check:** at both camera clamps the outermost margin column must be non-blank
+and must equal the reflected source column; mid-scroll the margin must equal
+what the tilemap authors there (i.e. must be byte-identical to the natural
+render), which is the assertion that catches a viewport-space fold.
+
 ### P3. Periodic layers fold; world-anchored layers use history
 
 **Defect:** treating a horizontally periodic layer (sky, repeating city glow) as
