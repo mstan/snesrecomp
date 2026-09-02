@@ -100,6 +100,10 @@ uint32_t snes_netplay_rb_desync_count(void);
  * confirmed_frontier as absent here; it was not — this watermark existed and
  * was already bounding the reconcile scan, it just had no name outside
  * snes_netplay_rb.c. */
+/* Link RTT in ms, EMA'd from the POST handshake; 0 until an episode has
+ * round-tripped. Feeds the scheduler's invent-grace budget. */
+uint32_t snes_netplay_rb_rtt_estimate_ms(void);
+
 uint32_t snes_netplay_rb_confirmed_through(void);
 uint32_t snes_netplay_rb_confirmed_remaining(void);
 int      snes_netplay_rb_episode_active(void);
