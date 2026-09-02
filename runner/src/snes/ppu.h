@@ -70,8 +70,13 @@ typedef struct PpuPixelPrioBufs {
   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
   // Sized for the widescreen border; logical screen x maps to
   // data[x + kPpuExtraLeftRight].
+  //
+  // 8-aligned because ClearBackdrop fills this through a uint64 pointer.
+  // The array itself only needs 2, so any member landing on a 4-mod-8
+  // offset aborts on ARM -- and which ones do shifts whenever a field
+  // above them grows.
   PpuZbufType data[kPpuBufWidth];
-} PpuPixelPrioBufs;
+} __attribute__((aligned(8))) PpuPixelPrioBufs;
 
 static inline void PpuWidescreenAdjustPinnedWindowEdges(
     int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,
