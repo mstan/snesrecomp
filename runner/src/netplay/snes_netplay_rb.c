@@ -112,6 +112,7 @@ static struct {
     const char *fork_partition;
     const char *stall_tag;
     uint32_t snap_interval;
+    uint32_t snap_depth;
     int      prediction_cap;
     int      force_invent_slot;  /* validation knob one-shot; -1 = idle */
     /* Poisoned-snapshot bound (psxrecomp g_bl_fork_cap, §83). 0 = none. */
@@ -929,8 +930,19 @@ int snes_netplay_rb_start(void)
         return 0;
 
     g_rb.snaps = rbe_snap_ring_create(
-        (uint32_t)rb_env_int("SNES_RB_SNAP_DEPTH",
-                             (int)RBE_SNAP_RING_DEFAULT_DEPTH, 8, 240));
+        /* Floor is 16, not 8. Measured at 200 ms RTT: depth 8 loses 15
+         * episodes a minute to peer NACKs because the follower cannot reach
+         * back to the load tick, while 16 and every depth above it lose none.
+         * At 300 ms the depth-attributable NACKs saturate the same way -- 17
+         * at depth 8, a flat 8 at 16, 24 and 40 alike, the remainder being
+         * refusals that have nothing to do with the ring. Eight was a settable
+         * value that silently disabled a share of rollback, so it is no longer
+         * accepted -- rb_env_int falls back to the DEFAULT on an out-of-range
+         * value rather than clamping to the bound, so a request for 8 now
+         * yields 40, which the startup banner states outright. The default is
+         * left alone: it has ample margin at every latency measured. */
+        (g_rb.snap_depth = (uint32_t)rb_env_int(
+             "SNES_RB_SNAP_DEPTH", (int)RBE_SNAP_RING_DEFAULT_DEPTH, 16, 240)));
     if (!g_rb.snaps) {
         rnet_rb_destroy(g_rb.rb);
         g_rb.rb = NULL;
@@ -959,9 +971,15 @@ int snes_netplay_rb_start(void)
     g_rb.stall_tag = NULL;
     fprintf(stderr,
             "snes_netplay: ROLLBACK start slot=%d slots=%d D=%d P=%d "
-            "snap_interval=%u tip_runway=%u\n",
+            "snap_interval=%u snap_depth=%u (reach %u ticks) "
+            "tip_runway=%u\n",
             rb_local_slot(), slots, rb_input_delay(), g_rb.prediction_cap,
-            (unsigned)g_rb.snap_interval, (unsigned)cfg.tip_runway);
+            (unsigned)g_rb.snap_interval, (unsigned)g_rb.snap_depth,
+            /* Slots are not ticks: reach is depth x interval, and the two
+             * only coincide because this host snapshots every tick. Printed
+             * because an operator setting a depth is reasoning about ticks. */
+            (unsigned)(g_rb.snap_depth * g_rb.snap_interval),
+            (unsigned)cfg.tip_runway);
     return 1;
 }
 
