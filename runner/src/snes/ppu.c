@@ -554,8 +554,35 @@ void ppu_handleVblank(Ppu* ppu) {
   ppu->frameInterlace = PPU_interlace(ppu); // set if we have a interlaced frame
 }
 
-static inline void ClearBackdrop(PpuPixelPrioBufs *buf) {
-  for (size_t i = 0; i != arraysize(buf->data); i += 4)
+// The columns anything can reach this frame: the 256 hardware ones plus the
+// per-side budget the host asked for. Every read of a priority buffer is
+// bounded by a window edge, and PpuWidescreenLayerExtra never hands out more
+// than extraLeftRight, so nothing outside this span is ever looked at.
+//
+// Rounded out to whole uint64 stores, because that is how ClearBackdrop
+// writes.
+static inline void PpuActiveSpan(const Ppu *ppu, size_t *begin,
+                                 size_t *end) {
+  size_t extra = ppu->extraLeftRight;
+  if (extra > kPpuExtraLeftRight)
+    extra = kPpuExtraLeftRight;
+  size_t b = ((size_t)kPpuExtraLeftRight - extra) & ~(size_t)3;
+  size_t e = ((size_t)kPpuExtraLeftRight + kPpuXPixels + extra + 3) &
+             ~(size_t)3;
+  if (e > kPpuBufWidth)
+    e = kPpuBufWidth;
+  *begin = b;
+  *end = e;
+}
+
+// Fills the active span only. At the full ultrawide budget that is the whole
+// buffer; below it the rest is never read, and clearing it anyway charges
+// every consumer for a border it did not ask for -- three buffers a line,
+// 224 lines, whether or not widescreen is on at all.
+static inline void ClearBackdrop(const Ppu *ppu, PpuPixelPrioBufs *buf) {
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  for (size_t i = begin; i < end; i += 4)
     *(uint64*)&buf->data[i] = 0x0500050005000500;
 }
 
@@ -621,7 +648,7 @@ void ppu_runLine(Ppu* ppu, int line) {
     }
 
     // evaluate sprites
-    ClearBackdrop(&ppu->objBuffer);
+    ClearBackdrop(ppu, &ppu->objBuffer);
     if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
       memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
@@ -1649,7 +1676,7 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   }
 
   PpuPixelPrioBufs layerbuf;
-  ClearBackdrop(&layerbuf);
+  ClearBackdrop(ppu, &layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
   else if (mosaic)
@@ -1705,7 +1732,7 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   }
 
   PpuPixelPrioBufs layerbuf;
-  ClearBackdrop(&layerbuf);
+  ClearBackdrop(ppu, &layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
   else if (mosaic)
@@ -1995,8 +2022,12 @@ static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
   PpuZbufType *dst = ppu->bgBuffers[sub].data;
   const PpuZbufType *src = layerbuf->data;
   bool remove = (capture->flags & kPpuOverlayFlag_RemoveFromGame) != 0;
-  for (int i = 0; i < kPpuBufWidth; i++) {
-    int x = i - kPpuExtraLeftRight;
+  // Same span as the backdrop clear: outside it dst holds last line's
+  // pixels and nothing reads either buffer there.
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  for (size_t i = begin; i < end; i++) {
+    int x = (int)i - kPpuExtraLeftRight;
     if (remove && x >= capture->x0 && x < capture->x1)
       continue;
     if (src[i] > dst[i])
@@ -2119,7 +2150,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   }
 
   // Default background is backdrop
-  ClearBackdrop(&ppu->bgBuffers[0]);
+  ClearBackdrop(ppu, &ppu->bgBuffers[0]);
 
   // Render main screen
   PpuDrawBackgrounds(ppu, y, false);
@@ -2131,7 +2162,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   // Render also the subscreen?
   bool rendered_subscreen = false;
   if (PPU_preventMathMode(ppu) != 3 && PPU_addSubscreen(ppu) && PPU_mathEnabled(ppu)) {
-    ClearBackdrop(&ppu->bgBuffers[1]);
+    ClearBackdrop(ppu, &ppu->bgBuffers[1]);
     if (ppu->screenEnabled[1] != 0) {
       PpuDrawBackgrounds(ppu, y, true);
       if (ppu->widescreenLineEnhancer &&
