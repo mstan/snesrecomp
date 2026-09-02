@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "snes_netplay.h"
 #include "snes_state_digest.h"
 #include "common_rtl.h"
 #include "snes/snes.h"
@@ -126,6 +127,12 @@ static struct {
     uint32_t post_sent_ms;
     uint32_t rtt_ema_ms;
     /* Boot-digest agreement at tick 0. See rb_boot_digest_gate. */
+    uint32_t local_build_fp;     /* our build fingerprint, 0 = not supplied */
+    uint32_t local_content_fp;   /* our content/mod fingerprint */
+    uint32_t peer_build_fp;
+    uint32_t peer_content_fp;
+    uint8_t  peer_ident_seen;
+    uint8_t  ident_sent;
     uint32_t chain_fork_tick;    /* last frame-commit fork reported */
     uint32_t chain_pending_tick; /* mismatch under observation, 0 = none */
     uint32_t chain_pending_ms;   /* when we first saw it */
@@ -628,15 +635,43 @@ static int rb_boot_digest_gate(void)
 
     g_rb.boot_dig_settled = 1u;
     if (local != peer) {
-        /* Not recoverable here and not worth pretending otherwise: the peers
-         * are running different machines. Name it at the only moment where it
-         * is still cheap to attribute. */
+        /* END THE MATCH. This used to warn and play on, and a real session did
+         * exactly that: the mismatch was named at tick 0 and the first fork
+         * landed at tick 4681, about 78 seconds of a fight that never had a
+         * chance. Rollback corrects inputs, not two machines that started
+         * differently, so there is nothing downstream that can recover it and
+         * nothing to be gained by continuing.
+         *
+         * Both peers reach this independently and agree, so both return to the
+         * lobby rather than one waiting on the other. */
         fprintf(stderr,
                 "snes_netplay: RB BOOT DIGEST MISMATCH ours=%08x peer=%08x — "
-                "the two sides did not start from the same state. Rollback "
-                "cannot fix this; every episode from here will fork at its "
-                "baseline.\n",
+                "the two sides did not start from the same state, so this "
+                "match cannot be played. Rollback corrects inputs, not a "
+                "divergent start.\n",
                 (unsigned)local, (unsigned)peer);
+        if (g_rb.peer_ident_seen)
+            fprintf(stderr,
+                    "snes_netplay:   peer identity: build ours=%08x "
+                    "peer=%08x%s, content ours=%08x peer=%08x%s\n",
+                    (unsigned)g_rb.local_build_fp, (unsigned)g_rb.peer_build_fp,
+                    g_rb.local_build_fp == g_rb.peer_build_fp ? "" : "  <-- DIFFERENT",
+                    (unsigned)g_rb.local_content_fp,
+                    (unsigned)g_rb.peer_content_fp,
+                    g_rb.local_content_fp == g_rb.peer_content_fp ? "" : "  <-- DIFFERENT");
+        else
+            fprintf(stderr,
+                    "snes_netplay:   peer identity not in yet — it travels "
+                    "with the same tick and can lose the race by a hair. If "
+                    "no \"peer identity\" line follows, the peer predates the "
+                    "message, which is itself a likely cause.\n");
+        if (rb_env_int("SNES_RB_ALLOW_BOOT_FORK", 0, 0, 1) > 0) {
+            fprintf(stderr, "snes_netplay:   SNES_RB_ALLOW_BOOT_FORK=1 — "
+                    "continuing anyway; every episode will fork at its "
+                    "baseline\n");
+            return 0;
+        }
+        snes_netplay_request_return_to_lobby();
         return 0;
     }
     fprintf(stderr, "snes_netplay: RB boot digest agreed (%08x)\n",
@@ -855,8 +890,18 @@ int snes_netplay_rb_start(void)
         /* Re-established by snes_netplay_rb_bind() immediately before every
          * start, but that call has already happened by the time we get here. */
         SnesNetplayRbBindings keep_bindings = g_rb.b;
+        /* Identity is a property of the PROCESS, not of a session: it is set
+         * once before the first start and is the same for every match this
+         * binary plays. Wiping it made the identity message never send, which
+         * is exactly the failure the binding guard below was written for --
+         * and adding a survivor is a one-line edit precisely because this
+         * clears by wiping and naming what stays. */
+        uint32_t keep_build_fp = g_rb.local_build_fp;
+        uint32_t keep_content_fp = g_rb.local_content_fp;
         memset(&g_rb, 0, sizeof(g_rb));
         g_rb.b = keep_bindings;
+        g_rb.local_build_fp = keep_build_fp;
+        g_rb.local_content_fp = keep_content_fp;
     }
     /* The only field whose cleared value is not zero. */
     g_rb.force_invent_slot = -1;
@@ -981,6 +1026,40 @@ int snes_netplay_rb_start(void)
             (unsigned)(g_rb.snap_depth * g_rb.snap_interval),
             (unsigned)cfg.tip_runway);
     return 1;
+}
+
+/*
+ * Announce who we are, from the very first tick.
+ *
+ * Timing is the whole point. The boot-digest verdict is rendered as soon as
+ * the peer's tick-0 digest arrives, and identity is what EXPLAINS that verdict
+ * — so it has to travel alongside the tick-0 FRAME_COMMIT, not after it. A
+ * first attempt sent it at sim 2-4 and it arrived after every verdict it was
+ * meant to inform, which made it useless at the one moment it is wanted.
+ *
+ * Retried until the peer's own identity comes back rather than fired once and
+ * assumed: the session may not be RUNNING on the first tick, and a send that
+ * failed must not count as sent. Bounded, because a peer that predates this
+ * message will never answer and we must not retransmit for the whole match.
+ */
+#define RB_IDENT_RETRY_TICKS 90u
+
+static void rb_send_identity(void)
+{
+    RNetSession *s = rb_session();
+    if (!s || g_rb.peer_ident_seen || g_rb.sim > RB_IDENT_RETRY_TICKS)
+        return;
+    if (g_rb.local_build_fp == 0u && g_rb.local_content_fp == 0u)
+        return;
+    /* Every few ticks, not every tick: one trip is all it needs, and a peer
+     * that is simply older should not be pelted. */
+    if ((g_rb.sim % 8u) != 0u)
+        return;
+    if (rnet_session_send_rb_sync(
+            s, 0u, g_rb.local_build_fp, g_rb.local_content_fp, 0u,
+            (rnet_u8)(rb_local_slot() < 0 ? 0 : rb_local_slot()),
+            RNET_RB_SYNC_OP_IDENT, 0u) == 0)
+        g_rb.ident_sent = 1u;
 }
 
 void snes_netplay_rb_shutdown(void)
@@ -1821,6 +1900,30 @@ static void rb_drain_wire(void)
                                     ? 0u : RB_COOLDOWN_TICKS);
             }
             break;
+        case RNET_RB_SYNC_OP_IDENT:
+            g_rb.peer_build_fp = a;
+            g_rb.peer_content_fp = b;
+            g_rb.peer_ident_seen = 1u;
+            if ((g_rb.local_build_fp | g_rb.local_content_fp) != 0u) {
+                int build_ok = (a == g_rb.local_build_fp);
+                int content_ok = (b == g_rb.local_content_fp);
+                if (!build_ok || !content_ok)
+                    fprintf(stderr,
+                            "snes_netplay: PEER IDENTITY DIFFERS — build "
+                            "ours=%08x peer=%08x%s, content ours=%08x "
+                            "peer=%08x%s. Different builds or different "
+                            "content cannot simulate alike; expect the boot "
+                            "digest to disagree.\n",
+                            (unsigned)g_rb.local_build_fp, (unsigned)a,
+                            build_ok ? " (same)" : " (DIFFERENT)",
+                            (unsigned)g_rb.local_content_fp, (unsigned)b,
+                            content_ok ? " (same)" : " (DIFFERENT)");
+                else
+                    fprintf(stderr, "snes_netplay: peer identity matches "
+                            "(build=%08x content=%08x)\n",
+                            (unsigned)a, (unsigned)b);
+            }
+            break;
         case RNET_RB_SYNC_OP_COMMIT:
             if (g_rb.stage == kRbTipHold && epoch == g_rb.corr.epoch_id)
                 rb_episode_clear();
@@ -2358,6 +2461,7 @@ void snes_netplay_rb_finish_frame(void)
     if (s)
         rnet_session_set_sim_tick(s, g_rb.sim);
     rb_lockstep_tick();
+    rb_send_identity();
 
     /* A stuck watermark whose next tick aged out of the ring is not a fork. */
     (void)rbe_hc_heal_stale_gap(&g_rb.hc);
@@ -2382,6 +2486,12 @@ uint32_t snes_netplay_rb_desync_count(void) { return g_rb.desync_count; }
  * through() is digest-agreed, not merely input-present — it simply was not
  * exposed. These name it so the "how far back is it safe to rewind" question
  * has an answer outside this file. */
+void snes_netplay_rb_set_identity(uint32_t build_fp, uint32_t content_fp)
+{
+    g_rb.local_build_fp = build_fp;
+    g_rb.local_content_fp = content_fp;
+}
+
 uint32_t snes_netplay_rb_rtt_estimate_ms(void)
 {
     return g_rb.rtt_ema_ms;

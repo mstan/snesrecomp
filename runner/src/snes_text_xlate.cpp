@@ -550,6 +550,20 @@ extern "C" int snes_text_xlate_init_c(const char* table_path,
     return 1;
 }
 
+extern "C" void snes_text_xlate_identity_c(char* out, int cap) {
+    if (!out || cap <= 0)
+        return;
+    /* "off" is the honest answer when the table never loaded, and it is what a
+     * peer without the mod reports too — so two such peers agree, which is
+     * correct: neither is patching guest memory. */
+    const std::string& lang = state().language;
+    const char* v = lang.empty() ? "off" : lang.c_str();
+    int i = 0;
+    for (; i < cap - 1 && v[i]; ++i)
+        out[i] = v[i];
+    out[i] = '\0';
+}
+
 extern "C" void snes_text_xlate_set_language_c(const char* language) {
     state().language = language && language[0] ? language : "off";
     state().rom_dirty = true;
