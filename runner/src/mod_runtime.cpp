@@ -2512,6 +2512,20 @@ extern "C" int snes_mod_runtime_adopt_set_c(const char* want, char* reason,
             }
         }
     }
+    /* Persist, or the claim is a lie.
+     *
+     * Everything above mutates the in-memory runtime, and nothing writes it
+     * back on its own -- state.toml is written at commit time and not again.
+     * Without this the peer was told "your settings have been changed to match
+     * the host", restarted, and found them exactly as before. A message that
+     * tells a player the problem is fixed when it is not is worse than no
+     * message.
+     */
+    if (!SNESRecomp::save_state(runtime, &runtime.error)) {
+        say(runtime.error.empty() ? "could not save the adopted settings"
+                                  : runtime.error);
+        return SNES_MODSET_OPTION;
+    }
     say("");
     return SNES_MODSET_OK;
 }
