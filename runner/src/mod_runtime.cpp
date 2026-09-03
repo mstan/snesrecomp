@@ -2244,6 +2244,76 @@ extern "C" int snes_mod_runtime_feature_option_value_c(
     return 1;
 }
 
+/*
+ * The effective mod set, as one canonical line per enabled feature.
+ *
+ * Netplay peers must agree on every mod that touches guest memory, and this is
+ * what they compare. A real match desynced because one side had localization
+ * active and the other did not -- that mod patches ROM text, RAM and VRAM in
+ * GUEST memory, so it is simulation state, not presentation.
+ *
+ * Canonical means byte-identical for equal selections on any machine:
+ *
+ *   - only ENABLED features appear; a disabled feature and an absent package
+ *     are the same thing to the simulation, and must hash alike
+ *   - packages, features and options are emitted in sorted order, which
+ *     std::map gives us, so map iteration order cannot leak into the value
+ *   - the package VERSION is included: the same mod at a different version can
+ *     patch different bytes
+ *   - option values are the RESOLVED ones, not the stored ones, so a peer
+ *     relying on a manifest default and a peer that chose the same value
+ *     explicitly agree -- which is the common case and must not desync
+ *
+ * Returns the number of bytes that WOULD be written, so a caller can detect
+ * truncation rather than silently compare prefixes.
+ */
+extern "C" int snes_mod_runtime_effective_set_c(char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string text;
+    if (runtime.initialized) {
+        for (const auto& sel_entry : runtime.selections) {
+            const std::string& package_id = sel_entry.first;
+            const SNESRecomp::PackageSelection& selection = sel_entry.second;
+            const SNESRecomp::Package* package =
+                SNESRecomp::selected_package(runtime, package_id.c_str());
+            if (!package)
+                continue;
+            for (const SNESRecomp::Feature& feature : package->features) {
+                if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                text += package_id;
+                text += '@';
+                text += selection.version;
+                text += '/';
+                text += feature.id;
+                /* Options are listed under the package, not the feature, so
+                 * filter — emitting another feature's options here would make
+                 * the line depend on manifest ordering. */
+                std::map<std::string, std::string> opts;
+                for (const SNESRecomp::Option& option : package->options) {
+                    if (option.feature_id != feature.id)
+                        continue;
+                    opts[option.id] =
+                        SNESRecomp::option_value(runtime, *package, feature, option);
+                }
+                for (const auto& o : opts) {
+                    text += ' ';
+                    text += o.first;
+                    text += '=';
+                    text += o.second;
+                }
+                text += '\n';
+            }
+        }
+    }
+    if (text.empty())
+        text = "(none)\n";
+    if (out && cap > 0) {
+        std::snprintf(out, cap, "%s", text.c_str());
+    }
+    return (int)text.size();
+}
+
 extern "C" const RecompLauncherCModProvider*
 snes_mod_runtime_launcher_provider_c(void) {
 #if defined(RECOMP_LAUNCHER)

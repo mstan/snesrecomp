@@ -58,6 +58,16 @@ snes_mod_runtime_launcher_provider_c(void);
 const char* snes_mod_runtime_last_error_c(void);
 int snes_mod_runtime_feature_enabled_c(const char* package_id,
                                        const char* feature_id);
+/* The effective mod set as canonical text, one line per ENABLED feature:
+ *   "<package>@<version>/<feature> <option>=<value> ...\n"
+ * Sorted and using resolved option values, so equal selections produce
+ * byte-identical output on any machine. "(none)\n" when nothing is enabled.
+ * Returns the length that WOULD be written, so truncation is detectable.
+ *
+ * This is what netplay peers must agree on: a mod that patches guest memory is
+ * simulation state, and two peers running different sets cannot stay in sync. */
+int snes_mod_runtime_effective_set_c(char* out, uint32_t cap);
+
 int snes_mod_runtime_feature_option_value_c(const char* package_id,
                                             const char* feature_id,
                                             const char* option_id,
