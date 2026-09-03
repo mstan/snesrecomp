@@ -323,9 +323,10 @@ uint16_t SwapInputBits(uint16_t x) {
  * the handler returned, so walking it before the handler runs makes any split
  * the handler schedules close ahead land in the past (Gundam Wing schedules
  * VTIME=+2 lines from its line-21 handler; that split was lost ~85% of frames
- * and the gameplay demo rendered black at brightness 0). While inIrq is
- * pending the walk consumes nothing; the host frame loop dispatches promptly,
- * the handler runs under snes_beam_hold, and the walk resumes on release. */
+ * and the gameplay demo rendered black at brightness 0). Once an IRQ is
+ * already pending, the generic beam walker must keep making progress; hosts
+ * that need near-zero handler latency dispatch the pending IRQ explicitly and
+ * bracket the handler with snes_beam_hold(). */
 static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
   /* One NTSC scanline is 1364 master clocks, 262 scanlines per frame. Keep
    * the live beam counters moving while LLE code executes so SLHV/OPHCT/OPVCT
@@ -338,8 +339,6 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
   uint32_t h = snes->hPos;
   uint32_t v = snes->vPos;
   uint32_t consumed = 0;
-  if (check_irq && snes->inIrq)
-    return 0;                      /* frozen until the pending IRQ is taken */
   while (clocks) {
     uint32_t span = 1364u - h;
     if (check_irq && v < 225u && h < 1024u && span > 1024u - h)

@@ -502,6 +502,9 @@ static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
     match_caps_clear(out);
     out->widescreen = json_get_bool(obj, "widescreen", 0);
     out->widescreen_hud = json_get_bool(obj, "widescreen_hud", 1);
+    /* Absent on an older host: an empty plan is "no mods required", which is
+     * the correct reading of a host that cannot express one. */
+    json_get_str(obj, "mods", out->mods, sizeof(out->mods));
     out->ignore_aspect = json_get_bool(obj, "ignore_aspect", 0);
     out->input_delay = json_get_int(obj, "input_delay", 2);
     if (out->input_delay < 2) out->input_delay = 2;
@@ -528,14 +531,15 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
                     ",\"match_caps\":{\"v\":1,\"widescreen\":%s,\"widescreen_hud\":%s,"
                     "\"ignore_aspect\":%s,\"input_delay\":%d,\"ws_extra\":%d,"
                     "\"force_turn\":%s,\"force_input_relay\":%s,"
-                    "\"rollback\":%s}",
+                    "\"rollback\":%s,\"mods\":\"%s\"}",
                     caps->widescreen ? "true" : "false",
                     caps->widescreen_hud ? "true" : "false",
                     caps->ignore_aspect ? "true" : "false",
                     caps->input_delay, caps->ws_extra,
                     caps->force_turn ? "true" : "false",
                     caps->force_input_relay ? "true" : "false",
-                    caps->rollback ? "true" : "false");
+                    caps->rollback ? "true" : "false",
+                    caps->mods);
 }
 
 static void queue_send(const char *json)

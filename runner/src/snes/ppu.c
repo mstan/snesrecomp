@@ -24,10 +24,13 @@ static void PpuDrawWholeLine(Ppu *ppu, uint y);
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line);
 static uint16_t ppu_getVramRemap(Ppu* ppu);
+static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
 
 
 Ppu* ppu_init(void) {
   Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
+  if (ppu)
+    ppu->wsOamMotionLastLine = -1;
   return ppu;
 }
 
@@ -52,6 +55,7 @@ void ppu_reset(Ppu* ppu) {
     memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
   }
   ppu->vramIncrement = 1;
+  ppu->wsOamMotionLastLine = -1;
 }
 
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
@@ -61,6 +65,16 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
   sli->func(sli, version, 8);
   sli->func(sli, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
+}
+
+void PpuResetWidescreenOamHistory(Ppu *ppu) {
+  if (!ppu)
+    return;
+  ppu->wsOamMotionLastLine = -1;
+  memset(ppu->wsOamMotionX, 0, sizeof(ppu->wsOamMotionX));
+  memset(ppu->wsOamMotionSig, 0, sizeof(ppu->wsOamMotionSig));
+  memset(ppu->wsOamMotionSeen, 0, sizeof(ppu->wsOamMotionSeen));
+  memset(ppu->wsOamMotionGrace, 0, sizeof(ppu->wsOamMotionGrace));
 }
 
 // Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
@@ -194,7 +208,7 @@ int PpuWsExtraOverride(void) {
   return s_ov;
 }
 
-void PpuSetExtraSpace(Ppu *ppu, uint8_t extra) {
+void PpuSetExtraSpace(Ppu *ppu, uint16_t extra) {
   if (extra > kPpuExtraLeftRight)
     extra = kPpuExtraLeftRight;
   // Symmetric border: equal columns added on each side. extraLeftRight is the
@@ -206,7 +220,7 @@ void PpuSetExtraSpace(Ppu *ppu, uint8_t extra) {
   PpuResetLayerPolicies(ppu);
 }
 
-void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget) {
+void PpuSetExtraSpaceCentered(Ppu *ppu, uint16_t budget) {
   if (budget > kPpuExtraLeftRight)
     budget = kPpuExtraLeftRight;
   // Render only the authentic 256 columns but keep the centering budget so the
@@ -225,8 +239,8 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom) {
   // the line renderer's window edges stay inside the priority buffers, bottom
   // clamps to the 16px overscan band. See ppu.h for the symmetric-vs-dynamic
   // distinction.
-  ppu->extraLeftCur = (uint8_t)IntMin(IntMax(left, 0), ppu->extraLeftRight);
-  ppu->extraRightCur = (uint8_t)IntMin(IntMax(right, 0), ppu->extraLeftRight);
+  ppu->extraLeftCur = (uint16_t)IntMin(IntMax(left, 0), ppu->extraLeftRight);
+  ppu->extraRightCur = (uint16_t)IntMin(IntMax(right, 0), ppu->extraLeftRight);
   ppu->extraBottomCur = (uint8_t)IntMin(IntMax(bottom, 0), 16);
 }
 
@@ -576,6 +590,7 @@ void ppu_runLine(Ppu* ppu, int line) {
     s_oam_snap_frame = snes_frame_counter;
     debug_server_on_oam_render();
   }
+  PpuUpdateWidescreenOamHistory(ppu, line);
   if(line == 0) {
     if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
       int mod = PPU_mosaicSize(ppu);
@@ -2303,6 +2318,49 @@ static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
   return x;
 }
 
+static uint32_t PpuOamMotionSignature(Ppu *ppu, uint8_t index) {
+  uint8_t slot = index >> 1;
+  uint32_t high_pair =
+      (ppu->highOam[slot >> 2] >> ((slot & 3) * 2)) & 0x3u;
+  return ((uint32_t)(ppu->oam[index] >> 8)) |
+         ((uint32_t)ppu->oam[index + 1] << 8) |
+         ((high_pair & 0x2u) << 23);
+}
+
+static bool PpuWsOamHistorySeen(Ppu *ppu, uint8_t slot) {
+  return (ppu->wsOamMotionSeen[slot >> 3] & (1u << (slot & 7))) != 0;
+}
+
+static void PpuWsOamHistoryMarkSeen(Ppu *ppu, uint8_t slot) {
+  ppu->wsOamMotionSeen[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+}
+
+static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line) {
+  if (ppu->wsOamMotionLastLine >= 0 && line > ppu->wsOamMotionLastLine) {
+    ppu->wsOamMotionLastLine = (int16_t)line;
+    return;
+  }
+  ppu->wsOamMotionLastLine = (int16_t)line;
+  for (uint8_t slot = 0; slot < 128; slot++) {
+    uint8_t index = (uint8_t)(slot * 2);
+    int16_t x = (int16_t)PpuDecodeOamX(ppu, index);
+    uint32_t sig = PpuOamMotionSignature(ppu, index);
+    if (PpuWsOamHistorySeen(ppu, slot) &&
+        sig == ppu->wsOamMotionSig[slot]) {
+      if (x != ppu->wsOamMotionX[slot]) {
+        ppu->wsOamMotionGrace[slot] = kPpuWsOamMovingGraceFrames;
+      } else if (ppu->wsOamMotionGrace[slot]) {
+        ppu->wsOamMotionGrace[slot]--;
+      }
+    } else {
+      ppu->wsOamMotionGrace[slot] = 0;
+      PpuWsOamHistoryMarkSeen(ppu, slot);
+    }
+    ppu->wsOamMotionX[slot] = x;
+    ppu->wsOamMotionSig[slot] = sig;
+  }
+}
+
 static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
                                            int sprite_size,
                                            int left_extra) {
@@ -2310,7 +2368,9 @@ static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
       x + sprite_size <= -left_extra)
     return true;
   int slot = index >> 1;
-  return (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) != 0;
+  if (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)))
+    return true;
+  return ppu->wsOamMotionGrace[slot] != 0;
 }
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {

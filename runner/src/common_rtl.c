@@ -737,6 +737,7 @@ bool RtlLoadSnapshot(const char *filename) {
     return false;
   }
   g_snes->beamMasterLast = g_cpu.master_cycles;
+  PpuResetWidescreenOamHistory(g_snes->ppu);
   /* Post-load reconciliation: host-side execution state (fibers, HLE
    * scheduler bookkeeping) cannot live in the guest snapshot; give the
    * game one hook to rebuild it against the freshly restored WRAM. */
@@ -784,6 +785,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   RtlApuUnlock();
   if (memory.error) return false;
   g_snes->beamMasterLast = g_cpu.master_cycles;
+  PpuResetWidescreenOamHistory(g_snes->ppu);
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;

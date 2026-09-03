@@ -89,6 +89,7 @@ static socket_t s_listen_sock = SOCKET_INVALID;
 static socket_t s_client_sock = SOCKET_INVALID;
 static uint8_t *s_ram = NULL;
 static uint32_t s_ram_size = 0;
+static DebugServerGameCommandHandler s_game_command_handler = NULL;
 // Note: s_frame_counter pointer removed — use snes_frame_counter directly
 static volatile int s_paused = 0;
 static volatile int s_step_remaining = 0;  // frames remaining before auto-re-pause
@@ -1504,7 +1505,7 @@ static char s_frange_dir[400];
 typedef struct DebugPpuHostState {
     uint8_t *render_buffer;
     uint32_t render_pitch, render_flags;
-    uint8_t extra_left_cur, extra_right_cur, extra_left_right;
+    uint16_t extra_left_cur, extra_right_cur, extra_left_right;
     uint8_t extra_bottom_cur;
     PpuWidescreenLineEnhancer *enhancer;
     void *enhancer_context;
@@ -2043,6 +2044,34 @@ static void cmd_ping(const char *args) {
 static void cmd_frame(const char *args) {
     send_fmt("{\"frame\":%d,\"func\":\"%s\"}", snes_frame_counter,
              g_last_recomp_func ? g_last_recomp_func : "?");
+}
+
+static void cmd_game(const char *args) {
+    char cmd[64];
+    size_t n;
+    const char *rest;
+    if (!args) args = "";
+    while (*args == ' ') args++;
+    if (!*args) {
+        send_line("{\"error\":\"missing game command\"}");
+        return;
+    }
+    rest = strchr(args, ' ');
+    n = rest ? (size_t)(rest - args) : strlen(args);
+    if (n >= sizeof(cmd))
+        n = sizeof(cmd) - 1;
+    memcpy(cmd, args, n);
+    cmd[n] = 0;
+    if (rest) {
+        while (*rest == ' ') rest++;
+    } else {
+        rest = "";
+    }
+    if (s_game_command_handler &&
+        s_game_command_handler(cmd, rest, send_line)) {
+        return;
+    }
+    send_fmt("{\"error\":\"unknown game command\",\"cmd\":\"%s\"}", cmd);
 }
 
 // read_ram: space-separated hex, streamed to handle arbitrary lengths up to
@@ -4166,6 +4195,7 @@ static void cmd_load_state(const char *args) {
         send_fmt("{\"error\":\"read failed after %zu bytes\"}", fs.total);
         return;
     }
+    PpuResetWidescreenOamHistory(g_snes->ppu);
     send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
 }
 
@@ -8073,6 +8103,7 @@ static const CmdEntry s_commands[] = {
     {"get_apu_misc",   cmd_get_apu_misc},
     {"frame",         cmd_frame},
     {"dump_frame_range", cmd_dump_frame_range},
+    {"game",          cmd_game},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
     {"dump_cart",     cmd_dump_cart},
@@ -8342,6 +8373,10 @@ int debug_server_init(int port) {
 void debug_server_set_ram(uint8_t *ram, uint32_t ram_size) {
     s_ram = ram;
     s_ram_size = ram_size;
+}
+
+void debug_server_set_game_command_handler(DebugServerGameCommandHandler handler) {
+    s_game_command_handler = handler;
 }
 
 static void check_watchpoints(void) {

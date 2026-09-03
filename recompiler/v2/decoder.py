@@ -1182,7 +1182,7 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
     ADVANCES the stacked return address by a constant N so its RTS/RTL
     returns PAST the inline data. The game-agnostic 65816 signature:
 
-        LDA $rr,S        ; load the return-address-low slot (rr=1 here)
+        LDA $rr,S        ; load the current return-address-low slot
         ... (A preserved: STA dp/abs, CLC/SEC) ...
         ADC #N           ; advance the return address by N
         STA $rr,S        ; write it back to the SAME slot
@@ -1229,13 +1229,49 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
     }
     pc = addr & 0xFFFF
     m, x = entry_m & 1, entry_x & 1
-    a_slot = None     # stack slot the live A value came from (LDA $nn,S)
-    a_pulled = False  # live A value came from PLA of the return address
-    a_added = 0       # constant added to that value since the load
-    y_slot = None     # stack slot copied through Y via TAY/TYA
+    stack_depth = 0
+    return_valid = 0b11
+    status_slots = {}
+
+    def return_mask(start, size):
+        mask = 0
+        if start <= 1 < start + size:
+            mask |= 0b01
+        if start <= 2 < start + size:
+            mask |= 0b10
+        return mask
+
+    def return_bytes_valid(start, size):
+        if start != 1 or size not in (1, 2):
+            return False
+        mask = (1 << size) - 1
+        return return_valid & mask == mask
+
+    def invalidate_stack_write(start, size):
+        nonlocal return_valid
+        return_valid &= ~return_mask(start, size)
+        for pos in range(start, start + size):
+            status_slots.pop(pos, None)
+
+    def push_bytes(size):
+        nonlocal stack_depth
+        stack_depth -= size
+        start = stack_depth + 1
+        invalidate_stack_write(start, size)
+        return start
+
+    a_slot = None
+    a_slot_size = 0
+    a_pulled = False
+    a_pulled_size = 0
+    a_added = 0
+    y_slot = None
+    y_slot_size = 0
     y_pulled = False
+    y_pulled_size = 0
     y_added = 0
     x_pulled = False
+    x_pulled_size = 0
     x_added = 0
     budget = 0
     while budget < 96:
@@ -1256,92 +1292,245 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
         if mn in _TERMINATORS:
             return None
         if mn == 'REP':
-            if ins.operand & 0x20: m = 0
+            if ins.operand & 0x20:
+                changed = m != 0
+                m = 0
+                if changed:
+                    a_slot = None
+                    a_slot_size = 0
+                    a_pulled = False
+                    a_pulled_size = 0
+                    a_added = 0
             if ins.operand & 0x10:
+                changed = x != 0
                 x = 0
-                x_pulled = False
-                x_added = 0
+                if changed:
+                    y_slot = None
+                    y_slot_size = 0
+                    y_pulled = False
+                    y_pulled_size = 0
+                    y_added = 0
+                    x_pulled = False
+                    x_pulled_size = 0
+                    x_added = 0
         elif mn == 'SEP':
-            if ins.operand & 0x20: m = 1
+            if ins.operand & 0x20:
+                changed = m != 1
+                m = 1
+                if changed:
+                    a_slot = None
+                    a_slot_size = 0
+                    a_pulled = False
+                    a_pulled_size = 0
+                    a_added = 0
             if ins.operand & 0x10:
+                changed = x != 1
                 x = 1
-                x_pulled = False
-                x_added = 0
+                if changed:
+                    y_slot = None
+                    y_slot_size = 0
+                    y_pulled = False
+                    y_pulled_size = 0
+                    y_added = 0
+                    x_pulled = False
+                    x_pulled_size = 0
+                    x_added = 0
         elif mn == 'LDA' and ins.mode == STK:
-            a_slot = ins.operand & 0xFF       # (re)start tracking from this slot
+            slot = ins.operand & 0xFF
+            size = 1 if m else 2
+            tracked = return_bytes_valid(stack_depth + slot, size)
+            a_slot = slot if tracked else None
+            a_slot_size = size if tracked else 0
             a_pulled = False
+            a_pulled_size = 0
             a_added = 0
         elif op == 0x68:                       # PLA
+            size = 1 if m else 2
             a_slot = None
-            a_pulled = True
+            a_slot_size = 0
+            a_pulled = return_bytes_valid(stack_depth + 1, size)
+            a_pulled_size = size if a_pulled else 0
             a_added = 0
+            stack_depth += size
         elif op == 0xA8:                       # TAY
-            if a_slot is not None or a_pulled:
+            if m == x and (a_slot is not None or a_pulled):
                 y_slot = a_slot
+                y_slot_size = a_slot_size
                 y_pulled = a_pulled
+                y_pulled_size = a_pulled_size
                 y_added = a_added
             else:
                 y_slot = None
+                y_slot_size = 0
                 y_pulled = False
+                y_pulled_size = 0
                 y_added = 0
         elif op == 0x98:                       # TYA
-            if y_slot is not None or y_pulled:
+            if m == x and (y_slot is not None or y_pulled):
                 a_slot = y_slot
+                a_slot_size = y_slot_size
                 a_pulled = y_pulled
+                a_pulled_size = y_pulled_size
                 a_added = y_added
             else:
                 a_slot = None
+                a_slot_size = 0
                 a_pulled = False
+                a_pulled_size = 0
                 a_added = 0
         elif op == 0x69 and (a_slot is not None or a_pulled):   # ADC #imm
             a_added = (a_added + ins.operand) & 0xFFFF
         elif op == 0x83 and ins.mode == STK:      # STA $nn,S — return-addr write-back
-            if a_slot is not None and (ins.operand & 0xFF) == a_slot and a_added:
+            slot = ins.operand & 0xFF
+            size = 1 if m else 2
+            start = stack_depth + slot
+            writeback = (a_slot is not None and slot == a_slot and
+                         a_slot_size == size and start == 1)
+            mask = return_mask(start, size)
+            if writeback and a_added and return_valid | mask == 0b11:
                 return a_added & 0xFF             # inline byte count
-            # store-back without an add (or to a different slot): not it
-        elif op == 0x48 and a_pulled:             # PHA
-            if a_added:
-                return a_added & 0xFF
+            invalidate_stack_write(start, size)
+            if writeback and not a_added:
+                return_valid |= mask
+        elif op == 0x48:                          # PHA
+            size = 1 if m else 2
+            start = push_bytes(size)
+            if (a_pulled and a_pulled_size == size and
+                    start == 1):
+                if a_added:
+                    if return_valid | return_mask(start, size) == 0b11:
+                        return a_added & 0xFF
+                else:
+                    return_valid |= return_mask(start, size)
             a_pulled = False
+            a_pulled_size = 0
             a_added = 0
         elif op == 0xFA:                          # PLX
-            x_pulled = True
+            size = 1 if x else 2
+            x_pulled = return_bytes_valid(stack_depth + 1, size)
+            x_pulled_size = size if x_pulled else 0
             x_added = 0
+            stack_depth += size
         elif op == 0xE8 and x_pulled:             # INX
             x_added = (x_added + 1) & 0xFFFF
-        elif op == 0xDA and x_pulled:             # PHX
-            if x_added:
-                return x_added & 0xFF
+        elif op == 0xDA:                          # PHX
+            size = 1 if x else 2
+            start = push_bytes(size)
+            if (x_pulled and x_pulled_size == size and
+                    start == 1):
+                if x_added:
+                    if return_valid | return_mask(start, size) == 0b11:
+                        return x_added & 0xFF
+                else:
+                    return_valid |= return_mask(start, size)
             x_pulled = False
+            x_pulled_size = 0
             x_added = 0
-        elif op in CONTROL_TRANSFER:
+        elif op == 0x5A:                          # PHY
+            push_bytes(1 if x else 2)
+            y_pulled = False
+            y_pulled_size = 0
+            y_added = 0
+        elif op == 0x08:                          # PHP
+            status_slots[push_bytes(1)] = (m, x)
+        elif op in (0x8B, 0x4B):                 # PHB / PHK
+            push_bytes(1)
+        elif op == 0x0B:                          # PHD
+            push_bytes(2)
+        elif op in (0xF4, 0xD4, 0x62):           # PEA / PEI / PER
+            push_bytes(2)
             a_slot = None
+            a_slot_size = 0
             a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+        elif op == 0x7A:                          # PLY
+            stack_depth += 1 if x else 2
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
             a_added = 0
             y_slot = None
             y_pulled = False
+            y_pulled_size = 0
+            y_added = 0
+        elif op == 0xAB:                          # PLB
+            stack_depth += 1
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+        elif op == 0x2B:                          # PLD
+            stack_depth += 2
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+        elif op == 0x28:                          # PLP
+            saved = status_slots.pop(stack_depth + 1, None)
+            if saved is None:
+                return None
+            stack_depth += 1
+            m, x = saved
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+            y_slot = None
+            y_slot_size = 0
+            y_pulled = False
+            y_pulled_size = 0
             y_added = 0
             x_pulled = False
+            x_pulled_size = 0
+            x_added = 0
+        elif op in (0x9A, 0x1B, 0xFB):           # TXS / TCS / XCE
+            return None
+        elif op in CONTROL_TRANSFER:
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+            y_slot = None
+            y_slot_size = 0
+            y_pulled = False
+            y_pulled_size = 0
+            y_added = 0
+            x_pulled = False
+            x_pulled_size = 0
             x_added = 0
         elif op in A_PRESERVING:
             if op in Y_MUTATING:
                 y_slot = None
+                y_slot_size = 0
                 y_pulled = False
+                y_pulled_size = 0
                 y_added = 0
             if op in X_MUTATING:
                 x_pulled = False
+                x_pulled_size = 0
                 x_added = 0
             pass                                  # A unchanged; keep tracking
         else:
             a_slot = None                         # A clobbered — reset
+            a_slot_size = 0
             a_pulled = False
+            a_pulled_size = 0
             a_added = 0
             if op in Y_MUTATING:
                 y_slot = None
+                y_slot_size = 0
                 y_pulled = False
+                y_pulled_size = 0
                 y_added = 0
             if op in X_MUTATING:
                 x_pulled = False
+                x_pulled_size = 0
                 x_added = 0
         pc = (pc + ins.length) & 0xFFFF
     return None

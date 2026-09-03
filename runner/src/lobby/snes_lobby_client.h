@@ -54,6 +54,16 @@ typedef struct SnesLobbyMatchCaps {
     int  force_turn;       /* 0/1 — host: ICE relay-only (TURN) for all peers */
     int  force_input_relay; /* 0/1 — lobby-server UDP input relay */
     int  rollback;         /* 0/1 — session mode; lobby default ON */
+    /* The host's required mod plan: one entry per enabled feature,
+     * "<package>@<version>/<feature> <opt>=<val> ...", entries separated by
+     * ';'. Semicolons rather than the canonical newlines purely so it survives
+     * a hand-rolled JSON string field without escaping.
+     *
+     * Host-authoritative like everything else here: mods patch guest memory,
+     * so a peer running a different set is running a different game. Carrying
+     * it in the lobby is what lets a guest SEE the requirement before seating,
+     * instead of discovering it when the match refuses to start. */
+    char mods[512];
 } SnesLobbyMatchCaps;
 
 typedef struct SnesLobbyJoinInfo {

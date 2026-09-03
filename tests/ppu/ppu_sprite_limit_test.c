@@ -118,6 +118,17 @@ static void render_one_line(Ppu *ppu) {
     ppu_runLine(ppu, 1);
 }
 
+static void render_strict_left_oam_frame(Ppu *ppu, uint32_t *pixels,
+                                         size_t pixel_count, int raw_x,
+                                         const uint8_t *hints) {
+    memset(pixels, 0, pixel_count * sizeof(pixels[0]));
+    PpuWsSetOamLeftHints(ppu, hints);
+    setup_one_sprite_line(ppu, raw_x);
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
+    snes_frame_counter++;
+}
+
 static unsigned count_argb_pixels(const uint32_t *pixels, size_t count) {
     unsigned nonzero = 0;
     for (size_t i = 0; i < count; i++) {
@@ -569,6 +580,53 @@ int main(void) {
         ppu_runLine(ppu, 1);
         failures += check(wide_pixels[kExtra - 1] != 0,
                           "NULL left hints restore legacy margin behavior");
+    }
+
+    /* Strict left hints only describe host-owned slots. For game-owned slots,
+     * a negative-X sprite that is moving frame-to-frame should continue through
+     * the widened margin, but a parked off-screen sprite should still clip. */
+    {
+        enum { kExtra = 16, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t wide_pixels[kWidePixels];
+        uint8_t no_hints[16] = {0};
+
+        ppu_reset(ppu);
+        snes_frame_counter = 1000;
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+
+        render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
+                                     0x1f9, no_hints);
+        failures += check(wide_pixels[kExtra] != 0,
+                          "partially visible negative OAM stays visible");
+
+        render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
+                                     0x1f8, no_hints);
+        failures += check(wide_pixels[kExtra - 1] != 0 &&
+                              wide_pixels[kExtra - 8] != 0,
+                          "moving unhinted OAM exits through left margin");
+
+        for (int i = 0; i < kPpuWsOamMovingGraceFrames; i++) {
+            render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
+                                         0x1f8, no_hints);
+        }
+        failures += check(wide_pixels[kExtra - 1] == 0 &&
+                              wide_pixels[kExtra - 8] == 0,
+                          "stopped unhinted OAM parks outside left edge");
+
+        ppu_reset(ppu);
+        snes_frame_counter = 2000;
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
+                                     0x1f8, no_hints);
+        failures += check(wide_pixels[kExtra - 1] == 0 &&
+                              wide_pixels[kExtra - 8] == 0,
+                          "initial parked unhinted OAM remains clipped");
     }
 
     ppu_free(ppu);

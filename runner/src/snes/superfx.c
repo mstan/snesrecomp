@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { kSuperFxWsMaxExtra = 111, kSuperFxWsMaxWidth = 446 };
+enum { kSuperFxWsMaxExtra = 288, kSuperFxWsMaxWidth = 800 };
 
 enum {
   SFR_Z = 1u << 1, SFR_CY = 1u << 2, SFR_S = 1u << 3,
@@ -473,7 +473,7 @@ void superfx_reset(SuperFx *f) {
   uint8_t *ws_present_valid=f->ws_present_valid;
   void *ws_task_state=f->ws_task_state; uint8_t *ws_task_ram=f->ws_task_ram;
   SuperFxEnhancementMode enhancement_mode=f->enhancement_mode;
-  uint8_t ws_extra=f->ws_extra;
+  uint16_t ws_extra=f->ws_extra;
   memset(f,0,sizeof(*f)); f->rom=rom;f->rom_size=rs;f->rom_mask=rs-1;f->ram=ram;f->ram_size=rm;f->ram_mask=rm-1;
   f->ws_pixels=ws_pixels;f->ws_valid=ws_valid;f->ws_task_state=ws_task_state;
   f->ws_present_pixels=ws_present_pixels;
@@ -577,7 +577,7 @@ SuperFxEnhancementMode superfx_get_enhancement_mode(const SuperFx *f) {
   return f ? f->enhancement_mode : kSuperFxEnhancement_None;
 }
 
-void superfx_set_widescreen(SuperFx *f, uint8_t extra, uint8_t task_pbr,
+void superfx_set_widescreen(SuperFx *f, uint16_t extra, uint8_t task_pbr,
                             uint16_t task_address, uint16_t center_x_ram,
                             uint16_t max_x_ram, uint8_t height) {
   if (!f) return;

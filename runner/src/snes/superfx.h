@@ -77,8 +77,8 @@ typedef struct SuperFx {
   uint8_t *ws_present_valid;
   void *ws_task_state;
   uint8_t *ws_task_ram;
-  uint16_t ws_width;
-  uint8_t ws_height, ws_extra;
+  uint16_t ws_width, ws_extra;
+  uint8_t ws_height;
   bool ws_render_active, ws_replay_pending, ws_replay_mode, ws_frame_ready;
   bool ws_pending_ready;
   uint8_t ws_replay_zero_word_count;
@@ -114,7 +114,7 @@ SuperFxEnhancementMode superfx_get_enhancement_mode(const SuperFx *fx);
  * selected above. The task's projection center and maximum X are supplied as
  * GSU RAM offsets, keeping title-specific addresses out of the LLE core.
  * `extra` is the added projected width per side; zero disables it. */
-void superfx_set_widescreen(SuperFx *fx, uint8_t extra, uint8_t task_pbr,
+void superfx_set_widescreen(SuperFx *fx, uint16_t extra, uint8_t task_pbr,
                             uint16_t task_address, uint16_t center_x_ram,
                             uint16_t max_x_ram, uint8_t height);
 /* Clear title-selected word flags only in the presentation replay. This lets

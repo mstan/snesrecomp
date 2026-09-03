@@ -28,6 +28,24 @@ void SnesEnterNativeMode(void);
 typedef void CpuInfraInitializeFunc(void);
 typedef void RunOneFrameOfGameFunc(void);
 
+typedef enum RtlEnhancedRenderResult {
+  kRtlEnhancedRender_NotHandled = 0,
+  kRtlEnhancedRender_Handled = 1,
+} RtlEnhancedRenderResult;
+
+typedef struct RtlEnhancedRendererFrame {
+  uint8 *pixels;
+  size_t pitch;
+  int width;
+  int height;
+  uint32 render_flags;
+  uint16 widescreen_extra;
+  int default_renderer_done;
+} RtlEnhancedRendererFrame;
+
+typedef RtlEnhancedRenderResult RtlEnhancedRenderFrameFunc(
+    RtlEnhancedRendererFrame *frame);
+
 void WatchdogCheck(void);
 void snes_refresh_charge(void);   /* DRAM refresh tax; see common_cpu_infra.c */
 void snes_refresh_exempt(void);   /* mark a master-clock teleport (park, load) */
@@ -88,6 +106,9 @@ typedef struct RtlGameInfo {
   CpuInfraInitializeFunc *initialize;
   RunOneFrameOfGameFunc *run_frame;
   RunOneFrameOfGameFunc *draw_ppu_frame;
+  /* Optional title-owned native/enhanced presentation hook. Hosts must keep
+   * this opt-in and leave draw_ppu_frame as the default console renderer. */
+  RtlEnhancedRenderFrameFunc *enhanced_render_frame;
   // Filename prefix used by RtlSaveLoad, e.g. "save" produces
   // "saves/save%d.sav". If NULL, framework uses "%s_save" with title.
   const char *save_name_prefix;
