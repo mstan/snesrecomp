@@ -1071,6 +1071,17 @@ static void rb_send_identity(void)
         return;
     if (g_rb.local_build_fp == 0u && g_rb.local_content_fp == 0u)
         return;
+    /* Validation (SNES_RB_FORCE_MOD_MISMATCH=1): claim a mod set we do not
+     * have, so the refusal path can be proven to fire. A refusal that has
+     * never refused anything is not a safety feature. */
+    if (rb_env_int("SNES_RB_FORCE_MOD_MISMATCH", 0, 0, 1) > 0) {
+        rnet_session_send_rb_sync(
+            s, 0u, g_rb.local_build_fp, g_rb.local_content_fp ^ 0x5a5a5a5au, 0u,
+            (rnet_u8)(rb_local_slot() < 0 ? 0 : rb_local_slot()),
+            RNET_RB_SYNC_OP_IDENT, 0u);
+        g_rb.ident_sent = 1u;
+        return;
+    }
     /* Every few ticks, not every tick: one trip is all it needs, and a peer
      * that is simply older should not be pelted. */
     if ((g_rb.sim % 8u) != 0u)
@@ -1927,21 +1938,44 @@ static void rb_drain_wire(void)
             if ((g_rb.local_build_fp | g_rb.local_content_fp) != 0u) {
                 int build_ok = (a == g_rb.local_build_fp);
                 int content_ok = (b == g_rb.local_content_fp);
-                if (!build_ok || !content_ok)
-                    fprintf(stderr,
-                            "snes_netplay: PEER IDENTITY DIFFERS — build "
-                            "ours=%08x peer=%08x%s, content ours=%08x "
-                            "peer=%08x%s. Different builds or different "
-                            "content cannot simulate alike; expect the boot "
-                            "digest to disagree.\n",
-                            (unsigned)g_rb.local_build_fp, (unsigned)a,
-                            build_ok ? " (same)" : " (DIFFERENT)",
-                            (unsigned)g_rb.local_content_fp, (unsigned)b,
-                            content_ok ? " (same)" : " (DIFFERENT)");
-                else
+                if (content_ok && build_ok) {
                     fprintf(stderr, "snes_netplay: peer identity matches "
                             "(build=%08x content=%08x)\n",
                             (unsigned)a, (unsigned)b);
+                    break;
+                }
+                if (!build_ok)
+                    fprintf(stderr,
+                            "snes_netplay: peer BUILD differs ours=%08x "
+                            "peer=%08x — not refused on its own, because a "
+                            "build can differ without changing what the guest "
+                            "simulates. The boot digest is the arbiter.\n",
+                            (unsigned)g_rb.local_build_fp, (unsigned)a);
+                if (!content_ok) {
+                    /* REFUSE. A mod set is not like a build: every mod in it
+                     * exists to change what the guest simulates -- localization
+                     * patches ROM text, RAM and VRAM in guest memory -- so two
+                     * peers with different sets are running different games by
+                     * definition, and no amount of rollback reconciles that.
+                     *
+                     * Both peers receive the other's identity and refuse
+                     * independently, so neither waits on the other. */
+                    fprintf(stderr,
+                            "snes_netplay: MOD SETS DIFFER ours=%08x "
+                            "peer=%08x — this match cannot be played. Every "
+                            "mod in the set changes what the guest simulates, "
+                            "so the two sides are running different games. "
+                            "Compare the \"game: mod set\" line in each log; "
+                            "the host's selection is the one to match.\n",
+                            (unsigned)g_rb.local_content_fp, (unsigned)b);
+                    if (rb_env_int("SNES_RB_ALLOW_MOD_MISMATCH", 0, 0, 1) > 0) {
+                        fprintf(stderr, "snes_netplay:   "
+                                "SNES_RB_ALLOW_MOD_MISMATCH=1 — continuing "
+                                "anyway; expect an immediate desync\n");
+                        break;
+                    }
+                    snes_netplay_request_return_to_lobby();
+                }
             }
             break;
         case RNET_RB_SYNC_OP_COMMIT:

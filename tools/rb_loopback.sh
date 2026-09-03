@@ -78,7 +78,8 @@ common=(SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 # to the follower's line.
 follower_off=(SNES_RB_FORCE_MISPREDICT=0
               SNES_RB_FORCE_FORK=0
-              SNES_RB_FORCE_BOOT_FORK=0)
+              SNES_RB_FORCE_BOOT_FORK=0
+              SNES_RB_FORCE_MOD_MISMATCH=0)
 
 cd "$EXE_DIR" || exit 2
 env "${common[@]}" SNES_NET_SLOT=0 SNES_NET_INPUT_PLAYER=0 \
@@ -185,13 +186,21 @@ echo
 # the difference is one-directional by construction.
 gap=$(( ep_i - ep_f ))
 resid=$(( gap - nack_i ))
-refused_boot=$(count initiator 'BOOT DIGEST MISMATCH')
+# Any deliberate pre-match refusal. Counted as a class rather than one string
+# at a time: the boot-digest stop needed this, then the mod-set stop needed it
+# again, and grading a safety feature as "a peer opened no episodes" is a
+# mistake worth making impossible rather than twice.
+# Counted on BOTH peers: a refusal is not always symmetric. The boot digest is
+# detected by each side independently, but a mod-set mismatch is detected by
+# whichever side RECEIVES the differing identity — so looking only at the
+# initiator missed it entirely and reported the refusal as a failure.
+refused_boot=$(( $(count initiator 'BOOT DIGEST MISMATCH\|MOD SETS DIFFER') \
+               + $(count follower  'BOOT DIGEST MISMATCH\|MOD SETS DIFFER') ))
 if [ "$refused_boot" -gt 0 ] && [ "$ep_i" -eq 0 ]; then
-    # The match was refused before it began, which is the CORRECT outcome for
-    # peers that booted differently. Without this the harness reported it as
-    # "a peer opened no episodes" -- grading the safety feature as a failure.
-    echo "PASS (refused): boot digests differed and the match did not start —" \
-         "0 episodes, which is the point"
+    why=$(grep -ohE 'BOOT DIGEST MISMATCH|MOD SETS DIFFER' "$OUT"/*.log \
+          2>/dev/null | head -1)
+    echo "PASS (refused): ${why:-a pre-match check} stopped the match before it" \
+         "started — 0 episodes, which is the point"
 elif [ "$KILL_AT" -gt 0 ] 2>/dev/null; then
     # The ledger cannot balance against a peer that stopped answering, so the
     # question becomes survival: did the initiator keep simulating after the
