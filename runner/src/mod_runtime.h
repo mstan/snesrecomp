@@ -58,6 +58,20 @@ snes_mod_runtime_launcher_provider_c(void);
 const char* snes_mod_runtime_last_error_c(void);
 int snes_mod_runtime_feature_enabled_c(const char* package_id,
                                        const char* feature_id);
+/* Verdicts for snes_mod_runtime_check_set_c. Values match the wire codes in
+ * the netplay protocol, but are declared here so the mod runtime does not have
+ * to know what a packet is -- the netplay layer owns that mapping. */
+#define SNES_MODSET_OK      0
+#define SNES_MODSET_MISSING 1  /* package absent entirely */
+#define SNES_MODSET_VERSION 2  /* present at a different version */
+#define SNES_MODSET_OPTION  3  /* option, value, or selection we cannot meet */
+#define SNES_MODSET_TOO_BIG 4  /* set too large to compare honestly */
+
+/* Can this build honour the host's mod set? Returns one of the above and
+ * writes a player-actionable reason ("missing mod: x", "y needs version z").
+ * Empty reason on OK. */
+int snes_mod_runtime_check_set_c(const char* want, char* reason, uint32_t cap);
+
 /* The effective mod set as canonical text, one line per ENABLED feature:
  *   "<package>@<version>/<feature> <option>=<value> ...\n"
  * Sorted and using resolved option values, so equal selections produce

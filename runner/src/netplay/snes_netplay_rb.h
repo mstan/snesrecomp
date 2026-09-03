@@ -108,6 +108,15 @@ uint32_t snes_netplay_rb_desync_count(void);
  * differ". */
 void snes_netplay_rb_set_identity(uint32_t build_fp, uint32_t content_fp);
 
+/* The host publishes this set; every peer must confirm it can run it before
+ * the match may start. `check` answers for the local build and writes a
+ * player-actionable reason. Both are supplied by the game, which owns its mod
+ * runtime; the netplay layer only carries and gates on them. */
+typedef int (*SnesNetplayModSetCheckFn)(const char *want, char *reason,
+                                        uint32_t cap);
+void snes_netplay_rb_set_modset(const char *text,
+                                SnesNetplayModSetCheckFn check);
+
 /* Link RTT in ms, EMA'd from the POST handshake; 0 until an episode has
  * round-tripped. Feeds the scheduler's invent-grace budget. */
 uint32_t snes_netplay_rb_rtt_estimate_ms(void);
