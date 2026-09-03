@@ -1630,12 +1630,29 @@ static int rb_begin_episode(uint32_t mismatch_tick, int slot, int as_initiator,
     uint32_t target;
     uint32_t sim_tip = g_rb.sim ? g_rb.sim - 1u : 0u;
 
-    if (!g_rb.rb || g_rb.stage != kRbIdle)
+    /* The last two silent exits in this function. Every other refusal says
+     * why; these returned 0 and left an episode the peer had opened with no
+     * trace on our side, which showed up as an intermittent unaccounted
+     * episode in the ledger and nothing else. Follower-side only: the
+     * initiator reaches here from reconcile, which already checked the stage,
+     * so logging both sides would be noise. */
+    if (!g_rb.rb || g_rb.stage != kRbIdle) {
+        if (!as_initiator)
+            fprintf(stderr,
+                    "snes_netplay: RB follow refused epoch=%u — busy in %s "
+                    "when the BEGIN reached rb_begin_episode\n",
+                    (unsigned)peer_epoch, rb_stage_name(g_rb.stage));
         return 0;
+    }
     if (as_initiator && rb_cooldown_active())
         return 0;
-    if (mismatch_tick == 0u)
+    if (mismatch_tick == 0u) {
+        if (!as_initiator)
+            fprintf(stderr,
+                    "snes_netplay: RB follow refused epoch=%u — BEGIN carried "
+                    "no mismatch tick\n", (unsigned)peer_epoch);
         return 0;
+    }
 
     if (as_initiator) {
         if (!rb_snap_floor(mismatch_tick, &load)) {

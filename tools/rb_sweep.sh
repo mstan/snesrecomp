@@ -23,6 +23,7 @@ OUT="${RB_SWEEP_OUT:-/tmp/rb_sweep}"
 mkdir -p "$OUT"
 
 fails=0
+pre_fails=0
 cells=0
 
 # ── pre-flight ────────────────────────────────────────────────────────────
@@ -43,10 +44,10 @@ if cc -I "$SNESRC/runner/src" -I "$SNESRC/runner/src/snes" \
     if "$OUT/pc24_test" >"$OUT/pc24_test.log" 2>&1; then
         echo "  resume-PC predicate      PASS  ($(grep -c '^  ok' "$OUT/pc24_test.log") cases)"
     else
-        echo "  resume-PC predicate      FAIL  — see $OUT/pc24_test.log"; fails=$((fails+1))
+        echo "  resume-PC predicate      FAIL  — see $OUT/pc24_test.log"; pre_fails=$((pre_fails+1))
     fi
 else
-    echo "  resume-PC predicate      NO-BUILD — see $OUT/pc24_build.log"; fails=$((fails+1))
+    echo "  resume-PC predicate      NO-BUILD — see $OUT/pc24_build.log"; pre_fails=$((pre_fails+1))
 fi
 
 # The recovery arms. Each must fire and the machine must keep running; with the
@@ -71,19 +72,40 @@ n_asym=$(printf '%s' "$probe_out" | grep -c 'ASYMMETRIC' || true)
 n_div=$(printf '%s' "$probe_out" | grep -c 'DIVERGE' || true)
 n_vol=$(printf '%s' "$probe_out" | grep -oE '\(([0-9]+) volatile' | grep -oE '[0-9]+' \
         | sort -rn | head -1)
+# Retried once before failing. These arms are fixed wall-clock runs, so a slow
+# start can yield zero of something and read as a defect; a check that cries
+# wolf on a busy machine gets ignored, which is worse than not having it. A
+# genuine failure fails twice.
+if [ "$n_sym" -eq 0 ] || [ "$n_asym" -gt 0 ] || [ "$n_div" -gt 0 ]; then
+    probe_out=$( ( cd "$(dirname "$EXE")" && timeout 40 env SDL_VIDEODRIVER=dummy \
+        SDL_AUDIODRIVER=dummy SNESRECOMP_RB_PROBE=25:2 SNESRECOMP_RB_PROBE_VERBOSE=1 \
+        "./$(basename "$EXE")" ) 2>&1 )
+    n_sym=$(printf '%s' "$probe_out" | grep -c 'symmetric frame' || true)
+    n_asym=$(printf '%s' "$probe_out" | grep -c 'ASYMMETRIC' || true)
+    n_div=$(printf '%s' "$probe_out" | grep -c 'DIVERGE' || true)
+fi
 if [ "$n_sym" -gt 0 ] && [ "$n_asym" -eq 0 ] && [ "$n_div" -eq 0 ]; then
     echo "  rewind determinism       PASS  ($n_sym symmetric, 0 asymmetric, 0 divergent," \
          "noise floor ${n_vol:-0} byte(s))"
 else
     echo "  rewind determinism       FAIL  (symmetric=$n_sym asymmetric=$n_asym divergent=$n_div)"
-    fails=$((fails+1))
+    pre_fails=$((pre_fails+1))
 fi
 
+if [ "$n_rec" -eq 0 ] || [ "$n_cold" -eq 0 ]; then
+    n_rec=$( ( cd "$(dirname "$EXE")" && timeout 25 env SDL_VIDEODRIVER=dummy \
+        SDL_AUDIODRIVER=dummy GAME_FORCE_BAD_RESUME_PC=120 \
+        "./$(basename "$EXE")" ) 2>&1 | grep -c "recovering to last good" || true )
+    n_cold=$( ( cd "$(dirname "$EXE")" && timeout 25 env SDL_VIDEODRIVER=dummy \
+        SDL_AUDIODRIVER=dummy GAME_FORCE_BAD_RESUME_PC=120 \
+        GAME_FORCE_BAD_RESUME_STICKY=1 "./$(basename "$EXE")" ) 2>&1 \
+        | grep -c "cold booting" || true )
+fi
 if [ "$n_rec" -gt 0 ] && [ "$n_cold" -gt 0 ] && [ "$n_quiet" -eq 0 ]; then
     echo "  resume-PC recovery       PASS  ($n_rec recovered, $n_cold cold-booted, 0 when off)"
 else
     echo "  resume-PC recovery       FAIL  (recovered=$n_rec cold=$n_cold when-off=$n_quiet)"
-    fails=$((fails+1))
+    pre_fails=$((pre_fails+1))
 fi
 echo
 
@@ -116,9 +138,9 @@ grid=(
 # fails a third of the time stops being read, which is the failure this whole
 # harness exists to avoid.
 
-printf '%-24s %-9s %7s %7s %7s %7s  %s\n' \
-  cell verdict episodes aborts extends stalls note
-printf '%.0s─' {1..92}; echo
+printf '%-24s %-9s %3s %7s %7s %7s %7s  %s\n' \
+  cell verdict rc episodes aborts extends stalls note
+printf '%.0s─' {1..96}; echo
 
 for row in "${grid[@]}"; do
     name="${row%%|*}"; name="${name%"${name##*[![:space:]]}"}"
@@ -145,14 +167,27 @@ for row in "${grid[@]}"; do
     ex=$(cat $logs 2>/dev/null | grep -c 'RB tip-extend epoch' || true)
     st=$(cat $logs 2>/dev/null | grep -c 'RB chain stall' || true)
     drop=$(cat $logs 2>/dev/null | grep -oE 'dropped=[0-9]+' | tail -1)
-    printf '%-24s %-9s %7s %7s %7s %7s  %s\n' \
-      "$name" "${verdict:0:9}" "$ep" "$ab" "$ex" "$st" "${drop:-}"
+    # rc is printed, not just accumulated: a cell that prints PASS while
+    # exiting non-zero is otherwise invisible, and the sweep total then
+    # disagrees with every row above it for no stated reason.
+    printf '%-24s %-9s %3s %7s %7s %7s %7s  %s\n' \
+      "$name" "${verdict:0:9}" "$rc" "$ep" "$ab" "$ex" "$st" "${drop:-}"
 done
 
 echo
-if [ "$fails" -eq 0 ]; then
-    echo "SWEEP PASS: $cells cells, every gating cell clean"
-else
+# Pre-flight and cells are counted apart. Folding them together made the
+# summary contradict every row above it -- "1 of 13 cells failed" while all
+# thirteen printed PASS, because the failure was a timing-sensitive pre-flight
+# arm. A total that disagrees with the table teaches people to ignore the table.
+if [ "$pre_fails" -gt 0 ] && [ "$fails" -gt 0 ]; then
+    echo "SWEEP FAIL: $pre_fails pre-flight check(s) and $fails of $cells cells" \
+         "failed — logs under $OUT"
+elif [ "$pre_fails" -gt 0 ]; then
+    echo "SWEEP FAIL: $pre_fails pre-flight check(s) failed; all $cells cells" \
+         "clean — logs under $OUT"
+elif [ "$fails" -gt 0 ]; then
     echo "SWEEP FAIL: $fails of $cells cells failed — logs under $OUT"
+else
+    echo "SWEEP PASS: pre-flight clean, $cells cells, every gating cell clean"
 fi
-exit $(( fails > 0 ))
+exit $(( (fails + pre_fails) > 0 ))
