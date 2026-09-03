@@ -2330,6 +2330,35 @@ extern "C" int snes_mod_runtime_effective_set_c(char* out, uint32_t cap) {
  * so the answer names the package, and the version or option, that we cannot
  * meet.
  */
+/*
+ * Do we have this package, at this version, and what is it called?
+ *
+ * The lobby shows a guest the host's required mods before anyone seats, and
+ * each row needs a local verdict: installed, wrong version, or absent. Names
+ * come from the manifest so the row reads "Gundam Wing Endless Duel
+ * Localization" rather than "gwed.localization" -- a player who has to go and
+ * install something should be told what to look for.
+ *
+ * Returns 1 installed at that version, 0 present at another, -1 absent.
+ */
+extern "C" int snes_mod_runtime_have_package_c(const char* package_id,
+                                               const char* version,
+                                               char* name_out,
+                                               uint32_t name_cap) {
+    if (name_out && name_cap) name_out[0] = '\0';
+    if (!package_id) return -1;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    auto it = runtime.packages.find(package_id);
+    if (it == runtime.packages.end() || it->second.empty()) return -1;
+    /* Any version will do for the NAME; the verdict is about the version. */
+    const SNESRecomp::Package& any = it->second.begin()->second;
+    if (name_out && name_cap)
+        std::snprintf(name_out, name_cap, "%s",
+                      any.name.empty() ? package_id : any.name.c_str());
+    if (!version || !version[0]) return 1;
+    return it->second.find(version) != it->second.end() ? 1 : 0;
+}
+
 extern "C" int snes_mod_runtime_check_set_c(const char* want, char* reason,
                                             uint32_t cap) {
     auto say = [&](const std::string& text) {

@@ -77,6 +77,12 @@ int snes_mod_runtime_feature_enabled_c(const char* package_id,
  * session exists, so the contract is "your settings now match, start again". */
 int snes_mod_runtime_adopt_set_c(const char* want, char* reason, uint32_t cap);
 
+/* Is `package_id` installed at `version`? 1 yes, 0 present at another version,
+ * -1 absent. Writes the package's display name (falling back to its id) so a
+ * lobby row can name what a player needs to install. */
+int snes_mod_runtime_have_package_c(const char* package_id, const char* version,
+                                    char* name_out, uint32_t name_cap);
+
 /* Can this build honour the host's mod set? Returns one of the above and
  * writes a player-actionable reason ("missing mod: x", "y needs version z").
  * Empty reason on OK. */

@@ -110,6 +110,60 @@ static const char *game_version(void)
                                                     : "0.0.0";
 }
 
+#if SNESRECOMP_ENABLE_MODS
+#include "mod_runtime.h"
+#endif
+
+/*
+ * The host's required mod plan, carried in match caps.
+ *
+ * Filled here rather than only in push_match_caps so EVERY caps push carries
+ * it: a plan that only rides along when someone happens to toggle a mod is a
+ * plan that goes stale the first time anything else changes.
+ *
+ * Newlines become ';' purely so the plan survives the hand-rolled JSON string
+ * field without escaping. Truncation is refused rather than trimmed -- two
+ * different plans can share a prefix, and a guest comparing a truncated one
+ * would call them equal.
+ */
+static void fill_caps_mods(SnesLobbyMatchCaps *caps)
+{
+#if SNESRECOMP_ENABLE_MODS
+  char text[1024];
+  int need;
+  size_t o = 0;
+  size_t i;
+
+  if (!caps)
+    return;
+  caps->mods[0] = '\0';
+  need = snes_mod_runtime_effective_set_c(text, (uint32_t)sizeof(text));
+  if (need <= 0 || need >= (int)sizeof(text))
+    return;
+  if (strcmp(text, "(none)\n") == 0)
+    return;
+  for (i = 0; text[i] && o + 1 < sizeof(caps->mods); ++i) {
+    char c = text[i];
+    if (c == '\n') {
+      if (o == 0 || caps->mods[o - 1] == ';')
+        continue;              /* no leading or doubled separators */
+      c = ';';
+    }
+    if (c == '"' || c == '\\')
+      continue;                /* cannot appear in a plan; would break the JSON */
+    caps->mods[o++] = c;
+  }
+  caps->mods[o] = '\0';
+  if (o && caps->mods[o - 1] == ';')
+    caps->mods[o - 1] = '\0';
+  if (text[i] != '\0')
+    caps->mods[0] = '\0';     /* did not fit: publish nothing over a prefix */
+#else
+  if (caps)
+    caps->mods[0] = '\0';
+#endif
+}
+
 static SnesLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
 {
   SnesLobbyMatchCaps caps;
@@ -127,6 +181,7 @@ static SnesLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
   caps.input_delay = clamp_input_delay(caps.input_delay);
   caps.force_turn = g_lobby_force_turn ? 1 : 0;
   caps.force_input_relay = g_lobby_force_input_relay ? 1 : 0;
+  fill_caps_mods(&caps);
   return caps;
 }
 
@@ -1023,6 +1078,140 @@ static int cb_fill_launch(void *ctx, RecompLauncherCNetplayLaunch *out)
   return 1;
 }
 
+/* ---- lobby mod plan -------------------------------------------------------
+ *
+ * recomp-ui already renders all of this -- a row per required mod, an
+ * installed/missing mark, a missing count and a download button. This game
+ * left the callbacks NULL, so the panel was simply dark and a guest learned
+ * about a mod mismatch only when the match refused to start. Nothing new is
+ * drawn here; the data is just supplied.
+ */
+
+/* Entry `index` of the plan the HOST published, into `out`. */
+static int plan_entry(int index, char *id, size_t id_cap,
+                      char *version, size_t version_cap)
+{
+  const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
+  const char *p;
+  int n = 0;
+
+  if (id_cap) id[0] = '\0';
+  if (version_cap) version[0] = '\0';
+  if (!caps || !caps->valid || !caps->mods[0] || index < 0)
+    return 0;
+  for (p = caps->mods; *p; ) {
+    const char *end = strchr(p, ';');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (n++ == index) {
+      /* "<package>@<version>/<feature> ..." — the row identifies the
+       * PACKAGE, since that is what a player installs. */
+      const char *at = memchr(p, '@', len);
+      const char *slash = at ? memchr(at, '/', len - (size_t)(at - p)) : NULL;
+      size_t id_len = at ? (size_t)(at - p) : len;
+      if (id_len >= id_cap) id_len = id_cap - 1;
+      memcpy(id, p, id_len);
+      id[id_len] = '\0';
+      if (at && slash) {
+        size_t v_len = (size_t)(slash - at - 1);
+        if (v_len >= version_cap) v_len = version_cap - 1;
+        memcpy(version, at + 1, v_len);
+        version[v_len] = '\0';
+      }
+      return 1;
+    }
+    p = end ? end + 1 : p + len;
+  }
+  return 0;
+}
+
+static int cb_lobby_mods_count(void *ctx)
+{
+  const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
+  const char *p;
+  int n = 0;
+  (void)ctx;
+  if (!caps || !caps->valid || !caps->mods[0])
+    return 0;
+  for (p = caps->mods; *p; ) {
+    const char *end = strchr(p, ';');
+    n++;
+    if (!end) break;
+    p = end + 1;
+  }
+  return n;
+}
+
+static int cb_lobby_mods_get(void *ctx, int index,
+                             RecompLauncherCNetplayLobbyMod *out)
+{
+  char id[96];
+  char version[32];
+  (void)ctx;
+  if (!out)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  if (!plan_entry(index, id, sizeof(id), version, sizeof(version)))
+    return 0;
+  snprintf(out->id, sizeof(out->id), "%s", id);
+  snprintf(out->version, sizeof(out->version), "%s", version);
+  snprintf(out->name, sizeof(out->name), "%s", id);
+  out->installed = 0;
+#if SNESRECOMP_ENABLE_MODS
+  {
+    char name[64];
+    const int have =
+        snes_mod_runtime_have_package_c(id, version, name, (uint32_t)sizeof(name));
+    if (name[0])
+      snprintf(out->name, sizeof(out->name), "%s", name);
+    if (have > 0) {
+      out->installed = 1;
+    } else if (have == 0) {
+      /* Distinguished on purpose: "install this" and "you have the wrong
+       * version of this" are different jobs for the player. */
+      snprintf(out->reason, sizeof(out->reason),
+               "installed, but not version %s", version[0] ? version : "?");
+    } else {
+      snprintf(out->reason, sizeof(out->reason), "not installed");
+    }
+  }
+#else
+  snprintf(out->reason, sizeof(out->reason), "this build has no mod support");
+#endif
+  return 1;
+}
+
+static int cb_lobby_mods_missing(void *ctx)
+{
+  const int n = cb_lobby_mods_count(ctx);
+  int missing = 0;
+  int i;
+  for (i = 0; i < n; ++i) {
+    RecompLauncherCNetplayLobbyMod lm;
+    if (cb_lobby_mods_get(ctx, i, &lm) && !lm.installed)
+      missing++;
+  }
+  return missing;
+}
+
+static int cb_lobby_mods_download(void *ctx)
+{
+  (void)ctx;
+  /* No mod transfer channel on this lobby. Reported as unavailable rather
+   * than as a failed download: the UI hides the button on <0, and offering a
+   * button that cannot work is worse than not offering one. */
+  return -1;
+}
+
+static void cb_push_match_caps(void *ctx)
+{
+  SnesLobbyMatchCaps caps;
+  (void)ctx;
+  if (!snes_lobby_is_host())
+    return;                    /* guests do not publish a plan */
+  caps = default_caps(NULL);   /* already carries the current mod plan */
+  (void)snes_lobby_set_match_caps(&caps);
+}
+
 static RecompLauncherCNetplayCallbacks g_callbacks = {
     NULL,
     cb_default_url,
@@ -1063,6 +1252,13 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     cb_lobby_max_slots,
     cb_force_turn_get,
     cb_force_turn_set,
+    /* Designated from here: the struct is append-only, and positional entries
+     * past this point would silently shift if a field were ever inserted. */
+    .push_match_caps = cb_push_match_caps,
+    .lobby_mods_count = cb_lobby_mods_count,
+    .lobby_mods_get = cb_lobby_mods_get,
+    .lobby_mods_missing = cb_lobby_mods_missing,
+    .lobby_mods_download = cb_lobby_mods_download,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
