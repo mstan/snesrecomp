@@ -132,6 +132,16 @@ static struct {
     uint32_t peer_build_fp;
     uint32_t peer_content_fp;
     uint8_t  peer_ident_seen;
+    /* Mod-set handshake. The host publishes and each peer confirms; nobody
+     * simulates until it has settled, because a peer running a different set
+     * is running a different game. */
+    const char *local_modset;
+    SnesNetplayModSetCheckFn modset_check;
+    uint8_t  modset_settled;    /* handshake finished, one way or the other */
+    uint8_t  modset_ok;         /* ...and it finished in agreement */
+    uint8_t  modset_sent;
+    uint32_t modset_since_ms;
+    char     modset_reason[96];
     uint8_t  ident_sent;
     uint32_t chain_fork_tick;    /* last frame-commit fork reported */
     uint32_t chain_pending_tick; /* mismatch under observation, 0 = none */
@@ -706,12 +716,121 @@ static uint8_t rb_gate_pre_admit_hold(void *ctx, uint32_t sim, uint32_t wire,
     (void)wire;
     /* Only at the first tick, and never under an open episode — a replay owns
      * the sim and must not be stalled by a boot check. */
+    /* Hold the whole match, not just tick 1: the handshake is the precondition
+     * for playing at all, and letting frames run while it is outstanding would
+     * be simulating a match nobody has agreed to. */
+    if (g_rb.local_modset && !g_rb.modset_settled && g_rb.stage == kRbIdle) {
+        if (tag_out)
+            *tag_out = "modset_wait";
+        return 1u;
+    }
     if (sim == 1u && g_rb.stage == kRbIdle && rb_boot_digest_gate()) {
         if (tag_out)
             *tag_out = "boot_digest_wait";
         return 1u;
     }
     return 0u;
+}
+
+/*
+ * The mod-set handshake, pumped once a tick until it settles.
+ *
+ * The host is authoritative and says what everyone runs; each peer answers
+ * whether it can. Nothing simulates until that is settled, because a mod
+ * patches guest memory -- a peer with a different set is running a different
+ * game, and the honest moment to find out is before the first frame rather
+ * than at the first fork.
+ *
+ * Bounded, and refusing on the bound. An older peer will never answer, and
+ * "we could not confirm" has to be a refusal rather than a shrug: an
+ * unverified match is exactly the thing this exists to prevent, and letting it
+ * through would make the whole handshake decorative.
+ */
+#define RB_MODSET_TIMEOUT_MS 4000u
+
+static void rb_modset_fail(const char *why)
+{
+    if (g_rb.modset_settled)
+        return;
+    g_rb.modset_settled = 1u;
+    g_rb.modset_ok = 0u;
+    fprintf(stderr,
+            "snes_netplay: MOD SET NOT AGREED — %s. The match cannot start: "
+            "the host decides which mods run, and a peer that cannot match "
+            "them is running a different game.\n", why);
+    if (rb_env_int("SNES_RB_ALLOW_MOD_MISMATCH", 0, 0, 1) > 0) {
+        fprintf(stderr, "snes_netplay:   SNES_RB_ALLOW_MOD_MISMATCH=1 — "
+                "starting anyway; expect an immediate desync\n");
+        g_rb.modset_ok = 1u;
+        return;
+    }
+    snes_netplay_request_return_to_lobby();
+}
+
+static void rb_modset_pump(void)
+{
+    RNetSession *s = rb_session();
+    const int host = (rb_local_slot() == 0);
+    char text[1024];
+    rnet_u8 status = 0;
+    char reason[96];
+
+    if (!s || g_rb.modset_settled || !g_rb.local_modset)
+        return;
+    if (g_rb.modset_since_ms == 0u)
+        g_rb.modset_since_ms = rbe_mono_ms();
+
+    if (host) {
+        /* Publish, then wait to be told it can be honoured. Re-sent while
+         * unanswered: this is one packet and the link may drop it. */
+        if (!g_rb.modset_sent || (g_rb.sim % 30u) == 0u) {
+            /* Validation (SNES_RB_FORCE_MODSET="<text>"): publish a set the
+             * peer genuinely cannot match, so the refusal can be proven to
+             * fire. Building a second install to disagree with turned out to
+             * be more fixture than test. */
+            const char *forced = getenv("SNES_RB_FORCE_MODSET");
+            const char *text = (forced && forced[0]) ? forced
+                                                     : g_rb.local_modset;
+            if (rnet_session_send_modset(s, text) == 0)
+                g_rb.modset_sent = 1u;
+        }
+        if (rnet_session_take_modset_ack(s, &status, reason, sizeof(reason))) {
+            if (status == 0u) {
+                g_rb.modset_settled = 1u;
+                g_rb.modset_ok = 1u;
+                fprintf(stderr, "snes_netplay: peer confirmed the mod set\n");
+            } else {
+                char why[160];
+                snprintf(why, sizeof(why), "peer reports: %s",
+                         reason[0] ? reason : "(no reason given)");
+                rb_modset_fail(why);
+            }
+            return;
+        }
+    } else if (rnet_session_take_modset(s, text, sizeof(text))) {
+        int rc = g_rb.modset_check ? g_rb.modset_check(text, reason,
+                                                       sizeof(reason))
+                                   : 0;
+        rnet_session_send_modset_ack(s, (rnet_u8)rc, reason);
+        if (rc == 0) {
+            g_rb.modset_settled = 1u;
+            g_rb.modset_ok = 1u;
+            fprintf(stderr, "snes_netplay: host mod set accepted:\n%s", text);
+        } else {
+            char why[200];
+            snprintf(why, sizeof(why), "%s. Host wants:\n%s",
+                     reason[0] ? reason : "cannot honour the host's set", text);
+            rb_modset_fail(why);
+        }
+        return;
+    }
+
+    if ((uint32_t)(rbe_mono_ms() - g_rb.modset_since_ms) >
+        RB_MODSET_TIMEOUT_MS)
+        rb_modset_fail(host ? "the peer never confirmed it (an older build "
+                              "cannot answer)"
+                            : "the host never published one (an older build "
+                              "does not send it)");
 }
 
 /*
@@ -918,10 +1037,14 @@ int snes_netplay_rb_start(void)
          * clears by wiping and naming what stays. */
         uint32_t keep_build_fp = g_rb.local_build_fp;
         uint32_t keep_content_fp = g_rb.local_content_fp;
+        const char *keep_modset = g_rb.local_modset;
+        SnesNetplayModSetCheckFn keep_check = g_rb.modset_check;
         memset(&g_rb, 0, sizeof(g_rb));
         g_rb.b = keep_bindings;
         g_rb.local_build_fp = keep_build_fp;
         g_rb.local_content_fp = keep_content_fp;
+        g_rb.local_modset = keep_modset;
+        g_rb.modset_check = keep_check;
     }
     /* The only field whose cleared value is not zero. */
     g_rb.force_invent_slot = -1;
@@ -2259,6 +2382,12 @@ int snes_netplay_rb_poll_admit(void)
         return 0;
 
     rb_drain_wire();
+    /* Before anything else, and NOT from finish_frame: the gate below stops
+     * the frame from happening while this is outstanding, so pumping it there
+     * deadlocked -- no frame, no pump, no handshake, forever. A precondition
+     * has to be driven by something that runs whether or not the thing it
+     * gates is running. */
+    rb_modset_pump();
     rb_reconcile_wire();
     rb_pump_episode();
 
@@ -2540,6 +2669,13 @@ uint32_t snes_netplay_rb_desync_count(void) { return g_rb.desync_count; }
  * through() is digest-agreed, not merely input-present — it simply was not
  * exposed. These name it so the "how far back is it safe to rewind" question
  * has an answer outside this file. */
+void snes_netplay_rb_set_modset(const char *text,
+                                SnesNetplayModSetCheckFn check)
+{
+    g_rb.local_modset = text;
+    g_rb.modset_check = check;
+}
+
 void snes_netplay_rb_set_identity(uint32_t build_fp, uint32_t content_fp)
 {
     g_rb.local_build_fp = build_fp;

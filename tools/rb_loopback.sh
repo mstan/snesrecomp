@@ -79,7 +79,8 @@ common=(SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 follower_off=(SNES_RB_FORCE_MISPREDICT=0
               SNES_RB_FORCE_FORK=0
               SNES_RB_FORCE_BOOT_FORK=0
-              SNES_RB_FORCE_MOD_MISMATCH=0)
+              SNES_RB_FORCE_MOD_MISMATCH=0
+              SNES_RB_FORCE_MODSET=)
 
 cd "$EXE_DIR" || exit 2
 env "${common[@]}" SNES_NET_SLOT=0 SNES_NET_INPUT_PLAYER=0 \
@@ -194,10 +195,10 @@ resid=$(( gap - nack_i ))
 # detected by each side independently, but a mod-set mismatch is detected by
 # whichever side RECEIVES the differing identity — so looking only at the
 # initiator missed it entirely and reported the refusal as a failure.
-refused_boot=$(( $(count initiator 'BOOT DIGEST MISMATCH\|MOD SETS DIFFER') \
-               + $(count follower  'BOOT DIGEST MISMATCH\|MOD SETS DIFFER') ))
+refused_boot=$(( $(count initiator 'BOOT DIGEST MISMATCH\|MOD SETS DIFFER\|MOD SET NOT AGREED') \
+               + $(count follower  'BOOT DIGEST MISMATCH\|MOD SETS DIFFER\|MOD SET NOT AGREED') ))
 if [ "$refused_boot" -gt 0 ] && [ "$ep_i" -eq 0 ]; then
-    why=$(grep -ohE 'BOOT DIGEST MISMATCH|MOD SETS DIFFER' "$OUT"/*.log \
+    why=$(grep -ohE 'BOOT DIGEST MISMATCH|MOD SETS DIFFER|MOD SET NOT AGREED' "$OUT"/*.log \
           2>/dev/null | head -1)
     echo "PASS (refused): ${why:-a pre-match check} stopped the match before it" \
          "started — 0 episodes, which is the point"

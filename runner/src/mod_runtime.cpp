@@ -2314,6 +2314,106 @@ extern "C" int snes_mod_runtime_effective_set_c(char* out, uint32_t cap) {
     return (int)text.size();
 }
 
+/*
+ * Can this build honour the host's mod set?
+ *
+ * The host is authoritative and the peer answers yes or no, because mods patch
+ * guest memory: a peer running a different set is running a different game,
+ * and that is better refused at the door than discovered desyncing in the
+ * third round.
+ *
+ * The verdict is simply whether our effective set is byte-identical to theirs
+ * -- that is the same string both sides fingerprint, so agreement here and
+ * agreement at tick 0 mean the same thing. What takes the work is saying WHY
+ * when it differs, because "your mods are wrong" is not something a player can
+ * act on. Each line of the host's set is checked against what we actually have
+ * so the answer names the package, and the version or option, that we cannot
+ * meet.
+ */
+extern "C" int snes_mod_runtime_check_set_c(const char* want, char* reason,
+                                            uint32_t cap) {
+    auto say = [&](const std::string& text) {
+        if (reason && cap) std::snprintf(reason, cap, "%s", text.c_str());
+    };
+    if (!want) {
+        say("no set supplied");
+        return SNES_MODSET_OPTION;
+    }
+    std::string mine;
+    {
+        std::vector<char> buf(4096);
+        int need = snes_mod_runtime_effective_set_c(buf.data(),
+                                                    (uint32_t)buf.size());
+        if (need >= (int)buf.size()) {
+            say("local mod set too large to compare");
+            return SNES_MODSET_TOO_BIG;
+        }
+        mine = buf.data();
+    }
+    if (mine == want) {
+        say("");
+        return SNES_MODSET_OK;
+    }
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::istringstream in{std::string(want)};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line == "(none)") continue;
+        /* "<package>@<version>/<feature> <opt>=<val> ..." */
+        const std::size_t at = line.find('@');
+        const std::size_t slash = line.find('/', at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || slash == std::string::npos) continue;
+        const std::string pkg_id = line.substr(0, at);
+        const std::string version = line.substr(at + 1, slash - at - 1);
+        std::string rest = line.substr(slash + 1);
+        const std::size_t sp = rest.find(' ');
+        const std::string feature_id =
+            sp == std::string::npos ? rest : rest.substr(0, sp);
+
+        auto pkg_it = runtime.packages.find(pkg_id);
+        if (pkg_it == runtime.packages.end() || pkg_it->second.empty()) {
+            say("missing mod: " + pkg_id);
+            return SNES_MODSET_MISSING;
+        }
+        if (pkg_it->second.find(version) == pkg_it->second.end()) {
+            say(pkg_id + " needs version " + version);
+            return SNES_MODSET_VERSION;
+        }
+        const SNESRecomp::Package& package = pkg_it->second.at(version);
+        if (!SNESRecomp::find_feature(package, feature_id)) {
+            say(pkg_id + " has no feature " + feature_id);
+            return SNES_MODSET_OPTION;
+        }
+        /* Every option the host names must exist here and accept their
+         * value; a value this build rejects is as fatal as a missing package. */
+        std::istringstream toks{sp == std::string::npos ? std::string()
+                                                        : rest.substr(sp + 1)};
+        std::string tok;
+        while (toks >> tok) {
+            const std::size_t eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string opt_id = tok.substr(0, eq);
+            const std::string value = tok.substr(eq + 1);
+            const SNESRecomp::Option* option =
+                SNESRecomp::find_option(package, feature_id, opt_id);
+            if (!option) {
+                say(pkg_id + " has no option " + opt_id);
+                return SNES_MODSET_OPTION;
+            }
+            std::string err;
+            if (!SNESRecomp::validate_option_value(*option, value, &err)) {
+                say(opt_id + "=" + value + " not available here");
+                return SNES_MODSET_OPTION;
+            }
+        }
+    }
+    /* Everything the host asked for exists here and is legal -- so the
+     * difference is what we have SELECTED, which the player can fix. */
+    say("your selection differs; match the host's");
+    return SNES_MODSET_OPTION;
+}
+
 extern "C" const RecompLauncherCModProvider*
 snes_mod_runtime_launcher_provider_c(void) {
 #if defined(RECOMP_LAUNCHER)
