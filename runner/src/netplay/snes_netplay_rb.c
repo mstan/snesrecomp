@@ -600,8 +600,28 @@ static int rb_boot_digest_gate(void)
     if (g_rb.boot_dig_local_valid) {
         local = g_rb.boot_dig_local;
     } else if (rbe_hc_local_digest(&g_rb.hc, 0u, &local)) {
+        SnesStateDigestParts p;
         g_rb.boot_dig_local = local;
         g_rb.boot_dig_local_valid = 1u;
+        /* Break tick 0 down by partition, always, on both peers.
+         *
+         * The chain carries only the master digest, so a mismatch says the two
+         * sides differ without saying WHERE. Establishing that took a long
+         * forensic pass over two logs and three wrong guesses -- save root,
+         * localization, a beam anchor that turned out not to be digested at
+         * all. Every one of those would have been a single glance if the
+         * partitions had been in the log.
+         *
+         * Printed on agreement too: knowing which partitions are identical is
+         * how the next reader rules things out, and it costs one line per
+         * session. */
+        snes_state_digest_parts(&p);
+        fprintf(stderr,
+                "snes_netplay: RB boot parts master=%08x cpu=%08x wram=%08x "
+                "apu=%08x ppu=%08x dma=%08x cart=%08x\n",
+                (unsigned)p.master, (unsigned)p.cpu, (unsigned)p.wram,
+                (unsigned)p.apu, (unsigned)p.ppu, (unsigned)p.dma,
+                (unsigned)p.cart);
     } else {
         return 1; /* our own tick 0 not published yet — nothing to compare */
     }
