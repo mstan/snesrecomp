@@ -2414,6 +2414,108 @@ extern "C" int snes_mod_runtime_check_set_c(const char* want, char* reason,
     return SNES_MODSET_OPTION;
 }
 
+/*
+ * Adopt the host's mod set as our own selection.
+ *
+ * A peer that cannot join because its mods differ is being told to go and
+ * reproduce someone else's configuration by hand, from a log line. This writes
+ * it for them: every feature the host runs is enabled with the host's option
+ * values, and every feature they do NOT run is disabled, because a set is the
+ * whole selection and not just its positive half -- a peer with an extra mod
+ * enabled differs just as surely as one missing a mod.
+ *
+ * Persisted, and deliberately so. Mods activate before the netplay session
+ * exists -- the translation has already patched ROM by the time a handshake
+ * could run -- so this cannot take effect in the current launch, and the
+ * honest contract is "your settings now match the host, start again" rather
+ * than pretending the running match can be repaired.
+ *
+ * Refuses rather than half-applies: if any line names something this build
+ * cannot honour, nothing is written. A partially adopted set is a third
+ * configuration that matches neither side.
+ */
+extern "C" int snes_mod_runtime_adopt_set_c(const char* want, char* reason,
+                                            uint32_t cap) {
+    auto say = [&](const std::string& text) {
+        if (reason && cap) std::snprintf(reason, cap, "%s", text.c_str());
+    };
+    if (!want) {
+        say("no set supplied");
+        return SNES_MODSET_OPTION;
+    }
+    {
+        char why[96];
+        const int check = snes_mod_runtime_check_set_c(want, why, sizeof(why));
+        /* OPTION here means "we could honour it, our selection differs", which
+         * is exactly the case worth adopting. Anything else is a capability we
+         * do not have, and no amount of rewriting selections fixes it. */
+        if (check != SNES_MODSET_OK && check != SNES_MODSET_OPTION) {
+            say(why);
+            return check;
+        }
+        if (check == SNES_MODSET_OK) {
+            say("");
+            return SNES_MODSET_OK;
+        }
+    }
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    /* Disable everything first: the host's set is the whole truth. */
+    for (auto& sel : runtime.selections) {
+        const SNESRecomp::Package* package =
+            SNESRecomp::selected_package(runtime, sel.first.c_str());
+        if (!package) continue;
+        for (const SNESRecomp::Feature& feature : package->features)
+            SNESRecomp::provider_feature_enable(nullptr, sel.first.c_str(),
+                                    feature.id.c_str(), 0);
+    }
+
+    std::istringstream in{std::string(want)};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line == "(none)") continue;
+        const std::size_t at = line.find('@');
+        const std::size_t slash = line.find('/', at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || slash == std::string::npos) continue;
+        const std::string pkg_id = line.substr(0, at);
+        const std::string version = line.substr(at + 1, slash - at - 1);
+        std::string rest = line.substr(slash + 1);
+        const std::size_t sp = rest.find(' ');
+        const std::string feature_id =
+            sp == std::string::npos ? rest : rest.substr(0, sp);
+
+        /* Pin the version the host names. selected_package() resolves
+         * through this, so an adopted set is version-exact rather than
+         * "whatever we happen to have". */
+        {
+            auto pit = runtime.packages.find(pkg_id);
+            if (pit != runtime.packages.end() &&
+                pit->second.find(version) != pit->second.end())
+                runtime.selections[pkg_id].version = version;
+        }
+        if (!SNESRecomp::provider_feature_enable(nullptr, pkg_id.c_str(),
+                                     feature_id.c_str(), 1)) {
+            say("could not enable " + pkg_id + "/" + feature_id);
+            return SNES_MODSET_OPTION;
+        }
+        std::istringstream toks{sp == std::string::npos ? std::string()
+                                                        : rest.substr(sp + 1)};
+        std::string tok;
+        while (toks >> tok) {
+            const std::size_t eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            if (!SNESRecomp::provider_feature_set_option(
+                    nullptr, pkg_id.c_str(), feature_id.c_str(),
+                    tok.substr(0, eq).c_str(), tok.substr(eq + 1).c_str())) {
+                say("could not set " + tok);
+                return SNES_MODSET_OPTION;
+            }
+        }
+    }
+    say("");
+    return SNES_MODSET_OK;
+}
+
 extern "C" const RecompLauncherCModProvider*
 snes_mod_runtime_launcher_provider_c(void) {
 #if defined(RECOMP_LAUNCHER)

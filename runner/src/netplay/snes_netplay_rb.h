@@ -114,8 +114,14 @@ void snes_netplay_rb_set_identity(uint32_t build_fp, uint32_t content_fp);
  * runtime; the netplay layer only carries and gates on them. */
 typedef int (*SnesNetplayModSetCheckFn)(const char *want, char *reason,
                                         uint32_t cap);
+/* Optional. Called when the peer cannot honour the host's set but COULD have:
+ * writes the host's selection into this build's own so the player can join by
+ * starting again instead of reproducing it by hand. Returns 0 on success. */
+typedef int (*SnesNetplayModSetAdoptFn)(const char *want, char *reason,
+                                        uint32_t cap);
 void snes_netplay_rb_set_modset(const char *text,
-                                SnesNetplayModSetCheckFn check);
+                                SnesNetplayModSetCheckFn check,
+                                SnesNetplayModSetAdoptFn adopt);
 
 /* Link RTT in ms, EMA'd from the POST handshake; 0 until an episode has
  * round-tripped. Feeds the scheduler's invent-grace budget. */

@@ -137,6 +137,7 @@ static struct {
      * is running a different game. */
     const char *local_modset;
     SnesNetplayModSetCheckFn modset_check;
+    SnesNetplayModSetAdoptFn modset_adopt;
     uint8_t  modset_settled;    /* handshake finished, one way or the other */
     uint8_t  modset_ok;         /* ...and it finished in agreement */
     uint8_t  modset_sent;
@@ -817,9 +818,25 @@ static void rb_modset_pump(void)
             g_rb.modset_ok = 1u;
             fprintf(stderr, "snes_netplay: host mod set accepted:\n%s", text);
         } else {
-            char why[200];
-            snprintf(why, sizeof(why), "%s. Host wants:\n%s",
-                     reason[0] ? reason : "cannot honour the host's set", text);
+            char why[320];
+            char adopt_reason[96];
+            int adopted = 0;
+            /* Write the host's selection into ours before refusing. The player
+             * asked to play with this person; making them reproduce someone
+             * else's mod configuration by hand, from a log line, is a worse
+             * answer than "your settings now match, start again". It cannot
+             * take effect this launch -- mods activate before the session
+             * exists -- so the refusal still stands. */
+            if (g_rb.modset_adopt)
+                adopted = (g_rb.modset_adopt(text, adopt_reason,
+                                             sizeof(adopt_reason)) == 0);
+            snprintf(why, sizeof(why), "%s.%s Host wants:\n%s",
+                     reason[0] ? reason : "cannot honour the host's set",
+                     adopted ? " Your settings have been changed to match the "
+                               "host — start the game again to join."
+                             : " Your settings were NOT changed; this build "
+                               "cannot run the host's set at all.",
+                     text);
             rb_modset_fail(why);
         }
         return;
@@ -1039,12 +1056,14 @@ int snes_netplay_rb_start(void)
         uint32_t keep_content_fp = g_rb.local_content_fp;
         const char *keep_modset = g_rb.local_modset;
         SnesNetplayModSetCheckFn keep_check = g_rb.modset_check;
+        SnesNetplayModSetAdoptFn keep_adopt = g_rb.modset_adopt;
         memset(&g_rb, 0, sizeof(g_rb));
         g_rb.b = keep_bindings;
         g_rb.local_build_fp = keep_build_fp;
         g_rb.local_content_fp = keep_content_fp;
         g_rb.local_modset = keep_modset;
         g_rb.modset_check = keep_check;
+        g_rb.modset_adopt = keep_adopt;
     }
     /* The only field whose cleared value is not zero. */
     g_rb.force_invent_slot = -1;
@@ -2670,10 +2689,12 @@ uint32_t snes_netplay_rb_desync_count(void) { return g_rb.desync_count; }
  * exposed. These name it so the "how far back is it safe to rewind" question
  * has an answer outside this file. */
 void snes_netplay_rb_set_modset(const char *text,
-                                SnesNetplayModSetCheckFn check)
+                                SnesNetplayModSetCheckFn check,
+                                SnesNetplayModSetAdoptFn adopt)
 {
     g_rb.local_modset = text;
     g_rb.modset_check = check;
+    g_rb.modset_adopt = adopt;
 }
 
 void snes_netplay_rb_set_identity(uint32_t build_fp, uint32_t content_fp)

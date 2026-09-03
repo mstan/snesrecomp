@@ -67,6 +67,16 @@ int snes_mod_runtime_feature_enabled_c(const char* package_id,
 #define SNES_MODSET_OPTION  3  /* option, value, or selection we cannot meet */
 #define SNES_MODSET_TOO_BIG 4  /* set too large to compare honestly */
 
+/* Write the host's set into this build's own selection, so a player whose
+ * mods differ can join by starting again rather than by reproducing someone
+ * else's configuration by hand. Disables everything the host does not run: a
+ * set is the whole selection, and an extra mod differs as surely as a missing
+ * one. All-or-nothing -- a partially adopted set matches neither side.
+ *
+ * Cannot take effect in the current launch: mods activate before the netplay
+ * session exists, so the contract is "your settings now match, start again". */
+int snes_mod_runtime_adopt_set_c(const char* want, char* reason, uint32_t cap);
+
 /* Can this build honour the host's mod set? Returns one of the above and
  * writes a player-actionable reason ("missing mod: x", "y needs version z").
  * Empty reason on OK. */
