@@ -66,6 +66,94 @@ static const char* cfg_or(const char* v, const char* d) {
     return (v && v[0]) ? v : d;
 }
 
+/* ── What the child processes said ──────────────────────────────────────────
+ *
+ * The wizard shows one line at a time and then reports "exit 1", which told a
+ * developer nothing about WHICH of 150 compile steps failed. Three outlets:
+ *
+ *   1. Every line is echoed to the host's stderr, so a GUI launched from a
+ *      terminal shows the whole build there, live.
+ *   2. Every line is appended to <build>/snesrecomp_rebuild.log, for a GUI
+ *      launched by double-click.
+ *   3. Lines that look like errors are kept, and the failure message carries
+ *      the last few of them plus the log path.
+ */
+static void mkdir_p(const char* path);
+static int join_path(char* out, size_t cap, const char* a, const char* b);
+static FILE* g_step_log;
+static char g_step_log_path[1400];
+#define STEP_ERR_KEEP 6
+static char g_step_errs[STEP_ERR_KEEP][200];
+static int g_step_err_n;
+
+static void step_log_open(const char* step) {
+    g_step_err_n = 0;
+    if (!g_step_log && g_build_dir[0]) {
+        mkdir_p(g_build_dir);
+        if (join_path(g_step_log_path, sizeof(g_step_log_path), g_build_dir,
+                      "snesrecomp_rebuild.log"))
+            g_step_log = fopen(g_step_log_path, "a");
+    }
+    if (g_step_log) {
+        fprintf(g_step_log, "\n==== %s ====\n", step);
+        fflush(g_step_log);
+    }
+    fprintf(stderr, "snesrecomp-codegen: ==== %s ====\n", step);
+}
+
+/* One diagnosis ninja states only as a hint. Files unpacked from a zip made
+ * in another time zone can sit hours in the future; ninja then regenerates
+ * build.ninja forever and compiles nothing. Say what to do about it. */
+static const char* step_hint_for(const char* line) {
+    if (strstr(line, "still dirty after 100 tries"))
+        return "Some files in this folder have timestamps in the future "
+               "(unzipped from a different time zone). Fix with: "
+               "find . -exec touch {} +   (in this folder), then rebuild.";
+    return NULL;
+}
+
+static int line_looks_like_error(const char* line) {
+    return strstr(line, "error") || strstr(line, "Error") || strstr(line, "ERROR") ||
+           strstr(line, "FAILED") || strstr(line, "undefined reference") ||
+           strstr(line, "fatal") || strstr(line, "No such file") ||
+           strstr(line, "ninja: build stopped");
+}
+
+static void step_log_line(const char* line) {
+    fprintf(stderr, "  %s\n", line);
+    if (g_step_log) {
+        fprintf(g_step_log, "%s\n", line);
+        fflush(g_step_log);
+    }
+    const char* hint = step_hint_for(line);
+    if (hint && g_step_err_n < STEP_ERR_KEEP)
+        snprintf(g_step_errs[g_step_err_n++], sizeof(g_step_errs[0]), "%s", hint);
+    if (line_looks_like_error(line)) {
+        /* Keep the LAST few: the root cause tends to precede the cascade,
+         * but "ninja: build stopped" and the FAILED line name the target. */
+        if (g_step_err_n == STEP_ERR_KEEP) {
+            memmove(g_step_errs[0], g_step_errs[1], sizeof(g_step_errs) - sizeof(g_step_errs[0]));
+            g_step_err_n--;
+        }
+        snprintf(g_step_errs[g_step_err_n++], sizeof(g_step_errs[0]), "%s", line);
+    }
+}
+
+/* "<what> failed (exit N)." plus the kept error lines and where the full log
+ * is. err_cap is whatever the launcher gave us; fill it, no more. */
+static void step_fail_message(char* err_msg, size_t err_cap, const char* what, int code) {
+    size_t used = (size_t)snprintf(err_msg, err_cap, "%s failed (exit %d).", what, code);
+    for (int i = 0; i < g_step_err_n && used + 8 < err_cap; ++i) {
+        int n = snprintf(err_msg + used, err_cap - used, "\n%.160s", g_step_errs[i]);
+        if (n < 0) break;
+        used += (size_t)n;
+        if (used >= err_cap) { used = err_cap - 1; break; }
+    }
+    if (g_step_log_path[0] && used + 24 < err_cap)
+        snprintf(err_msg + used, err_cap - used, "\nFull log: %s", g_step_log_path);
+    fprintf(stderr, "snesrecomp-codegen: %s\n", err_msg);
+}
+
 static int path_is_file(const char* path) {
 #if defined(_WIN32)
     DWORD attr = GetFileAttributesA(path);
@@ -818,7 +906,12 @@ static int json_get_number(const char* line, const char* key, double* out) {
 static void handle_progress_line(const char* line,
                                  RecompLauncherCPrepareProgressFn on_progress,
                                  void* progress_ctx) {
-    if (!line || line[0] != '{' || !on_progress) return;
+    if (!line) return;
+    if (line[0] != '{') {                 /* tool chatter that is not JSONL */
+        if (line[0]) step_log_line(line);
+        return;
+    }
+    if (!on_progress) return;
     char event[64] = "";
     json_get_string(line, "event", event, sizeof(event));
     if (strcmp(event, "phase") == 0) {
@@ -834,8 +927,10 @@ static void handle_progress_line(const char* line,
         on_progress(progress_ctx, (float)pct, message[0] ? message : NULL);
     } else if (strcmp(event, "log") == 0 || strcmp(event, "error") == 0) {
         char message[240] = "";
-        if (json_get_string(line, "message", message, sizeof(message)))
+        if (json_get_string(line, "message", message, sizeof(message))) {
+            step_log_line(message);
             on_progress(progress_ctx, -1.0f, message);
+        }
     }
 }
 
@@ -932,8 +1027,7 @@ static int run_generate_win(const char* rom,
     if (code == 3)
         snprintf(err_msg, err_cap, "ROM verification failed (wrong dump).");
     else
-        snprintf(err_msg, err_cap, "snesrecomp generate failed (exit %lu).",
-                 (unsigned long)code);
+        step_fail_message(err_msg, err_cap, "snesrecomp generate", (int)code);
     return 0;
 }
 #else
@@ -1028,8 +1122,7 @@ static int run_generate_posix(const char* rom,
     if (code == 3)
         snprintf(err_msg, err_cap, "ROM verification failed (wrong dump).");
     else
-        snprintf(err_msg, err_cap, "snesrecomp generate failed (exit %d).",
-                 code);
+        step_fail_message(err_msg, err_cap, "snesrecomp generate", code);
     return 0;
 }
 #endif
@@ -1053,6 +1146,7 @@ static int host_prepare_generate(const char* source_path, char* out_path,
             return 0;
         }
     }
+    step_log_open("snesrecomp generate");
     if (on_progress)
         on_progress(progress_ctx, 0.02f, "Starting snesrecomp generate…");
 
@@ -1135,8 +1229,12 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "  )\r\n"
             ")\r\n"
             "echo Building...\r\n"
+            /* The console shows the build live; the log keeps it for a
+             * failure report after the window has gone. */
             "\"%%CMAKE%%\" --build \"%%BUILD_DIR%%\" --parallel "
-            "--target \"%%TARGET%%\"\r\n"
+            "--target \"%%TARGET%%\" 2>&1 | "
+            "powershell -NoProfile -Command \"$input | Tee-Object -FilePath "
+            "'%%BUILD_DIR%%\\snesrecomp_rebuild.log' -Append\"\r\n"
             "if errorlevel 1 (\r\n"
             "  echo.\r\n"
             "  echo Build failed. Fix the errors above, then rebuild manually.\r\n"
@@ -1207,7 +1305,9 @@ static int run_cmake_posix(char** cmake_args, int n_args, const char* what,
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
             line[--n] = '\0';
-        if (line[0] && on_progress) {
+        if (!line[0]) continue;
+        step_log_line(line);
+        if (on_progress) {
             float pct = pct_base + (float)((line_i++ % 80) / 100.0) * 0.5f;
             if (pct > 0.95f) pct = 0.95f;
             on_progress(progress_ctx, pct, line);
@@ -1222,7 +1322,9 @@ static int run_cmake_posix(char** cmake_args, int n_args, const char* what,
     }
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     if (code == 0) return 1;
-    snprintf(err_msg, err_cap, "cmake %s failed (exit %d).", what, code);
+    char what_full[64];
+    snprintf(what_full, sizeof(what_full), "cmake %s", what);
+    step_fail_message(err_msg, err_cap, what_full, code);
     return 0;
 }
 
@@ -1255,6 +1357,7 @@ static int run_cmake_configure_posix(RecompLauncherCPrepareProgressFn on_progres
         if (g_toolchain_root[0]) args[n++] = make_program;
     }
     mkdir_p(g_build_dir);
+    step_log_open("cmake configure");
     return run_cmake_posix(args, n, "configure", 0.05f, on_progress, progress_ctx,
                            err_msg, err_cap);
 }
@@ -1263,6 +1366,7 @@ static int run_cmake_build_posix(RecompLauncherCPrepareProgressFn on_progress,
                                  void* progress_ctx, char* err_msg,
                                  size_t err_cap) {
     char* args[] = { "--build", g_build_dir, "--parallel", "--target", g_cmake_target };
+    step_log_open("cmake --build");
     return run_cmake_posix(args, 5, "--build", 0.30f, on_progress, progress_ctx,
                            err_msg, err_cap);
 }
@@ -1426,11 +1530,19 @@ void snesrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
              cfg_or(cfg->cfg_dir, "recomp"));
     snprintf(g_out_dir, sizeof(g_out_dir), "%s",
              cfg_or(cfg->out_dir, "src/gen"));
-    g_has_funcs_h = cfg->funcs_h && cfg->funcs_h[0];
-    if (g_has_funcs_h)
-        snprintf(g_funcs_h, sizeof(g_funcs_h), "%s", cfg->funcs_h);
-    else
+    /* recomp/funcs.h is a scaffold convention like recomp/ and src/gen/, and
+     * the generated C #includes it -- so a generate that skips --funcs-h
+     * produces a tree that cannot compile ("funcs.h file not found" on the
+     * first bank), which is exactly what the zero-config autowire path did
+     * when this had no default. An explicit empty string still opts out. */
+    if (cfg->funcs_h && !cfg->funcs_h[0]) {
+        g_has_funcs_h = 0;
         g_funcs_h[0] = '\0';
+    } else {
+        g_has_funcs_h = 1;
+        snprintf(g_funcs_h, sizeof(g_funcs_h), "%s",
+                 cfg_or(cfg->funcs_h, "recomp/funcs.h"));
+    }
     snprintf(g_cmake_target, sizeof(g_cmake_target), "%s", cfg->cmake_target);
     g_cfg_roots = cfg->cfg_roots != 0;
 
