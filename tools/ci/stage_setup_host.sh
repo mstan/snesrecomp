@@ -29,6 +29,12 @@
 # not given.
 set -euo pipefail
 
+# A silent exit is the worst outcome a packaging step can have: the first
+# Windows CI run died here with exit 1 and not one line of output. Name the
+# command and line instead of leaving the reader to bisect a shell script.
+trap 'echo "::error::$(basename "${BASH_SOURCE[0]}") failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${PWD}"
 BUILD_DIR=""
@@ -235,7 +241,8 @@ rm -f "${ZIP}"
   if command -v zip >/dev/null 2>&1; then
     zip -qr -y "${NAME}.zip" "${NAME}"
   elif command -v 7z >/dev/null 2>&1; then
-    7z a -tzip -bso0 -bsp0 "${NAME}.zip" "${NAME}" >/dev/null
+    # Errors stay visible (-bsp0 only silences the progress bar).
+    7z a -tzip -bsp0 "${NAME}.zip" "${NAME}"
   else
     # Python's zipfile does not keep the executable bit; only reached on a
     # host with neither zip nor 7z, which the workflow does not use.
