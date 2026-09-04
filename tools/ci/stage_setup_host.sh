@@ -236,7 +236,14 @@ printf '%s\n' "${VERSION}" > "${STAGE}/VERSION"
 # in the past in every zone, and reproducible besides.
 # GNU touch takes -d @epoch; BSD touch (macOS) does not. Both take an ISO
 # YYYY-MM-DDThh:mm:SS, so convert the epoch with whichever date is here.
+#
+# Two days BEFORE the commit, not the commit time itself. The zip stores
+# whatever wall-clock string the runner writes, and the runner is UTC; a
+# player in UTC-4 reading "16:59" gets a file four hours in the future, which
+# is how the first fix failed. No zone is more than 26 hours from another,
+# so 48 hours back is in the past everywhere, and still reproducible.
 EPOCH="$(git -C "${ROOT}" log -1 --format=%ct 2>/dev/null || date +%s)"
+EPOCH=$((EPOCH - 172800))
 STAMP="$(date -u -d "@${EPOCH}" +%Y-%m-%dT%H:%M:%S 2>/dev/null \
       || date -u -r "${EPOCH}" +%Y-%m-%dT%H:%M:%S)"
 find "${STAGE}" -exec touch -h -d "${STAMP}" {} + 2>/dev/null \

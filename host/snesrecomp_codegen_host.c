@@ -85,9 +85,11 @@ static char g_step_log_path[1400];
 #define STEP_ERR_KEEP 6
 static char g_step_errs[STEP_ERR_KEEP][200];
 static int g_step_err_n;
+static char g_step_hint[240];
 
 static void step_log_open(const char* step) {
     g_step_err_n = 0;
+    g_step_hint[0] = '\0';
     if (!g_step_log && g_build_dir[0]) {
         mkdir_p(g_build_dir);
         if (join_path(g_step_log_path, sizeof(g_step_log_path), g_build_dir,
@@ -106,9 +108,8 @@ static void step_log_open(const char* step) {
  * build.ninja forever and compiles nothing. Say what to do about it. */
 static const char* step_hint_for(const char* line) {
     if (strstr(line, "still dirty after 100 tries"))
-        return "Some files in this folder have timestamps in the future "
-               "(unzipped from a different time zone). Fix with: "
-               "find . -exec touch {} +   (in this folder), then rebuild.";
+        return "Files in this folder are dated in the future (zip from another "
+               "time zone). In this folder run: find . -exec touch {} +";
     return NULL;
 }
 
@@ -126,8 +127,8 @@ static void step_log_line(const char* line) {
         fflush(g_step_log);
     }
     const char* hint = step_hint_for(line);
-    if (hint && g_step_err_n < STEP_ERR_KEEP)
-        snprintf(g_step_errs[g_step_err_n++], sizeof(g_step_errs[0]), "%s", hint);
+    if (hint && !g_step_hint[0])
+        snprintf(g_step_hint, sizeof(g_step_hint), "%s", hint);
     if (line_looks_like_error(line)) {
         /* Keep the LAST few: the root cause tends to precede the cascade,
          * but "ninja: build stopped" and the FAILED line name the target. */
@@ -142,16 +143,25 @@ static void step_log_line(const char* line) {
 /* "<what> failed (exit N)." plus the kept error lines and where the full log
  * is. err_cap is whatever the launcher gave us; fill it, no more. */
 static void step_fail_message(char* err_msg, size_t err_cap, const char* what, int code) {
+    /* The launcher's buffer is small; order by what a reader needs most:
+     * the diagnosis if there is one, then the last error lines, then where
+     * the rest is. Anything that does not fit is in the log and on stderr. */
     size_t used = (size_t)snprintf(err_msg, err_cap, "%s failed (exit %d).", what, code);
-    for (int i = 0; i < g_step_err_n && used + 8 < err_cap; ++i) {
-        int n = snprintf(err_msg + used, err_cap - used, "\n%.160s", g_step_errs[i]);
+    if (g_step_hint[0] && used + 8 < err_cap)
+        used += (size_t)snprintf(err_msg + used, err_cap - used, "\n%s", g_step_hint);
+    int shown = 0;
+    for (int i = g_step_err_n - 1; i >= 0 && shown < 2 && used + 8 < err_cap; --i, ++shown) {
+        int n = snprintf(err_msg + used, err_cap - used, "\n%.120s", g_step_errs[i]);
         if (n < 0) break;
         used += (size_t)n;
         if (used >= err_cap) { used = err_cap - 1; break; }
     }
-    if (g_step_log_path[0] && used + 24 < err_cap)
-        snprintf(err_msg + used, err_cap - used, "\nFull log: %s", g_step_log_path);
-    fprintf(stderr, "snesrecomp-codegen: %s\n", err_msg);
+    if (g_step_log_path[0] && used + 12 < err_cap)
+        snprintf(err_msg + used, err_cap - used, "\nLog: %s", g_step_log_path);
+    fprintf(stderr, "snesrecomp-codegen: %s failed (exit %d)\n", what, code);
+    if (g_step_hint[0]) fprintf(stderr, "snesrecomp-codegen: %s\n", g_step_hint);
+    for (int i = 0; i < g_step_err_n; ++i) fprintf(stderr, "snesrecomp-codegen:   %s\n", g_step_errs[i]);
+    if (g_step_log_path[0]) fprintf(stderr, "snesrecomp-codegen: full log: %s\n", g_step_log_path);
 }
 
 static int path_is_file(const char* path) {
@@ -1218,6 +1228,11 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "cd /d \"%%ROOT%%\"\r\n"
             /* A setup zip ships no build tree: configure on first rebuild. */
             "if not exist \"%%BUILD_DIR%%\\CMakeCache.txt\" (\r\n"
+            /* Zip time is zone-less; files unpacked west of the packer sit
+             * in the future and ninja regenerates forever. Pull them back. */
+            "  powershell -NoProfile -Command \"Get-ChildItem -Recurse -File "
+            "-Exclude build | Where-Object { $_.LastWriteTime -gt (Get-Date) } | "
+            "ForEach-Object { $_.LastWriteTime = Get-Date }\"\r\n"
             "  echo Configuring...\r\n"
             "  \"%%CMAKE%%\" -S \"%%ROOT%%\" -B \"%%BUILD_DIR%%\" -G Ninja "
             "-DCMAKE_BUILD_TYPE=Release\r\n"
@@ -1338,9 +1353,33 @@ static int build_dir_is_configured(void) {
  * one. Ninja when the pack (or PATH) has it -- it is what the pack ships and
  * what CI used -- else CMake's default generator. Release, because a player is
  * not debugging the framework. */
+/* A zip carries zone-less local time. Unpacked west of where it was made,
+ * every file sits hours in the future; ninja then sees build.ninja older
+ * than its inputs on every pass and regenerates until it gives up, having
+ * compiled nothing. Pull such files back to now before the first configure.
+ * mtimes in an unpacked archive are fiction anyway; the build tree is left
+ * alone. */
+static void fix_future_mtimes_posix(void) {
+    char marker[1400];
+    if (!join_path(marker, sizeof(marker), g_build_dir, ".snesrecomp_now")) return;
+    mkdir_p(g_build_dir);
+    FILE* f = fopen(marker, "w");
+    if (!f) return;
+    fclose(f);
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "find \"%s\" -path \"%s\" -prune -o -newer \"%s\" -type f -exec touch {} + 2>/dev/null",
+             g_project_root, g_build_dir, marker);
+    unsigned long code = 0;
+    if (run_cmdline_wait(cmd, &code) && code == 0)
+        step_log_line("checked for future-dated files (zip time zone)");
+    remove(marker);
+}
+
 static int run_cmake_configure_posix(RecompLauncherCPrepareProgressFn on_progress,
                                      void* progress_ctx, char* err_msg,
                                      size_t err_cap) {
+    fix_future_mtimes_posix();
     char ninja[1400];
     int have_ninja = (g_toolchain_root[0] &&
                       pack_tool(g_toolchain_root, "ninja", ninja, sizeof(ninja)))
