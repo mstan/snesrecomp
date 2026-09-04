@@ -1,6 +1,21 @@
-# Build the @DISPLAY_NAME@ SETUP PACK for Linux, Windows, macOS arm64 and macOS
-# Intel, and optionally publish the four zips as a GitHub Release.
-# MANUAL TRIGGER ONLY.
+# Build the @DISPLAY_NAME@ SETUP PACK for Linux, Windows, macOS
+# arm64 and macOS Intel, tag the commit, and publish the four zips as a
+# GitHub Release.
+#
+# HUMAN-TRIGGERED ONLY. There is no push, pull_request or schedule trigger and
+# there must never be one: a run is a release decision, made by a person on
+# the Actions page. Releases across the port set are driven from the studio
+# bulk tool, and a per-push run would compete with it for minutes and for the
+# meaning of "did CI pass".
+#
+# WHAT A RUN DOES, with the defaults:
+#   1. Picks the next version: the latest v* tag with its patch number bumped
+#      (or VERSION when there is no tag yet, or whatever `version` says).
+#   2. Builds the setup host for all four platforms with that version as the
+#      lobby pin, and packages it.
+#   3. Tags the commit the run was started from as vX.Y.Z and publishes a
+#      public GitHub Release with the four zips. Uncheck publish_release for a
+#      dry run that only uploads workflow artifacts.
 #
 # WHAT THIS BUILDS. Not the game. src/gen/*.c is recompiler output derived
 # from ROM bytes: never committed, never in CI, never in a zip. What CI can
@@ -8,7 +23,6 @@
 # -DSNESRECOMP_SETUP_HOST=ON, i.e. without recompiled code -- packaged with
 # the recompiler and this source tree. On the player's machine the launcher
 # takes their own ROM, generates, rebuilds, and relaunches into the real game.
-# A green run here means four setup packs were produced, nothing more.
 #
 # THE TOOLCHAIN. Each pack is built with the retcomm-toolchains cmake-clang-v1
 # pack, because that is what the player's own rebuild uses: if it cannot build
@@ -16,23 +30,25 @@
 # the zip (embed_toolchain) so first run downloads nothing; turn it off for a
 # lean zip that fetches the pack on demand (Linux pack ~800 MB, Windows
 # ~200 MB, macOS ~90 MB).
-#
-# There is deliberately no push or pull_request trigger. Releases across the
-# port set are driven from the studio bulk tool, and a per-repo workflow that
-# fires on every push competes with it for minutes and for the meaning of
-# "did CI pass". Run this from the Actions tab, or with
-#   gh workflow run release.yml
-# and pass publish_release from a v* tag to cut a release.
 
-name: Build
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: 'Publish a GitHub Release (requires a v* tag ref)'
+        description: 'Tag this commit and publish a public GitHub Release'
         type: boolean
-        default: false
+        default: true
+      version:
+        description: 'Version to release, e.g. 0.2.0 (empty = bump the latest v* tag)'
+        type: string
+        default: ''
+      bump:
+        description: 'When version is empty, which part of the latest tag to bump'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
       embed_toolchain:
         description: 'Embed the cmake-clang-v1 pack in each zip (else the launcher downloads it)'
         type: boolean
@@ -63,11 +79,14 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Record framework pins
         run: |
@@ -78,31 +97,66 @@ jobs:
           fi
           bash snesrecomp/tools/ci/record_pins.sh "${ARGS[@]}"
 
-      - name: Refuse to publish from a non-tag ref
-        if: inputs.publish_release && !startsWith(github.ref, 'refs/tags/v')
-        run: |
-          echo "::error::publish_release was set, but this run is on ${GITHUB_REF}."
-          echo "Re-run the workflow selecting a v* tag."
-          exit 1
-
       - name: Resolve release version
         id: meta
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_BUMP: ${{ inputs.bump || 'patch' }}
+          IN_PUBLISH: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
-          VERSION="$(tr -d '[:space:]' < VERSION)"
-          [[ -n "${VERSION}" ]] || { echo "::error::VERSION is empty"; exit 1; }
-          if [[ "${{ inputs.publish_release }}" == "true" ]]; then
-            # VERSION is the lobby pin compiled into the binary. A tag that
-            # disagrees with it ships a release whose peers match on a
-            # different string than the one people were told to install.
-            if [[ "${GITHUB_REF_NAME#v}" != "${VERSION}" ]]; then
-              echo "::error::tag ${GITHUB_REF_NAME} does not match VERSION ${VERSION}."
-              echo "The lobby version pin is compiled from VERSION; bump it and retag."
-              exit 1
+          PUBLISH=true
+          [[ "${IN_PUBLISH}" == "false" ]] && PUBLISH=false
+          FILE_VER="$(tr -d '[:space:]' < VERSION)"
+          RAW="$(printf '%s' "${IN_VERSION}" | tr -d '[:space:]')"
+          LATEST="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)"
+
+          if [[ -n "${RAW}" ]]; then
+            VER="${RAW#v}"
+            echo "version given: ${VER}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Started from an existing tag: release exactly that.
+            VER="${GITHUB_REF_NAME#v}"
+            echo "running on tag ${GITHUB_REF_NAME}: releasing ${VER}"
+          elif [[ -z "${LATEST}" ]]; then
+            # First release: VERSION says what it is.
+            VER="${FILE_VER}"
+            echo "no v* tag yet: first release is VERSION = ${VER}"
+          else
+            BASE="${LATEST#v}"; BASE="${BASE%%[-+]*}"
+            IFS=. read -r MA MI PA <<<"${BASE}"
+            case "${IN_BUMP}" in
+              major) MA=$((MA + 1)); MI=0; PA=0 ;;
+              minor) MI=$((MI + 1)); PA=0 ;;
+              *)     PA=$((PA + 1)) ;;
+            esac
+            VER="${MA}.${MI}.${PA}"
+            # A deliberate bump of VERSION in the tree outranks the automatic
+            # patch step, so a maintainer can move to 0.2.0 by editing the file.
+            if [[ "$(printf '%s\n%s\n' "${FILE_VER}" "${VER}" | sort -V | tail -n1)" == "${FILE_VER}" \
+                  && "${FILE_VER}" != "${BASE}" ]]; then
+              echo "VERSION (${FILE_VER}) is ahead of ${LATEST} bumped (${VER}); using VERSION"
+              VER="${FILE_VER}"
+            else
+              echo "auto-bump ${IN_BUMP}: ${LATEST} -> ${VER}"
             fi
           fi
-          echo "version=${VERSION}" >>"$GITHUB_OUTPUT"
-          echo "version ${VERSION}"
+
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?$ ]]; then
+            echo "::error::'${VER}' is not a version (want X.Y.Z)"
+            exit 1
+          fi
+          TAG="v${VER}"
+          if [[ "${PUBLISH}" == "true" && "${GITHUB_REF}" != "refs/tags/${TAG}" ]] \
+             && git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} already exists at $(git rev-parse --short "${TAG}"). Pass a new version, or start the run from that tag to re-release it."
+            exit 1
+          fi
+
+          echo "version=${VER}" >>"$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >>"$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >>"$GITHUB_OUTPUT"
+          echo "release ${TAG} from ${GITHUB_SHA::12}; publish=${PUBLISH}"
 
   build:
     name: ${{ matrix.artifact }}
@@ -124,6 +178,8 @@ jobs:
       run:
         shell: bash
     env:
+      # The lobby pin compiled into the binary and written into the pack's
+      # VERSION, so the tag, the binary and the player's own rebuild agree.
       RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
 
     steps:
@@ -205,8 +261,8 @@ jobs:
       - name: Package setup pack
         run: |
           set -euo pipefail
-          # The packager inspects the executable's imports (objdump) and zips
-          # the stage; Git Bash on Windows has neither tool, the pack does.
+          # The packager inspects the executable's imports and zips the
+          # stage; Git Bash on Windows has neither tool, the pack does.
           # shellcheck disable=SC1091
           source "${TOOLCHAIN_DIR}/env.sh"
           ARGS=()
@@ -225,9 +281,9 @@ jobs:
           compression-level: 0
 
   release:
-    name: GitHub Release
+    name: Tag and publish ${{ needs.preflight.outputs.tag }}
     needs: [preflight, build]
-    if: inputs.publish_release
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -235,7 +291,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/download-artifact@v4
         with:
@@ -257,11 +314,30 @@ jobs:
           ( cd dist && sha256sum "${ZIP_PREFIX}"-*.zip > SHA256SUMS )
           cat dist/SHA256SUMS
 
+      # The tag is created here, after all four builds succeeded, so a failed
+      # build never leaves a version number claimed by nothing.
+      - name: Tag the commit
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} already exists at $(git rev-parse --short "${TAG}") (re-release from that tag)"
+          else
+            git tag -a "${TAG}" -m "@DISPLAY_NAME@ ${TAG}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${TAG}"
+            echo "tagged ${GITHUB_SHA::12} as ${TAG}"
+          fi
+
       - name: Release notes
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
           {
-            echo "@DISPLAY_NAME@ ${GITHUB_REF_NAME} — setup packs"
+            echo "@DISPLAY_NAME@ ${TAG} — setup packs"
             echo
             echo "These packs do not contain the game. Each holds a setup program, the"
             echo "recompiler and the source; on first run it takes your own copy of"
@@ -285,9 +361,12 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          name: "@DISPLAY_NAME@ ${{ github.ref_name }}"
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "@DISPLAY_NAME@ ${{ needs.preflight.outputs.tag }}"
           body_path: notes.md
           files: |
             dist/${{ env.ZIP_PREFIX }}-*.zip
             dist/SHA256SUMS
           fail_on_unmatched_files: true
+          make_latest: true

@@ -301,9 +301,10 @@ def test_framework_ref_defaults_to_this_checkouts_branch():
 
 
 def test_ci_workflow_is_manual_only():
-    """Releases across the port set are driven from the studio bulk tool. A
-    per-repo workflow that also fires on every push competes with it: wasted
-    minutes, and an ambiguous answer to "did CI pass" when the two disagree."""
+    """A run is a release decision made by a person on the Actions page.
+    Releases across the port set are driven from the studio bulk tool, and a
+    workflow that also fires on every push competes with it: wasted minutes,
+    and an ambiguous answer to "did CI pass" when the two disagree."""
     with tempfile.TemporaryDirectory() as directory:
         tmp = pathlib.Path(directory)
         project = _scaffold(tmp, "--ci")
@@ -316,9 +317,14 @@ def test_ci_workflow_is_manual_only():
         for trigger in ("push:", "pull_request:", "schedule:"):
             assert trigger not in body, f"{trigger} must not trigger this workflow"
 
-        # Publishing is opt-in per run, and still refuses a non-tag ref.
-        assert "publish_release" in text
-        assert "Refuse to publish from a non-tag ref" in text
+        # Publishing is the default and a checkbox, not a tag ceremony: the
+        # workflow chooses the next version and tags the commit itself.
+        publish = body[body.index("publish_release:"):]
+        publish = publish[:publish.index("\n      version:")]
+        assert "default: true" in publish, publish
+        assert "version:" in body and "bump:" in body
+        assert "git tag -a" in text and "git push origin \"refs/tags/" in text
+        assert "make_latest: true" in text
 
 
 def test_host_template_builds_against_both_sdl_backends():

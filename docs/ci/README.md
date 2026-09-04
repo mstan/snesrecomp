@@ -75,22 +75,29 @@ neither does a player's machine.
 
 ## Cutting a release
 
-`VERSION` is the lobby version pin compiled into the binary; the tag must
-agree with it and `preflight` fails when it does not.
+Open the Actions page, pick **Release**, press **Run workflow**. The defaults
+are the release: the next version is chosen for you, all four packs are
+built, the commit you ran from is tagged, and a public GitHub Release is
+published with the zips and a `SHA256SUMS`. No push, pull request or schedule
+ever runs it — a run is a decision a person makes.
 
-```sh
-printf '0.2.0\n' > VERSION && git commit -am 'Release 0.2.0'
-git tag v0.2.0 && git push origin main v0.2.0
-gh workflow run release.yml --ref v0.2.0 -f publish_release=true
-```
+| input | default | meaning |
+| --- | --- | --- |
+| `publish_release` | on | tag + publish; off = dry run, artifacts only |
+| `version` | empty | release exactly this `X.Y.Z` |
+| `bump` | `patch` | with `version` empty: bump this part of the latest `v*` tag |
+| `embed_toolchain` | on | embed cmake-clang-v1 in each zip (Linux ~800 MB); off = lean zip that downloads on first run |
+| `toolchain_tag` | empty | pin a retcomm-toolchains release; empty = latest |
+| `verify_pins` | off | fail on drift from `framework_pins.txt` |
 
-Inputs: `embed_toolchain` (default on; Linux pack ~800 MB, Windows ~200 MB,
-macOS ~90 MB — off gives a lean zip that downloads on first run),
-`toolchain_tag` (pin a `retcomm-toolchains` release; empty = latest),
-`verify_pins` (fail on drift from `framework_pins.txt`).
-
-The `release` job requires all four zips; a run that produced three fails
-rather than publishing a partial release.
+How the version is chosen, in order: `version` if given; the tag itself if
+the run was started from a `v*` tag (re-release); `VERSION` if no tag exists
+yet (the first release); otherwise the latest tag bumped — unless `VERSION`
+in the tree is ahead of that, in which case the maintainer's deliberate bump
+wins. That version is the lobby pin compiled into the binary and written into
+the pack's `VERSION`, so the tag, the setup host and the player's own rebuild
+agree. The tag is created only after all four builds succeed, so a failed
+build never claims a number.
 
 ## Shared scripts (`tools/ci/`)
 
