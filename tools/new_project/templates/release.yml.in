@@ -281,7 +281,7 @@ jobs:
           compression-level: 0
 
   release:
-    name: Tag and publish ${{ needs.preflight.outputs.tag }}
+    name: Tag and publish
     needs: [preflight, build]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-24.04
