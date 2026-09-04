@@ -13,6 +13,28 @@
 
 set(SNESRECOMP_RUNNER_ROOT ${CMAKE_CURRENT_LIST_DIR})
 
+# Portable toolchain packs (retcomm-toolchains cmake-clang-v1) compile and link
+# against a bundled sysroot -- clang.cfg passes --sysroot itself -- and their
+# env.sh exports CMAKE_SYSROOT for the same directory. CMake does not read that
+# variable from the environment, only from a -D or a toolchain file, so every
+# find_* still searched the HOST: on a bare CI runner find_package(OpenGL) then
+# failed even though the sysroot ships GL/gl.h and libGL.so, and on a developer
+# machine it silently linked the host's GL instead of the sysroot's. A player's
+# rebuild from a setup pack is the bare-machine case. Honour the pack's word.
+if(NOT CMAKE_SYSROOT AND DEFINED ENV{CMAKE_SYSROOT} AND IS_DIRECTORY "$ENV{CMAKE_SYSROOT}")
+    set(CMAKE_SYSROOT "$ENV{CMAKE_SYSROOT}")
+    message(STATUS "snesrecomp: CMAKE_SYSROOT from environment: ${CMAKE_SYSROOT}")
+    # The pack's sysroot carries legacy libGL.so (+ headers), not GLVND's
+    # libOpenGL.so / libGLX.so dev links. FindOpenGL prefers GLVND and, not
+    # finding it in the sysroot, falls through to the host -- which on a bare
+    # runner has nothing, and on a developer box has a different distro's GL.
+    # Legacy preference makes the sysroot the answer on every machine; the
+    # binary still loads the player's own libGL.so.1 at runtime.
+    if(NOT DEFINED OpenGL_GL_PREFERENCE)
+        set(OpenGL_GL_PREFERENCE LEGACY)
+    endif()
+endif()
+
 # Desktop SDL selection is shared by every game host. SDL3 is the default;
 # SDL2 remains available as an explicit compatibility fallback:
 #
