@@ -365,6 +365,34 @@ set(SNESRECOMP_RUNNER_INCLUDE_DIRS
     ${SNESRECOMP_RUNNER_ROOT}/src/snes
 )
 
+# ── Directories the game loads relative to its executable ───────────────────
+#
+# snesrecomp_target_stage_dir(<target> <source_dir> <dest_relative>)
+#
+# Copies <source_dir> to $<TARGET_FILE_DIR:target>/<dest_relative> every time
+# <target> is built. mods/, translations/ and the like are read from beside
+# the executable at runtime, so a binary without them beside it runs without
+# them -- silently, for a mods catalog.
+#
+# POST_BUILD on the executable rather than a separate ALL target, because the
+# executable is the one thing every build path agrees on: `cmake --build
+# --target <exe>` from CI, from a developer, and from the launcher's own
+# Generate & rebuild all produce it. A sibling ALL target is skipped by every
+# one of those that names the target, which is how a setup pack rebuilt on a
+# player's machine came up with an empty Mods page: the pack root beside the
+# setup host had mods/, the freshly built build/<exe> did not.
+function(snesrecomp_target_stage_dir target source_dir dest_rel)
+    if(NOT IS_DIRECTORY "${source_dir}")
+        message(FATAL_ERROR
+            "snesrecomp_target_stage_dir(${target}): ${source_dir} is not a directory")
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${source_dir}" "$<TARGET_FILE_DIR:${target}>/${dest_rel}"
+        COMMENT "${target}: staging ${dest_rel}/ beside the executable"
+        VERBATIM)
+endfunction()
+
 # ── Generated code, or the setup host that stands in for it ────────────────
 #
 # src/gen/*.c is recompiler output derived from ROM bytes: never committed,

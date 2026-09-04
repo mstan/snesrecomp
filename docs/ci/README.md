@@ -34,7 +34,7 @@ The zip then carries:
 |---|---|
 | the setup host | `build-ci/` |
 | `assets/` (launcher fonts, boxart) | beside the built exe (`recomp_ui.cmake` stages them) |
-| runtime dirs (`mods/`, `translations/`, …) | beside the built exe, per `--runtime-dir` |
+| runtime dirs (`mods/`, `translations/`, …) | beside the built exe, per `--runtime-dir`; the game stages them with `snesrecomp_target_stage_dir()` so the player's rebuild gets them too |
 | the whole source tree, submodules included | `git ls-files --recurse-submodules` |
 | `toolchain/` (optional) | the fetched `cmake-clang-v1` pack |
 | `README.txt`, `VERSION`, `SOURCE_REVISIONS` | generated |
