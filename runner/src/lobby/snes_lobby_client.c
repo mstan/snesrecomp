@@ -71,6 +71,16 @@ int  snes_lobby_mod_request(const char *a2, const char *b)
 {
     (void)a2; (void)b; return -1;
 }
+int  snes_lobby_mod_relay_size_allows(const char *path, uint64_t bytes,
+                                      const char *package_id,
+                                      char *reason, size_t reason_cap)
+{
+    /* Pure policy: it holds without a lobby too, and a build with no lobby
+     * client still links callers that ask the question. */
+    (void)path; (void)bytes; (void)package_id;
+    if (reason && reason_cap) reason[0] = '\0';
+    return 1;
+}
 void snes_lobby_mod_cancel(void) {}
 int  snes_lobby_mod_progress(void) { return -1; }
 int  snes_lobby_mod_failed(char *e, size_t c) { (void)e; (void)c; return 0; }
@@ -204,7 +214,18 @@ typedef struct {
     char  xfer_ver[SNES_LOBBY_MOD_VER_LEN];
     char  xfer_sha[65];
     uint32_t xfer_expect;
-    char  xfer_err[192];
+    char  xfer_err[256];
+    /* HOST side: the packed archive, waiting for the path to be known.
+     *
+     * The size cap depends on whether the pair turns out to be relayed, and
+     * that is not decided until ICE connects. So the export happens on the
+     * request (it is local work and it is what tells us the size) but the
+     * bytes are held here until the pump can price the path. Owned by us
+     * until queued; mod_xfer_reset frees it. */
+    uint8_t *xfer_hold;
+    size_t   xfer_hold_len;
+    char     xfer_hold_hdr[512];
+    int      xfer_path_priced;   /* 1 once the cap decision has been made */
     char  ice_stun[128], ice_turn[128], ice_user[192], ice_pass[128];
     /* ICE signals that arrived before the agent existed.
      *
@@ -2279,6 +2300,45 @@ static int mod_ice_type_for_push(int emitted_type)
     return emitted_type;
 }
 
+/* Is this ICE pair relayed? Only "relay" is; "unknown" is not an answer, and
+ * the caller must not treat it as one -- see snes_lobby_mod_relay_size_allows. */
+static int mod_path_is_relay(const char *path)
+{
+    return path && !strcmp(path, "relay");
+}
+
+static int mod_path_is_known(const char *path)
+{
+    if (!path || !path[0]) return 0;
+    return !strcmp(path, "relay") || !strcmp(path, "host") ||
+           !strcmp(path, "srflx") || !strcmp(path, "prflx");
+}
+
+int snes_lobby_mod_relay_size_allows(const char *path, uint64_t bytes,
+                                     const char *package_id,
+                                     char *reason, size_t reason_cap)
+{
+    if (reason && reason_cap) reason[0] = '\0';
+    if (!mod_path_is_relay(path)) return 1;
+    if (bytes <= (uint64_t)SNES_LOBBY_MOD_RELAY_MAX_BYTES) return 1;
+
+    if (reason && reason_cap) {
+        /* Say the size, say the cap, and say what to do instead. A player who
+         * is only told "too large" has no way to tell a mod that is over by a
+         * hair from one that was never going to fit, and no idea that the
+         * same download would have worked on a different network. */
+        snprintf(reason, reason_cap,
+                 "%s is %.1f MB. This connection could not find a direct route "
+                 "between the two of you, so the file would have to go through "
+                 "the relay server, which is capped at %u MB. Download the mod "
+                 "from its original source instead.",
+                 (package_id && package_id[0]) ? package_id : "that mod",
+                 (double)bytes / (1024.0 * 1024.0),
+                 (unsigned)(SNES_LOBBY_MOD_RELAY_MAX_BYTES / (1024u * 1024u)));
+    }
+    return 0;
+}
+
 static void mod_xfer_emit(const RNetSignal *msg, void *user)
 {
     (void)user;
@@ -2299,6 +2359,17 @@ static void mod_xfer_reset(void)
     g_lc.xfer_ver[0] = '\0';
     g_lc.xfer_sha[0] = '\0';
     g_lc.xfer_expect = 0;
+    /* Held bytes that never reached the queue are ours to release. Freed with
+     * the exporter's own free hook, because the exporter allocated them --
+     * only a blob that made it into rnet_ice_xfer_queue_blob belongs to the
+     * transfer, which frees it itself. */
+    if (g_lc.xfer_hold) {
+        if (g_mod_free_fn) g_mod_free_fn(g_lc.xfer_hold);
+        g_lc.xfer_hold = NULL;
+    }
+    g_lc.xfer_hold_len = 0;
+    g_lc.xfer_hold_hdr[0] = '\0';
+    g_lc.xfer_path_priced = 0;
     g_lc.sig_hold_n = 0;
     g_lc.sig_hold_from[0] = '\0';
 }
@@ -2402,7 +2473,6 @@ static void mod_xfer_on_request(const char *from, const char *text)
     char sha[65];
     char err[192];
     char header[512];
-    uint8_t *hdr_copy;
 
     /* Every refusal below is reported to the asking peer AND logged here.
      * The first version only sent the reason down the wire, so a host whose
@@ -2483,24 +2553,101 @@ static void mod_xfer_on_request(const char *from, const char *text)
 
     /* Two blobs: what is coming, then the thing itself. The digest travels in
      * the header so the receiver can check the payload against a value that
-     * did not come from the payload. */
+     * did not come from the payload.
+     *
+     * Neither goes out yet. Whether this transfer is allowed to be this big
+     * depends on whether ICE ends up on a direct pair or on the relay, and
+     * that is not decided until the agent connects -- so both are held and
+     * the pump releases them once it can price the path. */
     snprintf(header, sizeof(header),
              "{\"id\":\"%s\",\"ver\":\"%s\",\"len\":%u,\"sha256\":\"%s\"}",
              id, ver, (unsigned)len, sha);
-    hdr_copy = (uint8_t *)malloc(strlen(header) + 1);
+    snprintf(g_lc.xfer_hold_hdr, sizeof(g_lc.xfer_hold_hdr), "%s", header);
+    g_lc.xfer_hold = blob;
+    g_lc.xfer_hold_len = (size_t)len;
+    g_lc.xfer_path_priced = 0;
+    fprintf(stderr,
+            "snes_lobby: packed %s@%s (%u bytes) for %s - waiting for the "
+            "path before sending\n",
+            id, ver, (unsigned)len, from);
+}
+
+/* HOST side: the agent is up, so the pair type is finally knowable. Decide
+ * whether the held archive may go, then either queue it or refuse it. */
+static void mod_xfer_release_held(void)
+{
+    char path[32];
+    char reason[256];
+    uint8_t *hdr_copy;
+    size_t hdr_len;
+    uint8_t *blob;
+    size_t blob_len;
+
+    if (!g_lc.xfer || !g_lc.xfer_hold || g_lc.xfer_path_priced)
+        return;
+
+    rnet_ice_xfer_path(g_lc.xfer, path, sizeof(path));
+    if (!mod_path_is_known(path)) {
+        /* Connected but the pair has no name yet. Wait -- briefly. Refusing
+         * here would cap direct transfers we merely failed to identify, and
+         * allowing here would let an oversized one onto the relay by being
+         * asked a moment too early. Two seconds, then take the transfer at
+         * its word and say so. */
+        if (g_lc.xfer_connected_ms &&
+            lobby_mono_ms() - g_lc.xfer_connected_ms < 2000u)
+            return;
+        fprintf(stderr,
+                "snes_lobby: could not tell whether this link is relayed "
+                "(path=\"%s\") - sending %s@%s uncapped\n",
+                path, g_lc.xfer_id, g_lc.xfer_ver);
+    }
+
+    if (!snes_lobby_mod_relay_size_allows(path, (uint64_t)g_lc.xfer_hold_len,
+                                          g_lc.xfer_id, reason,
+                                          sizeof(reason))) {
+        fprintf(stderr, "snes_lobby: refusing to relay %s@%s - %s\n",
+                g_lc.xfer_id, g_lc.xfer_ver, reason);
+        (void)snes_lobby_send_signal_to(g_lc.xfer_peer,
+                                        SNES_LOBBY_SIG_MOD_NAK, 0, reason);
+        /* Not mod_xfer_fail: nothing failed on this machine, and the host's
+         * own panel should not light up red because a guest asked for
+         * something the network cannot carry. */
+        g_lc.xfer_progress = -1;
+        mod_xfer_reset();
+        return;
+    }
+
+    hdr_len = strlen(g_lc.xfer_hold_hdr);
+    hdr_copy = (uint8_t *)malloc(hdr_len + 1);
     if (!hdr_copy) {
-        if (g_mod_free_fn) g_mod_free_fn(blob);
         mod_xfer_fail("out of memory");
         return;
     }
-    memcpy(hdr_copy, header, strlen(header) + 1);
-    if (rnet_ice_xfer_queue_blob(g_lc.xfer, hdr_copy, strlen(header)) != 0 ||
-        rnet_ice_xfer_queue_blob(g_lc.xfer, blob, (size_t)len) != 0) {
+    memcpy(hdr_copy, g_lc.xfer_hold_hdr, hdr_len + 1);
+
+    /* Ownership moves to the transfer on a successful queue, so drop our
+     * pointer FIRST -- mod_xfer_reset frees xfer_hold, and a failure below
+     * would otherwise free bytes the transfer already owns. */
+    blob = g_lc.xfer_hold;
+    blob_len = g_lc.xfer_hold_len;
+    g_lc.xfer_hold = NULL;
+    g_lc.xfer_hold_len = 0;
+    g_lc.xfer_path_priced = 1;
+
+    /* Queued one at a time, not short-circuited: rnet_ice_xfer_queue_blob
+     * takes ownership on every path, so if the header fails to queue the
+     * archive is still ours and has to be released here. */
+    if (rnet_ice_xfer_queue_blob(g_lc.xfer, hdr_copy, hdr_len) != 0) {
+        if (g_mod_free_fn) g_mod_free_fn(blob);
         mod_xfer_fail("could not queue the mod for sending");
         return;
     }
-    fprintf(stderr, "snes_lobby: sending %s@%s (%u bytes) to %s\n", id, ver,
-            (unsigned)len, from);
+    if (rnet_ice_xfer_queue_blob(g_lc.xfer, blob, blob_len) != 0) {
+        mod_xfer_fail("could not queue the mod for sending");
+        return;
+    }
+    fprintf(stderr, "snes_lobby: sending %s@%s (%u bytes) over the %s path\n",
+            g_lc.xfer_id, g_lc.xfer_ver, (unsigned)blob_len, path);
 }
 
 /* GUEST side: a completed blob arrived. */
@@ -2537,8 +2684,30 @@ static void mod_xfer_on_blob(uint8_t *data, size_t len)
         json_get_str(text, "ver", g_lc.xfer_ver, sizeof(g_lc.xfer_ver));
         g_lc.xfer_expect = (uint32_t)json_get_int(text, "len", 0);
         free(data);
-        if (!g_lc.xfer_sha[0] || !g_lc.xfer_expect)
+        if (!g_lc.xfer_sha[0] || !g_lc.xfer_expect) {
             mod_xfer_fail("the host described the mod in a way we cannot read");
+            return;
+        }
+        /* The same cap, applied on the receiving side.
+         *
+         * The host checks before it queues, so in a matched pair this never
+         * fires. It is here because the header is the first moment THIS
+         * machine knows the size, and a peer running an older or altered
+         * build would otherwise be able to push an oversized archive across
+         * the relay -- the cap protects the relay operator, so it cannot
+         * depend on the other end choosing to honour it. */
+        {
+            char path[32];
+            char reason[256];
+            rnet_ice_xfer_path(g_lc.xfer, path, sizeof(path));
+            if (!snes_lobby_mod_relay_size_allows(path,
+                                                  (uint64_t)g_lc.xfer_expect,
+                                                  g_lc.xfer_id, reason,
+                                                  sizeof(reason))) {
+                mod_xfer_fail(reason);
+                return;
+            }
+        }
         return;
     }
 
@@ -2622,6 +2791,14 @@ void snes_lobby_mod_xfer_pump(void)
         }
     }
 
+    /* HOST: nothing has been queued yet -- the archive is held until the pair
+     * type is known, so the relay cap is decided on the path the bytes would
+     * actually take rather than on a guess made before ICE connected. */
+    if (g_lc.xfer_hold && g_lc.xfer_connected_ms) {
+        mod_xfer_release_held();
+        if (!g_lc.xfer) return;      /* refused or failed inside */
+    }
+
     {
         const int p = rnet_ice_xfer_progress(g_lc.xfer);
         if (p >= 0) g_lc.xfer_progress = p;
@@ -2632,8 +2809,13 @@ void snes_lobby_mod_xfer_pump(void)
         data = NULL;
         len = 0;
     }
-    /* The sender is done when everything queued has left. */
-    if (g_lc.xfer_sending && rnet_ice_xfer_send_idle(g_lc.xfer)) {
+    /* The sender is done when everything queued has left -- and not before
+     * anything was queued. An idle send queue used to mean "finished"; now it
+     * also describes a transfer still holding its archive while ICE connects,
+     * and treating that as finished would close the link the instant it
+     * opened, every time. xfer_path_priced is what tells the two apart. */
+    if (g_lc.xfer_sending && g_lc.xfer_path_priced &&
+        rnet_ice_xfer_send_idle(g_lc.xfer)) {
         fprintf(stderr, "snes_lobby: %s@%s sent\n", g_lc.xfer_id, g_lc.xfer_ver);
         g_lc.xfer_progress = -1;
         mod_xfer_reset();

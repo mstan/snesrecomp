@@ -59,6 +59,8 @@ int  rnet_ice_xfer_take_blob(RNetIceXfer *x, uint8_t **d, size_t *l)
 int  rnet_ice_xfer_progress(const RNetIceXfer *x) { (void)x; XFER_TRAP("progress"); }
 int  rnet_ice_xfer_failed(const RNetIceXfer *x, char *e, size_t c)
 { (void)x; (void)e; (void)c; XFER_TRAP("failed"); }
+void rnet_ice_xfer_path(const RNetIceXfer *x, char *o, size_t c)
+{ (void)x; (void)o; (void)c; XFER_TRAP("path"); }
 
 /* Stands in for the mod runtime: two installed packages. */
 static int two_pkg_offer(SnesLobbyModPkg *out, int max, void *ctx)
@@ -396,6 +398,120 @@ static void case_mod_set_round_trips(void)
        "resolved option values survive");
 }
 
+
+/* ---- relay size cap -----------------------------------------------------
+ *
+ * A relayed transfer is carried by the TURN server, so its bytes are the
+ * relay operator's cost, not the two players'. Direct pairs are free to both
+ * of us and stay uncapped at any size; only "relay" is priced.
+ *
+ * snes_lobby_mod_relay_size_allows is pure on purpose: the decision it makes
+ * is the whole policy, and testing it here means testing it without a socket,
+ * a TURN server, or a peer that has to be persuaded not to find a direct
+ * route. */
+#define ONE_MB (1024u * 1024u)
+
+static void case_relay_cap_is_five_mb(void)
+{
+    char why[256];
+    printf("  relay cap\n");
+
+    ck(SNES_LOBBY_MOD_RELAY_MAX_BYTES == 5u * ONE_MB,
+       "the cap is 5 MiB");
+
+    /* Exactly at the cap is allowed: the rule is "over 5 MB", and a package
+     * that is 5 MB to the byte is not over it. */
+    ck(snes_lobby_mod_relay_size_allows("relay", 5u * ONE_MB, "m", why,
+                                        sizeof(why)) == 1,
+       "5 MB exactly still goes over the relay");
+    ck(why[0] == '\0', "an allowed transfer writes no reason");
+
+    ck(snes_lobby_mod_relay_size_allows("relay", 5u * ONE_MB + 1u, "m", why,
+                                        sizeof(why)) == 0,
+       "one byte over the cap is refused on the relay");
+}
+
+static void case_direct_paths_are_never_capped(void)
+{
+    char why[256];
+    const char *direct[] = { "host", "srflx", "prflx" };
+    size_t i;
+    printf("  direct paths uncapped\n");
+
+    /* 400 MB over a direct pair is fine. This is the case the cap exists to
+     * leave alone -- a peer-to-peer link costs nobody but the two players,
+     * and refusing a big mod on it would be a limit invented for no reason. */
+    for (i = 0; i < sizeof(direct) / sizeof(direct[0]); ++i) {
+        why[0] = 'x';
+        ck(snes_lobby_mod_relay_size_allows(direct[i], 400u * ONE_MB, "big",
+                                            why, sizeof(why)) == 1,
+           direct[i]);
+        ck(why[0] == '\0', "no reason on an allowed direct transfer");
+    }
+}
+
+static void case_unknown_path_allows(void)
+{
+    char why[256];
+    printf("  unknown path\n");
+
+    /* Asked before the pair is named, the answer is yes. A "no" here would
+     * cap direct transfers on nothing more than a query that came too early,
+     * which is the failure this policy must not have. The callers are what
+     * make this safe: both wait for a named path first, and the host says so
+     * in the log on the rare occasion it gives up waiting. */
+    ck(snes_lobby_mod_relay_size_allows("unknown", 400u * ONE_MB, "big", why,
+                                        sizeof(why)) == 1,
+       "an unnamed path does not refuse");
+    ck(snes_lobby_mod_relay_size_allows(NULL, 400u * ONE_MB, "big", why,
+                                        sizeof(why)) == 1,
+       "a NULL path does not refuse");
+    ck(snes_lobby_mod_relay_size_allows("none", 400u * ONE_MB, "big", why,
+                                        sizeof(why)) == 1,
+       "a build without ICE does not refuse");
+}
+
+static void case_refusal_tells_the_player_what_to_do(void)
+{
+    char why[256];
+    printf("  refusal text\n");
+
+    why[0] = '\0';
+    (void)snes_lobby_mod_relay_size_allows("relay", 12u * ONE_MB + 512u * 1024u,
+                                           "gwed.enormous", why, sizeof(why));
+    /* The three things a player needs and cannot work out for themselves:
+     * which mod, how big it is, and that the fix is to fetch it elsewhere
+     * rather than to click again. */
+    ck(strstr(why, "gwed.enormous") != NULL, "the reason names the package");
+    ck(strstr(why, "12.5 MB") != NULL, "the reason states the actual size");
+    ck(strstr(why, "5 MB") != NULL, "the reason states the cap");
+    ck(strstr(why, "original source") != NULL,
+       "the reason says where to get it instead");
+    ck(strlen(why) < 256, "the reason fits the transfer error buffer");
+
+    /* A missing id still produces a sentence rather than an empty gap. */
+    why[0] = '\0';
+    (void)snes_lobby_mod_relay_size_allows("relay", 9u * ONE_MB, NULL, why,
+                                           sizeof(why));
+    ck(strstr(why, "that mod") != NULL, "an unnamed package still reads");
+}
+
+static void case_refusal_survives_a_short_buffer(void)
+{
+    char why[16];
+    printf("  short buffer\n");
+
+    /* The verdict is the return value, never the length of the reason. A
+     * caller with a small buffer still gets refused. */
+    ck(snes_lobby_mod_relay_size_allows("relay", 90u * ONE_MB, "m", why,
+                                        sizeof(why)) == 0,
+       "a truncated reason is still a refusal");
+    ck(why[sizeof(why) - 1] == '\0', "the short reason stays terminated");
+    ck(snes_lobby_mod_relay_size_allows("relay", 90u * ONE_MB, "m", NULL, 0)
+           == 0,
+       "no reason buffer at all is still a refusal");
+}
+
 int main(void)
 {
     case_rows();
@@ -408,6 +524,11 @@ int main(void)
     case_ice_local_becomes_remote();
     case_offer_round_trips_through_a_slot_row();
     case_mod_set_round_trips();
+    case_relay_cap_is_five_mb();
+    case_direct_paths_are_never_capped();
+    case_unknown_path_allows();
+    case_refusal_tells_the_player_what_to_do();
+    case_refusal_survives_a_short_buffer();
     printf(fails ? "\n%d failure(s)\n" : "\nall mod-plan cases passed\n", fails);
     return fails != 0;
 }
