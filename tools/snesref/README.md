@@ -48,6 +48,21 @@ for any libretro SNES core.
 
 ## Build
 
+### CMake (macOS, Linux, or Windows)
+
+Install the SDL2 development package, then configure and build from the
+SNESRecomp repository root:
+
+```sh
+cmake -S tools/snesref -B build/snesref -DCMAKE_BUILD_TYPE=Release
+cmake --build build/snesref
+```
+
+On macOS, Homebrew's `sdl2` formula supplies the required headers, library, and
+CMake package. The resulting executable is `build/snesref/snesref`.
+
+### Existing Visual Studio batch build
+
 ```bat
 :: 1. extract the SDL2 VC dev package here as SDL2-2.30.9\   (libsdl.org)
 :: 2. build
@@ -58,12 +73,19 @@ Produces `snesref.exe`.
 
 ## Run
 
-```bat
-snesref.exe <core.dll> <rom.sfc>
-:: e.g. snesref.exe snes9x_libretro.dll mmx.sfc
+```text
+snesref <libretro-core> <rom.sfc>
+
+Windows example:
+snesref.exe snes9x_libretro.dll game.sfc
+
+macOS example:
+./build/snesref/snesref snes9x_libretro.dylib game.sfc
 ```
 
-Place the libretro core DLL (and its `SDL2.dll`) next to the exe, or pass a path.
+Pass a path to a separately supplied libretro core: a DLL on Windows, a dylib
+on macOS, or a shared object on Linux. Windows batch-build users should also
+place `SDL2.dll` beside `snesref.exe`.
 
 ### Deterministic capture
 
@@ -72,6 +94,7 @@ Environment variables select non-interactive capture outputs:
 | Variable | Purpose |
 |---|---|
 | `SNESREF_FAST=1` | Hide the window and disable frame pacing. |
+| `SNESREF_HEADLESS=1` | Run without SDL video or live keyboard/controller input; scripted input and capture outputs remain available. Headless runs are unpaced. |
 | `SNESREF_FRAMES=N` | Exit after exactly `N` emulated frames. |
 | `SNESREF_INPUT_FILE=path` | Apply deterministic scripted joypad input. |
 | `SNESREF_WRAM_FILL=byte` | Fill exposed system WRAM before frame 1; use `0` to match SNESRecomp's hard-reset state. |
@@ -111,7 +134,20 @@ The 12-bit mask is:
 | 10 | `400` | L |
 | 11 | `800` | R |
 
-Example:
+POSIX shell example:
+
+```sh
+SNESREF_HEADLESS=1 \
+SNESREF_FRAMES=1800 \
+SNESREF_WRAM_FILL=0 \
+SNESREF_INPUT_FILE=menu-input.txt \
+SNESREF_TRACE_FILE=wram.jsonl \
+SNESREF_WAV=reference.wav \
+SNESREF_FRAME_DUMP_DIR=frames \
+./build/snesref/snesref /path/to/bsnes_libretro.dylib /path/to/game.sfc
+```
+
+PowerShell example:
 
 ```powershell
 $env:SNESREF_FAST = "1"
