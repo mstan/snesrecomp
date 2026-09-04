@@ -48,6 +48,11 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
+/* MinGW (gcc or llvm-mingw clang) is _WIN32 AND __GNUC__: the cpuid
+ * probe below takes the __get_cpuid branch, which lives in <cpuid.h>. */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
+#endif
 #else
 #include <pthread.h>
 #include <sys/utsname.h>
