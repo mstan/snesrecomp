@@ -205,6 +205,10 @@ jobs:
       - name: Package setup pack
         run: |
           set -euo pipefail
+          # The packager inspects the executable's imports (objdump) and zips
+          # the stage; Git Bash on Windows has neither tool, the pack does.
+          # shellcheck disable=SC1091
+          source "${TOOLCHAIN_DIR}/env.sh"
           ARGS=()
           if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then
             ARGS+=(--embed-toolchain)

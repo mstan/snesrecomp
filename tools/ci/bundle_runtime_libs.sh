@@ -20,6 +20,12 @@
 # already is on Windows).
 set -euo pipefail
 
+# A silent exit is the worst outcome a packaging step can have: the first
+# Windows CI run died here with exit 1 and not one line of output. Name the
+# command and line instead of leaving the reader to bisect a shell script.
+trap 'echo "::error::$(basename "${BASH_SOURCE[0]}") failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+
 EXE=""
 STAGE=""
 BUILD_DIR=""
@@ -70,6 +76,13 @@ windows)
   for cand in x86_64-w64-mingw32-objdump objdump llvm-objdump; do
     if command -v "${cand}" >/dev/null 2>&1; then OBJDUMP="${cand}"; break; fi
   done
+  # Git Bash on a Windows runner has no binutils; the llvm-mingw toolchain
+  # pack does. Look there before giving up.
+  if [[ -z "${OBJDUMP}" && -n "${RETCOMM_TOOLCHAIN_DIR:-}" ]]; then
+    for cand in llvm-objdump.exe llvm-objdump x86_64-w64-mingw32-objdump.exe; do
+      if [[ -x "${RETCOMM_TOOLCHAIN_DIR}/bin/${cand}" ]]; then OBJDUMP="${RETCOMM_TOOLCHAIN_DIR}/bin/${cand}"; break; fi
+    done
+  fi
   if [[ -z "${OBJDUMP}" ]]; then
     echo "::error::no objdump on PATH — cannot determine the DLLs $(basename "${EXE}") imports" >&2
     exit 1
