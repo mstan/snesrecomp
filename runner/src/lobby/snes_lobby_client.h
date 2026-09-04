@@ -308,6 +308,38 @@ void snes_lobby_set_mod_transfer_hooks(SnesLobbyModExportFn export_fn,
                                        SnesLobbyModInstallFn install_fn,
                                        void *ctx);
 
+/*
+ * A relayed transfer spends the TURN server's bandwidth, not the two players'.
+ * A direct pair (host/srflx/prflx) costs nobody anything and is left uncapped;
+ * a relayed pair is capped, and a package over the cap is refused with a
+ * reason that tells the player to get it from its source instead.
+ *
+ * Bytes, not megabytes, so the check needs no unit conversion at the call
+ * site: 5 MiB.
+ */
+#define SNES_LOBBY_MOD_RELAY_MAX_BYTES (5u * 1024u * 1024u)
+
+/*
+ * May a transfer of `bytes` proceed over an ICE pair of type `path`?
+ *
+ * `path` is what rnet_ice_xfer_path reports: "host", "srflx", "prflx",
+ * "relay", "unknown" or "none". Only "relay" is capped. Returns 1 to allow,
+ * 0 to refuse -- and on a refusal writes a player-facing sentence naming the
+ * package, its size and the cap.
+ *
+ * An unknown path ALLOWS. The alternative is refusing transfers on a direct
+ * pair we merely failed to name, which breaks the case this cap exists to
+ * protect. Callers gate on knowing the path first; see the pump.
+ *
+ * Pure: no globals, no I/O. Both ends call it -- the host before it queues
+ * anything, the guest when the header says how big the payload will be -- so
+ * a peer that skips the check on its side still cannot land an oversized
+ * relayed package on the other.
+ */
+int  snes_lobby_mod_relay_size_allows(const char *path, uint64_t bytes,
+                                      const char *package_id,
+                                      char *reason, size_t reason_cap);
+
 /* Guest: ask the host for one package. 0 = asked. */
 int  snes_lobby_mod_request(const char *package_id, const char *version);
 void snes_lobby_mod_cancel(void);
