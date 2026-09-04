@@ -29,15 +29,6 @@ if(NOT EXISTS "${SNESRECOMP_ROOT}/runner/runner.cmake")
 endif()
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
-# Generated recompiler output. Not committed: it is derived from a copyrighted
-# ROM, so every developer regenerates it locally from their own copy.
-file(GLOB GAME_GEN_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/gen/*.c)
-if(NOT GAME_GEN_SOURCES)
-    message(FATAL_ERROR
-        "src/gen/ is empty — run `bash tools/regen.sh` with a verified "
-        "@ROM_FILE@ at the repo root before building.")
-endif()
-
 add_executable(@PROJECT_NAME@
     ${SNESRECOMP_RUNNER_SOURCES}
     src/main.c
@@ -45,8 +36,17 @@ add_executable(@PROJECT_NAME@
     src/codegen_setup.c
     src/game_rtl.c
     src/gen_stubs.c
-    ${GAME_GEN_SOURCES}
 )
+
+# Generated recompiler output. Not committed: it is derived from a copyrighted
+# ROM, so every developer regenerates it locally from their own copy -- and a
+# release does not ship it either. With -DSNESRECOMP_SETUP_HOST=ON and an empty
+# src/gen/, this builds the SETUP HOST instead: the same executable minus the
+# recompiled code, whose only path is the launcher's Generate & rebuild wizard.
+# That is what release zips contain; the player's machine produces the
+# playable binary from their own ROM. Without the option an empty src/gen/ is
+# still a hard error (the framework owns the message).
+snesrecomp_target_generated_code(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/src/gen)
 
 target_include_directories(@PROJECT_NAME@ PRIVATE
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
@@ -65,13 +65,6 @@ target_compile_definitions(@PROJECT_NAME@ PRIVATE
 snesrecomp_target_sdl(@PROJECT_NAME@)
 
 @LAUNCHER_BLOCK@
-
-# Generated C is machine output: it is not held to the runner's warning bar,
-# and treating it as such buries real warnings from hand-written host code.
-if(NOT MSVC)
-    set_source_files_properties(${GAME_GEN_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-w")
-endif()
 
 @NETPLAY_BLOCK@
 @MULTITAP_BLOCK@

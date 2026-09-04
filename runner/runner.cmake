@@ -34,9 +34,56 @@ endif()
 set(SNESRECOMP_SDL_BACKEND "${_SNESRECOMP_SDL_BACKEND}" CACHE STRING
     "Desktop SDL backend (SDL3 or SDL2)" FORCE)
 
+option(SNESRECOMP_STATIC_RUNTIME
+    "On MinGW, link the C/C++ runtime statically so the executable is self-contained" ON)
+
+option(SNESRECOMP_SDL3_FETCH
+    "When no SDL3 package is found, build the pinned SDL3 release from source" ON)
+set(SNESRECOMP_SDL3_FETCH_VERSION "3.4.10" CACHE STRING
+    "SDL3 release built when SNESRECOMP_SDL3_FETCH kicks in")
+set(SNESRECOMP_SDL3_FETCH_SHA256
+    "12b34280415ec8418c864408b93d008a20a6530687ee613d60bfbd20411f2785"
+    CACHE STRING "sha256 of the SDL3 release tarball")
+
 function(snesrecomp_target_sdl target)
     if(_SNESRECOMP_SDL_BACKEND STREQUAL "SDL3")
-        find_package(SDL3 CONFIG REQUIRED)
+        find_package(SDL3 CONFIG QUIET)
+        if(NOT TARGET SDL3::SDL3 AND SNESRECOMP_SDL3_FETCH)
+            message(STATUS
+                "${target}: no SDL3 package found; building SDL3 "
+                "${SNESRECOMP_SDL3_FETCH_VERSION} from source "
+                "(-DSNESRECOMP_SDL3_FETCH=OFF to require an installed one)")
+            include(FetchContent)
+            # Static, so the finished executable carries its SDL and a
+            # release zip does not have to ship a shared library beside it.
+            set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+            set(SDL_STATIC ON CACHE BOOL "" FORCE)
+            set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+            set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+            set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+            set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+            set(_snesrecomp_sdl3_url
+                "https://github.com/libsdl-org/SDL/releases/download/release-${SNESRECOMP_SDL3_FETCH_VERSION}/SDL3-${SNESRECOMP_SDL3_FETCH_VERSION}.tar.gz")
+            if(DEFINED SNESRECOMP_SDL3_SOURCE_DIR AND
+               EXISTS "${SNESRECOMP_SDL3_SOURCE_DIR}/CMakeLists.txt")
+                # A pre-fetched tree (CI caches one; curl --http1.1 is more
+                # reliable against GitHub release assets than CMake's downloader).
+                FetchContent_Declare(SDL3 SOURCE_DIR "${SNESRECOMP_SDL3_SOURCE_DIR}")
+            else()
+                FetchContent_Declare(SDL3
+                    URL "${_snesrecomp_sdl3_url}"
+                    URL_HASH "SHA256=${SNESRECOMP_SDL3_FETCH_SHA256}"
+                    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+            endif()
+            FetchContent_MakeAvailable(SDL3)
+            unset(_snesrecomp_sdl3_url)
+        endif()
+        if(NOT TARGET SDL3::SDL3)
+            message(FATAL_ERROR
+                "${target}: SDL3 was not found. Install an SDL3 development "
+                "package, pass -DSDL3_DIR=<dir with SDL3Config.cmake>, or leave "
+                "SNESRECOMP_SDL3_FETCH=ON to build it from source.")
+        endif()
         target_link_libraries(${target} PRIVATE SDL3::SDL3)
         target_compile_definitions(${target} PRIVATE
             SNESRECOMP_SDL3=1
@@ -76,6 +123,17 @@ function(snesrecomp_target_sdl target)
                 ${_snesrecomp_sdl2_libraries})
         endif()
         message(STATUS "${target}: SDL2 compatibility backend")
+    endif()
+    # MinGW (gcc or llvm-mingw clang) links libgcc/libstdc++ -- or libc++,
+    # libunwind -- and winpthread as DLLs that live beside the COMPILER, not
+    # beside the game. An executable that works in the build tree and fails to
+    # start on a player's PC is the default outcome, and it is also what a
+    # setup zip's own rebuild would produce: the relaunched binary lands in
+    # build/, nowhere near any DLL the zip carried. Static linking makes the
+    # executable self-contained on every path that produces one.
+    if(WIN32 AND MINGW AND SNESRECOMP_STATIC_RUNTIME)
+        target_link_options(${target} PRIVATE -static)
+        message(STATUS "${target}: static MinGW runtime (-static)")
     endif()
 endfunction()
 
@@ -284,6 +342,74 @@ set(SNESRECOMP_RUNNER_INCLUDE_DIRS
     ${SNESRECOMP_RUNNER_ROOT}/src
     ${SNESRECOMP_RUNNER_ROOT}/src/snes
 )
+
+# ── Generated code, or the setup host that stands in for it ────────────────
+#
+# src/gen/*.c is recompiler output derived from ROM bytes: never committed,
+# never in CI, never in a release zip. That leaves exactly one honest way to
+# ship a binary without it -- a SETUP HOST: the same executable, built from
+# the runner and the hand-written host sources, whose only job is to open the
+# launcher's first-run wizard, take the player's own ROM, run the recompiler
+# locally, rebuild, and relaunch into the real game.
+#
+# It is not a stub build. The dispatch tables it links are empty on purpose
+# (setup_host_dispatch.c), and SnesInit() refuses to boot a guest at all when
+# SNESRECOMP_SETUP_HOST is defined -- so nothing in it can ever run guest code
+# with an invented result. Either the wizard produces a real build, or the
+# player is told exactly what is missing.
+option(SNESRECOMP_SETUP_HOST
+    "Build the host without recompiled code: a setup binary whose only path is Generate & rebuild"
+    OFF)
+
+# snesrecomp_target_generated_code(<target> <gen_dir>)
+#
+# Adds the generated C under <gen_dir> to <target>, or -- when it is absent
+# and SNESRECOMP_SETUP_HOST is ON -- the setup-host dispatch tables. A missing
+# gen directory with the option OFF is still a hard configure error, because
+# that is a developer who forgot to regenerate, and a silent fallback there
+# would hand them a binary that cannot play and does not say why.
+function(snesrecomp_target_generated_code target gen_dir)
+    file(GLOB _gen_sources CONFIGURE_DEPENDS "${gen_dir}/*.c")
+    if(_gen_sources)
+        if(SNESRECOMP_SETUP_HOST)
+            # Asked for a setup host while generated C is present: the two
+            # are contradictory, and quietly picking one hides a stale
+            # src/gen from whoever is packaging.
+            message(FATAL_ERROR
+                "SNESRECOMP_SETUP_HOST=ON but ${gen_dir} contains generated C.\n"
+                "A setup host must be built from a tree WITHOUT generated code, "
+                "so the zip cannot carry ROM-derived output by accident. Remove "
+                "${gen_dir}/*.c (and recomp/funcs.h) or configure without the option.")
+        endif()
+        target_sources(${target} PRIVATE ${_gen_sources})
+        # Generated C is machine output: it is not held to the runner's
+        # warning bar, and treating it as such buries real warnings from the
+        # hand-written host code.
+        if(NOT MSVC)
+            set_source_files_properties(${_gen_sources} PROPERTIES
+                COMPILE_OPTIONS "-w")
+        endif()
+        target_compile_definitions(${target} PRIVATE SNESRECOMP_HAS_GENERATED_CODE=1)
+        list(LENGTH _gen_sources _n)
+        message(STATUS "${target}: ${_n} generated translation unit(s) from ${gen_dir}")
+        return()
+    endif()
+
+    if(NOT SNESRECOMP_SETUP_HOST)
+        message(FATAL_ERROR
+            "${gen_dir} is empty -- run `bash tools/regen.sh` with your verified "
+            "ROM before building.\n"
+            "To build a SETUP HOST instead (a binary that regenerates on the "
+            "player's machine), configure with -DSNESRECOMP_SETUP_HOST=ON.")
+    endif()
+
+    target_sources(${target} PRIVATE
+        ${SNESRECOMP_RUNNER_ROOT}/src/setup_host_dispatch.c)
+    target_compile_definitions(${target} PRIVATE SNESRECOMP_SETUP_HOST=1)
+    message(STATUS
+        "${target}: SETUP HOST -- no recompiled code; the launcher's Generate & "
+        "rebuild wizard is the only path forward in this binary")
+endfunction()
 
 # Optional desktop GLSL preset renderer. It deliberately stays out of
 # SNESRECOMP_RUNNER_SOURCES because headless tools and non-OpenGL frontends do

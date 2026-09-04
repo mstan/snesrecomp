@@ -1,36 +1,28 @@
-# Build @DISPLAY_NAME@ for Linux, Windows, macOS arm64 and macOS Intel, and
-# optionally publish the four zips as a GitHub Release.
+# Build the @DISPLAY_NAME@ SETUP PACK for Linux, Windows, macOS arm64 and macOS
+# Intel, and optionally publish the four zips as a GitHub Release.
+# MANUAL TRIGGER ONLY.
 #
-# THE ROM IS NEVER IN CI AND NEVER IN A ZIP. Players supply their own copy and
-# the binary reads it at launch.
+# WHAT THIS BUILDS. Not the game. src/gen/*.c is recompiler output derived
+# from ROM bytes: never committed, never in CI, never in a zip. What CI can
+# honestly produce is the SETUP HOST -- the same executable built with
+# -DSNESRECOMP_SETUP_HOST=ON, i.e. without recompiled code -- packaged with
+# the recompiler and this source tree. On the player's machine the launcher
+# takes their own ROM, generates, rebuilds, and relaunches into the real game.
+# A green run here means four setup packs were produced, nothing more.
 #
-# That constraint decides what this workflow can honestly do. src/gen/*.c is
-# recompiler output derived from ROM bytes, so it is not committed and cannot
-# be regenerated here — which means CI can only link the real game if somebody
-# publishes the generated C from their own machine first:
+# THE TOOLCHAIN. Each pack is built with the retcomm-toolchains cmake-clang-v1
+# pack, because that is what the player's own rebuild uses: if it cannot build
+# this game, CI is where that must fail. By default the pack is embedded in
+# the zip (embed_toolchain) so first run downloads nothing; turn it off for a
+# lean zip that fetches the pack on demand (Linux pack ~800 MB, Windows
+# ~200 MB, macOS ~90 MB).
 #
-#   bash snesrecomp/tools/ci/publish_src_gen.sh \
-#       --repo OWNER/ASSETS --path @ROM_SLUG@ --include src/gen
-#
-# So this file has two modes, and its job names say which one ran:
-#
-#   * Repository variable CI_SRC_GEN_ASSET set (e.g. "@ROM_SLUG@/src-gen.zip")
-#     -> four real game builds, packaged and uploadable.
-#   * Not set -> one ROM-free check: framework tests plus a compile of the
-#     host translation units. Useful, and it does not pretend to be a build.
-#
-# The second mode exists so a fresh project has a green pipeline that tells
-# the truth about what it verified. It is not the destination; wire up the
-# assets repo when the port is ready to ship.
-#
-# Configuration:
-#   secret CI_ASSETS_TOKEN  — fine-grained PAT, Contents: Read on the assets repo
-#   var    CI_SRC_GEN_REPO  — assets repo (default TechnicallyComputers/psxrecomp-ci-assets)
-#   var    CI_SRC_GEN_ASSET — path within it, e.g. @ROM_SLUG@/src-gen.zip
-#
-# Triggers: manual and v* tags. Deliberately NOT push/pull_request: releases
-# across the port set are driven from the studio bulk tool, and a per-push run
-# competes with it for minutes and for the meaning of "did CI pass".
+# There is deliberately no push or pull_request trigger. Releases across the
+# port set are driven from the studio bulk tool, and a per-repo workflow that
+# fires on every push competes with it for minutes and for the meaning of
+# "did CI pass". Run this from the Actions tab, or with
+#   gh workflow run release.yml
+# and pass publish_release from a v* tag to cut a release.
 
 name: Build
 
@@ -41,13 +33,18 @@ on:
         description: 'Publish a GitHub Release (requires a v* tag ref)'
         type: boolean
         default: false
+      embed_toolchain:
+        description: 'Embed the cmake-clang-v1 pack in each zip (else the launcher downloads it)'
+        type: boolean
+        default: true
+      toolchain_tag:
+        description: 'retcomm-toolchains release to build with (empty = latest)'
+        type: string
+        default: ''
       verify_pins:
         description: 'Fail if the submodules disagree with framework_pins.txt'
         type: boolean
         default: false
-  push:
-    tags:
-      - 'v*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,9 +54,8 @@ permissions:
   contents: read
 
 env:
-  SRC_GEN_REPO: ${{ vars.CI_SRC_GEN_REPO || 'TechnicallyComputers/psxrecomp-ci-assets' }}
-  SRC_GEN_ASSET: ${{ vars.CI_SRC_GEN_ASSET }}
-  SDL3_VERSION: '3.4.10'
+  EXE_NAME: @PROJECT_NAME@
+  ZIP_PREFIX: @ZIP_PREFIX@
 
 jobs:
   preflight:
@@ -67,7 +63,6 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
-      publish: ${{ steps.meta.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,115 +78,35 @@ jobs:
           fi
           bash snesrecomp/tools/ci/record_pins.sh "${ARGS[@]}"
 
+      - name: Refuse to publish from a non-tag ref
+        if: inputs.publish_release && !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "::error::publish_release was set, but this run is on ${GITHUB_REF}."
+          echo "Re-run the workflow selecting a v* tag."
+          exit 1
+
       - name: Resolve release version
         id: meta
         run: |
           set -euo pipefail
           VERSION="$(tr -d '[:space:]' < VERSION)"
-          if [[ -z "${VERSION}" ]]; then
-            echo "::error::VERSION is empty"
-            exit 1
-          fi
-
-          PUBLISH=false
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            PUBLISH=true
-          elif [[ "${{ inputs.publish_release }}" == "true" ]]; then
-            PUBLISH=true
-          fi
-
-          if [[ "${PUBLISH}" == "true" ]]; then
-            if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
-              echo "::error::a release was requested, but this run is on ${GITHUB_REF}."
-              echo "Re-run selecting a v* tag."
-              exit 1
-            fi
-            if [[ -z "${SRC_GEN_ASSET}" ]]; then
-              echo "::error::a release was requested, but CI_SRC_GEN_ASSET is not set,"
-              echo "so no game binaries can be built. Publish the generated C and set"
-              echo "the repository variable before tagging a release."
-              exit 1
-            fi
+          [[ -n "${VERSION}" ]] || { echo "::error::VERSION is empty"; exit 1; }
+          if [[ "${{ inputs.publish_release }}" == "true" ]]; then
             # VERSION is the lobby pin compiled into the binary. A tag that
             # disagrees with it ships a release whose peers match on a
             # different string than the one people were told to install.
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
-            if [[ "${TAG_VERSION}" != "${VERSION}" ]]; then
+            if [[ "${GITHUB_REF_NAME#v}" != "${VERSION}" ]]; then
               echo "::error::tag ${GITHUB_REF_NAME} does not match VERSION ${VERSION}."
               echo "The lobby version pin is compiled from VERSION; bump it and retag."
               exit 1
             fi
           fi
-
           echo "version=${VERSION}" >>"$GITHUB_OUTPUT"
-          echo "publish=${PUBLISH}" >>"$GITHUB_OUTPUT"
-          echo "version ${VERSION}, publish ${PUBLISH}"
-
-  # Runs only when there is no generated C to build with. Named for what it
-  # actually verifies, so a green tick is never read as "the game builds".
-  host-check:
-    name: ROM-free host check (no game build)
-    needs: preflight
-    if: vars.CI_SRC_GEN_ASSET == ''
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config python3 \
-            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
-            libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
-            libxkbcommon-dev libwayland-dev wayland-protocols \
-            libdecor-0-dev libasound2-dev libpulse-dev libudev-dev
-
-      - name: Cache SDL3 build
-        uses: actions/cache@v4
-        with:
-          path: |
-            .cache/sdl3-prefix
-            .cache/SDL3-${{ env.SDL3_VERSION }}.tar.gz
-          key: sdl3-linux-x64-${{ env.SDL3_VERSION }}
-
-      - name: Provide SDL3
-        run: bash snesrecomp/tools/ci/provision_sdl3.sh --version "${SDL3_VERSION}"
-
-      - name: Framework tests
-        run: bash snesrecomp/tests/run_c_tests.sh
-
-      - name: Compile the host translation units
-        run: |
-          set -euo pipefail
-          # src/gen/ is empty without a ROM, so the game target cannot link.
-          # Compiling the hand-written host sources on their own still fails
-          # the pipeline on a syntax or API break, which is the part that is
-          # worth checking here.
-          #
-          # snesrecomp_rom_identity.h is generated from rom_identity.txt. The
-          # build does that at configure time, but configure refuses without
-          # src/gen/, so emit the same header straight from the same file —
-          # the framework owns that emitter and its tests pin it to the CMake
-          # one.
-          GEN=build-ci/snesrecomp_generated
-          python3 snesrecomp/tools/rom_identity.py rom_identity.txt --header "$GEN"
-          SDL_CFLAGS="$(pkg-config --cflags sdl3 2>/dev/null || pkg-config --cflags sdl2)"
-          for src in src/main.c src/game_rtl.c; do
-            echo "  cc $src"
-            cc -fsyntax-only -I src -I recomp -I "$GEN" \
-               -I snesrecomp/runner/src -I snesrecomp/runner/src/snes \
-               -I snesrecomp/runner/src/desktop -I snesrecomp/host \
-               ${SDL_CFLAGS} "$src"
-          done
+          echo "version ${VERSION}"
 
   build:
     name: ${{ matrix.artifact }}
     needs: preflight
-    if: vars.CI_SRC_GEN_ASSET != ''
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -199,21 +114,15 @@ jobs:
         include:
           - os: ubuntu-24.04
             artifact: linux-x64
-            shell: bash
           - os: windows-2022
             artifact: windows-x64
-            shell: 'msys2 {0}'
           - os: macos-15
             artifact: macos-arm64
-            shell: bash
-            deployment_target: '11.0'
           - os: macos-15-intel
             artifact: macos-x64
-            shell: bash
-            deployment_target: '11.0'
     defaults:
       run:
-        shell: ${{ matrix.shell }}
+        shell: bash
     env:
       RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
 
@@ -224,108 +133,97 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      # Everything before the MSYS2 setup runs in plain bash, because the
-      # job's default shell does not exist yet on the Windows runner.
       - name: Record framework pins
-        shell: bash
         run: bash snesrecomp/tools/ci/record_pins.sh
 
-      - name: Restore generated C
-        shell: bash
-        env:
-          CI_ASSETS_TOKEN: ${{ secrets.CI_ASSETS_TOKEN }}
-        run: |
-          bash snesrecomp/tools/ci/fetch_src_gen.sh \
-            --repo "${SRC_GEN_REPO}" \
-            --asset "${SRC_GEN_ASSET}" \
-            --expect 'src/gen/*.c'
-
-      - name: Setup MSYS2 (Windows)
-        if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-SDL3
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-python
-            zip
-
-      - name: Install deps (Linux)
-        if: runner.os == 'Linux'
+      # A setup host is defined by what it lacks. The checkout must carry no
+      # generated C; if it ever does, that is committed ROM-derived output and
+      # the build must stop here rather than package it.
+      - name: Assert no generated C in the tree
         run: |
           set -euo pipefail
-          sudo apt-get update
-          # X11/wayland/audio headers are for the SDL3 source build below;
-          # ubuntu-24.04 predates libsdl3-dev and has no package for it.
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config python3 zip \
-            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
-            libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
-            libxkbcommon-dev libwayland-dev wayland-protocols \
-            libdecor-0-dev libasound2-dev libpulse-dev libudev-dev
+          if compgen -G 'src/gen/*.c' >/dev/null || [[ -f recomp/funcs.h ]]; then
+            echo "::error::src/gen/*.c or recomp/funcs.h is present in the checkout."
+            exit 1
+          fi
+          echo "src/gen is empty — building the setup host."
 
-      - name: Install deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install cmake ninja pkg-config dylibbundler
-
-      # Only Linux builds SDL3 from source, so only Linux needs the cache.
-      - name: Cache SDL3 build
-        if: runner.os == 'Linux'
+      - name: Cache toolchain pack
         uses: actions/cache@v4
         with:
-          path: |
-            .cache/sdl3-prefix
-            .cache/SDL3-${{ env.SDL3_VERSION }}.tar.gz
-          key: sdl3-${{ matrix.artifact }}-${{ env.SDL3_VERSION }}
+          path: .cache/toolchain-pack
+          key: cmake-clang-v1-${{ matrix.artifact }}-${{ inputs.toolchain_tag || 'latest' }}
 
-      - name: Provide SDL3
-        run: bash snesrecomp/tools/ci/provision_sdl3.sh --version "${SDL3_VERSION}"
-
-      - name: Configure and build
-        env:
-          DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
+      - name: Fetch toolchain pack
         run: |
           set -euo pipefail
-          EXTRA=()
-          if [[ -n "${DEPLOYMENT_TARGET}" ]]; then
-            EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${DEPLOYMENT_TARGET}")
+          ARGS=(--artifact "${{ matrix.artifact }}")
+          if [[ -n "${{ inputs.toolchain_tag }}" ]]; then
+            ARGS+=(--tag "${{ inputs.toolchain_tag }}")
           fi
-          if [[ "$(uname -s)" == "Linux" ]]; then
-            # SDL3 may be built into a CI cache directory that will not exist
-            # on a player's disk, so the packager copies it beside the
-            # executable. $ORIGIN is what makes the loader look there.
-            EXTRA+=('-DCMAKE_BUILD_RPATH=$ORIGIN')
+          bash snesrecomp/tools/ci/fetch_toolchain.sh "${ARGS[@]}"
+
+      # The macOS pack is cmake + ninja + python; SDL3 comes from
+      # runner.cmake's pinned source fallback. Prefetch the tarball with curl
+      # (HTTP/1.1) and cache it, so configure does not download.
+      - name: Cache SDL3 source (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: .cache/sdl3-src
+          key: sdl3-src-3.4.10
+
+      - name: Prefetch SDL3 source (macOS)
+        if: runner.os == 'macOS'
+        run: bash snesrecomp/tools/ci/prefetch_sdl3.sh --out-dir .cache/sdl3-src
+
+      - name: Configure and build the setup host
+        run: |
+          set -euo pipefail
+          # The pack's env.sh is its own statement of how to use it (PATH,
+          # CC/CXX, sysroot, SDL3_DIR). Source it rather than restate it.
+          # shellcheck disable=SC1091
+          source "${TOOLCHAIN_DIR}/env.sh"
+          echo "cmake: $(command -v cmake) ($(cmake --version | head -n1))"
+          echo "cc:    ${CC:-$(command -v cc)}"
+          EXTRA=()
+          if [[ -n "${SNESRECOMP_SDL3_SOURCE_DIR:-}" ]]; then
+            EXTRA+=("-DSNESRECOMP_SDL3_SOURCE_DIR=${SNESRECOMP_SDL3_SOURCE_DIR}")
+          fi
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
           fi
           JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
           cmake -S . -B build-ci -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DSNESRECOMP_SETUP_HOST=ON \
             -DSNESRECOMP_ENABLE_TRACE=OFF \
             -DSNESRECOMP_BUILD_VERSION="${RELEASE_VERSION}" \
-            "${EXTRA[@]}"
-          cmake --build build-ci -j"${JOBS}" --target @PROJECT_NAME@
+            "${EXTRA[@]+"${EXTRA[@]}"}"
+          cmake --build build-ci -j"${JOBS}" --target "${EXE_NAME}"
 
-      - name: Package
+      - name: Package setup pack
         run: |
           set -euo pipefail
-          bash scripts/package_release.sh build-ci "${{ matrix.artifact }}"
+          ARGS=()
+          if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then
+            ARGS+=(--embed-toolchain)
+          fi
+          bash scripts/package_release.sh build-ci "${{ matrix.artifact }}" "${ARGS[@]+"${ARGS[@]}"}"
           ls -la dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: @ZIP_PREFIX@-${{ matrix.artifact }}
-          path: dist/@ZIP_PREFIX@-*-${{ matrix.artifact }}.zip
+          name: ${{ env.ZIP_PREFIX }}-${{ matrix.artifact }}
+          path: dist/${{ env.ZIP_PREFIX }}-*-${{ matrix.artifact }}.zip
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   release:
     name: GitHub Release
     needs: [preflight, build]
-    if: needs.preflight.outputs.publish == 'true'
+    if: inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -343,27 +241,34 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifacts -type f -name '@ZIP_PREFIX@-*.zip' -exec cp -v {} dist/ \;
+          find artifacts -type f -name "${ZIP_PREFIX}-*.zip" -exec cp -v {} dist/ \;
           # Four platforms in, four zips out. A release that silently carries
           # three is the failure this counts for.
-          count="$(find dist -name '@ZIP_PREFIX@-*.zip' | wc -l | tr -d ' ')"
+          count="$(find dist -name "${ZIP_PREFIX}-*.zip" | wc -l | tr -d ' ')"
           if [[ "${count}" -ne 4 ]]; then
             echo "::error::expected 4 platform zips, found ${count}"
             ls -la dist
             exit 1
           fi
-          ( cd dist && sha256sum @ZIP_PREFIX@-*.zip > SHA256SUMS )
+          ( cd dist && sha256sum "${ZIP_PREFIX}"-*.zip > SHA256SUMS )
           cat dist/SHA256SUMS
 
       - name: Release notes
         run: |
           set -euo pipefail
           {
-            echo "@DISPLAY_NAME@ ${GITHUB_REF_NAME}"
+            echo "@DISPLAY_NAME@ ${GITHUB_REF_NAME} — setup packs"
             echo
-            echo "Players supply their own ROM. No ROM data is included in these"
-            echo "packages — pick your copy of @ROM_FILE@ on first launch"
-            echo "(SHA-256 @ROM_SHA256@)."
+            echo "These packs do not contain the game. Each holds a setup program, the"
+            echo "recompiler and the source; on first run it takes your own copy of"
+            echo "@ROM_FILE@ (SHA-256 @ROM_SHA256@), recompiles it locally, and builds"
+            echo "the playable game. No ROM data is included or downloaded."
+            echo
+            if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then
+              echo "The portable build tools (cmake-clang-v1) are embedded in every pack."
+            else
+              echo "The portable build tools (cmake-clang-v1) are downloaded on first run."
+            fi
             echo
             echo '### Framework revisions'
             echo
@@ -379,6 +284,6 @@ jobs:
           name: "@DISPLAY_NAME@ ${{ github.ref_name }}"
           body_path: notes.md
           files: |
-            dist/@ZIP_PREFIX@-*.zip
+            dist/${{ env.ZIP_PREFIX }}-*.zip
             dist/SHA256SUMS
           fail_on_unmatched_files: true

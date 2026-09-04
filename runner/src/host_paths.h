@@ -22,6 +22,15 @@ int snesrecomp_abspath(const char *path, char *out, size_t max_len);
 int snesrecomp_exe_dir_path(const char *leaf, char *out, size_t max_len);
 
 /*
+ * Basename of the running executable, without directory and without a
+ * trailing ".exe". This is the name CMake built the target under, so it is
+ * what a self-rebuild needs for both `cmake --build --target` and for finding
+ * the freshly built binary to relaunch. Returns 0 when the executable path
+ * cannot be determined (platforms without a query mechanism).
+ */
+int snesrecomp_exe_basename(char *out, size_t max_len);
+
+/*
  * Change the working directory to the executable's writable directory so
  * relative config and save paths remain stable regardless of launch context.
  * Call this before opening files. If the directory cannot be determined or is

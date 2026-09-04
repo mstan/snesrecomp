@@ -703,6 +703,20 @@ void WatchdogCheck(void) {
 }
 
 Snes *SnesInit(const uint8 *data, int data_size) {
+#if defined(SNESRECOMP_SETUP_HOST)
+  /* A setup host carries no recompiled code (runner.cmake,
+   * snesrecomp_target_generated_code). Booting a guest here would run every
+   * instruction through the interpreter tier with nothing to hand off to --
+   * a build that "works" by never being the product. Refuse, and say what the
+   * player should do instead. Die() is the host's fatal path: the GUI
+   * launcher shows it, a console host prints it. */
+  (void)data;
+  (void)data_size;
+  Die("This is a setup build with no recompiled game code.\n"
+      "Start it with --launcher and use \"Generate & rebuild\" with your own "
+      "ROM; the rebuilt executable in build/ is the playable one.");
+  return NULL;
+#else
   g_snes = snes_init(g_ram);
   snes_set_master_clock_charge_hook(rtl_snes_charge_master_cycles);
   snes_set_wram_write_log_hook(wlog_addr_note_direct);
@@ -754,5 +768,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   g_sram = g_snes->cart->ram;
   g_sram_size = g_snes->cart->ramSize;
   return g_snes;
+#endif /* SNESRECOMP_SETUP_HOST */
 }
 

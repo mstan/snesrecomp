@@ -1,126 +1,116 @@
-# Release CI for a snesrecomp port
+# Release CI for a snesrecomp port: setup packs
 
 Four platform builds — Linux x86-64, Windows x86-64, macOS arm64, macOS Intel
-— from one workflow, packaged as player zips and attachable to a GitHub
-Release.
+— from one manual-trigger workflow, packaged as **setup packs** and
+attachable to a GitHub Release.
 
-The template is `tools/new_project/templates/release.yml.in`. There is one
-copy of it: `setup_project.sh --ci` fills its tokens into a new project's
-`.github/workflows/release.yml`. Do not fork the template per title — a leaf
-that re-implements a rule cannot inherit fixes to it. Title-specific
-differences belong in the filled workflow (extra `-D` flags, extra build
-targets) and in `scripts/package_release.sh`.
+The template is `tools/new_project/templates/release.yml.in`; there is one
+copy, and `setup_project.sh --ci` fills its tokens into a new project's
+`.github/workflows/release.yml`. Do not fork it per title — a leaf that
+re-implements a rule cannot inherit fixes to it. Title-specific differences
+belong in the filled workflow (extra `-D` flags, extra build targets) and in
+the thin `scripts/package_release.sh` wrapper (runtime dirs, ROM digests).
 
-## The constraint everything follows from
+## What a setup pack is
 
 `src/gen/*.c` is recompiler output derived from ROM bytes. It is not
-committed, the ROM is never stored in CI, and CI cannot regenerate it. So a
-workflow either gets the generated C from somewhere, or it is not building the
-game — and the one thing it must never do is blur those two into the same
-green tick.
+committed, the ROM is never stored in CI, and CI cannot regenerate it. So CI
+does not build the game. It builds the **setup host**:
 
-The template resolves that with a repository variable:
+```
+cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release -DSNESRECOMP_SETUP_HOST=ON
+```
 
-| `CI_SRC_GEN_ASSET` | what runs | what a green tick means |
-| --- | --- | --- |
-| set | `build` (4 platforms) + `release` | four real game binaries were produced |
-| unset | `ROM-free host check (no game build)` | the framework tests pass and the host sources still compile |
+`snesrecomp_target_generated_code(<target> src/gen)` (runner.cmake) sees an
+empty `src/gen/` plus that option and links `runner/src/setup_host_dispatch.c`
+— empty dispatch tables — instead of failing configure. `SnesInit()` in that
+build refuses to boot a guest at all and says why. Nothing in the binary can
+run guest code with an invented result; its only reachable path is the
+launcher's first-run wizard.
 
-Exactly one of the two runs. Publishing a release with the variable unset is
-refused in `preflight` rather than producing an empty release.
+The zip then carries:
 
-## Setting up the real build
+| in the zip | from |
+|---|---|
+| the setup host | `build-ci/` |
+| `assets/` (launcher fonts, boxart) | beside the built exe (`recomp_ui.cmake` stages them) |
+| runtime dirs (`mods/`, `translations/`, …) | beside the built exe, per `--runtime-dir` |
+| the whole source tree, submodules included | `git ls-files --recurse-submodules` |
+| `toolchain/` (optional) | the fetched `cmake-clang-v1` pack |
+| `README.txt`, `VERSION`, `SOURCE_REVISIONS` | generated |
 
-1. Regenerate locally from your own verified ROM: `bash tools/regen.sh`.
-2. Publish the recompiler output to a private assets repository:
+Never: the ROM, `src/gen/*.c`, `recomp/funcs.h`. `stage_setup_host.sh`
+checks the stage for all three and refuses to zip. It also refuses a build
+directory not configured with `SNESRECOMP_SETUP_HOST=ON`, and a stage that
+lacks `snesrecomp/snesrecomp_cli.py` or `recomp/bank00.cfg` — the two files
+the launcher uses to recognise its project root; without them the shipped
+host could generate but never rebuild.
 
-   ```sh
-   snesrecomp/tools/ci/publish_src_gen.sh \
-       --repo OWNER/psxrecomp-ci-assets \
-       --path <game-slug> \
-       --include src/gen \
-       --include recomp/funcs.h      # if your build needs it and gitignores it
-   ```
+## What happens on the player's machine
 
-   `--include` is repeatable and repo-relative; paths are stored
-   repo-root-relative so the fetch side unzips at the root. The script refuses
-   to publish anything ROM-shaped. Add a thin `tools/publish_ci_src_gen.sh`
-   wrapper in the game repo so nobody has to remember the arguments.
+`host/snesrecomp_codegen_host.c`, wired by `snesrecomp_codegen_host_autowire()`
+in the game's `main.c`, drives the recomp-ui first-run wizard:
 
-3. In the game repo's settings add:
-   - secret `CI_ASSETS_TOKEN` — fine-grained PAT, **Contents: Read** on the
-     assets repo.
-   - variable `CI_SRC_GEN_ASSET` — e.g. `<game-slug>/src-gen.zip`.
-   - variable `CI_SRC_GEN_REPO` — only if the assets repo is not
-     `TechnicallyComputers/psxrecomp-ci-assets`.
+1. **Toolchain.** Looks for a `cmake-clang-v1` pack: `RETCOMM_TOOLCHAIN_DIR`,
+   then `toolchain/` beside the executable (embedded), then the RetComM cache
+   (`%LOCALAPPDATA%\retcomm\toolchains\cmake-clang-v1`, or
+   `$XDG_DATA_HOME`/`~/.local/share/retcomm/toolchains/cmake-clang-v1`), then
+   cmake + a C compiler + python on `PATH`. If none, the wizard offers to
+   download the pack from `TechnicallyComputers/retcomm-toolchains` (or take a
+   zip the player fetched) into that cache — shared with RetComM and psxrecomp
+   hosts, so one download per machine.
+2. **ROM.** The player picks their copy; digests are checked.
+3. **Generate.** `snesrecomp_cli.py generate` with the pack's Python (or
+   `PATH`'s), streaming JSONL progress.
+4. **Configure + build.** First time: `cmake -S <root> -B build -G Ninja
+   -DCMAKE_BUILD_TYPE=Release` with the pack's `env.sh` sourced (its own
+   statement of PATH / CC / sysroot / SDL3_DIR). Then `cmake --build`.
+   Windows defers this to a helper `.cmd` after exit, because the running
+   `.exe` cannot be rebuilt in place.
+5. **Relaunch** into `build/<exe>`.
 
-Fork pull requests cannot read repository secrets. That is why the workflow
-triggers on `workflow_dispatch` and `v*` tags rather than on pull requests.
+`SNESRECOMP_SDL3_FETCH` (runner.cmake, default ON) builds SDL3 from the
+pinned release when no package is found — the macOS pack ships no SDL3, and
+neither does a player's machine.
 
 ## Cutting a release
 
-`VERSION` is the lobby version pin compiled into the binary: two peers on
-different strings are refused a seat rather than allowed to desync later. So
-the tag and `VERSION` must agree, and `preflight` fails when they do not.
+`VERSION` is the lobby version pin compiled into the binary; the tag must
+agree with it and `preflight` fails when it does not.
 
 ```sh
 printf '0.2.0\n' > VERSION && git commit -am 'Release 0.2.0'
 git tag v0.2.0 && git push origin main v0.2.0
+gh workflow run release.yml --ref v0.2.0 -f publish_release=true
 ```
+
+Inputs: `embed_toolchain` (default on; Linux pack ~800 MB, Windows ~200 MB,
+macOS ~90 MB — off gives a lean zip that downloads on first run),
+`toolchain_tag` (pin a `retcomm-toolchains` release; empty = latest),
+`verify_pins` (fail on drift from `framework_pins.txt`).
 
 The `release` job requires all four zips; a run that produced three fails
 rather than publishing a partial release.
 
 ## Shared scripts (`tools/ci/`)
 
-One implementation per problem, for every port:
-
 | script | what it is for |
 | --- | --- |
 | `record_pins.sh` | print the framework revisions a build used; `--check framework_pins.txt` turns drift into an error |
-| `provision_sdl3.sh` | make SDL3 findable by `find_package(SDL3 CONFIG)` on all four runners |
-| `fetch_src_gen.sh` | restore the generated C from the assets repo (`--from-file` for local testing) |
-| `publish_src_gen.sh` | the producer side of the above |
-| `bundle_runtime_libs.sh` | copy the shared libraries a staged executable needs next to it |
-
-### Why `provision_sdl3.sh` exists
-
-`runner.cmake` defaults to SDL3 and resolves it with `find_package(SDL3
-CONFIG REQUIRED)`; there is no FetchContent fallback, so a runner without SDL3
-development files fails at *configure* time with a message that reads like a
-project bug. The four runners do not agree on how to supply it: Homebrew and
-MSYS2 both package SDL3, but **Ubuntu 24.04 — which is `ubuntu-latest` — does
-not**, because SDL3 postdates noble. The script tries the system, then apt,
-then builds the pinned release tarball into `.cache/sdl3-prefix`, which the
-workflow caches. Newer runner images that gain `libsdl3-dev` are picked up
-automatically without a workflow edit.
-
-### Why `bundle_runtime_libs.sh` exists
-
-A zip that runs on the machine that built it and nowhere else is the default
-outcome on all three platforms, for three unrelated reasons: MinGW links
-libgcc/libstdc++/libwinpthread and SDL3 as DLLs beside the compiler; Homebrew
-dylibs carry absolute `/opt/homebrew` paths; a source-built SDL3 on Linux
-lives in a CI cache directory. The script walks the binary's imports
-transitively on Windows, runs `dylibbundler` and then *verifies* no absolute
-paths remain on macOS, and on Linux copies only what a player's distro may not
-have — refusing to copy anything unless the executable has an `$ORIGIN`
-RUNPATH, because a bundled library the loader cannot find is worse than an
-honest missing dependency.
-
-The Linux workflow therefore configures with `-DCMAKE_BUILD_RPATH='$ORIGIN'`.
-A fully static SDL3 (what the retcomm toolchain pack produces) leaves nothing
-to bundle, and that is reported as a finished step, not a skipped one.
+| `fetch_toolchain.sh` | download + unpack the `cmake-clang-v1` pack for the runner (cached by `actions/cache`) |
+| `prefetch_sdl3.sh` | curl the pinned SDL3 tarball for the FetchContent fallback (macOS) |
+| `stage_setup_host.sh` | build the setup pack; every rule above lives here |
+| `bundle_runtime_libs.sh` | copy shared libraries beside a staged executable (usually nothing: SDL3 is static and MinGW links `-static`) |
 
 ## Runner images
 
-| runner | artifact |
-| --- | --- |
-| `ubuntu-24.04` | `linux-x64` |
-| `windows-2022` (MSYS2 MINGW64) | `windows-x64` |
-| `macos-15` | `macos-arm64` |
-| `macos-15-intel` | `macos-x64` |
+| runner | artifact | compiler |
+| --- | --- | --- |
+| `ubuntu-24.04` | `linux-x64` | pack clang + jammy sysroot → runs on glibc ≥ 2.35 |
+| `windows-2022` | `windows-x64` | pack llvm-mingw, `-static` runtime |
+| `macos-15` | `macos-arm64` | Xcode clang; pack supplies cmake/ninja/python |
+| `macos-15-intel` | `macos-x64` | same |
 
-macOS builds pass `-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0`. They are two separate
-single-architecture packs rather than one universal binary, because the games
-link Homebrew dependencies that are themselves per-architecture.
+All four jobs run in `bash` — the Windows pack ships an `env.sh`, so MSYS2 is
+not involved. Two separate macOS packs rather than one universal binary,
+because the player's rebuild is single-architecture anyway.

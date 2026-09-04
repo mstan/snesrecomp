@@ -101,3 +101,24 @@ projects uniformly.
 CLI wrappers such as `tools/regen.sh` should call `snesrecomp_cli.py generate`
 (same contract as the host). Metal Warriors is one consumer; other titles copy
 the thin config pattern from its `src/codegen_setup.c`.
+
+## Setup packs (release zips without generated C)
+
+A release zip is a **setup pack**: the host built with
+`-DSNESRECOMP_SETUP_HOST=ON` (no `src/gen`, empty dispatch tables from
+`runner/src/setup_host_dispatch.c`, `SnesInit()` refuses to boot), plus the
+recompiler and source tree. The wizard above is the only path forward in that
+binary. `docs/ci/README.md` covers how CI builds and packages one.
+
+For that to work from a zip the host does three things a source checkout
+never needed:
+
+| step | behaviour |
+|------|-----------|
+| project root | also searched upward from the **executable's directory**, not just the cwd — a double-clicked zip has an unrelated cwd |
+| toolchain | `setup_needs_toolchain` + `toolchain_is_ready` / `ensure_toolchain_with_progress` / `toolchain_update_available`: finds a `cmake-clang-v1` pack (`RETCOMM_TOOLCHAIN_DIR`, `toolchain/` beside the exe, the RetComM cache) or downloads it from `TechnicallyComputers/retcomm-toolchains` into that cache; falls back to cmake/cc/python on `PATH` |
+| configure | when `build/CMakeCache.txt` is absent, `cmake -S -B -G Ninja -DCMAKE_BUILD_TYPE=Release` runs before `--build`, with the pack's `env.sh` sourced (POSIX) or `env.bat` called (the Windows deferred helper) |
+
+`setup_wizard_supported` is set by `apply()`; without it recomp-ui keeps the
+wizard dark even with every callback wired, which is what an SNES host built
+before this change did.
