@@ -2626,6 +2626,25 @@ extern "C" int snes_mod_runtime_install_blob_c(const uint8_t* data, uint32_t len
     if (!ok)
         return fail(error.empty() ? "the package could not be installed" : error);
 
+    /* install_archive publishes the files; it does NOT tell the runtime they
+     * are there. Without this re-scan the package exists on disk and nowhere
+     * else: have_package_c still answers "absent", so the lobby row stays
+     * "not installed", the offer keeps omitting it, and the host's launch gate
+     * stays shut -- a mod that downloaded and installed perfectly looks like
+     * one that never arrived.
+     *
+     * provider_install (the launcher's own install path) does exactly this
+     * afterwards. Two callers of install_archive must not disagree about what
+     * finishing an install means. */
+    if (!SNESRecomp::scan(runtime, &error))
+        return fail(error.empty() ? "installed, but the mod catalog could not "
+                                    "be re-read" : error);
+    /* Selected at the version just installed, matching provider_install: a
+     * package the host requires is one this peer is expected to RUN, not
+     * merely to own. */
+    runtime.selections[id].version = ver;
+    SNESRecomp::refresh_validation();
+
     if (installed_id && id_cap)
         std::snprintf(installed_id, id_cap, "%s", id.c_str());
     if (installed_ver && ver_cap)

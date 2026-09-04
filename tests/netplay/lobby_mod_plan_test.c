@@ -60,6 +60,28 @@ int  rnet_ice_xfer_progress(const RNetIceXfer *x) { (void)x; XFER_TRAP("progress
 int  rnet_ice_xfer_failed(const RNetIceXfer *x, char *e, size_t c)
 { (void)x; (void)e; (void)c; XFER_TRAP("failed"); }
 
+/* Stands in for the mod runtime: two installed packages. */
+static int two_pkg_offer(SnesLobbyModPkg *out, int max, void *ctx)
+{
+    (void)ctx;
+    if (max < 2) return 0;
+    memset(out, 0, sizeof(*out) * 2);
+    snprintf(out[0].id, sizeof(out[0].id), "gwed.localization");
+    snprintf(out[0].ver, sizeof(out[0].ver), "1.0.0");
+    snprintf(out[1].id, sizeof(out[1].id), "gwed.enhancement.widescreen");
+    snprintf(out[1].ver, sizeof(out[1].ver), "1.0.0");
+    return 2;
+}
+
+/* The shape the server builds in slot_json(): the offer object verbatim,
+ * beside the other per-seat fields. */
+static void std_snprintf_slot(char *dst, size_t cap, const char *offer)
+{
+    snprintf(dst, cap,
+             "{\"slot\":1,\"player_id\":\"them\",\"display_name\":\"Bob\","
+             "\"ready\":true%s}", offer);
+}
+
 static int fails;
 
 static void ck(int cond, const char *what)
@@ -293,6 +315,58 @@ static void case_hooks_survive_disconnect(void)
     snes_lobby_set_mod_transfer_hooks(NULL, NULL, NULL, NULL);
 }
 
+/* The ICE signal a peer emits is not the one its partner must be handed. */
+static void case_ice_local_becomes_remote(void)
+{
+    ck(mod_ice_type_for_push((int)RNET_SIGNAL_LOCAL_SDP) ==
+       (int)RNET_SIGNAL_REMOTE_SDP, "a peer's LOCAL_SDP is pushed as REMOTE_SDP");
+    ck(mod_ice_type_for_push((int)RNET_SIGNAL_LOCAL_CANDIDATE) ==
+       (int)RNET_SIGNAL_REMOTE_CANDIDATE,
+       "a peer's LOCAL_CANDIDATE is pushed as REMOTE_CANDIDATE");
+    /* These mean the same on both sides. */
+    ck(mod_ice_type_for_push((int)RNET_SIGNAL_GATHERING_DONE) ==
+       (int)RNET_SIGNAL_GATHERING_DONE, "GATHERING_DONE passes through");
+    ck(mod_ice_type_for_push((int)RNET_SIGNAL_SET_CONTROLLING) ==
+       (int)RNET_SIGNAL_SET_CONTROLLING, "SET_CONTROLLING passes through");
+    /* Forwarding REMOTE_* would mean somebody already translated it once. */
+    ck(mod_ice_type_for_push((int)RNET_SIGNAL_REMOTE_SDP) ==
+       (int)RNET_SIGNAL_REMOTE_SDP, "REMOTE_SDP is not translated twice");
+}
+
+/* The offer this peer SENDS must be readable by the code that RECEIVES one.
+ *
+ * They are written in different places -- append_mod_offer builds it, and the
+ * slot parser reads it back out of the server's echo -- and they disagreed:
+ * one wrote {"pkgs":[...]}, the other looked for a bare array. Every peer
+ * therefore looked empty-handed, and a guest with every mod installed was
+ * still refused at Play. This asserts the two ends against each other rather
+ * than each against its own idea of the format. */
+static void case_offer_round_trips_through_a_slot_row(void)
+{
+    char offer[SNES_LOBBY_MAX_MODS * 256 + 64];
+    char slot_row[SNES_LOBBY_MAX_MODS * 256 + 256];
+    char obj[SNES_LOBBY_MAX_MODS * 256 + 64];
+    SnesLobbyModPkg back[SNES_LOBBY_MAX_MODS];
+    int n;
+
+    snes_lobby_set_mod_offer_supplier(two_pkg_offer, NULL);
+    ck(append_mod_offer(offer, sizeof(offer)) > 0, "offer encodes");
+    /* The server stores the object and echoes it inside the slot row. */
+    std_snprintf_slot(slot_row, sizeof(slot_row), offer);
+    ck(strstr(slot_row, "\"mod_offer\":{") != NULL,
+       "the offer travels as an object, which is what the server accepts");
+
+    ck(json_extract_object(slot_row, "mod_offer", obj, sizeof(obj)) != 0,
+       "the offer object extracts from a slot row");
+    n = parse_mod_pkg_array(obj, "pkgs", back, SNES_LOBBY_MAX_MODS);
+    ck(n == 2, "both offered packages are read back");
+    if (n == 2) {
+        ck(!strcmp(back[0].id, "gwed.localization"), "offer row 0 id");
+        ck(!strcmp(back[1].id, "gwed.enhancement.widescreen"), "offer row 1 id");
+    }
+    snes_lobby_set_mod_offer_supplier(NULL, NULL);
+}
+
 int main(void)
 {
     case_rows();
@@ -302,6 +376,8 @@ int main(void)
     case_overflow_refuses();
     case_gate_matches_on_id_only();
     case_hooks_survive_disconnect();
+    case_ice_local_becomes_remote();
+    case_offer_round_trips_through_a_slot_row();
     printf(fails ? "\n%d failure(s)\n" : "\nall mod-plan cases passed\n", fails);
     return fails != 0;
 }

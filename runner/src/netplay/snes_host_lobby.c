@@ -114,6 +114,8 @@ static const char *game_version(void)
 #include "mod_runtime.h"
 #endif
 
+static void dl_queue_step(void);
+
 /*
  * The host's required mod plan, carried in match caps.
  *
@@ -595,6 +597,7 @@ static void cb_pump(void *ctx)
 {
   (void)ctx;
   snes_lobby_pump();
+  dl_queue_step();
   if (g_hosting_lan && g_direct_host) {
     int rtt = -1;
     if (rnet_lan_direct_host_pump(g_direct_host, &g_lan_room, &rtt))
@@ -1276,6 +1279,48 @@ static int cb_lobby_mods_missing(void *ctx)
  * `can_transfer` flag: the server hardcodes that true and is describing
  * itself, not this build's ability to drive a transfer.
  */
+/* "Download All": the missing rows, fetched one after another.
+ *
+ * The queue lives here rather than in the lobby client because this is the
+ * layer that knows which rows are missing -- the client moves one package at
+ * a time and has no opinion about which. Advanced from the pump, since a
+ * transfer finishing is not an event anything reports. */
+static char g_dl_id[SNES_LOBBY_MAX_MODS][SNES_LOBBY_MOD_ID_LEN];
+static char g_dl_ver[SNES_LOBBY_MAX_MODS][SNES_LOBBY_MOD_VER_LEN];
+static int  g_dl_n;
+static int  g_dl_next;
+
+static void dl_queue_clear(void)
+{
+  g_dl_n = 0;
+  g_dl_next = 0;
+}
+
+/* Start the next queued package once the previous one has left. Called every
+ * pump; a no-op unless a queue is running and the link is idle. */
+static void dl_queue_step(void)
+{
+  if (g_dl_next >= g_dl_n) {
+    if (g_dl_n) dl_queue_clear();
+    return;
+  }
+  if (snes_lobby_mod_in_flight()[0])
+    return;                        /* one at a time */
+  {
+    const int i = g_dl_next++;
+    const int rc = snes_lobby_mod_request(g_dl_id[i], g_dl_ver[i]);
+    if (rc == 0) {
+      fprintf(stderr, "netplay: download-all %d/%d: %s\n", i + 1, g_dl_n,
+              g_dl_id[i]);
+    } else if (rc == -2) {
+      g_dl_next--;                 /* still busy; try again next pump */
+    } else {
+      fprintf(stderr, "netplay: download-all stopped at %s\n", g_dl_id[i]);
+      dl_queue_clear();
+    }
+  }
+}
+
 static int cb_lobby_mods_can_download(void *ctx)
 {
   (void)ctx;
@@ -1303,6 +1348,8 @@ static int cb_lobby_mods_download_one(void *ctx, int index)
   (void)ctx;
   if (!row || !cb_lobby_mods_can_download(NULL))
     return -1;
+  /* Passes -2 (busy) through untouched: the UI tells those two apart, and
+   * flattening them here would report a working transfer as a broken one. */
   return snes_lobby_mod_request(row->id, row->ver);
 }
 
@@ -1333,10 +1380,27 @@ static void cb_mod_xfer_cancel(void *ctx)
 
 static int cb_lobby_mods_download(void *ctx)
 {
+  int n;
+  int i;
   (void)ctx;
-  /* Unreachable while cb_lobby_mods_can_download answers 0, and still honest
-   * if a UI asks anyway: no channel exists, so nothing was started. */
-  return -1;
+  if (!cb_lobby_mods_can_download(NULL))
+    return -1;
+  dl_queue_clear();
+  n = cb_lobby_mods_count(NULL);
+  for (i = 0; i < n && g_dl_n < SNES_LOBBY_MAX_MODS; ++i) {
+    RecompLauncherCNetplayLobbyMod lm;
+    if (!cb_lobby_mods_get(NULL, i, &lm) || lm.installed)
+      continue;
+    snprintf(g_dl_id[g_dl_n], SNES_LOBBY_MOD_ID_LEN, "%s", lm.id);
+    snprintf(g_dl_ver[g_dl_n], SNES_LOBBY_MOD_VER_LEN, "%s", lm.version);
+    g_dl_n++;
+  }
+  if (g_dl_n == 0)
+    return -1;                     /* nothing missing; nothing to start */
+  fprintf(stderr, "netplay: downloading all %d missing mod(s) from the host\n",
+          g_dl_n);
+  dl_queue_step();
+  return 0;
 }
 
 static void cb_push_match_caps(void *ctx)
