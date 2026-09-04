@@ -356,10 +356,14 @@ void dma_primeHdmaFirstLine(Dma* dma) {
     int len = transferLength[ch->mode];
     for(int j = 0; j < len; j++) {
       uint8_t b = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode][j]);
+      /* `i` is the channel: S-DD1 needs it to know which decompression
+       * stream this byte belongs to. Upstream added the parameter in the
+       * S-DD1 commit and updated dma_doHdma; this priming pass is local to
+       * this branch, so nothing upstream could have updated it. */
       if(ch->indirect) {
-        dma_transferByte(dma, ch->size++, ch->indBank, b, false);
+        dma_transferByte(dma, ch->size++, ch->indBank, b, false, i);
       } else {
-        dma_transferByte(dma, ch->tableAdr++, ch->aBank, b, false);
+        dma_transferByte(dma, ch->tableAdr++, ch->aBank, b, false, i);
       }
     }
     *ch = save;

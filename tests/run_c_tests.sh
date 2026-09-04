@@ -46,23 +46,32 @@ echo "=== PPU widescreen elastic anchor band ==="
 "$OUT/ppu_elastic_band_test"
 
 echo "=== DMA / HDMA ==="
-"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+# sdd1.c is upstream's vendored S-DD1 decoder and is not -Werror clean here:
+# sdd1.c:773 reads `(a16 >= 0x00 && 0)`, an always-true comparison on a
+# uint16_t ANDed with 0, so the clause is dead. The product build does not
+# use -Werror, so this only bites the harness. Exempted rather than edited:
+# the file belongs to work still moving upstream, and quietly rewriting
+# somebody else's condition is how a real intent ("disabled for now") gets
+# lost. Worth reporting there.
+"$CC" -std=c11 -Wall -Wextra -Werror -Wno-error=type-limits -O1 \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
     "$ROOT/tests/dma/hdma_test.c" \
     "$ROOT/runner/src/snes/dma.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
     -o "$OUT/hdma_test"
 "$OUT/hdma_test"
 
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -Wno-error=parentheses -Wno-error=unused-variable \
-    -Wno-error=unused-const-variable \
+    -Wno-error=unused-const-variable -Wno-error=type-limits \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
     -ffunction-sections -fdata-sections \
     -I "$ROOT/tests/dma" -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
     "$ROOT/tests/dma/hdma_timing_test.c" \
     "$ROOT/runner/src/snes/dma.c" \
     "$ROOT/runner/src/snes/snes.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
     -Wl,--gc-sections -o "$OUT/hdma_timing_test"
 "$OUT/hdma_timing_test"
 
@@ -172,6 +181,7 @@ echo "=== runtime dispatch ==="
     "$ROOT/tests/runtime_dispatch/known_lle_entry_test.c" \
     "$ROOT/runner/src/cpu_state.c" \
     "$ROOT/runner/src/snes/cart.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
     "$ROOT/runner/src/snes/cx4.c" \
     "$ROOT/runner/src/snes/dsp1.c" \
     "$ROOT/runner/src/snes/dsp1_hle.c" \
