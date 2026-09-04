@@ -72,26 +72,64 @@ copy_lib() {
 
 case "${PLATFORM}" in
 windows)
-  OBJDUMP=""
-  for cand in x86_64-w64-mingw32-objdump objdump llvm-objdump; do
-    if command -v "${cand}" >/dev/null 2>&1; then OBJDUMP="${cand}"; break; fi
-  done
-  # Git Bash on a Windows runner has no binutils; the llvm-mingw toolchain
-  # pack does. Look there before giving up.
-  if [[ -z "${OBJDUMP}" && -n "${RETCOMM_TOOLCHAIN_DIR:-}" ]]; then
-    for cand in llvm-objdump.exe llvm-objdump x86_64-w64-mingw32-objdump.exe; do
-      if [[ -x "${RETCOMM_TOOLCHAIN_DIR}/bin/${cand}" ]]; then OBJDUMP="${RETCOMM_TOOLCHAIN_DIR}/bin/${cand}"; break; fi
+  # Import table of a PE file, read directly. objdump is not on a Windows
+  # runner's PATH, and the llvm-mingw pack's `<triple>-objdump` is a wrapper
+  # whose output and exit status differ from GNU's -- the first packaging run
+  # died exactly there. The PE format is small and fixed; Python is in the
+  # pack and on every runner. objdump remains a fallback for a host without
+  # Python.
+  PY="$(command -v python3 || command -v python || true)"
+  imports_of() {
+    if [[ -n "${PY}" ]]; then
+      "${PY}" - "$1" <<'PYEOF'
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+pe = struct.unpack_from("<I", data, 0x3C)[0]
+if data[pe:pe+4] != b"PE\0\0":
+    sys.exit("not a PE file")
+nsec, opt_size = struct.unpack_from("<H", data, pe+6)[0], struct.unpack_from("<H", data, pe+20)[0]
+opt = pe + 24
+magic = struct.unpack_from("<H", data, opt)[0]
+dd = opt + (112 if magic == 0x20B else 96)          # data directories
+imp_rva, imp_size = struct.unpack_from("<II", data, dd + 8)  # entry 1: imports
+secs = []
+st = opt + opt_size
+for i in range(nsec):
+    vsz, va, rsz, raw = struct.unpack_from("<IIII", data, st + i*40 + 8)
+    secs.append((va, max(vsz, rsz), raw))
+def off(rva):
+    for va, size, raw in secs:
+        if va <= rva < va + size:
+            return raw + (rva - va)
+    sys.exit(f"RVA {rva:#x} outside any section")
+if imp_rva == 0:
+    sys.exit(0)                                       # no imports at all
+o = off(imp_rva)
+names = set()
+while True:
+    ilt, ts, fwd, name_rva, iat = struct.unpack_from("<IIIII", data, o)
+    if name_rva == 0:
+        break
+    n = off(name_rva)
+    end = data.index(b"\0", n)
+    names.add(data[n:end].decode("ascii", "replace"))
+    o += 20
+for n in sorted(names):
+    print(n)
+PYEOF
+      return
+    fi
+    local objdump=""
+    for cand in x86_64-w64-mingw32-objdump objdump llvm-objdump; do
+      if command -v "${cand}" >/dev/null 2>&1; then objdump="${cand}"; break; fi
     done
-  fi
-  if [[ -z "${OBJDUMP}" ]]; then
-    echo "::error::no objdump on PATH — cannot determine the DLLs $(basename "${EXE}") imports" >&2
-    exit 1
-  fi
+    if [[ -z "${objdump}" ]]; then
+      echo "::error::neither python nor objdump available to read $(basename "$1")'s imports" >&2
+      return 1
+    fi
+    "${objdump}" -p "$1" | awk '/DLL Name:/{print $3}' | sort -u
+  }
 
-  # Where MinGW runtime DLLs live: MSYS2's /mingw64/bin, or the llvm-mingw
-  # toolchain pack (bin/ for the host arch, plus the target sysroot's bin/).
-  # With SNESRECOMP_STATIC_RUNTIME (the default) none are imported and this
-  # walk finds nothing to copy -- which is the intended outcome, not a skip.
   RUNTIME_BINS=("${MINGW_PREFIX:-/mingw64}/bin")
   if [[ -n "${RETCOMM_TOOLCHAIN_DIR:-}" ]]; then
     RUNTIME_BINS+=("${RETCOMM_TOOLCHAIN_DIR}/bin" "${RETCOMM_TOOLCHAIN_DIR}/x86_64-w64-mingw32/bin")
@@ -99,10 +137,6 @@ windows)
   # Windows' own DLLs ship with the OS; copying them is at best noise and at
   # worst a version conflict with the loader's.
   SYSTEM_RE='^(KERNEL32|KERNELBASE|USER32|GDI32|GDIPLUS|ADVAPI32|SHELL32|SHCORE|OLE32|OLEAUT32|WS2_32|WINMM|IMM32|SETUPAPI|VERSION|OPENGL32|GLU32|COMCTL32|COMDLG32|RPCRT4|SHLWAPI|CRYPT32|BCRYPT|NCRYPT|IPHLPAPI|NSI|DNSAPI|MSVCRT|UCRTBASE|VCRUNTIME[0-9]*|MSVCP[0-9]*|DBGHELP|DWMAPI|UXTHEME|POWRPROF|CFGMGR32|HID|WINTRUST|MSIMG32|AVRT|MF[A-Z]*|AUDIOSES|DINPUT8|XINPUT[0-9_]*|API-MS-.*|EXT-MS-.*)\.DLL$'
-
-  imports_of() {
-    "${OBJDUMP}" -p "$1" 2>/dev/null | awk '/DLL Name:/{print $3}' | sort -u
-  }
 
   # Walk transitively: SDL3.dll itself pulls in the MinGW runtime DLLs, and a
   # zip carrying SDL3.dll without them is the same broken zip one level down.
