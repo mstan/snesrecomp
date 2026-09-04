@@ -46,8 +46,13 @@ echo "=== PPU widescreen elastic anchor band ==="
 "$OUT/ppu_elastic_band_test"
 
 echo "=== DMA / HDMA ==="
-# sdd1.c is intentionally linked with dma.c; its disabled-path condition is
-# not type-limits clean under the harness's stricter -Werror policy.
+# sdd1.c is upstream's vendored S-DD1 decoder and is not -Werror clean here:
+# sdd1.c:773 reads `(a16 >= 0x00 && 0)`, an always-true comparison on a
+# uint16_t ANDed with 0, so the clause is dead. The product build does not
+# use -Werror, so this only bites the harness. Exempted rather than edited:
+# the file belongs to work still moving upstream, and quietly rewriting
+# somebody else's condition is how a real intent ("disabled for now") gets
+# lost. Worth reporting there.
 "$CC" -std=c11 -Wall -Wextra -Werror -Wno-error=type-limits -O1 \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
