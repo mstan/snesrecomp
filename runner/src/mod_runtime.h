@@ -120,6 +120,17 @@ int snes_mod_runtime_plan_rows_c(SnesModPkgRow* out, int max);
  * rule as above. */
 int snes_mod_runtime_installed_rows_c(SnesModPkgRow* out, int max);
 
+/* Where `package_id`@`version` lives on disk (its version directory).
+ *
+ * A mod's data belongs INSIDE its package, because that is the unit that gets
+ * transferred: a package whose files sit elsewhere in the install arrives at a
+ * peer as a manifest describing a mod it does not have. Plugins resolve their
+ * assets from here rather than from the executable's directory.
+ *
+ * Pass NULL for `version` to get the selected one. Returns 1 on success. */
+int snes_mod_runtime_package_root_c(const char* package_id, const char* version,
+                                    char* out, uint32_t cap);
+
 /* ---- peer-to-peer package transfer -------------------------------------
  *
  * The host packs a package it has; the guest verifies and installs it. The

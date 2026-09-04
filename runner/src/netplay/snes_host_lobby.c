@@ -116,6 +116,8 @@ static const char *game_version(void)
 
 static void dl_queue_step(void);
 static void mod_set_sync_step(void);
+static void cb_push_match_caps(void *ctx);
+static void host_caps_watch_step(void);
 
 /*
  * The host's required mod plan, carried in match caps.
@@ -627,6 +629,7 @@ static void cb_pump(void *ctx)
   (void)ctx;
   snes_lobby_pump();
   dl_queue_step();
+  host_caps_watch_step();
   mod_set_sync_step();
   if (g_hosting_lan && g_direct_host) {
     int rtt = -1;
@@ -1254,6 +1257,47 @@ static int cb_lobby_mods_get(void *ctx, int index,
   snprintf(out->name, sizeof(out->name), "%s",
            row->name[0] ? row->name : id);
   out->installed = 0;
+
+  /* Pull this package's lines out of the host's published set.
+   *
+   * caps.mod_set is the canonical text with ';' where newlines were, one entry
+   * per enabled feature:  "<pkg>@<ver>/<feature> <opt>=<val> ..."
+   * The row shows the part after the package prefix, so a guest reads the
+   * host's actual choices -- "localization language=en" -- rather than its own
+   * local settings, which are not what the match will run. */
+  {
+    const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
+    size_t o = 0;
+    if (caps && caps->valid && caps->mod_set[0]) {
+      const char *p = caps->mod_set;
+      const size_t id_len = strlen(id);
+      while (*p) {
+        const char *end = strchr(p, ';');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        /* "<id>@" anchors the match, so a package whose id is a prefix of
+         * another's cannot claim its line. */
+        if (len > id_len + 1 && !strncmp(p, id, id_len) && p[id_len] == '@') {
+          const char *slash = (const char *)memchr(p, '/', len);
+          if (slash) {
+            const size_t tail = len - (size_t)(slash + 1 - p);
+            /* One entry per line. A package with several features, or one
+             * feature with several options, is a list -- run together on one
+             * line it wraps into a paragraph the player has to parse. */
+            if (o && o + 1 < sizeof(out->options))
+              out->options[o++] = '\n';
+            if (o + tail < sizeof(out->options)) {
+              memcpy(out->options + o, slash + 1, tail);
+              o += tail;
+            }
+          }
+        }
+        if (!end) break;
+        p = end + 1;
+      }
+    }
+    out->options[o] = '\0';
+  }
+
 #if SNESRECOMP_ENABLE_MODS
   {
     char name[64];
@@ -1350,6 +1394,44 @@ static void dl_queue_step(void)
     }
   }
 }
+
+/* Republish whenever the HOST's own configuration changes.
+ *
+ * push_match_caps was called from exactly one place in the launcher: the
+ * feature enable checkbox. Changing an option -- picking a language from a
+ * dropdown -- changed what the host would run and told nobody, so guests kept
+ * showing and ADOPTING the previous value, and only found out at launch when
+ * the mod-set check refused them.
+ *
+ * Watched here rather than wired into each control because publication is this
+ * layer's job: any path that changes the effective set, present or future, is
+ * covered by comparing the set itself. The comparison is against the canonical
+ * text, so it fires on a real change and not on a redraw. */
+#if SNESRECOMP_ENABLE_MODS
+static char g_published_set[1024];
+
+static void host_caps_watch_step(void)
+{
+  char text[1024];
+  int need;
+
+  if (!snes_lobby_in_lobby() || !snes_lobby_is_host()) {
+    g_published_set[0] = '\0';
+    return;
+  }
+  need = snes_mod_runtime_effective_set_c(text, (uint32_t)sizeof(text));
+  if (need <= 0 || need >= (int)sizeof(text))
+    return;
+  if (!strcmp(text, g_published_set))
+    return;
+  snprintf(g_published_set, sizeof(g_published_set), "%s", text);
+  fprintf(stderr, "netplay: mod configuration changed - republishing to the "
+                  "lobby\n");
+  cb_push_match_caps(NULL);
+}
+#else
+static void host_caps_watch_step(void) {}
+#endif
 
 /* Bring this peer's mod configuration into line with the host's, in the
  * LOBBY, where it still costs nothing.

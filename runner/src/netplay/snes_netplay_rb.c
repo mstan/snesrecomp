@@ -7,6 +7,7 @@
 #include "snes_netplay.h"
 #include "snes_state_digest.h"
 #include "common_rtl.h"
+#include "common_cpu_infra.h"  /* snes_refresh_state_get */
 #include "snes/snes.h"
 
 extern Snes *g_snes;
@@ -600,6 +601,17 @@ static uint8_t rb_gate_episode_active(void *ctx)
  */
 #define RB_BOOT_DIGEST_TIMEOUT_MS 4000u
 
+/* The refresh tax's sub-scanline carry at capture. A cold boot starts at 0;
+ * anything else means the machine inherited a phase from a previous session,
+ * which changes how the first block is charged. */
+static uint64_t rb_refresh_phase_now(void)
+{
+    uint64_t phase = 0;
+    uint64_t upto = 0;
+    snes_refresh_state_get(&phase, &upto);
+    return phase;
+}
+
 static int rb_boot_digest_gate(void)
 {
     uint32_t local = 0u, peer = 0u;
@@ -633,6 +645,23 @@ static int rb_boot_digest_gate(void)
                 (unsigned)p.master, (unsigned)p.cpu, (unsigned)p.wram,
                 (unsigned)p.apu, (unsigned)p.ppu, (unsigned)p.dma,
                 (unsigned)p.cart);
+        /* How far the machine had already run when tick 0 was captured.
+         *
+         * WRAM is zeroed by snes_reset(hard) at SnesInit, so a tick-0 WRAM
+         * digest that differs between peers means one of them executed guest
+         * code before the snapshot -- the partitions say WHICH state differs
+         * and never how it got that way. On a rematch these should read
+         * identically on both peers; if they do not, the boot is not the cold
+         * boot it claims to be, and that is upstream of anything rollback can
+         * reconcile. */
+        fprintf(stderr,
+                "snes_netplay: RB boot taken at frame=%llu "
+                "apu_catchup=%.3f vpos=%u hpos=%u refresh_phase=%llu\n",
+                (unsigned long long)snes_frame_counter,
+                g_snes ? g_snes->apuCatchupCycles : 0.0,
+                (unsigned)(g_snes ? g_snes->vPos : 0),
+                (unsigned)(g_snes ? g_snes->hPos : 0),
+                (unsigned long long)rb_refresh_phase_now());
     } else {
         return 1; /* our own tick 0 not published yet — nothing to compare */
     }
