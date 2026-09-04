@@ -62,6 +62,25 @@ int snesrecomp_codegen_host_sources_missing(
  * on success (exec / spawn helper + exit). */
 void snesrecomp_codegen_host_relaunch_or_exit(const char* rom_path);
 
+/* Zero-configuration wiring — the form every port should use.
+ *
+ * Generate & rebuild is framework behavior, not per-title behavior: the paths
+ * it needs (recomp/, src/gen/, recomp/funcs.h, build/, snesrecomp_cli.py) are
+ * scaffolder conventions, and the two remaining facts -- the CMake target and
+ * the binary to relaunch -- are both the running executable's own name. So a
+ * game supplies nothing but the label the wizard shows.
+ *
+ * Prefer this over snesrecomp_codegen_host_apply(). Reach for the explicit
+ * config only when a project genuinely departs from the scaffold layout;
+ * anything a port can express by NOT calling it should stay a default here,
+ * where every port inherits the fix.
+ *
+ * display_name may be NULL. Silently does nothing when the executable name
+ * cannot be determined, exactly as apply() does when the SDK is absent --
+ * a missing wizard is not a reason to refuse to boot. */
+void snesrecomp_codegen_host_autowire(RecompLauncherCGameInfo* gi,
+                                      const char* display_name);
+
 #ifdef __cplusplus
 }
 #endif

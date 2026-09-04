@@ -68,20 +68,20 @@ create` (no push) → generate/build → one push. Pushing earlier leaves a seco
 
 ## The workflow it writes
 
-`.github/workflows/release.yml` builds four platform packs — Linux x86-64,
+`.github/workflows/release.yml` builds four **setup packs** — Linux x86-64,
 Windows x86-64, macOS arm64, macOS Intel — and can attach them to a GitHub
-Release from a `v*` tag.
+Release from a `v*` tag. It is manual-trigger only.
 
-A fresh scaffold cannot build the game in CI: `src/gen/` is derived from a ROM
-that never enters CI. So the workflow ships in its honest mode — one job named
-`ROM-free host check (no game build)`, which runs the framework tests and
-compiles the host translation units. Set the repository variable
-`CI_SRC_GEN_ASSET` (and the `CI_ASSETS_TOKEN` secret) once you have published
-the generated C, and the four real builds take over from it. Exactly one of
-the two runs, and the job name says which.
+A setup pack is not the game. `src/gen/` is derived from a ROM that never
+enters CI, so the pack holds the *setup host* (the executable built with
+`-DSNESRECOMP_SETUP_HOST=ON`, without recompiled code), the recompiler, and
+this source tree. On the player's machine the launcher's first-run wizard
+takes their own ROM, generates, rebuilds, and relaunches into the real game.
+The build tools (the retcomm `cmake-clang-v1` pack) are embedded in the zip by
+default, or downloaded on first run.
 
-See `snesrecomp/docs/ci/README.md` for the full setup, including
-`tools/ci/publish_src_gen.sh`.
+See `snesrecomp/docs/ci/README.md` for the mechanics, and
+`snesrecomp/docs/LOCAL_CODEGEN_SDK.md` for the launcher side.
 
 `probe_rom.py` is usable on its own — `python3 probe_rom.py game.sfc` prints
 what the scaffold would bake in, which is the fastest way to check whether a

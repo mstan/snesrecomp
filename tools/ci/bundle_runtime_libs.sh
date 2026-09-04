@@ -75,7 +75,14 @@ windows)
     exit 1
   fi
 
-  RUNTIME_BIN="${MINGW_PREFIX:-/mingw64}/bin"
+  # Where MinGW runtime DLLs live: MSYS2's /mingw64/bin, or the llvm-mingw
+  # toolchain pack (bin/ for the host arch, plus the target sysroot's bin/).
+  # With SNESRECOMP_STATIC_RUNTIME (the default) none are imported and this
+  # walk finds nothing to copy -- which is the intended outcome, not a skip.
+  RUNTIME_BINS=("${MINGW_PREFIX:-/mingw64}/bin")
+  if [[ -n "${RETCOMM_TOOLCHAIN_DIR:-}" ]]; then
+    RUNTIME_BINS+=("${RETCOMM_TOOLCHAIN_DIR}/bin" "${RETCOMM_TOOLCHAIN_DIR}/x86_64-w64-mingw32/bin")
+  fi
   # Windows' own DLLs ship with the OS; copying them is at best noise and at
   # worst a version conflict with the loader's.
   SYSTEM_RE='^(KERNEL32|KERNELBASE|USER32|GDI32|GDIPLUS|ADVAPI32|SHELL32|SHCORE|OLE32|OLEAUT32|WS2_32|WINMM|IMM32|SETUPAPI|VERSION|OPENGL32|GLU32|COMCTL32|COMDLG32|RPCRT4|SHLWAPI|CRYPT32|BCRYPT|NCRYPT|IPHLPAPI|NSI|DNSAPI|MSVCRT|UCRTBASE|VCRUNTIME[0-9]*|MSVCP[0-9]*|DBGHELP|DWMAPI|UXTHEME|POWRPROF|CFGMGR32|HID|WINTRUST|MSIMG32|AVRT|MF[A-Z]*|AUDIOSES|DINPUT8|XINPUT[0-9_]*|API-MS-.*|EXT-MS-.*)\.DLL$'
@@ -98,12 +105,12 @@ windows)
         continue
       fi
       src=""
-      for dir in "$(dirname "${EXE}")" "${BUILD_DIR}" "${RUNTIME_BIN}"; do
+      for dir in "$(dirname "${EXE}")" "${BUILD_DIR}" "${RUNTIME_BINS[@]}"; do
         if [[ -f "${dir}/${dll}" ]]; then src="${dir}/${dll}"; break; fi
       done
       if [[ -z "${src}" ]]; then
         echo "::error::required DLL not found: ${dll}" >&2
-        echo "  looked in $(dirname "${EXE}"), ${BUILD_DIR}, ${RUNTIME_BIN}" >&2
+        echo "  looked in $(dirname "${EXE}"), ${BUILD_DIR}, ${RUNTIME_BINS[*]}" >&2
         exit 1
       fi
       copy_lib "${src}"

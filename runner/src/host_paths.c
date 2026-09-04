@@ -96,6 +96,34 @@ int snesrecomp_abspath(const char *path, char *out, size_t max_len) {
 #endif
 }
 
+int snesrecomp_exe_basename(char *out, size_t max_len) {
+    char exe_path[1024];
+    if (!out || max_len == 0) return 0;
+    out[0] = '\0';
+    if (!get_exe_path(exe_path, sizeof(exe_path))) return 0;
+
+    const char *base = exe_path;
+    for (const char *p = exe_path; *p; p++)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    if (!*base) return 0;
+
+    size_t len = strlen(base);
+    /* Strip a trailing ".exe" so the same name serves the CMake target on
+     * every platform. Case-insensitive: Windows does not promise the case. */
+    if (len > 4) {
+        const char *ext = base + len - 4;
+        if ((ext[0] == '.') &&
+            (ext[1] == 'e' || ext[1] == 'E') &&
+            (ext[2] == 'x' || ext[2] == 'X') &&
+            (ext[3] == 'e' || ext[3] == 'E'))
+            len -= 4;
+    }
+    if (len >= max_len) return 0;
+    memcpy(out, base, len);
+    out[len] = '\0';
+    return 1;
+}
+
 int snesrecomp_exe_dir_path(const char *leaf, char *out, size_t max_len) {
     if (!leaf || !out || max_len == 0) return 0;
     char dir[1024];
