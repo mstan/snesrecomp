@@ -90,9 +90,13 @@ STAGE="${DIST}/${NAME}"
 ZIP="${DIST}/${NAME}.zip"
 
 # ── the setup host ──────────────────────────────────────────────────────────
+# .exe candidates FIRST. Under MSYS/Git Bash, [[ -f foo ]] is true when only
+# foo.exe exists (the runtime maps the name), so probing the bare name first
+# staged an extensionless path that no native tool -- Python, 7z, the loader
+# -- could open. On Linux/macOS no .exe exists and the bare name wins.
 EXE=""
-for cand in "${BUILD_DIR}/${EXE_NAME}" "${BUILD_DIR}/${EXE_NAME}.exe" \
-            "${BUILD_DIR}/Release/${EXE_NAME}.exe"; do
+for cand in "${BUILD_DIR}/${EXE_NAME}.exe" "${BUILD_DIR}/Release/${EXE_NAME}.exe" \
+            "${BUILD_DIR}/${EXE_NAME}"; do
   if [[ -f "${cand}" ]]; then EXE="${cand}"; break; fi
 done
 if [[ -z "${EXE}" ]]; then
