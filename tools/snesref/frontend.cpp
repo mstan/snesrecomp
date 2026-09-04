@@ -4,15 +4,19 @@
  * keyboard input, and logs per-frame WRAM changes (same JSON shape as the
  * recomp debug_server's wram_writes_at) to snesref_trace.jsonl.
  *
- *   snesref.exe <core.dll> <rom.sfc>
+ *   snesref <libretro-core> <rom.sfc>
  *
  * Keys (match the recomp keybinds): arrows=D-pad, Z=B(jump), X=A, A=Y(fire),
  *   S=X, C=L, V=R, Enter=Start, RShift=Select.
  *   Shift+F1-F9 = save state slot       F1-F9 = load state slot
  *   Backspace = clear the WRAM trace    Esc = quit
  */
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <cstdio>
@@ -21,8 +25,53 @@
 #include <vector>
 #include "libretro.h"
 
-// ---- core function pointers ----
-static HMODULE g_core;
+// ---- portable dynamic-core loading + core function pointers ----
+#ifdef _WIN32
+using CoreHandle = HMODULE;
+#else
+using CoreHandle = void*;
+#endif
+
+static CoreHandle g_core;
+
+static CoreHandle core_open(const char* path) {
+#ifdef _WIN32
+    return LoadLibraryA(path);
+#else
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+static void* core_symbol(CoreHandle core, const char* name) {
+#ifdef _WIN32
+    return reinterpret_cast<void*>(GetProcAddress(core, name));
+#else
+    dlerror();
+    return dlsym(core, name);
+#endif
+}
+
+static const char* core_error() {
+#ifdef _WIN32
+    static char message[64];
+    snprintf(message, sizeof message, "Windows error %lu",
+             static_cast<unsigned long>(GetLastError()));
+    return message;
+#else
+    const char* message = dlerror();
+    return message ? message : "unknown dynamic-loader error";
+#endif
+}
+
+static void core_close(CoreHandle core) {
+    if (!core) return;
+#ifdef _WIN32
+    FreeLibrary(core);
+#else
+    dlclose(core);
+#endif
+}
+
 #define LR(sym) static decltype(&sym) p_##sym;
 LR(retro_init) LR(retro_deinit) LR(retro_api_version)
 LR(retro_get_system_info) LR(retro_get_system_av_info)
@@ -36,8 +85,11 @@ LR(retro_get_memory_data) LR(retro_get_memory_size)
 #undef LR
 
 template<class T> static void bind(T& fn, const char* name) {
-    fn = (T)GetProcAddress(g_core, name);
-    if (!fn) { fprintf(stderr, "missing core symbol: %s\n", name); exit(2); }
+    fn = reinterpret_cast<T>(core_symbol(g_core, name));
+    if (!fn) {
+        fprintf(stderr, "missing core symbol %s: %s\n", name, core_error());
+        exit(2);
+    }
 }
 
 // ---- video state ----
@@ -47,6 +99,7 @@ static SDL_Texture*  g_tex;
 static int g_tex_w = 0, g_tex_h = 0;
 static retro_pixel_format g_fmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static SDL_GameController* g_pad = nullptr;
+static bool g_headless = false;
 
 static void open_first_pad() {
     if (g_pad) return;
@@ -364,9 +417,11 @@ static void maybe_dump_frame(const void* data, unsigned w, unsigned h, size_t pi
 static void cb_video(const void* data, unsigned w, unsigned h, size_t pitch) {
     if (data && w && h) {
         maybe_dump_frame(data, w, h, pitch);
+        if (g_headless) return;
         ensure_texture(w,h);
         SDL_UpdateTexture(g_tex, nullptr, data, (int)pitch);
     }
+    if (g_headless) return;
     SDL_RenderClear(g_ren);
     if (g_tex) SDL_RenderCopy(g_ren, g_tex, nullptr, nullptr);
     SDL_RenderPresent(g_ren);
@@ -434,6 +489,7 @@ static int16_t cb_input_state(unsigned port, unsigned device, unsigned index, un
         }
         return (g_scripted_mask & bit) != 0;
     }
+    if (g_headless) return 0;
     const Uint8* ks = SDL_GetKeyboardState(nullptr);
     SDL_Scancode sc; SDL_GameControllerButton gb;
     switch (id) {
@@ -491,14 +547,21 @@ static void load_state(int slot) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr,"usage: snesref <core.dll> <rom.sfc>\n"); return 1; }
+    if (argc < 3) {
+        fprintf(stderr, "usage: snesref <libretro-core> <rom.sfc>\n");
+        return 1;
+    }
     const char* corePath = argv[1];
     const char* romPath  = argv[2];
     { const char* input = getenv("SNESREF_INPUT_FILE");
       if (input && input[0] && !load_input_file(input)) return 6; }
 
-    g_core = LoadLibraryA(corePath);
-    if (!g_core) { fprintf(stderr,"LoadLibrary failed: %s (err %lu)\n", corePath, GetLastError()); return 2; }
+    g_core = core_open(corePath);
+    if (!g_core) {
+        fprintf(stderr, "cannot load libretro core %s: %s\n",
+                corePath, core_error());
+        return 2;
+    }
     bind(p_retro_init,"retro_init"); bind(p_retro_deinit,"retro_deinit");
     bind(p_retro_api_version,"retro_api_version");
     bind(p_retro_get_system_info,"retro_get_system_info");
@@ -555,23 +618,32 @@ int main(int argc, char** argv) {
       if (qf && qf[0]) quit_frames = atol(qf); }
     const char* fast_value = getenv("SNESREF_FAST");
     bool fast = fast_value && fast_value[0] && fast_value[0] != '0';
+    const char* headless_value = getenv("SNESREF_HEADLESS");
+    bool headless = headless_value && headless_value[0] &&
+                    headless_value[0] != '0';
+    g_headless = headless;
 
     SDL_SetMainReady();
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) { fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 5; }
-    open_first_pad();
-    g_win = SDL_CreateWindow("snesref (libretro) — Fn load / Shift+Fn save / Backspace clear-trace",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, vw*2, vh*2,
-        fast ? SDL_WINDOW_HIDDEN : SDL_WINDOW_RESIZABLE);
-    g_ren = SDL_CreateRenderer(g_win, -1,
-        fast ? SDL_RENDERER_ACCELERATED
-             : SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!g_ren)
-        g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
-    if (!g_win || !g_ren) {
-        fprintf(stderr, "SDL renderer setup failed: %s\n", SDL_GetError());
-        return 5;
+    Uint32 sdl_flags = headless
+        ? SDL_INIT_TIMER
+        : SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK;
+    if (SDL_Init(sdl_flags) != 0) { fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 5; }
+    if (!headless) {
+        open_first_pad();
+        g_win = SDL_CreateWindow("snesref (libretro) — Fn load / Shift+Fn save / Backspace clear-trace",
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, vw*2, vh*2,
+            fast ? SDL_WINDOW_HIDDEN : SDL_WINDOW_RESIZABLE);
+        g_ren = SDL_CreateRenderer(g_win, -1,
+            fast ? SDL_RENDERER_ACCELERATED
+                 : SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!g_ren)
+            g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
+        if (!g_win || !g_ren) {
+            fprintf(stderr, "SDL renderer setup failed: %s\n", SDL_GetError());
+            return 5;
+        }
+        SDL_RenderSetLogicalSize(g_ren, vw, vh);
     }
-    SDL_RenderSetLogicalSize(g_ren, vw, vh);
 
     printf("RUN. KB: arrows=DPad Z=B(jump) X=A A=Y(fire) S=X C=L V=R Enter=Start RShift=Select\n");
     printf("     Pad: dpad/L-stick, Cross=jump Square=fire Circle=A Triangle=X L1/R1=L/R Start/Select\n");
@@ -582,18 +654,20 @@ int main(int argc, char** argv) {
     Uint64 freq=SDL_GetPerformanceFrequency(), prev=SDL_GetPerformanceCounter();
     const double target = (double)freq / 60.098;
     while (running) {
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type==SDL_QUIT) running=false;
-            else if (e.type==SDL_CONTROLLERDEVICEADDED) open_first_pad();
-            else if (e.type==SDL_CONTROLLERDEVICEREMOVED) { if(g_pad){ SDL_GameControllerClose(g_pad); g_pad=nullptr; printf("[controller removed]\n"); fflush(stdout);} open_first_pad(); }
-            else if (e.type==SDL_KEYDOWN && e.key.repeat==0) {
-                SDL_Scancode s = e.key.keysym.scancode;
-                if (s==SDL_SCANCODE_ESCAPE) running=false;
-                else if (s==SDL_SCANCODE_BACKSPACE) clear_trace();
-                else if (s>=SDL_SCANCODE_F1 && s<=SDL_SCANCODE_F9) {
-                    int slot = (int)(s - SDL_SCANCODE_F1) + 1;
-                    if (e.key.keysym.mod & KMOD_SHIFT) save_state(slot); else load_state(slot);
+        if (!headless) {
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                if (e.type==SDL_QUIT) running=false;
+                else if (e.type==SDL_CONTROLLERDEVICEADDED) open_first_pad();
+                else if (e.type==SDL_CONTROLLERDEVICEREMOVED) { if(g_pad){ SDL_GameControllerClose(g_pad); g_pad=nullptr; printf("[controller removed]\n"); fflush(stdout);} open_first_pad(); }
+                else if (e.type==SDL_KEYDOWN && e.key.repeat==0) {
+                    SDL_Scancode s = e.key.keysym.scancode;
+                    if (s==SDL_SCANCODE_ESCAPE) running=false;
+                    else if (s==SDL_SCANCODE_BACKSPACE) clear_trace();
+                    else if (s>=SDL_SCANCODE_F1 && s<=SDL_SCANCODE_F9) {
+                        int slot = (int)(s - SDL_SCANCODE_F1) + 1;
+                        if (e.key.keysym.mod & KMOD_SHIFT) save_state(slot); else load_state(slot);
+                    }
                 }
             }
         }
@@ -615,7 +689,7 @@ int main(int argc, char** argv) {
         { static long fr=-2; if(fr==-2){const char*v=getenv("SNESREF_FRAMES"); fr=(v&&v[0])?atol(v):-1;}
           if(fr>0 && (long)g_frame>=fr){ if(g_log)fflush(g_log); running=false; } }
         // 60fps cap (disabled only for deterministic offline capture).
-        if (!fast) {
+        if (!fast && !headless) {
             for (;;) {
                 Uint64 now=SDL_GetPerformanceCounter();
                 double el=(double)(now-prev);
@@ -631,6 +705,6 @@ int main(int argc, char** argv) {
     }
     wav_close();
     p_retro_unload_game(); p_retro_deinit();
-    SDL_Quit(); FreeLibrary(g_core);
+    SDL_Quit(); core_close(g_core);
     return 0;
 }
