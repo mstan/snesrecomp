@@ -178,6 +178,17 @@ typedef struct HostMeshDrawStats {
   int32_t bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y; /* target pixels */
 } HostMeshDrawStats;
 
+/* A detached display list drawn in the same pass as the limbs (sharing the
+ * Z-buffer) with its own model->camera matrix: engine glows, shields, muzzle
+ * flashes attached to a limb origin but billboarded to the camera. */
+typedef struct HostMeshExtraList {
+  int display_list;
+  float model_to_camera[12];
+  float alpha_scale;
+} HostMeshExtraList;
+
+#define HOST_MESH_MAX_EXTRA_LISTS 8
+
 typedef struct HostMeshDrawParams {
   const HostMesh *mesh;
   int pose;                        /* pose index or -1 for bind pose */
@@ -209,6 +220,9 @@ typedef struct HostMeshDrawParams {
    * pixels over already-drawn content are blended. This suits scratch
    * layers composited with a "non-zero pixel" rule. */
   int transparent_black_target;
+  /* Extra lists drawn after the limbs in the same Z-buffered pass. */
+  const HostMeshExtraList *extra_lists;
+  int extra_list_count;
   HostMeshDrawStats *stats;        /* may be NULL */
 } HostMeshDrawParams;
 

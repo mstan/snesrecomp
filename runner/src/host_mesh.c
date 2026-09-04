@@ -1018,6 +1018,35 @@ uint32_t host_mesh_draw(const HostMeshDrawParams *params) {
       }
     }
   }
+  const int extra_count =
+      params->extra_lists
+          ? (params->extra_list_count < HOST_MESH_MAX_EXTRA_LISTS
+                 ? params->extra_list_count
+                 : HOST_MESH_MAX_EXTRA_LISTS)
+          : 0;
+  for (int e = 0; e < extra_count; e++) {
+    const HostMeshExtraList *x = &params->extra_lists[e];
+    if (x->display_list < 0 || x->display_list >= (int)mesh->display_list_count)
+      continue;
+    const HostMeshDisplayList *d = &mesh->display_lists[x->display_list];
+    total_tris += d->triangle_count;
+    for (uint32_t t = 0; t < d->triangle_count; t++) {
+      const HostMeshTriangle *tri = &mesh->triangles[d->first_triangle + t];
+      for (int k = 0; k < 3; k++) {
+        float c[3];
+        mat_apply(x->model_to_camera, tri->v[k].x, tri->v[k].y, tri->v[k].z, c);
+        if (c[2] < near_z) c[2] = near_z;
+        float sx, sy;
+        params->projection.project(params->projection.ctx, c[0], c[1], c[2],
+                                   &sx, &sy);
+        if (!isfinite(sx) || !isfinite(sy)) continue;
+        if (sx < bb_min_x) bb_min_x = sx;
+        if (sx > bb_max_x) bb_max_x = sx;
+        if (sy < bb_min_y) bb_min_y = sy;
+        if (sy > bb_max_y) bb_max_y = sy;
+      }
+    }
+  }
   stats->triangles_submitted = total_tris;
   if (total_tris == 0 || !isfinite(bb_min_x) || !isfinite(bb_max_x) ||
       !isfinite(bb_min_y) || !isfinite(bb_max_y)) {
@@ -1079,6 +1108,38 @@ uint32_t host_mesh_draw(const HostMeshDrawParams *params) {
       for (int k = 0; k < n; k++) to_raster_vertex(&rs, &clipped[k], &rv[k]);
       raster_triangle(&rs, m, &rv[0], &rv[1], &rv[2], stats);
       if (n == 4) raster_triangle(&rs, m, &rv[0], &rv[2], &rv[3], stats);
+    }
+  }
+
+  /* Pass 2b: detached extra lists in the same Z-buffer. */
+  for (int e = 0; e < extra_count; e++) {
+    const HostMeshExtraList *x = &params->extra_lists[e];
+    if (x->display_list < 0 || x->display_list >= (int)mesh->display_list_count)
+      continue;
+    const HostMeshDisplayList *d = &mesh->display_lists[x->display_list];
+    HostMeshDrawParams extra_params = local_params;
+    extra_params.alpha_scale = params->alpha_scale * x->alpha_scale;
+    Raster xrs = rs;
+    xrs.params = &extra_params;
+    for (uint32_t t = 0; t < d->triangle_count; t++) {
+      const HostMeshTriangle *tri = &mesh->triangles[d->first_triangle + t];
+      const HostMeshMaterial *m = &mesh->materials[tri->material];
+      ClipVertex cv[3];
+      for (int k = 0; k < 3; k++) {
+        mat_apply(x->model_to_camera, tri->v[k].x, tri->v[k].y, tri->v[k].z,
+                  cv[k].c);
+        cv[k].u = tri->v[k].u;
+        cv[k].v = tri->v[k].v;
+        vertex_shade(&extra_params, m, x->model_to_camera, &tri->v[k],
+                     cv[k].shade);
+      }
+      ClipVertex clipped[4];
+      const int n = clip_near(cv, near_z, clipped);
+      if (n < 3) continue;
+      RasterVertex rv[4];
+      for (int k = 0; k < n; k++) to_raster_vertex(&xrs, &clipped[k], &rv[k]);
+      raster_triangle(&xrs, m, &rv[0], &rv[1], &rv[2], stats);
+      if (n == 4) raster_triangle(&xrs, m, &rv[0], &rv[2], &rv[3], stats);
     }
   }
 
