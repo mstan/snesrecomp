@@ -62,6 +62,7 @@ typedef struct HostMeshImpl {
   HostMeshPose *poses;
   uint32_t *pixels;
   HostMeshVec3 *pose_rot;
+  uint32_t *limb_order;
 } HostMeshImpl;
 
 static uint32_t rd_u32(const uint8_t *p) {
@@ -270,11 +271,48 @@ HostMesh *host_mesh_load(const void *blob_in, size_t size, const char **error) {
     l->rot_deg.x = rd_f32(r + 20);
     l->rot_deg.y = rd_f32(r + 24);
     l->rot_deg.z = rd_f32(r + 28);
-    if (l->parent < -1 || l->parent >= (int32_t)i ||
-        (i == 0 && l->parent != -1) || l->display_list < -1 ||
+    if (l->parent < -1 || l->parent >= (int32_t)counts[4] ||
+        l->parent == (int32_t)i || l->display_list < -1 ||
         l->display_list >= (int32_t)counts[3] || !finite3(l->trans) ||
         !finite3(l->rot_deg)) {
       err = "host_mesh: invalid limb record";
+      goto fail;
+    }
+  }
+  /* Topological order: repeatedly emit limbs whose parent is emitted. */
+  impl->limb_order = (uint32_t *)calloc(counts[4], sizeof(uint32_t));
+  if (!impl->limb_order) {
+    err = "host_mesh: out of memory";
+    goto fail;
+  }
+  {
+    uint8_t *emitted = (uint8_t *)calloc(counts[4], 1);
+    if (!emitted) {
+      err = "host_mesh: out of memory";
+      goto fail;
+    }
+    uint32_t n = 0, roots = 0;
+    while (n < counts[4]) {
+      uint32_t progress = 0;
+      for (uint32_t i = 0; i < counts[4]; i++) {
+        if (emitted[i]) continue;
+        const int32_t parent = impl->limbs[i].parent;
+        if (parent == -1 || emitted[parent]) {
+          if (parent == -1) roots++;
+          impl->limb_order[n++] = i;
+          emitted[i] = 1;
+          progress++;
+        }
+      }
+      if (!progress) break;
+    }
+    free(emitted);
+    if (n != counts[4]) {
+      err = "host_mesh: limb parent cycle";
+      goto fail;
+    }
+    if (roots == 0) {
+      err = "host_mesh: no root limb";
       goto fail;
     }
   }
@@ -314,6 +352,7 @@ HostMesh *host_mesh_load(const void *blob_in, size_t size, const char **error) {
   impl->pub.display_lists = impl->display_lists;
   impl->pub.limbs = impl->limbs;
   impl->pub.poses = impl->poses;
+  impl->pub.limb_order = impl->limb_order;
   impl->pub.model_scale = model_scale;
 
   /* Bind-pose bounds: place every limb and accumulate its display list. */
@@ -353,6 +392,7 @@ void host_mesh_free(HostMesh *mesh) {
   free(impl->poses);
   free(impl->pixels);
   free(impl->pose_rot);
+  free(impl->limb_order);
   free(impl->blob);
   free(impl);
 }
@@ -514,7 +554,8 @@ static int place_limbs(const HostMeshDrawParams *params, PlacedLimb *out) {
       (params->pose >= 0 && params->pose < (int)mesh->pose_count)
           ? &mesh->poses[params->pose]
           : NULL;
-  for (uint32_t i = 0; i < mesh->limb_count; i++) {
+  for (uint32_t oi = 0; oi < mesh->limb_count; oi++) {
+    const uint32_t i = mesh->limb_order[oi];
     const HostMeshLimb *limb = &mesh->limbs[i];
     HostMeshVec3 trans = limb->trans;
     HostMeshVec3 rot = pose ? pose->rot_deg[i] : limb->rot_deg;
@@ -686,17 +727,24 @@ static void shade_fragment(const Raster *rs, const HostMeshMaterial *m,
     rgb[2] *= shade[2];
     alpha *= shade[3];
   }
-  if (m->flags & HOST_MESH_MAT_PRIM_COLOR) {
-    rgb[0] *= m->prim[0] / 255.0f;
-    rgb[1] *= m->prim[1] / 255.0f;
-    rgb[2] *= m->prim[2] / 255.0f;
+  if (m->flags & HOST_MESH_MAT_LERP_PRIM_ENV) {
+    for (int c = 0; c < 3; c++) {
+      const float pr = m->prim[c] / 255.0f, en = m->env[c] / 255.0f;
+      rgb[c] = en + (pr - en) * rgb[c];
+    }
+  } else {
+    if (m->flags & HOST_MESH_MAT_PRIM_COLOR) {
+      rgb[0] *= m->prim[0] / 255.0f;
+      rgb[1] *= m->prim[1] / 255.0f;
+      rgb[2] *= m->prim[2] / 255.0f;
+    }
+    if (m->flags & HOST_MESH_MAT_ENV_COLOR) {
+      rgb[0] *= m->env[0] / 255.0f;
+      rgb[1] *= m->env[1] / 255.0f;
+      rgb[2] *= m->env[2] / 255.0f;
+    }
   }
   if (m->flags & HOST_MESH_MAT_PRIM_ALPHA) alpha *= m->prim[3] / 255.0f;
-  if (m->flags & HOST_MESH_MAT_ENV_COLOR) {
-    rgb[0] *= m->env[0] / 255.0f;
-    rgb[1] *= m->env[1] / 255.0f;
-    rgb[2] *= m->env[2] / 255.0f;
-  }
   if (m->flags & HOST_MESH_MAT_ENV_ALPHA) alpha *= m->env[3] / 255.0f;
   const HostMeshDrawParams *p = rs->params;
   out[0] = clampf(rgb[0] * p->tint[0], 0.0f, 1.0f);

@@ -7,6 +7,7 @@ $args = @(
     "-I$root\runner\src",
     "$root\tests\host_mesh\host_mesh_test.c",
     "$root\runner\src\host_mesh.c",
+    "$root\runner\src\host_mesh_builder.c",
     "-o", $out
 )
 New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null

@@ -46,6 +46,9 @@ enum {
   HOST_MESH_MAT_NO_ZWRITE = 1u << 12,   /* decal / effect: test but no write */
   HOST_MESH_MAT_NO_ZTEST = 1u << 13,    /* always on top (billboard glow) */
   HOST_MESH_MAT_ADDITIVE = 1u << 14,    /* additive blend instead of lerp */
+  HOST_MESH_MAT_LERP_PRIM_ENV = 1u << 15, /* rgb = env + (prim - env) * tex (N64
+                                             (PRIM-ENV)*TEXEL0+ENV combiner);
+                                             overrides PRIM/ENV_COLOR multiply */
 };
 
 /* Texture wrap modes per axis. Masks emulate the N64 tile mask (power of two
@@ -96,7 +99,9 @@ typedef struct HostMeshDisplayList {
 } HostMeshDisplayList;
 
 typedef struct HostMeshLimb {
-  int32_t parent;       /* -1 for the root; parents precede children */
+  int32_t parent;       /* -1 for the root; any acyclic order is accepted,
+                           indices are preserved so callers can use the
+                           source skeleton's limb numbering */
   int32_t display_list; /* index or -1 */
   HostMeshVec3 trans;   /* model units */
   HostMeshVec3 rot_deg; /* bind rotation, degrees, applied Z then Y then X */
@@ -121,6 +126,8 @@ typedef struct HostMesh {
   const HostMeshDisplayList *display_lists;
   const HostMeshLimb *limbs;
   const HostMeshPose *poses;
+  /* Limb indices in an order where every parent precedes its children. */
+  const uint32_t *limb_order;
   float model_scale;    /* informational: source units per model unit */
   /* Bind-pose bounding box in model space (all limbs, all display lists
    * referenced by limbs). */

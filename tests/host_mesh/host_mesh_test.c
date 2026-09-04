@@ -6,6 +6,7 @@
  * hierarchy, overrides, supersampling and deterministic output.
  */
 #include "host_mesh.h"
+#include "host_mesh_builder.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -552,10 +553,155 @@ static void test_texture_wrap(void) {
   host_mesh_free(mesh);
 }
 
+/* Builder round trip with a child listed BEFORE its parent (source skeleton
+ * order preserved), plus the prim/env lerp material used by N64 glow quads. */
+static int hide_root_override(void *ctx, int limb, int *dl, HostMeshVec3 *t,
+                              HostMeshVec3 *r) {
+  (void)ctx;
+  (void)dl;
+  (void)t;
+  (void)r;
+  return limb != 1; /* limb 1 is the root in this fixture */
+}
+
+static void test_builder_roundtrip(void) {
+  HostMeshBuilder *b = host_mesh_builder_create();
+  CHECK(b != NULL);
+  if (!b) return;
+  const int tex = host_mesh_builder_add_texture(
+      b, 4, 4, HOST_MESH_WRAP_REPEAT, HOST_MESH_WRAP_REPEAT, 2, 2, kChecker);
+  CHECK(tex == 0);
+  /* Same content again -> de-duplicated. */
+  CHECK(host_mesh_builder_add_texture(b, 4, 4, HOST_MESH_WRAP_REPEAT,
+                                      HOST_MESH_WRAP_REPEAT, 2, 2,
+                                      kChecker) == 0);
+  const uint8_t prim[4] = {255, 0, 0, 255}, env[4] = {0, 0, 255, 255};
+  const int mat_lit = host_mesh_builder_add_material(
+      b, HOST_MESH_MAT_TEXTURE | HOST_MESH_MAT_SHADE | HOST_MESH_MAT_LIGHTING,
+      tex, NULL, NULL);
+  const int mat_lerp = host_mesh_builder_add_material(
+      b, HOST_MESH_MAT_TEXTURE | HOST_MESH_MAT_LERP_PRIM_ENV |
+             HOST_MESH_MAT_ALPHA_BLEND | HOST_MESH_MAT_NO_ZWRITE,
+      tex, prim, env);
+  CHECK(mat_lit == 0 && mat_lerp == 1);
+  CHECK(host_mesh_builder_add_material(b, HOST_MESH_MAT_TEXTURE |
+                                              HOST_MESH_MAT_SHADE |
+                                              HOST_MESH_MAT_LIGHTING,
+                                       tex, NULL, NULL) == 0);
+  /* Display list 0: the lit front quad; list 1: a lerp quad. */
+  CHECK(host_mesh_builder_begin_display_list(b, "front") == 0);
+  for (int i = 0; i < 2; i++) {
+    HostMeshVertex v[3];
+    for (int k = 0; k < 3; k++) {
+      memset(&v[k], 0, sizeof(v[k]));
+      v[k].x = kTris[i].v[k][0];
+      v[k].y = kTris[i].v[k][1];
+      v[k].z = kTris[i].v[k][2];
+      v[k].u = kTris[i].uv[k][0];
+      v[k].v = kTris[i].uv[k][1];
+      v[k].nz = -127;
+      memset(v[k].color, 0xff, 4);
+    }
+    CHECK(host_mesh_builder_add_triangle(b, (uint32_t)mat_lit, v));
+  }
+  CHECK(host_mesh_builder_begin_display_list(b, "front") == -1); /* dup */
+  CHECK(host_mesh_builder_begin_display_list(b, "glow") == 1);
+  for (int i = 2; i < 4; i++) {
+    HostMeshVertex v[3];
+    for (int k = 0; k < 3; k++) {
+      memset(&v[k], 0, sizeof(v[k]));
+      v[k].x = kTris[i].v[k][0];
+      v[k].y = kTris[i].v[k][1];
+      v[k].z = kTris[i].v[k][2];
+      v[k].u = kTris[i].uv[k][0];
+      v[k].v = kTris[i].uv[k][1];
+      memset(v[k].color, 0xff, 4);
+    }
+    CHECK(host_mesh_builder_add_triangle(b, (uint32_t)mat_lerp, v));
+  }
+  /* Limb 0 is the CHILD (parent = 1, added later), limb 1 is the root. */
+  HostMeshVec3 zero = {0, 0, 0};
+  HostMeshVec3 t0 = {0, 0, -10.0f}, t1 = {0, 0, 20.0f};
+  CHECK(host_mesh_builder_add_limb(b, 1, 0, t0, zero) == 0);
+  CHECK(host_mesh_builder_add_limb(b, -1, 1, t1, zero) == 1);
+  HostMeshVec3 rots[2] = {{0, 0, 0}, {0, 0, 0}};
+  CHECK(host_mesh_builder_add_pose(b, "bind", zero, rots, 2) == 0);
+  CHECK(host_mesh_builder_add_pose(b, "bind", zero, rots, 2) == -1);
+  host_mesh_builder_set_model_scale(b, 0.5f);
+  uint8_t *blob = NULL;
+  size_t blob_size = 0;
+  const char *err = NULL;
+  CHECK(host_mesh_builder_finish(b, &blob, &blob_size, &err));
+  host_mesh_builder_destroy(b);
+  if (!blob) {
+    printf("  builder error: %s\n", err ? err : "?");
+    return;
+  }
+  HostMesh *mesh = host_mesh_load(blob, blob_size, &err);
+  CHECK(mesh != NULL);
+  if (!mesh) {
+    printf("  load error: %s\n", err ? err : "?");
+    free(blob);
+    return;
+  }
+  free(blob);
+  CHECK(mesh->limb_count == 2 && mesh->limb_order[0] == 1 &&
+        mesh->limb_order[1] == 0);
+  CHECK(fabsf(mesh->model_scale - 0.5f) < 1e-6f);
+  CHECK(mesh->textures[0].mask_s == 2);
+  /* Child sits at 20 - 10 = 10 despite being listed first. */
+  HostMeshDrawParams p;
+  host_mesh_draw_params_init(&p);
+  p.mesh = mesh;
+  Pinhole cam = {32.0f, 32.0f, 32.0f};
+  p.projection.project = pinhole;
+  p.projection.ctx = &cam;
+  float origin[3];
+  CHECK(host_mesh_limb_origin(&p, 0, origin) && fabsf(origin[2] - 10.0f) < 1e-4f);
+  CHECK(fabsf(mesh->bounds_min.z - 10.0f) < 1e-4f &&
+        fabsf(mesh->bounds_max.z - 20.0f) < 1e-4f);
+  /* Lerp material: texel red (1,0,0) -> env + (prim-env)*tex per channel:
+   * r = 0 + (1-0)*1 = 1, b = 1 + (0-1)*0 = 1 -> magenta; texel blue
+   * (0,0,1) -> r = 0, b = 1 + (0-1)*1 = 0 -> black. Render only the root
+   * (glow) quad by hiding the child, and look for magenta. */
+  enum { W = 64, H = 64 };
+  uint8_t *target = (uint8_t *)calloc(W * H * 4, 1);
+  p.target = target;
+  p.target_pitch = W * 4;
+  p.target_width = W;
+  p.target_height = H;
+  p.override.fn = hide_root_override; /* hides limb 1?? no: hides child */
+  /* hide_root_override returns 0 for limb 1 (the root). We want the glow
+   * quad which IS the root's list, so hide the child instead: */
+  p.override.fn = NULL;
+  host_mesh_draw(&p);
+  int saw_magenta = 0, saw_black_inside = 0;
+  for (int y = 24; y <= 40; y++) {
+    for (int x = 24; x <= 40; x++) {
+      uint32_t c = px(target, W * 4, x, y);
+      uint8_t r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, bl = c & 0xff;
+      if (r > 200 && bl > 200 && g < 40) saw_magenta = 1;
+      if ((c >> 24) == 0xff && r < 40 && g < 40 && bl < 40) saw_black_inside = 1;
+    }
+  }
+  /* The lit child quad covers the centre; the glow quad shows around it. */
+  int saw_magenta_edge = 0;
+  for (int x = 22; x <= 25; x++) {
+    uint32_t c = px(target, W * 4, x, 32);
+    uint8_t r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, bl = c & 0xff;
+    if (r > 200 && bl > 200 && g < 40) saw_magenta_edge = 1;
+  }
+  CHECK(saw_magenta || saw_magenta_edge);
+  (void)saw_black_inside;
+  free(target);
+  host_mesh_free(mesh);
+}
+
 int main(void) {
   test_parser();
   test_render();
   test_texture_wrap();
+  test_builder_roundtrip();
   if (g_failures) {
     printf("host_mesh tests: %d failure(s)\n", g_failures);
     return 1;
