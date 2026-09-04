@@ -26,12 +26,94 @@ typedef struct Voice {
     SNESModAudioClip clip;
     uint64_t phase; /* source-frame position in unsigned 32.32 fixed point */
     int gain_percent;
+    int pitch_q10;   /* source-rate multiplier, 1024 = unity */
+    int looping;
+    uint32_t loop_start;
+    uint32_t loop_end; /* exclusive */
+    uint32_t generation; /* distinguishes reuse of the same slot */
 } Voice;
 
 static ClipSlot s_clips[SNES_MOD_AUDIO_MAX_CLIPS];
 static Voice s_voices[SNES_MOD_AUDIO_MAX_VOICES];
 static unsigned s_replace_cursor;
 static size_t s_clip_bytes;
+static uint32_t s_voice_generation;
+static ClipSlot *clip_slot(SNESModAudioClip clip);
+
+/* Handle = (generation << 4) | slot + 1, generation masked so the int handle
+ * stays positive. */
+static SNESModAudioVoice voice_handle(int slot) {
+    return (SNESModAudioVoice)(((s_voices[slot].generation & 0x07ffffffu) << 4) |
+                               (unsigned)(slot + 1));
+}
+
+static Voice *voice_from_handle(SNESModAudioVoice handle) {
+    if (handle <= 0) return NULL;
+    const int slot = (int)((unsigned)handle & 0xfu) - 1;
+    if (slot < 0 || slot >= SNES_MOD_AUDIO_MAX_VOICES) return NULL;
+    Voice *voice = &s_voices[slot];
+    if (voice->clip == SNES_MOD_AUDIO_CLIP_INVALID) return NULL;
+    if ((voice->generation & 0x07ffffffu) != ((unsigned)handle >> 4)) return NULL;
+    return voice;
+}
+
+static int allocate_voice_locked(void) {
+    int index;
+    for (index = 0; index < SNES_MOD_AUDIO_MAX_VOICES; ++index)
+        if (s_voices[index].clip == SNES_MOD_AUDIO_CLIP_INVALID) break;
+    if (index == SNES_MOD_AUDIO_MAX_VOICES) {
+        /* Prefer stealing a one-shot over a loop. */
+        for (unsigned probe = 0; probe < SNES_MOD_AUDIO_MAX_VOICES; ++probe) {
+            const unsigned candidate =
+                (s_replace_cursor + probe) % SNES_MOD_AUDIO_MAX_VOICES;
+            if (!s_voices[candidate].looping) {
+                index = (int)candidate;
+                s_replace_cursor = (candidate + 1u) % SNES_MOD_AUDIO_MAX_VOICES;
+                break;
+            }
+        }
+        if (index == SNES_MOD_AUDIO_MAX_VOICES) {
+            index = (int)s_replace_cursor;
+            s_replace_cursor = (s_replace_cursor + 1u) % SNES_MOD_AUDIO_MAX_VOICES;
+        }
+    }
+    memset(&s_voices[index], 0, sizeof(Voice));
+    s_voices[index].generation = ++s_voice_generation;
+    s_voices[index].pitch_q10 = 1024;
+    return index;
+}
+
+static SNESModAudioVoice start_voice(SNESModAudioClip clip, int gain_percent,
+                                     int looping, uint32_t loop_start,
+                                     uint32_t loop_end) {
+    RtlApuLock();
+    ClipSlot *slot = clip_slot(clip);
+    if (!slot) {
+        RtlApuUnlock();
+        return SNES_MOD_AUDIO_VOICE_INVALID;
+    }
+    if (gain_percent < 0) gain_percent = 0;
+    if (gain_percent > 200) gain_percent = 200;
+    if (looping) {
+        if (loop_end == 0 || loop_end > slot->frame_count)
+            loop_end = slot->frame_count;
+        if (loop_start >= loop_end) loop_start = 0;
+        if (loop_end - loop_start < 2) {
+            RtlApuUnlock();
+            return SNES_MOD_AUDIO_VOICE_INVALID;
+        }
+    }
+    const int index = allocate_voice_locked();
+    s_voices[index].clip = clip;
+    s_voices[index].phase = 0;
+    s_voices[index].gain_percent = gain_percent;
+    s_voices[index].looping = looping;
+    s_voices[index].loop_start = loop_start;
+    s_voices[index].loop_end = loop_end;
+    const SNESModAudioVoice handle = voice_handle(index);
+    RtlApuUnlock();
+    return handle;
+}
 
 static ClipSlot *clip_slot(SNESModAudioClip clip) {
     if (clip <= 0 || clip > SNES_MOD_AUDIO_MAX_CLIPS) return NULL;
@@ -100,25 +182,57 @@ void snes_mod_audio_unregister(SNESModAudioClip clip) {
 }
 
 int snes_mod_audio_play(SNESModAudioClip clip, int gain_percent) {
+    return start_voice(clip, gain_percent, 0, 0, 0) != SNES_MOD_AUDIO_VOICE_INVALID;
+}
+
+SNESModAudioVoice snes_mod_audio_play_voice(SNESModAudioClip clip,
+                                            int gain_percent) {
+    return start_voice(clip, gain_percent, 0, 0, 0);
+}
+
+SNESModAudioVoice snes_mod_audio_play_loop(SNESModAudioClip clip,
+                                           int gain_percent,
+                                           uint32_t loop_start_frame,
+                                           uint32_t loop_end_frame) {
+    return start_voice(clip, gain_percent, 1, loop_start_frame, loop_end_frame);
+}
+
+int snes_mod_audio_set_voice_gain(SNESModAudioVoice voice, int gain_percent) {
     RtlApuLock();
-    if (!clip_slot(clip)) {
-        RtlApuUnlock();
-        return 0;
+    Voice *v = voice_from_handle(voice);
+    if (v) {
+        if (gain_percent < 0) gain_percent = 0;
+        if (gain_percent > 200) gain_percent = 200;
+        v->gain_percent = gain_percent;
     }
-    if (gain_percent < 0) gain_percent = 0;
-    if (gain_percent > 200) gain_percent = 200;
-    int index;
-    for (index = 0; index < SNES_MOD_AUDIO_MAX_VOICES; ++index)
-        if (s_voices[index].clip == SNES_MOD_AUDIO_CLIP_INVALID) break;
-    if (index == SNES_MOD_AUDIO_MAX_VOICES) {
-        index = (int)s_replace_cursor;
-        s_replace_cursor = (s_replace_cursor + 1u) % SNES_MOD_AUDIO_MAX_VOICES;
-    }
-    s_voices[index].clip = clip;
-    s_voices[index].phase = 0;
-    s_voices[index].gain_percent = gain_percent;
     RtlApuUnlock();
-    return 1;
+    return v != NULL;
+}
+
+int snes_mod_audio_set_voice_pitch(SNESModAudioVoice voice, int pitch_q10) {
+    RtlApuLock();
+    Voice *v = voice_from_handle(voice);
+    if (v) {
+        if (pitch_q10 < 256) pitch_q10 = 256;
+        if (pitch_q10 > 4096) pitch_q10 = 4096;
+        v->pitch_q10 = pitch_q10;
+    }
+    RtlApuUnlock();
+    return v != NULL;
+}
+
+void snes_mod_audio_stop_voice(SNESModAudioVoice voice) {
+    RtlApuLock();
+    Voice *v = voice_from_handle(voice);
+    if (v) memset(v, 0, sizeof(*v));
+    RtlApuUnlock();
+}
+
+int snes_mod_audio_voice_active(SNESModAudioVoice voice) {
+    RtlApuLock();
+    const int active = voice_from_handle(voice) != NULL;
+    RtlApuUnlock();
+    return active;
 }
 
 void snes_mod_audio_stop_all(void) {
@@ -179,14 +293,26 @@ void snes_mod_audio_mix(int16_t *dst, int frame_count, uint32_t output_rate,
                 mixed[channel] += ((int64_t)sample * voice->gain_percent) / 100;
             }
             const uint64_t step =
-                ((uint64_t)slot->sample_rate << 32) / output_rate;
+                (((uint64_t)slot->sample_rate << 32) / output_rate) *
+                (uint64_t)(voice->pitch_q10 > 0 ? voice->pitch_q10 : 1024) /
+                1024u;
             if (voice->phase > UINT64_MAX - step)
                 memset(voice, 0, sizeof(*voice));
             else
                 voice->phase += step;
-            if (voice->clip != SNES_MOD_AUDIO_CLIP_INVALID &&
-                (voice->phase >> 32) >= slot->frame_count)
+            if (voice->clip == SNES_MOD_AUDIO_CLIP_INVALID) continue;
+            if (voice->looping) {
+                if ((voice->phase >> 32) >= voice->loop_end) {
+                    const uint64_t span =
+                        ((uint64_t)(voice->loop_end - voice->loop_start)) << 32;
+                    voice->phase -= span;
+                    if ((voice->phase >> 32) < voice->loop_start ||
+                        (voice->phase >> 32) >= voice->loop_end)
+                        voice->phase = (uint64_t)voice->loop_start << 32;
+                }
+            } else if ((voice->phase >> 32) >= slot->frame_count) {
                 memset(voice, 0, sizeof(*voice));
+            }
         }
         for (uint32_t channel = 0; channel < output_channels; ++channel)
             dst[(size_t)frame * output_channels + channel] = clamp_s16(mixed[channel]);

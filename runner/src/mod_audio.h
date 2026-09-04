@@ -31,6 +31,35 @@ void snes_mod_audio_unregister(SNESModAudioClip clip);
 /* Starts an overlapping one-shot. gain_percent is clamped to 0..200. */
 int snes_mod_audio_play(SNESModAudioClip clip, int gain_percent);
 
+/* Voice handles identify a playing instance; 0 is invalid. */
+typedef int SNESModAudioVoice;
+#define SNES_MOD_AUDIO_VOICE_INVALID 0
+
+/* Starts a one-shot and returns its voice handle so it can be stopped or
+ * re-gained early (e.g. a brake sound cut short). */
+SNESModAudioVoice snes_mod_audio_play_voice(SNESModAudioClip clip,
+                                            int gain_percent);
+
+/* Starts a looping voice (engine hum, charge whine). loop_start_frame /
+ * loop_end_frame bound the repeated region; pass 0 / 0 to loop the whole
+ * clip. Loops never self-expire: stop them explicitly. */
+SNESModAudioVoice snes_mod_audio_play_loop(SNESModAudioClip clip,
+                                           int gain_percent,
+                                           uint32_t loop_start_frame,
+                                           uint32_t loop_end_frame);
+
+/* Adjust a playing voice's gain (0..200) or pitch (source-rate multiplier in
+ * 1/1024 units, 1024 = unity, clamped 256..4096). Return 0 when the voice
+ * has already ended or the handle is stale. */
+int snes_mod_audio_set_voice_gain(SNESModAudioVoice voice, int gain_percent);
+int snes_mod_audio_set_voice_pitch(SNESModAudioVoice voice, int pitch_q10);
+
+/* Stop one voice; a stale handle is ignored. */
+void snes_mod_audio_stop_voice(SNESModAudioVoice voice);
+
+/* Nonzero while the voice is still playing. */
+int snes_mod_audio_voice_active(SNESModAudioVoice voice);
+
 /* Stop every voice while retaining registrations. Call on reset and after a
  * successful save-state load because host delivery state is not serialized. */
 void snes_mod_audio_stop_all(void);
