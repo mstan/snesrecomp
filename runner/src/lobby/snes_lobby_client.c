@@ -217,6 +217,9 @@ typedef struct {
     RNetSignal sig_hold[24];
     int   sig_hold_n;
     char  sig_hold_from[SNES_LOBBY_ID_LEN];
+    int      xfer_last_state;    /* last RNetIceState logged */
+    uint64_t xfer_started_ms;    /* for the stall watchdog */
+    uint64_t xfer_connected_ms;
     SnesLobbyModPkg need_mods[SNES_LOBBY_MAX_MODS];
     int need_mods_count;
     int need_mods_can_transfer;
@@ -379,6 +382,7 @@ static int json_extract_object(const char *json, const char *key, char *out, siz
 static void send_set_ready(int ready);
 static void mod_xfer_on_request(const char *from, const char *text);
 static void mod_xfer_fail(const char *why);
+static int mod_ice_type_for_push(int emitted_type);
 static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out);
 static void ingest_match_caps_from_json(const char *json);
 static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatchCaps *caps);
@@ -746,6 +750,24 @@ static int append_mod_offer(char *dst, size_t cap)
     if ((size_t)used + 2 >= cap) return 0;
     dst[used++] = '}';
     dst[used] = '\0';
+    /* The lobby server discards a mod_offer object larger than 2048 bytes
+     * (sanitize_mod_offer), and a discarded offer is indistinguishable from
+     * "this peer has nothing" -- which reads as missing every mod and holds
+     * the match. Refuse here, where the reason can be said out loud. The
+     * measured field is the object itself, not the `,"mod_offer":` prefix the
+     * server never sees. */
+    {
+        const char *obj = strchr(dst, '{');
+        const size_t obj_len = obj ? strlen(obj) : (size_t)used;
+        if (obj_len > 2000) {
+            fprintf(stderr,
+                    "snes_lobby: the installed mod set is %zu bytes, over the "
+                    "lobby server's 2048-byte limit; it was not announced\n",
+                    obj_len);
+            dst[0] = '\0';
+            return 0;
+        }
+    }
     return used;
 }
 
@@ -967,11 +989,25 @@ static void parse_slots_array(const char *json)
                 g_lc.members[n].slot = json_get_int(chunk, "slot", n);
                 json_get_str(chunk, "player_id", g_lc.members[n].player_id,
                              sizeof(g_lc.members[n].player_id));
-                g_lc.member_offer_count[n] =
-                    clipped ? 0
-                            : parse_mod_pkg_array(chunk, "mod_offer",
-                                                  g_lc.member_offer[n],
-                                                  SNES_LOBBY_MAX_MODS);
+                /* mod_offer is an OBJECT -- {"pkgs":[...]} -- not a bare
+                 * array. The server requires an object (sanitize_mod_offer
+                 * rejects anything else) and echoes it back verbatim, so the
+                 * array has to be reached through it.
+                 *
+                 * Read as a bare array this returned zero rows every time, so
+                 * the host saw every peer as owning nothing: a guest with both
+                 * mods installed and showing OK on its own screen was still
+                 * refused at Play, and the message named a mod it had. */
+                g_lc.member_offer_count[n] = 0;
+                if (!clipped) {
+                    char offer_obj[SNES_LOBBY_MAX_MODS * 256 + 64];
+                    if (json_extract_object(chunk, "mod_offer", offer_obj,
+                                            sizeof(offer_obj)))
+                        g_lc.member_offer_count[n] =
+                            parse_mod_pkg_array(offer_obj, "pkgs",
+                                                g_lc.member_offer[n],
+                                                SNES_LOBBY_MAX_MODS);
+                }
                 if (clipped)
                     fprintf(stderr,
                             "snes_lobby: slot %d row did not fit; treating its "
@@ -1354,8 +1390,10 @@ static void handle_server_json(const char *json)
              * from anyone else is either a stale exchange or someone else's,
              * and feeding it to the agent breaks the live negotiation. */
             RNetSignal sig;
+            const int t = mod_ice_type_for_push(type -
+                                                SNES_LOBBY_SIG_MOD_ICE_BASE);
             memset(&sig, 0, sizeof(sig));
-            sig.type = (RNetSignalType)(type - SNES_LOBBY_SIG_MOD_ICE_BASE);
+            sig.type = (RNetSignalType)t;
             sig.flag = (rnet_u8)flag;
             snprintf(sig.text, sizeof(sig.text), "%s", text);
             if (g_lc.xfer && from[0] && !strcmp(from, g_lc.xfer_peer)) {
@@ -2215,6 +2253,29 @@ int snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out)
  * connection, on the same relay the seats already use.
  */
 
+/* What an agent EMITS is not what its peer must be PUSHED.
+ *
+ * An agent describes itself with LOCAL_SDP / LOCAL_CANDIDATE; the far side has
+ * to receive those as REMOTE_*, because to it they are the remote description.
+ * Forwarded unchanged, both agents gather candidates, neither ever learns the
+ * other's description, and both sit in "connecting" until they time out --
+ * with nothing in either log to show they were talking past each other.
+ *
+ * snes_netplay.c does the same translation for the game's own session and says
+ * so in a one-line comment. Kept as a named function here so the rule is a
+ * thing that can be asserted, not a pair of ifs buried in a message handler.
+ *
+ * GATHERING_DONE and SET_CONTROLLING mean the same on both sides and pass
+ * through. */
+static int mod_ice_type_for_push(int emitted_type)
+{
+    if (emitted_type == (int)RNET_SIGNAL_LOCAL_SDP)
+        return (int)RNET_SIGNAL_REMOTE_SDP;
+    if (emitted_type == (int)RNET_SIGNAL_LOCAL_CANDIDATE)
+        return (int)RNET_SIGNAL_REMOTE_CANDIDATE;
+    return emitted_type;
+}
+
 static void mod_xfer_emit(const RNetSignal *msg, void *user)
 {
     (void)user;
@@ -2250,10 +2311,23 @@ static void mod_xfer_fail(const char *why)
 
 /* Build the ICE config from the lobby's Coturn mint. Copied into g_lc because
  * RNetIceConfig holds borrowed pointers that must outlive the agent. */
-static int mod_xfer_ice_config(RNetIceConfig *ice)
+static int mod_xfer_ice_config(RNetIceConfig *ice, int controlling)
 {
     const SnesLobbyTurnCredentials *tc = snes_lobby_turn_credentials();
     rnet_ice_config_init_defaults(ice);
+    /* The role is decided HERE, before the agent exists.
+     *
+     * rnet_ice_config_init_defaults leaves controlling = 1, and
+     * rnet_ice_xfer_open starts gathering immediately -- so leaving it alone
+     * made both peers offerers, which is what libjuice was reporting as
+     * "ICE role conflict (both controlling)". It still connected, because ICE
+     * resolves a conflict by comparing tiebreakers, but the two then raced to
+     * offer instead of one offering and one answering.
+     *
+     * The answerer defers gathering until the offer arrives (see
+     * rnet_ice_agent_start_gathering), which is also why the requester used to
+     * emit candidates before the sender had an agent at all. */
+    ice->controlling = (rnet_u8)(controlling ? 1 : 0);
     if (!tc || !tc->valid)
         return 0;              /* host-candidate only; fine on a LAN */
     if (tc->stun_host[0]) {
@@ -2276,25 +2350,25 @@ static int mod_xfer_ice_config(RNetIceConfig *ice)
 static int mod_xfer_open(const char *peer, int controlling)
 {
     RNetIceConfig ice;
-    RNetSignal set_role;
 
     if (g_lc.xfer) rnet_ice_xfer_close(&g_lc.xfer);
-    (void)mod_xfer_ice_config(&ice);
+    (void)mod_xfer_ice_config(&ice, controlling);
     if (rnet_ice_xfer_open(&g_lc.xfer, &ice, mod_xfer_emit, NULL) != 0 ||
         !g_lc.xfer) {
         mod_xfer_fail("could not open a direct connection");
         return -1;
     }
     snprintf(g_lc.xfer_peer, sizeof(g_lc.xfer_peer), "%s", peer ? peer : "");
-    /* libjuice has no set-role API; the agent takes this as a gather-order
-     * hint, and the two sides must not both claim it. The SENDER controls. */
-    memset(&set_role, 0, sizeof(set_role));
-    set_role.type = RNET_SIGNAL_SET_CONTROLLING;
-    set_role.flag = (rnet_u8)(controlling ? 1 : 0);
-    rnet_ice_xfer_push_signal(g_lc.xfer, &set_role);
+    /* No SET_CONTROLLING signal is pushed here. It would arrive after
+     * rnet_ice_xfer_open has already started gathering, so it could only
+     * change a flag after the decision it governs had been made -- the role
+     * belongs in the config above, where the agent reads it. */
     g_lc.xfer_busy = 1;
     g_lc.xfer_progress = 0;
     g_lc.xfer_err[0] = '\0';
+    g_lc.xfer_last_state = -1;
+    g_lc.xfer_started_ms = lobby_mono_ms();
+    g_lc.xfer_connected_ms = 0;
 
     /* Replay anything that arrived while we were still getting ready, but
      * only from the peer this agent is for -- a hold from an abandoned
@@ -2433,14 +2507,30 @@ static void mod_xfer_on_blob(uint8_t *data, size_t len)
     char id[96];
     char ver[32];
 
+    fprintf(stderr, "snes_lobby: received %u byte(s) over the direct link\n",
+            (unsigned)len);
     if (!g_lc.xfer_sha[0]) {
         /* First blob is the header. */
         char text[600];
         size_t n = len < sizeof(text) - 1 ? len : sizeof(text) - 1;
         memcpy(text, data, n);
         text[n] = '\0';
+        char got_id[SNES_LOBBY_MOD_ID_LEN];
+        got_id[0] = '\0';
         json_get_str(text, "sha256", g_lc.xfer_sha, sizeof(g_lc.xfer_sha));
-        json_get_str(text, "id", g_lc.xfer_id, sizeof(g_lc.xfer_id));
+        json_get_str(text, "id", got_id, sizeof(got_id));
+        /* The host is answering a specific request. If it describes a
+         * different package, something is confused on one side or the other
+         * and installing it anyway would put a mod on this machine that
+         * nobody asked for. */
+        if (g_lc.xfer_id[0] && got_id[0] && strcmp(got_id, g_lc.xfer_id) != 0) {
+            free(data);
+            mod_xfer_fail("the host offered a different mod than the one "
+                          "requested");
+            return;
+        }
+        if (got_id[0])
+            snprintf(g_lc.xfer_id, sizeof(g_lc.xfer_id), "%s", got_id);
         json_get_str(text, "ver", g_lc.xfer_ver, sizeof(g_lc.xfer_ver));
         g_lc.xfer_expect = (uint32_t)json_get_int(text, "len", 0);
         free(data);
@@ -2487,10 +2577,48 @@ void snes_lobby_mod_xfer_pump(void)
     if (!g_lc.xfer) return;
     rnet_ice_xfer_pump(g_lc.xfer);
 
+    /* Narrate the handshake. Without this a transfer that never connects and
+     * one that connects and stalls look identical from the log: both are just
+     * silence after "asked the host". */
+    {
+        const RNetIceState st = rnet_ice_xfer_state(g_lc.xfer);
+        if ((int)st != g_lc.xfer_last_state) {
+            g_lc.xfer_last_state = (int)st;
+            fprintf(stderr, "snes_lobby: mod transfer link is %s\n",
+                    rnet_ice_state_name(st));
+            if ((st == RNET_ICE_STATE_CONNECTED ||
+                 st == RNET_ICE_STATE_COMPLETED) && !g_lc.xfer_connected_ms)
+                g_lc.xfer_connected_ms = lobby_mono_ms();
+        }
+    }
+
     if (rnet_ice_xfer_failed(g_lc.xfer, err, sizeof(err))) {
         mod_xfer_fail(err);
         return;
     }
+
+    /* Stall watchdog.
+     *
+     * A transfer that never connects used to sit at "busy" forever, and
+     * because only one runs at a time every later attempt was refused with
+     * "could not start the download" -- a message about the second click that
+     * was really about the first one never ending. ICE either finds a path in
+     * well under this or it is not going to. */
+    {
+        const uint64_t now = lobby_mono_ms();
+        const uint64_t age = now - g_lc.xfer_started_ms;
+        if (!g_lc.xfer_connected_ms && age > 45000u) {
+            mod_xfer_fail("could not open a direct connection to the other "
+                          "player (no route found)");
+            return;
+        }
+        if (g_lc.xfer_connected_ms &&
+            now - g_lc.xfer_connected_ms > 180000u) {
+            mod_xfer_fail("the transfer stopped making progress");
+            return;
+        }
+    }
+
     {
         const int p = rnet_ice_xfer_progress(g_lc.xfer);
         if (p >= 0) g_lc.xfer_progress = p;
@@ -2517,13 +2645,26 @@ int snes_lobby_mod_request(const char *package_id, const char *version)
     if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
     if (g_lc.is_host) return -1;            /* the host IS the source */
     if (!host || !host[0]) return -1;
-    if (g_lc.xfer_busy) return -1;
+    if (g_lc.xfer_busy) {
+        fprintf(stderr, "snes_lobby: not asking for %s - already transferring "
+                        "%s\n", package_id ? package_id : "?", g_lc.xfer_id);
+        return -2;              /* distinct: busy, not broken */
+    }
     if (!package_id || !package_id[0]) return -1;
 
     if (mod_xfer_open(host, /*controlling=*/0) != 0) return -1;
     g_lc.xfer_sending = 0;
     g_lc.xfer_sha[0] = '\0';
     g_lc.xfer_expect = 0;
+    /* Named NOW, not when the header arrives.
+     *
+     * snes_lobby_mod_in_flight() is what attributes progress to a row, and
+     * what the "already transferring" message quotes. Left empty until the
+     * first blob, the requesting side spent the whole connect phase unable to
+     * say which package it was fetching: no row showed a bar, and the busy
+     * refusal read "already transferring " with a blank where the name goes. */
+    snprintf(g_lc.xfer_id, sizeof(g_lc.xfer_id), "%s", package_id);
+    snprintf(g_lc.xfer_ver, sizeof(g_lc.xfer_ver), "%s", version ? version : "");
     snprintf(text, sizeof(text), "%s@%s", package_id, version ? version : "");
     if (snes_lobby_send_signal_to(host, SNES_LOBBY_SIG_MOD_REQ, 0, text) != 0) {
         mod_xfer_fail("could not reach the host");
