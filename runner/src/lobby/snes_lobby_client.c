@@ -784,6 +784,7 @@ static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
      * what the match requires. */
     out->mod_count = parse_mod_pkg_array(obj, "mod_plan", out->mods,
                                          SNES_LOBBY_MAX_MODS);
+    json_get_str(obj, "mod_set", out->mod_set, sizeof(out->mod_set));
     out->ignore_aspect = json_get_bool(obj, "ignore_aspect", 0);
     out->input_delay = json_get_int(obj, "input_delay", 2);
     if (out->input_delay < 2) out->input_delay = 2;
@@ -809,6 +810,7 @@ static void ingest_match_caps_from_json(const char *json)
 static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatchCaps *caps)
 {
     char mods[SNES_LOBBY_MAX_MODS * 256 + 16];
+    char set_esc[sizeof(caps->mod_set) * 2 + 4];
     int n;
 
     if (!dst || dst_cap < 8 || !caps || !caps->valid) return 0;
@@ -818,11 +820,12 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
     if (!append_mod_pkg_array(mods, sizeof(mods), "mod_plan", caps->mods,
                               caps->mod_count))
         return 0;
+    json_escape(caps->mod_set, set_esc, sizeof(set_esc));
     n = snprintf(dst, dst_cap,
                  ",\"match_caps\":{\"v\":1,\"widescreen\":%s,\"widescreen_hud\":%s,"
                  "\"ignore_aspect\":%s,\"input_delay\":%d,\"ws_extra\":%d,"
                  "\"force_turn\":%s,\"force_input_relay\":%s,"
-                 "\"rollback\":%s,%s}",
+                 "\"rollback\":%s,%s,\"mod_set\":\"%s\"}",
                  caps->widescreen ? "true" : "false",
                  caps->widescreen_hud ? "true" : "false",
                  caps->ignore_aspect ? "true" : "false",
@@ -830,7 +833,7 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
                  caps->force_turn ? "true" : "false",
                  caps->force_input_relay ? "true" : "false",
                  caps->rollback ? "true" : "false",
-                 mods);
+                 mods, set_esc);
     if (n < 0 || (size_t)n >= dst_cap) return 0;
     /* The lobby server drops a match_caps object over 4096 bytes ENTIRELY
      * (sanitize_match_caps returns None), which would take widescreen,

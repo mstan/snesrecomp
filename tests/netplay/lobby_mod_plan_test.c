@@ -367,6 +367,35 @@ static void case_offer_round_trips_through_a_slot_row(void)
     snes_lobby_set_mod_offer_supplier(NULL, NULL);
 }
 
+/* The host's exact configuration has to survive the wire, because a guest
+ * adopts it verbatim. The plan says which packages; this says how they are
+ * set up, and a guest that owns both mods but enabled neither passes the
+ * plan and is still refused at launch. */
+static void case_mod_set_round_trips(void)
+{
+    SnesLobbyMatchCaps caps;
+    SnesLobbyMatchCaps back;
+    char json[SNES_LOBBY_MAX_MODS * 256 + 1024];
+    char obj[SNES_LOBBY_MAX_MODS * 256 + 1024];
+
+    memset(&caps, 0, sizeof(caps));
+    caps.valid = 1;
+    caps.mod_count = 0;
+    snprintf(caps.mod_set, sizeof(caps.mod_set),
+             "gwed.enhancement.widescreen@1.0.0/widescreen;"
+             "gwed.localization@1.0.0/localization language=en");
+    ck(append_match_caps_json(json, sizeof(json), &caps) > 0, "caps encode");
+    ck(json_extract_object(json, "match_caps", obj, sizeof(obj)) != 0,
+       "caps object extracts");
+    memset(&back, 0, sizeof(back));
+    parse_match_caps_object(obj, &back);
+    ck(!strcmp(back.mod_set, caps.mod_set),
+       "the host's effective set survives the round trip verbatim");
+    /* Option values are part of the identity, not decoration. */
+    ck(strstr(back.mod_set, "language=en") != NULL,
+       "resolved option values survive");
+}
+
 int main(void)
 {
     case_rows();
@@ -378,6 +407,7 @@ int main(void)
     case_hooks_survive_disconnect();
     case_ice_local_becomes_remote();
     case_offer_round_trips_through_a_slot_row();
+    case_mod_set_round_trips();
     printf(fails ? "\n%d failure(s)\n" : "\nall mod-plan cases passed\n", fails);
     return fails != 0;
 }
