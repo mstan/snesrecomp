@@ -87,6 +87,12 @@ typedef struct Config {
   const char *shader;
 
   bool enable_gamepad[2];
+  /* Which input device drives each player, from config.ini [Controller]
+   * SourceP1/SourceP2 as the launcher writes it: 0 none, 1 keyboard,
+   * 2 gamepad. Player 1 defaults to keyboard so a config without the section
+   * behaves as it always did; player 2 defaults to none, because a second
+   * keyboard player sharing one keyboard has to be asked for. */
+  int player_src[2];
   int gamepad_deadzone;
 
   // Which players have keyboard controls

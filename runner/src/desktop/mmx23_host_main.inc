@@ -1567,8 +1567,18 @@ error_reading:;
      * it every frame is safe. */
     {
       const uint8_t *keys = snesrecomp_sdl_get_keyboard_state();
-      uint16_t kb_p1 = keybinds_read_player(keys, 1);
-      uint16_t kb_p2 = keybinds_read_player(keys, 2);
+      /* Only a slot whose SOURCE is the keyboard reads the keyboard.
+       *
+       * Both slots' bits used to be applied every frame, so a keyboard key
+       * bound in slot 2 moved player 2 even when player 2 was a gamepad --
+       * and the two inputs fought over the same character. The launcher
+       * records each slot's device in [Controller] SourceP1/SourceP2; a file
+       * without the section keeps the historical behaviour, player 1 on the
+       * keyboard and player 2 silent. */
+      const bool kb_ok_p1 = (g_config.player_src[0] == 1);
+      const bool kb_ok_p2 = (g_config.player_src[1] == 1);
+      uint16_t kb_p1 = kb_ok_p1 ? keybinds_read_player(keys, 1) : 0;
+      uint16_t kb_p2 = kb_ok_p2 ? keybinds_read_player(keys, 2) : 0;
       static const uint8 kKb2CtrlsIdx[12] = { 7, 6, 5, 4, 9, 8, 3, 11, 2, 10, 1, 0 };
       for (int i = 0; i < 12; i++) {
         HandleCommand(kKeys_Controls   + i, (kb_p1 >> kKb2CtrlsIdx[i]) & 1);

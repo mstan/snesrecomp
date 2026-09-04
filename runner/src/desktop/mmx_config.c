@@ -287,6 +287,13 @@ static int GetIniSection(const char *s) {
     return 5;
   if (StringEqualsNoCase(s, "[Netplay]"))
     return 6;
+  if (StringEqualsNoCase(s, "[Controller]"))
+    return 7;
+  /* [Controller.<guid>] -- a saved per-device profile. The launcher owns
+   * these; the runner only needs to not treat them as a malformed file. Each
+   * one would otherwise print "Invalid .ini section" on every start. */
+  if (StringStartsWithNoCase(s, "[Controller."))
+    return 8;
   return -1;
 }
 
@@ -317,6 +324,19 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
         }
       }
     }
+  } else if (section == 7) {
+    if (StringEqualsNoCase(key, "SourceP1")) {
+      g_config.player_src[0] = (int)strtol(value, (char**)NULL, 10);
+      return true;
+    } else if (StringEqualsNoCase(key, "SourceP2")) {
+      g_config.player_src[1] = (int)strtol(value, (char**)NULL, 10);
+      return true;
+    }
+    /* GuidPn / DeadzonePn are the launcher's business; accepted silently so
+     * the runner does not report the launcher's own keys as unknown. */
+    return true;
+  } else if (section == 8) {
+    return true;                 /* saved profile; launcher-owned */
   } else if (section == 1) {
     if (StringEqualsNoCase(key, "WindowSize")) {
       char *s;
@@ -465,6 +485,13 @@ void ParseConfigFile(const char *filename) {
    * = false` in config.ini overrides this. */
   g_config.enable_gamepad[0] = true;
   g_config.enable_gamepad[1] = true;
+  /* Seeded BEFORE the file is read, so a config.ini with no [Controller]
+   * section behaves exactly as it did before the section existed: player 1 on
+   * the keyboard, player 2 silent until someone assigns it a device. Leaving
+   * these zero would have read as "no slot uses the keyboard" and taken the
+   * keyboard away from every existing install. */
+  g_config.player_src[0] = 1;   /* keyboard */
+  g_config.player_src[1] = 0;   /* none */
   g_config.gamepad_deadzone = 10000;
   g_config.display_aspect = kSnesDisplayAspect_Crt4x3;
   g_config.skip_launcher = false;

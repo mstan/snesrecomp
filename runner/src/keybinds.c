@@ -39,14 +39,32 @@
         .left   = SDL_SCANCODE_LEFT, \
         .right  = SDL_SCANCODE_RIGHT, \
     }, \
-    /* Player 2 unbound by default. Add bindings in the INI to enable. */ \
+    /* Player 2 gets the SAME defaults as player 1.
+     *
+     * It used to be entirely unbound, because the host applied both players'
+     * keyboard bits every frame: any key player 2 owned would drive player 2
+     * even when a gamepad was, so an empty map stood in for a gate that did
+     * not exist. The host now applies keyboard only to slots whose source IS
+     * the keyboard, so identical defaults are safe -- and a player who picks
+     * Keyboard for slot 2 finds it already playable instead of having to bind
+     * twelve buttons by hand first.
+     *
+     * Two slots both set to Keyboard do share these keys. That is a
+     * configuration a player has to choose, and rebinding one of them is the
+     * answer; it is not a reason to ship slot 2 unusable. */ \
     .p2 = { \
-        .a = SDL_SCANCODE_UNKNOWN, .b = SDL_SCANCODE_UNKNOWN, \
-        .x = SDL_SCANCODE_UNKNOWN, .y = SDL_SCANCODE_UNKNOWN, \
-        .l = SDL_SCANCODE_UNKNOWN, .r = SDL_SCANCODE_UNKNOWN, \
-        .start = SDL_SCANCODE_UNKNOWN, .select = SDL_SCANCODE_UNKNOWN, \
-        .up    = SDL_SCANCODE_UNKNOWN, .down  = SDL_SCANCODE_UNKNOWN, \
-        .left  = SDL_SCANCODE_UNKNOWN, .right = SDL_SCANCODE_UNKNOWN, \
+        .a      = SDL_SCANCODE_X, \
+        .b      = SDL_SCANCODE_Z, \
+        .x      = SDL_SCANCODE_S, \
+        .y      = SDL_SCANCODE_A, \
+        .l      = SDL_SCANCODE_C, \
+        .r      = SDL_SCANCODE_V, \
+        .start  = SDL_SCANCODE_RETURN, \
+        .select = SDL_SCANCODE_RSHIFT, \
+        .up     = SDL_SCANCODE_UP, \
+        .down   = SDL_SCANCODE_DOWN, \
+        .left   = SDL_SCANCODE_LEFT, \
+        .right  = SDL_SCANCODE_RIGHT, \
     }, \
 }
 
@@ -155,8 +173,9 @@ static void write_defaults(const char *path) {
         "# Return, Tab, Space, Left Shift, Right Shift, Left Ctrl, Right Ctrl,\n"
         "# Backspace, Escape, Backslash. Use \"None\" to leave a button unbound.\n"
         "#\n"
-        "# Player 2 is unbound by default — fill in keys to enable a second\n"
-        "# keyboard player.\n"
+        "# Both players default to the same keys. Only a player whose Input\n"
+        "# source is Keyboard reads them, so this is not a conflict unless you\n"
+        "# put BOTH players on the keyboard -- rebind one if you do.\n"
         "\n");
     write_player_section(f, "player1", &s_binds.p1);
     write_player_section(f, "player2", &s_binds.p2);
