@@ -114,8 +114,12 @@ while True:
     end = data.index(b"\0", n)
     names.add(data[n:end].decode("ascii", "replace"))
     o += 20
+# Bytes, not print(): Python on Windows would end each line with \r\n, and
+# "ADVAPI32.DLL\r" is neither a system DLL nor a file that exists.
+out = sys.stdout.buffer
 for n in sorted(names):
-    print(n)
+    out.write((n + "\n").encode("ascii", "replace"))
+out.flush()
 PYEOF
       return
     fi
@@ -140,7 +144,7 @@ PYEOF
 
   # Walk transitively: SDL3.dll itself pulls in the MinGW runtime DLLs, and a
   # zip carrying SDL3.dll without them is the same broken zip one level down.
-  pending="$(imports_of "${EXE}")"
+  pending="$(imports_of "${EXE}" | tr -d '\r')"
   seen=""
   while [[ -n "${pending}" ]]; do
     next=""
@@ -161,7 +165,7 @@ PYEOF
         exit 1
       fi
       copy_lib "${src}"
-      next="${next} $(imports_of "${src}")"
+      next="${next} $(imports_of "${src}" | tr -d '\r')"
     done
     pending="${next}"
   done
