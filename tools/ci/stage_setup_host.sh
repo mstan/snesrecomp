@@ -226,6 +226,18 @@ printf '%s\n' "${VERSION}" > "${STAGE}/VERSION"
   echo "SOURCE_REVISIONS lists the exact commits this pack was cut from."
 } > "${STAGE}/README.txt"
 
+# ── timestamps ──────────────────────────────────────────────────────────────
+# Zip entries carry local time with no zone. CI runs in UTC; a player who
+# unpacks in a western zone gets every source file stamped hours in the
+# FUTURE, the build's own outputs stay "older" than their inputs, and ninja
+# regenerates build.ninja until it gives up: "manifest 'build.ninja' still
+# dirty after 100 tries, perhaps system time is not set" -- with nothing
+# compiled. Stamp every staged file with the game commit's time, which is
+# in the past in every zone, and reproducible besides.
+STAMP="$(git -C "${ROOT}" log -1 --format=%ct 2>/dev/null || date +%s)"
+find "${STAGE}" -exec touch -h -d "@${STAMP}" {} + 2>/dev/null \
+  || find "${STAGE}" -exec touch -d "@${STAMP}" {} +
+
 # ── the licensing rule, enforced ────────────────────────────────────────────
 if find "${STAGE}" \( -iname '*.sfc' -o -iname '*.smc' -o -iname '*.srm' -o -iname '*.fig' \) | grep -q .; then
   echo "error: refusing to package — ROM files in ${STAGE}:" >&2
