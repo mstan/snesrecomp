@@ -301,6 +301,15 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size);
 
 void RtlApuWrite(uint16 adr, uint8 val);
 
+/* APU port write observers: called for every guest write to $2140-$217F
+ * before the SPC sees it; return nonzero to consume the write. Observers run
+ * in registration order; any consumer wins. */
+typedef int (*RtlApuPortObserver)(uint16 reg, uint8 value);
+#define RTL_APU_PORT_OBSERVER_MAX 8
+int RtlAddApuPortObserver(RtlApuPortObserver observer);
+void RtlRemoveApuPortObserver(RtlApuPortObserver observer);
+int rtl_apu_port_observers_filter(uint16 reg, uint8 value);
+
 
 enum {
   kJoypadL_A = 0x80,

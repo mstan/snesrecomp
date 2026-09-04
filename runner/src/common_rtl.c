@@ -43,6 +43,42 @@ Ppu *g_ppu;
 Dma *g_dma;
 uint8 g_snesrecomp_last_hdmaen;
 
+/* Guest -> APU port ($2140-$217F) write observers. Trusted host modules
+ * (sound replacement, telemetry) see every CPU-side port write in program
+ * order before it reaches the SPC; returning nonzero consumes the write so
+ * the SPC never hears it. Always compiled (independent of the mod package
+ * runtime) so a title can register one from plain C. */
+static RtlApuPortObserver s_apu_port_observers[RTL_APU_PORT_OBSERVER_MAX];
+static int s_apu_port_observer_count;
+
+int RtlAddApuPortObserver(RtlApuPortObserver observer) {
+  if (!observer) return 0;
+  for (int i = 0; i < s_apu_port_observer_count; i++)
+    if (s_apu_port_observers[i] == observer) return 1;
+  if (s_apu_port_observer_count >= RTL_APU_PORT_OBSERVER_MAX) return 0;
+  s_apu_port_observers[s_apu_port_observer_count++] = observer;
+  return 1;
+}
+
+void RtlRemoveApuPortObserver(RtlApuPortObserver observer) {
+  for (int i = 0; i < s_apu_port_observer_count; i++) {
+    if (s_apu_port_observers[i] == observer) {
+      s_apu_port_observers[i] =
+          s_apu_port_observers[s_apu_port_observer_count - 1];
+      s_apu_port_observers[--s_apu_port_observer_count] = NULL;
+      return;
+    }
+  }
+}
+
+int rtl_apu_port_observers_filter(uint16 reg, uint8 value) {
+  int consumed = 0;
+  for (int i = 0; i < s_apu_port_observer_count; i++)
+    if (s_apu_port_observers[i] && s_apu_port_observers[i](reg, value))
+      consumed = 1;
+  return consumed;
+}
+
 /* Netplay suppresses the pre-frame wall-clock fallback below. Once frames
  * begin, every runner uses the same guest-frame/APU coupling, and the audio
  * callback only consumes samples without advancing emulation. */
@@ -837,6 +873,10 @@ void WriteReg(uint16 reg, uint8 value) {
       return;
     }
 #endif
+    if (rtl_apu_port_observers_filter(reg, value)) {
+      debug_server_on_reg_write(reg, value);
+      return;
+    }
     RtlApuWrite(reg, value);
   } else if (reg >= 0x2180 && reg < 0x2184) {
     snes_writeBBus(g_snes, reg & 0xff, value);
