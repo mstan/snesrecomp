@@ -1506,6 +1506,146 @@ bool extract_zip(const std::vector<uint8_t>& bytes,
     return true;
 }
 
+/* ---- STORE-only ZIP32 writer -------------------------------------------
+ *
+ * The reader above handles STORE and DEFLATE; this writes STORE only. A mod
+ * package is a manifest and a handful of small assets, so the bytes saved by
+ * compressing them do not pay for a deflate encoder that would then need its
+ * own correctness argument. The lobby protocol specifies STORE zip32 anyway.
+ *
+ * Everything it produces must satisfy parse_zip() on the far side, including
+ * safe_archive_name() -- so names are relative, '/'-separated, and never
+ * absolute or dotted. */
+void put16(std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back((uint8_t)(x & 0xFF));
+    v.push_back((uint8_t)(x >> 8));
+}
+
+void put32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((uint8_t)(x & 0xFF));
+    v.push_back((uint8_t)((x >> 8) & 0xFF));
+    v.push_back((uint8_t)((x >> 16) & 0xFF));
+    v.push_back((uint8_t)((x >> 24) & 0xFF));
+}
+
+struct OutEntry {
+    std::string name;
+    uint32_t crc;
+    uint32_t size;
+    uint32_t local_offset;
+};
+
+bool zip_store_tree(const fs::path& root, std::vector<uint8_t>& out,
+                    std::string* error) {
+    std::vector<OutEntry> entries;
+    std::error_code ec;
+    std::vector<fs::path> files;
+
+    for (fs::recursive_directory_iterator it(root, ec), end; it != end;
+         it.increment(ec)) {
+        if (ec) {
+            set_error(error, "cannot walk the package: " + ec.message());
+            return false;
+        }
+        if (it->is_regular_file(ec)) files.push_back(it->path());
+    }
+    /* Sorted so the same package always produces byte-identical bytes, which
+     * is what lets a digest of the archive mean anything to two machines. */
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        set_error(error, "package directory is empty");
+        return false;
+    }
+    if (files.size() > kMaxArchiveFiles) {
+        set_error(error, "package has too many files");
+        return false;
+    }
+
+    for (const fs::path& file : files) {
+        const fs::path rel = fs::relative(file, root, ec);
+        if (ec || rel.empty()) {
+            set_error(error, "cannot relativize " + file.string());
+            return false;
+        }
+        std::string name = rel.generic_string();
+        if (!safe_archive_name(name)) {
+            set_error(error, "unsafe path in package: " + name);
+            return false;
+        }
+        std::vector<uint8_t> data;
+        if (!read_file(file, data, error)) return false;
+        if (out.size() + data.size() > kMaxArchiveBytes) {
+            set_error(error, "package exceeds the archive size limit");
+            return false;
+        }
+
+        OutEntry e;
+        e.name = name;
+        e.crc = crc32_compute(data.data(), data.size());
+        e.size = (uint32_t)data.size();
+        e.local_offset = (uint32_t)out.size();
+
+        put32(out, 0x04034b50u);          /* local file header */
+        put16(out, 20);                   /* version needed */
+        put16(out, 0);                    /* flags */
+        put16(out, 0);                    /* method: STORE */
+        put16(out, 0);                    /* mod time  */
+        put16(out, 0);                    /* mod date  */
+        put32(out, e.crc);
+        put32(out, e.size);               /* compressed == uncompressed */
+        put32(out, e.size);
+        put16(out, (uint16_t)name.size());
+        put16(out, 0);                    /* extra len */
+        out.insert(out.end(), name.begin(), name.end());
+        out.insert(out.end(), data.begin(), data.end());
+        entries.push_back(e);
+    }
+
+    const uint32_t cd_offset = (uint32_t)out.size();
+    for (const OutEntry& e : entries) {
+        put32(out, 0x02014b50u);          /* central directory header */
+        put16(out, 20);                   /* version made by */
+        put16(out, 20);                   /* version needed */
+        put16(out, 0);
+        put16(out, 0);                    /* STORE */
+        put16(out, 0);
+        put16(out, 0);
+        put32(out, e.crc);
+        put32(out, e.size);
+        put32(out, e.size);
+        put16(out, (uint16_t)e.name.size());
+        put16(out, 0);                    /* extra */
+        put16(out, 0);                    /* comment */
+        put16(out, 0);                    /* disk */
+        put16(out, 0);                    /* internal attrs */
+        put32(out, 0);                    /* external attrs */
+        put32(out, e.local_offset);
+        out.insert(out.end(), e.name.begin(), e.name.end());
+    }
+    const uint32_t cd_size = (uint32_t)out.size() - cd_offset;
+
+    put32(out, 0x06054b50u);              /* end of central directory */
+    put16(out, 0);
+    put16(out, 0);
+    put16(out, (uint16_t)entries.size());
+    put16(out, (uint16_t)entries.size());
+    put32(out, cd_size);
+    put32(out, cd_offset);
+    put16(out, 0);                        /* comment length */
+    return true;
+}
+
+std::string hex32(const uint8_t digest[32]) {
+    static const char* kHex = "0123456789abcdef";
+    std::string s;
+    s.reserve(64);
+    for (int i = 0; i < 32; ++i) {
+        s.push_back(kHex[digest[i] >> 4]);
+        s.push_back(kHex[digest[i] & 0xF]);
+    }
+    return s;
+}
+
 bool install_archive(Runtime& runtime, const fs::path& archive,
                      std::string* installed_id,
                      std::string* installed_version,
@@ -2357,6 +2497,200 @@ extern "C" int snes_mod_runtime_have_package_c(const char* package_id,
                       any.name.empty() ? package_id : any.name.c_str());
     if (!version || !version[0]) return 1;
     return it->second.find(version) != it->second.end() ? 1 : 0;
+}
+
+namespace {
+
+/* Copy into a fixed row field, refusing rather than truncating. A truncated
+ * package id or version names something else, and every consumer of these
+ * rows compares them for equality. */
+bool row_field(char* dst, size_t cap, const std::string& value) {
+    if (value.size() + 1 > cap) return false;
+    std::memcpy(dst, value.c_str(), value.size() + 1);
+    return true;
+}
+
+}  // namespace
+
+extern "C" int snes_mod_runtime_export_package_c(const char* package_id,
+                                                const char* version,
+                                                uint8_t** out, uint32_t* out_len,
+                                                char* sha256_hex, uint32_t sha_cap,
+                                                char* err, uint32_t err_cap) {
+    auto fail = [&](const std::string& why) {
+        if (err && err_cap) std::snprintf(err, err_cap, "%s", why.c_str());
+        return 0;
+    };
+    if (out) *out = nullptr;
+    if (out_len) *out_len = 0;
+    if (sha256_hex && sha_cap) sha256_hex[0] = '\0';
+    if (err && err_cap) err[0] = '\0';
+    if (!package_id || !version || !out || !out_len)
+        return fail("bad arguments");
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return fail("mod runtime is not initialized");
+    auto by_id = runtime.packages.find(package_id);
+    if (by_id == runtime.packages.end())
+        return fail(std::string("not installed: ") + package_id);
+    auto by_ver = by_id->second.find(version);
+    if (by_ver == by_id->second.end())
+        return fail(std::string(package_id) + " is not installed at version " +
+                    version);
+
+    std::vector<uint8_t> bytes;
+    std::string error;
+    if (!SNESRecomp::zip_store_tree(by_ver->second.root, bytes, &error))
+        return fail(error.empty() ? "could not pack the package" : error);
+
+    uint8_t digest[32];
+    sha256_compute(bytes.data(), bytes.size(), digest);
+    const std::string hex = SNESRecomp::hex32(digest);
+    if (sha256_hex) {
+        if (sha_cap < hex.size() + 1) return fail("digest buffer too small");
+        std::memcpy(sha256_hex, hex.c_str(), hex.size() + 1);
+    }
+
+    uint8_t* blob = (uint8_t*)std::malloc(bytes.size() ? bytes.size() : 1);
+    if (!blob) return fail("out of memory packing the package");
+    std::memcpy(blob, bytes.data(), bytes.size());
+    *out = blob;
+    *out_len = (uint32_t)bytes.size();
+    return 1;
+}
+
+extern "C" void snes_mod_runtime_free_blob_c(uint8_t* blob) {
+    std::free(blob);
+}
+
+extern "C" int snes_mod_runtime_install_blob_c(const uint8_t* data, uint32_t len,
+                                               const char* expect_sha256,
+                                               char* installed_id, uint32_t id_cap,
+                                               char* installed_ver, uint32_t ver_cap,
+                                               char* err, uint32_t err_cap) {
+    auto fail = [&](const std::string& why) {
+        if (err && err_cap) std::snprintf(err, err_cap, "%s", why.c_str());
+        return 0;
+    };
+    if (installed_id && id_cap) installed_id[0] = '\0';
+    if (installed_ver && ver_cap) installed_ver[0] = '\0';
+    if (err && err_cap) err[0] = '\0';
+    if (!data || !len) return fail("nothing was received");
+    if (!expect_sha256 || !*expect_sha256)
+        return fail("refusing to install without a digest to check against");
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return fail("mod runtime is not initialized");
+
+    /* Checked BEFORE the archive is parsed, let alone written anywhere. This
+     * is code from another machine: everything downstream -- the zip reader,
+     * the manifest parser, the extractor -- is being handed bytes chosen by
+     * someone else, and the digest is what says they are the bytes the host
+     * meant to send. */
+    uint8_t digest[32];
+    sha256_compute(data, len, digest);
+    const std::string got = SNESRecomp::hex32(digest);
+    std::string want(expect_sha256);
+    std::transform(want.begin(), want.end(), want.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (got != want)
+        return fail("the package that arrived is not the one the host sent "
+                    "(digest mismatch); nothing was installed");
+
+    const uint64_t nonce = (uint64_t)
+        std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    std::error_code ec;
+    fs::create_directories(runtime.root, ec);
+    /* install_archive() requires the .snesmod extension, and it reads from a
+     * path -- so the verified bytes land in the mod root's own scratch file
+     * rather than a shared temp directory another process could swap. */
+    const fs::path staged =
+        runtime.root / (".incoming-" + std::to_string(nonce) + ".snesmod");
+    {
+        std::ofstream f(staged, std::ios::binary | std::ios::trunc);
+        if (!f) return fail("cannot write the incoming package");
+        f.write((const char*)data, (std::streamsize)len);
+        if (!f) {
+            std::error_code ignored;
+            fs::remove(staged, ignored);
+            return fail("cannot write the incoming package");
+        }
+    }
+
+    std::string id;
+    std::string ver;
+    std::string error;
+    const bool ok = SNESRecomp::install_archive(runtime, staged, &id, &ver, &error);
+    std::error_code ignored;
+    fs::remove(staged, ignored);
+    if (!ok)
+        return fail(error.empty() ? "the package could not be installed" : error);
+
+    if (installed_id && id_cap)
+        std::snprintf(installed_id, id_cap, "%s", id.c_str());
+    if (installed_ver && ver_cap)
+        std::snprintf(installed_ver, ver_cap, "%s", ver.c_str());
+    return 1;
+}
+
+extern "C" int snes_mod_runtime_plan_rows_c(SnesModPkgRow* out, int max) {
+    if (!out || max <= 0) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+    int n = 0;
+    for (const auto& sel_entry : runtime.selections) {
+        if (n >= max) break;
+        const std::string& package_id = sel_entry.first;
+        const SNESRecomp::PackageSelection& selection = sel_entry.second;
+        const SNESRecomp::Package* package =
+            SNESRecomp::selected_package(runtime, package_id.c_str());
+        if (!package) continue;
+
+        std::string feats;
+        for (const SNESRecomp::Feature& feature : package->features) {
+            if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                continue;
+            if (!feats.empty()) feats += ',';
+            feats += feature.id;
+        }
+        if (feats.empty())
+            continue;           /* package present but contributing nothing */
+
+        SnesModPkgRow row;
+        std::memset(&row, 0, sizeof(row));
+        if (!row_field(row.id, sizeof(row.id), package_id) ||
+            !row_field(row.version, sizeof(row.version), selection.version))
+            continue;           /* see the header: drop, never truncate */
+        row_field(row.name, sizeof(row.name),
+                  package->name.empty() ? package_id : package->name);
+        /* The feature list is a human-readable extra, so a long one is trimmed
+         * rather than costing the player the whole row. */
+        std::snprintf(row.features, sizeof(row.features), "%s", feats.c_str());
+        out[n++] = row;
+    }
+    return n;
+}
+
+extern "C" int snes_mod_runtime_installed_rows_c(SnesModPkgRow* out, int max) {
+    if (!out || max <= 0) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+    int n = 0;
+    for (const auto& by_id : runtime.packages) {
+        for (const auto& by_version : by_id.second) {
+            if (n >= max) return n;
+            const SNESRecomp::Package& package = by_version.second;
+            SnesModPkgRow row;
+            std::memset(&row, 0, sizeof(row));
+            if (!row_field(row.id, sizeof(row.id), by_id.first) ||
+                !row_field(row.version, sizeof(row.version), by_version.first))
+                continue;
+            row_field(row.name, sizeof(row.name),
+                      package.name.empty() ? by_id.first : package.name);
+            out[n++] = row;
+        }
+    }
+    return n;
 }
 
 extern "C" int snes_mod_runtime_check_set_c(const char* want, char* reason,

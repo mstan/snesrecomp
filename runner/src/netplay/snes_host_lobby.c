@@ -121,48 +121,130 @@ static const char *game_version(void)
  * it: a plan that only rides along when someone happens to toggle a mod is a
  * plan that goes stale the first time anything else changes.
  *
- * Newlines become ';' purely so the plan survives the hand-rolled JSON string
- * field without escaping. Truncation is refused rather than trimmed -- two
- * different plans can share a prefix, and a guest comparing a truncated one
- * would call them equal.
+ * One row per PACKAGE, which is both what the lobby server matches a joiner's
+ * offer against and what a player actually installs. The runtime's own
+ * effective-set text is per FEATURE and stays the basis of the simulation
+ * equality check -- a package can be present and still be configured
+ * differently. Two grains, two questions.
  */
 static void fill_caps_mods(SnesLobbyMatchCaps *caps)
 {
 #if SNESRECOMP_ENABLE_MODS
-  char text[1024];
-  int need;
-  size_t o = 0;
-  size_t i;
+  SnesModPkgRow rows[SNES_LOBBY_MAX_MODS];
+  int n;
+  int i;
 
   if (!caps)
     return;
-  caps->mods[0] = '\0';
-  need = snes_mod_runtime_effective_set_c(text, (uint32_t)sizeof(text));
-  if (need <= 0 || need >= (int)sizeof(text))
-    return;
-  if (strcmp(text, "(none)\n") == 0)
-    return;
-  for (i = 0; text[i] && o + 1 < sizeof(caps->mods); ++i) {
-    char c = text[i];
-    if (c == '\n') {
-      if (o == 0 || caps->mods[o - 1] == ';')
-        continue;              /* no leading or doubled separators */
-      c = ';';
-    }
-    if (c == '"' || c == '\\')
-      continue;                /* cannot appear in a plan; would break the JSON */
-    caps->mods[o++] = c;
+  caps->mod_count = 0;
+  n = snes_mod_runtime_plan_rows_c(rows, SNES_LOBBY_MAX_MODS);
+  for (i = 0; i < n && i < SNES_LOBBY_MAX_MODS; ++i) {
+    SnesLobbyModPkg *dst = &caps->mods[caps->mod_count];
+    /* The runtime already refuses to emit a row whose id or version had to be
+     * cut, so anything arriving here is whole. The lobby's fields are at least
+     * as wide; snprintf is belt-and-braces, not the policy. */
+    snprintf(dst->id, sizeof(dst->id), "%s", rows[i].id);
+    snprintf(dst->ver, sizeof(dst->ver), "%s", rows[i].version);
+    snprintf(dst->name, sizeof(dst->name), "%s", rows[i].name);
+    snprintf(dst->feats, sizeof(dst->feats), "%s", rows[i].features);
+    caps->mod_count++;
   }
-  caps->mods[o] = '\0';
-  if (o && caps->mods[o - 1] == ';')
-    caps->mods[o - 1] = '\0';
-  if (text[i] != '\0')
-    caps->mods[0] = '\0';     /* did not fit: publish nothing over a prefix */
+  /* Say what went on the wire. The caps line next to this one reported
+   * widescreen/hud/aspect and said nothing about mods, so a host with a plan
+   * and a guest without the packages produced two clean-looking logs and a
+   * join that failed for reasons neither of them recorded. */
+  if (caps->mod_count > 0) {
+    int k;
+    fprintf(stderr, "netplay: publishing mod plan (%d package(s)) - peers "
+                    "may join without these, but the match will not start "
+                    "until they have them\n", caps->mod_count);
+    for (k = 0; k < caps->mod_count; ++k)
+      fprintf(stderr, "netplay:   requires %s@%s [%s]\n", caps->mods[k].id,
+              caps->mods[k].ver, caps->mods[k].feats);
+  } else {
+    fprintf(stderr, "netplay: publishing mod plan (none) - vanilla match\n");
+  }
 #else
   if (caps)
-    caps->mods[0] = '\0';
+    caps->mod_count = 0;
 #endif
 }
+
+/* What this peer already has, for the join's mod_offer. The lobby server
+ * subtracts this from the host's plan and refuses to seat on any remainder, so
+ * this is the half of the seat decision that speaks for US.
+ *
+ * Every installed (package, version) pair, enabled or not: the question the
+ * server asks is possession. Which of them actually RUN is the host's plan to
+ * decide, and a peer that owns a mod it has switched off can still play in a
+ * lobby that requires it. */
+static int mod_offer_rows(SnesLobbyModPkg *out, int max, void *ctx)
+{
+  (void)ctx;
+#if SNESRECOMP_ENABLE_MODS
+  {
+    SnesModPkgRow rows[SNES_LOBBY_MAX_MODS];
+    int n;
+    int i;
+    int o = 0;
+    if (!out || max <= 0)
+      return 0;
+    n = snes_mod_runtime_installed_rows_c(rows, SNES_LOBBY_MAX_MODS);
+    for (i = 0; i < n && o < max; ++i) {
+      int dup = 0;
+      int k;
+      /* One row per package id. The runtime lists every (id, version) it
+       * holds, but peers match on id, so a second version of the same package
+       * says nothing new and would spend one of the few rows the offer has
+       * room for. The first version stays as the one we report, so the row
+       * can still say WHICH version we hold. */
+      for (k = 0; k < o; ++k)
+        if (!strcmp(out[k].id, rows[i].id)) { dup = 1; break; }
+      if (dup)
+        continue;
+      memset(&out[o], 0, sizeof(out[o]));
+      snprintf(out[o].id, sizeof(out[o].id), "%s", rows[i].id);
+      snprintf(out[o].ver, sizeof(out[o].ver), "%s", rows[i].version);
+      /* Name and features are the host plan's business; an offer claims
+       * possession and nothing else. */
+      o++;
+    }
+    return o;
+  }
+#else
+  (void)out;
+  (void)max;
+  return 0;
+#endif
+}
+
+/* The mod runtime, handed to the lobby as three plain functions. The lobby
+ * moves bytes; only these know what a package is. */
+#if SNESRECOMP_ENABLE_MODS
+static int xfer_export(const char *id, const char *ver, uint8_t **out,
+                       uint32_t *out_len, char *sha, uint32_t sha_cap,
+                       char *err, uint32_t err_cap, void *ctx)
+{
+  (void)ctx;
+  return snes_mod_runtime_export_package_c(id, ver, out, out_len, sha, sha_cap,
+                                           err, err_cap);
+}
+
+static void xfer_free(uint8_t *blob)
+{
+  snes_mod_runtime_free_blob_c(blob);
+}
+
+static int xfer_install(const uint8_t *data, uint32_t len,
+                        const char *expect_sha256, char *id, uint32_t id_cap,
+                        char *ver, uint32_t ver_cap, char *err,
+                        uint32_t err_cap, void *ctx)
+{
+  (void)ctx;
+  return snes_mod_runtime_install_blob_c(data, len, expect_sha256, id, id_cap,
+                                         ver, ver_cap, err, err_cap);
+}
+#endif
 
 static SnesLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
 {
@@ -389,6 +471,18 @@ int snes_host_lobby_init(const SnesHostLobbyIdentity *id,
   g_runtime_error[0] = '\0';
   g_external_ip[0] = '\0';
   g_local_address_count = 0;
+  /* Installed before any join can be issued: a join that goes out without the
+   * offer tells the server this peer owns no mods at all, and the server turns
+   * it away from every lobby whose host enabled one. */
+  snes_lobby_set_mod_offer_supplier(mod_offer_rows, NULL);
+#if SNESRECOMP_ENABLE_MODS
+  snes_lobby_set_mod_transfer_hooks(xfer_export, xfer_free, xfer_install, NULL);
+  fprintf(stderr, "netplay: mod transfer hooks installed (this build can send "
+                  "and receive mods)\n");
+#else
+  fprintf(stderr, "netplay: built without mod support; this build cannot send "
+                  "or receive mods\n");
+#endif
   g_inited = 1;
   return 0;
 }
@@ -1087,89 +1181,66 @@ static int cb_fill_launch(void *ctx, RecompLauncherCNetplayLaunch *out)
  * drawn here; the data is just supplied.
  */
 
-/* Entry `index` of the plan the HOST published, into `out`. */
-static int plan_entry(int index, char *id, size_t id_cap,
-                      char *version, size_t version_cap)
+/* Row `index` of the plan the HOST published. */
+static const SnesLobbyModPkg *plan_row(int index)
 {
   const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
-  const char *p;
-  int n = 0;
-
-  if (id_cap) id[0] = '\0';
-  if (version_cap) version[0] = '\0';
-  if (!caps || !caps->valid || !caps->mods[0] || index < 0)
-    return 0;
-  for (p = caps->mods; *p; ) {
-    const char *end = strchr(p, ';');
-    size_t len = end ? (size_t)(end - p) : strlen(p);
-    if (n++ == index) {
-      /* "<package>@<version>/<feature> ..." — the row identifies the
-       * PACKAGE, since that is what a player installs. */
-      const char *at = memchr(p, '@', len);
-      const char *slash = at ? memchr(at, '/', len - (size_t)(at - p)) : NULL;
-      size_t id_len = at ? (size_t)(at - p) : len;
-      if (id_len >= id_cap) id_len = id_cap - 1;
-      memcpy(id, p, id_len);
-      id[id_len] = '\0';
-      if (at && slash) {
-        size_t v_len = (size_t)(slash - at - 1);
-        if (v_len >= version_cap) v_len = version_cap - 1;
-        memcpy(version, at + 1, v_len);
-        version[v_len] = '\0';
-      }
-      return 1;
-    }
-    p = end ? end + 1 : p + len;
-  }
-  return 0;
+  if (!caps || !caps->valid || index < 0 || index >= caps->mod_count)
+    return NULL;
+  return &caps->mods[index];
 }
 
 static int cb_lobby_mods_count(void *ctx)
 {
   const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
-  const char *p;
-  int n = 0;
   (void)ctx;
-  if (!caps || !caps->valid || !caps->mods[0])
+  if (!caps || !caps->valid)
     return 0;
-  for (p = caps->mods; *p; ) {
-    const char *end = strchr(p, ';');
-    n++;
-    if (!end) break;
-    p = end + 1;
-  }
-  return n;
+  return caps->mod_count;
 }
 
 static int cb_lobby_mods_get(void *ctx, int index,
                              RecompLauncherCNetplayLobbyMod *out)
 {
-  char id[96];
-  char version[32];
+  const SnesLobbyModPkg *row = plan_row(index);
+  const char *id;
+  const char *version;
   (void)ctx;
   if (!out)
     return 0;
   memset(out, 0, sizeof(*out));
-  if (!plan_entry(index, id, sizeof(id), version, sizeof(version)))
+  if (!row)
     return 0;
+  id = row->id;
+  version = row->ver;
   snprintf(out->id, sizeof(out->id), "%s", id);
   snprintf(out->version, sizeof(out->version), "%s", version);
-  snprintf(out->name, sizeof(out->name), "%s", id);
+  /* The host published a display name; prefer it, and fall back to the id.
+   * The local lookup below overrides it when this peer has the package, so a
+   * player sees the same name the host sees either way. */
+  snprintf(out->name, sizeof(out->name), "%s",
+           row->name[0] ? row->name : id);
   out->installed = 0;
 #if SNESRECOMP_ENABLE_MODS
   {
     char name[64];
+    /* NULL version: "do I have this package at all". A different version is
+     * still HAVING it, so the lobby says installed and offers no download --
+     * there is nothing to fetch. If the two versions genuinely simulate
+     * differently, the mod-set exchange at session start says so precisely,
+     * naming the versions and offering to adopt the host's selection. */
     const int have =
-        snes_mod_runtime_have_package_c(id, version, name, (uint32_t)sizeof(name));
+        snes_mod_runtime_have_package_c(id, NULL, name, (uint32_t)sizeof(name));
     if (name[0])
       snprintf(out->name, sizeof(out->name), "%s", name);
     if (have > 0) {
       out->installed = 1;
-    } else if (have == 0) {
-      /* Distinguished on purpose: "install this" and "you have the wrong
-       * version of this" are different jobs for the player. */
-      snprintf(out->reason, sizeof(out->reason),
-               "installed, but not version %s", version[0] ? version : "?");
+      /* Say so when the versions differ. Not a blocker here, but it is the
+       * first thing worth knowing if the match later refuses to start. */
+      if (version[0] &&
+          snes_mod_runtime_have_package_c(id, version, NULL, 0) == 0)
+        snprintf(out->reason, sizeof(out->reason),
+                 "host runs %s; you have another version", version);
     } else {
       snprintf(out->reason, sizeof(out->reason), "not installed");
     }
@@ -1193,12 +1264,78 @@ static int cb_lobby_mods_missing(void *ctx)
   return missing;
 }
 
+/* Can this peer pull the plan's mods from the host RIGHT NOW?
+ *
+ * Not yet: this build has no mod transfer. Answered as a capability question
+ * rather than left for the download call to fail, because the UI asks this
+ * BEFORE drawing the button -- a button that cannot work is worse than no
+ * button, and the message it used to print blamed the host for it.
+ *
+ * When the transfer lands this becomes "are we seated, is there a host, and is
+ * the plan unmet". Note that it must NOT be answered from the lobby server's
+ * `can_transfer` flag: the server hardcodes that true and is describing
+ * itself, not this build's ability to drive a transfer.
+ */
+static int cb_lobby_mods_can_download(void *ctx)
+{
+  (void)ctx;
+#if SNESRECOMP_ENABLE_MODS
+  /* A guest seated in a server lobby, with a host to ask. Not derived from
+   * the server's `can_transfer` flag: that is hardcoded true and describes
+   * the server, not this build's ability to drive a transfer.
+   *
+   * LAN and direct-IP sessions have no signalling relay to carry the SDP, so
+   * they answer no and say so in the panel rather than offering a button that
+   * would sit at "connecting" forever. */
+  if (g_hosting_lan || g_joined_lan || g_joined_direct)
+    return 0;
+  if (!snes_lobby_in_lobby() || snes_lobby_is_host())
+    return 0;
+  return snes_lobby_host_player_id()[0] != '\0';
+#else
+  return 0;
+#endif
+}
+
+static int cb_lobby_mods_download_one(void *ctx, int index)
+{
+  const SnesLobbyModPkg *row = plan_row(index);
+  (void)ctx;
+  if (!row || !cb_lobby_mods_can_download(NULL))
+    return -1;
+  return snes_lobby_mod_request(row->id, row->ver);
+}
+
+static int cb_lobby_mods_progress_one(void *ctx, int index)
+{
+  const SnesLobbyModPkg *row = plan_row(index);
+  const char *moving = snes_lobby_mod_in_flight();
+  (void)ctx;
+  /* Progress belongs to the row being transferred, not to every row: without
+   * this every unmet row would show the same bar and the player could not
+   * tell which one was actually moving. */
+  if (!row || !moving[0] || strcmp(moving, row->id) != 0)
+    return -1;
+  return snes_lobby_mod_progress();
+}
+
+static int cb_mod_xfer_failed(void *ctx, char *err, size_t err_cap)
+{
+  (void)ctx;
+  return snes_lobby_mod_failed(err, err_cap);
+}
+
+static void cb_mod_xfer_cancel(void *ctx)
+{
+  (void)ctx;
+  snes_lobby_mod_cancel();
+}
+
 static int cb_lobby_mods_download(void *ctx)
 {
   (void)ctx;
-  /* No mod transfer channel on this lobby. Reported as unavailable rather
-   * than as a failed download: the UI hides the button on <0, and offering a
-   * button that cannot work is worse than not offering one. */
+  /* Unreachable while cb_lobby_mods_can_download answers 0, and still honest
+   * if a UI asks anyway: no channel exists, so nothing was started. */
   return -1;
 }
 
@@ -1259,6 +1396,11 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .lobby_mods_get = cb_lobby_mods_get,
     .lobby_mods_missing = cb_lobby_mods_missing,
     .lobby_mods_download = cb_lobby_mods_download,
+    .lobby_mods_can_download = cb_lobby_mods_can_download,
+    .lobby_mods_download_one = cb_lobby_mods_download_one,
+    .lobby_mods_progress_one = cb_lobby_mods_progress_one,
+    .mod_xfer_failed = cb_mod_xfer_failed,
+    .mod_xfer_cancel = cb_mod_xfer_cancel,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
