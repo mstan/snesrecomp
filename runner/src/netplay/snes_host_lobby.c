@@ -115,6 +115,7 @@ static const char *game_version(void)
 #endif
 
 static void dl_queue_step(void);
+static void mod_set_sync_step(void);
 
 /*
  * The host's required mod plan, carried in match caps.
@@ -151,6 +152,34 @@ static void fill_caps_mods(SnesLobbyMatchCaps *caps)
     snprintf(dst->feats, sizeof(dst->feats), "%s", rows[i].features);
     caps->mod_count++;
   }
+  /* The exact configuration, not just the package list. */
+  {
+    char text[1024];
+    const int need = snes_mod_runtime_effective_set_c(text, (uint32_t)sizeof(text));
+    caps->mod_set[0] = '\0';
+    if (need > 0 && need < (int)sizeof(text) && strcmp(text, "(none)\n") != 0) {
+      size_t o = 0;
+      size_t k;
+      for (k = 0; text[k] && o + 1 < sizeof(caps->mod_set); ++k) {
+        char c = text[k];
+        if (c == '\n') {
+          if (o == 0 || caps->mod_set[o - 1] == ';') continue;
+          c = ';';
+        }
+        caps->mod_set[o++] = c;
+      }
+      caps->mod_set[o] = '\0';
+      if (o && caps->mod_set[o - 1] == ';') caps->mod_set[o - 1] = '\0';
+      if (text[k] != '\0') {
+        /* Publishing a PREFIX would be worse than publishing nothing: a guest
+         * would adopt a partial configuration and believe it matched. */
+        caps->mod_set[0] = '\0';
+        fprintf(stderr, "netplay: mod set too long to publish; guests will be "
+                        "asked to match it at launch instead\n");
+      }
+    }
+  }
+
   /* Say what went on the wire. The caps line next to this one reported
    * widescreen/hud/aspect and said nothing about mods, so a host with a plan
    * and a guest without the packages produced two clean-looking logs and a
@@ -598,6 +627,7 @@ static void cb_pump(void *ctx)
   (void)ctx;
   snes_lobby_pump();
   dl_queue_step();
+  mod_set_sync_step();
   if (g_hosting_lan && g_direct_host) {
     int rtt = -1;
     if (rnet_lan_direct_host_pump(g_direct_host, &g_lan_room, &rtt))
@@ -1320,6 +1350,67 @@ static void dl_queue_step(void)
     }
   }
 }
+
+/* Bring this peer's mod configuration into line with the host's, in the
+ * LOBBY, where it still costs nothing.
+ *
+ * Owning a package and running it are different things. The lobby gate asks
+ * only whether a peer HAS each mod, so a guest that downloaded both and
+ * enabled neither sails through it -- and is then refused by the session's
+ * mod-set check, which compares enabled features and resolved options. That
+ * refusal is correct; the problem is that it arrives after Play, having told
+ * the player everything was ready.
+ *
+ * Adoption is the same policy the netplay layer already applies on that
+ * refusal, moved earlier. It works here because mods commit and activate
+ * after the launcher exits (src/main.c), so a selection changed in the lobby
+ * is the selection the match runs -- no "start the game again".
+ *
+ * Only ever toward the host's set, only for a guest, and only when it
+ * actually differs. */
+#if SNESRECOMP_ENABLE_MODS
+static char g_adopted_set[512];
+
+static void mod_set_sync_step(void)
+{
+  const SnesLobbyMatchCaps *caps;
+  char want[1024];
+  char reason[160];
+  size_t i;
+  size_t o = 0;
+
+  if (!snes_lobby_in_lobby() || snes_lobby_is_host()) {
+    g_adopted_set[0] = '\0';
+    return;
+  }
+  caps = snes_lobby_match_caps();
+  if (!caps || !caps->valid || !caps->mod_set[0])
+    return;
+  if (!strcmp(g_adopted_set, caps->mod_set))
+    return;                      /* already tried this exact set */
+
+  /* Back to the canonical newline form the runtime speaks. */
+  for (i = 0; caps->mod_set[i] && o + 2 < sizeof(want); ++i)
+    want[o++] = caps->mod_set[i] == ';' ? '\n' : caps->mod_set[i];
+  want[o++] = '\n';
+  want[o] = '\0';
+
+  if (snes_mod_runtime_check_set_c(want, reason, sizeof(reason)) == SNES_MODSET_OK)
+    return;                      /* already matches */
+
+  snprintf(g_adopted_set, sizeof(g_adopted_set), "%s", caps->mod_set);
+  if (snes_mod_runtime_adopt_set_c(want, reason, sizeof(reason)) == 0) {
+    fprintf(stderr, "netplay: matched the host's mod configuration:\n%s", want);
+    /* The set changed, so what we announce has changed with it. */
+    (void)snes_lobby_set_ready(1);
+  } else {
+    fprintf(stderr, "netplay: cannot match the host's mod set: %s\n",
+            reason[0] ? reason : "(no reason given)");
+  }
+}
+#else
+static void mod_set_sync_step(void) {}
+#endif
 
 static int cb_lobby_mods_can_download(void *ctx)
 {

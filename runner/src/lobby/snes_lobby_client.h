@@ -134,6 +134,19 @@ typedef struct SnesLobbyMatchCaps {
      * full plan as a host requiring nothing. */
     int mod_count;
     SnesLobbyModPkg mods[SNES_LOBBY_MAX_MODS];
+    /* The host's EFFECTIVE set: one entry per enabled feature with its
+     * resolved option values, ';' where the canonical text has newlines
+     * (json_get_str does not unescape, so the text cannot carry them).
+     *
+     * The plan above says which packages a peer must HAVE. This says how the
+     * host has them configured, which is a different and stricter question --
+     * and the one the match actually enforces. A guest that owns both mods but
+     * has enabled neither passes the plan and is still refused at launch,
+     * because the two would simulate differently.
+     *
+     * Carried so a guest can match the host BEFORE launching rather than
+     * discovering the difference from a refused match. */
+    char mod_set[512];
 } SnesLobbyMatchCaps;
 
 typedef struct SnesLobbyJoinInfo {
