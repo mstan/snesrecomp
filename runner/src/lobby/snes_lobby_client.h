@@ -40,6 +40,59 @@ typedef struct SnesLobbyMember {
     int  ready;
 } SnesLobbyMember;
 
+/* One package on the lobby wire -- a row of the host's required plan, or of a
+ * peer's offer of what it already has. Deliberately independent of the mod
+ * runtime's own types: the lobby transports package identity and knows nothing
+ * about what a package contains. */
+#define SNES_LOBBY_MAX_MODS      16
+#define SNES_LOBBY_MOD_ID_LEN    96
+#define SNES_LOBBY_MOD_VER_LEN   32
+#define SNES_LOBBY_MOD_NAME_LEN  64
+#define SNES_LOBBY_MOD_FEATS_LEN 192
+
+typedef struct SnesLobbyModPkg {
+    char id[SNES_LOBBY_MOD_ID_LEN];
+    char ver[SNES_LOBBY_MOD_VER_LEN];
+    /* Display name, for a player reading the list. Empty on an offer row. */
+    char name[SNES_LOBBY_MOD_NAME_LEN];
+    /* Comma-separated ids of the features the host enabled. Empty on an offer
+     * row, which claims possession only. Never part of the seat decision --
+     * the server matches on (id, ver). */
+    char feats[SNES_LOBBY_MOD_FEATS_LEN];
+} SnesLobbyModPkg;
+
+/* Fills `out` with the packages this peer already has, returning the count.
+ *
+ * Installed by the host layer, because the lobby transports package identity
+ * and deliberately knows nothing about what a package is or where it lives. */
+typedef int (*SnesLobbyModOfferFn)(SnesLobbyModPkg *out, int max, void *ctx);
+
+/* Without a supplier this peer announces nothing, and every other peer reads
+ * that as "has no mods" -- so the host's launch gate holds the match. That is
+ * the safe direction (held rather than started into a desync), but it is only
+ * the TRUE answer if the peer genuinely has nothing. Any build with a mod
+ * runtime must install one. */
+void snes_lobby_set_mod_offer_supplier(SnesLobbyModOfferFn fn, void *ctx);
+
+/* The last need_mods refusal: how many packages the server said were missing,
+ * and each row. Valid until the next join attempt. `can_transfer` is the
+ * server's claim that a transfer channel is available -- it is the server's
+ * opinion about ITSELF, not a promise that this build can drive one. */
+int snes_lobby_need_mods_count(void);
+const SnesLobbyModPkg *snes_lobby_need_mods_get(int index);
+int snes_lobby_need_mods_can_transfer(void);
+
+/* The launch gate. Returns how many plan packages the OTHER seated peers are
+ * missing (0 = the match may start), naming the first offender and the first
+ * package they lack. Joining is deliberately not gated on this -- a peer
+ * without the mods belongs in the lobby, where they can get them. */
+int snes_lobby_match_blocked_by_mods(char *who, size_t who_cap,
+                                     char *what, size_t what_cap);
+
+/* How many plan packages THIS peer is missing, as the host's published plan
+ * and our own announced offer see it. */
+int snes_lobby_local_missing_mods(void);
+
 /*
  * Host-authoritative sim settings negotiated over the lobby.
  * Guests apply these on launch so both peers boot with matching caps.
@@ -54,16 +107,33 @@ typedef struct SnesLobbyMatchCaps {
     int  force_turn;       /* 0/1 — host: ICE relay-only (TURN) for all peers */
     int  force_input_relay; /* 0/1 — lobby-server UDP input relay */
     int  rollback;         /* 0/1 — session mode; lobby default ON */
-    /* The host's required mod plan: one entry per enabled feature,
-     * "<package>@<version>/<feature> <opt>=<val> ...", entries separated by
-     * ';'. Semicolons rather than the canonical newlines purely so it survives
-     * a hand-rolled JSON string field without escaping.
+    /* The host's required mod plan, one row per PACKAGE.
      *
      * Host-authoritative like everything else here: mods patch guest memory,
-     * so a peer running a different set is running a different game. Carrying
-     * it in the lobby is what lets a guest SEE the requirement before seating,
-     * instead of discovering it when the match refuses to start. */
-    char mods[512];
+     * so a peer running a different set is running a different game.
+     *
+     * Published as `match_caps.mod_plan`, deliberately NOT as `match_caps.mods`.
+     *
+     * `mods` is the key the lobby server enforces: required_mod_rows() reads it
+     * and REFUSES TO SEAT a joiner whose mod_offer does not cover it. That is
+     * the wrong door for this title. A player who lacks a mod should still get
+     * into the room -- to see what is needed, to talk to the host, and above
+     * all to download it from them. What must not happen is the MATCH starting
+     * while the peers would simulate differently, and that gate belongs at
+     * launch, where it can be enforced against every seated peer rather than
+     * against one joiner at the moment they knock.
+     *
+     * The server passes unknown match_caps keys through untouched and echoes
+     * them to members, so `mod_plan` reaches every peer while leaving the seat
+     * gate inert. It is a policy difference, not a workaround: this title says
+     * who may PLAY, the server says who may SIT.
+     *
+     * Encoded as an array of objects either way. An older encoding put the plan
+     * in a ';'-separated STRING, which is valid JSON but not an array, so
+     * anything reading it with as_array() got nothing -- and read a host with a
+     * full plan as a host requiring nothing. */
+    int mod_count;
+    SnesLobbyModPkg mods[SNES_LOBBY_MAX_MODS];
 } SnesLobbyMatchCaps;
 
 typedef struct SnesLobbyJoinInfo {
@@ -192,7 +262,49 @@ int  snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out);
  * copied out (LOCAL_* types as emitted by the peer — remap to REMOTE_* before
  * rnet_session_push_signal).
  */
+/* Addressed variant. An empty/NULL to_player_id broadcasts to the other
+ * seated members, which is what the game's own ICE wants; a point-to-point
+ * exchange must name its peer. */
+int  snes_lobby_send_signal_to(const char *to_player_id, int type, int flag,
+                              const char *text);
 int  snes_lobby_send_signal(int type, int flag, const char *text);
+
+/* ---- peer-to-peer mod transfer -----------------------------------------
+ *
+ * The package travels over its own ICE agent, directly between the two
+ * players. The lobby server relays only SDP and candidate lines, on the same
+ * seated `signal` channel the room already uses -- no file byte passes
+ * through it, and it needs no support for any of this.
+ *
+ * Hooks rather than direct calls into the mod runtime: the lobby transports
+ * package identity and bytes, and knows nothing about what a package is.
+ * export writes a self-contained archive plus its digest; install is handed
+ * that digest and must verify BEFORE unpacking. */
+typedef int (*SnesLobbyModExportFn)(const char *package_id, const char *version,
+                                    uint8_t **out, uint32_t *out_len,
+                                    char *sha256_hex, uint32_t sha_cap,
+                                    char *err, uint32_t err_cap, void *ctx);
+typedef void (*SnesLobbyModFreeFn)(uint8_t *blob);
+typedef int (*SnesLobbyModInstallFn)(const uint8_t *data, uint32_t len,
+                                     const char *expect_sha256,
+                                     char *installed_id, uint32_t id_cap,
+                                     char *installed_ver, uint32_t ver_cap,
+                                     char *err, uint32_t err_cap, void *ctx);
+void snes_lobby_set_mod_transfer_hooks(SnesLobbyModExportFn export_fn,
+                                       SnesLobbyModFreeFn free_fn,
+                                       SnesLobbyModInstallFn install_fn,
+                                       void *ctx);
+
+/* Guest: ask the host for one package. 0 = asked. */
+int  snes_lobby_mod_request(const char *package_id, const char *version);
+void snes_lobby_mod_cancel(void);
+/* -1 idle, -2 failed, 0..100 in flight. */
+int  snes_lobby_mod_progress(void);
+int  snes_lobby_mod_failed(char *err, size_t err_cap);
+/* Package id currently moving, or "" when idle. */
+const char *snes_lobby_mod_in_flight(void);
+/* Pumped from snes_lobby_pump; exposed for hosts that drive their own loop. */
+void snes_lobby_mod_xfer_pump(void);
 int  snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap);
 
 /*

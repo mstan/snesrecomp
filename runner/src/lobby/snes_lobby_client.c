@@ -1,5 +1,7 @@
 #include "snes_lobby_client.h"
 
+#include "recomp_net/ice_xfer.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -48,6 +50,37 @@ const SnesLobbyMatchCaps *snes_lobby_match_caps(void)
     static SnesLobbyMatchCaps z;
     return &z;
 }
+void snes_lobby_set_mod_offer_supplier(SnesLobbyModOfferFn fn, void *ctx)
+{
+    (void)fn; (void)ctx;
+}
+int  snes_lobby_need_mods_count(void) { return 0; }
+const SnesLobbyModPkg *snes_lobby_need_mods_get(int i) { (void)i; return NULL; }
+int  snes_lobby_need_mods_can_transfer(void) { return 0; }
+int  snes_lobby_send_signal_to(const char *t, int a2, int b, const char *c)
+{
+    (void)t; (void)a2; (void)b; (void)c; return -1;
+}
+void snes_lobby_set_mod_transfer_hooks(SnesLobbyModExportFn e,
+                                       SnesLobbyModFreeFn f,
+                                       SnesLobbyModInstallFn i, void *c)
+{
+    (void)e; (void)f; (void)i; (void)c;
+}
+int  snes_lobby_mod_request(const char *a2, const char *b)
+{
+    (void)a2; (void)b; return -1;
+}
+void snes_lobby_mod_cancel(void) {}
+int  snes_lobby_mod_progress(void) { return -1; }
+int  snes_lobby_mod_failed(char *e, size_t c) { (void)e; (void)c; return 0; }
+const char *snes_lobby_mod_in_flight(void) { return ""; }
+void snes_lobby_mod_xfer_pump(void) {}
+int  snes_lobby_match_blocked_by_mods(char *w, size_t wc, char *t, size_t tc)
+{
+    (void)w; (void)wc; (void)t; (void)tc; return 0;
+}
+int  snes_lobby_local_missing_mods(void) { return 0; }
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
 int  snes_lobby_member_get(int index, SnesLobbyMember *out) { (void)index; (void)out; return 0; }
@@ -149,6 +182,46 @@ typedef struct {
     int all_ready;
     int launch_pending;
     SnesLobbyMatchCaps match_caps;
+    /* The server's need_mods refusal: what it says we are missing, and the
+     * identity of the peer that could supply it. Kept rather than reduced to
+     * an error code because "you cannot join" is not actionable without the
+     * list. */
+    /* What each seated peer says it has, from the server's per-slot echo of
+     * their set_ready offer. The input to the launch gate: the host compares
+     * every peer against the plan and holds the match until they can run it. */
+    SnesLobbyModPkg member_offer[SNES_LOBBY_MAX_MEMBERS][SNES_LOBBY_MAX_MODS];
+    int member_offer_count[SNES_LOBBY_MAX_MEMBERS];
+    /* Mod transfer: one at a time, in one direction. A second request while
+     * one is in flight is refused rather than queued -- two agents on one
+     * relay is a harder thing to get right than making the player click
+     * again, and the panel shows which row is moving. */
+    RNetIceXfer *xfer;
+    int   xfer_busy;
+    int   xfer_sending;              /* 1 host side, 0 guest side */
+    int   xfer_progress;             /* -1 idle, -2 failed, 0..100 */
+    char  xfer_peer[SNES_LOBBY_ID_LEN];
+    char  xfer_id[SNES_LOBBY_MOD_ID_LEN];
+    char  xfer_ver[SNES_LOBBY_MOD_VER_LEN];
+    char  xfer_sha[65];
+    uint32_t xfer_expect;
+    char  xfer_err[192];
+    char  ice_stun[128], ice_turn[128], ice_user[192], ice_pass[128];
+    /* ICE signals that arrived before the agent existed.
+     *
+     * The requester opens its agent and starts gathering the moment it asks,
+     * so its offer and first candidates are already crossing the relay while
+     * the sender is still packing the archive. Dropped, they are simply gone
+     * -- libjuice will not re-send them -- and the handshake stalls until it
+     * times out. Held here and replayed in arrival order once the agent
+     * exists. */
+    RNetSignal sig_hold[24];
+    int   sig_hold_n;
+    char  sig_hold_from[SNES_LOBBY_ID_LEN];
+    SnesLobbyModPkg need_mods[SNES_LOBBY_MAX_MODS];
+    int need_mods_count;
+    int need_mods_can_transfer;
+    char need_mods_lobby_id[SNES_LOBBY_ID_LEN];
+    char need_mods_host_player_id[SNES_LOBBY_ID_LEN];
     char pending_tx[8][2048];
     int pending_n;
     /* Inbound ICE signals (WS op:signal). */
@@ -172,7 +245,25 @@ typedef struct {
 enum {
     SNES_LOBBY_SIG_RTT_PING = 100,
     SNES_LOBBY_SIG_RTT_PONG = 101,
-    SNES_LOBBY_SIG_RTT_REPORT = 102
+    SNES_LOBBY_SIG_RTT_REPORT = 102,
+
+    /* Mod transfer.
+     *
+     * These ride the ordinary seated `signal` relay, which the lobby server
+     * forwards between seated members verbatim -- so a transfer needs no
+     * server support at all. The server's own mod_xfer_* ops cannot serve
+     * this: it grants that channel only to a peer it REFUSED to seat, and
+     * this title seats everyone on purpose.
+     *
+     * Only SDP and ICE candidates travel here. The package itself goes over
+     * the direct peer-to-peer connection those negotiate, so no file byte
+     * ever reaches the lobby server. */
+    SNES_LOBBY_SIG_MOD_REQ = 110,   /* guest -> host: "<id>@<ver>"           */
+    SNES_LOBBY_SIG_MOD_NAK = 111,   /* host -> guest: refusal, text = reason */
+    /* 120 + RNetSignalType(1..6): the ICE handshake for the transfer agent.
+     * Offset so the game's own netplay ICE, which uses the bare types on the
+     * same relay, can never ingest one of ours nor we one of its. */
+    SNES_LOBBY_SIG_MOD_ICE_BASE = 120
 };
 
 static uint64_t lobby_mono_ms(void)
@@ -228,8 +319,15 @@ static const char *effective_game_version(const char *override_ver)
 
 static int list_filter_version_strict(void)
 {
+    /* Any dev build lists UNFILTERED, including the "dev+<sha>" ones.
+     *
+     * The version pin is still enforced -- the server refuses the join with
+     * version_mismatch -- but a filtered list would hide the mismatched lobby
+     * instead of explaining it, and "my friend's lobby isn't showing up" is a
+     * much worse thing to debug than "this lobby is a different build". Prefix,
+     * not equality: dev+abc12345 and dev+abc12345-dirty are both dev. */
     const char *gv = effective_game_version(NULL);
-    return gv && gv[0] && strcmp(gv, "dev") != 0;
+    return gv && gv[0] && strncmp(gv, "dev", 3) != 0;
 }
 
 static void queue_send(const char *json);
@@ -278,6 +376,9 @@ static void match_caps_clear(SnesLobbyMatchCaps *c)
 }
 
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
+static void send_set_ready(int ready);
+static void mod_xfer_on_request(const char *from, const char *text);
+static void mod_xfer_fail(const char *why);
 static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out);
 static void ingest_match_caps_from_json(const char *json);
 static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatchCaps *caps);
@@ -496,15 +597,171 @@ static int json_extract_object(const char *json, const char *key, char *out, siz
     return depth == 0 && n > 1;
 }
 
+/* Parse `"<key>":[ {..}, {..} ]` into package rows.
+ *
+ * Returns the number of rows filled. A row missing an id or a version is
+ * skipped: the pair is the whole identity the seat gate matches on, so half of
+ * it is not a lesser row, it is a different package. */
+static int parse_mod_pkg_array(const char *json, const char *key,
+                               SnesLobbyModPkg *out, int max)
+{
+    char pattern[64];
+    const char *p;
+    int n = 0;
+
+    if (!json || !key || !out || max <= 0) return 0;
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    p = strstr(json, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    while (*p && *p != ':') p++;
+    if (*p != ':') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '[') return 0;          /* a string here is the old encoding */
+    p++;
+
+    while (*p && n < max) {
+        char obj[512];
+        const char *start;
+        int depth = 0;
+        int in_str = 0;
+        size_t len;
+        SnesLobbyModPkg row;
+
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
+            p++;
+        if (*p == ']' || !*p) break;
+        if (*p != '{') break;
+        start = p;
+        for (; *p; ++p) {
+            if (in_str) {
+                if (*p == '\\' && p[1]) { ++p; continue; }
+                if (*p == '"') in_str = 0;
+                continue;
+            }
+            if (*p == '"') { in_str = 1; continue; }
+            if (*p == '{') depth++;
+            else if (*p == '}') { depth--; if (depth == 0) { ++p; break; } }
+        }
+        if (depth != 0) break;                    /* truncated array */
+        len = (size_t)(p - start);
+        if (len >= sizeof(obj)) continue;         /* absurd row; skip it */
+        memcpy(obj, start, len);
+        obj[len] = '\0';
+
+        memset(&row, 0, sizeof(row));
+        json_get_str(obj, "id", row.id, sizeof(row.id));
+        json_get_str(obj, "ver", row.ver, sizeof(row.ver));
+        json_get_str(obj, "n", row.name, sizeof(row.name));
+        json_get_str(obj, "f", row.feats, sizeof(row.feats));
+        if (!row.id[0] || !row.ver[0])
+            continue;
+        out[n++] = row;
+    }
+    return n;
+}
+
+/* Emit `"<key>":[ … ]`. Returns bytes written, or 0 if the whole array did not
+ * fit -- a half-written array is invalid JSON, and a SHORT one is worse: it
+ * would name fewer requirements than the host actually has. */
+static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
+                                const SnesLobbyModPkg *pkgs, int count)
+{
+    size_t used = 0;
+    int i;
+    int n;
+    int wrote = 0;
+
+    if (!dst || cap < 8 || !key || (!pkgs && count > 0)) return 0;
+    n = snprintf(dst, cap, "\"%s\":[", key);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    used = (size_t)n;
+    for (i = 0; i < count; ++i) {
+        char name_esc[SNES_LOBBY_MOD_NAME_LEN * 2 + 4];
+        char feats_esc[SNES_LOBBY_MOD_FEATS_LEN * 2 + 4];
+        if (!pkgs[i].id[0] || !pkgs[i].ver[0]) continue;
+        json_escape(pkgs[i].name, name_esc, sizeof(name_esc));
+        json_escape(pkgs[i].feats, feats_esc, sizeof(feats_esc));
+        n = snprintf(dst + used, cap - used,
+                     "%s{\"id\":\"%s\",\"ver\":\"%s\",\"n\":\"%s\",\"f\":\"%s\"}",
+                     wrote ? "," : "",
+                     pkgs[i].id, pkgs[i].ver, name_esc, feats_esc);
+        if (n < 0 || (size_t)n >= cap - used) return 0;
+        used += (size_t)n;
+        wrote++;
+    }
+    n = snprintf(dst + used, cap - used, "]");
+    if (n < 0 || (size_t)n >= cap - used) return 0;
+    return (int)(used + (size_t)n);
+}
+
+/* Installed once at start-up and kept OUTSIDE LobbyClient on purpose.
+ *
+ * snes_lobby_disconnect() memsets the whole LobbyClient -- and connect()
+ * calls disconnect() first -- so anything living in there is per-connection
+ * state by definition. These are configuration: the build either can pack and
+ * install a package or it cannot, and connecting to a lobby does not change
+ * the answer. Held in g_lc, the export hook was installed at init and NULL by
+ * the time any peer could ask, and every request came back "could not pack
+ * the mod" from a host that was perfectly able to. */
+static SnesLobbyModOfferFn g_mod_offer_fn;
+static void *g_mod_offer_ctx;
+static SnesLobbyModExportFn  g_mod_export_fn;
+static SnesLobbyModFreeFn    g_mod_free_fn;
+static SnesLobbyModInstallFn g_mod_install_fn;
+static void *g_mod_hook_ctx;
+
+void snes_lobby_set_mod_offer_supplier(SnesLobbyModOfferFn fn, void *ctx)
+{
+    g_mod_offer_fn = fn;
+    g_mod_offer_ctx = ctx;
+}
+
+/* `"mod_offer":{"pkgs":[…]}` -- what this peer already has. The server matches
+ * each row of the host's plan against it and refuses to seat on any miss, so
+ * an offer that is short in EITHER direction is wrong: too few rows and the
+ * peer is turned away holding the mod, too many and it is seated without one.
+ * Returns bytes written, or 0 if the whole offer did not fit. */
+static int append_mod_offer(char *dst, size_t cap)
+{
+    SnesLobbyModPkg rows[SNES_LOBBY_MAX_MODS];
+    int n;
+    int used;
+
+    if (!dst || cap < 8) return 0;
+    if (!g_mod_offer_fn) { dst[0] = '\0'; return 0; }
+    memset(rows, 0, sizeof(rows));
+    n = g_mod_offer_fn(rows, SNES_LOBBY_MAX_MODS, g_mod_offer_ctx);
+    if (n < 0) n = 0;
+    if (n > SNES_LOBBY_MAX_MODS) n = SNES_LOBBY_MAX_MODS;
+    used = snprintf(dst, cap, ",\"mod_offer\":{");
+    if (used < 0 || (size_t)used >= cap) return 0;
+    {
+        int m = append_mod_pkg_array(dst + used, cap - (size_t)used, "pkgs",
+                                     rows, n);
+        if (m <= 0) return 0;
+        used += m;
+    }
+    if ((size_t)used + 2 >= cap) return 0;
+    dst[used++] = '}';
+    dst[used] = '\0';
+    return used;
+}
+
 static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
 {
     if (!obj || !out || obj[0] != '{') return;
     match_caps_clear(out);
     out->widescreen = json_get_bool(obj, "widescreen", 0);
     out->widescreen_hud = json_get_bool(obj, "widescreen_hud", 1);
-    /* Absent on an older host: an empty plan is "no mods required", which is
-     * the correct reading of a host that cannot express one. */
-    json_get_str(obj, "mods", out->mods, sizeof(out->mods));
+    /* Absent: an empty plan is "no mods required". A plan encoded as a STRING
+     * rather than an array parses to zero rows here on purpose -- that is the
+     * superseded encoding, and reading it would revive a plan the lobby server
+     * has already ignored, leaving this peer and the server disagreeing about
+     * what the match requires. */
+    out->mod_count = parse_mod_pkg_array(obj, "mod_plan", out->mods,
+                                         SNES_LOBBY_MAX_MODS);
     out->ignore_aspect = json_get_bool(obj, "ignore_aspect", 0);
     out->input_delay = json_get_int(obj, "input_delay", 2);
     if (out->input_delay < 2) out->input_delay = 2;
@@ -519,27 +776,53 @@ static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
 
 static void ingest_match_caps_from_json(const char *json)
 {
-    char obj[512];
+    /* Sized for the whole caps object INCLUDING a full mod array. It used to
+     * be 512 bytes, which a plan of any size overflows -- and a truncated
+     * extract parses as a caps blob with no plan, i.e. it fails open. */
+    char obj[SNES_LOBBY_MAX_MODS * 256 + 512];
     if (json_extract_object(json, "match_caps", obj, sizeof(obj)))
         parse_match_caps_object(obj, &g_lc.match_caps);
 }
 
 static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatchCaps *caps)
 {
+    char mods[SNES_LOBBY_MAX_MODS * 256 + 16];
+    int n;
+
     if (!dst || dst_cap < 8 || !caps || !caps->valid) return 0;
-    return snprintf(dst, dst_cap,
-                    ",\"match_caps\":{\"v\":1,\"widescreen\":%s,\"widescreen_hud\":%s,"
-                    "\"ignore_aspect\":%s,\"input_delay\":%d,\"ws_extra\":%d,"
-                    "\"force_turn\":%s,\"force_input_relay\":%s,"
-                    "\"rollback\":%s,\"mods\":\"%s\"}",
-                    caps->widescreen ? "true" : "false",
-                    caps->widescreen_hud ? "true" : "false",
-                    caps->ignore_aspect ? "true" : "false",
-                    caps->input_delay, caps->ws_extra,
-                    caps->force_turn ? "true" : "false",
-                    caps->force_input_relay ? "true" : "false",
-                    caps->rollback ? "true" : "false",
-                    caps->mods);
+    /* Build the plan first. If it does not fit, publish NOTHING rather than a
+     * caps blob carrying a short plan: the server seats on what it reads, so
+     * an under-reported requirement seats a peer that cannot play. */
+    if (!append_mod_pkg_array(mods, sizeof(mods), "mod_plan", caps->mods,
+                              caps->mod_count))
+        return 0;
+    n = snprintf(dst, dst_cap,
+                 ",\"match_caps\":{\"v\":1,\"widescreen\":%s,\"widescreen_hud\":%s,"
+                 "\"ignore_aspect\":%s,\"input_delay\":%d,\"ws_extra\":%d,"
+                 "\"force_turn\":%s,\"force_input_relay\":%s,"
+                 "\"rollback\":%s,%s}",
+                 caps->widescreen ? "true" : "false",
+                 caps->widescreen_hud ? "true" : "false",
+                 caps->ignore_aspect ? "true" : "false",
+                 caps->input_delay, caps->ws_extra,
+                 caps->force_turn ? "true" : "false",
+                 caps->force_input_relay ? "true" : "false",
+                 caps->rollback ? "true" : "false",
+                 mods);
+    if (n < 0 || (size_t)n >= dst_cap) return 0;
+    /* The lobby server drops a match_caps object over 4096 bytes ENTIRELY
+     * (sanitize_match_caps returns None), which would take widescreen,
+     * rollback and input_delay down with the plan and hand guests a blank
+     * caps blob. Refuse here instead, where we can say why. */
+    if ((size_t)n > 4000) {
+        fprintf(stderr,
+                "snes_lobby: match caps are %d bytes with %d mod(s); the lobby "
+                "server discards anything over 4096, so nothing was published"
+                " -- reduce the enabled mod set\n",
+                n, caps->mod_count);
+        return 0;
+    }
+    return n;
 }
 
 static void queue_send(const char *json)
@@ -668,16 +951,31 @@ static void parse_slots_array(const char *json)
                 ++end;
             } while (*end && depth > 0);
             {
-                char chunk[512];
+                /* Wide enough for a slot row carrying a full mod_offer. At
+                 * 512 the row was silently clipped and the peer's set parsed
+                 * short -- which reads as "missing", so the gate would hold a
+                 * match that should have started. */
+                char chunk[SNES_LOBBY_MAX_MODS * 256 + 512];
                 size_t len = (size_t)(end - obj);
+                int clipped = 0;
                 if (len >= sizeof(chunk)) {
                     len = sizeof(chunk) - 1;
+                    clipped = 1;
                 }
                 memcpy(chunk, obj, len);
                 chunk[len] = '\0';
                 g_lc.members[n].slot = json_get_int(chunk, "slot", n);
                 json_get_str(chunk, "player_id", g_lc.members[n].player_id,
                              sizeof(g_lc.members[n].player_id));
+                g_lc.member_offer_count[n] =
+                    clipped ? 0
+                            : parse_mod_pkg_array(chunk, "mod_offer",
+                                                  g_lc.member_offer[n],
+                                                  SNES_LOBBY_MAX_MODS);
+                if (clipped)
+                    fprintf(stderr,
+                            "snes_lobby: slot %d row did not fit; treating its "
+                            "mod set as unknown\n", n);
                 json_get_str(chunk, "display_name", g_lc.members[n].display_name,
                              sizeof(g_lc.members[n].display_name));
                 g_lc.members[n].ready = json_get_bool(chunk, "ready", 0);
@@ -910,7 +1208,7 @@ static void handle_server_json(const char *json)
         }
         /* Ready UI is gone; auto-ready so older lobby servers that still gate
          * start on all_ready accept host Play. */
-        queue_send("{\"op\":\"set_ready\",\"ready\":true}");
+        send_set_ready(1);
         flush_pending();
         return;
     }
@@ -934,7 +1232,7 @@ static void handle_server_json(const char *json)
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
         parse_slots_array(json);
-        queue_send("{\"op\":\"set_ready\",\"ready\":true}");
+        send_set_ready(1);
         flush_pending();
         return;
     }
@@ -953,7 +1251,7 @@ static void handle_server_json(const char *json)
         /* Kick/move/start clear ready; re-arm so host Play keeps working on
          * servers that still require all_ready. */
         if (g_lc.in_lobby && !g_lc.local_ready) {
-            queue_send("{\"op\":\"set_ready\",\"ready\":true}");
+            send_set_ready(1);
             flush_pending();
         }
         return;
@@ -1042,8 +1340,83 @@ static void handle_server_json(const char *json)
                 g_lc.member_rtt_ms[slot] = ms;
             return;
         }
+        if (type == SNES_LOBBY_SIG_MOD_REQ) {
+            mod_xfer_on_request(from, text);
+            return;
+        }
+        if (type == SNES_LOBBY_SIG_MOD_NAK) {
+            mod_xfer_fail(text[0] ? text : "the host refused");
+            return;
+        }
+        if (type > SNES_LOBBY_SIG_MOD_ICE_BASE &&
+            type <= SNES_LOBBY_SIG_MOD_ICE_BASE + 6) {
+            /* Only from the peer we are actually transferring with. An SDP
+             * from anyone else is either a stale exchange or someone else's,
+             * and feeding it to the agent breaks the live negotiation. */
+            RNetSignal sig;
+            memset(&sig, 0, sizeof(sig));
+            sig.type = (RNetSignalType)(type - SNES_LOBBY_SIG_MOD_ICE_BASE);
+            sig.flag = (rnet_u8)flag;
+            snprintf(sig.text, sizeof(sig.text), "%s", text);
+            if (g_lc.xfer && from[0] && !strcmp(from, g_lc.xfer_peer)) {
+                rnet_ice_xfer_push_signal(g_lc.xfer, &sig);
+            } else if (from[0]) {
+                /* No agent yet: the sender is still packing. Hold it. */
+                if (g_lc.sig_hold_n == 0 ||
+                    strcmp(g_lc.sig_hold_from, from) != 0) {
+                    g_lc.sig_hold_n = 0;
+                    snprintf(g_lc.sig_hold_from, sizeof(g_lc.sig_hold_from),
+                             "%s", from);
+                }
+                if (g_lc.sig_hold_n <
+                    (int)(sizeof(g_lc.sig_hold) / sizeof(g_lc.sig_hold[0]))) {
+                    g_lc.sig_hold[g_lc.sig_hold_n++] = sig;
+                } else {
+                    /* Overflowing means the peer gathered far more candidates
+                     * than a handshake needs while we did nothing with them --
+                     * dropping the newest keeps the offer, which is the one
+                     * that matters. */
+                    fprintf(stderr, "snes_lobby: ICE hold buffer full; "
+                                    "dropping a candidate\n");
+                }
+            }
+            return;
+        }
         enqueue_signal(type, flag, text);
         (void)flag;
+        return;
+    }
+    if (strcmp(op, "need_mods") == 0) {
+        /* Not op:"error": the server answers a refused join with its own op,
+         * carrying the list. Falling through to the generic handler used to
+         * drop it entirely -- no error code, no list, nothing logged -- so a
+         * player saw the join simply do nothing and the log showed a clean
+         * session. A refusal has to explain itself where it happens. */
+        int i;
+        g_lc.need_mods_count = parse_mod_pkg_array(json, "mods", g_lc.need_mods,
+                                                   SNES_LOBBY_MAX_MODS);
+        g_lc.need_mods_can_transfer = json_get_bool(json, "can_transfer", 0);
+        json_get_str(json, "lobby_id", g_lc.need_mods_lobby_id,
+                     sizeof(g_lc.need_mods_lobby_id));
+        json_get_str(json, "host_player_id", g_lc.need_mods_host_player_id,
+                     sizeof(g_lc.need_mods_host_player_id));
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "need_mods");
+        g_lc.join.ok = 0;
+        g_lc.in_lobby = 0;
+        fprintf(stderr,
+                "snes_lobby: refused - this lobby needs %d mod(s) this build "
+                "does not have (server can_transfer=%d)\n",
+                g_lc.need_mods_count, g_lc.need_mods_can_transfer);
+        for (i = 0; i < g_lc.need_mods_count; ++i)
+            fprintf(stderr, "snes_lobby:   missing %s@%s%s%s\n",
+                    g_lc.need_mods[i].id, g_lc.need_mods[i].ver,
+                    g_lc.need_mods[i].name[0] ? " - " : "",
+                    g_lc.need_mods[i].name);
+        if (g_lc.need_mods_count == 0)
+            fprintf(stderr,
+                    "snes_lobby:   the server named none, which means it read "
+                    "a plan it could not parse -- check the host's build\n");
         return;
     }
     if (strcmp(op, "error") == 0) {
@@ -1090,6 +1463,13 @@ int snes_lobby_connect(const char *ws_url)
     char key_b64[32];
     char req[512];
     int i;
+
+    /* Name the pin we will present. A join refused with version_mismatch tells
+     * a player only that the two builds differ; without both values in the log
+     * there is nothing to compare, and "dev" against "dev" used to look like
+     * agreement even when the builds shared no code. */
+    fprintf(stderr, "snes_lobby: this build presents game_version=\"%s\"\n",
+            effective_game_version(NULL));
 
     snes_lobby_disconnect();
 #if defined(_WIN32)
@@ -1183,6 +1563,10 @@ void snes_lobby_disconnect(void)
     }
     {
         char dname[SNES_LOBBY_NAME_LEN];
+        /* The memset below would drop the pointer, not the agent: closing it
+         * first is the difference between ending a transfer and leaking a
+         * live UDP socket every time the lobby reconnects. */
+        if (g_lc.xfer) rnet_ice_xfer_close(&g_lc.xfer);
         strncpy(dname, g_lc.display_name, sizeof(dname) - 1);
         memset(&g_lc, 0, sizeof(g_lc));
         g_lc.fd = -1;
@@ -1230,6 +1614,11 @@ void snes_lobby_pump(void)
 #else
     ssize_t n;
 #endif
+    /* Driven from the lobby pump so a transfer runs while the player sits in
+     * the waiting room -- which is the only time one happens. Deliberately
+     * before the connected() check: an agent mid-handshake still has to be
+     * pumped so it can fail cleanly rather than hang if the WS drops. */
+    snes_lobby_mod_xfer_pump();
     if (!snes_lobby_connected()) {
         return;
     }
@@ -1425,9 +1814,11 @@ static void snes_lobby_normalize_guest_bind(const char *guest_bind, char *out,
 
 int snes_lobby_join(const char *lobby_id, const char *password, const char *guest_bind)
 {
-    char msg[1024];
+    char msg[SNES_LOBBY_MAX_MODS * 256 + 1024];
+    char offer[SNES_LOBBY_MAX_MODS * 256 + 64];
     const char *gn;
     const char *gv;
+    int n;
     if (!snes_lobby_connected() || !lobby_id) {
         return -1;
     }
@@ -1435,11 +1826,27 @@ int snes_lobby_join(const char *lobby_id, const char *password, const char *gues
     gv = effective_game_version(NULL);
     snes_lobby_normalize_guest_bind(guest_bind, g_lc.my_bind, sizeof(g_lc.my_bind));
     g_lc.join.last_error[0] = '\0';
-    snprintf(msg, sizeof(msg),
-             "{\"op\":\"join\",\"lobby_id\":\"%s\",\"password\":\"%s\",\"guest_bind\":\"%s\","
-             "\"display_name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\"}",
-             lobby_id, password ? password : "", g_lc.my_bind,
-             g_lc.display_name[0] ? g_lc.display_name : "Guest", gn, gv);
+    offer[0] = '\0';
+    if (g_mod_offer_fn && !append_mod_offer(offer, sizeof(offer))) {
+        /* Refuse the join rather than send a short offer. A truncated offer
+         * would have the server turn this peer away over mods it is holding,
+         * and the player would be told to install something already present --
+         * an error nobody can act on. */
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "mod_offer_too_large");
+        return -1;
+    }
+    n = snprintf(msg, sizeof(msg),
+                 "{\"op\":\"join\",\"lobby_id\":\"%s\",\"password\":\"%s\",\"guest_bind\":\"%s\","
+                 "\"display_name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\"%s}",
+                 lobby_id, password ? password : "", g_lc.my_bind,
+                 g_lc.display_name[0] ? g_lc.display_name : "Guest", gn, gv,
+                 offer);
+    if (n < 0 || (size_t)n >= sizeof(msg)) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "join_too_large");
+        return -1;
+    }
     queue_send(msg);
     flush_pending();
     return 0;
@@ -1508,6 +1915,23 @@ const char *snes_lobby_host_player_id(void)
 const SnesLobbyJoinInfo *snes_lobby_join_info(void)
 {
     return &g_lc.join;
+}
+
+int snes_lobby_need_mods_count(void)
+{
+    return g_lc.need_mods_count;
+}
+
+const SnesLobbyModPkg *snes_lobby_need_mods_get(int index)
+{
+    if (index < 0 || index >= g_lc.need_mods_count)
+        return NULL;
+    return &g_lc.need_mods[index];
+}
+
+int snes_lobby_need_mods_can_transfer(void)
+{
+    return g_lc.need_mods_can_transfer;
 }
 
 const SnesLobbyMatchCaps *snes_lobby_match_caps(void)
@@ -1580,24 +2004,165 @@ int snes_lobby_all_ready(void)
     return g_lc.all_ready != 0 && g_lc.in_lobby && g_lc.join.player_count >= 2;
 }
 
+/* Every set_ready carries this peer's installed set.
+ *
+ * The server stores it against our seat and echoes it to the whole room, which
+ * is how the HOST learns what each peer actually has -- the input to the
+ * launch gate. It rides on set_ready rather than only on join because the set
+ * can change while sitting in the lobby (a player installs the missing mod, or
+ * a transfer completes), and a stale offer would keep the match locked after
+ * the reason to lock it is gone. */
+static void send_set_ready(int ready)
+{
+    char msg[SNES_LOBBY_MAX_MODS * 256 + 256];
+    char offer[SNES_LOBBY_MAX_MODS * 256 + 64];
+    int n;
+
+    offer[0] = '\0';
+    if (g_mod_offer_fn && !append_mod_offer(offer, sizeof(offer))) {
+        /* Ready without the offer rather than not ready at all: the host's
+         * gate then sees "this peer claims nothing" and holds the match, which
+         * is the safe direction, and the log says why. */
+        offer[0] = '\0';
+        fprintf(stderr, "snes_lobby: could not announce the installed mod set "
+                        "(too large); the host will see this peer as having "
+                        "none\n");
+    }
+    n = snprintf(msg, sizeof(msg), "{\"op\":\"set_ready\",\"ready\":%s%s}",
+                 ready ? "true" : "false", offer);
+    if (n < 0 || (size_t)n >= sizeof(msg)) {
+        queue_send(ready ? "{\"op\":\"set_ready\",\"ready\":true}"
+                         : "{\"op\":\"set_ready\",\"ready\":false}");
+        return;
+    }
+    queue_send(msg);
+}
+
 int snes_lobby_set_ready(int ready)
 {
-    char msg[64];
     if (!snes_lobby_connected() || !g_lc.in_lobby) {
         return -1;
     }
-    snprintf(msg, sizeof(msg), "{\"op\":\"set_ready\",\"ready\":%s}", ready ? "true" : "false");
-    queue_send(msg);
+    send_set_ready(ready);
     flush_pending();
+    return 0;
+}
+
+/* Does the peer in `slot` hold every package the host's plan names?
+ *
+ * A peer that has announced nothing counts as missing everything. That is the
+ * safe reading and NOT a guess: a peer running this build always announces,
+ * so silence means either an older build or a set too large to state, and in
+ * both cases we do not know that it can play. */
+static int member_missing_count(int slot)
+{
+    const SnesLobbyMatchCaps *caps = &g_lc.match_caps;
+    int missing = 0;
+    int i;
+    int j;
+
+    if (slot < 0 || slot >= SNES_LOBBY_MAX_MEMBERS)
+        return 0;
+    for (i = 0; i < caps->mod_count; ++i) {
+        int have = 0;
+        for (j = 0; j < g_lc.member_offer_count[slot]; ++j) {
+            /* Matched on id ALONE, deliberately.
+             *
+             * The lobby's job is "does this player have the package at all",
+             * because that is the question a download answers. Whether the
+             * two builds resolve to the SAME simulation is settled later and
+             * far more precisely: snes_netplay_rb exchanges the whole
+             * effective set at session start -- per feature, with versions and
+             * resolved option values -- and refuses on any difference, with
+             * SNES_MODSET_VERSION as its own verdict for "right mod, wrong
+             * version". Repeating a coarser version check here only adds a
+             * second, earlier, less informative way to say no. */
+            if (!strcmp(g_lc.member_offer[slot][j].id, caps->mods[i].id)) {
+                have = 1;
+                break;
+            }
+        }
+        if (!have)
+            missing++;
+    }
+    return missing;
+}
+
+int snes_lobby_match_blocked_by_mods(char *who, size_t who_cap,
+                                     char *what, size_t what_cap)
+{
+    int n;
+    int blocked = 0;
+
+    if (who && who_cap) who[0] = '\0';
+    if (what && what_cap) what[0] = '\0';
+    if (!g_lc.in_lobby || g_lc.match_caps.mod_count <= 0)
+        return 0;
+    for (n = 0; n < g_lc.member_count; ++n) {
+        int missing;
+        if (!strcmp(g_lc.members[n].player_id, g_lc.player_id))
+            continue;              /* the host runs the plan by definition */
+        missing = member_missing_count(n);
+        if (missing <= 0)
+            continue;
+        blocked += missing;
+        if (who && who_cap && !who[0])
+            snprintf(who, who_cap, "%s", g_lc.members[n].display_name);
+        if (what && what_cap && !what[0]) {
+            const SnesLobbyMatchCaps *caps = &g_lc.match_caps;
+            int i;
+            int j;
+            for (i = 0; i < caps->mod_count; ++i) {
+                int have = 0;
+                for (j = 0; j < g_lc.member_offer_count[n]; ++j)
+                    if (!strcmp(g_lc.member_offer[n][j].id, caps->mods[i].id)) {
+                        have = 1;
+                        break;
+                    }
+                if (!have) {
+                    snprintf(what, what_cap, "%s@%s", caps->mods[i].id,
+                             caps->mods[i].ver);
+                    break;
+                }
+            }
+        }
+    }
+    return blocked;
+}
+
+int snes_lobby_local_missing_mods(void)
+{
+    int n;
+    for (n = 0; n < g_lc.member_count; ++n)
+        if (!strcmp(g_lc.members[n].player_id, g_lc.player_id))
+            return member_missing_count(n);
     return 0;
 }
 
 int snes_lobby_request_start(const SnesLobbyMatchCaps *match_caps)
 {
-    char msg[768];
-    char caps_json[512];
+    char msg[SNES_LOBBY_MAX_MODS * 256 + 1024];
+    char caps_json[SNES_LOBBY_MAX_MODS * 256 + 512];
+    char who[SNES_LOBBY_NAME_LEN];
+    char what[SNES_LOBBY_MOD_ID_LEN + SNES_LOBBY_MOD_VER_LEN + 2];
     int n;
     if (!snes_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host) {
+        return -1;
+    }
+    /* THE gate. Not the door: a peer without the mods is welcome in the room,
+     * and is expected to be here -- this is where they see what is missing and
+     * pull it from the host. What cannot happen is the match starting while
+     * two peers would patch guest memory differently, because that is a desync
+     * dressed up as a match. Checked against every seated peer at the moment
+     * of starting, which is the only moment the answer is current. */
+    if (snes_lobby_match_blocked_by_mods(who, sizeof(who), what,
+                                         sizeof(what)) > 0) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "peer_needs_mods");
+        fprintf(stderr,
+                "snes_lobby: not starting -- %s does not have %s (and possibly "
+                "more). They can download it from you in the lobby.\n",
+                who[0] ? who : "a player", what[0] ? what : "a required mod");
         return -1;
     }
     caps_json[0] = '\0';
@@ -1643,7 +2208,369 @@ int snes_lobby_try_fill_launch(SnesLobbyJoinInfo *out)
     return 1;
 }
 
-int snes_lobby_send_signal(int type, int flag, const char *text)
+/* ---- peer-to-peer mod transfer -----------------------------------------
+ *
+ * Bytes go over a dedicated ICE agent straight between the two players. The
+ * lobby server carries only the SDP and candidate lines needed to build that
+ * connection, on the same relay the seats already use.
+ */
+
+static void mod_xfer_emit(const RNetSignal *msg, void *user)
+{
+    (void)user;
+    if (!msg) return;
+    (void)snes_lobby_send_signal_to(g_lc.xfer_peer,
+                                    SNES_LOBBY_SIG_MOD_ICE_BASE + (int)msg->type,
+                                    (int)msg->flag, msg->text);
+}
+
+static void mod_xfer_reset(void)
+{
+    if (g_lc.xfer) rnet_ice_xfer_close(&g_lc.xfer);
+    g_lc.xfer = NULL;
+    g_lc.xfer_busy = 0;
+    g_lc.xfer_sending = 0;
+    g_lc.xfer_peer[0] = '\0';
+    g_lc.xfer_id[0] = '\0';
+    g_lc.xfer_ver[0] = '\0';
+    g_lc.xfer_sha[0] = '\0';
+    g_lc.xfer_expect = 0;
+    g_lc.sig_hold_n = 0;
+    g_lc.sig_hold_from[0] = '\0';
+}
+
+static void mod_xfer_fail(const char *why)
+{
+    snprintf(g_lc.xfer_err, sizeof(g_lc.xfer_err), "%s",
+             why && why[0] ? why : "transfer failed");
+    fprintf(stderr, "snes_lobby: mod transfer failed - %s\n", g_lc.xfer_err);
+    g_lc.xfer_progress = -2;
+    mod_xfer_reset();
+}
+
+/* Build the ICE config from the lobby's Coturn mint. Copied into g_lc because
+ * RNetIceConfig holds borrowed pointers that must outlive the agent. */
+static int mod_xfer_ice_config(RNetIceConfig *ice)
+{
+    const SnesLobbyTurnCredentials *tc = snes_lobby_turn_credentials();
+    rnet_ice_config_init_defaults(ice);
+    if (!tc || !tc->valid)
+        return 0;              /* host-candidate only; fine on a LAN */
+    if (tc->stun_host[0]) {
+        snprintf(g_lc.ice_stun, sizeof(g_lc.ice_stun), "%s", tc->stun_host);
+        ice->stun_host = g_lc.ice_stun;
+        ice->stun_port = (rnet_u16)(tc->stun_port > 0 ? tc->stun_port : 3478);
+    }
+    if (tc->turn_host[0]) {
+        snprintf(g_lc.ice_turn, sizeof(g_lc.ice_turn), "%s", tc->turn_host);
+        snprintf(g_lc.ice_user, sizeof(g_lc.ice_user), "%s", tc->username);
+        snprintf(g_lc.ice_pass, sizeof(g_lc.ice_pass), "%s", tc->password);
+        ice->turn_host = g_lc.ice_turn;
+        ice->turn_port = (rnet_u16)(tc->turn_port > 0 ? tc->turn_port : 3478);
+        ice->turn_user = g_lc.ice_user;
+        ice->turn_pass = g_lc.ice_pass;
+    }
+    return 1;
+}
+
+static int mod_xfer_open(const char *peer, int controlling)
+{
+    RNetIceConfig ice;
+    RNetSignal set_role;
+
+    if (g_lc.xfer) rnet_ice_xfer_close(&g_lc.xfer);
+    (void)mod_xfer_ice_config(&ice);
+    if (rnet_ice_xfer_open(&g_lc.xfer, &ice, mod_xfer_emit, NULL) != 0 ||
+        !g_lc.xfer) {
+        mod_xfer_fail("could not open a direct connection");
+        return -1;
+    }
+    snprintf(g_lc.xfer_peer, sizeof(g_lc.xfer_peer), "%s", peer ? peer : "");
+    /* libjuice has no set-role API; the agent takes this as a gather-order
+     * hint, and the two sides must not both claim it. The SENDER controls. */
+    memset(&set_role, 0, sizeof(set_role));
+    set_role.type = RNET_SIGNAL_SET_CONTROLLING;
+    set_role.flag = (rnet_u8)(controlling ? 1 : 0);
+    rnet_ice_xfer_push_signal(g_lc.xfer, &set_role);
+    g_lc.xfer_busy = 1;
+    g_lc.xfer_progress = 0;
+    g_lc.xfer_err[0] = '\0';
+
+    /* Replay anything that arrived while we were still getting ready, but
+     * only from the peer this agent is for -- a hold from an abandoned
+     * exchange would poison the new one. */
+    if (g_lc.sig_hold_n > 0) {
+        if (g_lc.xfer_peer[0] && !strcmp(g_lc.sig_hold_from, g_lc.xfer_peer)) {
+            int i;
+            fprintf(stderr, "snes_lobby: replaying %d held ICE signal(s)\n",
+                    g_lc.sig_hold_n);
+            for (i = 0; i < g_lc.sig_hold_n; ++i)
+                rnet_ice_xfer_push_signal(g_lc.xfer, &g_lc.sig_hold[i]);
+        }
+        g_lc.sig_hold_n = 0;
+        g_lc.sig_hold_from[0] = '\0';
+    }
+    return 0;
+}
+
+/* HOST side: a seated peer asked for a package. */
+static void mod_xfer_on_request(const char *from, const char *text)
+{
+    char id[SNES_LOBBY_MOD_ID_LEN];
+    char ver[SNES_LOBBY_MOD_VER_LEN];
+    const char *at;
+    size_t idlen;
+    uint8_t *blob = NULL;
+    uint32_t len = 0;
+    char sha[65];
+    char err[192];
+    char header[512];
+    uint8_t *hdr_copy;
+
+    /* Every refusal below is reported to the asking peer AND logged here.
+     * The first version only sent the reason down the wire, so a host whose
+     * export failed showed a clean log while the guest was told "could not
+     * pack the mod" -- the one machine that knew why said nothing. */
+    err[0] = '\0';
+    sha[0] = '\0';
+
+    if (!from || !from[0] || !text) return;
+    fprintf(stderr, "snes_lobby: %s asked for \"%s\"\n", from, text);
+    if (g_lc.xfer_busy) {
+        fprintf(stderr, "snes_lobby: refusing - already transferring\n");
+        (void)snes_lobby_send_signal_to(from, SNES_LOBBY_SIG_MOD_NAK, 0,
+                                        "the host is already sending a mod; "
+                                        "try again in a moment");
+        return;
+    }
+    at = strchr(text, '@');
+    if (!at) return;
+    idlen = (size_t)(at - text);
+    if (idlen == 0 || idlen >= sizeof(id)) return;
+    memcpy(id, text, idlen);
+    id[idlen] = '\0';
+    snprintf(ver, sizeof(ver), "%s", at + 1);
+
+    /* Only ever send something this host actually runs. The plan is the list
+     * the guest was shown; anything else is a request we have no reason to
+     * honour, and honouring it would let a peer pull arbitrary packages off
+     * this machine by name. */
+    {
+        int i;
+        int in_plan = 0;
+        for (i = 0; i < g_lc.match_caps.mod_count; ++i)
+            if (!strcmp(g_lc.match_caps.mods[i].id, id)) {
+                in_plan = 1;
+                snprintf(ver, sizeof(ver), "%s", g_lc.match_caps.mods[i].ver);
+                break;
+            }
+        if (!in_plan) {
+            fprintf(stderr,
+                    "snes_lobby: refusing - \"%s\" is not in this host's "
+                    "published plan (%d package(s))\n",
+                    id, g_lc.match_caps.mod_count);
+            (void)snes_lobby_send_signal_to(from, SNES_LOBBY_SIG_MOD_NAK, 0,
+                                            "that mod is not part of this "
+                                            "lobby's plan");
+            return;
+        }
+    }
+
+    if (!g_mod_export_fn) {
+        /* Distinct from an export that ran and failed: this build never
+         * installed the hook, which is a wiring fault on this side, not
+         * anything about the package. Previously both said "could not pack
+         * the mod" -- and read err[] uninitialized to decide which. */
+        fprintf(stderr, "snes_lobby: refusing - no mod export hook is "
+                        "installed in this build\n");
+        (void)snes_lobby_send_signal_to(from, SNES_LOBBY_SIG_MOD_NAK, 0,
+                                        "the host's build cannot send mods");
+        return;
+    }
+    if (g_mod_export_fn(id, ver, &blob, &len, sha, sizeof(sha), err,
+                           sizeof(err), g_mod_hook_ctx) != 1) {
+        fprintf(stderr, "snes_lobby: refusing - packing %s@%s failed: %s\n",
+                id, ver, err[0] ? err : "(the exporter gave no reason)");
+        (void)snes_lobby_send_signal_to(from, SNES_LOBBY_SIG_MOD_NAK, 0,
+                                        err[0] ? err : "could not pack the mod");
+        return;
+    }
+
+    if (mod_xfer_open(from, /*controlling=*/1) != 0) {
+        if (g_mod_free_fn) g_mod_free_fn(blob);
+        return;
+    }
+    g_lc.xfer_sending = 1;
+    snprintf(g_lc.xfer_id, sizeof(g_lc.xfer_id), "%s", id);
+    snprintf(g_lc.xfer_ver, sizeof(g_lc.xfer_ver), "%s", ver);
+
+    /* Two blobs: what is coming, then the thing itself. The digest travels in
+     * the header so the receiver can check the payload against a value that
+     * did not come from the payload. */
+    snprintf(header, sizeof(header),
+             "{\"id\":\"%s\",\"ver\":\"%s\",\"len\":%u,\"sha256\":\"%s\"}",
+             id, ver, (unsigned)len, sha);
+    hdr_copy = (uint8_t *)malloc(strlen(header) + 1);
+    if (!hdr_copy) {
+        if (g_mod_free_fn) g_mod_free_fn(blob);
+        mod_xfer_fail("out of memory");
+        return;
+    }
+    memcpy(hdr_copy, header, strlen(header) + 1);
+    if (rnet_ice_xfer_queue_blob(g_lc.xfer, hdr_copy, strlen(header)) != 0 ||
+        rnet_ice_xfer_queue_blob(g_lc.xfer, blob, (size_t)len) != 0) {
+        mod_xfer_fail("could not queue the mod for sending");
+        return;
+    }
+    fprintf(stderr, "snes_lobby: sending %s@%s (%u bytes) to %s\n", id, ver,
+            (unsigned)len, from);
+}
+
+/* GUEST side: a completed blob arrived. */
+static void mod_xfer_on_blob(uint8_t *data, size_t len)
+{
+    char err[192];
+    char id[96];
+    char ver[32];
+
+    if (!g_lc.xfer_sha[0]) {
+        /* First blob is the header. */
+        char text[600];
+        size_t n = len < sizeof(text) - 1 ? len : sizeof(text) - 1;
+        memcpy(text, data, n);
+        text[n] = '\0';
+        json_get_str(text, "sha256", g_lc.xfer_sha, sizeof(g_lc.xfer_sha));
+        json_get_str(text, "id", g_lc.xfer_id, sizeof(g_lc.xfer_id));
+        json_get_str(text, "ver", g_lc.xfer_ver, sizeof(g_lc.xfer_ver));
+        g_lc.xfer_expect = (uint32_t)json_get_int(text, "len", 0);
+        free(data);
+        if (!g_lc.xfer_sha[0] || !g_lc.xfer_expect)
+            mod_xfer_fail("the host described the mod in a way we cannot read");
+        return;
+    }
+
+    if ((uint32_t)len != g_lc.xfer_expect) {
+        free(data);
+        mod_xfer_fail("the mod arrived a different size than the host said");
+        return;
+    }
+    if (!g_mod_install_fn) {
+        free(data);
+        mod_xfer_fail("this build cannot install mods");
+        return;
+    }
+    /* The digest is checked inside the install callback, before anything is
+     * unpacked -- see snes_mod_runtime_install_blob_c. */
+    if (g_mod_install_fn(data, (uint32_t)len, g_lc.xfer_sha, id, sizeof(id),
+                            ver, sizeof(ver), err, sizeof(err),
+                            g_mod_hook_ctx) != 1) {
+        free(data);
+        mod_xfer_fail(err[0] ? err : "the mod could not be installed");
+        return;
+    }
+    free(data);
+    fprintf(stderr, "snes_lobby: installed %s@%s from the host\n", id, ver);
+    g_lc.xfer_progress = 100;
+    mod_xfer_reset();
+    /* Re-announce: we now hold something we did not a moment ago, and the
+     * host's launch gate is reading that announcement. */
+    send_set_ready(g_lc.local_ready ? 1 : 0);
+    flush_pending();
+}
+
+void snes_lobby_mod_xfer_pump(void)
+{
+    uint8_t *data = NULL;
+    size_t len = 0;
+    char err[160];
+
+    if (!g_lc.xfer) return;
+    rnet_ice_xfer_pump(g_lc.xfer);
+
+    if (rnet_ice_xfer_failed(g_lc.xfer, err, sizeof(err))) {
+        mod_xfer_fail(err);
+        return;
+    }
+    {
+        const int p = rnet_ice_xfer_progress(g_lc.xfer);
+        if (p >= 0) g_lc.xfer_progress = p;
+    }
+    while (rnet_ice_xfer_take_blob(g_lc.xfer, &data, &len)) {
+        mod_xfer_on_blob(data, len);
+        if (!g_lc.xfer) return;      /* finished or failed inside */
+        data = NULL;
+        len = 0;
+    }
+    /* The sender is done when everything queued has left. */
+    if (g_lc.xfer_sending && rnet_ice_xfer_send_idle(g_lc.xfer)) {
+        fprintf(stderr, "snes_lobby: %s@%s sent\n", g_lc.xfer_id, g_lc.xfer_ver);
+        g_lc.xfer_progress = -1;
+        mod_xfer_reset();
+    }
+}
+
+int snes_lobby_mod_request(const char *package_id, const char *version)
+{
+    char text[192];
+    const char *host = g_lc.host_player_id;
+
+    if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (g_lc.is_host) return -1;            /* the host IS the source */
+    if (!host || !host[0]) return -1;
+    if (g_lc.xfer_busy) return -1;
+    if (!package_id || !package_id[0]) return -1;
+
+    if (mod_xfer_open(host, /*controlling=*/0) != 0) return -1;
+    g_lc.xfer_sending = 0;
+    g_lc.xfer_sha[0] = '\0';
+    g_lc.xfer_expect = 0;
+    snprintf(text, sizeof(text), "%s@%s", package_id, version ? version : "");
+    if (snes_lobby_send_signal_to(host, SNES_LOBBY_SIG_MOD_REQ, 0, text) != 0) {
+        mod_xfer_fail("could not reach the host");
+        return -1;
+    }
+    fprintf(stderr, "snes_lobby: asked the host for %s\n", text);
+    return 0;
+}
+
+void snes_lobby_mod_cancel(void)
+{
+    if (!g_lc.xfer_busy) return;
+    fprintf(stderr, "snes_lobby: mod transfer cancelled\n");
+    g_lc.xfer_progress = -1;
+    mod_xfer_reset();
+}
+
+int snes_lobby_mod_progress(void)
+{
+    return g_lc.xfer_busy ? g_lc.xfer_progress : (g_lc.xfer_progress == -2 ? -2 : -1);
+}
+
+int snes_lobby_mod_failed(char *err, size_t err_cap)
+{
+    if (!g_lc.xfer_err[0]) return 0;
+    if (err && err_cap) snprintf(err, err_cap, "%s", g_lc.xfer_err);
+    return 1;
+}
+
+const char *snes_lobby_mod_in_flight(void)
+{
+    return g_lc.xfer_busy ? g_lc.xfer_id : "";
+}
+
+void snes_lobby_set_mod_transfer_hooks(SnesLobbyModExportFn export_fn,
+                                       SnesLobbyModFreeFn free_fn,
+                                       SnesLobbyModInstallFn install_fn,
+                                       void *ctx)
+{
+    g_mod_export_fn = export_fn;
+    g_mod_free_fn = free_fn;
+    g_mod_install_fn = install_fn;
+    g_mod_hook_ctx = ctx;
+}
+
+int snes_lobby_send_signal_to(const char *to_player_id, int type, int flag,
+                              const char *text)
 {
     char esc[4096];
     char msg[4608];
@@ -1653,10 +2580,14 @@ int snes_lobby_send_signal(int type, int flag, const char *text)
     }
     lid = g_lc.join.lobby_id[0] ? g_lc.join.lobby_id : "";
     json_escape(text ? text : "", esc, sizeof(esc));
+    /* An empty to_player_id broadcasts to the other seated members, which is
+     * right for the game's own ICE but wrong for a transfer: a third player
+     * would push a stranger's SDP into their agent and corrupt a negotiation
+     * they are not part of. */
     snprintf(msg, sizeof(msg),
-             "{\"op\":\"signal\",\"lobby_id\":\"%s\",\"to_player_id\":\"\","
+             "{\"op\":\"signal\",\"lobby_id\":\"%s\",\"to_player_id\":\"%s\","
              "\"type\":%d,\"flag\":%d,\"text\":\"%s\"}",
-             lid, type, flag, esc);
+             lid, to_player_id ? to_player_id : "", type, flag, esc);
     /* Write immediately — ICE candidates arrive in bursts larger than pending_tx. */
     if (g_lc.handshake_done && g_lc.fd >= 0) {
         if (rnet_ws_write_text(g_lc.fd, msg, 1) < 0)
@@ -1665,6 +2596,11 @@ int snes_lobby_send_signal(int type, int flag, const char *text)
     }
     queue_send(msg);
     return 0;
+}
+
+int snes_lobby_send_signal(int type, int flag, const char *text)
+{
+    return snes_lobby_send_signal_to("", type, flag, text);
 }
 
 int snes_lobby_poll_signal(int *type, int *flag, char *text, size_t text_cap)

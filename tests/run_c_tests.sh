@@ -191,3 +191,15 @@ echo "=== APU guest-time pacing ==="
     "$ROOT/runner/src/snes/dsp.c" \
     -Wl,--gc-sections -o "$OUT/apu_port_guest_time_test"
 "$OUT/apu_port_guest_time_test"
+
+echo "=== lobby mod plan (match_caps.mods wire shape) ==="
+# Includes snes_lobby_client.c directly to exercise the real codec, so it needs
+# the same guard define and include roots the runner build uses.
+"$CC" -std=c11 -Wall -Wextra -O1 \
+    -D_POSIX_C_SOURCE=200809L -DSNES_HAS_LOBBY_CLIENT=1 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/lobby" \
+    -I "$ROOT/runner/src/lobby/ws" -I "$ROOT/lib/recomp-net/include" \
+    "$ROOT/tests/netplay/lobby_mod_plan_test.c" \
+    "$ROOT"/runner/src/lobby/ws/*.c \
+    -o "$OUT/lobby_mod_plan_test"
+"$OUT/lobby_mod_plan_test"

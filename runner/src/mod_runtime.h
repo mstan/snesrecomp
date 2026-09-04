@@ -83,6 +83,76 @@ int snes_mod_runtime_adopt_set_c(const char* want, char* reason, uint32_t cap);
 int snes_mod_runtime_have_package_c(const char* package_id, const char* version,
                                     char* name_out, uint32_t name_cap);
 
+/* One package row on the lobby wire.
+ *
+ * The effective-set text below is keyed by FEATURE, which is the right grain
+ * for "are we simulating the same thing". The lobby server asks a coarser
+ * question -- does this peer have this package at this version, at all -- so
+ * these rows are per PACKAGE, and carry the enabled feature ids alongside for
+ * the player to read. Both grains describe the same selection; neither
+ * replaces the other. */
+#define SNES_MOD_ROW_ID_LEN    96
+#define SNES_MOD_ROW_VER_LEN   32
+#define SNES_MOD_ROW_NAME_LEN  64
+#define SNES_MOD_ROW_FEATS_LEN 192
+
+typedef struct SnesModPkgRow {
+    char id[SNES_MOD_ROW_ID_LEN];
+    char version[SNES_MOD_ROW_VER_LEN];
+    char name[SNES_MOD_ROW_NAME_LEN];
+    /* Plan rows only: comma-separated ids of the features the host turned on.
+     * Empty on an offer row, which says only "I have this package". */
+    char features[SNES_MOD_ROW_FEATS_LEN];
+} SnesModPkgRow;
+
+/* The host's required plan: one row per package with at least one ENABLED
+ * feature, at the version actually selected. Returns the number of rows
+ * written (capped at `max`), or 0 when nothing is enabled.
+ *
+ * A row whose id or version does not fit is DROPPED rather than truncated: a
+ * truncated id names a different package, and the server would compare it to
+ * a peer's offer and reach a confident wrong answer. */
+int snes_mod_runtime_plan_rows_c(SnesModPkgRow* out, int max);
+
+/* Every (package, version) installed on this machine -- what a peer offers so
+ * the server can tell what it is missing. Enabled or not: the question is
+ * possession, and the host's plan decides what runs. Same drop-don't-truncate
+ * rule as above. */
+int snes_mod_runtime_installed_rows_c(SnesModPkgRow* out, int max);
+
+/* ---- peer-to-peer package transfer -------------------------------------
+ *
+ * The host packs a package it has; the guest verifies and installs it. The
+ * bytes travel over a direct ICE connection between the two players, never
+ * through the lobby server -- see runner/src/lobby.
+ */
+
+/* Pack `package_id`@`version` into a .snesmod archive in memory.
+ *
+ * Writes the archive's SHA-256 as lowercase hex into `sha256_hex` (needs 65
+ * bytes). The digest is computed here, at the source, so the receiver checks
+ * the bytes it actually got against a value that never shared a path with
+ * them. Returns 1 on success; *out must then be released with
+ * snes_mod_runtime_free_blob_c. */
+int snes_mod_runtime_export_package_c(const char* package_id,
+                                      const char* version,
+                                      uint8_t** out, uint32_t* out_len,
+                                      char* sha256_hex, uint32_t sha_cap,
+                                      char* err, uint32_t err_cap);
+void snes_mod_runtime_free_blob_c(uint8_t* blob);
+
+/* Install a received archive.
+ *
+ * `expect_sha256` is REQUIRED and checked before a single byte is unpacked:
+ * this is code from another machine, and the digest is the only thing tying
+ * what arrived to what the host said it was sending. A mismatch is refused
+ * without touching the mod directory. Returns 1 on success. */
+int snes_mod_runtime_install_blob_c(const uint8_t* data, uint32_t len,
+                                    const char* expect_sha256,
+                                    char* installed_id, uint32_t id_cap,
+                                    char* installed_ver, uint32_t ver_cap,
+                                    char* err, uint32_t err_cap);
+
 /* Can this build honour the host's mod set? Returns one of the above and
  * writes a player-actionable reason ("missing mod: x", "y needs version z").
  * Empty reason on OK. */
