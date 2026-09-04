@@ -276,7 +276,14 @@ static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
   memory->position += n;
 }
 
-void RtlReset(int mode) {
+/* Host-side state that paces the guest but is not part of it.
+ *
+ * Shared by the two ways into a fresh machine -- RtlReset (soft reset) and
+ * SnesInit (cold boot / rematch). Kept in one place because they diverged:
+ * SnesInit reset the guest and left these alone, so a rematch started with the
+ * previous session's frame counter and APU anchors and booted to a different
+ * state than a first run. */
+void rtl_reset_host_pacing(void) {
   snes_frame_counter = 0;
   g_apu_frame_time_valid = false;
   g_apu_frame_start_master = g_cpu.master_cycles;
@@ -287,6 +294,27 @@ void RtlReset(int mode) {
   // g_cpu); anchor the sync pointer to its current value so the first post-reset
   // catch-up sees a zero delta rather than the whole run's accumulated cycles.
   g_apu_last_sync_master = g_cpu.master_cycles;
+
+  /* The DRAM refresh tax carries a SUB-SCANLINE remainder across frames, and
+   * that remainder decides where the next refresh boundary falls -- so it
+   * decides how many cycles the first block after a boot is charged.
+   *
+   * It is a static in the runtime, not part of the Snes, so it survived
+   * re-creating the machine. A rematch therefore began mid-refresh-line at
+   * whatever phase the previous session happened to stop on: the first frame
+   * was charged a different number of cycles than on a first boot, the APU
+   * catch-up residual came out different (measured: 0.804 vs 0.752), and tick
+   * 0 hashed to a different WRAM and APU state. Two peers that had stopped at
+   * different phases could not agree on a boot they had both just performed.
+   *
+   * Anchored to now and zeroed, which is the state a first boot starts from.
+   * This same carry has bitten before: it was the rollback replay divergence
+   * that had to be found by diffing .data and .bss. */
+  snes_refresh_state_set(0u, g_cpu.master_cycles);
+}
+
+void RtlReset(int mode) {
+  rtl_reset_host_pacing();
   snes_reset(g_snes, true);
   g_snes->beamMasterLast = g_cpu.master_cycles;
   SnesEnterNativeMode();

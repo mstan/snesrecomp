@@ -254,6 +254,10 @@ static inline void rdb_indir_dbx_store16(uint8 dp_addr, uint16 offs, uint16 valu
 }
 #endif
 
+/* Clear the host-side pacing that drives the guest: frame counter and APU
+ * anchors. Called by RtlReset and by SnesInit, so a soft reset and a cold boot
+ * agree on what a fresh machine means. */
+void rtl_reset_host_pacing(void);
 void RtlReset(int mode);
 
 enum {

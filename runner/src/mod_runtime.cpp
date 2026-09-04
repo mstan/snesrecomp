@@ -1649,7 +1649,8 @@ std::string hex32(const uint8_t digest[32]) {
 bool install_archive(Runtime& runtime, const fs::path& archive,
                      std::string* installed_id,
                      std::string* installed_version,
-                     std::string* error) {
+                     std::string* error,
+                     bool replace_existing = false) {
     if (archive.extension() != ".snesmod") {
         set_error(error, "SNES mod archives must use the .snesmod extension");
         return false;
@@ -1689,10 +1690,22 @@ bool install_archive(Runtime& runtime, const fs::path& archive,
     const fs::path destination =
         runtime.root / "packages" / package.id / package.version;
     if (fs::exists(destination)) {
-        cleanup();
-        set_error(error, package.id + " " + package.version +
-                         " is already installed");
-        return false;
+        if (!replace_existing) {
+            cleanup();
+            set_error(error, package.id + " " + package.version +
+                             " is already installed");
+            return false;
+        }
+        /* Replacing, not merging: the incoming copy is authoritative and a
+         * leftover file from the old one would travel with it. */
+        fs::remove_all(destination, ec);
+        if (ec) {
+            cleanup();
+            set_error(error, "cannot replace the installed package: " +
+                             ec.message());
+            return false;
+        }
+        ec.clear();
     }
     fs::create_directories(destination.parent_path(), ec);
     if (!ec) fs::rename(staging, destination, ec);
@@ -2512,6 +2525,32 @@ bool row_field(char* dst, size_t cap, const std::string& value) {
 
 }  // namespace
 
+extern "C" int snes_mod_runtime_package_root_c(const char* package_id,
+                                              const char* version,
+                                              char* out, uint32_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!package_id || !out || !cap) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+
+    const SNESRecomp::Package* package = nullptr;
+    if (version && version[0]) {
+        auto by_id = runtime.packages.find(package_id);
+        if (by_id == runtime.packages.end()) return 0;
+        auto by_ver = by_id->second.find(version);
+        if (by_ver == by_id->second.end()) return 0;
+        package = &by_ver->second;
+    } else {
+        package = SNESRecomp::selected_package(runtime, package_id);
+    }
+    if (!package) return 0;
+
+    const std::string root = package->root.string();
+    if (root.size() + 1 > cap) return 0;
+    std::memcpy(out, root.c_str(), root.size() + 1);
+    return 1;
+}
+
 extern "C" int snes_mod_runtime_export_package_c(const char* package_id,
                                                 const char* version,
                                                 uint8_t** out, uint32_t* out_len,
@@ -2620,7 +2659,20 @@ extern "C" int snes_mod_runtime_install_blob_c(const uint8_t* data, uint32_t len
     std::string id;
     std::string ver;
     std::string error;
-    const bool ok = SNESRecomp::install_archive(runtime, staged, &id, &ver, &error);
+    /* A transfer REPLACES an existing copy of the same version.
+     *
+     * install_archive refuses when the destination exists, which is right for
+     * a file a user dropped in -- but wrong for a package the host just sent,
+     * whose bytes have already been checked against the host's digest above.
+     * Without it, a peer holding a stale or incomplete copy at that version
+     * can never repair it: the row reads "installed", so no download is
+     * offered, and the mod stays broken forever. That is precisely how a
+     * package predating its data being moved inside it survives.
+     *
+     * Only reachable after the digest check passed, so a failed or tampered
+     * transfer can never delete a working package. */
+    const bool ok = SNESRecomp::install_archive(runtime, staged, &id, &ver,
+                                                &error, /*replace=*/true);
     std::error_code ignored;
     fs::remove(staged, ignored);
     if (!ok)

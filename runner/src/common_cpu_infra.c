@@ -724,6 +724,21 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     if (g_rtl_game_info->initialize)
       g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
+    /* The machine is new; the HOST-SIDE pacing that drives it must be too.
+     *
+     * snes_reset clears the guest (WRAM included). It does not touch the frame
+     * counter or the APU pacing anchors, which live in the runtime and outlive
+     * any one Snes -- so a rematch re-entered through SnesInit inherited the
+     * previous session's counter and anchors. The APU was then caught up by a
+     * different number of cycles than on a first boot, the CPU read different
+     * values from its ports while booting, and the two peers' WRAM and APU
+     * digests came out different at tick 0 -- a rematch that could never start
+     * even with nobody touching anything.
+     *
+     * RtlReset (the soft-reset path) has always done this. SnesInit is the
+     * other way into a fresh machine and has to agree with it: two entry
+     * points must not disagree about what "cold boot" means. */
+    rtl_reset_host_pacing();
     g_snes->beamMasterLast = g_cpu.master_cycles;
     SnesEnterNativeMode();
   } else {
