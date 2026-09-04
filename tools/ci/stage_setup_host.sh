@@ -234,9 +234,13 @@ printf '%s\n' "${VERSION}" > "${STAGE}/VERSION"
 # dirty after 100 tries, perhaps system time is not set" -- with nothing
 # compiled. Stamp every staged file with the game commit's time, which is
 # in the past in every zone, and reproducible besides.
-STAMP="$(git -C "${ROOT}" log -1 --format=%ct 2>/dev/null || date +%s)"
-find "${STAGE}" -exec touch -h -d "@${STAMP}" {} + 2>/dev/null \
-  || find "${STAGE}" -exec touch -d "@${STAMP}" {} +
+# GNU touch takes -d @epoch; BSD touch (macOS) does not. Both take an ISO
+# YYYY-MM-DDThh:mm:SS, so convert the epoch with whichever date is here.
+EPOCH="$(git -C "${ROOT}" log -1 --format=%ct 2>/dev/null || date +%s)"
+STAMP="$(date -u -d "@${EPOCH}" +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+      || date -u -r "${EPOCH}" +%Y-%m-%dT%H:%M:%S)"
+find "${STAGE}" -exec touch -h -d "${STAMP}" {} + 2>/dev/null \
+  || find "${STAGE}" -exec touch -d "${STAMP}" {} +
 
 # ── the licensing rule, enforced ────────────────────────────────────────────
 if find "${STAGE}" \( -iname '*.sfc' -o -iname '*.smc' -o -iname '*.srm' -o -iname '*.fig' \) | grep -q .; then
