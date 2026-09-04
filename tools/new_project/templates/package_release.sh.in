@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 # Package a player-facing @DISPLAY_NAME@ release.
 #
-# The zip contains the built executable and its runtime assets. It never
-# contains the ROM, generated C, or anything else derived from copyrighted
-# data — players bring their own ROM and the binary reads it at launch.
+# The zip contains the built executable, its runtime assets, and the shared
+# libraries the binary needs. It never contains the ROM, generated C, or
+# anything else derived from copyrighted data — players bring their own ROM
+# and the binary reads it at launch.
+#
+# Usage:
+#   scripts/package_release.sh [<build-dir>] [<platform-tag>]
+#
+# Both arguments are optional; BUILD_DIR and PLATFORM still work as env vars.
+# Defaults: build, and the host's own <os>-<arch>.
+#
+# Writes: dist/@ZIP_PREFIX@-<VERSION>-<platform-tag>.zip
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
-BUILD_DIR="${BUILD_DIR:-build}"
+BUILD_DIR="${1:-${BUILD_DIR:-build}}"
+PLATFORM="${2:-${PLATFORM:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}}"
 VERSION="$(tr -d '[:space:]' < VERSION)"
-PLATFORM="${PLATFORM:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}"
-STAGE="dist/@ZIP_PREFIX@-$VERSION-$PLATFORM"
+if [ -z "$VERSION" ]; then
+  echo "package_release.sh: VERSION is empty" >&2
+  exit 1
+fi
+
+NAME="@ZIP_PREFIX@-$VERSION-$PLATFORM"
+STAGE="dist/$NAME"
 EXE="$BUILD_DIR/@PROJECT_NAME@"
 [ -f "$EXE.exe" ] && EXE="$EXE.exe"
 
@@ -22,20 +37,43 @@ if [ ! -f "$EXE" ]; then
   echo "  cmake -S . -B $BUILD_DIR -DCMAKE_BUILD_TYPE=Release && cmake --build $BUILD_DIR -j" >&2
   exit 1
 fi
+EXE_DIR="$(cd "$(dirname "$EXE")" && pwd)"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp "$EXE" "$STAGE/"
-cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+cp README.md LICENSE VERSION "$STAGE/" 2>/dev/null || true
+
 # Launcher runtime assets (fonts, chrome, boxart) are staged into the BUILD
 # dir by recomp_ui.cmake POST_BUILD — that copy is the one beside the exe at
 # runtime, so it is the one that ships. Repo-root assets/ is the fallback for
 # builds without the launcher.
-if [ -d "$BUILD_DIR/assets" ]; then
-  cp -R "$BUILD_DIR/assets" "$STAGE/"
-elif [ -d assets ]; then
+if [ -d "$EXE_DIR/assets" ]; then
+  cp -R "$EXE_DIR/assets" "$STAGE/"
+elif [ -d assets ] && [ -n "$(ls -A assets 2>/dev/null)" ]; then
   cp -R assets "$STAGE/"
 fi
+
+# Shared libraries. Without this the zip runs on the machine that built it and
+# nowhere else; the framework owns the per-platform rules.
+BUNDLE="snesrecomp/tools/ci/bundle_runtime_libs.sh"
+if [ -f "$BUNDLE" ]; then
+  bash "$BUNDLE" --exe "$STAGE/$(basename "$EXE")" --build-dir "$EXE_DIR"
+else
+  echo "package_release.sh: $BUNDLE missing (old snesrecomp pin) —" >&2
+  echo "  the zip may depend on libraries only this machine has." >&2
+fi
+
+cat > "$STAGE/README.txt" <<EOF
+@DISPLAY_NAME@ $VERSION
+Platform pack: $PLATFORM
+
+This build does NOT include the SNES ROM.
+On first launch, pick your legally obtained copy of
+@ROM_FILE@.
+
+  SHA-256 @ROM_SHA256@
+EOF
 
 # Guard the licensing rule mechanically rather than by memory: no ROM-derived
 # bytes leave this tree in a release zip.
@@ -44,5 +82,8 @@ if find "$STAGE" \( -name '*.sfc' -o -name '*.smc' -o -name '*.srm' \) | grep -q
   exit 1
 fi
 
-( cd dist && zip -qr "$(basename "$STAGE").zip" "$(basename "$STAGE")" )
-echo "Packaged: dist/$(basename "$STAGE").zip"
+rm -f "dist/$NAME.zip"
+( cd dist && zip -qr "$NAME.zip" "$NAME" )
+rm -rf "$STAGE"
+echo "Packaged: dist/$NAME.zip"
+ls -l "dist/$NAME.zip"

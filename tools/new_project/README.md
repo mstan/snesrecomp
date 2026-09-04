@@ -66,6 +66,23 @@ create` (no push) → generate/build → one push. Pushing earlier leaves a seco
 | `fill_tokens.py` | `@TOKEN@` substitution; unknown tokens are an error, not a blank |
 | `templates/` | Everything written into the new repo |
 
+## The workflow it writes
+
+`.github/workflows/release.yml` builds four platform packs — Linux x86-64,
+Windows x86-64, macOS arm64, macOS Intel — and can attach them to a GitHub
+Release from a `v*` tag.
+
+A fresh scaffold cannot build the game in CI: `src/gen/` is derived from a ROM
+that never enters CI. So the workflow ships in its honest mode — one job named
+`ROM-free host check (no game build)`, which runs the framework tests and
+compiles the host translation units. Set the repository variable
+`CI_SRC_GEN_ASSET` (and the `CI_ASSETS_TOKEN` secret) once you have published
+the generated C, and the four real builds take over from it. Exactly one of
+the two runs, and the job name says which.
+
+See `snesrecomp/docs/ci/README.md` for the full setup, including
+`tools/ci/publish_src_gen.sh`.
+
 `probe_rom.py` is usable on its own — `python3 probe_rom.py game.sfc` prints
 what the scaffold would bake in, which is the fastest way to check whether a
 title uses a coprocessor this runner supports before investing in a port.
