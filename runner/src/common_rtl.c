@@ -19,6 +19,7 @@
 #include "snes/cx4.h"
 #include "snes/sa1.h"
 #include "snes/msu1.h"
+#include "mod_audio.h"
 #include "snes/ws_shadow.h"
 #if SNESRECOMP_ENABLE_MODS
 #include "mod_runtime.h"
@@ -272,6 +273,7 @@ void RtlReset(int mode) {
   // g_cpu); anchor the sync pointer to its current value so the first post-reset
   // catch-up sees a zero delta rather than the whole run's accumulated cycles.
   g_apu_last_sync_master = g_cpu.master_cycles;
+  snes_mod_audio_stop_all();
   snes_reset(g_snes, true);
   g_snes->beamMasterLast = g_cpu.master_cycles;
   SnesEnterNativeMode();
@@ -647,6 +649,7 @@ bool RtlLoadSnapshot(const char *filename) {
     return false;
   }
   g_snes->beamMasterLast = g_cpu.master_cycles;
+  snes_mod_audio_stop_all();
   /* Post-load reconciliation: host-side execution state (fibers, HLE
    * scheduler bookkeeping) cannot live in the guest snapshot; give the
    * game one hook to rebuild it against the freshly restored WRAM. */
@@ -694,6 +697,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   RtlApuUnlock();
   if (memory.error) return false;
   g_snes->beamMasterLast = g_cpu.master_cycles;
+  snes_mod_audio_stop_all();
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
@@ -1546,6 +1550,10 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * lock we already hold, which serialises it against MSU register
    * writes on the CPU thread (msu1_read/msu1_write take the same lock). */
   msu1_mix(audio_buffer, samples);
+  /* Overlay follows the native+MSU mix and precedes recovery fade, so trusted
+   * one-shots share the final discontinuity smoothing. */
+  snes_mod_audio_mix(audio_buffer, samples,
+                      (uint32_t)(RtlAudioOutputRate() + 0.5), channels);
   for (int i = 0; i < samples && g_audio_recovery_remaining != 0; i++) {
     uint32_t progressed = RTL_AUDIO_RECOVERY_RAMP -
                           g_audio_recovery_remaining + 1;
