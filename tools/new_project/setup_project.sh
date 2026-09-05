@@ -7,7 +7,9 @@
 #
 # Required:
 #   --rom <file.sfc>      Your legally-owned ROM. Probed for identity; never
-#                         copied into the repo.
+#                         copied into the repo. A bare path works too
+#                         (`setup_project.sh game.sfc`), and on a terminal
+#                         with no ROM given, it is the first question.
 #
 # Common:
 #   --dir <parent>        Parent directory for the new repo (default: .)
@@ -29,7 +31,8 @@
 #   --ci / --no-ci                  .github/workflows/release.yml (default: on)
 #   --fetch-boxart / --no-fetch-boxart
 #                                   libretro Named_Boxarts art for the launcher
-#                                   (default: on; needs the network)
+#                                   (needs the network; asked on a terminal,
+#                                   off when non-interactive)
 #   --recomp-ui / --no-recomp-ui    Dear ImGui pre-boot launcher: ROM picker,
 #                                   verification, display/audio/input settings
 #                                   (default: on). Without it the host still
@@ -57,8 +60,10 @@
 # early push produces a second "initial" commit that collides on re-run.
 #
 # Usage:
-#   sh tools/new_project/setup_project.sh --rom ~/roms/game.sfc
+#   sh tools/new_project/setup_project.sh ~/roms/game.sfc
 #   sh tools/new_project/setup_project.sh --rom game.sfc --dir ~/src --yes
+#   sh tools/new_project/setup_project.sh            # asks for the ROM
+# Windows: powershell -File tools\new_project\setup_project.ps1 -Rom game.sfc
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -113,7 +118,7 @@ SET_NETPLAY=0; SET_ROLLBACK=0; SET_CI=0; SET_RECOMP_UI=0
 SET_GENERATE=0; SET_BUILD=0; SET_GITHUB=0
 GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
 ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
-FETCH_BOXART=1
+FETCH_BOXART=0; SET_BOXART=0
 ADD_SUBMODULES=1
 DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
 # Default the framework ref to the branch this checkout is on, for the same
@@ -154,8 +159,8 @@ while [ $# -gt 0 ]; do
         --recomp-ui) ENABLE_RECOMP_UI=1; SET_RECOMP_UI=1; shift ;;
         --no-recomp-ui) ENABLE_RECOMP_UI=0; SET_RECOMP_UI=1; shift ;;
         --ci) ENABLE_CI=1; SET_CI=1; shift ;;
-        --fetch-boxart) FETCH_BOXART=1; shift ;;
-        --no-fetch-boxart) FETCH_BOXART=0; shift ;;
+        --fetch-boxart) FETCH_BOXART=1; SET_BOXART=1; shift ;;
+        --no-fetch-boxart) FETCH_BOXART=0; SET_BOXART=1; shift ;;
         --no-submodules) ADD_SUBMODULES=0; shift ;;
         --no-ci) ENABLE_CI=0; SET_CI=1; shift ;;
         --generate) DO_GENERATE=1; SET_GENERATE=1; shift ;;
@@ -173,11 +178,37 @@ while [ $# -gt 0 ]; do
         --recomp-ui-url) RECOMP_UI_URL=$2; shift 2 ;;
         --yes|-y) ASSUME_YES=1; shift ;;
         -h|--help) usage 0 ;;
-        *) echo "setup_project: unknown flag: $1" >&2; usage 2 ;;
+        -*) echo "setup_project: unknown flag: $1" >&2; usage 2 ;;
+        *)  # A bare argument is the ROM: `setup_project.sh game.sfc`.
+            if [ -n "$ROM" ]; then
+                echo "setup_project: two ROMs given ('$ROM' and '$1');" >&2
+                echo "               a project is cut from exactly one image." >&2
+                exit 2
+            fi
+            ROM=$1; shift ;;
     esac
 done
 
-[ -n "$ROM" ] || { echo "setup_project: --rom is required" >&2; usage 2; }
+# No ROM on the command line: on a terminal it is simply the first question.
+# Anything else (scripts, CI, --yes) has to say what it means.
+if [ -z "$ROM" ]; then
+    if [ "$ASSUME_YES" != "1" ] && is_tty; then
+        echo "A new project is cut from one legally-owned ROM (.sfc/.smc). It is"
+        echo "probed here and never copied into the repository."
+        while :; do
+            prompt_line "Path to the ROM" ROM ""
+            # Shells and file managers hand over quoted or ~-prefixed paths.
+            ROM=$(printf '%s' "$ROM" | sed -e "s/^['\"]//" -e "s/['\"]\$//")
+            case "$ROM" in "~/"*) ROM="$HOME/${ROM#\~/}" ;; esac
+            [ -n "$ROM" ] || { echo "setup_project: a ROM is required" >&2; exit 2; }
+            [ -f "$ROM" ] && break
+            printf '  not found: %s\n' "$ROM" >/dev/tty
+        done
+    else
+        echo "setup_project: --rom <file.sfc> (or a bare path) is required" >&2
+        usage 2
+    fi
+fi
 [ -f "$ROM" ] || { echo "setup_project: ROM not found: $ROM" >&2; exit 1; }
 ROM_ABS=$(CDPATH= cd -- "$(dirname -- "$ROM")" && pwd)/$(basename -- "$ROM")
 
@@ -293,6 +324,13 @@ fi
 
 if [ "$SET_RECOMP_UI" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
     prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 1
+fi
+
+# Boxart is a network fetch, so it is asked rather than assumed, and stays off
+# for a non-interactive run unless --fetch-boxart says otherwise -- a script
+# or a test should not reach the internet because a default said so.
+if [ "$ENABLE_RECOMP_UI" -eq 1 ] && [ "$SET_BOXART" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
+    prompt_yn "Fetch libretro boxart for the launcher now? (needs the network)" FETCH_BOXART 1
 fi
 
 if [ "$PLAYERS" -eq 1 ]; then
@@ -443,7 +481,7 @@ echo "  rom:        $ROM_FILE ($ROM_MAPPING, $REGION, crc32 $ROM_CRC32)"
 echo "  zip prefix: $ZIP_PREFIX"
 echo "  players:    $PLAYERS (multitap: $MULTITAP)"
 echo "  netplay:    $ENABLE_NETPLAY (rollback: $ENABLE_ROLLBACK)"
-echo "  recomp-ui:  $ENABLE_RECOMP_UI"
+echo "  recomp-ui:  $ENABLE_RECOMP_UI (boxart: $FETCH_BOXART)"
 echo "  CI:         $ENABLE_CI"
 echo "  generate:   $DO_GENERATE (build: $DO_BUILD)"
 if [ "$CREATE_GITHUB" -eq 1 ]; then
