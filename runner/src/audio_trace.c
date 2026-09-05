@@ -5,6 +5,12 @@
 
 #include "audio_trace.h"
 
+#ifdef SNESRECOMP_AUDIO_TRACE_TEST_WALL_MS
+extern uint64_t audio_trace_test_wall_ms(void);
+static uint64_t wall_ms(void) { return audio_trace_test_wall_ms(); }
+#define AUDIO_TRACE_WALL_MS_DEFINED 1
+#endif
+
 #ifdef SNES_COSIM
 /* Co-sim determinism (SNES_COSIM.md, Gate 1): every audio-pacing consumer that
  * reads the wall clock (APU catch-up baseline, RtlApuWrite port-write scheduler)
@@ -16,17 +22,23 @@
 #ifdef SNES_COSIM_REF
 /* B side: the interp816 driver owns the master-cycle accumulator (no g_cpu). */
 extern uint64_t g_ref_master_cycles;
+#ifndef AUDIO_TRACE_WALL_MS_DEFINED
 static uint64_t wall_ms(void) { return g_ref_master_cycles / 21477ull; }
+#endif
 static uint64_t wall_ns(void) { return g_ref_master_cycles * 4657ull / 100ull; }
 #else
 #include "cpu_state.h"
 extern CpuState g_cpu;
+#ifndef AUDIO_TRACE_WALL_MS_DEFINED
 static uint64_t wall_ms(void) { return g_cpu.master_cycles / 21477ull; }
+#endif
 static uint64_t wall_ns(void) { return g_cpu.master_cycles * 4657ull / 100ull; }
 #endif
 #elif defined(_WIN32)
 #include <windows.h>
+#ifndef AUDIO_TRACE_WALL_MS_DEFINED
 static uint64_t wall_ms(void) { return (uint64_t)GetTickCount64(); }
+#endif
 /* High-resolution monotonic nanoseconds — GetTickCount64's ~15 ms
  * granularity is far too coarse for intra-frame port-write spacing. */
 static uint64_t wall_ns(void) {
@@ -38,11 +50,13 @@ static uint64_t wall_ns(void) {
 }
 #else
 #include <time.h>
+#ifndef AUDIO_TRACE_WALL_MS_DEFINED
 static uint64_t wall_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
+#endif
 static uint64_t wall_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -54,9 +68,25 @@ static uint64_t wall_ns(void) {
 void RtlApuLock(void);
 void RtlApuUnlock(void);
 
+#ifdef SNESRECOMP_AUDIO_TRACE_TEST_FOPEN
+extern FILE *audio_trace_test_fopen(const char *path, const char *mode);
+#define AUDIO_TRACE_FOPEN(path, mode) audio_trace_test_fopen((path), (mode))
+#else
+#define AUDIO_TRACE_FOPEN(path, mode) fopen((path), (mode))
+#endif
+
+#ifdef SNESRECOMP_AUDIO_TRACE_TEST_GETENV
+extern char *audio_trace_test_getenv(const char *name);
+#define AUDIO_TRACE_GETENV(name) audio_trace_test_getenv((name))
+#else
+#define AUDIO_TRACE_GETENV(name) getenv((name))
+#endif
+
+#if AUDIO_TRACE_HAS_STORAGE
 static int16_t s_pcm[AUDIO_TRACE_PCM_RING * 2];
 static AudioTraceEvent s_events[AUDIO_TRACE_EVENT_RING];
 static AudioTraceSnap s_snaps[AUDIO_TRACE_SNAP_RING];
+#endif
 static AudioTraceStats s_stats;
 static int s_producer = AUDIO_TRACE_PRODUCER_UNKNOWN;
 /* Open drop run: index into s_events of the DROP event being extended,
@@ -65,6 +95,7 @@ static uint64_t s_open_drop_event = UINT64_MAX;
 static uint64_t s_last_snap_ms = 0;
 
 static AudioTraceEvent *push_event(uint8_t type) {
+#if AUDIO_TRACE_WRITES_HISTORY
   AudioTraceEvent *e = &s_events[s_stats.event_count & (AUDIO_TRACE_EVENT_RING - 1)];
   s_stats.event_count++;
   e->sample_idx = s_stats.produced;
@@ -74,6 +105,17 @@ static AudioTraceEvent *push_event(uint8_t type) {
   e->val = 0;
   e->producer = (uint8_t)s_producer;
   return e;
+#else
+  static AudioTraceEvent e;
+  s_stats.event_count++;
+  e.sample_idx = s_stats.produced;
+  e.aux = 0;
+  e.type = type;
+  e.addr = 0;
+  e.val = 0;
+  e.producer = (uint8_t)s_producer;
+  return &e;
+#endif
 }
 
 /* Release-readable readout of the always-on counters.
@@ -84,36 +126,42 @@ static AudioTraceEvent *push_event(uint8_t type) {
  * is not an acceptable substitute here: it perturbs the very timing the
  * audio path is being measured for.
  *
- * This is a QUERY of the always-on rings, not an arm-then-capture probe:
- * the counters have been accumulating since process start regardless, and
- * setting SNESRECOMP_AUDIO_STATS only decides whether a line gets written
- * out once per second. Line-buffered + explicit fflush so a killed process
- * still leaves every completed second on disk.
+ * The counters have been accumulating since process start regardless of the
+ * retained-history mode, and setting SNESRECOMP_AUDIO_STATS only decides
+ * whether a line gets written out once per second. Line-buffered + explicit
+ * fflush so a killed process still leaves every completed second on disk.
  *
  * SNESRECOMP_AUDIO_STATS=<path>  append one line per second to <path>
  * SNESRECOMP_AUDIO_STATS=1       ... to stderr
  */
 static FILE *s_stats_out;        /* NULL until resolved; s_stats_mode says how */
 static int   s_stats_mode = -1;  /* -1 unresolved, 0 off, 1 on */
+static int   s_stats_header_written;
 
-static void stats_line(uint32_t ring_fill) {
+static int stats_mode(void) {
   if (s_stats_mode < 0) {
-    const char *e = getenv("SNESRECOMP_AUDIO_STATS");
+    const char *e = AUDIO_TRACE_GETENV("SNESRECOMP_AUDIO_STATS");
     if (!e || !e[0] || (e[0] == '0' && !e[1])) {
       s_stats_mode = 0;
     } else if (e[0] == '1' && !e[1]) {
       s_stats_out = stderr;
       s_stats_mode = 1;
     } else {
-      s_stats_out = fopen(e, "a");
+      s_stats_out = AUDIO_TRACE_FOPEN(e, "a");
       s_stats_mode = s_stats_out ? 1 : 0;
     }
-    if (s_stats_mode == 1)
-      fprintf(s_stats_out,
-              "# ms produced consumed dropped dropped_audible drop_runs "
-              "underflows consume_calls occupancy hiwater prod_cpu prod_audio\n");
   }
-  if (s_stats_mode == 0) return;
+  return s_stats_mode;
+}
+
+static void stats_line(uint32_t ring_fill) {
+  if (stats_mode() == 0) return;
+  if (!s_stats_header_written) {
+    fprintf(s_stats_out,
+            "# ms produced consumed dropped dropped_audible drop_runs "
+            "underflows consume_calls occupancy hiwater prod_cpu prod_audio\n");
+    s_stats_header_written = 1;
+  }
   fprintf(s_stats_out,
           "%llu %llu %llu %llu %llu %llu %llu %llu %u %u %llu %llu\n",
           (unsigned long long)wall_ms(),
@@ -131,9 +179,13 @@ static void stats_line(uint32_t ring_fill) {
 }
 
 static void maybe_snap(uint32_t ring_fill) {
+#if !AUDIO_TRACE_WRITES_HISTORY
+  if (stats_mode() == 0) return;
+#endif
   uint64_t now = wall_ms();
   if (now - s_last_snap_ms < 1000) return;
   s_last_snap_ms = now;
+#if AUDIO_TRACE_WRITES_HISTORY
   AudioTraceSnap *s = &s_snaps[s_stats.snap_count & (AUDIO_TRACE_SNAP_RING - 1)];
   s_stats.snap_count++;
   s->wall_ms = now;
@@ -141,6 +193,7 @@ static void maybe_snap(uint32_t ring_fill) {
   s->dropped = s_stats.dropped;
   s->consumed = s_stats.consumed;
   s->occupancy = ring_fill;
+#endif
   stats_line(ring_fill);
 }
 
@@ -160,13 +213,18 @@ void audio_trace_on_output_underflow(uint32_t occupancy) {
 }
 
 void audio_trace_on_sample(int16_t l, int16_t r, int dropped, uint32_t ring_fill) {
+#if AUDIO_TRACE_WRITES_HISTORY
   uint32_t w = (uint32_t)(s_stats.produced & (AUDIO_TRACE_PCM_RING - 1));
   s_pcm[w * 2] = l;
   s_pcm[w * 2 + 1] = r;
+#endif
   if (dropped) {
     if (s_open_drop_event != UINT64_MAX &&
-        s_stats.event_count - s_open_drop_event <= AUDIO_TRACE_EVENT_RING) {
+        s_stats.event_count - s_open_drop_event <=
+            AUDIO_TRACE_DROP_RUN_EVENT_RING) {
+#if AUDIO_TRACE_WRITES_HISTORY
       s_events[s_open_drop_event & (AUDIO_TRACE_EVENT_RING - 1)].aux++;
+#endif
     } else {
       s_open_drop_event = s_stats.event_count;
       push_event(AUDIO_TRACE_EV_DROP)->aux = 1;
@@ -368,6 +426,12 @@ void audio_trace_sample_clocks(uint64_t *produced, uint64_t *consumed) {
 
 void audio_trace_get_stats(AudioTraceStats *out) {
   RtlApuLock();
+#if AUDIO_TRACE_HAS_STORAGE && !AUDIO_TRACE_WRITES_HISTORY
+  static volatile uintptr_t s_storage_anchor;
+  s_storage_anchor ^= (uintptr_t)&s_pcm[0];
+  s_storage_anchor ^= (uintptr_t)&s_events[0];
+  s_storage_anchor ^= (uintptr_t)&s_snaps[0];
+#endif
   *out = s_stats;
   RtlApuUnlock();
 }
@@ -375,6 +439,7 @@ void audio_trace_get_stats(AudioTraceStats *out) {
 uint32_t audio_trace_copy_events(uint64_t first_idx, uint32_t max,
                                  AudioTraceEvent *out, uint64_t *oldest) {
   RtlApuLock();
+#if AUDIO_TRACE_WRITES_HISTORY
   uint64_t total = s_stats.event_count;
   uint64_t old = total > AUDIO_TRACE_EVENT_RING ? total - AUDIO_TRACE_EVENT_RING : 0;
   if (oldest) *oldest = old;
@@ -386,11 +451,20 @@ uint32_t audio_trace_copy_events(uint64_t first_idx, uint32_t max,
   }
   RtlApuUnlock();
   return n;
+#else
+  if (oldest) *oldest = s_stats.event_count;
+  (void)first_idx;
+  (void)max;
+  (void)out;
+  RtlApuUnlock();
+  return 0;
+#endif
 }
 
 uint32_t audio_trace_copy_snaps(uint64_t first_idx, uint32_t max,
                                 AudioTraceSnap *out, uint64_t *oldest) {
   RtlApuLock();
+#if AUDIO_TRACE_WRITES_HISTORY
   uint64_t total = s_stats.snap_count;
   uint64_t old = total > AUDIO_TRACE_SNAP_RING ? total - AUDIO_TRACE_SNAP_RING : 0;
   if (oldest) *oldest = old;
@@ -402,25 +476,85 @@ uint32_t audio_trace_copy_snaps(uint64_t first_idx, uint32_t max,
   }
   RtlApuUnlock();
   return n;
+#else
+  if (oldest) *oldest = s_stats.snap_count;
+  (void)first_idx;
+  (void)max;
+  (void)out;
+  RtlApuUnlock();
+  return 0;
+#endif
 }
 
 int audio_trace_dump_wav(const char *path, int64_t start_idx, uint64_t count,
                          uint64_t *out_start, uint64_t *out_count) {
-  /* Snapshot the write head under the lock; the slice [oldest, total) is
-   * then stable without the lock — ring slots are append-only and only
-   * lapped after a full 131 s revolution, far longer than any dump. */
+#if !AUDIO_TRACE_WRITES_HISTORY
+  (void)path;
+  (void)start_idx;
+  (void)count;
+  if (out_start) *out_start = 0;
+  if (out_count) *out_count = 0;
+  return -1;
+#else
+  if (!path || !path[0]) {
+    if (out_start) *out_start = 0;
+    if (out_count) *out_count = 0;
+    return -1;
+  }
+
+  uint64_t copy_cap = count ? count : AUDIO_TRACE_PCM_RING;
+  if (copy_cap > AUDIO_TRACE_PCM_RING)
+    copy_cap = AUDIO_TRACE_PCM_RING;
+  if (copy_cap > (uint64_t)(SIZE_MAX / (2 * sizeof(int16_t)))) {
+    fprintf(stderr, "audio_trace_dump_wav: requested slice is too large\n");
+    if (out_start) *out_start = 0;
+    if (out_count) *out_count = 0;
+    return -1;
+  }
+
+  int16_t *snapshot = NULL;
+  if (copy_cap > 0) {
+    snapshot = (int16_t *)malloc((size_t)copy_cap * 2 * sizeof(int16_t));
+    if (!snapshot) {
+      fprintf(stderr, "audio_trace_dump_wav: out of memory for %llu samples\n",
+              (unsigned long long)copy_cap);
+      if (out_start) *out_start = 0;
+      if (out_count) *out_count = 0;
+      return -1;
+    }
+  }
+
+  /* Copy the requested PCM slice while the APU lock freezes producers. Do not
+   * hold the lock over allocation or file I/O; SMALL history is short enough
+   * that live producers can otherwise lap the ring while fwrite is running. */
   RtlApuLock();
   uint64_t total = s_stats.produced;
-  RtlApuUnlock();
   uint64_t oldest = total > AUDIO_TRACE_PCM_RING ? total - AUDIO_TRACE_PCM_RING : 0;
   uint64_t start = (start_idx < 0) ? oldest : (uint64_t)start_idx;
   if (start < oldest) start = oldest;
   if (start > total) start = total;
   uint64_t avail = total - start;
   if (count == 0 || count > avail) count = avail;
+  if (count > copy_cap)
+    count = copy_cap;
+  for (uint64_t i = 0; i < count; ) {
+    uint32_t r = (uint32_t)((start + i) & (AUDIO_TRACE_PCM_RING - 1));
+    uint64_t run = AUDIO_TRACE_PCM_RING - r;
+    if (run > count - i) run = count - i;
+    memcpy(&snapshot[i * 2], &s_pcm[(uint64_t)r * 2],
+           (size_t)run * 2 * sizeof(int16_t));
+    i += run;
+  }
+  RtlApuUnlock();
 
-  FILE *f = fopen(path, "wb");
-  if (!f) return -1;
+  FILE *f = AUDIO_TRACE_FOPEN(path, "wb");
+  if (!f) {
+    fprintf(stderr, "audio_trace_dump_wav: cannot open %s\n", path);
+    free(snapshot);
+    if (out_start) *out_start = 0;
+    if (out_count) *out_count = 0;
+    return -1;
+  }
   uint32_t data_bytes = (uint32_t)(count * 4);
   /* The PCM ring stores DSP output at the S-DSP NATIVE rate, which is 32040 Hz
    * (1364*262*60 master / 32 per sample; the same rate apuCyclesPerMaster and
@@ -435,28 +569,36 @@ int audio_trace_dump_wav(const char *path, int64_t start_idx, uint64_t count,
   uint32_t riff_size = 36 + data_bytes;
   uint16_t fmt16;
   uint32_t fmt32;
-  fwrite("RIFF", 1, 4, f);
-  fwrite(&riff_size, 4, 1, f);
-  fwrite("WAVEfmt ", 1, 8, f);
-  fmt32 = 16;          fwrite(&fmt32, 4, 1, f); /* fmt chunk size  */
-  fmt16 = 1;           fwrite(&fmt16, 2, 1, f); /* PCM             */
-  fmt16 = 2;           fwrite(&fmt16, 2, 1, f); /* stereo          */
-  fwrite(&sample_rate, 4, 1, f);
-  fwrite(&byte_rate, 4, 1, f);
-  fmt16 = 4;           fwrite(&fmt16, 2, 1, f); /* block align     */
-  fmt16 = 16;          fwrite(&fmt16, 2, 1, f); /* bits per sample */
-  fwrite("data", 1, 4, f);
-  fwrite(&data_bytes, 4, 1, f);
-  for (uint64_t i = 0; i < count; ) {
-    uint32_t r = (uint32_t)((start + i) & (AUDIO_TRACE_PCM_RING - 1));
-    /* contiguous run up to the ring wrap point */
-    uint64_t run = AUDIO_TRACE_PCM_RING - r;
-    if (run > count - i) run = count - i;
-    fwrite(&s_pcm[(uint64_t)r * 2], 4, (size_t)run, f);
-    i += run;
+  int ok = 1;
+#define WAV_WRITE(ptr, size, nmemb) \
+  do { if (fwrite((ptr), (size), (nmemb), f) != (nmemb)) ok = 0; } while (0)
+  WAV_WRITE("RIFF", 1, 4);
+  WAV_WRITE(&riff_size, 4, 1);
+  WAV_WRITE("WAVEfmt ", 1, 8);
+  fmt32 = 16;          WAV_WRITE(&fmt32, 4, 1); /* fmt chunk size  */
+  fmt16 = 1;           WAV_WRITE(&fmt16, 2, 1); /* PCM             */
+  fmt16 = 2;           WAV_WRITE(&fmt16, 2, 1); /* stereo          */
+  WAV_WRITE(&sample_rate, 4, 1);
+  WAV_WRITE(&byte_rate, 4, 1);
+  fmt16 = 4;           WAV_WRITE(&fmt16, 2, 1); /* block align     */
+  fmt16 = 16;          WAV_WRITE(&fmt16, 2, 1); /* bits per sample */
+  WAV_WRITE("data", 1, 4);
+  WAV_WRITE(&data_bytes, 4, 1);
+  if (count > 0)
+    WAV_WRITE(snapshot, 4, (size_t)count);
+#undef WAV_WRITE
+  if (fclose(f) != 0)
+    ok = 0;
+  free(snapshot);
+  if (!ok) {
+    fprintf(stderr, "audio_trace_dump_wav: write failed for %s\n", path);
+    remove(path);
+    if (out_start) *out_start = 0;
+    if (out_count) *out_count = 0;
+    return -1;
   }
-  fclose(f);
   if (out_start) *out_start = start;
   if (out_count) *out_count = count;
   return 0;
+#endif
 }

@@ -9,11 +9,15 @@
 #include "../audio_trace.h"
 
 DspShadow* dsp_shadow_create(void) {
+  const char* e = getenv("SNESRECOMP_AUDIO_SHADOW");
+  int enabled = (e && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+#if !SNESRECOMP_DSP_FORENSICS
+  if (!enabled) return NULL;
+#endif
   DspShadow* sh = (DspShadow*)calloc(1, sizeof(DspShadow));
   if (!sh) return NULL;
   shadow_verifier_init(&sh->vf);
-  const char* e = getenv("SNESRECOMP_AUDIO_SHADOW");
-  sh->enabled = (e && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+  sh->enabled = enabled;
   if (sh->enabled) {
     fprintf(stderr, "[audio] SNES S-DSP shadow mixer ARMED (verified-"
                     "enhancement; reverts to hardware mix on divergence)\n");
@@ -67,7 +71,7 @@ static void shadow_render_dry(DspShadow* sh, Dsp* dsp, float* dryLOut,
   *dryROut = dryR;
 }
 
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
 // blargg (snes9x/bsnes) reference Gaussian, applied to the canonical gaussValues
 // table (verified byte-identical to blargg's gauss[512]). The ONLY difference
 // vs canon dsp_getSample: blargg shifts >>11 per term with the intermediate
@@ -92,7 +96,7 @@ static int ref_gauss(const int16_t* buf, int n, int offset) {
 // HALF scale (compensated later by the Gaussian >>10 vs blargg >>11), so the
 // reference is seeded with 2x canon's prior samples and the comparison is canon*2
 // vs the reference. Isolates the BRR filter/shift/clamp logic vs the gold standard.
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
 void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
                            int oldSeed, int olderSeed, const int16_t* canonOut16) {
   int header = aram[blockStart];
@@ -132,7 +136,7 @@ void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
 // Faithful echo-FIR reference = blargg's snes9x/bsnes CALC_FIR: taps 0-6 summed,
 // (int16) clip, then tap 7 added as (int16), CLAMP16, clear LSB. Production
 // mirrors this sequence; the reference remains an independent bit-exact check.
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
 static int ref_echo_fir(const int16_t* fir, const int8_t* coeff, int idx) {
   int sum = 0;
   for (int i = 0; i < 7; i++)
@@ -164,18 +168,18 @@ void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
   *outL = canonL;
   *outR = canonR;
   if (!sh) return;
-#if !defined(SNESRECOMP_TRACE)
+#if !SNESRECOMP_DSP_FORENSICS
   // Production: only pay the re-render cost when the enhancement is armed.
   if (!sh->enabled) return;
 #endif
-  // Dev (SNESRECOMP_TRACE) ALWAYS renders the reference + records the in-process
+  // Dev/co-sim forensics ALWAYS render the reference + record the in-process
   // tone divergence, independent of substitution — the artifact-free internal
   // oracle (no cross-process resample). Substitution below is still opt-in, so
   // with the enhancement off the output stays byte-identical to canon.
   float dryL, dryR;
   shadow_render_dry(sh, dsp, &dryL, &dryR);
 
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
   // Accumulate only on non-silent canon samples so the RMS reflects active
   // audio rather than boot/silence. Normalized to [-1,1] by 16-bit full scale.
   if (canonL != 0 || canonR != 0) {

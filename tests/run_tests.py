@@ -31,6 +31,7 @@ TEST_MODULES = [
     'test_sync_funcs_h',
     'test_snes_cycles',
     'test_cx4_datarom',
+    'test_run_benchmark_pairs',
 ]
 
 

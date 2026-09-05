@@ -13,6 +13,14 @@
 #include "dsp.h"
 #include "../audio_trace.h"
 
+#ifndef SNESRECOMP_TRACE
+#define SNESRECOMP_TRACE 0
+#endif
+
+#ifndef SNESRECOMP_SPC_DIAGNOSTICS
+#define SNESRECOMP_SPC_DIAGNOSTICS SNESRECOMP_TRACE
+#endif
+
 static const uint8_t bootRom[0x40] = {
   0xcd, 0xef, 0xbd, 0xe8, 0x00, 0xc6, 0x1d, 0xd0, 0xfc, 0x8f, 0xaa, 0xf4, 0x8f, 0xbb, 0xf5, 0x78,
   0xcc, 0xf4, 0xd0, 0xfb, 0x2f, 0x19, 0xeb, 0xf4, 0xd0, 0xfc, 0x7e, 0xf4, 0xd0, 0x0b, 0xe4, 0xf5,
@@ -193,7 +201,11 @@ void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
   spc_saveload(apu->spc, sli);
 }
 
+#if SNESRECOMP_SPC_DIAGNOSTICS || SNESRECOMP_TRACE
 extern uint64_t g_spc_pc_histogram[0x10000];
+#else
+extern uint64_t g_spc_pc_histogram[1];
+#endif
 extern int g_spc_pc_max_seen;
 
 void apu_cycle(Apu* apu) {
@@ -201,8 +213,10 @@ void apu_cycle(Apu* apu) {
   if(apu->cpuCyclesLeft == 0) {
     /* Sample PC right BEFORE running the opcode — so PC reflects the
      * instruction we're about to execute, not the post-opcode PC. */
+#if SNESRECOMP_SPC_DIAGNOSTICS
     g_spc_pc_histogram[apu->spc->pc]++;
     if (apu->spc->pc > g_spc_pc_max_seen) g_spc_pc_max_seen = apu->spc->pc;
+#endif
     apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
   }
   apu->cpuCyclesLeft--;
@@ -287,6 +301,7 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
 
 /* Diagnostic counters: track SPC writes to specific addresses so we
  * can see whether the engine is touching outPorts at all. */
+#if SNESRECOMP_SPC_DIAGNOSTICS || SNESRECOMP_TRACE
 uint64_t g_spc_write_counts[0x100] = {0};
 
 /* SPC PC histogram. Sampled once per apu_cycle that starts a new
@@ -299,8 +314,18 @@ uint64_t g_spc_outport_value_counts[4 * 256] = {0};
 typedef struct { uint8_t adr; uint8_t val; } SpcWriteRec;
 SpcWriteRec g_spc_recent_outport_writes[32];
 int g_spc_recent_outport_idx = 0;
+#else
+uint64_t g_spc_write_counts[1] = {0};
+uint64_t g_spc_pc_histogram[1] = {0};
+int g_spc_pc_max_seen = 0;
+uint64_t g_spc_outport_value_counts[1] = {0};
+typedef struct { uint8_t adr; uint8_t val; } SpcWriteRec;
+SpcWriteRec g_spc_recent_outport_writes[1];
+int g_spc_recent_outport_idx = 0;
+#endif
 
 void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
+#if SNESRECOMP_SPC_DIAGNOSTICS
   if (adr < 0x100) g_spc_write_counts[adr]++;
   if (adr >= 0xF4 && adr <= 0xF7) {
     int port = adr - 0xF4;
@@ -309,6 +334,7 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
     g_spc_recent_outport_writes[i].adr = (uint8_t)adr;
     g_spc_recent_outport_writes[i].val = val;
   }
+#endif
   switch(adr) {
     case 0xf0: {
       break; // test register

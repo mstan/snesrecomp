@@ -9,37 +9,62 @@
                    fputc('\n', stderr); return 1; } \
 } while (0)
 
-int main(void) {
-    const char *manifest = "tier2_capture_contract.json";
-    const char *journal = "tier2_capture_contract.jsonl";
+static void set_env_value(const char *name, const char *value) {
+#ifdef _WIN32
+    if (value)
+        _putenv_s(name, value);
+    else
+        _putenv_s(name, "");
+#else
+    if (value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+#endif
+}
+
+static int run_disabled_case(void) {
+    const char *manifest = "tier2_capture_disabled.json";
+    const char *journal = "tier2_capture_disabled.jsonl";
     remove(manifest);
     remove(journal);
 
-#ifdef _WIN32
-    _putenv_s("SNESRECOMP_TIER2_MANIFEST", manifest);
-    _putenv_s("SNESRECOMP_TIER2_JOURNAL", journal);
-    _putenv_s("SNESRECOMP_TIER2_CAPTURE", "");
-    _putenv_s("SNESRECOMP_TIER2", "");
-#else
-    setenv("SNESRECOMP_TIER2_MANIFEST", manifest, 1);
-    setenv("SNESRECOMP_TIER2_JOURNAL", journal, 1);
-    unsetenv("SNESRECOMP_TIER2_CAPTURE");
-    unsetenv("SNESRECOMP_TIER2");
-#endif
+    set_env_value("SNESRECOMP_TIER2_MANIFEST", manifest);
+    set_env_value("SNESRECOMP_TIER2_JOURNAL", NULL);
+    set_env_value("SNESRECOMP_TIER2_CAPTURE", NULL);
+    set_env_value("SNESRECOMP_TIER2", NULL);
 
     CHECK(strcmp(tier2_capture_manifest_path("QA Game"), manifest) == 0,
           "explicit manifest path changed");
     CHECK(strcmp(tier2_capture_journal_path("QA Game"), journal) == 0,
-          "explicit journal path changed");
-    CHECK(!tier2_capture_enabled(), "tier2 capture should default off");
+          "derived journal path changed");
     CHECK(tier2_capture_append_discovery(
               "QA Game", 0x807000, 0xC00000, "M1X1", "dispatch", 1, 1),
           "disabled capture should be a successful no-op");
     FILE *disabled = fopen(journal, "r");
     CHECK(disabled == NULL, "disabled capture created journal");
+    puts("tier2_capture_test disabled: PASS");
+    return 0;
+}
 
-    tier2_capture_set_default_enabled(1);
-    CHECK(tier2_capture_enabled(), "tier2 capture did not enable");
+int main(int argc, char **argv) {
+    const char *manifest = "tier2_capture_contract.json";
+    const char *journal = "tier2_capture_contract.jsonl";
+    if (argc == 2 && strcmp(argv[1], "disabled") == 0)
+        return run_disabled_case();
+    CHECK(argc == 1, "usage: tier2_capture_test [disabled]");
+    remove(manifest);
+    remove(journal);
+
+    set_env_value("SNESRECOMP_TIER2_MANIFEST", manifest);
+    set_env_value("SNESRECOMP_TIER2_JOURNAL", journal);
+    set_env_value("SNESRECOMP_TIER2_CAPTURE", NULL);
+    set_env_value("SNESRECOMP_TIER2", NULL);
+
+    CHECK(strcmp(tier2_capture_manifest_path("QA Game"), manifest) == 0,
+          "explicit manifest path changed");
+    CHECK(strcmp(tier2_capture_journal_path("QA Game"), journal) == 0,
+          "explicit journal path changed");
 
     FILE *seed = fopen(journal, "w");
     CHECK(seed != NULL, "cannot seed %s", journal);
