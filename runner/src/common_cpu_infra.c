@@ -718,6 +718,16 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   return NULL;
 #else
   g_snes = snes_init(g_ram);
+  /* The CpuState's WRAM pointer is host state, not simulation state: no reset
+   * path sets it, and a CpuState that never had it dereferences NULL on the
+   * first guest stack push (interp816_pushByte -> cpu_write8 -> cpu->ram[off])
+   * or the first WRAM read. Every port used to wire this itself from its
+   * initialize hook -- Endless Duel and Metal Warriors do -- and every port
+   * that did not crashed on frame 1 (a fresh scaffold: SIGSEGV in cpu_read8
+   * with rax = 0). The machine is being built here; the pointer belongs here.
+   * A port's own cpu_state_init() in its initialize hook, below, is harmless
+   * -- same call, same moment, before snes_reset(). */
+  cpu_state_init(&g_cpu, g_ram);
   snes_set_master_clock_charge_hook(rtl_snes_charge_master_cycles);
   snes_set_wram_write_log_hook(wlog_addr_note_direct);
   cart_set_master_clock_source(g_snes->cart,

@@ -408,7 +408,7 @@ endfunction()
 #
 # Format: `key = value`, one per line, `#` comments, optional double quotes.
 # Keys: display_name, rom_file, expected_crc32, expected_sha256, mapping,
-# region. A missing key expands to "", which every consumer reads as
+# region, game_id (the id mod manifests target). A missing key expands to "", which every consumer reads as
 # "cannot verify" rather than "verified". Editing the file re-runs configure.
 function(snesrecomp_rom_identity target identity_file)
     if(NOT EXISTS "${identity_file}")
@@ -419,7 +419,7 @@ function(snesrecomp_rom_identity target identity_file)
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${identity_file}")
 
-    foreach(_field display_name rom_file expected_crc32 expected_sha256 mapping region)
+    foreach(_field display_name rom_file expected_crc32 expected_sha256 mapping region game_id)
         set(_id_${_field} "")
     endforeach()
 
@@ -454,6 +454,7 @@ function(snesrecomp_rom_identity target identity_file)
     set(SNESRECOMP_ROM_EXPECTED_SHA256 "${_id_expected_sha256}")
     set(SNESRECOMP_ROM_MAPPING         "${_id_mapping}")
     set(SNESRECOMP_ROM_REGION          "${_id_region}")
+    set(SNESRECOMP_ROM_GAME_ID         "${_id_game_id}")
 
     if(SNESRECOMP_ROM_EXPECTED_SHA256 STREQUAL "" AND SNESRECOMP_ROM_EXPECTED_CRC32 STREQUAL "")
         message(WARNING

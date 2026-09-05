@@ -28,6 +28,7 @@ expected_crc32  = 6852cf05
 expected_sha256 = 4400876a57dc43a85021732727b673def55fd2008c7329ce4fcfc6792ac5ce70
 mapping         = lorom
 region          = JPN
+game_id         = fixture-jp
 """
 
 
@@ -86,6 +87,7 @@ def test_values_reach_the_header():
         assert ('"4400876a57dc43a85021732727b673def55fd2008c7329ce4fcfc6792ac'
                 '5ce70"') in header
         assert '"fixture.sfc"' in header
+        assert '#define SNESRECOMP_ROM_GAME_ID         "fixture-jp"' in header
 
 
 def test_missing_field_is_empty_not_absent():

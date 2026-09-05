@@ -23,7 +23,7 @@ import re
 import sys
 
 FIELDS = ("display_name", "rom_file", "expected_crc32",
-          "expected_sha256", "mapping", "region")
+          "expected_sha256", "mapping", "region", "game_id")
 
 LINE = re.compile(r"^([A-Za-z0-9_]+)[ \t]*=[ \t]*(.*)$")
 
@@ -46,6 +46,7 @@ HEADER = '''/* Generated from {source} by snesrecomp_rom_identity().
 #define SNESRECOMP_ROM_EXPECTED_SHA256 "{expected_sha256}"
 #define SNESRECOMP_ROM_MAPPING         "{mapping}"
 #define SNESRECOMP_ROM_REGION          "{region}"
+#define SNESRECOMP_ROM_GAME_ID         "{game_id}"
 
 #endif /* SNESRECOMP_ROM_IDENTITY_H */
 '''
