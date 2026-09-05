@@ -33,10 +33,15 @@ add_executable(@PROJECT_NAME@
     ${SNESRECOMP_RUNNER_SOURCES}
     src/main.c
     src/host_contract.c
-    src/codegen_setup.c
     src/game_rtl.c
     src/gen_stubs.c
 )
+
+# ROM identity. rom_identity.txt is the one place the digests live: the build
+# turns it into snesrecomp_rom_identity.h (SNESRECOMP_ROM_EXPECTED_SHA256 and
+# friends) for src/main.c, and tools/regen.sh, scripts/package_release.sh and
+# the release workflow read the same file. A revision bump is one edit there.
+snesrecomp_rom_identity(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/rom_identity.txt)
 
 # Generated recompiler output. Not committed: it is derived from a copyrighted
 # ROM, so every developer regenerates it locally from their own copy -- and a

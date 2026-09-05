@@ -336,12 +336,15 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
+          # From rom_identity.txt, not a copy baked into this workflow.
+          ROM_FILE="$(python3 snesrecomp/tools/rom_identity.py rom_identity.txt --get rom_file)"
+          ROM_SHA256="$(python3 snesrecomp/tools/rom_identity.py rom_identity.txt --get expected_sha256)"
           {
             echo "@DISPLAY_NAME@ ${TAG} — setup packs"
             echo
             echo "These packs do not contain the game. Each holds a setup program, the"
             echo "recompiler and the source; on first run it takes your own copy of"
-            echo "@ROM_FILE@ (SHA-256 @ROM_SHA256@), recompiles it locally, and builds"
+            echo "${ROM_FILE} (SHA-256 ${ROM_SHA256}), recompiles it locally, and builds"
             echo "the playable game. No ROM data is included or downloaded."
             echo
             if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then

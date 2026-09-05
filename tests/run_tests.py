@@ -33,6 +33,7 @@ TEST_MODULES = [
     'test_cx4_datarom',
     'test_run_benchmark_pairs',
     'test_new_project',
+    'test_rom_identity',
 ]
 
 

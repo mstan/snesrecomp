@@ -410,7 +410,18 @@ include(\${RECOMP_UI_ROOT}/recomp_ui.cmake)
 # shows assets/img/boxart.tga by default. EXISTS-guarded in recomp_ui.cmake,
 # so this configures cleanly before any art is fetched.
 recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes
-    BOXART \"\${CMAKE_SOURCE_DIR}/launcher_assets/img/boxart.tga\")"
+    BOXART \"\${CMAKE_SOURCE_DIR}/launcher_assets/img/boxart.tga\")
+
+# Generate & rebuild from inside the launcher: pick ROM -> recompile locally
+# -> cmake --build -> relaunch. The implementation is the framework's; this
+# project contributes no configuration (snesrecomp_codegen_host_autowire in
+# src/main.c). recomp-ui/src is on the include path because the host speaks
+# RecompLauncherCGameInfo.
+target_sources($PROJECT_NAME PRIVATE
+    \${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c)
+target_include_directories($PROJECT_NAME PRIVATE
+    \${SNESRECOMP_ROOT}/host
+    \${RECOMP_UI_ROOT}/src)"
 fi
 
 MULTITAP_BLOCK="# No multitap: two seats, one controller per port."
@@ -559,8 +570,7 @@ fill game_rtl.h.in       src/game_rtl.h
 fill gen_stubs.c.in      src/gen_stubs.c
 fill variables.h.in      src/variables.h
 fill host_contract.c.in  src/host_contract.c
-fill codegen_setup.c.in  src/codegen_setup.c
-fill codegen_setup.h.in  src/codegen_setup.h
+fill rom_identity.txt.in rom_identity.txt
 fill regen.sh.in         tools/regen.sh
 fill package_release.sh.in scripts/package_release.sh
 fill symbols_readme.md.in  recomp/README.md

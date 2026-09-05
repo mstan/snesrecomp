@@ -108,7 +108,7 @@ def test_scaffold_writes_the_expected_layout():
             "recomp/bank00.cfg", "recomp/symbols.toml", "recomp/README.md",
             "src/main.c", "src/game_rtl.c", "src/game_rtl.h",
             "src/host_contract.c", "src/variables.h", "src/gen_stubs.c",
-            "src/codegen_setup.c", "src/codegen_setup.h",
+            "rom_identity.txt",
             "tools/regen.sh", "scripts/package_release.sh",
         ]
         missing = [name for name in expected if not (project / name).is_file()]
@@ -139,9 +139,9 @@ def test_scaffold_leaves_no_unfilled_tokens():
 
 
 def test_scaffold_carries_rom_identity_into_the_pipeline():
-    """The digests in regen.sh, codegen_setup.c and the README must be the
-    same ones — they are what stops a mismatched revision generating quietly
-    wrong output."""
+    """rom_identity.txt is the one place the digests live, and every consumer
+    must reach them from there — that is what stops a mismatched revision
+    generating quietly wrong output."""
     with tempfile.TemporaryDirectory() as directory:
         tmp = pathlib.Path(directory)
         project = _scaffold(tmp)
@@ -151,10 +151,39 @@ def test_scaffold_carries_rom_identity_into_the_pipeline():
         crc = "%08x" % (zlib.crc32(raw) & 0xFFFFFFFF)
         sha = hashlib.sha256(raw).hexdigest()
 
-        for name in ("tools/regen.sh", "src/codegen_setup.c", "README.md"):
+        identity = (project / "rom_identity.txt").read_text(encoding="utf-8")
+        assert crc in identity, "rom_identity.txt is missing the ROM CRC32"
+        assert sha in identity, "rom_identity.txt is missing the ROM SHA-256"
+
+        # The README is documentation and still states them for a reader.
+        readme = (project / "README.md").read_text(encoding="utf-8")
+        assert crc in readme and sha in readme, "README lost the digests"
+
+
+def test_digests_are_not_copied_into_code_or_scripts():
+    """The point of rom_identity.txt: no consumer may carry its own copy of a
+    digest, because a second copy is a second thing to forget on a revision
+    bump. regen.sh must PARSE the file, and the build must GENERATE from it."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        project = _scaffold(tmp)
+        import hashlib
+        import zlib
+        raw = (tmp / "fixture.sfc").read_bytes()
+        crc = "%08x" % (zlib.crc32(raw) & 0xFFFFFFFF)
+        sha = hashlib.sha256(raw).hexdigest()
+
+        for name in ("tools/regen.sh", "src/main.c", "CMakeLists.txt",
+                     "scripts/package_release.sh",
+                     ".github/workflows/release.yml"):
             text = (project / name).read_text(encoding="utf-8")
-            assert crc in text, f"{name} is missing the ROM CRC32"
-            assert sha in text, f"{name} is missing the ROM SHA-256"
+            assert crc not in text, f"{name} hardcodes the CRC32"
+            assert sha not in text, f"{name} hardcodes the SHA-256"
+
+        regen = (project / "tools/regen.sh").read_text(encoding="utf-8")
+        assert "rom_identity.txt" in regen, "regen.sh does not read the identity"
+        cmake = (project / "CMakeLists.txt").read_text(encoding="utf-8")
+        assert "snesrecomp_rom_identity" in cmake, "build does not generate it"
 
 
 def test_scaffold_never_stages_the_rom():
