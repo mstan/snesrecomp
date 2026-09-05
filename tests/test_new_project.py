@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import tempfile
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SETUP = REPO_ROOT / "tools" / "new_project" / "setup_project.sh"
 PROBE = REPO_ROOT / "tools" / "new_project" / "probe_rom.py"
@@ -389,3 +391,130 @@ def test_scaffold_refuses_to_overwrite():
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         assert result.returncode != 0, "second run should refuse"
         assert "already exists" in result.stdout, result.stdout
+
+
+def test_a_bare_argument_is_the_rom():
+    """`setup_project.sh game.sfc` -- the ROM is the one thing a new project
+    is cut from, so it does not need a flag."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        rom = tmp / "fixture.sfc"
+        _fixture_rom(rom)
+        result = subprocess.run(
+            ["sh", str(SETUP), str(rom), "--dir", str(tmp),
+             "--name", "Fixture Quest", "--yes", "--no-submodules"],
+            cwd=REPO_ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0, result.stdout
+        assert (tmp / "FixtureQuestSNESRecomp" / "rom_identity.txt").is_file()
+
+
+def test_no_rom_is_an_error_when_nobody_can_be_asked():
+    with tempfile.TemporaryDirectory() as directory:
+        result = subprocess.run(
+            ["sh", str(SETUP), "--dir", directory, "--yes", "--no-submodules"],
+            cwd=REPO_ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode != 0
+        assert "--rom" in result.stdout, result.stdout
+        assert not any(pathlib.Path(directory).iterdir()), "created something"
+
+
+def test_non_interactive_runs_do_not_reach_the_network():
+    """Boxart is a download. A --yes run (scripts, CI, this suite) must not
+    start one because a default said so; it is asked on a terminal and
+    otherwise needs --fetch-boxart."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        rom = tmp / "fixture.sfc"
+        _fixture_rom(rom)
+        result = subprocess.run(
+            ["sh", str(SETUP), "--rom", str(rom), "--dir", str(tmp),
+             "--name", "Fixture Quest", "--yes", "--no-submodules"],
+            cwd=REPO_ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0, result.stdout
+        assert "Fetching boxart" not in result.stdout, result.stdout
+        project = tmp / "FixtureQuestSNESRecomp"
+        assert not (project / "launcher_assets" / "img" / "boxart.tga").exists()
+
+
+def _drive_on_a_pty(cmd, answer, timeout=120):
+    """Run cmd on a pseudo-terminal, answering each prompt through answer().
+    setup_project.sh reads /dev/tty, so a pipe cannot exercise its questions;
+    this is the only way to test the flow a person actually sees."""
+    import os
+    import pty
+    import select
+    import time
+
+    pid, fd = pty.fork()
+    if pid == 0:  # child
+        os.execvp(cmd[0], cmd)
+    out = b""
+    pending = b""
+    last = time.time()
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0.5)
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            pending += chunk
+            last = time.time()
+            if pending.endswith(b": "):
+                prompt = pending.decode(errors="replace").splitlines()[-1]
+                os.write(fd, answer(prompt).encode() + b"\n")
+                pending = b""
+        elif time.time() - last > timeout:
+            os.kill(pid, 9)
+            break
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="needs fork/pty")
+def test_the_interactive_flow_asks_and_listens():
+    """No flags at all: the ROM is the first question, every setting after it
+    is asked with a probed default, and the answers reach the project."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        rom = tmp / "fixture.sfc"
+        _fixture_rom(rom)
+
+        asked = []
+
+        def answer(prompt):
+            asked.append(prompt)
+            p = prompt.lower()
+            if "path to the rom" in p:
+                return str(rom)
+            if "max players" in p:
+                return "3"
+            if "short description" in p:
+                return "Driven through a pty"
+            if "boxart" in p or "netplay" in p or "generate c" in p:
+                return "n"
+            return ""   # take the default
+
+        code, out = _drive_on_a_pty(
+            ["sh", str(SETUP), "--dir", str(tmp), "--no-submodules"], answer)
+        assert code == 0, out
+
+        text = " | ".join(asked)
+        for question in ("Path to the ROM", "Display name", "Max players",
+                         "Multitap", "boxart", "netplay", "GitHub Actions",
+                         "Generate C", "gh?", "Proceed?"):
+            assert question in text, f"never asked {question!r}:\n{out}"
+
+        project = tmp / "FixtureQuestSNESRecomp"
+        assert project.is_dir(), out
+        readme = (project / "README.md").read_text(encoding="utf-8")
+        assert "Driven through a pty" in readme
+        cmake = (project / "CMakeLists.txt").read_text(encoding="utf-8")
+        assert "Seats: 3" in cmake and "port2" in cmake, cmake
+        assert not (project / "launcher_assets" / "img" / "boxart.tga").exists()

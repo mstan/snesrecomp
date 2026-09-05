@@ -4,15 +4,23 @@ Scaffold a new SNES recomp title end to end: probe the ROM, lay out the repo,
 wire the submodules, seed the analysis config, generate C, build, and publish.
 
 ```sh
-sh tools/new_project/setup_project.sh --rom ~/roms/game.sfc --dir ~/src
+sh tools/new_project/setup_project.sh ~/roms/game.sfc --dir ~/src
 ```
 
-On a terminal that is the only argument you need: everything else is asked,
-with the probed ROM identity supplying the defaults. Flags are for scripting —
-anything passed explicitly skips its question, and `--yes` (or a non-TTY run)
-takes every default without asking.
+```powershell
+powershell -File tools\new_project\setup_project.ps1 -Rom C:\roms\game.sfc -Dir C:\src
+```
 
-`sh setup_project.sh --help` lists every flag.
+On a terminal the ROM is the only argument you need — and with none at all it
+is the first question. Everything else is asked, with the probed ROM identity
+supplying the defaults. Flags are for scripting: anything passed explicitly
+skips its question, and `--yes` (or a non-TTY run) takes every default without
+asking, with network toggles (boxart, GitHub) off unless flagged.
+
+`sh setup_project.sh --help` lists every flag. The PowerShell entry point is a
+thin launcher: it finds Git for Windows' bash and runs the same script with the
+same arguments, so there is one scaffolder to fix. It needs Git for Windows,
+Python 3 and CMake on `PATH`; WSL and Git Bash users can run the `.sh` directly.
 
 ## What it asks
 
@@ -25,6 +33,7 @@ takes every default without asking.
 | Description, publisher, year | blank (README metadata) |
 | Region | from the cartridge header |
 | Include the recomp-ui launcher submodule? | yes |
+| Fetch libretro boxart now? (network) | yes on a terminal; off when non-interactive |
 | Enable netplay? | no — skipped entirely for a 1-player title |
 | Also build rollback? | yes, when netplay is on |
 | Add the GitHub Actions workflow? | yes |

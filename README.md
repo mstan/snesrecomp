@@ -198,14 +198,24 @@ From a snesrecomp checkout, one command takes a ROM to a repository that
 builds, regenerates, packages, and publishes itself:
 
 ```sh
-sh tools/new_project/setup_project.sh --rom ~/roms/game.sfc --dir ~/src
+# macOS / Linux / WSL / Git Bash
+sh tools/new_project/setup_project.sh ~/roms/game.sfc --dir ~/src
 ```
 
-It probes the cartridge header, lays out the repo, wires the framework
-submodules, seeds the analysis config, writes CI and packaging, and can
-generate, build, and `gh repo create` in the same run. `--players 1-8` and
-`--rollback` configure multitap and netplay up front. See
-[docs/GAME_PROJECT_SETUP.md](docs/GAME_PROJECT_SETUP.md).
+```powershell
+# Windows (needs Git for Windows, Python 3 and CMake on PATH)
+powershell -File tools\new_project\setup_project.ps1 -Rom C:\roms\game.sfc -Dir C:\src
+```
+
+Pass the ROM and answer the questions: title, players and multitap, netplay
+and rollback, launcher, boxart, CI, generate and build, GitHub. Every answer
+has a default probed from the cartridge, and every question has a flag for
+scripting (`--players 1-8`, `--rollback`, `--yes`, ...). It probes the
+cartridge header, lays out the repo, wires the framework submodules, seeds
+the analysis config, writes CI and packaging, and can generate, build, and
+`gh repo create` in the same run. See
+[docs/GAME_PROJECT_SETUP.md](docs/GAME_PROJECT_SETUP.md) and
+[tools/new_project/README.md](tools/new_project/README.md).
 
 The result builds a real executable, but it is not a working port: the frame
 driver in `src/game_rtl.c` is where the game-specific work starts.
