@@ -1,0 +1,21 @@
+/* Generated from @SNESRECOMP_ROM_IDENTITY_SOURCE@ by snesrecomp_rom_identity().
+ * Do not edit: edit that file and rebuild.
+ *
+ * The digests are compiled in rather than read at runtime so a shipped build
+ * carries no extra file it can be separated from. The text file stays the one
+ * place a human edits, and tools/regen.sh and CI read the same file, so a
+ * revision change cannot land in the binary and miss the tooling.
+ *
+ * Any field absent from the identity file expands to an empty string, which
+ * every consumer reads as "cannot verify" rather than "verified". */
+#ifndef SNESRECOMP_ROM_IDENTITY_H
+#define SNESRECOMP_ROM_IDENTITY_H
+
+#define SNESRECOMP_ROM_DISPLAY_NAME    "@SNESRECOMP_ROM_DISPLAY_NAME@"
+#define SNESRECOMP_ROM_FILE            "@SNESRECOMP_ROM_FILE@"
+#define SNESRECOMP_ROM_EXPECTED_CRC32  "@SNESRECOMP_ROM_EXPECTED_CRC32@"
+#define SNESRECOMP_ROM_EXPECTED_SHA256 "@SNESRECOMP_ROM_EXPECTED_SHA256@"
+#define SNESRECOMP_ROM_MAPPING         "@SNESRECOMP_ROM_MAPPING@"
+#define SNESRECOMP_ROM_REGION          "@SNESRECOMP_ROM_REGION@"
+
+#endif /* SNESRECOMP_ROM_IDENTITY_H */

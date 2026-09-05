@@ -20,9 +20,27 @@
 typedef int (*RomCandidateValidator)(const char *path, int positional,
                                      const void *context);
 
+/* Index of the first non-flag argument, or 0 when there is none.
+ *
+ * Scans rather than reading argv[1], because the ROM is not always first.
+ * The hosts in this ecosystem take their flags BEFORE the positional ROM
+ * (`<exe> --launcher <rom>`) -- mmx23_host_main.inc accepts --launcher only as
+ * argv[1], and MetalWarriors stops parsing flags at the first non-flag. A
+ * caller that put the ROM first to satisfy this resolver therefore hid
+ * --launcher from the host, and every SNES title booted straight past its
+ * launcher. Accepting either order is what lets one argv satisfy both. */
+static int first_positional_arg(int argc, char **argv) {
+    if (!argv) return 0;
+    for (int i = 1; i < argc; ++i) {
+        if (!argv[i] || argv[i][0] == '\0') continue;
+        if (argv[i][0] == '-') continue;   /* a flag, not the ROM */
+        return i;
+    }
+    return 0;
+}
+
 static int has_positional_rom(int argc, char **argv) {
-    return argc >= 2 && argv && argv[1] &&
-           argv[1][0] != '-' && argv[1][0] != '\0';
+    return first_positional_arg(argc, argv) != 0;
 }
 
 static void copy_path_fallback(const char *path,
@@ -38,9 +56,10 @@ static int resolve_rom_common(int argc, char **argv,
     if (!out_path || max_len == 0) return 0;
     out_path[0] = '\0';
 
-    if (has_positional_rom(argc, argv)) {
-        if (!snesrecomp_abspath(argv[1], out_path, max_len))
-            copy_path_fallback(argv[1], out_path, max_len);
+    const int pos = first_positional_arg(argc, argv);
+    if (pos) {
+        if (!snesrecomp_abspath(argv[pos], out_path, max_len))
+            copy_path_fallback(argv[pos], out_path, max_len);
         /* Positional validators preserve the historical warning-and-continue
          * behavior for explicit command-line overrides. */
         if (!validate(out_path, 1, context)) return 0;

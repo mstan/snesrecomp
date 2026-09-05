@@ -47,6 +47,14 @@ if [ ! -f "$IMPL" ]; then
   exit 1
 fi
 
+# The ROM hint and digests come from rom_identity.txt -- the same file the
+# build compiles in and tools/regen.sh verifies against -- so a revision bump
+# is one edit. stage_setup_host.sh already needs python3, so this does too.
+IDENTITY_TOOL="snesrecomp/tools/rom_identity.py"
+ROM_FILE="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get rom_file)"
+ROM_SHA256="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get expected_sha256)"
+ROM_CRC32="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get expected_crc32)"
+
 # Add --runtime-dir <name> for every directory the game loads exe-relative
 # (mods, translations, ...) once CMake stages one beside the executable.
 exec bash "$IMPL" \
@@ -55,6 +63,7 @@ exec bash "$IMPL" \
   --exe-name @PROJECT_NAME@ \
   --zip-prefix @ZIP_PREFIX@ \
   --display-name "@DISPLAY_NAME@" \
-  --rom-hint "@ROM_FILE@" \
-  --rom-sha256 @ROM_SHA256@ \
+  --rom-hint "$ROM_FILE" \
+  --rom-sha256 "$ROM_SHA256" \
+  --rom-crc32 "$ROM_CRC32" \
   "${EXTRA[@]+"${EXTRA[@]}"}"

@@ -19,7 +19,7 @@
  *      positional argument, then a copy beside the executable, then the
  *      <exe_dir>/rom.cfg cache, then a native file picker.
  *
- * Both check what they are handed against the digests in codegen_setup.c —
+ * Both check what they are handed against the digests in rom_identity.txt —
  * the same ones tools/regen.sh generated this C from — so a ROM that cannot
  * have produced this executable is caught at the door rather than as
  * mis-execution ten frames in.
@@ -38,7 +38,7 @@
 #include "host_paths.h"      /* snesrecomp_exe_dir_path */
 #include "launcher.h"        /* snesrecomp_launcher_resolve_rom_sha256 */
 #include "launcher_cache.h"  /* snesrecomp_rom_cache_read */
-#include "codegen_setup.h"   /* kGameCodegenIdentity - the ROM digests */
+#include "snesrecomp_rom_identity.h" /* generated from rom_identity.txt */
 
 #if defined(RECOMP_LAUNCHER)
 /* Defined by recomp_target_launcher_ui() in CMakeLists.txt. Absent when the
@@ -46,6 +46,9 @@
  * this file compiles out with it. */
 #include "recomp_launcher.h"
 #include "launcher_profile.h"
+/* Generate & rebuild, framework-owned. Speaks RecompLauncherCGameInfo, so it
+ * only exists where the launcher does. */
+#include "snesrecomp_codegen_host.h"
 #endif
 
 #if defined(SNES_HAS_LOBBY_CLIENT)
@@ -179,13 +182,13 @@ static uint8 *read_rom(const char *path, int *size_out)
     return data;
 }
 
-/* kGameCodegenIdentity carries the digests as text, because tools/regen.sh
- * and the CI workflow read them from the same struct. The ROM checks want
- * bytes. Returns NULL when the identity is unset or malformed, which the
- * callers read as "cannot verify" rather than "verified". */
+/* The identity carries the digests as text, because tools/regen.sh and the
+ * CI workflow read the same rom_identity.txt. The ROM checks want bytes.
+ * Returns NULL when the identity is unset or malformed, which the callers
+ * read as "cannot verify" rather than "verified". */
 static const uint8_t *expected_rom_sha256(uint8_t out[32])
 {
-    const char *hex = kGameCodegenIdentity.expected_sha256;
+    const char *hex = SNESRECOMP_ROM_EXPECTED_SHA256;
     int i;
 
     if (!hex || strlen(hex) != 64)
@@ -202,7 +205,7 @@ static const uint8_t *expected_rom_sha256(uint8_t out[32])
 
 static int expected_rom_crc32(uint32_t *out)
 {
-    const char *hex = kGameCodegenIdentity.expected_crc32;
+    const char *hex = SNESRECOMP_ROM_EXPECTED_CRC32;
     uint32_t v = 0;
     int i;
 
@@ -224,7 +227,7 @@ static int expected_rom_crc32(uint32_t *out)
  * who already followed it is the whole point. */
 static int find_rom_beside_exe(char *out, size_t cap)
 {
-    const char *name = kGameCodegenIdentity.rom_file;
+    const char *name = SNESRECOMP_ROM_FILE;
     FILE *f;
 
     if (!name || !name[0])
@@ -296,6 +299,12 @@ static int run_gui_launcher(const char *initial_rom, char *out, size_t cap)
     gi.netplay = snes_host_lobby_callbacks();
 #endif
 
+    /* Wire "Generate & rebuild…". Zero configuration by design: generate and
+     * build are framework behavior, so a fix there reaches every port on a pin
+     * bump instead of needing one edit per port. No-ops when the SDK, CMake or
+     * the build tree is absent, which is the normal state of a shipped build. */
+    snesrecomp_codegen_host_autowire(&gi, gi.name);
+
     out[0] = '\0';
     lr = recomp_launcher_run_window("@WINDOW_TITLE@", &ls, &gi, assets_dir,
                                     (initial_rom && initial_rom[0]) ? initial_rom
@@ -316,9 +325,15 @@ static int run_gui_launcher(const char *initial_rom, char *out, size_t cap)
         return -1;
     if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && out[0])
         return 1;
-    /* UNAVAILABLE (assets or GL missing) and RELAUNCH (only reachable once a
-     * host wires gi.rebuild_with_progress, which this scaffold does not) both
-     * mean "the GUI produced no ROM" — resolve one the text-mode way. */
+    if (lr == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
+        /* The player generated sources and rebuilt: this binary is stale.
+         * Does not return on success — it execs the new build (or, on
+         * Windows, schedules a helper and exits so the .exe is unlocked). */
+        snesrecomp_codegen_host_relaunch_or_exit(out);
+        return -1;   /* only reached if the relaunch could not be performed */
+    }
+    /* UNAVAILABLE (assets or GL missing) means "the GUI produced no ROM" —
+     * resolve one the text-mode way. */
     out[0] = '\0';
     return 0;
 }
@@ -330,7 +345,19 @@ int main(int argc, char **argv)
     char beside_exe[1024] = "";
     uint8_t sha[32];
     const uint8_t *want_sha = expected_rom_sha256(sha);
-    int has_positional = (argc > 1 && argv[1] && argv[1][0] && argv[1][0] != '-');
+    /* First non-flag argument, not argv[1]: the hosts in this ecosystem take
+     * their flags BEFORE the ROM (`<exe> --launcher <rom>`), so reading
+     * argv[1] here would see "--launcher" and conclude there is no ROM. */
+    int pos_arg = 0;
+    {
+        int ai;
+        for (ai = 1; ai < argc; ++ai) {
+            if (!argv[ai] || !argv[ai][0] || argv[ai][0] == '-') continue;
+            pos_arg = ai;
+            break;
+        }
+    }
+    int has_positional = (pos_arg != 0);
     /* --launcher / --no-launcher, spelled as the reference host spells them
      * (snesrecomp/runner/src/desktop/mmx23_host_main.inc).
      *
@@ -379,7 +406,7 @@ int main(int argc, char **argv)
              * --launcher with a ROM means "show me the launcher, loaded with
              * THIS one". */
             if (has_positional)
-                snprintf(hint, sizeof(hint), "%s", argv[1]);
+                snprintf(hint, sizeof(hint), "%s", argv[pos_arg]);
             else
                 snprintf(hint, sizeof(hint), "%s", beside_exe);
             if (!hint[0] && !snesrecomp_rom_cache_read(hint, sizeof(hint)))
@@ -403,7 +430,7 @@ int main(int argc, char **argv)
 
         resolve_argv[0] = argv[0];
         if (has_positional) {
-            resolve_argv[1] = argv[1];
+            resolve_argv[1] = argv[pos_arg];
             resolve_argc = 2;
         } else if (beside_exe[0]) {
             resolve_argv[1] = beside_exe;

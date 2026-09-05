@@ -393,6 +393,81 @@ function(snesrecomp_target_stage_dir target source_dir dest_rel)
         VERBATIM)
 endfunction()
 
+# ── ROM identity ────────────────────────────────────────────────────────────
+#
+# snesrecomp_rom_identity(<target> <identity_file>)
+#
+# rom_identity.txt is the one place a project's ROM digests live. This turns
+# it into snesrecomp_rom_identity.h (SNESRECOMP_ROM_EXPECTED_SHA256 and
+# friends, see cmake/rom_identity.h.in) at configure time and puts the header
+# on <target>'s include path, so the host compiles the digests in and a
+# shipped binary carries no file it can be separated from. tools/regen.sh and
+# the release workflow read the same text file through tools/rom_identity.py,
+# which emits an identical header for CI (CI cannot configure a project whose
+# src/gen is empty); tests/test_rom_identity.py pins the two emitters together.
+#
+# Format: `key = value`, one per line, `#` comments, optional double quotes.
+# Keys: display_name, rom_file, expected_crc32, expected_sha256, mapping,
+# region. A missing key expands to "", which every consumer reads as
+# "cannot verify" rather than "verified". Editing the file re-runs configure.
+function(snesrecomp_rom_identity target identity_file)
+    if(NOT EXISTS "${identity_file}")
+        message(FATAL_ERROR
+            "snesrecomp_rom_identity(${target}): ${identity_file} does not exist.\n"
+            "It is the project's ROM identity (digests, filename, mapping); the "
+            "scaffolder writes it as rom_identity.txt at the project root.")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${identity_file}")
+
+    foreach(_field display_name rom_file expected_crc32 expected_sha256 mapping region)
+        set(_id_${_field} "")
+    endforeach()
+
+    # Not file(STRINGS): a value containing ';' would be split into two lines.
+    file(READ "${identity_file}" _content)
+    string(REPLACE ";" "\;" _content "${_content}")
+    string(REGEX REPLACE "\r?\n" ";" _lines "${_content}")
+    foreach(_line IN LISTS _lines)
+        string(STRIP "${_line}" _line)
+        if(_line STREQUAL "" OR _line MATCHES "^#")
+            continue()
+        endif()
+        if(NOT _line MATCHES "^([A-Za-z0-9_]+)[ \t]*=[ \t]*(.*)$")
+            message(WARNING "${identity_file}: ignoring unparsable line: ${_line}")
+            continue()
+        endif()
+        set(_key "${CMAKE_MATCH_1}")
+        string(STRIP "${CMAKE_MATCH_2}" _value)
+        if(_value MATCHES "^\"(.*)\"$")
+            set(_value "${CMAKE_MATCH_1}")
+        endif()
+        string(TOLOWER "${_key}" _key)
+        set(_id_${_key} "${_value}")
+    endforeach()
+
+    # The macro names are the contract with tools/rom_identity.py and every
+    # host that includes the header; spelled out rather than derived so the
+    # one irregular name (rom_file -> SNESRECOMP_ROM_FILE) cannot drift.
+    set(SNESRECOMP_ROM_DISPLAY_NAME    "${_id_display_name}")
+    set(SNESRECOMP_ROM_FILE            "${_id_rom_file}")
+    set(SNESRECOMP_ROM_EXPECTED_CRC32  "${_id_expected_crc32}")
+    set(SNESRECOMP_ROM_EXPECTED_SHA256 "${_id_expected_sha256}")
+    set(SNESRECOMP_ROM_MAPPING         "${_id_mapping}")
+    set(SNESRECOMP_ROM_REGION          "${_id_region}")
+
+    if(SNESRECOMP_ROM_EXPECTED_SHA256 STREQUAL "" AND SNESRECOMP_ROM_EXPECTED_CRC32 STREQUAL "")
+        message(WARNING
+            "${identity_file}: sets neither expected_sha256 nor expected_crc32 -- "
+            "this build cannot verify the ROM it is handed.")
+    endif()
+
+    set(SNESRECOMP_ROM_IDENTITY_SOURCE "${identity_file}")
+    set(_out_dir "${CMAKE_CURRENT_BINARY_DIR}/snesrecomp_rom_identity")
+    configure_file("${SNESRECOMP_RUNNER_ROOT}/cmake/rom_identity.h.in"
+                   "${_out_dir}/snesrecomp_rom_identity.h" @ONLY)
+    target_include_directories(${target} PRIVATE "${_out_dir}")
+endfunction()
+
 # ── Generated code, or the setup host that stands in for it ────────────────
 #
 # src/gen/*.c is recompiler output derived from ROM bytes: never committed,

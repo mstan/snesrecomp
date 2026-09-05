@@ -1,0 +1,17 @@
+# ROM identity for @DISPLAY_NAME@ — the single source of truth.
+#
+# Read by three consumers, so a revision change is made once, here:
+#   - the build   (CMake generates snesrecomp_rom_identity.h from this file)
+#   - tools/regen.sh
+#   - .github/workflows/release.yml
+#
+# Format is `key = value`, one per line; `#` starts a comment. Values may be
+# quoted. Leaving a digest empty means the build cannot verify a ROM it is
+# handed — it will say so rather than accept it.
+
+display_name    = @DISPLAY_NAME@
+rom_file        = @ROM_FILE@
+expected_crc32  = @ROM_CRC32@
+expected_sha256 = @ROM_SHA256@
+mapping         = @ROM_MAPPING@
+region          = @REGION@

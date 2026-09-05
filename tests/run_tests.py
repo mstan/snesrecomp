@@ -32,6 +32,7 @@ TEST_MODULES = [
     'test_snes_cycles',
     'test_cx4_datarom',
     'test_new_project',
+    'test_rom_identity',
 ]
 
 

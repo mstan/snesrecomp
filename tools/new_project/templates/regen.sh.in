@@ -2,8 +2,9 @@
 # Regenerate src/gen/*.c for @DISPLAY_NAME@ from a verified ROM.
 #
 # Generated C is derived from copyrighted ROM data and is never committed;
-# every developer regenerates from their own copy. The ROM digests below are
-# the same ones src/codegen_setup.c and the CI workflow use.
+# every developer regenerates from their own copy. The ROM digests come from
+# rom_identity.txt, which the build and the release workflow read too, so
+# there is one place to change when a revision changes.
 #
 # Flags:
 #   --rom <path>  ROM to generate from. Defaults to a known filename at the
@@ -19,9 +20,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
-
-EXPECTED_CRC32="${SNESRECOMP_EXPECTED_CRC32:-@ROM_CRC32@}"
-EXPECTED_SHA256="${SNESRECOMP_EXPECTED_SHA256:-@ROM_SHA256@}"
 
 VERIFY=1
 CFG_ROOTS=0
@@ -48,6 +46,12 @@ if [ -z "$PYTHON" ]; then
   echo "regen.sh: no python3 on PATH" >&2
   exit 1
 fi
+
+# The framework parses rom_identity.txt (the same parser CI uses), so this
+# script carries no copy of a digest to forget on a revision bump.
+IDENTITY="$SNESRECOMP_ROOT/tools/rom_identity.py"
+EXPECTED_CRC32="${SNESRECOMP_EXPECTED_CRC32:-$("$PYTHON" "$IDENTITY" "$ROOT/rom_identity.txt" --get expected_crc32)}"
+EXPECTED_SHA256="${SNESRECOMP_EXPECTED_SHA256:-$("$PYTHON" "$IDENTITY" "$ROOT/rom_identity.txt" --get expected_sha256)}"
 
 # --rom / SNESRECOMP_ROM win; otherwise look for a known name at the root.
 if [ -z "$ROM" ]; then

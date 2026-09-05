@@ -49,7 +49,8 @@ create` (no push) → generate/build → one push. Pushing earlier leaves a seco
 ├── VERSION                 release pin used for lobby version matching
 ├── framework_pins.txt      exact framework SHAs this project was cut against
 ├── recomp/                 bank*.cfg, symbols.toml — analysis input you own
-├── src/                    main.c, game_rtl.c, host_contract.c, codegen_setup.c
+├── rom_identity.txt        ROM digests — the one place a revision changes
+├── src/                    main.c, game_rtl.c, host_contract.c
 │   └── gen/                generated C (gitignored — never committed)
 ├── tools/regen.sh          ROM → C, with digest verification
 ├── scripts/package_release.sh
@@ -115,7 +116,9 @@ generated `.gitignore` blocks `*.sfc` / `*.smc` / `src/gen/` regardless.
 
 Which means the scaffolded host has to *ask* for one, and `src/main.c` does —
 in this order, each candidate checked against the digests in
-`src/codegen_setup.c`, the same ones the C was generated from:
+`rom_identity.txt`, the same ones the C was generated from. The build turns
+that file into `snesrecomp_rom_identity.h`; `tools/regen.sh` and the release
+workflow read it directly, so a revision bump is a one-line edit:
 
 1. **The recomp-ui launcher** (`--recomp-ui`, on by default). A pre-boot GUI
    with a ROM picker and verification badge, plus display / audio / input
@@ -158,6 +161,6 @@ names nothing.
 `tests/test_new_project.py` (in the framework suite, `python3
 tests/run_tests.py`) runs the scaffolder against a synthetic, redistributable
 image with `--no-submodules`, and checks the layout, that no `@TOKEN@`
-survives, that the ROM digests reach `regen.sh` / `codegen_setup.c` / the
-README identically, that multitap and rollback flags reach CMake, and that no
-ROM is ever staged.
+survives, that the ROM digests live in `rom_identity.txt` and are NOT copied
+into `regen.sh` / `main.c` / `CMakeLists.txt`, that multitap and rollback flags
+reach CMake, and that no ROM is ever staged.

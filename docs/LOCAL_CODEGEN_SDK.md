@@ -99,8 +99,14 @@ projects uniformly.
 ### Game regen scripts
 
 CLI wrappers such as `tools/regen.sh` should call `snesrecomp_cli.py generate`
-(same contract as the host). Metal Warriors is one consumer; other titles copy
-the thin config pattern from its `src/codegen_setup.c`.
+(same contract as the host), reading their digests from `rom_identity.txt`.
+
+Titles no longer copy a config pattern. Generate & rebuild is wired by
+`snesrecomp_codegen_host_autowire()`, which takes no configuration: the CMake
+target and the binary to relaunch are the running executable's own name, and
+every path it needs is a scaffolder convention with a default in
+`snesrecomp_codegen_host_apply()`. A port that copies configuration is a port
+that cannot inherit a fix to it.
 
 ## Setup packs (release zips without generated C)
 

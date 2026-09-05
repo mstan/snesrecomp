@@ -71,7 +71,8 @@ than mis-executing ten frames in.
 | Path | What lives there |
 |---|---|
 | `recomp/` | Analysis input: `bank*.cfg`, `symbols.toml`, generated `funcs.h` |
-| `src/` | Host code you own: `main.c`, `game_rtl.c`, `codegen_setup.c` |
+| `rom_identity.txt` | ROM digests — read by the build, `tools/regen.sh` and CI |
+| `src/` | Host code you own: `main.c`, `game_rtl.c` |
 | `src/gen/` | Generated C. Never committed — regenerate locally |
 | `snesrecomp/` | Framework submodule (owns `lib/recomp-net`, `lib/retcomm-rbengine`) |
 | `tools/` | `regen.sh` — the ROM → C pipeline |
