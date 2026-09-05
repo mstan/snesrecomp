@@ -13,7 +13,21 @@ extern "C" {
 #define SNES_LOBBY_VERSION_LEN 32
 #define SNES_LOBBY_ENDPOINT_LEN 64
 #define SNES_LOBBY_MAX_LIST 32
-#define SNES_LOBBY_MAX_MEMBERS 4
+
+/* Player seats this title can seat. Was what SNES_LOBBY_MAX_MEMBERS meant
+ * before there was anything in a lobby that was not a player. */
+#define SNES_LOBBY_MAX_PLAYERS 4
+/* Spectator seats a host may open, on top of the players. */
+#define SNES_LOBBY_MAX_SPECTATORS 4
+/* Rows in the membership table: both tables land in it, tagged by role. */
+#define SNES_LOBBY_MAX_MEMBERS \
+    (SNES_LOBBY_MAX_PLAYERS + SNES_LOBBY_MAX_SPECTATORS)
+
+/* Seat indices are one namespace, matching the server: below the base is a
+ * player seat, at or above it is `index - base` in the gallery. The server
+ * republishes its own base in every lobby_update; this is the compiled-in
+ * default for the case where it does not. */
+#define SNES_LOBBY_SPECTATOR_SLOT_BASE 64
 
 #ifndef SNES_GAME_VERSION
 #ifdef SNESRECOMP_BUILD_VERSION
@@ -34,10 +48,15 @@ typedef struct SnesLobbyRow {
 } SnesLobbyRow;
 
 typedef struct SnesLobbyMember {
+    /* Seat index in the shared namespace: a player seat, or
+     * spectator_slot_base + gallery index. Pass it back to kick / move as-is. */
     int  slot;
     char player_id[SNES_LOBBY_ID_LEN];
     char display_name[SNES_LOBBY_NAME_LEN];
     int  ready;
+    /* 1 when this row is in the gallery. Read this rather than comparing
+     * `slot` against a base: the base is the server's to choose. */
+    int  is_spectator;
 } SnesLobbyMember;
 
 /* One package on the lobby wire -- a row of the host's required plan, or of a
@@ -160,6 +179,15 @@ typedef struct SnesLobbyJoinInfo {
     char     peer_hostport[SNES_LOBBY_ENDPOINT_LEN];
     int      player_count;
     int      max_slots;
+    /* 1 when this client holds a gallery seat: it runs the match and shows it,
+     * and contributes no input to anyone. */
+    int      local_is_spectator;
+    /* Host opt-in, echoed by the server. 0 when the server predates
+     * spectators, which is why every spectator control is gated on it. */
+    int      allow_spectators;
+    int      max_spectators;
+    int      spectator_count;
+    int      spectator_slot_base;
     char     last_error[64]; /* need_password | bad_password | … */
 } SnesLobbyJoinInfo;
 
@@ -208,6 +236,34 @@ int  snes_lobby_join(const char *lobby_id, const char *password,
                     const char *guest_bind);
 
 int  snes_lobby_leave(void);
+
+/* ---- spectators --------------------------------------------------------
+ *
+ * A gallery seat runs the match locally, in sync, and contributes nothing.
+ * The server enforces the "contributes nothing" half at the relay; this side
+ * enforces the rest -- no Ready vote, no controller reaching the sim.
+ *
+ * Every one of these reads 0 against a server that predates spectators, so a
+ * caller that gates its UI on allow_spectators degrades to the old lobby. */
+
+/* Host: open a gallery on the NEXT create. Sticky, like the max_slots
+ * default -- create carries whatever this was last set to. */
+void snes_lobby_set_allow_spectators(int allow);
+/* What the toggle is set to, for the UI to render. Distinct from the next
+ * call: this is what the host ASKED for and has not created yet. */
+int  snes_lobby_allow_spectators_pref(void);
+/* What the current lobby actually has (server-echoed), not what was asked.
+ * These disagree whenever the server predates spectators -- which is exactly
+ * the case the UI must not offer a gallery in. */
+int  snes_lobby_allow_spectators(void);
+int  snes_lobby_max_spectators(void);
+int  snes_lobby_spectator_count(void);
+/* 1 when THIS client is in the gallery. The one call the engine needs. */
+int  snes_lobby_local_is_spectator(void);
+/* Base of the gallery half of the seat namespace, as the server reports it. */
+int  snes_lobby_spectator_slot_base(void);
+/* Seat index for gallery position `index`, for move / kick. */
+int  snes_lobby_spectator_slot(int index);
 
 /* Host: remove the player seated in `slot` (not the host). Returns 0 if sent. */
 int  snes_lobby_kick(int slot);
