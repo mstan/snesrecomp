@@ -93,6 +93,14 @@ int  snes_lobby_match_blocked_by_mods(char *w, size_t wc, char *t, size_t tc)
 int  snes_lobby_local_missing_mods(void) { return 0; }
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
+void snes_lobby_set_allow_spectators(int allow) { (void)allow; }
+int  snes_lobby_allow_spectators_pref(void) { return 0; }
+int  snes_lobby_allow_spectators(void) { return 0; }
+int  snes_lobby_max_spectators(void) { return 0; }
+int  snes_lobby_spectator_count(void) { return 0; }
+int  snes_lobby_local_is_spectator(void) { return 0; }
+int  snes_lobby_spectator_slot_base(void) { return SNES_LOBBY_SPECTATOR_SLOT_BASE; }
+int  snes_lobby_spectator_slot(int index) { (void)index; return -1; }
 int  snes_lobby_member_get(int index, SnesLobbyMember *out) { (void)index; (void)out; return 0; }
 int  snes_lobby_member_latency_ms(int slot) { (void)slot; return -1; }
 int  snes_lobby_member_is_host(const SnesLobbyMember *member)
@@ -732,6 +740,11 @@ static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
  * the mod" from a host that was perfectly able to. */
 static SnesLobbyModOfferFn g_mod_offer_fn;
 static void *g_mod_offer_ctx;
+/* Host preference for the next create. File scope, like the transfer hooks:
+ * snes_lobby_disconnect memsets g_lc, and a setting made before a reconnect
+ * must still be there when the create goes out. */
+static int g_allow_spectators_pref;
+
 static SnesLobbyModExportFn  g_mod_export_fn;
 static SnesLobbyModFreeFn    g_mod_free_fn;
 static SnesLobbyModInstallFn g_mod_install_fn;
@@ -958,26 +971,35 @@ static void fill_peer_bind_from_join(void)
     j->peer_hostport[sizeof(j->peer_hostport) - 1] = '\0';
 }
 
-static void parse_slots_array(const char *json)
+/* Read one seat array into the membership table, appending from `n`.
+ *
+ * Players and spectators arrive as two arrays of identical rows and land in
+ * one table tagged by role, because every consumer -- the UI's two tables
+ * included -- wants "who is here and what are they" rather than two parallel
+ * lists to keep in step. Returns the new row count.
+ *
+ * `key` absent is not an error: a server that predates spectators sends no
+ * "spectators", and the correct result there is a lobby with an empty gallery. */
+static int parse_seat_array(const char *json, const char *key, int is_spectator,
+                            int n)
 {
-    const char *p = strstr(json, "\"slots\"");
-    int n = 0;
-    g_lc.member_count = 0;
-    g_lc.local_ready = 0;
+    char keybuf[32];
+    const char *p;
+    snprintf(keybuf, sizeof(keybuf), "\"%s\"", key);
+    p = strstr(json, keybuf);
     if (!p) {
-        return;
+        return n;
     }
     p = strchr(p, '[');
     if (!p) {
-        return;
+        return n;
     }
     ++p;
     while (*p && n < SNES_LOBBY_MAX_MEMBERS) {
         const char *obj;
         while (*p && *p != '{') {
             if (*p == ']') {
-                g_lc.member_count = n;
-                return;
+                return n;
             }
             ++p;
         }
@@ -1039,18 +1061,53 @@ static void parse_slots_array(const char *json)
                 json_get_str(chunk, "display_name", g_lc.members[n].display_name,
                              sizeof(g_lc.members[n].display_name));
                 g_lc.members[n].ready = json_get_bool(chunk, "ready", 0);
+                g_lc.members[n].is_spectator = is_spectator;
                 if (g_lc.player_id[0] &&
                     strcmp(g_lc.members[n].player_id, g_lc.player_id) == 0) {
                     g_lc.local_ready = g_lc.members[n].ready;
                     /* Seat swaps only arrive via lobby_update slots — keep
                      * join.local_slot in sync for launch / netplay_cfg. */
                     g_lc.join.local_slot = g_lc.members[n].slot;
+                    /* And the role, which a host move can change under us at
+                     * any moment. Everything downstream -- whether this build
+                     * contributes input, whether it may press Ready -- reads
+                     * this, so it has to be refreshed from the same update
+                     * that moved the seat. */
+                    g_lc.join.local_is_spectator = is_spectator;
                 }
                 ++n;
                 p = end;
             }
         }
     }
+    return n;
+}
+
+static void parse_slots_array(const char *json)
+{
+    int n;
+    g_lc.member_count = 0;
+    g_lc.local_ready = 0;
+    g_lc.join.local_is_spectator = 0;
+    /* Default to what we already knew, not to zero.
+     *
+     * This runs for `launch` as well as `lobby_update`, and the launch message
+     * carries no allow_spectators / max_spectators -- it has no reason to.
+     * Defaulting those to 0 would erase the gallery's existence at the exact
+     * moment the client has to decide whether it is in it. */
+    g_lc.join.allow_spectators =
+        json_get_bool(json, "allow_spectators", g_lc.join.allow_spectators);
+    g_lc.join.max_spectators =
+        json_get_int(json, "max_spectators", g_lc.join.max_spectators);
+    g_lc.join.spectator_count =
+        json_get_int(json, "spectator_count", g_lc.join.spectator_count);
+    g_lc.join.spectator_slot_base =
+        json_get_int(json, "spectator_slot_base",
+                     g_lc.join.spectator_slot_base > 0
+                         ? g_lc.join.spectator_slot_base
+                         : SNES_LOBBY_SPECTATOR_SLOT_BASE);
+    n = parse_seat_array(json, "slots", 0, 0);
+    n = parse_seat_array(json, "spectators", 1, n);
     g_lc.member_count = n;
 }
 
@@ -1828,7 +1885,9 @@ int snes_lobby_create(const char *name, const char *game_name,
     }
     slots = max_slots;
     if (slots < 2) slots = 2;
-    if (slots > SNES_LOBBY_MAX_MEMBERS) slots = SNES_LOBBY_MAX_MEMBERS;
+    /* PLAYERS, not members. The membership table grew to hold the gallery;
+     * the number of people who can pick up a controller did not. */
+    if (slots > SNES_LOBBY_MAX_PLAYERS) slots = SNES_LOBBY_MAX_PLAYERS;
     gn = game_name && game_name[0] ? game_name
          : (g_lc.filter_game_name[0] ? g_lc.filter_game_name : "Game");
     gv = effective_game_version(game_version);
@@ -1844,9 +1903,11 @@ int snes_lobby_create(const char *name, const char *game_name,
     }
     n = snprintf(msg, sizeof(msg),
                  "{\"op\":\"create\",\"name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\",\"password\":\"%s\","
-                 "\"max_slots\":%d,\"host_bind\":\"%s\",\"display_name\":\"%s\"%s}",
+                 "\"max_slots\":%d,\"allow_spectators\":%s,"
+                 "\"host_bind\":\"%s\",\"display_name\":\"%s\"%s}",
                  name && name[0] ? name : "Lobby", gn, gv,
-                 password ? password : "", slots, g_lc.my_bind,
+                 password ? password : "", slots,
+                 g_allow_spectators_pref ? "true" : "false", g_lc.my_bind,
                  g_lc.display_name[0] ? g_lc.display_name : "Host", caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
     queue_send(msg);
@@ -2016,6 +2077,51 @@ int snes_lobby_set_match_caps(const SnesLobbyMatchCaps *caps)
     queue_send(msg);
     flush_pending();
     return 0;
+}
+
+void snes_lobby_set_allow_spectators(int allow)
+{
+    g_allow_spectators_pref = allow ? 1 : 0;
+}
+
+int snes_lobby_allow_spectators_pref(void)
+{
+    return g_allow_spectators_pref;
+}
+
+int snes_lobby_allow_spectators(void)
+{
+    return g_lc.join.allow_spectators ? 1 : 0;
+}
+
+int snes_lobby_max_spectators(void)
+{
+    return g_lc.join.max_spectators;
+}
+
+int snes_lobby_spectator_count(void)
+{
+    return g_lc.join.spectator_count;
+}
+
+int snes_lobby_local_is_spectator(void)
+{
+    return g_lc.join.local_is_spectator ? 1 : 0;
+}
+
+int snes_lobby_spectator_slot_base(void)
+{
+    /* The server republishes its base in every update, and the namespace is
+     * the server's to define. The compiled-in value is only a fallback for an
+     * update that arrives without it, so `move` stays addressable. */
+    return g_lc.join.spectator_slot_base > 0 ? g_lc.join.spectator_slot_base
+                                             : SNES_LOBBY_SPECTATOR_SLOT_BASE;
+}
+
+int snes_lobby_spectator_slot(int index)
+{
+    if (index < 0 || index >= SNES_LOBBY_MAX_SPECTATORS) return -1;
+    return snes_lobby_spectator_slot_base() + index;
 }
 
 int snes_lobby_member_count(void)

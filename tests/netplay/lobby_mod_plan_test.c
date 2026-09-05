@@ -512,6 +512,144 @@ static void case_refusal_survives_a_short_buffer(void)
        "no reason buffer at all is still a refusal");
 }
 
+
+/* ---- spectator seats ----------------------------------------------------
+ *
+ * Two arrays of identical rows land in one membership table tagged by role.
+ * The parser is the whole client-side contract: a role read wrong here is a
+ * spectator that sends input, or a player that cannot.
+ */
+static void case_spectator_rows_are_tagged(void)
+{
+    const char *json =
+        "{\"op\":\"lobby_update\",\"player_count\":2,\"max_slots\":2,"
+        "\"allow_spectators\":true,\"max_spectators\":4,"
+        "\"spectator_count\":2,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\",\"ready\":true},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\",\"ready\":false}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"s0\",\"display_name\":\"Watcher\",\"ready\":false},"
+        "{\"slot\":66,\"player_id\":\"s2\",\"display_name\":\"Other\",\"ready\":false}]}";
+    printf("  spectator rows\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "s2");
+    parse_slots_array(json);
+
+    ck(g_lc.member_count == 4, "both tables land in one membership list");
+    ck(g_lc.members[0].is_spectator == 0, "row 0 is a player");
+    ck(g_lc.members[1].is_spectator == 0, "row 1 is a player");
+    ck(g_lc.members[2].is_spectator == 1, "row 2 is a spectator");
+    ck(g_lc.members[3].is_spectator == 1, "row 3 is a spectator");
+    /* Seat indices survive verbatim -- they are what kick / move send back. */
+    ck(g_lc.members[2].slot == 64, "spectator seat index is preserved");
+    ck(g_lc.members[3].slot == 66, "a sparse gallery keeps its indices");
+    ck(strcmp(g_lc.members[3].display_name, "Other") == 0, "names still parse");
+
+    /* The local client is s2, in the gallery. */
+    ck(snes_lobby_local_is_spectator() == 1, "this client knows it is watching");
+    ck(g_lc.join.local_slot == 66, "and which seat it holds");
+    ck(snes_lobby_allow_spectators() == 1, "allow_spectators round-trips");
+    ck(snes_lobby_max_spectators() == 4, "max_spectators round-trips");
+    ck(snes_lobby_spectator_slot_base() == 64, "the base comes from the server");
+}
+
+static void case_a_player_is_not_a_spectator(void)
+{
+    const char *json =
+        "{\"allow_spectators\":true,\"max_spectators\":4,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"me\",\"display_name\":\"Me\",\"ready\":true}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"s\",\"display_name\":\"S\",\"ready\":false}]}";
+    printf("  player role\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
+    parse_slots_array(json);
+    ck(snes_lobby_local_is_spectator() == 0, "a seated player is not watching");
+    ck(g_lc.local_ready == 1, "and its own ready still tracks");
+}
+
+static void case_promotion_flips_the_role(void)
+{
+    /* The host moved us out of the gallery. The role has to move with the
+     * seat in the SAME update, because everything downstream -- whether this
+     * build sends input at all -- reads it. */
+    const char *watching =
+        "{\"allow_spectators\":true,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":false}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"me\",\"display_name\":\"Me\",\"ready\":false}]}";
+    const char *playing =
+        "{\"allow_spectators\":true,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":false},"
+        "{\"slot\":1,\"player_id\":\"me\",\"display_name\":\"Me\",\"ready\":false}],"
+        "\"spectators\":[]}";
+    printf("  promotion\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
+    parse_slots_array(watching);
+    ck(snes_lobby_local_is_spectator() == 1, "watching first");
+    parse_slots_array(playing);
+    ck(snes_lobby_local_is_spectator() == 0, "playing after the host moved us");
+    ck(g_lc.join.local_slot == 1, "and holding the seat we were moved to");
+    ck(g_lc.member_count == 2, "the empty gallery contributes no rows");
+}
+
+static void case_a_server_without_spectators_reads_as_before(void)
+{
+    /* The compatibility case. No "spectators" key at all: the lobby is
+     * exactly the lobby this client saw before the feature existed. */
+    const char *json =
+        "{\"player_count\":2,\"max_slots\":2,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":true},"
+        "{\"slot\":1,\"player_id\":\"me\",\"display_name\":\"Me\",\"ready\":true}]}";
+    printf("  legacy server\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
+    parse_slots_array(json);
+    ck(g_lc.member_count == 2, "both players parse");
+    ck(g_lc.members[0].is_spectator == 0 && g_lc.members[1].is_spectator == 0,
+       "nobody is tagged as a spectator");
+    ck(snes_lobby_allow_spectators() == 0, "and the gallery is reported closed");
+    ck(snes_lobby_local_is_spectator() == 0, "so this client is a player");
+}
+
+static void case_launch_does_not_erase_the_gallery(void)
+{
+    /* `launch` carries spectators/spectator_count but no allow_spectators --
+     * it has no reason to. Defaulting that to 0 would erase the gallery at
+     * the exact moment the client decides whether it is in it. */
+    const char *update =
+        "{\"allow_spectators\":true,\"max_spectators\":4,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":true}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"me\",\"display_name\":\"Me\",\"ready\":false}]}";
+    const char *launch =
+        "{\"op\":\"launch\",\"player_count\":1,\"spectator_count\":1,"
+        "\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":true}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"me\",\"display_name\":\"Me\",\"ready\":false}]}";
+    printf("  launch keeps the role\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
+    parse_slots_array(update);
+    ck(snes_lobby_allow_spectators() == 1, "gallery open in the lobby");
+    parse_slots_array(launch);
+    ck(snes_lobby_allow_spectators() == 1, "still open through launch");
+    ck(snes_lobby_max_spectators() == 4, "and the size is remembered");
+    ck(snes_lobby_local_is_spectator() == 1, "we launch as a spectator");
+}
+
+static void case_gallery_seat_addressing(void)
+{
+    printf("  seat addressing\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.join.spectator_slot_base = 64;
+    ck(snes_lobby_spectator_slot(0) == 64, "gallery 0 addresses seat 64");
+    ck(snes_lobby_spectator_slot(3) == 67, "gallery 3 addresses seat 67");
+    ck(snes_lobby_spectator_slot(4) == -1, "past the gallery is refused");
+    ck(snes_lobby_spectator_slot(-1) == -1, "and so is a negative index");
+    /* Player seats must keep the indices they always had, or every existing
+     * `slot` on the wire changes meaning. */
+    ck(SNES_LOBBY_MAX_PLAYERS < SNES_LOBBY_SPECTATOR_SLOT_BASE,
+       "the two halves of the namespace cannot collide");
+}
+
 int main(void)
 {
     case_rows();
@@ -529,6 +667,12 @@ int main(void)
     case_unknown_path_allows();
     case_refusal_tells_the_player_what_to_do();
     case_refusal_survives_a_short_buffer();
+    case_spectator_rows_are_tagged();
+    case_a_player_is_not_a_spectator();
+    case_promotion_flips_the_role();
+    case_a_server_without_spectators_reads_as_before();
+    case_launch_does_not_erase_the_gallery();
+    case_gallery_seat_addressing();
     printf(fails ? "\n%d failure(s)\n" : "\nall mod-plan cases passed\n", fails);
     return fails != 0;
 }

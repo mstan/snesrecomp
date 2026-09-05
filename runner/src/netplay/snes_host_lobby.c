@@ -933,11 +933,72 @@ static int cb_member_get(void *ctx, int index,
     return 0;
   out->slot = member.slot;
   out->ready = member.ready;
+  out->is_spectator = member.is_spectator;
   out->is_host = snes_lobby_member_is_host(&member);
   snprintf(out->display_name, sizeof(out->display_name), "%s",
            member.display_name);
   out->latency_ms = snes_lobby_member_latency_ms(member.slot);
   return 1;
+}
+
+/* ---- spectators ---------------------------------------------------------
+ * The gallery exists only on the lobby server. A LAN / direct-IP room has no
+ * server to enforce "cannot affect the game" at, so it reports no gallery and
+ * the UI's spectator section stays hidden there. */
+
+static int cb_allow_spectators_get(void *ctx)
+{
+  (void)ctx;
+  return snes_lobby_allow_spectators_pref();
+}
+
+static int cb_allow_spectators_set(void *ctx, int allow)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return -1;
+  snes_lobby_set_allow_spectators(allow);
+  return 0;
+}
+
+static int cb_lobby_allow_spectators(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_allow_spectators();
+}
+
+static int cb_lobby_max_spectators(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_max_spectators();
+}
+
+static int cb_lobby_spectator_count(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_spectator_count();
+}
+
+static int cb_local_is_spectator(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_local_is_spectator();
+}
+
+static int cb_spectator_slot(void *ctx, int index)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return -1;
+  return snes_lobby_spectator_slot(index);
 }
 
 static int cb_move_member(void *ctx, int from_slot, int to_slot)
@@ -1201,6 +1262,33 @@ static int cb_fill_launch(void *ctx, RecompLauncherCNetplayLaunch *out)
   out->max_slots = join.max_slots >= 2 ? clamp_lobby_max_slots(join.max_slots)
                                        : clamp_lobby_max_slots(g_lobby_max_slots);
   out->player_count = join.player_count > 0 ? join.player_count : out->max_slots;
+  /* player_count above is the PLAYER count the server sent, and it stays
+   * that: it is what sizes every peer's rollback slot_count, and a spectator
+   * counted in it is a seat the whole match waits on and nobody fills.
+   *
+   * The role rides separately, and the engine reads it to decide whether this
+   * build contributes a row at all. */
+  out->is_spectator = join.local_is_spectator ? 1 : 0;
+  if (out->is_spectator) {
+    /* Fail closed until the engine can run a seat-less session.
+     *
+     * The lobby half of spectating is done -- a spectator joins, is listed,
+     * and the host can move it in and out of play. The engine half is not:
+     * recomp-net's ROLLBACK layer accepts an observer (local_slot ==
+     * slot_count) but its SESSION layer still rejects one, and its ack
+     * heuristic indexes remote_rings off local_slot. Until that seam is
+     * finished, arming a match here would clamp this seat index into a real
+     * player slot and desync everybody -- silently, and in a live match.
+     *
+     * So: refuse the launch and say why. A spectator stays in the lobby
+     * rather than joining as a player nobody asked for. */
+    fprintf(stderr,
+            "netplay: refusing to launch as a spectator - this build's engine "
+            "cannot yet run a seat-less session (lobby seat %d). Ask the host "
+            "to move you into a player slot.\n",
+            join.local_slot);
+    return 0;
+  }
   snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s",
            join.bind_hostport);
   snprintf(out->peer_hostport, sizeof(out->peer_hostport), "%s",
@@ -1638,6 +1726,13 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .lobby_mods_progress_one = cb_lobby_mods_progress_one,
     .mod_xfer_failed = cb_mod_xfer_failed,
     .mod_xfer_cancel = cb_mod_xfer_cancel,
+    .allow_spectators_get = cb_allow_spectators_get,
+    .allow_spectators_set = cb_allow_spectators_set,
+    .lobby_allow_spectators = cb_lobby_allow_spectators,
+    .lobby_max_spectators = cb_lobby_max_spectators,
+    .lobby_spectator_count = cb_lobby_spectator_count,
+    .local_is_spectator = cb_local_is_spectator,
+    .spectator_slot = cb_spectator_slot,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
