@@ -1,7 +1,7 @@
 #ifndef AUDIO_TRACE_H
 #define AUDIO_TRACE_H
 
-/* Always-on audio observability rings.
+/* Audio observability counters and optional forensic history.
  *
  * Captures, continuously from process start (Release/Production too, per
  * the ring-buffer observability discipline):
@@ -25,13 +25,73 @@
 
 #include <stdint.h>
 
+/* History modes:
+ *   0 COUNTERS: no retained PCM/event/snapshot history.
+ *   1 SMALL: reduced retained history for targeted captures.
+ *   2 FULL: historical retained history.
+ *   3 RESERVED: full storage reserved, hot-path history writes disabled.
+ *
+ * Counters remain active in every mode. Production defaults to SMALL after
+ * title A/B acceptance. Trace/co-sim force FULL so forensic captures keep the
+ * historical retention window. Direct non-CMake builds follow the same rule.
+ */
+#ifndef SNESRECOMP_TRACE
+#define SNESRECOMP_TRACE 0
+#endif
+
+#if SNESRECOMP_TRACE || defined(SNES_COSIM)
+#ifdef SNESRECOMP_AUDIO_TRACE_HISTORY
+#undef SNESRECOMP_AUDIO_TRACE_HISTORY
+#endif
+#define SNESRECOMP_AUDIO_TRACE_HISTORY 2
+#elif !defined(SNESRECOMP_AUDIO_TRACE_HISTORY)
+#define SNESRECOMP_AUDIO_TRACE_HISTORY 1
+#endif
+
+#if SNESRECOMP_AUDIO_TRACE_HISTORY < 0 || SNESRECOMP_AUDIO_TRACE_HISTORY > 3
+#error "SNESRECOMP_AUDIO_TRACE_HISTORY must be 0, 1, 2, or 3"
+#endif
+
+#define AUDIO_TRACE_HISTORY_COUNTERS 0
+#define AUDIO_TRACE_HISTORY_SMALL    1
+#define AUDIO_TRACE_HISTORY_FULL     2
+#define AUDIO_TRACE_HISTORY_RESERVED 3
+
+#define AUDIO_TRACE_FULL_EVENT_RING (1u << 19)
+
+#if SNESRECOMP_AUDIO_TRACE_HISTORY == AUDIO_TRACE_HISTORY_SMALL
+/* Production retained-history rings. */
+#define AUDIO_TRACE_PCM_RING   (1u << 16)
+#define AUDIO_TRACE_EVENT_RING (1u << 14)
+#define AUDIO_TRACE_SNAP_RING  (1u << 9)
+#elif SNESRECOMP_AUDIO_TRACE_HISTORY == AUDIO_TRACE_HISTORY_FULL || \
+      SNESRECOMP_AUDIO_TRACE_HISTORY == AUDIO_TRACE_HISTORY_RESERVED
 /* 2^22 native samples ~= 131 s @ 32 kHz (16 MiB, stereo int16). */
 #define AUDIO_TRACE_PCM_RING   (1u << 22)
-/* DSP register writes run a few hundred per frame at most; 2^19 entries
- * (~8 MiB) holds a full multi-minute session without evicting boot. */
-#define AUDIO_TRACE_EVENT_RING (1u << 19)
+/* Large event history for multi-minute trace sessions. */
+#define AUDIO_TRACE_EVENT_RING AUDIO_TRACE_FULL_EVENT_RING
 /* Once-per-second stat snapshots: ~68 min. */
 #define AUDIO_TRACE_SNAP_RING  (1u << 12)
+#else
+#define AUDIO_TRACE_PCM_RING   0u
+#define AUDIO_TRACE_EVENT_RING 0u
+#define AUDIO_TRACE_SNAP_RING  0u
+#endif
+
+#if SNESRECOMP_AUDIO_TRACE_HISTORY == AUDIO_TRACE_HISTORY_SMALL
+/* SMALL intentionally follows its actual retained-history window. */
+#define AUDIO_TRACE_DROP_RUN_EVENT_RING AUDIO_TRACE_EVENT_RING
+#else
+/* COUNTERS and RESERVED do not write retained events, but their counters
+ * emulate FULL's historical drop-run fragmentation boundary. */
+#define AUDIO_TRACE_DROP_RUN_EVENT_RING AUDIO_TRACE_FULL_EVENT_RING
+#endif
+
+#define AUDIO_TRACE_HAS_STORAGE \
+  (SNESRECOMP_AUDIO_TRACE_HISTORY != AUDIO_TRACE_HISTORY_COUNTERS)
+#define AUDIO_TRACE_WRITES_HISTORY \
+  (SNESRECOMP_AUDIO_TRACE_HISTORY == AUDIO_TRACE_HISTORY_SMALL || \
+   SNESRECOMP_AUDIO_TRACE_HISTORY == AUDIO_TRACE_HISTORY_FULL)
 
 enum {
   AUDIO_TRACE_EV_REG     = 1, /* DSP register write: addr, val            */

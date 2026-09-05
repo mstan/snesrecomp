@@ -211,7 +211,7 @@ static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR) {
   sumR = sumR < -0x8000 ? -0x8000 : (sumR > 0x7fff ? 0x7fff : sumR); // clamp 16-bit
   sumL &= ~1;
   sumR &= ~1;
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
   dsp_shadow_verify_echo(dsp->firBufferL, dsp->firBufferR, dsp->firValues,
                          dsp->firBufferIndex, sumL, sumR);
 #endif
@@ -441,7 +441,7 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
     }
     dsp->ram[0x7c] |= 1 << ch; // set ENDx
   }
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
   /* Dev faithful-reference: capture this BRR block's start + the two seed
    * samples before canon decodes, so the reference can re-decode the same block
    * (dsp_shadow_verify_brr below). */
@@ -486,7 +486,7 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
   }
   dsp->channel[ch].older = older;
   dsp->channel[ch].old = old;
-#if defined(SNESRECOMP_TRACE)
+#if SNESRECOMP_DSP_FORENSICS
   dsp_shadow_verify_brr(dsp->apu_ram, _brr_blk, _brr_old, _brr_older,
                         &dsp->channel[ch].decodeBuffer[3]);
 #endif

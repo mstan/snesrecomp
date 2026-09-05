@@ -53,6 +53,15 @@ static int rtl_netplay_locks_audio(void) {
 #endif
 }
 
+static int rtl_fps_heartbeat_enabled(void) {
+  static int s_enabled = -1;
+  if (s_enabled < 0) {
+    const char *env = getenv("SNESRECOMP_FPS");
+    s_enabled = env != NULL;
+  }
+  return s_enabled;
+}
+
 void RtlNetplayAudioReset(void) {
   /* Kept as a stable facade hook for recomp-net hosts. The current runner's
    * audio callback is already consumer-only, so there is no separate
@@ -555,9 +564,10 @@ bool RtlRunFrame(uint32 inputs) {
 
   /* Axis-2 soak instrumentation: env-gated FPS heartbeat to stderr. Counts
    * frames completed per wall-clock second (the frame loop caps at ~60 fps, so
-   * ~60 = full speed; a sustained dip = slowdown). Zero cost when off; never
-   * pauses the runtime (RULE 0). Enable with SNESRECOMP_FPS=1. */
-  if (getenv("SNESRECOMP_FPS")) {
+   * ~60 = full speed; a sustained dip = slowdown). When off, only the cached
+   * branch remains; no clock or output work runs. Enable by setting
+   * SNESRECOMP_FPS. */
+  if (rtl_fps_heartbeat_enabled()) {
     static long s_last_sec = 0;
     static int  s_frames = 0;
     long now = (long)time(NULL);

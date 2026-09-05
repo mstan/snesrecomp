@@ -18,6 +18,18 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef SNESRECOMP_FUNC_SNAPSHOT
+#define SNESRECOMP_FUNC_SNAPSHOT SNESRECOMP_TRACE
+#endif
+
+#ifndef SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
+#define SNESRECOMP_STACK_BALANCE_DIAGNOSTICS SNESRECOMP_TRACE
+#endif
+
+#ifndef SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS
+#define SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS SNESRECOMP_TRACE
+#endif
+
 Snes *g_snes;
 Cpu *g_snes_cpu;
 
@@ -306,15 +318,24 @@ typedef struct {
     int     frame;
     uint8_t wram_slice[RECOMP_SNAP_SLICE_LEN];
 } recomp_snap_entry;
+#if SNESRECOMP_FUNC_SNAPSHOT || SNESRECOMP_TRACE
 recomp_snap_entry g_recomp_snap_ring[RECOMP_SNAP_RING_LEN];
+#else
+recomp_snap_entry g_recomp_snap_ring[1];
+#endif
 
 /* Lookup an entry by absolute call index. Returns NULL if the index
  * is out of the ring's current window. */
 const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
+#if SNESRECOMP_FUNC_SNAPSHOT
     if (call_idx < 1) return NULL;
     int slot = (call_idx - 1) % RECOMP_SNAP_RING_LEN;
     if (g_recomp_snap_ring[slot].call_idx != call_idx) return NULL;
     return &g_recomp_snap_ring[slot];
+#else
+    (void)call_idx;
+    return NULL;
+#endif
 }
 
 /* Write-log scope: arm the shared write ring around the selected AOT body.
@@ -437,7 +458,9 @@ void RecompStackPush(const char *name) {
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH) {
     int slot = g_recomp_stack_top++;
     g_recomp_stack[slot] = name;
-    if (g_wlog_aot_slot < 0 && wlog_func_matches(name)) {
+    if (g_wlog_aot_slot < 0 && g_wlog_configured != 0 &&
+        wlog_scope_available() &&
+        wlog_func_matches(name)) {
       g_wlog_aot_slot = slot;
       wlog_scope_enter(name);
     }
@@ -465,6 +488,7 @@ void RecompStackPush(const char *name) {
   // continues afterward — no longjmp. Compare the snapshot at
   // matching points across recomp + oracle for sub-frame-precise
   // state diff regardless of NMI ordering.
+#if SNESRECOMP_FUNC_SNAPSHOT
   if (g_recomp_snap_on_func) {
     extern int snes_frame_counter;
     int match;
@@ -484,6 +508,7 @@ void RecompStackPush(const char *name) {
       memcpy(g_recomp_snap_ring[slot].wram_slice, g_ram, RECOMP_SNAP_SLICE_LEN);
     }
   }
+#endif
 }
 
 void RecompStackDump(void) {
@@ -500,8 +525,8 @@ void RecompStackDump(void) {
  * PHP/PHA/PHX/PHY prologue whose matching pulls are skipped by a mis-routed
  * early exit). We accumulate net delta per function name (pointer-keyed —
  * the generated code passes interned string literals) so a per-frame leaker
- * stands out by sheer magnitude. Always on; dumped by the watchdog/crash
- * path and the post-mortem report. */
+ * stands out by sheer magnitude. Optional in production; dumped by the
+ * watchdog/crash path and the post-mortem report when enabled. */
 #define STACKBAL_MAX 2048
 typedef struct {
   const char *name;
@@ -510,6 +535,7 @@ typedef struct {
   long        nonzero;      /* # returns with a nonzero delta */
   int         last_delta;
 } StackBalEntry;
+#if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
 static StackBalEntry g_stackbal[STACKBAL_MAX];
 
 static StackBalEntry *stackbal_find(const char *name) {
@@ -521,9 +547,11 @@ static StackBalEntry *stackbal_find(const char *name) {
   }
   return NULL; /* table full — drop */
 }
+#endif
 
 /* Comparator helper: collect non-zero-delta entries into `out`, return count. */
 static int stackbal_collect(StackBalEntry **out, int cap) {
+#if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
   int n = 0;
   for (int i = 0; i < STACKBAL_MAX && n < cap; i++)
     if (g_stackbal[i].name && g_stackbal[i].total_delta != 0)
@@ -536,23 +564,34 @@ static int stackbal_collect(StackBalEntry **out, int cap) {
     StackBalEntry *t = out[a]; out[a] = out[best]; out[best] = t;
   }
   return n;
+#else
+  (void)out;
+  (void)cap;
+  return 0;
+#endif
 }
 
 void RecompStackBalDumpStderr(int topn) {
   StackBalEntry *top[64];
   if (topn > 64) topn = 64;
   int n = stackbal_collect(top, topn);
+#if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
   fprintf(stderr, "=== stack-balance auditor: top %d net-imbalanced funcs ===\n", n);
   for (int i = 0; i < n; i++)
     fprintf(stderr, "  %+lld bytes net over %ld calls (%ld nonzero, last %+d): %s\n",
             top[i]->total_delta, top[i]->calls, top[i]->nonzero,
             top[i]->last_delta, top[i]->name ? top[i]->name : "?");
+#else
+  (void)n;
+  fprintf(stderr, "=== stack-balance auditor: disabled ===\n");
+#endif
   fflush(stderr);
 }
 
 void RecompStackBalDumpJson(FILE *f) {
   StackBalEntry *top[64];
   int n = stackbal_collect(top, 40);
+#if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
   fprintf(f, "  \"stack_balance\": [");
   for (int i = 0; i < n; i++)
     fprintf(f, "%s{\"name\":\"%s\",\"total_delta\":%lld,\"calls\":%ld,"
@@ -560,6 +599,11 @@ void RecompStackBalDumpJson(FILE *f) {
             (i ? "," : ""), top[i]->name ? top[i]->name : "?",
             top[i]->total_delta, top[i]->calls, top[i]->nonzero, top[i]->last_delta);
   fprintf(f, "],\n");
+#else
+  (void)n;
+  fprintf(f, "  \"stack_balance\": [],\n");
+  fprintf(f, "  \"stack_balance_disabled\": true,\n");
+#endif
 }
 
 void RecompStackPop(void) {
@@ -578,6 +622,7 @@ void RecompStackPop(void) {
   // empty stack: the auditor must NOT consume an entry_seq it didn't push.
   if (g_recomp_stack_top > 0) {
     const char *fn = g_recomp_stack[g_recomp_stack_top - 1];
+#if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
     int slot = g_recomp_stack_top - 1;
     int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
                 (int)g_cpu_entry_return_frame[slot];
@@ -586,6 +631,9 @@ void RecompStackPop(void) {
       e->calls++;
       if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
     }
+#else
+    (void)fn;
+#endif
     boundary_audit_record_exit(g_recomp_stack[g_recomp_stack_top - 1]);
     if (g_wlog_aot_slot == g_recomp_stack_top - 1) {
       wlog_scope_exit();
@@ -669,6 +717,7 @@ void WatchdogCheck(void) {
    * Tunable via SNESRECOMP_BOOT_WATCHDOG_SECS (default: first sample at
    * 8 s, then every 3 s). Shared across every game's bring-up. */
   if (snes_frame_counter == 0) {
+#if SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS
     static long    boot_calls = 0;
     static clock_t boot_first = 0, boot_last_print = 0;
     static double  boot_first_secs = -1.0;
@@ -693,6 +742,7 @@ void WatchdogCheck(void) {
         fprintf(stderr, "    [%d] %s\n", n, g_recomp_stack[i]);
       fflush(stderr);
     }
+#endif
     return;
   }
   if (!g_watchdog_enabled) return;
@@ -770,4 +820,3 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   g_sram_size = g_snes->cart->ramSize;
   return g_snes;
 }
-

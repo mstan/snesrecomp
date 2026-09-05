@@ -459,6 +459,8 @@ extern CpuState g_cpu;
  * arm/disarm around a function scope (AOT body via RecompStackPush/Pop,
  * interp via interp_tier_dispatch_balanced). See cpu_state.c. */
 extern int g_wlog_active;
+extern int g_wlog_configured;
+int wlog_scope_available(void);
 void wlog_scope_enter(const char *tag);
 void wlog_scope_exit(void);
 
