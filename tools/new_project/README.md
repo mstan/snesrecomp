@@ -58,7 +58,8 @@ create` (no push) → generate/build → one push. Pushing earlier leaves a seco
 ├── VERSION                 release pin used for lobby version matching
 ├── framework_pins.txt      exact framework SHAs this project was cut against
 ├── recomp/                 bank*.cfg, symbols.toml — analysis input you own
-├── rom_identity.txt        ROM digests — the one place a revision changes
+├── rom_identity.txt        ROM digests + game_id — the one place a revision changes
+├── mods/preloaded/         mod catalog (staged beside the exe; empty to start)
 ├── src/                    main.c, game_rtl.c, host_contract.c
 │   └── gen/                generated C (gitignored — never committed)
 ├── tools/regen.sh          ROM → C, with digest verification

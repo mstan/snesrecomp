@@ -55,9 +55,11 @@ ROM_FILE="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get rom_file)"
 ROM_SHA256="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get expected_sha256)"
 ROM_CRC32="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get expected_crc32)"
 
-# Add --runtime-dir <name> for every directory the game loads exe-relative
-# (mods, translations, ...) once CMake stages one beside the executable.
+# mods/ is the catalog the build stages beside the executable, and the package
+# a netplay host transfers to a guest. Add --runtime-dir <name> for any other
+# directory the game loads exe-relative (translations, ...).
 exec bash "$IMPL" \
+  --runtime-dir mods \
   --build-dir "$BUILD_DIR" \
   --artifact "$PLATFORM" \
   --exe-name @PROJECT_NAME@ \

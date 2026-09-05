@@ -110,7 +110,7 @@ def test_scaffold_writes_the_expected_layout():
             "recomp/bank00.cfg", "recomp/symbols.toml", "recomp/README.md",
             "src/main.c", "src/game_rtl.c", "src/game_rtl.h",
             "src/host_contract.c", "src/variables.h", "src/gen_stubs.c",
-            "rom_identity.txt",
+            "rom_identity.txt", "mods/preloaded/README.md",
             "tools/regen.sh", "scripts/package_release.sh",
         ]
         missing = [name for name in expected if not (project / name).is_file()]
@@ -518,3 +518,63 @@ def test_the_interactive_flow_asks_and_listens():
         cmake = (project / "CMakeLists.txt").read_text(encoding="utf-8")
         assert "Seats: 3" in cmake and "port2" in cmake, cmake
         assert not (project / "launcher_assets" / "img" / "boxart.tga").exists()
+
+
+def test_mods_are_built_into_every_project():
+    """Mod support is not a scaffold option. A build without it cannot send
+    or receive mods (the lobby says so on every init), so the loader, the
+    launcher's Mods page, the staged catalog, the runtime wiring in main.c,
+    the packaged mods/ directory and the netplay gate all come standard."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        project = _scaffold(tmp, "--rollback")
+
+        cmake = (project / "CMakeLists.txt").read_text(encoding="utf-8")
+        assert "set(SNESRECOMP_ENABLE_MODS ON" in cmake, "loader not enabled"
+        assert cmake.index("SNESRECOMP_ENABLE_MODS ON") < cmake.index(
+            "runner/runner.cmake)"), "must be set before runner.cmake reads it"
+        assert "snesrecomp_target_stage_dir(FixtureQuestSNESRecomp " \
+               "${CMAKE_SOURCE_DIR}/mods mods)" in cmake, "catalog not staged"
+        assert cmake.count("snesrecomp_codegen_host.c") == 1, \
+            "codegen host wired more than once"
+
+        main_c = (project / "src" / "main.c").read_text(encoding="utf-8")
+        for call in ("snes_mod_runtime_initialize_c", "snes_mod_runtime_commit_c",
+                     "snes_mod_runtime_activate_plugins_c",
+                     "snes_mod_runtime_launcher_provider_c",
+                     "snes_netplay_rb_set_modset"):
+            assert call in main_c, f"main.c does not call {call}"
+        assert "SNESRECOMP_ROM_GAME_ID" in main_c, "game id not compiled in"
+
+        identity = (project / "rom_identity.txt").read_text(encoding="utf-8")
+        assert "game_id         = fixturequest-usa" in identity, identity
+
+        assert (project / "mods" / "preloaded" / "packages" / ".gitkeep").is_file()
+        readme = (project / "mods" / "preloaded" / "README.md").read_text(
+            encoding="utf-8")
+        assert 'game_id = "fixturequest-usa"' in readme
+
+        package = (project / "scripts" / "package_release.sh").read_text(
+            encoding="utf-8")
+        assert "--runtime-dir mods" in package, "release zip would omit mods/"
+
+
+def test_recomp_ui_ref_is_declared_by_the_framework():
+    """The framework's lobby client compiles against recomp-ui's header, so
+    the framework -- not the scaffolder -- says which recomp-ui ref a new
+    project pins. Hard-coding "master" here produced netplay projects that
+    could not compile snes_host_lobby.c."""
+    declared = (REPO_ROOT / "tools" / "new_project" / "RECOMP_UI_REF").read_text(
+        encoding="utf-8").strip()
+    assert declared, "tools/new_project/RECOMP_UI_REF is empty"
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = pathlib.Path(directory)
+        rom = tmp / "fixture.sfc"
+        _fixture_rom(rom)
+        result = subprocess.run(
+            ["sh", str(SETUP), "--rom", str(rom), "--dir", str(tmp),
+             "--name", "Fixture Quest", "--yes", "--no-submodules"],
+            cwd=REPO_ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0, result.stdout
+        assert f"recomp-ui:  {declared}" in result.stdout, result.stdout

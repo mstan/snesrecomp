@@ -25,6 +25,11 @@
 #   --github-owner <org>  Default: TechnicallyComputers
 #   --github-repo <name>  Default: the project name
 #
+# Always on (no flag): mod packages. Every project builds the loader, the
+#   launcher's Mods page and the netplay mod-set gate, and ships an (initially
+#   empty) mods/preloaded catalog. A build without them cannot exchange mods
+#   with a peer, so it is not something a title gets to skip.
+#
 # Toggles (each has a --no- form):
 #   --netplay / --no-netplay        recomp-net delay-sync (default: off)
 #   --rollback / --no-rollback      retcomm-rbengine rollback (implies netplay)
@@ -47,7 +52,11 @@
 #
 # Framework refs:
 #   --snesrecomp-ref <ref>    default: main
-#   --recomp-ui-ref <ref>     default: master (unused with --no-recomp-ui)
+#   --recomp-ui-ref <ref>     default: the branch this framework checkout
+#                             declares in tools/new_project/RECOMP_UI_REF --
+#                             its lobby client compiles against recomp-ui's
+#                             API, so the framework, not this script, says
+#                             which recomp-ui it needs
 #   --recomp-net-ref <ref>    override the nested pin inside snesrecomp
 #   --rbengine-ref <ref>      override the nested pin inside snesrecomp
 #   --snesrecomp-url / --recomp-ui-url
@@ -128,7 +137,15 @@ DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
 # branch.
 SNESRECOMP_REF=$(git -C "$FRAMEWORK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 [ -n "$SNESRECOMP_REF" ] || SNESRECOMP_REF="main"
-RECOMP_UI_REF="master"; RECOMP_NET_REF=""; RBENGINE_REF=""
+# recomp-ui is not a submodule of the framework, but the framework's lobby
+# client is compiled against its header, so the framework declares the ref
+# it needs (tools/new_project/RECOMP_UI_REF) and a pin bump is one edit there.
+# "master" was hard-coded here once, and every netplay project cut with the
+# default failed to compile snes_host_lobby.c against a recomp-ui that had
+# never heard of the lobby mod-transfer callbacks.
+RECOMP_UI_REF=$(sed -n '1{s/[[:space:]]*$//;p}' "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || true)
+[ -n "$RECOMP_UI_REF" ] || RECOMP_UI_REF="master"
+RECOMP_NET_REF=""; RBENGINE_REF=""
 # The framework URL comes from the checkout this script is running out of, so
 # it cannot drift from where snesrecomp actually lives. (It was hard-coded to
 # the wrong org once; deriving it removes the class.)
@@ -321,6 +338,9 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     [ -n "$REGION_OVERRIDE" ] || prompt_line "Region" REGION_OVERRIDE "$REGION"
 fi
 [ -z "$REGION_OVERRIDE" ] || REGION="$REGION_OVERRIDE"
+# The id a mod package's [[target]] names (MOD_PACKAGES.md), e.g. gwed-jp.
+# Derived once, recorded in rom_identity.txt, compiled in from there.
+GAME_ID="$ROM_SLUG-$(printf '%s' "$REGION" | tr 'A-Z' 'a-z')"
 
 if [ "$SET_RECOMP_UI" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
     prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 1
@@ -481,7 +501,12 @@ echo "  rom:        $ROM_FILE ($ROM_MAPPING, $REGION, crc32 $ROM_CRC32)"
 echo "  zip prefix: $ZIP_PREFIX"
 echo "  players:    $PLAYERS (multitap: $MULTITAP)"
 echo "  netplay:    $ENABLE_NETPLAY (rollback: $ENABLE_ROLLBACK)"
-echo "  recomp-ui:  $ENABLE_RECOMP_UI (boxart: $FETCH_BOXART)"
+if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    echo "  recomp-ui:  $RECOMP_UI_REF (boxart: $FETCH_BOXART)"
+else
+    echo "  recomp-ui:  no (text-mode host)"
+fi
+echo "  mods:       on (always: loader, Mods page, netplay mod-set gate)"
 echo "  CI:         $ENABLE_CI"
 echo "  generate:   $DO_GENERATE (build: $DO_BUILD)"
 if [ "$CREATE_GITHUB" -eq 1 ]; then
@@ -567,7 +592,8 @@ cleanup_partial() {
 trap cleanup_partial EXIT
 
 cd "$ROOT"
-mkdir -p recomp src src/gen tools scripts assets .github/workflows
+mkdir -p recomp src src/gen tools scripts assets .github/workflows \
+         mods/preloaded/packages
 git init -q -b "$DEFAULT_BRANCH" .
 
 fill() {
@@ -583,6 +609,7 @@ fill() {
         --set "ROM_SHA256=$ROM_SHA256" \
         --set "REGION=$REGION" \
         --set "REGION_NAME=$REGION_NAME" \
+        --set "GAME_ID=$GAME_ID" \
         --set "COPROCESSOR=$COPROCESSOR" \
         --set "ZIP_PREFIX=$ZIP_PREFIX" \
         --set "PLAYERS=$PLAYERS" \
@@ -613,6 +640,31 @@ fill regen.sh.in         tools/regen.sh
 fill package_release.sh.in scripts/package_release.sh
 fill symbols_readme.md.in  recomp/README.md
 chmod +x tools/regen.sh scripts/package_release.sh
+
+# Empty mod catalog. The build stages mods/ beside the executable on every
+# build of it, and the runtime initializes from mods/preloaded there; an empty
+# catalog is a valid one (the Mods page just lists nothing).
+cat > mods/preloaded/README.md <<EOF
+# Preloaded mods
+
+Ship reviewed, default-disabled packages here:
+
+\`\`\`text
+packages/<package-id>/<version>/
+  manifest.toml
+  ...
+\`\`\`
+
+A manifest's \`[[target]]\` names this title as \`game_id = "$GAME_ID"\` with the
+ROM's SHA-256 (both live in \`rom_identity.txt\`). The build copies \`mods/\`
+beside the executable on every build; nothing placed there by hand survives.
+Players install \`.snesmod\` archives through the launcher's Mods page, which
+the runtime keeps under its own state beside the executable.
+
+See \`snesrecomp/docs/MOD_PACKAGES.md\` for the manifest format and the
+trusted-plugin registration a package can activate.
+EOF
+: > mods/preloaded/packages/.gitkeep
 : > src/gen/.gitkeep
 
 echo "== Seeding analysis config =="
@@ -719,6 +771,15 @@ if [ "$DO_GENERATE" -eq 1 ] &&
 fi
 if [ "$ENABLE_NETPLAY" -eq 1 ] && [ ! -f snesrecomp/lib/recomp-net/CMakeLists.txt ]; then
     note_gap "netplay: snesrecomp/lib/recomp-net is missing"
+fi
+# The lobby client (runner/src/netplay/snes_host_lobby.c) fills recomp-ui's
+# netplay callback table, mod-transfer entries included, whether or not this
+# project enables netplay -- so the recomp-ui ref must carry that API. Check
+# the header now instead of letting the first build fail on a struct member.
+if [ "$ENABLE_NETPLAY" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ] &&
+   [ -f recomp-ui/src/recomp_launcher.h ] &&
+   ! grep -q 'lobby_mods_can_download' recomp-ui/src/recomp_launcher.h; then
+    note_gap "netplay: recomp-ui ref '$RECOMP_UI_REF' lacks the lobby mod-transfer API the framework's lobby client needs (try --recomp-ui-ref $(cat "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || echo merge/frameblend-localization))"
 fi
 if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
     if [ ! -f snesrecomp/lib/retcomm-rbengine/CMakeLists.txt ]; then

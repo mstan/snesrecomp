@@ -15,3 +15,6 @@ expected_crc32  = @ROM_CRC32@
 expected_sha256 = @ROM_SHA256@
 mapping         = @ROM_MAPPING@
 region          = @REGION@
+# What a mod package's [[target]] game_id must name to apply to this title
+# (snesrecomp/docs/MOD_PACKAGES.md). Stable across revisions on purpose.
+game_id         = @GAME_ID@

@@ -27,6 +27,13 @@ if(NOT EXISTS "${SNESRECOMP_ROOT}/runner/runner.cmake")
         "snesrecomp submodule missing at ${SNESRECOMP_ROOT}.\n"
         "Run: git submodule update --init --recursive")
 endif()
+# Mod packages are part of every project, not an option. The launcher's Mods
+# page, the .snesmod loader, the trusted-plugin registry and netplay's mod-set
+# gate all hang off this one switch; a build without it cannot exchange mods
+# with a peer that has them, and the framework says so at every lobby init.
+# Must precede the include: runner.cmake reads it to add the loader sources.
+set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
+    "Mod package loader + trusted plugins (required for every title)" FORCE)
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 add_executable(@PROJECT_NAME@
@@ -53,12 +60,14 @@ snesrecomp_rom_identity(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/rom_identity.txt)
 # still a hard error (the framework owns the message).
 snesrecomp_target_generated_code(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/src/gen)
 
-# Anything the game reads relative to its executable (a mods/ catalog, a
-# translations/ table) is staged with snesrecomp_target_stage_dir(), which
-# runs whenever the executable is built -- including the launcher's own
-# Generate & rebuild on a player's machine. Do NOT use a separate ALL target
-# for this: `cmake --build --target @PROJECT_NAME@` skips it.
-#   snesrecomp_target_stage_dir(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/mods mods)
+# The mod catalog ships beside the executable on every build OF THE
+# EXECUTABLE -- including the launcher's own Generate & rebuild on a player's
+# machine, which builds only this target and would skip a sibling ALL target.
+# mods/preloaded/packages/ holds reviewed, default-disabled packages; players
+# install .snesmod archives through the launcher. snesrecomp/docs/MOD_PACKAGES.md.
+snesrecomp_target_stage_dir(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/mods mods)
+# Any other directory the game reads exe-relative (a translations/ table, ...)
+# is staged the same way, never with a separate ALL target.
 
 target_include_directories(@PROJECT_NAME@ PRIVATE
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
