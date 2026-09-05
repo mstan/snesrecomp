@@ -104,6 +104,12 @@ static int bridge_is_apu_port(uint32_t adr) {
     uint8_t bank = (uint8_t)((adr >> 16) & 0xFF);
     return bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF);
 }
+static int bridge_apu_port_diag_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("SNESRECOMP_APU_PORT_DIAG") != NULL;
+    return enabled;
+}
 
 /* ── memory bus shim ───────────────────────────────────────────────────────
  * The interpreter's `mem` is the CpuState*; route every access through the
@@ -176,12 +182,13 @@ static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
     bridge_timing_bus(adr);
     g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && bridge_is_apu_port(adr)) {
+    const int is_apu_port = bridge_is_apu_port(adr);
+    if (is_apu_port && bridge_apu_port_diag_enabled()) {
         static unsigned reports;
         if(reports++<256) fprintf(stderr,"[apu_port] write $%04X=%02X master=%llu\n",
           (unsigned)(uint16_t)adr,val,(unsigned long long)cpu->master_cycles);
     }
-    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
+    if (is_apu_port) bridge_apu_flush(cpu);
     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
 }
 
@@ -213,9 +220,10 @@ static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
     if (bridge_continuous_read(adrl) || bridge_continuous_read(adrh))
         s_interp_continuous_read_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    const int is_apu_port = bridge_is_apu_port(adrl);
+    if (is_apu_port) bridge_apu_flush(cpu);
     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && (uint16_t)adrl == 0x2140) {
+    if ((uint16_t)adrl == 0x2140 && bridge_apu_port_diag_enabled()) {
         static uint16_t last=0xffff; static unsigned reports;
         if (*out!=last && reports++<256) {
             fprintf(stderr,"[apu_port] read $2140=%04X pc-master=%llu pending=%llu\n",
@@ -244,15 +252,27 @@ static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
     bridge_timing_bus(adrh);
     g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && bridge_is_apu_port(adrl)) {
+    const int is_apu_port = bridge_is_apu_port(adrl);
+    if (is_apu_port && bridge_apu_port_diag_enabled()) {
         static unsigned reports;
         if(reports++<256) fprintf(stderr,"[apu_port] writew $%04X=%04X master=%llu\n",
           (unsigned)(uint16_t)adrl,val,(unsigned long long)cpu->master_cycles);
     }
-    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    if (is_apu_port) bridge_apu_flush(cpu);
     cpu_write16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF), val);
     return true;
 }
+
+#ifdef SNESRECOMP_APU_PORT_DIAG_TEST
+void interp_bridge_test_apu_port_diag_probe(CpuState *cpu, int apu_port) {
+    uint16_t value;
+    const uint32_t lo = apu_port ? 0x002140u : 0x002100u;
+    s_apu_pending_master = 1364;
+    bridge_bus_write(cpu, lo, 0x12);
+    (void)bridge_bus_read_word(cpu, lo, lo + 1, &value);
+    (void)bridge_bus_write_word(cpu, lo, lo + 1, 0x3456, false);
+}
+#endif
 
 /* ── register/flag sync ────────────────────────────────────────────────────
  * interp816 carries flags as discrete bools + an `e` (emulation) bit; CpuState
