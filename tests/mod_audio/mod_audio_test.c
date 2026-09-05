@@ -74,7 +74,9 @@ static void test_stop_and_unregister(void) {
     SNESModAudioClip clip = snes_mod_audio_register_pcm_s16(
         pcm, 2, 32040, SNES_MOD_AUDIO_CHANNELS_MONO);
     assert(clip && snes_mod_audio_play(clip, 100));
+    uint32_t generation = snes_mod_audio_reset_generation();
     snes_mod_audio_stop_all();
+    assert(snes_mod_audio_reset_generation() == generation + 1u);
     int16_t out[2] = {};
     snes_mod_audio_mix(out, 1, 32040, 2);
     assert(out[0] == 0 && out[1] == 0);

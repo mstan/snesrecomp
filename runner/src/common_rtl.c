@@ -50,6 +50,29 @@ uint8 g_snesrecomp_last_hdmaen;
  * runtime) so a title can register one from plain C. */
 static RtlApuPortObserver s_apu_port_observers[RTL_APU_PORT_OBSERVER_MAX];
 static int s_apu_port_observer_count;
+static RtlApuPortReadObserver s_apu_read_observers[RTL_APU_PORT_OBSERVER_MAX];
+static int s_apu_read_observer_count;
+
+int RtlAddApuPortReadObserver(RtlApuPortReadObserver observer) {
+  if (!observer) return 0;
+  for (int i = 0; i < s_apu_read_observer_count; i++)
+    if (s_apu_read_observers[i] == observer) return 1;
+  if (s_apu_read_observer_count >= RTL_APU_PORT_OBSERVER_MAX) return 0;
+  s_apu_read_observers[s_apu_read_observer_count++] = observer;
+  return 1;
+}
+void RtlRemoveApuPortReadObserver(RtlApuPortReadObserver observer) {
+  for (int i = 0; i < s_apu_read_observer_count; i++) if (s_apu_read_observers[i] == observer) {
+    memmove(s_apu_read_observers+i, s_apu_read_observers+i+1,
+            (s_apu_read_observer_count-i-1)*sizeof(*s_apu_read_observers));
+    s_apu_read_observers[--s_apu_read_observer_count] = NULL; return;
+  }
+}
+uint8 rtl_apu_port_observers_read(uint16 reg, uint8 value) {
+  for (int i = 0; i < s_apu_read_observer_count; i++)
+    if (s_apu_read_observers[i](reg, &value)) break;
+  return value;
+}
 
 int RtlAddApuPortObserver(RtlApuPortObserver observer) {
   if (!observer) return 0;
@@ -63,8 +86,8 @@ int RtlAddApuPortObserver(RtlApuPortObserver observer) {
 void RtlRemoveApuPortObserver(RtlApuPortObserver observer) {
   for (int i = 0; i < s_apu_port_observer_count; i++) {
     if (s_apu_port_observers[i] == observer) {
-      s_apu_port_observers[i] =
-          s_apu_port_observers[s_apu_port_observer_count - 1];
+      memmove(s_apu_port_observers + i, s_apu_port_observers + i + 1,
+              (s_apu_port_observer_count - i - 1) * sizeof(*s_apu_port_observers));
       s_apu_port_observers[--s_apu_port_observer_count] = NULL;
       return;
     }
@@ -873,10 +896,6 @@ void WriteReg(uint16 reg, uint8 value) {
       return;
     }
 #endif
-    if (rtl_apu_port_observers_filter(reg, value)) {
-      debug_server_on_reg_write(reg, value);
-      return;
-    }
     RtlApuWrite(reg, value);
   } else if (reg >= 0x2180 && reg < 0x2184) {
     snes_writeBBus(g_snes, reg & 0xff, value);
@@ -959,6 +978,8 @@ uint16 ReadRegWord(uint16 reg) {
     uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
     uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
     RtlApuUnlock();
+    lo = rtl_apu_port_observers_read(reg, lo);
+    hi = rtl_apu_port_observers_read(reg + 1, hi);
     g_cpu.open_bus = hi;
     return (uint16_t)lo | ((uint16_t)hi << 8);
   }
@@ -1143,7 +1164,8 @@ void rtl_accumulate_apu_catchup(void) {
 }
 
 void RtlApuWrite(uint16 adr, uint8 val) {
-  assert(adr >= APUI00 && adr <= APUI03);
+  assert(adr >= 0x2140 && adr <= 0x217f);
+  if (rtl_apu_port_observers_filter(adr, val)) return;
   uint8_t port = (uint8_t)(adr & 3);
 
 #ifdef SNES_COSIM

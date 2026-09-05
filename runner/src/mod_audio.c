@@ -38,6 +38,7 @@ static Voice s_voices[SNES_MOD_AUDIO_MAX_VOICES];
 static unsigned s_replace_cursor;
 static size_t s_clip_bytes;
 static uint32_t s_voice_generation;
+static uint32_t s_reset_generation;
 static ClipSlot *clip_slot(SNESModAudioClip clip);
 
 /* Handle = (generation << 4) | slot + 1, generation masked so the int handle
@@ -238,7 +239,13 @@ int snes_mod_audio_voice_active(SNESModAudioVoice voice) {
 void snes_mod_audio_stop_all(void) {
     RtlApuLock();
     stop_all_locked();
+    s_reset_generation++;
     RtlApuUnlock();
+}
+uint32_t snes_mod_audio_reset_generation(void) {
+    /* Queried on the guest thread, including from a port-read observer while
+     * the APU lock is already held. stop_all also runs on the guest thread. */
+    return s_reset_generation;
 }
 
 static int32_t interpolated_sample(const ClipSlot *slot, uint32_t frame,

@@ -309,6 +309,12 @@ typedef int (*RtlApuPortObserver)(uint16 reg, uint8 value);
 int RtlAddApuPortObserver(RtlApuPortObserver observer);
 void RtlRemoveApuPortObserver(RtlApuPortObserver observer);
 int rtl_apu_port_observers_filter(uint16 reg, uint8 value);
+/* Optional host acknowledgement of consumed requests. The original SPC value
+ * is provided after time synchronization; return nonzero after replacing it. */
+typedef int (*RtlApuPortReadObserver)(uint16 reg, uint8 *value);
+int RtlAddApuPortReadObserver(RtlApuPortReadObserver observer);
+void RtlRemoveApuPortReadObserver(RtlApuPortReadObserver observer);
+uint8 rtl_apu_port_observers_read(uint16 reg, uint8 value);
 
 
 enum {

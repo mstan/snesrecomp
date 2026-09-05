@@ -63,6 +63,9 @@ int snes_mod_audio_voice_active(SNESModAudioVoice voice);
 /* Stop every voice while retaining registrations. Call on reset and after a
  * successful save-state load because host delivery state is not serialized. */
 void snes_mod_audio_stop_all(void);
+/* Changes on stop_all (reset/load). Host cue ledgers can discard stale
+ * acknowledgements and loop intent without serializing presentation state. */
+uint32_t snes_mod_audio_reset_generation(void);
 
 /* Saturating-mix active one-shots into interleaved mono/stereo destination
  * PCM. output_rate is the actual device rate for this callback. The host calls
