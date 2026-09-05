@@ -34,6 +34,7 @@ TEST_MODULES = [
     'test_run_benchmark_pairs',
     'test_new_project',
     'test_rom_identity',
+    'test_generate_ci',
 ]
 
 

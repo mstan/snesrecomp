@@ -50,6 +50,29 @@ same publish order for the same reason: scaffold + CI → commit → `gh repo
 create` (no push) → generate/build → one push. Pushing earlier leaves a second
 "initial" commit that collides when the script is re-run.
 
+## Existing projects: the release workflow on its own
+
+A project that predates the scaffolder, or was cut before the CI template
+gained a step, gets the same workflow from `tools/generate_ci`:
+
+```sh
+sh snesrecomp/tools/generate_ci.sh            # in the project; --check, --force, --dry-run
+```
+
+```powershell
+powershell -File snesrecomp\tools\generate_ci.ps1
+```
+
+It fills `templates/release.yml.in` with values read from the project --
+`project()` in CMakeLists.txt, `display_name` from `rom_identity.txt` (or the
+old `codegen_setup.c`), the zip prefix from `scripts/package_release.sh` --
+using the template from the project's own snesrecomp submodule, so the
+workflow matches the framework it pins. An installed workflow is compared by
+step name: `--check` exits 1 when it is missing or stale, and only `--force`
+overwrites one. It warns about anything the run will reach for and the
+project lacks (`VERSION`, `framework_pins.txt`, `rom_identity.txt`, the
+packager).
+
 ## What it produces
 
 ```text
