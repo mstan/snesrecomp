@@ -231,6 +231,15 @@ typedef struct SnesLobbyJoinInfo {
      * The relay forwards nothing from a slot at or beyond its player count, so
      * this is the number that makes a spectator unable to send. */
     int      spectator_relay_base;
+    /* This match's transport, as the LAUNCH stated it: 1 = the lobby server
+     * allocated its UDP input relay and everyone dials it, 0 = peer-to-peer.
+     *
+     * Deliberately not read back out of match_caps at start time. The caps
+     * copy of this flag is also written by the HOST's published caps, where it
+     * means the host's UI toggle, so an unrelated republish landing between
+     * the launch and the start silently reverted a relayed match to p2p. It is
+     * recorded here, once per launch, by the only message that knows. */
+    int      force_input_relay;
     char     last_error[64]; /* need_password | bad_password | … */
 } SnesLobbyJoinInfo;
 

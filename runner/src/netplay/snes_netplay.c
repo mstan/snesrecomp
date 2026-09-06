@@ -712,6 +712,27 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     if (use_ice < 0)
         return -4;
 
+    /* A spectator has no route over ICE, and must say so rather than show it.
+     *
+     * The session owns exactly one ICE agent, and in a p2p match both players
+     * spend theirs on each other. A third participant therefore negotiates
+     * with nobody: it stalls the full 5s host/STUN timeout, tries a TURN
+     * fallback against no peer, and renders a black window the whole time --
+     * a failure that looks, to the person watching it, like the game is
+     * broken. Only the lobby server's UDP input relay carries a third
+     * participant, so without one there is nothing to spectate over.
+     *
+     * Refusing here is the same rule as the missing-relay-slot check above:
+     * abort rather than silently degrade. The players are unaffected. */
+    if (cfg->spectator && use_ice) {
+        fprintf(stderr,
+                "snes_netplay: spectating needs the lobby server's UDP input "
+                "relay, but this match was launched peer-to-peer (no "
+                "relay_endpoint) — refusing to start rather than showing a "
+                "black screen\n");
+        return -5;
+    }
+
     memset(&host, 0, sizeof(host));
     host.sample_local = host_sample_local;
     host.publish = host_publish;
