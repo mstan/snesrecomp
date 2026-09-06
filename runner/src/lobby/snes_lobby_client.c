@@ -1415,16 +1415,27 @@ static void handle_server_json(const char *json)
     json_get_str(json, "op", op, sizeof(op));
     if (strcmp(op, "welcome") == 0) {
         json_get_str(json, "player_id", g_lc.player_id, sizeof(g_lc.player_id));
-        if (g_lc.display_name[0]) {
-            char msg[256];
+        {
+            /* Say who we are AND what we are playing in the first message:
+             * the server scopes players-online and server chat by title, and
+             * waiting for a `list` to tell it left a client that chatted
+             * first with no title at all. Title only -- never the version. */
+            char msg[512];
             char name_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
+            char gn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
             /* A name with a quote in it builds malformed JSON, which the
-             * server drops whole -- so the rename simply never happens. */
+             * server drops whole -- so the rename simply never happens. The
+             * title needs the same treatment for the same reason. */
             json_escape(g_lc.display_name, name_esc, sizeof(name_esc));
-            snprintf(msg, sizeof(msg), "{\"op\":\"hello\",\"display_name\":\"%s\"}", name_esc);
+            json_escape(g_lc.filter_game_name, gn_esc, sizeof(gn_esc));
+            snprintf(msg, sizeof(msg),
+                     "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
+                     name_esc, gn_esc);
             queue_send(msg);
         }
-        queue_send("{\"op\":\"list\"}");
+        /* The bare list this used to send told the server nothing about the
+         * title, so the whole per-game scope stayed empty for this client. */
+        queue_list_request();
         /* Prefetch Coturn creds for ICE (no-op reply if server lacks COTURN_*). */
         (void)queue_turn_credentials_request();
         return;
@@ -2532,12 +2543,16 @@ int snes_lobby_chat_count(void)
 int snes_lobby_send_server_chat(const char *text)
 {
     char esc[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 8];
-    char msg[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 64];
+    char msg[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 256];
     int n;
     if (!snes_lobby_connected()) return -1;
     if (!text || !text[0]) return -1;
     json_escape(text, esc, sizeof(esc));
-    n = snprintf(msg, sizeof(msg), "{\"op\":\"server_chat\",\"text\":\"%s\"}", esc);
+    /* Carry the title on the line itself: the server scopes by it, and this
+     * works even against a server that has not seen our `list` yet. */
+    n = snprintf(msg, sizeof(msg),
+                 "{\"op\":\"server_chat\",\"game_name\":\"%s\",\"text\":\"%s\"}",
+                 g_lc.filter_game_name, esc);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
     queue_send(msg);
     flush_pending();
