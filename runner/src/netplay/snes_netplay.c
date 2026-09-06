@@ -461,6 +461,21 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
     int in_motk_room = 0;
 
     if (cfg->transport == 2) return 0; /* force LAN */
+
+    /* The lobby server owns the transport, and when it allocates a UDP input
+     * relay it says so: op:"launch" carries relay_endpoint, both endpoints are
+     * rewritten to it, and match caps set force_input_relay (see
+     * using_server_input_relay / fill_peer_bind_from_join in the lobby client).
+     * Honour that assignment.
+     *
+     * Choosing p2p ICE anyway is not a harmless preference. The relay is the
+     * only transport that carries more than two participants -- the session
+     * holds exactly one ICE agent -- and the only place "the gallery is
+     * read-only" can be enforced against a patched client, because the relay
+     * drops a spectator's packets itself. Taking ICE instead put three agents
+     * on one broadcast signalling channel, where the spectator's offer read as
+     * a peer ICE restart and destroyed the two players' established link. */
+    if (cfg->force_input_relay) return 0;
 #if defined(SNES_HAS_LOBBY_CLIENT)
     in_motk_room = snes_lobby_connected() && snes_lobby_in_lobby();
 #endif
@@ -474,7 +489,8 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
         }
         return 1;
     }
-    /* Auto: hosted MotK room always uses ICE. Do not demote to LAN when the
+    /* Auto: a hosted MotK room the server did NOT put on the relay uses ICE
+     * (the relay assignment is honoured above). Do not demote to LAN when the
      * lobby rewrites 0.0.0.0 binds to a private TCP peer IP (often wrong —
      * e.g. router .1). LAN file-registry (no MotK seat) stays on LAN UDP. */
     if (in_motk_room)
@@ -514,7 +530,10 @@ int snes_netplay_is_running(void)
 const char *snes_netplay_transport_name(void)
 {
     if (!snes_netplay_active()) return "none";
-    return g_np.use_ice ? "ice" : "lan";
+    if (g_np.use_ice) return "ice";
+    /* "lan" and "relay" are the same UDP transport; they are not the same
+     * thing to read in a log when a match misbehaves. */
+    return g_np.force_input_relay ? "relay" : "lan";
 }
 
 int snes_netplay_ice_failed(void)
@@ -958,7 +977,7 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     fprintf(stderr,
             "snes_netplay: started transport=%s slot=%d input_player=%d session=%u "
             "delay=%u force_input_relay=%d bind=%s peer=%s\n",
-            use_ice ? "ice" : "lan", g_np.local_slot, g_np.input_player,
+            snes_netplay_transport_name(), g_np.local_slot, g_np.input_player,
             (unsigned)rcfg.session_id, (unsigned)rcfg.input_delay,
             g_np.force_input_relay, cfg->bind_hostport,
             /* Lobby peer rewrite is unused for ICE (candidates via WS). */

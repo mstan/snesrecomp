@@ -26,6 +26,8 @@ void snes_lobby_pump(void) {}
 void snes_lobby_request_list(void) {}
 int  snes_lobby_list_count(void) { return 0; }
 int  snes_lobby_list_get(int index, SnesLobbyRow *out) { (void)index; (void)out; return 0; }
+int  snes_lobby_online_count(void) { return 0; }
+int  snes_lobby_online_get(int index, SnesLobbyOnlinePlayer *out) { (void)index; (void)out; return 0; }
 void snes_lobby_set_game_identity(const char *a, const char *b) { (void)a; (void)b; }
 const char *snes_lobby_game_version(void) { return SNES_GAME_VERSION; }
 int  snes_lobby_create(const char *a, const char *b, const char *c, const char *d,
@@ -200,6 +202,8 @@ typedef struct {
     size_t ws_pending_len;
     SnesLobbyRow list[SNES_LOBBY_MAX_LIST];
     int list_count;
+    SnesLobbyOnlinePlayer online[SNES_LOBBY_MAX_ONLINE];
+    int online_count;
     int in_lobby;
     int is_host;
     char host_player_id[SNES_LOBBY_ID_LEN];
@@ -364,6 +368,56 @@ static int member_slot_for_player(const char *player_id)
 static int local_member_slot(void)
 {
     return member_slot_for_player(g_lc.player_id);
+}
+
+static int member_is_spectator(const char *player_id)
+{
+    int i;
+    if (!player_id || !player_id[0])
+        return 0;
+    for (i = 0; i < g_lc.member_count; ++i) {
+        if (strcmp(g_lc.members[i].player_id, player_id) == 0)
+            return g_lc.members[i].is_spectator ? 1 : 0;
+    }
+    return 0;
+}
+
+/* Is this gameplay ICE signal ours to ingest?
+ *
+ * The netplay session owns exactly ONE ICE agent (rnet_session.c), so it can
+ * negotiate with exactly one peer. The lobby relay, though, forwards a
+ * broadcast `signal` to everyone in the room, and a spectator's agent gathers
+ * and offers just like a player's. Feeding a third party's SDP to an agent
+ * that has already set a remote description reads to it as a peer ICE restart
+ * (rnet_ice_agent.c): it destroys the LIVE connection, adopts force_relay, and
+ * rebinds to the wrong party -- whose host candidates the relay filter then
+ * drops, so nothing reconnects. Both players lose the match the moment anyone
+ * walks into the gallery.
+ *
+ * The mod-transfer handshake above already learned this and filters by sender.
+ * This is the same rule for the game's own ICE: the gallery never speaks to a
+ * player's agent, and a spectator -- which has no ICE peer at all, since it
+ * rides the server input relay -- ingests nothing.
+ *
+ * A sender we cannot attribute (`from` empty, a server that predates
+ * from_player_id) is accepted as before: dropping it would break a working
+ * two-player match to close a hole that server cannot open. */
+static int ice_signal_is_for_us(int type, const char *from)
+{
+    if (type < (int)RNET_SIGNAL_LOCAL_SDP || type > (int)RNET_SIGNAL_SET_CONTROLLING)
+        return 1; /* Not a gameplay ICE signal -- not ours to judge. */
+    if (member_is_spectator(g_lc.player_id)) {
+        fprintf(stderr, "snes_lobby: dropping ICE signal type=%d — this build "
+                        "is spectating and negotiates with nobody\n", type);
+        return 0;
+    }
+    if (from && from[0] && member_is_spectator(from)) {
+        fprintf(stderr, "snes_lobby: dropping ICE signal type=%d from a "
+                        "spectator — the gallery does not negotiate with a "
+                        "player's agent\n", type);
+        return 0;
+    }
+    return 1;
 }
 
 static const char *effective_game_version(const char *override_ver)
@@ -598,6 +652,65 @@ static int json_get_int(const char *json, const char *key, int def)
         return def;
     }
     return (int)strtol(p + 1, NULL, 10);
+}
+
+static int json_get_bool(const char *json, const char *key, int def);
+
+/* The `players` array of a lobby_list: everyone on the hub. Flat objects,
+ * so each one is cut out by brace depth and read with the key getters. An
+ * older server has no such array and the count simply goes to zero. */
+static void lobby_list_parse_players(const char *json)
+{
+    const char *p = strstr(json, "\"players\"");
+    int n = 0;
+    g_lc.online_count = 0;
+    if (!p) return;
+    p = strchr(p, '[');
+    if (!p) return;
+    ++p;
+    while (*p && n < SNES_LOBBY_MAX_ONLINE) {
+        const char *obj, *end;
+        int depth = 0;
+        char chunk[512];
+        size_t len;
+        while (*p && *p != '{' && *p != ']') ++p;
+        if (*p != '{') break;
+        obj = end = p;
+        do {
+            if (*end == '{') ++depth;
+            else if (*end == '}') --depth;
+            ++end;
+        } while (*end && depth > 0);
+        len = (size_t)(end - obj);
+        if (len >= sizeof(chunk)) len = sizeof(chunk) - 1;
+        memcpy(chunk, obj, len);
+        chunk[len] = '\0';
+        memset(&g_lc.online[n], 0, sizeof(g_lc.online[n]));
+        json_get_str(chunk, "display_name", g_lc.online[n].display_name,
+                     sizeof(g_lc.online[n].display_name));
+        json_get_str(chunk, "country", g_lc.online[n].country,
+                     sizeof(g_lc.online[n].country));
+        json_get_str(chunk, "lobby_id", g_lc.online[n].lobby_id,
+                     sizeof(g_lc.online[n].lobby_id));
+        json_get_str(chunk, "lobby_name", g_lc.online[n].lobby_name,
+                     sizeof(g_lc.online[n].lobby_name));
+        g_lc.online[n].hosting = json_get_bool(chunk, "hosting", 0);
+        if (g_lc.online[n].display_name[0]) ++n;
+        p = end;
+    }
+    g_lc.online_count = n;
+}
+
+int snes_lobby_online_count(void)
+{
+    return g_lc.online_count;
+}
+
+int snes_lobby_online_get(int index, SnesLobbyOnlinePlayer *out)
+{
+    if (!out || index < 0 || index >= g_lc.online_count) return 0;
+    *out = g_lc.online[index];
+    return 1;
 }
 
 static int json_get_bool(const char *json, const char *key, int def)
@@ -1282,6 +1395,7 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "lobby_list") == 0) {
         const char *p = strstr(json, "\"lobbies\"");
         int n = 0;
+        lobby_list_parse_players(json);
         g_lc.list_count = 0;
         if (!p) {
             return;
@@ -1349,6 +1463,9 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].has_password = json_get_bool(chunk, "has_password", 0);
                     json_get_str(chunk, "host_country", g_lc.list[n].host_country,
                                  sizeof(g_lc.list[n].host_country));
+                    g_lc.list[n].allow_spectators = json_get_bool(chunk, "allow_spectators", 0);
+                    g_lc.list[n].max_spectators = json_get_int(chunk, "max_spectators", 0);
+                    g_lc.list[n].spectator_count = json_get_int(chunk, "spectator_count", 0);
                     ++n;
                     p = end;
                 }
@@ -1597,6 +1714,8 @@ static void handle_server_json(const char *json)
             }
             return;
         }
+        if (!ice_signal_is_for_us(type, from))
+            return;
         enqueue_signal(type, flag, text);
         (void)flag;
         return;

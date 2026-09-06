@@ -1,7 +1,12 @@
 /*
  * Round-trip the lobby mod plan: rows -> match_caps JSON -> rows.
  *
- *   cc tests/netplay/lobby_mod_plan_test.c -o /tmp/t && /tmp/t
+ *   cc tests/netplay/lobby_mod_plan_test.c -DSNES_HAS_LOBBY_CLIENT=1 \
+ *      -DRNET_ENABLE_ICE=1 -Ilib/recomp-net/include -Irunner/src \
+ *      -Irunner/src/lobby/ws -o /tmp/t && /tmp/t
+ *
+ * The defines are not optional: without SNES_HAS_LOBBY_CLIENT the header
+ * compiles to stubs and every case below tests nothing.
  *
  * The plan is what the LOBBY SERVER reads to decide whether a joiner may sit
  * down. Its required_mod_rows() takes match_caps.mods as a JSON ARRAY of
@@ -61,6 +66,19 @@ int  rnet_ice_xfer_failed(const RNetIceXfer *x, char *e, size_t c)
 { (void)x; (void)e; (void)c; XFER_TRAP("failed"); }
 void rnet_ice_xfer_path(const RNetIceXfer *x, char *o, size_t c)
 { (void)x; (void)o; (void)c; XFER_TRAP("path"); }
+RNetIceState rnet_ice_xfer_state(const RNetIceXfer *x) { (void)x; XFER_TRAP("state"); }
+const char *rnet_ice_state_name(RNetIceState st) { (void)st; XFER_TRAP("state_name"); }
+
+/* Same rule for the lobby socket: these cases drive the client's parsers, not
+ * its transport. A write that escapes to a real fd would mean a case started
+ * talking to a server that is not there. */
+int rnet_ws_write_text(int fd, const char *text, int client_mask)
+{
+    (void)fd; (void)text; (void)client_mask;
+    fprintf(stderr, "lobby_mod_plan_test: rnet_ws_write_text was called; "
+                    "this test does no networking\n");
+    abort();
+}
 
 /* Stands in for the mod runtime: two installed packages. */
 static int two_pkg_offer(SnesLobbyModPkg *out, int max, void *ctx)
@@ -746,6 +764,72 @@ static void case_chat_ignores_empty_and_clears(void)
     }
 }
 
+
+/* A spectator's ICE offer must never reach a player's netplay agent.
+ *
+ * This is the bug that ended a live match: the lobby relay forwards a
+ * broadcast `signal` to EVERYONE, a spectator's agent gathers and offers just
+ * like a player's, and the netplay session owns exactly one ICE agent. Handing
+ * that agent a third party's SDP after it already has a remote description
+ * reads to it as a peer ICE restart -- it destroys the connected agent and
+ * rebinds to the wrong party. Both players watched the match freeze the moment
+ * someone opened the gallery.
+ *
+ * The asserts below are on the real predicate the WS handler calls, against a
+ * real membership table, because the failure was precisely that nobody asked
+ * WHO sent it. */
+static void case_the_gallery_does_not_negotiate(void)
+{
+    const char *json =
+        "{\"op\":\"lobby_update\",\"player_count\":2,\"max_slots\":2,"
+        "\"allow_spectators\":true,\"max_spectators\":4,"
+        "\"spectator_count\":1,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\",\"ready\":true},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\",\"ready\":false}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"s0\",\"display_name\":\"Watcher\",\"ready\":false}]}";
+    printf("  gallery does not negotiate\n");
+
+    /* We are the host, seated. */
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "h");
+    parse_slots_array(json);
+
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_SDP, "g") == 1,
+       "the other player's SDP is the one we are negotiating with");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_CANDIDATE, "g") == 1,
+       "and so are its candidates");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_SDP, "s0") == 0,
+       "a spectator's SDP is refused -- accepting it destroys the live agent");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_CANDIDATE, "s0") == 0,
+       "and its candidates with it");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_GATHERING_DONE, "s0") == 0,
+       "every ICE type is filtered, not just the SDP");
+
+    /* A sender we cannot attribute stays accepted. Dropping it would break a
+     * working two-player match against a server that predates from_player_id,
+     * to close a hole that server cannot open -- it has nobody to broadcast a
+     * third offer from. */
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_SDP, "") == 1,
+       "an unattributable sender is handled as before");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_SDP, NULL) == 1,
+       "and so is a missing one");
+
+    /* Not an ICE signal at all: not this predicate's business. */
+    ck(ice_signal_is_for_us(SNES_LOBBY_SIG_RTT_PING, "s0") == 1,
+       "a non-ICE signal is not judged by an ICE rule");
+
+    /* Now run the same table as the spectator. It rides the server input
+     * relay and has no ICE peer at all, so nothing is for it. */
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "s0");
+    parse_slots_array(json);
+    ck(snes_lobby_local_is_spectator() == 1, "this client is watching");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_SDP, "h") == 0,
+       "a spectator ingests nothing, not even the host's offer");
+    ck(ice_signal_is_for_us((int)RNET_SIGNAL_LOCAL_SDP, "g") == 0,
+       "nor the other player's");
+}
+
 int main(void)
 {
     case_rows();
@@ -769,6 +853,7 @@ int main(void)
     case_a_server_without_spectators_reads_as_before();
     case_launch_does_not_erase_the_gallery();
     case_gallery_seat_addressing();
+    case_the_gallery_does_not_negotiate();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
     case_chat_ignores_empty_and_clears();

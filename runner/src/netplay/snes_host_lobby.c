@@ -756,6 +756,36 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   out->max_slots = row.max_slots;
   out->has_password = row.has_password;
   snprintf(out->host_country, sizeof(out->host_country), "%s", row.host_country);
+  out->allow_spectators = row.allow_spectators;
+  out->max_spectators = row.max_spectators;
+  out->spectator_count = row.spectator_count;
+  return 1;
+}
+
+/* Players online: the hub's `players` list. The LAN room has no hub. */
+static int cb_online_count(void *ctx)
+{
+  (void)ctx;
+  return snes_lobby_connected() ? snes_lobby_online_count() : 0;
+}
+
+static int cb_online_get(void *ctx, int index, RecompLauncherCNetplayOnlinePlayer *out)
+{
+  SnesLobbyOnlinePlayer p;
+  const char *me;
+  (void)ctx;
+  if (!out || !snes_lobby_online_get(index, &p))
+    return 0;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->display_name, sizeof(out->display_name), "%s", p.display_name);
+  snprintf(out->country, sizeof(out->country), "%s", p.country);
+  snprintf(out->lobby_name, sizeof(out->lobby_name), "%s", p.lobby_name);
+  out->in_lobby = p.lobby_id[0] != '\0';
+  out->hosting = p.hosting;
+  /* The hub does not say which row is us; our own name is the best the
+   * client has (names are unique within a room, not globally). */
+  me = snes_lobby_display_name();
+  out->is_local = me && me[0] && strcmp(me, p.display_name) == 0;
   return 1;
 }
 
@@ -2027,6 +2057,8 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .seat_swap_respond = cb_seat_swap_respond,
     .seat_swap_outgoing = cb_seat_swap_outgoing,
     .seat_swap_clear = cb_seat_swap_clear,
+    .online_count = cb_online_count,
+    .online_get = cb_online_get,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
