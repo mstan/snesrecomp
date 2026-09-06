@@ -140,7 +140,14 @@ PYEOF
   fi
   # Windows' own DLLs ship with the OS; copying them is at best noise and at
   # worst a version conflict with the loader's.
-  SYSTEM_RE='^(KERNEL32|KERNELBASE|USER32|GDI32|GDIPLUS|ADVAPI32|SHELL32|SHCORE|OLE32|OLEAUT32|WS2_32|WINMM|IMM32|SETUPAPI|VERSION|OPENGL32|GLU32|COMCTL32|COMDLG32|RPCRT4|SHLWAPI|CRYPT32|BCRYPT|NCRYPT|IPHLPAPI|NSI|DNSAPI|MSVCRT|UCRTBASE|VCRUNTIME[0-9]*|MSVCP[0-9]*|DBGHELP|DWMAPI|UXTHEME|POWRPROF|CFGMGR32|HID|WINTRUST|MSIMG32|AVRT|MF[A-Z]*|AUDIOSES|DINPUT8|XINPUT[0-9_]*|API-MS-.*|EXT-MS-.*)\.DLL$'
+  #
+  # A name missing from this list is not a warning, it is a FAILED RELEASE: the
+  # bundler hunts for it in the MinGW sysroot, does not find it (it only exists
+  # on Windows), and exits 1. That is how DWrite.dll broke the setup-pack job --
+  # recomp-ui's Win32 emoji/font path imports DirectWrite, Direct2D and WIC, and
+  # none of the three was listed. When a new import shows up here, ask whether
+  # Windows ships it before reaching for a copy of it.
+  SYSTEM_RE='^(KERNEL32|KERNELBASE|USER32|GDI32|GDIPLUS|ADVAPI32|SHELL32|SHCORE|OLE32|OLEAUT32|WS2_32|WINMM|IMM32|SETUPAPI|VERSION|OPENGL32|GLU32|D2D1|DWRITE|DCOMP|DXGI|D3D[0-9]*|D3DCOMPILER_[0-9]*|WINDOWSCODECS|PROPSYS|COMCTL32|COMDLG32|RPCRT4|SHLWAPI|CRYPT32|BCRYPT|NCRYPT|IPHLPAPI|NSI|DNSAPI|MSVCRT|UCRTBASE|VCRUNTIME[0-9]*|MSVCP[0-9]*|DBGHELP|DWMAPI|UXTHEME|POWRPROF|CFGMGR32|HID|WINTRUST|MSIMG32|AVRT|MF[A-Z]*|AUDIOSES|DINPUT8|XINPUT[0-9_]*|USERENV|API-MS-.*|EXT-MS-.*)\.DLL$'
 
   # Walk transitively: SDL3.dll itself pulls in the MinGW runtime DLLs, and a
   # zip carrying SDL3.dll without them is the same broken zip one level down.
