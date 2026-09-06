@@ -7,9 +7,12 @@ set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 ```
 
-The normal default is `OFF`. An opted-in build also enables recomp-ui's Mods
-surface, but that surface remains hidden until the game initializes the runtime
-and supplies its provider.
+The framework default is `OFF`; every project the scaffolder produces sets it
+`ON` (`tools/new_project`), ships an empty `mods/preloaded` catalog, and wires
+the runtime in `src/main.c` -- a title cannot exchange mods with a netplay peer
+without it, so it is not left to be remembered. An enabled build also enables
+recomp-ui's Mods surface, but that surface remains hidden until the game
+initializes the runtime and supplies its provider.
 
 ## Product and trust model
 

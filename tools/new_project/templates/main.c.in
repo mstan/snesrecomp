@@ -40,6 +40,16 @@
 #include "launcher_cache.h"  /* snesrecomp_rom_cache_read */
 #include "snesrecomp_rom_identity.h" /* generated from rom_identity.txt */
 
+#if SNESRECOMP_ENABLE_MODS
+/* Mod packages -- always built (CMakeLists.txt sets SNESRECOMP_ENABLE_MODS).
+ * The catalog is mods/preloaded beside the executable, staged by the build;
+ * an empty one is valid. The runtime owns installs, selection and the plan;
+ * this host only initializes it, hands its provider to the launcher, commits
+ * the plan against the ROM, and activates plugins once the guest exists. */
+#include "mod_runtime.h"
+static int g_mods_ready;
+#endif
+
 #if defined(RECOMP_LAUNCHER)
 /* Defined by recomp_target_launcher_ui() in CMakeLists.txt. Absent when the
  * project was scaffolded with --no-recomp-ui, and every launcher block in
@@ -60,6 +70,9 @@
 #include "snes_netplay.h"
 #include "snes_host_lobby.h"
 #include "snes_host_app.h"
+#if defined(SNESRECOMP_NET_ROLLBACK)
+#include "netplay/snes_netplay_rb.h"
+#endif
 
 static SnesNetplayConfig g_netplay_cfg;
 static int g_netplay_pending;    /* launcher armed a session; start after SnesInit */
@@ -291,6 +304,11 @@ static int run_gui_launcher(const char *initial_rom, char *out, size_t cap)
         gi.expected_crc     = crc;
         gi.has_expected_crc = 1;
     }
+#if SNESRECOMP_ENABLE_MODS
+    /* The Mods page appears only when the game supplies a provider; recomp-ui
+     * keeps its half hidden otherwise. */
+    gi.mods = g_mods_ready ? snes_mod_runtime_launcher_provider_c() : NULL;
+#endif
 #if defined(SNES_HAS_LOBBY_CLIENT)
     /* The netplay button is capability-gated: these two fields are what make
      * the launcher show it. */
@@ -389,6 +407,20 @@ int main(int argc, char **argv)
     if (!has_positional)
         find_rom_beside_exe(beside_exe, sizeof(beside_exe));
 
+#if SNESRECOMP_ENABLE_MODS
+    /* Before the launcher, which needs the provider to show the Mods page. */
+    {
+        char mods_dir[1024];
+        if (snesrecomp_exe_dir_path("mods/preloaded", mods_dir, sizeof(mods_dir))) {
+            g_mods_ready = snes_mod_runtime_initialize_c(
+                mods_dir, SNESRECOMP_ROM_GAME_ID, SNESRECOMP_ROM_EXPECTED_SHA256);
+            if (!g_mods_ready)
+                fprintf(stderr, "mods: unavailable: %s\n",
+                        snes_mod_runtime_last_error_c());
+        }
+    }
+#endif
+
 #if defined(RECOMP_LAUNCHER)
     /* A dummy video driver means CI or a screenshot harness: there is no one
      * to answer a GUI, and blocking on one would hang the job. */
@@ -448,6 +480,19 @@ int main(int argc, char **argv)
         }
     }
 
+#if SNESRECOMP_ENABLE_MODS
+    /* Resolve the enabled features against THIS ROM and persist the plan. The
+     * launcher's Play does the same through the provider; this is the
+     * text-mode path, and a second commit is a no-op. A rejected plan (wrong
+     * ROM for a package, a plugin nothing registered) is a refusal, not a
+     * silent fallback. */
+    if (g_mods_ready && !snes_mod_runtime_commit_c(rom_path)) {
+        fprintf(stderr, "mods: plan rejected: %s\n",
+                snes_mod_runtime_last_error_c());
+        return 1;
+    }
+#endif
+
     rom = read_rom(rom_path, &rom_size);
     if (!rom)
         return 1;
@@ -457,8 +502,32 @@ int main(int argc, char **argv)
         fprintf(stderr, "@PROJECT_NAME@: SnesInit failed\n");
         return 1;
     }
+#if SNESRECOMP_ENABLE_MODS
+    /* Plugins act on a machine that exists: after SnesInit, before frame 1. */
+    if (g_mods_ready)
+        snes_mod_runtime_activate_plugins_c();
+#endif
 #if defined(SNES_HAS_LOBBY_CLIENT)
     if (g_netplay_pending) {
+#if SNESRECOMP_ENABLE_MODS && defined(SNESRECOMP_NET_ROLLBACK)
+        /* A mod that patches guest memory is simulation state. The host
+         * publishes its effective set and every peer must confirm it before
+         * the match may start (snes_netplay_rb.h); two peers on different
+         * sets cannot stay in sync, so the netcode refuses with a reason
+         * instead of desyncing minutes in. */
+        if (g_mods_ready) {
+            static char s_modset[2048];
+            int need = snes_mod_runtime_effective_set_c(s_modset,
+                                                        sizeof(s_modset));
+            if (need >= 0 && need < (int)sizeof(s_modset))
+                snes_netplay_rb_set_modset(s_modset,
+                                           &snes_mod_runtime_check_set_c,
+                                           &snes_mod_runtime_adopt_set_c);
+            else
+                fprintf(stderr, "mods: effective set is %d bytes, too large "
+                        "to publish -- netplay cannot gate on it\n", need);
+        }
+#endif
         int nrc = snes_netplay_start(&g_netplay_cfg);
         if (nrc != 0)
             fprintf(stderr,

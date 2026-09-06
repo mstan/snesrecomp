@@ -1736,6 +1736,14 @@ bool sha256_file(const fs::path& path, std::string& out,
     return true;
 }
 
+/* Selection edits, wherever they come from, re-run validation. Not launcher
+ * code: the netplay paths below (install_blob, adopt_set) edit selections in
+ * a text-mode host too, and this used to sit inside the RECOMP_LAUNCHER block
+ * -- so a host built without the launcher did not compile once mods were on. */
+void refresh_validation() {
+    state().validation = validate(state());
+}
+
 #if defined(RECOMP_LAUNCHER)
 template <size_t N>
 void copy_text(char (&out)[N], const std::string& value) {
@@ -1763,10 +1771,6 @@ std::vector<FeatureRef> selected_features(Runtime& runtime) {
         for (const Feature& feature : package->features)
             result.push_back({package, &feature});
     return result;
-}
-
-void refresh_validation() {
-    state().validation = validate(state());
 }
 
 int provider_package_count(void*) {
@@ -2029,6 +2033,11 @@ int provider_feature_choice_get(
     return 1;
 }
 
+#endif /* RECOMP_LAUNCHER */
+
+/* The two selection editors double as the netplay adopt-set path (a peer
+ * taking on the host's mod set), so they exist with or without the launcher;
+ * the provider table below merely points at them. */
 int provider_feature_enable(void*, const char* package_id,
                             const char* feature_id, int enabled) {
     if (!package_id || !feature_id) return 0;
@@ -2065,6 +2074,7 @@ int provider_feature_set_option(
     return 1;
 }
 
+#if defined(RECOMP_LAUNCHER)
 int provider_diagnostic_count(void*, const char* package_id,
                               const char* feature_id) {
     if (!package_id || !feature_id) return 0;
