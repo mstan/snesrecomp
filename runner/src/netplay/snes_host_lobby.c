@@ -782,10 +782,10 @@ static int cb_online_get(void *ctx, int index, RecompLauncherCNetplayOnlinePlaye
   snprintf(out->lobby_name, sizeof(out->lobby_name), "%s", p.lobby_name);
   out->in_lobby = p.lobby_id[0] != '\0';
   out->hosting = p.hosting;
-  /* The hub does not say which row is us; our own name is the best the
-   * client has (names are unique within a room, not globally). */
-  me = snes_lobby_display_name();
-  out->is_local = me && me[0] && strcmp(me, p.display_name) == 0;
+  /* Which row is us: the hub tags each row with the first characters of
+   * its connection id. A name match would mark every namesake. */
+  me = snes_lobby_player_id();
+  out->is_local = me && me[0] && p.tag[0] && strncmp(me, p.tag, strlen(p.tag)) == 0;
   return 1;
 }
 
