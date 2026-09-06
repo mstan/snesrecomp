@@ -1395,6 +1395,24 @@ static void drain_ws_pending(void)
     }
 }
 
+/* The identity message: who we are and what we are playing. Sent once on
+ * `welcome` and again whenever the player renames. Both fields are escaped
+ * -- a name with a quote in it used to build malformed JSON, which the
+ * server drops whole, so the rename simply never happened. */
+static void queue_hello(void)
+{
+    char name_esc[SNES_LOBBY_NAME_LEN * 2 + 8];
+    char game_esc[SNES_LOBBY_NAME_LEN * 2 + 8];
+    char msg[SNES_LOBBY_NAME_LEN * 4 + 64];
+    json_escape(g_lc.display_name, name_esc, sizeof(name_esc));
+    json_escape(g_lc.filter_game_name, game_esc, sizeof(game_esc));
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
+             name_esc, game_esc);
+    queue_send(msg);
+    flush_pending();
+}
+
 static void handle_server_json(const char *json)
 {
     char op[32];
@@ -1406,11 +1424,7 @@ static void handle_server_json(const char *json)
              * the server scopes players-online and server chat by title, and
              * waiting for a `list` to tell it left a client that chatted
              * first with no title at all. Title only -- never the version. */
-            char msg[512];
-            snprintf(msg, sizeof(msg),
-                     "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
-                     g_lc.display_name, g_lc.filter_game_name);
-            queue_send(msg);
+            queue_hello();
             fprintf(stderr, "snes_lobby: hello as \"%s\" for game \"%s\"\n",
                     g_lc.display_name,
                     g_lc.filter_game_name[0] ? g_lc.filter_game_name : "(none)");
@@ -2048,11 +2062,19 @@ const char *snes_lobby_url(void)
 
 void snes_lobby_set_display_name(const char *name)
 {
+    char prev[SNES_LOBBY_NAME_LEN];
     if (!name) {
         return;
     }
+    snprintf(prev, sizeof(prev), "%s", g_lc.display_name);
     strncpy(g_lc.display_name, name, sizeof(g_lc.display_name) - 1);
     g_lc.display_name[sizeof(g_lc.display_name) - 1] = '\0';
+    /* A rename after connect has to reach the server, or the players-online
+     * list and our seat keep the name from the first hello until the next
+     * reconnect. `hello` IS the identity message and the server takes it at
+     * any time, so re-sending it is the whole rename protocol. */
+    if (snes_lobby_connected() && strcmp(prev, g_lc.display_name) != 0)
+        queue_hello();
 }
 
 const char *snes_lobby_display_name(void)
