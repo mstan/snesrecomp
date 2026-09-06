@@ -1366,6 +1366,40 @@ static int cb_chat_get(void *ctx, int index,
   return 1;
 }
 
+/* Server chat: per-game, online only. A LAN room has no server and no wider
+ * audience, so the panel is hidden there (send refuses, count 0). */
+static int cb_server_chat_send(void *ctx, const char *text)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan || !snes_lobby_connected())
+    return -1;
+  return snes_lobby_send_server_chat(text);
+}
+
+static int cb_server_chat_count(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_server_chat_count();
+}
+
+static int cb_server_chat_get(void *ctx, int index,
+                              RecompLauncherCNetplayChatMessage *out)
+{
+  SnesLobbyChatMsg msg;
+  (void)ctx;
+  if (!out || !snes_lobby_server_chat_get(index, &msg))
+    return 0;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->from, sizeof(out->from), "%s", msg.from);
+  snprintf(out->text, sizeof(out->text), "%s", msg.text);
+  out->is_local = msg.is_local;
+  out->is_system = msg.is_system;
+  out->seq = msg.seq;
+  return 1;
+}
+
 /* ---- spectators ---------------------------------------------------------
  * The gallery exists only on the lobby server. A LAN / direct-IP room has no
  * server to enforce "cannot affect the game" at, so it reports no gallery and
@@ -2247,6 +2281,9 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .seat_swap_clear = cb_seat_swap_clear,
     .online_count = cb_online_count,
     .online_get = cb_online_get,
+    .server_chat_send = cb_server_chat_send,
+    .server_chat_count = cb_server_chat_count,
+    .server_chat_get = cb_server_chat_get,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)

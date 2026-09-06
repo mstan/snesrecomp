@@ -63,6 +63,9 @@ typedef struct SnesLobbyOnlinePlayer {
     /* First 8 characters of the player's connection id: enough to tell
      * "which row is me" without publishing whole ids to browsers. */
     char tag[12];
+    /* The title that player is browsing for; rows of other titles are
+     * dropped at parse time when this client has a game identity. */
+    char game_name[SNES_LOBBY_NAME_LEN];
 } SnesLobbyOnlinePlayer;
 #define SNES_LOBBY_MAX_ONLINE 64
 
@@ -331,6 +334,12 @@ int  snes_lobby_local_wire_slot(void);
  * Spectators take part: the server fans a line out to everyone in the room,
  * and talking is not affecting the match. */
 int  snes_lobby_send_chat(const char *text);
+
+/* Server chat: per-game, outside any room (op server_chat). Its own ring,
+ * cleared on disconnect; lines are masked on arrival like lobby chat. */
+int  snes_lobby_send_server_chat(const char *text);
+int  snes_lobby_server_chat_count(void);
+int  snes_lobby_server_chat_get(int index, SnesLobbyChatMsg *out);
 
 /* Seat self-service (server ops seat_move / seat_swap_request /
  * seat_swap_answer): move yourself to a FREE player seat, or ask the

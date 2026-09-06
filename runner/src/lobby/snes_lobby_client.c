@@ -1,6 +1,7 @@
 #include "snes_lobby_client.h"
 
 #include "recomp_net/ice_xfer.h"
+#include "recomp_net/chat_filter.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -96,6 +97,9 @@ int  snes_lobby_local_missing_mods(void) { return 0; }
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
 int  snes_lobby_send_chat(const char *text) { (void)text; return -1; }
+int  snes_lobby_send_server_chat(const char *text) { (void)text; return -1; }
+int  snes_lobby_server_chat_count(void) { return 0; }
+int  snes_lobby_server_chat_get(int index, SnesLobbyChatMsg *out) { (void)index; (void)out; return 0; }
 int  snes_lobby_seat_move_self(int to_slot) { (void)to_slot; return -1; }
 int  snes_lobby_seat_swap_request(int target_slot) { (void)target_slot; return -1; }
 int  snes_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot)
@@ -215,6 +219,11 @@ typedef struct {
     int member_count;
     /* Lobby chat ring (oldest at chat_head). */
     SnesLobbyChatMsg chat[SNES_LOBBY_CHAT_RING];
+    /* Server (per-game) chat: a second ring with its own sequence. */
+    SnesLobbyChatMsg schat[SNES_LOBBY_CHAT_RING];
+    int schat_head;
+    int schat_count;
+    uint32_t schat_seq;
     /* Seat swap: one pending ask aimed at us, one outgoing result. */
     int  swap_in_valid;
     char swap_in_asker_id[SNES_LOBBY_ID_LEN];
@@ -728,6 +737,13 @@ static void lobby_list_parse_players(const char *json)
                      sizeof(g_lc.online[n].lobby_name));
         g_lc.online[n].hosting = json_get_bool(chunk, "hosting", 0);
         json_get_str(chunk, "tag", g_lc.online[n].tag, sizeof(g_lc.online[n].tag));
+        json_get_str(chunk, "game_name", g_lc.online[n].game_name,
+                     sizeof(g_lc.online[n].game_name));
+        /* Players of another title are not "online" for this one. A row
+         * with no title yet (a client that has not listed) is kept. */
+        if (g_lc.filter_game_name[0] && g_lc.online[n].game_name[0] &&
+            strcmp(g_lc.online[n].game_name, g_lc.filter_game_name) != 0)
+            { p = end; continue; }
         if (g_lc.online[n].display_name[0]) ++n;
         p = end;
     }
@@ -1273,6 +1289,10 @@ static void chat_push(const char *player_id, const char *from, const char *text,
     snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
     snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
     snprintf(m->text, sizeof(m->text), "%s", text);
+    /* Masked on arrival, whatever relayed it: the server already did this,
+     * an older server did not, and the rule is that nothing unmasked is
+     * ever shown. */
+    if (!is_system) (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
     m->is_system = is_system ? 1 : 0;
     /* "Mine" is decided by player id, not by having just sent something: the
      * server echoes our own line back like everyone else's, and that echo is
@@ -1280,6 +1300,29 @@ static void chat_push(const char *player_id, const char *from, const char *text,
     m->is_local = (!is_system && g_lc.player_id[0] && player_id &&
                    strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
     m->seq = ++g_lc.chat_seq;
+}
+
+static void schat_push(const char *player_id, const char *from, const char *text)
+{
+    SnesLobbyChatMsg *m;
+    int idx;
+    if (!text || !text[0]) return;
+    if (g_lc.schat_count < SNES_LOBBY_CHAT_RING) {
+        idx = (g_lc.schat_head + g_lc.schat_count) % SNES_LOBBY_CHAT_RING;
+        g_lc.schat_count++;
+    } else {
+        idx = g_lc.schat_head;
+        g_lc.schat_head = (g_lc.schat_head + 1) % SNES_LOBBY_CHAT_RING;
+    }
+    m = &g_lc.schat[idx];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+    snprintf(m->text, sizeof(m->text), "%s", text);
+    (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
+    m->is_local = (g_lc.player_id[0] && player_id &&
+                   strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
+    m->seq = ++g_lc.schat_seq;
 }
 
 void snes_lobby_chat_clear(void)
@@ -1662,6 +1705,19 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "seat_swap_result") == 0) {
         g_lc.swap_out = json_get_bool(json, "accept", 0) ? 2 : -1;
+        return;
+    }
+    if (strcmp(op, "server_chat") == 0) {
+        char text[SNES_LOBBY_CHAT_TEXT_LEN];
+        char from_id[SNES_LOBBY_ID_LEN];
+        char from[SNES_LOBBY_NAME_LEN];
+        text[0] = '\0';
+        from_id[0] = '\0';
+        from[0] = '\0';
+        json_get_str(json, "text", text, sizeof(text));
+        json_get_str(json, "from_player_id", from_id, sizeof(from_id));
+        json_get_str(json, "from", from, sizeof(from));
+        schat_push(from_id, from, text);
         return;
     }
     if (strcmp(op, "chat") == 0) {
@@ -2471,6 +2527,33 @@ int snes_lobby_send_chat(const char *text)
 int snes_lobby_chat_count(void)
 {
     return g_lc.chat_count;
+}
+
+int snes_lobby_send_server_chat(const char *text)
+{
+    char esc[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 8];
+    char msg[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 64];
+    int n;
+    if (!snes_lobby_connected()) return -1;
+    if (!text || !text[0]) return -1;
+    json_escape(text, esc, sizeof(esc));
+    n = snprintf(msg, sizeof(msg), "{\"op\":\"server_chat\",\"text\":\"%s\"}", esc);
+    if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int snes_lobby_server_chat_count(void)
+{
+    return g_lc.schat_count;
+}
+
+int snes_lobby_server_chat_get(int index, SnesLobbyChatMsg *out)
+{
+    if (!out || index < 0 || index >= g_lc.schat_count) return 0;
+    *out = g_lc.schat[(g_lc.schat_head + index) % SNES_LOBBY_CHAT_RING];
+    return 1;
 }
 
 int snes_lobby_chat_get(int index, SnesLobbyChatMsg *out)
