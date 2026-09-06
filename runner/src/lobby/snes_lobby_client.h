@@ -45,6 +45,8 @@ typedef struct SnesLobbyRow {
     int      player_count;
     int      max_slots;
     int      has_password;
+    /* Host's country (alpha-2) from the server's GeoIP; "" unknown. */
+    char     host_country[4];
 } SnesLobbyRow;
 
 /* One lobby chat line.
@@ -74,6 +76,8 @@ typedef struct SnesLobbyMember {
     /* 1 when this row is in the gallery. Read this rather than comparing
      * `slot` against a base: the base is the server's to choose. */
     int  is_spectator;
+    /* Country (alpha-2) from the server's GeoIP; "" unknown. */
+    char country[4];
 } SnesLobbyMember;
 
 /* One package on the lobby wire -- a row of the host's required plan, or of a

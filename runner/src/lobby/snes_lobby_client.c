@@ -1100,6 +1100,8 @@ static int parse_seat_array(const char *json, const char *key, int is_spectator,
                              sizeof(g_lc.members[n].display_name));
                 g_lc.members[n].ready = json_get_bool(chunk, "ready", 0);
                 g_lc.members[n].is_spectator = is_spectator;
+                json_get_str(chunk, "country", g_lc.members[n].country,
+                             sizeof(g_lc.members[n].country));
                 if (g_lc.player_id[0] &&
                     strcmp(g_lc.members[n].player_id, g_lc.player_id) == 0) {
                     g_lc.local_ready = g_lc.members[n].ready;
@@ -1363,6 +1365,8 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].player_count = json_get_int(chunk, "player_count", 0);
                     g_lc.list[n].max_slots = json_get_int(chunk, "max_slots", 2);
                     g_lc.list[n].has_password = json_get_bool(chunk, "has_password", 0);
+                    json_get_str(chunk, "host_country", g_lc.list[n].host_country,
+                                 sizeof(g_lc.list[n].host_country));
                     ++n;
                     p = end;
                 }
