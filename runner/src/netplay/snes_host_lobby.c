@@ -1817,6 +1817,45 @@ static void cb_push_match_caps(void *ctx)
   (void)snes_lobby_set_match_caps(&caps);
 }
 
+/* Seat self-service: online rooms only. The LAN room is two seats with
+ * the host as the only authority; there a swap is the host's move_member. */
+static int cb_seat_move_self(void *ctx, int to_slot)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return -1;
+  return snes_lobby_seat_move_self(to_slot);
+}
+static int cb_seat_swap_request(void *ctx, int target_slot)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return -1;
+  return snes_lobby_seat_swap_request(target_slot);
+}
+static int cb_seat_swap_incoming(void *ctx, char *who, size_t who_cap, int *from_slot)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return 0;
+  return snes_lobby_seat_swap_incoming(who, who_cap, from_slot);
+}
+static int cb_seat_swap_respond(void *ctx, int accept)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return -1;
+  return snes_lobby_seat_swap_respond(accept);
+}
+static int cb_seat_swap_outgoing(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return 0;
+  return snes_lobby_seat_swap_outgoing();
+}
+static void cb_seat_swap_clear(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return;
+  snes_lobby_seat_swap_clear();
+}
+
 static RecompLauncherCNetplayCallbacks g_callbacks = {
     NULL,
     cb_default_url,
@@ -1879,6 +1918,12 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .chat_send = cb_chat_send,
     .chat_count = cb_chat_count,
     .chat_get = cb_chat_get,
+    .seat_move_self = cb_seat_move_self,
+    .seat_swap_request = cb_seat_swap_request,
+    .seat_swap_incoming = cb_seat_swap_incoming,
+    .seat_swap_respond = cb_seat_swap_respond,
+    .seat_swap_outgoing = cb_seat_swap_outgoing,
+    .seat_swap_clear = cb_seat_swap_clear,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)

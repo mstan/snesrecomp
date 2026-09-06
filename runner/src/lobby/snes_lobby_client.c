@@ -94,6 +94,13 @@ int  snes_lobby_local_missing_mods(void) { return 0; }
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
 int  snes_lobby_send_chat(const char *text) { (void)text; return -1; }
+int  snes_lobby_seat_move_self(int to_slot) { (void)to_slot; return -1; }
+int  snes_lobby_seat_swap_request(int target_slot) { (void)target_slot; return -1; }
+int  snes_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot)
+{ (void)who; (void)who_cap; (void)from_slot; return 0; }
+int  snes_lobby_seat_swap_respond(int accept) { (void)accept; return -1; }
+int  snes_lobby_seat_swap_outgoing(void) { return 0; }
+void snes_lobby_seat_swap_clear(void) {}
 int  snes_lobby_chat_count(void) { return 0; }
 int  snes_lobby_chat_get(int index, SnesLobbyChatMsg *out)
 { (void)index; (void)out; return 0; }
@@ -204,6 +211,12 @@ typedef struct {
     int member_count;
     /* Lobby chat ring (oldest at chat_head). */
     SnesLobbyChatMsg chat[SNES_LOBBY_CHAT_RING];
+    /* Seat swap: one pending ask aimed at us, one outgoing result. */
+    int  swap_in_valid;
+    char swap_in_asker_id[SNES_LOBBY_ID_LEN];
+    char swap_in_asker_name[SNES_LOBBY_NAME_LEN];
+    int  swap_in_from_slot;
+    int  swap_out;
     int chat_head;
     int chat_count;
     uint32_t chat_seq;
@@ -1484,6 +1497,19 @@ static void handle_server_json(const char *json)
         g_lc.launch_pending = 1;
         return;
     }
+    if (strcmp(op, "seat_swap_ask") == 0) {
+        g_lc.swap_in_valid = 1;
+        json_get_str(json, "asker_player_id", g_lc.swap_in_asker_id,
+                     sizeof(g_lc.swap_in_asker_id));
+        json_get_str(json, "asker_name", g_lc.swap_in_asker_name,
+                     sizeof(g_lc.swap_in_asker_name));
+        g_lc.swap_in_from_slot = json_get_int(json, "from_slot", -1);
+        return;
+    }
+    if (strcmp(op, "seat_swap_result") == 0) {
+        g_lc.swap_out = json_get_bool(json, "accept", 0) ? 2 : -1;
+        return;
+    }
     if (strcmp(op, "chat") == 0) {
         char text[SNES_LOBBY_CHAT_TEXT_LEN];
         char from_id[SNES_LOBBY_ID_LEN];
@@ -1633,6 +1659,8 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
         strcmp(op, "kicked") == 0) {
         snes_lobby_chat_clear();
+        g_lc.swap_in_valid = 0;
+        g_lc.swap_out = 0;
         g_lc.in_lobby = 0;
         g_lc.is_host = 0;
         g_lc.host_player_id[0] = '\0';
@@ -2208,6 +2236,64 @@ int snes_lobby_set_match_caps(const SnesLobbyMatchCaps *caps)
     queue_send(msg);
     flush_pending();
     return 0;
+}
+
+int snes_lobby_seat_move_self(int to_slot)
+{
+    char msg[80];
+    if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (to_slot < 0 || to_slot >= SNES_LOBBY_MAX_PLAYERS) return -1;
+    snprintf(msg, sizeof(msg), "{\"op\":\"seat_move\",\"to_slot\":%d}", to_slot);
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int snes_lobby_seat_swap_request(int target_slot)
+{
+    char msg[96];
+    if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (target_slot < 0 || target_slot >= SNES_LOBBY_MAX_PLAYERS) return -1;
+    if (g_lc.swap_out == 1) return -1; /* one ask at a time */
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_swap_request\",\"target_slot\":%d}", target_slot);
+    queue_send(msg);
+    flush_pending();
+    g_lc.swap_out = 1;
+    return 0;
+}
+
+int snes_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot)
+{
+    if (!g_lc.swap_in_valid) return 0;
+    if (who && who_cap) snprintf(who, who_cap, "%s", g_lc.swap_in_asker_name);
+    if (from_slot) *from_slot = g_lc.swap_in_from_slot;
+    return 1;
+}
+
+int snes_lobby_seat_swap_respond(int accept)
+{
+    char msg[160];
+    if (!g_lc.swap_in_valid) return -1;
+    g_lc.swap_in_valid = 0;
+    if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_swap_answer\",\"accept\":%s,"
+             "\"asker_player_id\":\"%s\"}",
+             accept ? "true" : "false", g_lc.swap_in_asker_id);
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int snes_lobby_seat_swap_outgoing(void)
+{
+    return g_lc.swap_out;
+}
+
+void snes_lobby_seat_swap_clear(void)
+{
+    if (g_lc.swap_out != 1) g_lc.swap_out = 0;
 }
 
 int snes_lobby_send_chat(const char *text)
