@@ -52,6 +52,19 @@
  * probe below takes the __get_cpuid branch, which lives in <cpuid.h>. */
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>
+/* ...and then get GCC's five-argument __cpuid MACRO back out of the way.
+ *
+ * <cpuid.h> defines __cpuid(level, a, b, c, d). MinGW's <intrin.h> declares a
+ * two-argument function of the same name, and SDL.h reaches intrin.h through
+ * SDL_cpuinfo.h -- so with sdl_compat.h included below, that declaration
+ * arrives already macro-mangled and the build dies on "macro '__cpuid'
+ * requires 5 arguments, but only 2 given".
+ *
+ * Nothing here wants the macro: the GCC branch of dump_cpu_brand calls
+ * __get_cpuid, and only the MSVC branch uses a two-argument __cpuid. Undefing
+ * it costs nothing -- __get_cpuid is a static inline whose body expanded the
+ * macro when this header was parsed, so it keeps working. */
+#undef __cpuid
 #endif
 #else
 #include <pthread.h>
