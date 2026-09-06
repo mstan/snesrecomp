@@ -60,6 +60,9 @@ typedef struct SnesLobbyOnlinePlayer {
     char lobby_id[SNES_LOBBY_ID_LEN];
     char lobby_name[SNES_LOBBY_NAME_LEN];
     int  hosting;
+    /* First 8 characters of the player's connection id: enough to tell
+     * "which row is me" without publishing whole ids to browsers. */
+    char tag[12];
 } SnesLobbyOnlinePlayer;
 #define SNES_LOBBY_MAX_ONLINE 64
 

@@ -353,6 +353,24 @@ static void member_rtt_clear(void)
     g_lc.rtt_next_ping_ms = 0;
 }
 
+int snes_lobby_spectator_slot_base(void);
+
+/* member_rtt_ms has a cell per seat in BOTH tables, but a gallery seat is
+ * numbered from the server's spectator base (64+), not from the array. Map
+ * a seat to its cell; -1 for a seat neither table has. Without this every
+ * spectator's report was dropped as out of range and the gallery showed no
+ * latency at all. */
+static int rtt_index_for_slot(int slot)
+{
+    int base;
+    if (slot < 0) return -1;
+    if (slot < SNES_LOBBY_MAX_PLAYERS) return slot;
+    base = snes_lobby_spectator_slot_base();
+    if (base > 0 && slot >= base && slot < base + SNES_LOBBY_MAX_SPECTATORS)
+        return SNES_LOBBY_MAX_PLAYERS + (slot - base);
+    return -1;
+}
+
 static int member_slot_for_player(const char *player_id)
 {
     int i;
@@ -709,6 +727,7 @@ static void lobby_list_parse_players(const char *json)
         json_get_str(chunk, "lobby_name", g_lc.online[n].lobby_name,
                      sizeof(g_lc.online[n].lobby_name));
         g_lc.online[n].hosting = json_get_bool(chunk, "hosting", 0);
+        json_get_str(chunk, "tag", g_lc.online[n].tag, sizeof(g_lc.online[n].tag));
         if (g_lc.online[n].display_name[0]) ++n;
         p = end;
     }
@@ -1667,8 +1686,8 @@ static void handle_server_json(const char *json)
                 int ms = (int)(now - (uint64_t)sent);
                 if (ms < 0) ms = 0;
                 if (ms > 60000) ms = 60000;
-                slot = local_member_slot();
-                if (slot >= 0 && slot < SNES_LOBBY_MAX_MEMBERS)
+                slot = rtt_index_for_slot(local_member_slot());
+                if (slot >= 0)
                     g_lc.member_rtt_ms[slot] = ms;
                 /* Tell the host (and peers) our measured RTT to host. */
                 {
@@ -1681,10 +1700,9 @@ static void handle_server_json(const char *json)
             return;
         }
         if (type == SNES_LOBBY_SIG_RTT_REPORT) {
-            int slot = member_slot_for_player(from);
+            int slot = rtt_index_for_slot(member_slot_for_player(from));
             int ms = (int)strtol(text, NULL, 10);
-            if (slot >= 0 && slot < SNES_LOBBY_MAX_MEMBERS && ms >= 0 &&
-                ms <= 60000)
+            if (slot >= 0 && ms >= 0 && ms <= 60000)
                 g_lc.member_rtt_ms[slot] = ms;
             return;
         }
@@ -2520,7 +2538,8 @@ int snes_lobby_member_get(int index, SnesLobbyMember *out)
 
 int snes_lobby_member_latency_ms(int slot)
 {
-    if (slot < 0 || slot >= SNES_LOBBY_MAX_MEMBERS)
+    const int idx = rtt_index_for_slot(slot);
+    if (idx < 0)
         return -1;
     if (g_lc.host_player_id[0]) {
         int i;
@@ -2530,7 +2549,7 @@ int snes_lobby_member_latency_ms(int slot)
                 return -1; /* host row */
         }
     }
-    return g_lc.member_rtt_ms[slot];
+    return g_lc.member_rtt_ms[idx];
 }
 
 int snes_lobby_member_is_host(const SnesLobbyMember *member)
