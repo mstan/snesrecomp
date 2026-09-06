@@ -188,6 +188,11 @@ typedef struct SnesLobbyJoinInfo {
     int      max_spectators;
     int      spectator_count;
     int      spectator_slot_base;
+    /* Where the gallery starts in the RELAY's slot space -- a different
+     * namespace from the lobby seat index above, and the one the engine needs.
+     * The relay forwards nothing from a slot at or beyond its player count, so
+     * this is the number that makes a spectator unable to send. */
+    int      spectator_relay_base;
     char     last_error[64]; /* need_password | bad_password | … */
 } SnesLobbyJoinInfo;
 
@@ -264,6 +269,11 @@ int  snes_lobby_local_is_spectator(void);
 int  snes_lobby_spectator_slot_base(void);
 /* Seat index for gallery position `index`, for move / kick. */
 int  snes_lobby_spectator_slot(int index);
+/* This client's slot in the RELAY's namespace, for RNetConfig.wire_slot.
+ * -1 when this client is not a spectator or the server published no relay
+ * base -- and a spectator without one must not launch, because sending as a
+ * player slot is exactly what it must not do. */
+int  snes_lobby_local_wire_slot(void);
 
 /* Host: remove the player seated in `slot` (not the host). Returns 0 if sent. */
 int  snes_lobby_kick(int slot);

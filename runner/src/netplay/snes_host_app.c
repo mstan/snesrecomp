@@ -22,6 +22,8 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
   snes_netplay_config_defaults(&out->net_cfg);
   out->net_cfg.enabled = 1;
   out->net_cfg.local_slot = net->local_slot;
+  out->net_cfg.spectator = net->is_spectator ? 1 : 0;
+  out->net_cfg.spectator_wire_slot = net->spectator_wire_slot;
   out->net_cfg.input_player =
       (net->input_player == 0 || net->input_player == 1) ? net->input_player
                                                          : -1;

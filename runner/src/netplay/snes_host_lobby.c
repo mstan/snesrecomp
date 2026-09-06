@@ -1269,25 +1269,22 @@ static int cb_fill_launch(void *ctx, RecompLauncherCNetplayLaunch *out)
    * The role rides separately, and the engine reads it to decide whether this
    * build contributes a row at all. */
   out->is_spectator = join.local_is_spectator ? 1 : 0;
+  out->spectator_wire_slot = 0;
   if (out->is_spectator) {
-    /* Fail closed until the engine can run a seat-less session.
-     *
-     * The lobby half of spectating is done -- a spectator joins, is listed,
-     * and the host can move it in and out of play. The engine half is not:
-     * recomp-net's ROLLBACK layer accepts an observer (local_slot ==
-     * slot_count) but its SESSION layer still rejects one, and its ack
-     * heuristic indexes remote_rings off local_slot. Until that seam is
-     * finished, arming a match here would clamp this seat index into a real
-     * player slot and desync everybody -- silently, and in a live match.
-     *
-     * So: refuse the launch and say why. A spectator stays in the lobby
-     * rather than joining as a player nobody asked for. */
-    fprintf(stderr,
-            "netplay: refusing to launch as a spectator - this build's engine "
-            "cannot yet run a seat-less session (lobby seat %d). Ask the host "
-            "to move you into a player slot.\n",
-            join.local_slot);
-    return 0;
+    const int wire = snes_lobby_local_wire_slot();
+    if (wire <= 0) {
+      /* No relay base published, so there is no slot we could send from that
+       * the relay would recognise as a spectator. Falling back to a player
+       * slot is the one thing a spectator must never do -- the relay would
+       * forward it and the peers would take it as that seat's input. Refuse
+       * instead: a lobby with a message beats a desynced match. */
+      fprintf(stderr,
+              "netplay: refusing to launch as a spectator - the host "
+              "published no spectator relay slot (lobby seat %d)\n",
+              join.local_slot);
+      return 0;
+    }
+    out->spectator_wire_slot = wire;
   }
   snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s",
            join.bind_hostport);
