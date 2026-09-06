@@ -60,14 +60,22 @@ snesrecomp_rom_identity(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/rom_identity.txt)
 # still a hard error (the framework owns the message).
 snesrecomp_target_generated_code(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/src/gen)
 
-# The mod catalog ships beside the executable on every build OF THE
-# EXECUTABLE -- including the launcher's own Generate & rebuild on a player's
-# machine, which builds only this target and would skip a sibling ALL target.
-# mods/preloaded/packages/ holds reviewed, default-disabled packages; players
-# install .snesmod archives through the launcher. snesrecomp/docs/MOD_PACKAGES.md.
-snesrecomp_target_stage_dir(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/mods mods)
+# The mod catalog. This names WHERE the packages are; the framework owns the
+# layout they are staged into beside the executable, and stages them on every
+# build OF THE EXECUTABLE -- including the launcher's own Generate & rebuild on
+# a player's machine, which builds only this target and would skip a sibling
+# ALL target. mods/preloaded/packages/ holds reviewed, default-disabled
+# packages; players install .snesmod archives through the launcher.
+# snesrecomp/docs/MOD_PACKAGES.md.
+#
+# It used to be `snesrecomp_target_stage_dir(... ${CMAKE_SOURCE_DIR}/mods mods)`
+# -- the destination spelled per title, which is how three ports in the same
+# workspace ended up shipping an empty Mods page and nothing said so. Declaring
+# it is now also enforced: a project with packages that never calls this fails
+# to configure.
+snesrecomp_target_mod_catalog(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/mods/preloaded)
 # Any other directory the game reads exe-relative (a translations/ table, ...)
-# is staged the same way, never with a separate ALL target.
+# is staged with snesrecomp_target_stage_dir, never with a separate ALL target.
 
 target_include_directories(@PROJECT_NAME@ PRIVATE
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}

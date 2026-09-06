@@ -641,9 +641,10 @@ fill package_release.sh.in scripts/package_release.sh
 fill symbols_readme.md.in  recomp/README.md
 chmod +x tools/regen.sh scripts/package_release.sh
 
-# Empty mod catalog. The build stages mods/ beside the executable on every
-# build of it, and the runtime initializes from mods/preloaded there; an empty
-# catalog is a valid one (the Mods page just lists nothing).
+# Empty mod catalog. CMakeLists.txt declares it to the framework
+# (snesrecomp_target_mod_catalog), which stages packages/ beside the executable
+# on every build of it, and the runtime initializes from mods/preloaded there;
+# an empty catalog is a valid one (the Mods page just lists nothing).
 cat > mods/preloaded/README.md <<EOF
 # Preloaded mods
 
@@ -656,8 +657,12 @@ packages/<package-id>/<version>/
 \`\`\`
 
 A manifest's \`[[target]]\` names this title as \`game_id = "$GAME_ID"\` with the
-ROM's SHA-256 (both live in \`rom_identity.txt\`). The build copies \`mods/\`
-beside the executable on every build; nothing placed there by hand survives.
+ROM's SHA-256 (both live in \`rom_identity.txt\`). CMakeLists.txt declares this
+directory with \`snesrecomp_target_mod_catalog\` and the FRAMEWORK stages
+\`packages/\` beside the executable on every build -- do not add a copy step of
+your own, and do not spell the destination: it belongs to snesrecomp, so a
+future change to the layout touches one file instead of every port. Nothing
+placed beside the executable by hand survives a build.
 Players install \`.snesmod\` archives through the launcher's Mods page, which
 the runtime keeps under its own state beside the executable.
 
