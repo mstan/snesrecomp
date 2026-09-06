@@ -57,7 +57,7 @@ static char g_runtime_error[64];
 static RNetIpv4Address g_local_addresses[kMaxLocalAddresses];
 static int g_local_address_count;
 static char g_external_ip[RNET_IPV4_ADDRESS_TEXT_MAX];
-static int g_lobby_input_delay = 2; /* waiting-room setting; clamped 2..20 */
+static int g_lobby_input_delay = 6; /* waiting-room setting; clamped 2..20 */
 static int g_lobby_force_turn = 0;  /* host: ICE relay-only for server lobbies */
 static int g_lobby_force_input_relay = 0; /* host: server UDP input relay */
 static int g_lobby_max_slots = 2;   /* seat ceiling for current/created room */

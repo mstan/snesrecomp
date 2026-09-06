@@ -284,6 +284,8 @@ int  snes_lobby_spectator_count(void);
 int  snes_lobby_local_is_spectator(void);
 /* Base of the gallery half of the seat namespace, as the server reports it. */
 int  snes_lobby_spectator_slot_base(void);
+/* 1 when `slot` is a seat the server would accept in move / kick. */
+int  snes_lobby_seat_valid(int slot);
 /* Seat index for gallery position `index`, for move / kick. */
 int  snes_lobby_spectator_slot(int index);
 /* This client's slot in the RELAY's namespace, for RNetConfig.wire_slot.

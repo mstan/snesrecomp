@@ -429,7 +429,7 @@ static void match_caps_clear(SnesLobbyMatchCaps *c)
 {
     if (!c) return;
     memset(c, 0, sizeof(*c));
-    c->input_delay = 2;
+    c->input_delay = 6;
 }
 
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
@@ -845,7 +845,7 @@ static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
                                          SNES_LOBBY_MAX_MODS);
     json_get_str(obj, "mod_set", out->mod_set, sizeof(out->mod_set));
     out->ignore_aspect = json_get_bool(obj, "ignore_aspect", 0);
-    out->input_delay = json_get_int(obj, "input_delay", 2);
+    out->input_delay = json_get_int(obj, "input_delay", 6);
     if (out->input_delay < 2) out->input_delay = 2;
     if (out->input_delay > 20) out->input_delay = 20;
     out->ws_extra = json_get_int(obj, "ws_extra", 0);
@@ -2101,12 +2101,14 @@ int snes_lobby_leave(void)
     return 0;
 }
 
+int snes_lobby_seat_valid(int slot);
+
 int snes_lobby_kick(int slot)
 {
     char msg[64];
     if (!snes_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host)
         return -1;
-    if (slot < 0 || slot >= SNES_LOBBY_MAX_MEMBERS)
+    if (!snes_lobby_seat_valid(slot))
         return -1;
     snprintf(msg, sizeof(msg), "{\"op\":\"kick\",\"slot\":%d}", slot);
     queue_send(msg);
@@ -2114,13 +2116,31 @@ int snes_lobby_kick(int slot)
     return 0;
 }
 
+/* A lobby seat index the server would accept: a player seat, or a gallery
+ * seat at or above the base the server published (never valid before it
+ * did -- a server that predates spectators has no gallery to move into). */
+int snes_lobby_seat_valid(int slot)
+{
+    const int base = snes_lobby_spectator_slot_base();
+    if (slot < 0) return 0;
+    if (slot < SNES_LOBBY_MAX_MEMBERS) return 1;
+    if (base <= 0) return 0;
+#ifdef SNES_LOBBY_MAX_SPECTATORS
+    return slot >= base && slot < base + SNES_LOBBY_MAX_SPECTATORS;
+#else
+    return slot >= base && slot < base + SNES_LOBBY_MAX_MEMBERS;
+#endif
+}
+
 int snes_lobby_move(int from_slot, int to_slot)
 {
     char msg[96];
     if (!snes_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host)
         return -1;
-    if (from_slot < 0 || from_slot >= SNES_LOBBY_MAX_MEMBERS ||
-        to_slot < 0 || to_slot >= SNES_LOBBY_MAX_MEMBERS ||
+    /* Either seat may be in the gallery: this is the call that promotes and
+     * demotes as well as reorders. Gallery seats live at the server's
+     * spectator base, far above the player table. */
+    if (!snes_lobby_seat_valid(from_slot) || !snes_lobby_seat_valid(to_slot) ||
         from_slot == to_slot)
         return -1;
     snprintf(msg, sizeof(msg),
