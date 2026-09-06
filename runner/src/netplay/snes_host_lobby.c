@@ -13,6 +13,7 @@
 #endif
 
 #include "recomp_net/lan_lobby.h"
+#include "host_paths.h"
 #include "recomp_net/lan_direct.h"
 #include "recomp_net/address.h"
 
@@ -81,11 +82,24 @@ static int clamp_input_delay(int delay)
   return delay;
 }
 
+/* The LAN room is a file. Two instances of one build only see the same room
+ * if they read the same file, and the working directory is whatever each
+ * was launched from -- a terminal in the repo root, a file manager in the
+ * build dir -- so a relative registry path is anchored to the executable's
+ * directory, not to the cwd. An absolute path from the game is kept as is. */
 static const char *lan_path(void)
 {
-  return g_id.lan_registry_path && g_id.lan_registry_path[0]
-             ? g_id.lan_registry_path
-             : "netplay_lan_lobby.txt";
+  static char resolved[1024];
+  const char *p = g_id.lan_registry_path && g_id.lan_registry_path[0]
+                      ? g_id.lan_registry_path
+                      : "netplay_lan_lobby.txt";
+  const int absolute = p[0] == '/' || p[0] == '\\' ||
+                       (p[0] && p[1] == ':'); /* C:\... */
+  if (absolute)
+    return p;
+  if (!resolved[0] && !snesrecomp_exe_dir_path(p, resolved, sizeof(resolved)))
+    return p; /* no exe dir known: the old cwd-relative behaviour */
+  return resolved;
 }
 
 /* Defined with the rest of the chat plumbing further down; needed up here by
