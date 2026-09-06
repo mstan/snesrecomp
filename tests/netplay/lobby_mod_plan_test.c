@@ -830,6 +830,83 @@ static void case_the_gallery_does_not_negotiate(void)
        "nor the other player's");
 }
 
+
+/* The transport the LAUNCH assigned survives whatever the lobby says next.
+ *
+ * This is the regression that produced a spectator's black screen. The server
+ * allocated its UDP input relay and said so with relay_endpoint; the client
+ * recorded that in match_caps.force_input_relay -- a field the HOST's own
+ * published caps also write, where it means the host's UI toggle and is
+ * normally false. Any lobby_update arriving before the game actually started
+ * (a mod-plan republish, a ready toggle, someone joining) re-ingested those
+ * caps and erased the assignment, so the match fell back to p2p ICE. Two
+ * players merely lost the relay; a spectator lost its only possible route and
+ * rendered black. It "happened inconsistently" because it turned on whether a
+ * lobby_update happened to land in that window.
+ *
+ * So the assertion is not "the flag is set" -- it was, briefly. It is that the
+ * flag is still set after the traffic that used to clear it, and that the two
+ * meanings of the name are read from two different places. */
+static void case_launch_transport_survives_a_lobby_update(void)
+{
+    const char *launch =
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":8,"
+        "\"host_endpoint\":\"relay.example:8777\","
+        "\"guest_endpoint\":\"relay.example:8777\","
+        "\"relay_endpoint\":\"relay.example:8777\",\"transport\":\"sfu\","
+        "\"player_count\":2,\"max_slots\":2,\"spectator_relay_base\":2,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":9,\"force_input_relay\":false},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}";
+    /* The host republishing its plan. Its caps carry force_input_relay=false,
+     * because on the way OUT that field means the host's toggle. */
+    const char *update =
+        "{\"op\":\"lobby_update\",\"lobby_id\":\"L\",\"player_count\":2,"
+        "\"max_slots\":2,\"host_endpoint\":\"relay.example:8777\","
+        "\"guest_endpoint\":\"relay.example:8777\","
+        "\"match_caps\":{\"v\":1,\"input_delay\":9,\"force_input_relay\":false},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}";
+    SnesLobbyJoinInfo out;
+
+    printf("  launch transport survives lobby traffic\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    g_lc.connected = 1;
+
+    handle_server_json(launch);
+    ck(g_lc.join.force_input_relay == 1,
+       "a launch carrying relay_endpoint is a relayed match");
+    ck(strcmp(g_lc.join.peer_hostport, "relay.example:8777") == 0,
+       "and everyone dials the relay");
+    ck(strcmp(g_lc.join.bind_hostport, "0.0.0.0:0") == 0,
+       "from an ephemeral local bind");
+
+    /* The traffic that used to undo it. */
+    handle_server_json(update);
+    ck(g_lc.match_caps.force_input_relay == 0,
+       "the host's published caps still say what the host's toggle says");
+    ck(g_lc.join.force_input_relay == 1,
+       "but the match is still relayed — the launch decided that, not the caps");
+
+    /* And this is the value the session is actually started with. Reading the
+     * caps copy here instead is the shipped bug, and fails this case. */
+    ck(snes_lobby_try_fill_launch(&out) == 1, "the launch still fills");
+    ck(out.force_input_relay == 1,
+       "so the session starts on the relay, not on p2p ICE");
+
+    /* A p2p launch must not inherit the 1 from the relayed match before it. */
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":9,"
+        "\"host_endpoint\":\"1.2.3.4:5000\",\"guest_endpoint\":\"5.6.7.8:6000\","
+        "\"transport\":\"ice_p2p\",\"player_count\":2,\"max_slots\":2,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":9,\"force_input_relay\":false},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.force_input_relay == 0,
+       "a p2p launch does not inherit the previous match's relay");
+}
+
 int main(void)
 {
     case_rows();
@@ -854,6 +931,7 @@ int main(void)
     case_launch_does_not_erase_the_gallery();
     case_gallery_seat_addressing();
     case_the_gallery_does_not_negotiate();
+    case_launch_transport_survives_a_lobby_update();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
     case_chat_ignores_empty_and_clears();

@@ -1618,6 +1618,20 @@ static void handle_server_json(const char *json)
                 g_lc.match_caps.valid = 1;
             g_lc.match_caps.force_input_relay = 1;
         }
+        /* Decide this match's transport HERE, and record it on the join.
+         *
+         * It used to be re-read from match_caps at the moment the game
+         * actually started, which is a later moment: every lobby_update
+         * re-ingests the host's published caps, whose force_input_relay is the
+         * host's UI toggle (default off) rather than the server's allocation.
+         * A republish landing in that window -- a mod-plan change, a ready
+         * toggle, someone joining -- erased the fact that the server had
+         * handed out a relay, and the match fell back to p2p ICE. That is why
+         * it "happened inconsistently": it depended on lobby traffic timing.
+         *
+         * Restated on every launch, both ways, so a relayed match cannot leave
+         * a 1 behind for the next p2p one. */
+        g_lc.join.force_input_relay = using_server_input_relay(&g_lc.join) ? 1 : 0;
         fill_peer_bind_from_join();
         parse_slots_array(json);
         /* Guest must know the host. Host may leave peer empty to learn the

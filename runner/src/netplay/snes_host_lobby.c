@@ -1495,7 +1495,10 @@ static int cb_fill_launch(void *ctx, RecompLauncherCNetplayLaunch *out)
   out->input_player = 0;
   out->session_id = join.session_id;
   out->input_delay = clamp_input_delay(caps->input_delay);
-  out->force_input_relay = caps->force_input_relay ? 1 : 0;
+  /* The launch's own statement, not the caps copy: the caps field is shared
+   * with the host's UI toggle and is overwritten by any lobby_update that
+   * arrives before we get here. See SnesLobbyJoinInfo::force_input_relay. */
+  out->force_input_relay = join.force_input_relay ? 1 : 0;
   out->max_slots = join.max_slots >= 2 ? clamp_lobby_max_slots(join.max_slots)
                                        : clamp_lobby_max_slots(g_lobby_max_slots);
   out->player_count = join.player_count > 0 ? join.player_count : out->max_slots;
