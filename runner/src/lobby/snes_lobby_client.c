@@ -1411,6 +1411,9 @@ static void handle_server_json(const char *json)
                      "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
                      g_lc.display_name, g_lc.filter_game_name);
             queue_send(msg);
+            fprintf(stderr, "snes_lobby: hello as \"%s\" for game \"%s\"\n",
+                    g_lc.display_name,
+                    g_lc.filter_game_name[0] ? g_lc.filter_game_name : "(none)");
         }
         /* The bare list this used to send told the server nothing about the
          * title, so the whole per-game scope stayed empty for this client. */
@@ -1996,14 +1999,37 @@ void snes_lobby_disconnect(void)
     }
     {
         char dname[SNES_LOBBY_NAME_LEN];
+        char fgame[SNES_LOBBY_NAME_LEN];
+        char fver[SNES_LOBBY_VERSION_LEN];
         /* The memset below would drop the pointer, not the agent: closing it
          * first is the difference between ending a transfer and leaking a
          * live UDP socket every time the lobby reconnects. */
         if (g_lc.xfer) rnet_ice_xfer_close(&g_lc.xfer);
         strncpy(dname, g_lc.display_name, sizeof(dname) - 1);
+        dname[sizeof(dname) - 1] = '\0';
+        /* The game identity is what this BUILD is, not what this connection
+         * was: keep it across the reset, exactly as the display name is kept.
+         * snes_lobby_connect() calls this first, so a caller that sets the
+         * identity and then connects (cb_connect does) otherwise reached
+         * `welcome` with an empty title -- and a client with no title is one
+         * the server cannot scope, which came back as `no_game` the moment it
+         * tried to use the per-game server chat. */
+        strncpy(fgame, g_lc.filter_game_name, sizeof(fgame) - 1);
+        fgame[sizeof(fgame) - 1] = '\0';
+        strncpy(fver, g_lc.filter_game_version, sizeof(fver) - 1);
+        fver[sizeof(fver) - 1] = '\0';
         memset(&g_lc, 0, sizeof(g_lc));
         g_lc.fd = -1;
         strncpy(g_lc.display_name, dname, sizeof(g_lc.display_name) - 1);
+        strncpy(g_lc.filter_game_name, fgame, sizeof(g_lc.filter_game_name) - 1);
+        if (fver[0]) {
+            strncpy(g_lc.filter_game_version, fver,
+                    sizeof(g_lc.filter_game_version) - 1);
+        } else {
+            strncpy(g_lc.filter_game_version, SNES_GAME_VERSION,
+                    sizeof(g_lc.filter_game_version) - 1);
+            g_lc.filter_game_version[sizeof(g_lc.filter_game_version) - 1] = '\0';
+        }
         member_rtt_clear();
     }
 }

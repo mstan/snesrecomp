@@ -811,9 +811,15 @@ static void cb_set_url(void *ctx, const char *url)
 
 static int cb_connect(void *ctx)
 {
+  int rc;
   (void)ctx;
   snes_lobby_set_game_identity(game_name(), game_version());
-  return snes_lobby_connect(cb_default_url(NULL));
+  rc = snes_lobby_connect(cb_default_url(NULL));
+  /* connect() resets the client; the reset keeps the identity, and this
+   * re-apply is the second lock on the same door -- a lobby created or a
+   * chat sent with an empty title is invisible to everyone else. */
+  snes_lobby_set_game_identity(game_name(), game_version());
+  return rc;
 }
 
 static int cb_connected(void *ctx)
