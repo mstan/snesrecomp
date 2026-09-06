@@ -15,6 +15,8 @@
 #include "recomp_net/lan_lobby.h"
 #include "host_paths.h"
 #include "recomp_net/lan_direct.h"
+#include "recomp_net/lan_beacon.h"
+#include "recomp_net/chat_filter.h"
 #include "recomp_net/address.h"
 
 #if !defined(RECOMP_LAUNCHER) && !defined(SNES_HOST_HAS_RECOMP_UI)
@@ -51,6 +53,17 @@ static RecompLauncherCNetplayLaunch g_lan_launch;
 static RNetLanLobby g_lan_room; /* host + direct-guest in-memory seat state */
 static RNetLanDirectHost *g_direct_host;
 static RNetLanDirectGuest *g_direct_guest;
+/* LAN discovery across machines. The registry file below is visible to one
+ * machine only, and a remote peer used to reach a LAN room solely by typing
+ * its IP into Join Direct -- discovery "worked on the same machine, not on
+ * the other PC". While hosting, the room is also announced by UDP broadcast
+ * on RNET_LAN_BEACON_DEFAULT_PORT (one datagram a second); every launcher
+ * listens and lists what it hears beside the file row. The row's lobby_id is
+ * the same "lan:<ip:port>" Join Direct builds, so joining it takes the
+ * JOIN_REQ path that already exists -- the beacon only replaces the typing. */
+static RNetLanBeacon *g_beacon_pub;    /* host: announces g_lan_room */
+static RNetLanBeacon *g_beacon_listen; /* browser: what other hosts announce */
+static RNetLanBeaconRoom g_beacon_last; /* what the publisher was last told */
 static char g_direct_peer_endpoint[64]; /* guest launch peer = typed IP:port */
 static char g_lobby_url[256];
 static char g_resume_endpoint[64];
@@ -106,6 +119,9 @@ static const char *lan_path(void)
  * the pump and by the one place every LAN room teardown passes through. */
 static void lan_chat_clear(void);
 static void lan_chat_drain(void);
+/* Defined below; the beacon filter needs the identity before then. */
+static const char *game_name(void);
+static const char *game_version(void);
 
 /* LAN seat swap: the two-seat room has one trade. incoming = the guest asked
  * the host (host side); outgoing = 0 idle, 1 waiting, 2 accepted, -1 declined
@@ -117,6 +133,10 @@ static void close_direct_sockets(void)
 {
   rnet_lan_direct_host_close(&g_direct_host);
   rnet_lan_direct_guest_close(&g_direct_guest);
+  /* The announce follows the waiting-room socket: a room nobody can JOIN_REQ
+   * (match running, host gone) must not keep appearing in browsers. */
+  rnet_lan_beacon_close(&g_beacon_pub);
+  memset(&g_beacon_last, 0, sizeof(g_beacon_last));
   g_lan_swap_incoming = 0;
   g_lan_swap_outgoing = 0;
   /* The room is over, so its log is too. Every LAN teardown -- leave, kick,
@@ -128,10 +148,152 @@ static void close_direct_sockets(void)
 static int publish_lan_room(void)
 {
   /* The seated guest hears every room change over its socket; the file is
-   * for browsers on this machine. */
+   * for browsers on this machine; the beacon (beacon_publish_step, from the
+   * pump) is for browsers on the other machines. */
   if (g_direct_host)
     (void)rnet_lan_direct_host_notify_room(g_direct_host, &g_lan_room);
   return rnet_lan_lobby_publish(lan_path(), &g_lan_room) == RNET_LAN_LOBBY_OK;
+}
+
+/* The beacon's view of g_lan_room. lobby_id is exactly the Join Direct id so
+ * cb_join needs no new case. */
+static void beacon_room_from_lan(RNetLanBeaconRoom *out)
+{
+  memset(out, 0, sizeof(*out));
+  snprintf(out->lobby_id, sizeof(out->lobby_id), "lan:%s", g_lan_room.endpoint);
+  snprintf(out->endpoint, sizeof(out->endpoint), "%s", g_lan_room.endpoint);
+  snprintf(out->game_name, sizeof(out->game_name), "%s", g_lan_room.game);
+  snprintf(out->game_version, sizeof(out->game_version), "%s",
+           g_lan_room.game_version);
+  snprintf(out->room_name, sizeof(out->room_name), "%s", g_lan_room.name);
+  out->has_password = g_lan_room.password[0] != '\0';
+  out->player_count = g_lan_room.joiner_name[0] ? 2 : 1;
+  out->max_slots = 2;
+  out->started = g_lan_room.started;
+}
+
+/* Host, once per pump: announce the room while its waiting-room socket is
+ * open. Opening is lazy and retried, so a transient socket failure costs one
+ * second, not the session. The publisher refuses a non-private endpoint
+ * (127.0.0.1 from a LAN-only room, a WAN address): that is the beacon's
+ * RFC1918 rule, and such a room is not reachable by broadcast anyway. */
+static void beacon_publish_step(void)
+{
+  RNetLanBeaconRoom room;
+  if (!g_hosting_lan || !g_direct_host || !g_lan_room.endpoint[0])
+    return;
+  if (!g_beacon_pub) {
+    if (rnet_lan_beacon_publish_open(&g_beacon_pub, 0) != 0) {
+      static int s_said;
+      if (!s_said++)
+        fprintf(stderr, "snes_host_lobby: LAN discovery beacon could not "
+                        "open a UDP socket; other machines will not list "
+                        "this room (Join Direct still works)\n");
+      return;
+    }
+  }
+  beacon_room_from_lan(&room);
+  if (memcmp(&room, &g_beacon_last, sizeof(room)) != 0) {
+    g_beacon_last = room;
+    if (rnet_lan_beacon_publish_set_room(g_beacon_pub, &room) != 0) {
+      static int s_said;
+      if (!s_said++)
+        fprintf(stderr, "snes_host_lobby: LAN room endpoint %s is not a "
+                        "private IPv4 address; not announcing it to the LAN\n",
+                room.endpoint);
+      return;
+    }
+    fprintf(stderr, "snes_host_lobby: announcing LAN room %s on UDP %d\n",
+            room.endpoint, RNET_LAN_BEACON_DEFAULT_PORT);
+  }
+  (void)rnet_lan_beacon_publish_tick(g_beacon_pub);
+}
+
+/* Browser, once per pump: hear other hosts. Opened lazily on the first pump
+ * (the netplay page), kept for the launcher's life; the cache forgets a room
+ * five seconds after its last announce, so a closed room disappears on its
+ * own. Two launchers on one machine share the port (reuseaddr). */
+static void beacon_listen_step(void)
+{
+  if (!g_beacon_listen) {
+    static int s_tried;
+    if (s_tried)
+      return;  /* one failure is a firewall / port conflict, not a retry case */
+    s_tried = 1;
+    if (rnet_lan_beacon_listen_open(&g_beacon_listen, 0) != 0) {
+      fprintf(stderr, "snes_host_lobby: LAN discovery listener could not bind "
+                      "UDP %d; rooms hosted on other machines will not be "
+                      "listed (Join Direct still works)\n",
+              RNET_LAN_BEACON_DEFAULT_PORT);
+      return;
+    }
+  }
+  (void)rnet_lan_beacon_listen_pump(g_beacon_listen);
+}
+
+/* A heard room is listed when it is this game at this version (the same
+ * filter the registry read applies, and what JOIN_REQ will insist on), is
+ * not started, and is not the room this launcher already shows another way:
+ * its own hosted room, or the same-machine registry row. `skip_endpoint` is
+ * that registry row's endpoint (or empty). */
+static int beacon_row_listed(const RNetLanBeaconRoom *room,
+                             const char *skip_endpoint)
+{
+  if (strcmp(room->game_name, game_name()) != 0)
+    return 0;
+  if (room->game_version[0] && strcmp(room->game_version, game_version()) != 0)
+    return 0;
+  if (room->started)
+    return 0;
+  if (g_hosting_lan && strcmp(room->endpoint, g_lan_room.endpoint) == 0)
+    return 0;
+  if (skip_endpoint && skip_endpoint[0] &&
+      strcmp(room->endpoint, skip_endpoint) == 0)
+    return 0;
+  return 1;
+}
+
+/* index-th listed beacon row (see beacon_row_listed). 1 = filled. */
+static int fill_beacon_row(int index, const char *skip_endpoint,
+                           RecompLauncherCNetplayLobby *out)
+{
+  RNetLanBeaconRoom room;
+  int i;
+  int n;
+  if (!g_beacon_listen || index < 0)
+    return 0;
+  n = rnet_lan_beacon_count(g_beacon_listen);
+  for (i = 0; i < n; ++i) {
+    if (!rnet_lan_beacon_get(g_beacon_listen, i, &room))
+      break;
+    if (!beacon_row_listed(&room, skip_endpoint))
+      continue;
+    if (index-- > 0)
+      continue;
+    if (!out)
+      return 1;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->lobby_id, sizeof(out->lobby_id), "%s", room.lobby_id);
+    snprintf(out->name, sizeof(out->name), "LAN - %s",
+             room.room_name[0] ? room.room_name : room.endpoint);
+    snprintf(out->game_name, sizeof(out->game_name), "%s", room.game_name);
+    snprintf(out->game_version, sizeof(out->game_version), "%s",
+             room.game_version[0] ? room.game_version : game_version());
+    out->player_count = room.player_count > 0 ? room.player_count : 1;
+    out->max_slots = room.max_slots >= 2 ? room.max_slots : 2;
+    out->has_password = room.has_password;
+    out->latency_ms = -1;
+    return 1;
+  }
+  return 0;
+}
+
+static int beacon_row_count(const char *skip_endpoint)
+{
+  int n = 0;
+  while (fill_beacon_row(n, skip_endpoint, NULL))
+    ++n;
+  return n;
 }
 
 static const char *game_name(void)
@@ -558,6 +720,7 @@ int snes_host_lobby_init(const SnesHostLobbyIdentity *id,
 void snes_host_lobby_shutdown(void)
 {
   snes_host_lobby_disconnect();
+  rnet_lan_beacon_close(&g_beacon_listen);
   g_inited = 0;
 }
 
@@ -667,6 +830,8 @@ static void cb_pump(void *ctx)
   host_caps_watch_step();
   mod_set_sync_step();
   lan_chat_drain();
+  beacon_listen_step();
+  beacon_publish_step();
   if (g_hosting_lan && g_direct_host) {
     int rtt = -1;
     if (rnet_lan_direct_host_pump(g_direct_host, &g_lan_room, &rtt))
@@ -727,11 +892,17 @@ static void cb_request_list(void *ctx)
   snes_lobby_request_list();
 }
 
+/* The list is: hub rows, then the same-machine registry row (if any), then
+ * the rooms heard on the LAN beacon. The registry row's endpoint is passed to
+ * the beacon filter so a host on THIS machine is listed once, not twice. */
 static int cb_list_count(void *ctx)
 {
   RecompLauncherCNetplayLobby lan;
+  int have_lan;
   (void)ctx;
-  return snes_lobby_list_count() + (fill_lan_row(&lan) ? 1 : 0);
+  have_lan = fill_lan_row(&lan);
+  return snes_lobby_list_count() + (have_lan ? 1 : 0) +
+         beacon_row_count(have_lan ? lan.lobby_id + 4 : "");
 }
 
 static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
@@ -742,8 +913,19 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   if (!out || index < 0)
     return 0;
   remote_count = snes_lobby_list_count();
-  if (index >= remote_count)
-    return index == remote_count ? fill_lan_row(out) : 0;
+  if (index >= remote_count) {
+    RecompLauncherCNetplayLobby lan;
+    int have_lan = fill_lan_row(&lan);
+    index -= remote_count;
+    if (have_lan) {
+      if (index == 0) {
+        *out = lan;
+        return 1;
+      }
+      --index;
+    }
+    return fill_beacon_row(index, have_lan ? lan.lobby_id + 4 : "", out);
+  }
   if (!snes_lobby_list_get(index, &row))
     return 0;
   memset(out, 0, sizeof(*out));
@@ -1072,6 +1254,9 @@ static void lan_chat_push(const char *player_id, const char *from,
   snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
   snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
   snprintf(m->text, sizeof(m->text), "%s", text);
+  /* A LAN room has no server to mask for it: every peer masks the line as
+   * it lands in the ring, the host included. */
+  (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
   /* On LAN a player id is whatever each side calls itself, so "mine" is
    * decided by the display name the host stamped -- the only identity both
    * sides agree on here. */
