@@ -2214,7 +2214,8 @@ int snes_lobby_seat_swap_request(int target_slot)
 {
     char msg[96];
     if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
-    if (target_slot < 0 || target_slot >= SNES_LOBBY_MAX_PLAYERS) return -1;
+    /* A player seat or a gallery seat: the occupant of either can be asked. */
+    if (!snes_lobby_seat_valid(target_slot)) return -1;
     if (g_lc.swap_out == 1) return -1; /* one ask at a time */
     snprintf(msg, sizeof(msg),
              "{\"op\":\"seat_swap_request\",\"target_slot\":%d}", target_slot);
