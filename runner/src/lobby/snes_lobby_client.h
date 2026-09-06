@@ -47,7 +47,21 @@ typedef struct SnesLobbyRow {
     int      has_password;
     /* Host's country (alpha-2) from the server's GeoIP; "" unknown. */
     char     host_country[4];
+    /* Gallery: 0 = none; else how many watch out of how many seats. */
+    int      allow_spectators;
+    int      max_spectators;
+    int      spectator_count;
 } SnesLobbyRow;
+
+/* One player connected to the hub (the lobby_list `players` array). */
+typedef struct SnesLobbyOnlinePlayer {
+    char display_name[SNES_LOBBY_NAME_LEN];
+    char country[4];
+    char lobby_id[SNES_LOBBY_ID_LEN];
+    char lobby_name[SNES_LOBBY_NAME_LEN];
+    int  hosting;
+} SnesLobbyOnlinePlayer;
+#define SNES_LOBBY_MAX_ONLINE 64
 
 /* One lobby chat line.
  *
@@ -242,6 +256,9 @@ const char *snes_lobby_game_version(void);
 void snes_lobby_request_list(void);
 int  snes_lobby_list_count(void);
 int  snes_lobby_list_get(int index, SnesLobbyRow *out);
+/* Players connected to the hub, refreshed with every lobby_list. */
+int  snes_lobby_online_count(void);
+int  snes_lobby_online_get(int index, SnesLobbyOnlinePlayer *out);
 
 /*
  * Create lobby. host_bind e.g. "0.0.0.0:7777". password may be NULL/empty.
