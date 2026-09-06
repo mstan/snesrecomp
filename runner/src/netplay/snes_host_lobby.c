@@ -88,10 +88,19 @@ static const char *lan_path(void)
              : "netplay_lan_lobby.txt";
 }
 
+/* Defined with the rest of the chat plumbing further down; needed up here by
+ * the pump and by the one place every LAN room teardown passes through. */
+static void lan_chat_clear(void);
+static void lan_chat_drain(void);
+
 static void close_direct_sockets(void)
 {
   rnet_lan_direct_host_close(&g_direct_host);
   rnet_lan_direct_guest_close(&g_direct_guest);
+  /* The room is over, so its log is too. Every LAN teardown -- leave, kick,
+   * host close -- passes through here, which is why the clear lives here
+   * rather than at each of those call sites. */
+  lan_chat_clear();
 }
 
 static int publish_lan_room(void)
@@ -631,6 +640,7 @@ static void cb_pump(void *ctx)
   dl_queue_step();
   host_caps_watch_step();
   mod_set_sync_step();
+  lan_chat_drain();
   if (g_hosting_lan && g_direct_host) {
     int rtt = -1;
     if (rnet_lan_direct_host_pump(g_direct_host, &g_lan_room, &rtt))
@@ -942,16 +952,107 @@ static int cb_member_get(void *ctx, int index,
 }
 
 /* ---- lobby chat ---------------------------------------------------------
- * Online only. A LAN / direct-IP room has no server to echo a line off, and
- * the UI never appends its own send -- so on LAN chat_send would accept a
- * line that never came back and the box would swallow everything typed into
- * it. Reporting no chat there is the honest answer. */
+ *
+ * Two transports, one discipline. Online the lobby server echoes every line
+ * back and that echo is the copy we keep. On LAN the HOST plays the server's
+ * part: a guest sends its line to the host, keeps nothing locally, and the
+ * host stamps the seat name on it and echoes it back. Either way the UI never
+ * appends its own send, so both peers hold the same lines in the same order.
+ *
+ * Direct-IP only on the LAN side. The same-machine file registry has no
+ * channel between the two instances to carry a line over, so a room seated
+ * through it reports no chat rather than a box that swallows what you type. */
+#define SNES_LAN_CHAT_RING 64
+static SnesLobbyChatMsg g_lan_chat[SNES_LAN_CHAT_RING];
+static int g_lan_chat_head;
+static int g_lan_chat_count;
+static uint32_t g_lan_chat_seq;
+
+static void lan_chat_clear(void)
+{
+  g_lan_chat_head = 0;
+  g_lan_chat_count = 0;
+  /* seq keeps counting across rooms -- see snes_lobby_chat_clear. */
+}
+
+static void lan_chat_push(const char *player_id, const char *from,
+                          const char *text)
+{
+  SnesLobbyChatMsg *m;
+  int idx;
+  if (!text || !text[0])
+    return;
+  if (g_lan_chat_count < SNES_LAN_CHAT_RING) {
+    idx = (g_lan_chat_head + g_lan_chat_count) % SNES_LAN_CHAT_RING;
+    g_lan_chat_count++;
+  } else {
+    idx = g_lan_chat_head;
+    g_lan_chat_head = (g_lan_chat_head + 1) % SNES_LAN_CHAT_RING;
+  }
+  m = &g_lan_chat[idx];
+  memset(m, 0, sizeof(*m));
+  snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+  snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+  snprintf(m->text, sizeof(m->text), "%s", text);
+  /* On LAN a player id is whatever each side calls itself, so "mine" is
+   * decided by the display name the host stamped -- the only identity both
+   * sides agree on here. */
+  {
+    const char *me = snes_lobby_display_name();
+    m->is_local = (me && me[0] && m->from[0] && strcmp(m->from, me) == 0) ? 1 : 0;
+  }
+  m->seq = ++g_lan_chat_seq;
+}
+
+/* Drain whatever the direct-IP link delivered since the last pump. */
+static void lan_chat_drain(void)
+{
+  RNetLanChatLine line;
+  if (g_hosting_lan && g_direct_host) {
+    while (rnet_lan_direct_host_take_chat(g_direct_host, &line))
+      lan_chat_push(line.player_id, line.from, line.text);
+  } else if (g_joined_lan && g_joined_direct && g_direct_guest) {
+    while (rnet_lan_direct_guest_take_chat(g_direct_guest, &line))
+      lan_chat_push(line.player_id, line.from, line.text);
+  }
+}
+
+/* 1 when this LAN room can actually carry a line between the two peers. */
+static int lan_chat_available(void)
+{
+  if (g_hosting_lan)
+    return g_direct_host != NULL;
+  if (g_joined_lan)
+    return g_joined_direct && g_direct_guest != NULL;
+  return 0;
+}
 
 static int cb_chat_send(void *ctx, const char *text)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan)
-    return -1;
+  if (g_hosting_lan || g_joined_lan) {
+    if (!lan_chat_available())
+      return -1;
+    if (g_hosting_lan) {
+      /* The host keeps its own line and sends it on -- it is the authority
+       * here, exactly as the lobby server is online. */
+      const char *me = snes_lobby_display_name();
+      return rnet_lan_direct_host_send_chat(g_direct_host, me ? me : "",
+                                            me ? me : "Host",
+                                            text) == RNET_LAN_DIRECT_OK
+                 ? 0
+                 : -1;
+    }
+    /* Guest: send and keep nothing. The host's echo is the copy we keep, so
+     * the two logs cannot disagree about order. */
+    {
+      const char *me = snes_lobby_display_name();
+      return rnet_lan_direct_guest_send_chat(g_direct_guest, me ? me : "",
+                                             text) == RNET_LAN_DIRECT_OK
+                 ? 0
+                 : -1;
+    }
+  }
   return snes_lobby_send_chat(text);
 }
 
@@ -959,7 +1060,7 @@ static int cb_chat_count(void *ctx)
 {
   (void)ctx;
   if (g_hosting_lan || g_joined_lan)
-    return 0;
+    return lan_chat_available() ? g_lan_chat_count : 0;
   return snes_lobby_chat_count();
 }
 
@@ -971,10 +1072,13 @@ static int cb_chat_get(void *ctx, int index,
   if (!out)
     return 0;
   memset(out, 0, sizeof(*out));
-  if (g_hosting_lan || g_joined_lan)
+  if (g_hosting_lan || g_joined_lan) {
+    if (!lan_chat_available() || index < 0 || index >= g_lan_chat_count)
+      return 0;
+    msg = g_lan_chat[(g_lan_chat_head + index) % SNES_LAN_CHAT_RING];
+  } else if (!snes_lobby_chat_get(index, &msg)) {
     return 0;
-  if (!snes_lobby_chat_get(index, &msg))
-    return 0;
+  }
   snprintf(out->from, sizeof(out->from), "%s", msg.from);
   snprintf(out->text, sizeof(out->text), "%s", msg.text);
   out->is_local = msg.is_local;
