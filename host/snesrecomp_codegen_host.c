@@ -1471,6 +1471,161 @@ static int host_rebuild_game(const char* rom_path, char* out_exe_path,
 #endif
 }
 
+/* ── Setup build → playable build handoff ────────────────────────────────
+ *
+ * THE BUG THIS EXISTS TO PREVENT, in the player's words: "First launch seems
+ * fine, game loads, if I close it, I cannot open it again."
+ *
+ * A setup pack contains TWO executables once the wizard has run: the setup
+ * host the player unzipped and clicks, and the playable one the rebuild puts
+ * in build/. The wizard's own relaunch (the Windows helper .cmd, execv below)
+ * starts the playable one, so the first launch is right. Every launch after
+ * that is the player clicking the same icon they always click -- the setup
+ * host -- and the setup host had no idea it was no longer the product:
+ * `needs_setup` is decided by whether src/gen/dispatch_v2.c exists ON DISK,
+ * which the first rebuild made true forever. So the wizard stepped aside, Play
+ * booted a guest, and SnesInit died with "This is a setup build with no
+ * recompiled game code."
+ *
+ * Sources on disk say what the TREE has. They say nothing about what THIS
+ * BINARY has, and that is the question a setup host has to answer about
+ * itself. So:
+ *
+ *   - a rebuilt binary exists  -> start it and get out of the way, which is
+ *     what the player meant by double-clicking the icon, and
+ *   - it does not             -> demand the wizard no matter what src/gen
+ *     holds, because a tree full of generated C still cannot be played by a
+ *     binary that was compiled without it.
+ *
+ * Only ever compiled into a setup build. A playable build IS the product and
+ * must never hand off to anything -- including to itself, which is what a
+ * runtime-only check would have done the moment a stale build/ existed beside
+ * a playable exe run from the source tree.
+ *
+ * Loop safety, belt and braces: the child is marked with
+ * SNESRECOMP_SETUP_HANDOFF=1 and refuses to hand off again (so a build/ that
+ * somehow also contains a setup build starts, says "rebuild first", and stops
+ * rather than ping-ponging), and a target that is this very file is skipped.
+ * SNESRECOMP_NO_HANDOFF=1 turns the whole thing off for anyone who wants the
+ * setup host itself. */
+#if defined(SNESRECOMP_SETUP_HOST)
+static int env_flag_set(const char* name) {
+    const char* v = getenv(name);
+    return v && v[0] && v[0] != '0';
+}
+
+static int same_file_path(const char* a, const char* b) {
+    /* Textual, deliberately: this is a loop guard, not a security check, and
+     * the two paths it compares are both built by this file. */
+    if (!a || !b || !a[0] || !b[0])
+        return 0;
+#if defined(_WIN32)
+    return _stricmp(a, b) == 0;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
+/* 1 when `a` was written after `b`, 0 when it was not or either is unreadable
+ * -- "do not know" answers the same as "no", because every caller here treats
+ * a yes as a reason to stop. */
+static int file_is_newer(const char* a, const char* b) {
+#if defined(_WIN32)
+    WIN32_FILE_ATTRIBUTE_DATA fa, fb;
+    if (!GetFileAttributesExA(a, GetFileExInfoStandard, &fa) ||
+        !GetFileAttributesExA(b, GetFileExInfoStandard, &fb))
+        return 0;
+    return CompareFileTime(&fa.ftLastWriteTime, &fb.ftLastWriteTime) > 0;
+#else
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0)
+        return 0;
+    if (sa.st_mtime != sb.st_mtime)
+        return sa.st_mtime > sb.st_mtime;
+    return 0;
+#endif
+}
+
+/* Returns only when the handoff did NOT happen. */
+static void handoff_to_rebuilt_or_return(void) {
+    char self[1100];
+    int have_self = 0;
+
+    if (env_flag_set("SNESRECOMP_NO_HANDOFF") ||
+        env_flag_set("SNESRECOMP_SETUP_HANDOFF"))
+        return;
+    if (!g_exe_path[0] || !path_is_file(g_exe_path))
+        return;
+    if (g_exe_dir[0]) {
+        char exe_name[300];
+#if defined(_WIN32)
+        snprintf(exe_name, sizeof(exe_name), "%s.exe", g_cfg->exe_basename);
+#else
+        snprintf(exe_name, sizeof(exe_name), "%s", g_cfg->exe_basename);
+#endif
+        have_self = join_path(self, sizeof(self), g_exe_dir, exe_name);
+        if (have_self && same_file_path(self, g_exe_path))
+            return;   /* build/ IS where we are running from */
+    }
+    /* An UPDATE, not a second launch: the player unpacked a newer pack over
+     * the folder, so the setup binary is newer than the game the last rebuild
+     * produced. Handing off there would run the old build forever and the
+     * update would look like it did nothing. Fall through to the wizard
+     * instead -- and a false positive costs one no-op rebuild, because the
+     * mtimes a zip carries are the packaging machine's. */
+    if (have_self && file_is_newer(self, g_exe_path)) {
+        fprintf(stderr,
+                "snesrecomp-codegen: %s is newer than the rebuilt game in "
+                "build/ — rebuild before playing, or the update does nothing\n",
+                self);
+        return;
+    }
+
+    fprintf(stderr,
+            "snesrecomp-codegen: this is the setup build; the rebuilt game is "
+            "%s — starting it instead\n", g_exe_path);
+
+#if defined(_WIN32)
+    {
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        char cmd[1536];
+        memset(&si, 0, sizeof(si));
+        memset(&pi, 0, sizeof(pi));
+        si.cb = sizeof(si);
+        SetEnvironmentVariableA("SNESRECOMP_SETUP_HANDOFF", "1");
+        snprintf(cmd, sizeof(cmd), "\"%s\" --launcher", g_exe_path);
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL,
+                            g_project_root[0] ? g_project_root : NULL, &si,
+                            &pi)) {
+            /* Not fatal: fall through and let the wizard explain itself. */
+            fprintf(stderr, "snesrecomp-codegen: could not start it (%lu) — "
+                            "staying in the setup host\n",
+                    (unsigned long)GetLastError());
+            return;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        ExitProcess(0);
+    }
+#else
+    {
+        char* args[3];
+        setenv("SNESRECOMP_SETUP_HANDOFF", "1", 1);
+        if (g_project_root[0] && chdir(g_project_root) != 0) {
+            /* Nothing here needs the cwd badly enough to abort over it. */
+        }
+        args[0] = g_exe_path;
+        args[1] = (char*)"--launcher";
+        args[2] = NULL;
+        execv(g_exe_path, args);
+        perror("snesrecomp-codegen: could not start the rebuilt game");
+        /* execv only returns on failure; carry on as the setup host. */
+    }
+#endif
+}
+#endif /* SNESRECOMP_SETUP_HOST */
+
 void snesrecomp_codegen_host_relaunch_or_exit(const char* rom_path) {
     char exe[512];
     if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
@@ -1672,4 +1827,18 @@ void snesrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
         gi->needs_setup = 1;
         gi->prepare_required_before_continue = 1;
     }
+
+#if defined(SNESRECOMP_SETUP_HOST)
+    /* Does not return when a rebuilt binary is there to run. Placed last so
+     * the handoff happens with every path resolved, and before the launcher
+     * window opens -- the player double-clicked the icon to play, not to look
+     * at a setup screen they already completed. */
+    if (can_rebuild)
+        handoff_to_rebuilt_or_return();
+    /* Still here: this binary cannot run the game, whatever src/gen holds.
+     * Saying so through the wizard is the whole point -- without it the
+     * launcher offers Play and SnesInit dies on the player. */
+    gi->needs_setup = 1;
+    gi->prepare_required_before_continue = 1;
+#endif
 }
