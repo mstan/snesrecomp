@@ -613,13 +613,29 @@ void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
 #ifndef SNESRECOMP_LLE_BOUNCE_DEFAULT
 #define SNESRECOMP_LLE_BOUNCE_DEFAULT 1
 #endif
+/* Host-side override, for a mod whose behavior lives in @hook prologues
+ * injected into generated bodies: those only execute when the scheduler
+ * bounces, so a build defaulting to interpret-everything silently disables
+ * the mod. The host asserts this per frame; -1 clears it.
+ *
+ * Env still wins. SNESRECOMP_LLE_BOUNCE is the co-sim differential lever
+ * (bounced vs interpreted must be guest-state bit-exact), and a host that
+ * could override it would make the =0 side of that A/B unreachable. */
+static int s_lle_bounce_override = -1;
+
+void interp_bridge_set_bounce_override(int enabled) {
+    s_lle_bounce_override = (enabled < 0) ? -1 : (enabled != 0);
+}
+
 static int lle_yield_bounce_enabled(void) {
-    static int v = -1;
-    if (v < 0) {
+    static int env_v = -2;  /* -2 unread, -1 unset, else 0/1 */
+    if (env_v == -2) {
         const char *e = getenv("SNESRECOMP_LLE_BOUNCE");
-        v = (e && e[0]) ? (e[0] != '0') : SNESRECOMP_LLE_BOUNCE_DEFAULT;
+        env_v = (e && e[0]) ? (e[0] != '0') : -1;
     }
-    return v;
+    if (env_v >= 0) return env_v;
+    if (s_lle_bounce_override >= 0) return s_lle_bounce_override;
+    return SNESRECOMP_LLE_BOUNCE_DEFAULT;
 }
 
 /* Target-scoped LLE differential: keep the rich scheduler/AOT bounce enabled

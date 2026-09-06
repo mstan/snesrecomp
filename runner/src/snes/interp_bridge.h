@@ -70,6 +70,16 @@ int interp_bridge_run(CpuState *cpu, uint32_t entry_pc24);
  * yield after one frame's slot walk — when it reaches yield_pc (its vblank-wait
  * spin) with the flag byte at flag_addr cleared. Tasks it dispatches bounce to
  * compiled bodies via the paired ABI. Returns 1 on clean yield, 0 on cap bail. */
+/* Override the interp->AOT bounce switch from the host, for a mod whose
+ * behavior lives in @hook prologues injected into generated bodies (those
+ * only run when the scheduler bounces). Pass 1/0 to force, -1 to clear and
+ * fall back to SNESRECOMP_LLE_BOUNCE_DEFAULT. Cheap; intended to be asserted
+ * once per frame before interp_bridge_run_scheduler.
+ *
+ * SNESRECOMP_LLE_BOUNCE still wins when set: it is the co-sim A/B lever and
+ * must stay able to select interpret-everything. */
+void interp_bridge_set_bounce_override(int enabled);
+
 int interp_bridge_run_scheduler(CpuState *cpu, uint32_t entry_pc24,
                                 uint32_t yield_pc, uint16_t flag_addr);
 
