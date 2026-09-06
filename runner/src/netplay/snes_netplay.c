@@ -129,6 +129,7 @@ int  snes_netplay_is_running(void) { return 0; }
 const char *snes_netplay_transport_name(void) { return "none"; }
 int  snes_netplay_ice_failed(void) { return 0; }
 int  snes_netplay_local_slot(void) { return -1; }
+int  snes_netplay_is_spectator(void) { return 0; }
 int  snes_netplay_slot_count(void) { return 2; }
 int  snes_netplay_input_player(void) { return 0; }
 uint32_t snes_netplay_sim_tick(void) { return 0; }
@@ -208,6 +209,7 @@ typedef struct {
     int          active;
     int          slot_count;
     int          local_slot;
+    int          spectator;
     int          input_player; /* resolved 0/1 */
     int          needs_advance;
     int          latched_for_tick;
@@ -531,6 +533,11 @@ int snes_netplay_local_slot(void)
     return snes_netplay_active() ? g_np.local_slot : -1;
 }
 
+int snes_netplay_is_spectator(void)
+{
+    return (snes_netplay_active() && g_np.spectator) ? 1 : 0;
+}
+
 int snes_netplay_input_player(void)
 {
     return snes_netplay_active() ? g_np.input_player : 0;
@@ -647,9 +654,33 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
             return -1;
         }
         rcfg.slot_count = (rnet_u8)seats;
-        slot = cfg->local_slot < 0 ? 0 : cfg->local_slot;
-        if (slot >= seats) slot = seats - 1;
-        rcfg.local_slot = (rnet_u8)slot;
+        if (cfg->spectator) {
+            /* No seat. local_slot == slot_count is the observer sentinel:
+             * every "is this my seat?" test in the session and the rollback
+             * answers no, so this build resolves every slot from the wire and
+             * contributes to none.
+             *
+             * The wire id is a DIFFERENT number -- a slot in the relay's
+             * namespace, above its player count, which is what makes the relay
+             * refuse to forward anything sent from here. Clamping it into a
+             * player slot would be the one failure that desyncs a live match,
+             * so a spectator without one refuses to start. */
+            if (cfg->spectator_wire_slot <= 0 ||
+                cfg->spectator_wire_slot < seats ||
+                cfg->spectator_wire_slot > 0xff) {
+                fprintf(stderr,
+                        "snes_netplay: spectator without a usable relay slot "
+                        "(%d, seats=%d) — refusing to start\n",
+                        cfg->spectator_wire_slot, seats);
+                return -1;
+            }
+            rcfg.local_slot = (rnet_u8)seats;
+            rcfg.wire_slot = (rnet_u8)cfg->spectator_wire_slot;
+        } else {
+            slot = cfg->local_slot < 0 ? 0 : cfg->local_slot;
+            if (slot >= seats) slot = seats - 1;
+            rcfg.local_slot = (rnet_u8)slot;
+        }
     }
     rcfg.input_delay = (rnet_u8)(cfg->input_delay < 0 ? 0
                                 : (cfg->input_delay > 20 ? 20 : cfg->input_delay));
@@ -692,7 +723,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
         g_np.ice_bind_addr[0] = '\0';
 
         rnet_ice_config_init_defaults(&ice);
-        ice.controlling = (rcfg.local_slot == 0) ? 1u : 0u;
+        /* A spectator is never the offerer: its sentinel slot is not 0, so
+         * this already answers no. Stated rather than left to arithmetic. */
+        ice.controlling = (!cfg->spectator && rcfg.local_slot == 0) ? 1u : 0u;
 
         /* Prefer a concrete LAN IPv4 for host candidates (not 0.0.0.0). */
         naddr = rnet_ipv4_enumerate(addrs, sizeof(addrs) / sizeof(addrs[0]));
@@ -841,6 +874,7 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.active = 1;
     g_np.slot_count = (int)rcfg.slot_count;
     g_np.local_slot = (int)rcfg.local_slot;
+    g_np.spectator = cfg->spectator ? 1 : 0;
     g_np.input_player = in_player;
     g_np.staged_valid = 0;
     g_np.needs_advance = 0;
@@ -898,6 +932,12 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     }
     g_diag_file_session = 0;
     g_diag_last_write_ms = 0;
+
+    if (g_np.spectator)
+        fprintf(stderr,
+                "snes_netplay: SPECTATING - simulating %d seat(s) from the "
+                "wire, relay slot %u, contributing no input\n",
+                g_np.slot_count, (unsigned)rcfg.wire_slot);
 
     /* Guest: sandbox SRAM/savestate paths so host sync never touches personal saves. */
     if (g_np.local_slot != 0) {

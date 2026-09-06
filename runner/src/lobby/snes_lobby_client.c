@@ -101,6 +101,7 @@ int  snes_lobby_spectator_count(void) { return 0; }
 int  snes_lobby_local_is_spectator(void) { return 0; }
 int  snes_lobby_spectator_slot_base(void) { return SNES_LOBBY_SPECTATOR_SLOT_BASE; }
 int  snes_lobby_spectator_slot(int index) { (void)index; return -1; }
+int  snes_lobby_local_wire_slot(void) { return -1; }
 int  snes_lobby_member_get(int index, SnesLobbyMember *out) { (void)index; (void)out; return 0; }
 int  snes_lobby_member_latency_ms(int slot) { (void)slot; return -1; }
 int  snes_lobby_member_is_host(const SnesLobbyMember *member)
@@ -1115,6 +1116,9 @@ static void parse_slots_array(const char *json)
         json_get_int(json, "max_spectators", g_lc.join.max_spectators);
     g_lc.join.spectator_count =
         json_get_int(json, "spectator_count", g_lc.join.spectator_count);
+    g_lc.join.spectator_relay_base =
+        json_get_int(json, "spectator_relay_base",
+                     g_lc.join.spectator_relay_base);
     g_lc.join.spectator_slot_base =
         json_get_int(json, "spectator_slot_base",
                      g_lc.join.spectator_slot_base > 0
@@ -2166,6 +2170,17 @@ int snes_lobby_spectator_slot(int index)
 {
     if (index < 0 || index >= SNES_LOBBY_MAX_SPECTATORS) return -1;
     return snes_lobby_spectator_slot_base() + index;
+}
+
+int snes_lobby_local_wire_slot(void)
+{
+    int gallery_index;
+    if (!g_lc.join.local_is_spectator) return -1;
+    if (g_lc.join.spectator_relay_base <= 0) return -1;
+    gallery_index = g_lc.join.local_slot - snes_lobby_spectator_slot_base();
+    if (gallery_index < 0 || gallery_index >= SNES_LOBBY_MAX_SPECTATORS)
+        return -1;
+    return g_lc.join.spectator_relay_base + gallery_index;
 }
 
 int snes_lobby_member_count(void)

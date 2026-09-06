@@ -47,6 +47,16 @@ typedef struct SnesNetplayConfig {
      * seat count is part of the settled session requirement
      * (recomp-ai-rules/NETPLAY.md §4). Env: SNES_NET_SLOTS. */
     int         slot_count;
+    /* 1 = spectator: simulate the match, display it, contribute nothing.
+     * The session owns no seat (RNetConfig.local_slot == slot_count) and is
+     * never sampled for input, so the local pads never enter the pipeline at
+     * all -- which is the only version of "cannot affect the game" that
+     * survives a spectator with a controller in their hands. */
+    int         spectator;
+    /* Spectator only: slot in the input relay's namespace, at or above the
+     * relay's player count. Required when spectator is set; the relay uses it
+     * to refuse to forward anything this peer sends. */
+    int         spectator_wire_slot;
     int         input_player;  /* 0/1 host device index; -1 = auto */
     int         input_delay;   /* frames; default 2 */
     /* Invent runway cap (P) for rollback; 0 = engine default. The lobby
@@ -100,6 +110,9 @@ const char *snes_netplay_transport_name(void);
 /* 1 when ICE transport reached FAILED (STUN/TURN path dead). */
 int  snes_netplay_ice_failed(void);
 int  snes_netplay_local_slot(void);
+/* 1 while this build is watching rather than playing: it simulates every seat
+ * from the wire and its own controllers reach nothing. */
+int  snes_netplay_is_spectator(void);
 /* Resolved host device index (0/1) used for local capture. */
 int  snes_netplay_input_player(void);
 uint32_t snes_netplay_sim_tick(void);
