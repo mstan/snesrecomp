@@ -107,10 +107,18 @@ static const char *lan_path(void)
 static void lan_chat_clear(void);
 static void lan_chat_drain(void);
 
+/* LAN seat swap: the two-seat room has one trade. incoming = the guest asked
+ * the host (host side); outgoing = 0 idle, 1 waiting, 2 accepted, -1 declined
+ * (guest side, and the host's own instant result). */
+static int g_lan_swap_incoming;
+static int g_lan_swap_outgoing;
+
 static void close_direct_sockets(void)
 {
   rnet_lan_direct_host_close(&g_direct_host);
   rnet_lan_direct_guest_close(&g_direct_guest);
+  g_lan_swap_incoming = 0;
+  g_lan_swap_outgoing = 0;
   /* The room is over, so its log is too. Every LAN teardown -- leave, kick,
    * host close -- passes through here, which is why the clear lives here
    * rather than at each of those call sites. */
@@ -119,6 +127,10 @@ static void close_direct_sockets(void)
 
 static int publish_lan_room(void)
 {
+  /* The seated guest hears every room change over its socket; the file is
+   * for browsers on this machine. */
+  if (g_direct_host)
+    (void)rnet_lan_direct_host_notify_room(g_direct_host, &g_lan_room);
   return rnet_lan_lobby_publish(lan_path(), &g_lan_room) == RNET_LAN_LOBBY_OK;
 }
 
@@ -743,6 +755,7 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   out->player_count = row.player_count;
   out->max_slots = row.max_slots;
   out->has_password = row.has_password;
+  snprintf(out->host_country, sizeof(out->host_country), "%s", row.host_country);
   return 1;
 }
 
@@ -867,7 +880,30 @@ static int cb_join(void *ctx, const char *lobby_id, const char *password,
     g_joined_direct = 0;
     g_direct_peer_endpoint[0] = '\0';
 
-    /* Same-machine fast path: shared file registry. */
+    /* UDP JOIN_REQ to the host's socket first -- on the same machine too.
+     * The host's seat table, chat and seat swaps all live on that socket;
+     * a joiner that only wrote itself into the registry file is invisible
+     * to the host and can neither talk nor trade seats. The endpoint comes
+     * from the lobby id (the registry's advertised address, or what the
+     * player typed for Join Direct). */
+    rc = rnet_lan_direct_guest_join(
+        endpoint, game_name(), game_version(), password ? password : "",
+        name && name[0] ? name : "Player", guest_bind, 2500, &state,
+        &g_direct_guest);
+    if (rc == RNET_LAN_DIRECT_OK) {
+      g_lan_room = state;
+      g_joined_lan = 1;
+      g_joined_direct = 1;
+      snprintf(g_direct_peer_endpoint, sizeof(g_direct_peer_endpoint), "%s",
+               endpoint);
+      snprintf(g_resume_endpoint, sizeof(g_resume_endpoint), "%s", endpoint);
+      return 0;
+    }
+    if (rc == RNET_LAN_DIRECT_ERR_PASSWORD)
+      return -2;
+
+    /* Registry-file fallback: a host without a direct socket (older build).
+     * Seated, but with no channel to the host beyond the file. */
     rc = rnet_lan_lobby_join(lan_path(), game_name(), game_version(),
                              password ? password : "",
                              name && name[0] ? name : "Player", &state);
@@ -880,21 +916,11 @@ static int cb_join(void *ctx, const char *lobby_id, const char *password,
                endpoint[0] ? endpoint : state.endpoint);
       return 0;
     }
-
-    /* Remote / cross-subnet: UDP JOIN_REQ to the typed IP:port. */
-    rc = rnet_lan_direct_guest_join(
-        endpoint, game_name(), game_version(), password ? password : "",
-        name && name[0] ? name : "Player", guest_bind, 2500, &state,
-        &g_direct_guest);
-    if (rc != RNET_LAN_DIRECT_OK)
-      return map_direct_join_rc(rc);
-    g_lan_room = state;
-    g_joined_lan = 1;
-    g_joined_direct = 1;
-    snprintf(g_direct_peer_endpoint, sizeof(g_direct_peer_endpoint), "%s",
-             endpoint);
-    snprintf(g_resume_endpoint, sizeof(g_resume_endpoint), "%s", endpoint);
-    return 0;
+    if (rc == RNET_LAN_LOBBY_ERR_PASSWORD)
+      return -2;
+    if (rc == RNET_LAN_LOBBY_ERR_IO)
+      return -3;
+    return -1;
   }
   g_hosting_lan = 0;
   g_joined_lan = 0;
@@ -946,6 +972,8 @@ static int cb_member_get(void *ctx, int index,
     out->slot = index == 0 ? state.host_slot : 1 - state.host_slot;
     out->ready = index == 0 || state.joiner_name[0] != '\0';
     out->is_host = index == 0;
+    /* The launcher's self-service (drag your own row) keys on this. */
+    out->is_local = index == 0 ? (g_hosting_lan ? 1 : 0) : (g_joined_lan ? 1 : 0);
     snprintf(out->display_name, sizeof(out->display_name), "%s",
              index == 0 ? state.host_name : state.joiner_name);
     /* Host row: N/A. Guest row: Direct-IP / LAN UDP RTT when known. */
@@ -959,6 +987,12 @@ static int cb_member_get(void *ctx, int index,
   out->ready = member.ready;
   out->is_spectator = member.is_spectator;
   out->is_host = snes_lobby_member_is_host(&member);
+  snprintf(out->country, sizeof(out->country), "%s", member.country);
+  {
+    const char *me = snes_lobby_player_id();
+    out->is_local = (me && me[0] && member.player_id[0] &&
+                     strcmp(me, member.player_id) == 0) ? 1 : 0;
+  }
   snprintf(out->display_name, sizeof(out->display_name), "%s",
            member.display_name);
   out->latency_ms = snes_lobby_member_latency_ms(member.slot);
@@ -1025,10 +1059,26 @@ static void lan_chat_drain(void)
   if (g_hosting_lan && g_direct_host) {
     while (rnet_lan_direct_host_take_chat(g_direct_host, &line))
       lan_chat_push(line.player_id, line.from, line.text);
+    if (rnet_lan_direct_host_take_swap_request(g_direct_host))
+      g_lan_swap_incoming = 1;
   } else if (g_joined_lan && g_joined_direct && g_direct_guest) {
+    int accept = 0;
     while (rnet_lan_direct_guest_take_chat(g_direct_guest, &line))
       lan_chat_push(line.player_id, line.from, line.text);
+    if (rnet_lan_direct_guest_take_swap_result(g_direct_guest, &accept))
+      g_lan_swap_outgoing = accept ? 2 : -1;
   }
+}
+
+/* Host: trade the two seats and tell the room. */
+static int lan_swap_seats(const char *why)
+{
+  if (!g_hosting_lan) return -1;
+  fprintf(stderr, "netplay: LAN seat swap (%s): host_slot %d -> %d\n", why,
+          g_lan_room.host_slot, 1 - g_lan_room.host_slot);
+  g_lan_room.host_slot = 1 - g_lan_room.host_slot;
+  g_lan_room.started = 0;
+  return publish_lan_room() ? 0 : -1;
 }
 
 /* 1 when this LAN room can actually carry a line between the two peers. */
@@ -1166,10 +1216,7 @@ static int cb_move_member(void *ctx, int from_slot, int to_slot)
   (void)ctx;
   if (g_hosting_lan && from_slot >= 0 && from_slot <= 1 && to_slot >= 0 &&
       to_slot <= 1 && from_slot != to_slot) {
-    g_lan_room.host_slot = 1 - g_lan_room.host_slot;
-    g_lan_room.started = 0;
-    (void)publish_lan_room();
-    return 0;
+    return lan_swap_seats("host move_member");
   }
   if (g_joined_lan)
     return -1;
@@ -1836,37 +1883,79 @@ static void cb_push_match_caps(void *ctx)
 static int cb_seat_move_self(void *ctx, int to_slot)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan) return -1;
+  if (g_hosting_lan) {
+    /* Two seats: the other one is free only while nobody has joined. */
+    if (to_slot != 1 - g_lan_room.host_slot) return -1;
+    if (g_lan_room.joiner_name[0]) return -1; /* occupied: ask instead */
+    return lan_swap_seats("host move_self");
+  }
+  if (g_joined_lan) return -1; /* the only other seat is the host's: ask */
   return snes_lobby_seat_move_self(to_slot);
 }
 static int cb_seat_swap_request(void *ctx, int target_slot)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan) return -1;
+  if (g_hosting_lan) {
+    /* The host is the authority of a LAN room: its own trade is immediate. */
+    if (target_slot != 1 - g_lan_room.host_slot || !g_lan_room.joiner_name[0])
+      return -1;
+    if (lan_swap_seats("host swap_request") != 0) return -1;
+    g_lan_swap_outgoing = 2;
+    return 0;
+  }
+  if (g_joined_lan) {
+    if (!g_joined_direct || !g_direct_guest) return -1;
+    if (target_slot != g_lan_room.host_slot) return -1;
+    if (g_lan_swap_outgoing == 1) return -1;
+    if (rnet_lan_direct_guest_send_swap_request(g_direct_guest) != RNET_LAN_DIRECT_OK)
+      return -1;
+    g_lan_swap_outgoing = 1;
+    return 0;
+  }
   return snes_lobby_seat_swap_request(target_slot);
 }
 static int cb_seat_swap_incoming(void *ctx, char *who, size_t who_cap, int *from_slot)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan) return 0;
+  if (g_hosting_lan) {
+    if (!g_lan_swap_incoming) return 0;
+    if (who && who_cap)
+      snprintf(who, who_cap, "%s",
+               g_lan_room.joiner_name[0] ? g_lan_room.joiner_name : "Player");
+    if (from_slot) *from_slot = 1 - g_lan_room.host_slot;
+    return 1;
+  }
+  if (g_joined_lan) return 0;
   return snes_lobby_seat_swap_incoming(who, who_cap, from_slot);
 }
 static int cb_seat_swap_respond(void *ctx, int accept)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan) return -1;
+  if (g_hosting_lan) {
+    int swapped = 0;
+    if (!g_lan_swap_incoming) return -1;
+    g_lan_swap_incoming = 0;
+    if (accept && g_lan_room.joiner_name[0] && lan_swap_seats("host accepted") == 0) swapped = 1;
+    if (g_direct_host)
+      (void)rnet_lan_direct_host_send_swap_result(g_direct_host, swapped);
+    return 0;
+  }
+  if (g_joined_lan) return -1;
   return snes_lobby_seat_swap_respond(accept);
 }
 static int cb_seat_swap_outgoing(void *ctx)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan) return 0;
+  if (g_hosting_lan || g_joined_lan) return g_lan_swap_outgoing;
   return snes_lobby_seat_swap_outgoing();
 }
 static void cb_seat_swap_clear(void *ctx)
 {
   (void)ctx;
-  if (g_hosting_lan || g_joined_lan) return;
+  if (g_hosting_lan || g_joined_lan) {
+    if (g_lan_swap_outgoing != 1) g_lan_swap_outgoing = 0;
+    return;
+  }
   snes_lobby_seat_swap_clear();
 }
 
