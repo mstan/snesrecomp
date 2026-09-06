@@ -2202,7 +2202,8 @@ int snes_lobby_seat_move_self(int to_slot)
 {
     char msg[80];
     if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
-    if (to_slot < 0 || to_slot >= SNES_LOBBY_MAX_PLAYERS) return -1;
+    /* A player seat or a gallery seat: the server takes either, empty only. */
+    if (!snes_lobby_seat_valid(to_slot)) return -1;
     snprintf(msg, sizeof(msg), "{\"op\":\"seat_move\",\"to_slot\":%d}", to_slot);
     queue_send(msg);
     flush_pending();
