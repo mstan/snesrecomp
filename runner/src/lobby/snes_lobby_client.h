@@ -298,6 +298,18 @@ int  snes_lobby_local_wire_slot(void);
  * Spectators take part: the server fans a line out to everyone in the room,
  * and talking is not affecting the match. */
 int  snes_lobby_send_chat(const char *text);
+
+/* Seat self-service (server ops seat_move / seat_swap_request /
+ * seat_swap_answer): move yourself to a FREE player seat, or ask the
+ * occupant of a taken one to trade. incoming: 1 while somebody is asking
+ * this player (who + their seat); respond answers it. outgoing: 0 idle,
+ * 1 waiting, 2 accepted, -1 declined; clear returns a finished result to 0. */
+int  snes_lobby_seat_move_self(int to_slot);
+int  snes_lobby_seat_swap_request(int target_slot);
+int  snes_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot);
+int  snes_lobby_seat_swap_respond(int accept);
+int  snes_lobby_seat_swap_outgoing(void);
+void snes_lobby_seat_swap_clear(void);
 int  snes_lobby_chat_count(void);
 int  snes_lobby_chat_get(int index, SnesLobbyChatMsg *out);
 void snes_lobby_chat_clear(void);
