@@ -650,6 +650,102 @@ static void case_gallery_seat_addressing(void)
        "the two halves of the namespace cannot collide");
 }
 
+
+/* ---- lobby chat ---------------------------------------------------------
+ *
+ * The server echoes every line to everyone INCLUDING the sender, and that
+ * echo is the copy the ring keeps -- the client never appends its own send.
+ * So "is this mine" is a question about player ids, not about who called
+ * send, and the ring's order is the room's order.
+ */
+static void case_chat_ring_keeps_room_order(void)
+{
+    SnesLobbyChatMsg got;
+    int i;
+    printf("  chat ring\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
+
+    chat_push("them", "Them", "first", 0);
+    chat_push("me",   "Me",   "second", 0);
+    chat_push("",     "",     "third", 1);
+
+    ck(snes_lobby_chat_count() == 3, "three lines land");
+    ck(snes_lobby_chat_get(0, &got) && strcmp(got.text, "first") == 0,
+       "index 0 is the oldest");
+    ck(snes_lobby_chat_get(2, &got) && strcmp(got.text, "third") == 0,
+       "index 2 is the newest");
+
+    ck(snes_lobby_chat_get(0, &got) && got.is_local == 0,
+       "a peer's line is not local");
+    ck(snes_lobby_chat_get(1, &got) && got.is_local == 1,
+       "our own echoed line is local");
+    ck(snes_lobby_chat_get(2, &got) && got.is_system == 1 && got.is_local == 0,
+       "a system line is neither ours nor a player's");
+
+    /* seq is what the UI compares to notice a new line. */
+    {
+        uint32_t a = 0, b = 0;
+        (void)snes_lobby_chat_get(0, &got); a = got.seq;
+        (void)snes_lobby_chat_get(2, &got); b = got.seq;
+        ck(b > a, "seq increases with arrival order");
+    }
+    ck(!snes_lobby_chat_get(3, &got), "reading past the end is refused");
+    ck(!snes_lobby_chat_get(-1, &got), "so is a negative index");
+    (void)i;
+}
+
+static void case_chat_ring_wraps_oldest_first(void)
+{
+    SnesLobbyChatMsg got;
+    int i;
+    char buf[32];
+    printf("  chat wrap\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
+
+    /* Overfill by ten. The ring must drop the OLDEST, not the newest -- a
+     * chat that discards what was just said is worse than no chat. */
+    for (i = 0; i < SNES_LOBBY_CHAT_RING + 10; ++i) {
+        snprintf(buf, sizeof(buf), "line%d", i);
+        chat_push("them", "Them", buf, 0);
+    }
+    ck(snes_lobby_chat_count() == SNES_LOBBY_CHAT_RING,
+       "the ring stops at its capacity");
+    ck(snes_lobby_chat_get(0, &got) && strcmp(got.text, "line10") == 0,
+       "the oldest surviving line is the 11th sent");
+    snprintf(buf, sizeof(buf), "line%d", SNES_LOBBY_CHAT_RING + 9);
+    ck(snes_lobby_chat_get(SNES_LOBBY_CHAT_RING - 1, &got) &&
+       strcmp(got.text, buf) == 0,
+       "the newest line is the last one sent");
+}
+
+static void case_chat_ignores_empty_and_clears(void)
+{
+    printf("  chat empty/clear\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    chat_push("them", "Them", "", 0);
+    chat_push("them", "Them", NULL, 0);
+    ck(snes_lobby_chat_count() == 0, "an empty line is not a line");
+
+    chat_push("them", "Them", "hello", 0);
+    ck(snes_lobby_chat_count() == 1, "a real line is");
+    {
+        SnesLobbyChatMsg m;
+        uint32_t before;
+        (void)snes_lobby_chat_get(0, &m);
+        before = m.seq;
+        snes_lobby_chat_clear();
+        ck(snes_lobby_chat_count() == 0, "clear empties the room log");
+        chat_push("them", "Them", "new room", 0);
+        (void)snes_lobby_chat_get(0, &m);
+        /* seq must NOT restart: a UI tracking "newest seen" would otherwise
+         * mistake the first line of a new room for one it already scrolled
+         * past, and never scroll to it. */
+        ck(m.seq > before, "seq keeps counting across a clear");
+    }
+}
+
 int main(void)
 {
     case_rows();
@@ -673,6 +769,9 @@ int main(void)
     case_a_server_without_spectators_reads_as_before();
     case_launch_does_not_erase_the_gallery();
     case_gallery_seat_addressing();
+    case_chat_ring_keeps_room_order();
+    case_chat_ring_wraps_oldest_first();
+    case_chat_ignores_empty_and_clears();
     printf(fails ? "\n%d failure(s)\n" : "\nall mod-plan cases passed\n", fails);
     return fails != 0;
 }

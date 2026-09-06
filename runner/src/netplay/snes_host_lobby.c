@@ -941,6 +941,48 @@ static int cb_member_get(void *ctx, int index,
   return 1;
 }
 
+/* ---- lobby chat ---------------------------------------------------------
+ * Online only. A LAN / direct-IP room has no server to echo a line off, and
+ * the UI never appends its own send -- so on LAN chat_send would accept a
+ * line that never came back and the box would swallow everything typed into
+ * it. Reporting no chat there is the honest answer. */
+
+static int cb_chat_send(void *ctx, const char *text)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return -1;
+  return snes_lobby_send_chat(text);
+}
+
+static int cb_chat_count(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_chat_count();
+}
+
+static int cb_chat_get(void *ctx, int index,
+                       RecompLauncherCNetplayChatMessage *out)
+{
+  SnesLobbyChatMsg msg;
+  (void)ctx;
+  if (!out)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  if (!snes_lobby_chat_get(index, &msg))
+    return 0;
+  snprintf(out->from, sizeof(out->from), "%s", msg.from);
+  snprintf(out->text, sizeof(out->text), "%s", msg.text);
+  out->is_local = msg.is_local;
+  out->is_system = msg.is_system;
+  out->seq = msg.seq;
+  return 1;
+}
+
 /* ---- spectators ---------------------------------------------------------
  * The gallery exists only on the lobby server. A LAN / direct-IP room has no
  * server to enforce "cannot affect the game" at, so it reports no gallery and
@@ -1730,6 +1772,9 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .lobby_spectator_count = cb_lobby_spectator_count,
     .local_is_spectator = cb_local_is_spectator,
     .spectator_slot = cb_spectator_slot,
+    .chat_send = cb_chat_send,
+    .chat_count = cb_chat_count,
+    .chat_get = cb_chat_get,
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
