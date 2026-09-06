@@ -93,6 +93,11 @@ int  snes_lobby_match_blocked_by_mods(char *w, size_t wc, char *t, size_t tc)
 int  snes_lobby_local_missing_mods(void) { return 0; }
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
+int  snes_lobby_send_chat(const char *text) { (void)text; return -1; }
+int  snes_lobby_chat_count(void) { return 0; }
+int  snes_lobby_chat_get(int index, SnesLobbyChatMsg *out)
+{ (void)index; (void)out; return 0; }
+void snes_lobby_chat_clear(void) {}
 void snes_lobby_set_allow_spectators(int allow) { (void)allow; }
 int  snes_lobby_allow_spectators_pref(void) { return 0; }
 int  snes_lobby_allow_spectators(void) { return 0; }
@@ -197,6 +202,11 @@ typedef struct {
     SnesLobbyJoinInfo join;
     SnesLobbyMember members[SNES_LOBBY_MAX_MEMBERS];
     int member_count;
+    /* Lobby chat ring (oldest at chat_head). */
+    SnesLobbyChatMsg chat[SNES_LOBBY_CHAT_RING];
+    int chat_head;
+    int chat_count;
+    uint32_t chat_seq;
     int local_ready;
     int all_ready;
     int launch_pending;
@@ -1084,6 +1094,41 @@ static int parse_seat_array(const char *json, const char *key, int is_spectator,
     return n;
 }
 
+static void chat_push(const char *player_id, const char *from, const char *text,
+                      int is_system)
+{
+    SnesLobbyChatMsg *m;
+    int idx;
+    if (!text || !text[0]) return;
+    if (g_lc.chat_count < SNES_LOBBY_CHAT_RING) {
+        idx = (g_lc.chat_head + g_lc.chat_count) % SNES_LOBBY_CHAT_RING;
+        g_lc.chat_count++;
+    } else {
+        idx = g_lc.chat_head;
+        g_lc.chat_head = (g_lc.chat_head + 1) % SNES_LOBBY_CHAT_RING;
+    }
+    m = &g_lc.chat[idx];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+    snprintf(m->text, sizeof(m->text), "%s", text);
+    m->is_system = is_system ? 1 : 0;
+    /* "Mine" is decided by player id, not by having just sent something: the
+     * server echoes our own line back like everyone else's, and that echo is
+     * the copy the ring keeps. */
+    m->is_local = (!is_system && g_lc.player_id[0] && player_id &&
+                   strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
+    m->seq = ++g_lc.chat_seq;
+}
+
+void snes_lobby_chat_clear(void)
+{
+    g_lc.chat_head = 0;
+    g_lc.chat_count = 0;
+    /* seq keeps counting: a UI comparing "newest seen" must not mistake the
+     * first line of a new room for one it already scrolled past. */
+}
+
 static void parse_slots_array(const char *json)
 {
     int n;
@@ -1296,6 +1341,9 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "created") == 0) {
+        /* A new room starts with an empty log -- carrying the last room's
+         * lines in would show a conversation nobody in this one had. */
+        snes_lobby_chat_clear();
         g_lc.in_lobby = 1;
         g_lc.is_host = 1;
         g_lc.join.ok = 1;
@@ -1334,6 +1382,7 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "joined") == 0) {
+        snes_lobby_chat_clear();
         g_lc.in_lobby = 1;
         g_lc.is_host = 0;
         g_lc.join.ok = 1;
@@ -1415,6 +1464,19 @@ static void handle_server_json(const char *json)
         g_lc.join.ok = 1;
         g_lc.join.last_error[0] = '\0';
         g_lc.launch_pending = 1;
+        return;
+    }
+    if (strcmp(op, "chat") == 0) {
+        char text[SNES_LOBBY_CHAT_TEXT_LEN];
+        char from_id[SNES_LOBBY_ID_LEN];
+        char from[SNES_LOBBY_NAME_LEN];
+        text[0] = '\0';
+        from_id[0] = '\0';
+        from[0] = '\0';
+        json_get_str(json, "text", text, sizeof(text));
+        json_get_str(json, "from_player_id", from_id, sizeof(from_id));
+        json_get_str(json, "from", from, sizeof(from));
+        chat_push(from_id, from, text, json_get_bool(json, "system", 0));
         return;
     }
     if (strcmp(op, "signal") == 0) {
@@ -1552,6 +1614,7 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
         strcmp(op, "kicked") == 0) {
+        snes_lobby_chat_clear();
         g_lc.in_lobby = 0;
         g_lc.is_host = 0;
         g_lc.host_player_id[0] = '\0';
@@ -2081,6 +2144,33 @@ int snes_lobby_set_match_caps(const SnesLobbyMatchCaps *caps)
     queue_send(msg);
     flush_pending();
     return 0;
+}
+
+int snes_lobby_send_chat(const char *text)
+{
+    char esc[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 8];
+    char msg[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 64];
+    int n;
+    if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (!text || !text[0]) return -1;
+    json_escape(text, esc, sizeof(esc));
+    n = snprintf(msg, sizeof(msg), "{\"op\":\"chat\",\"text\":\"%s\"}", esc);
+    if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int snes_lobby_chat_count(void)
+{
+    return g_lc.chat_count;
+}
+
+int snes_lobby_chat_get(int index, SnesLobbyChatMsg *out)
+{
+    if (!out || index < 0 || index >= g_lc.chat_count) return 0;
+    *out = g_lc.chat[(g_lc.chat_head + index) % SNES_LOBBY_CHAT_RING];
+    return 1;
 }
 
 void snes_lobby_set_allow_spectators(int allow)

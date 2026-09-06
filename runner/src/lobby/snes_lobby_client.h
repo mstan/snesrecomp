@@ -47,6 +47,23 @@ typedef struct SnesLobbyRow {
     int      has_password;
 } SnesLobbyRow;
 
+/* One lobby chat line.
+ *
+ * The server echoes every line to everyone in the room INCLUDING the sender,
+ * so this ring is the room's order rather than ours -- the client never
+ * appends its own send locally, or two peers would disagree about what was
+ * said when. */
+#define SNES_LOBBY_CHAT_TEXT_LEN 256
+#define SNES_LOBBY_CHAT_RING 64
+typedef struct SnesLobbyChatMsg {
+    char     player_id[SNES_LOBBY_ID_LEN];
+    char     from[SNES_LOBBY_NAME_LEN];
+    char     text[SNES_LOBBY_CHAT_TEXT_LEN];
+    int      is_local;
+    int      is_system;
+    uint32_t seq;
+} SnesLobbyChatMsg;
+
 typedef struct SnesLobbyMember {
     /* Seat index in the shared namespace: a player seat, or
      * spectator_slot_base + gallery index. Pass it back to kick / move as-is. */
@@ -274,6 +291,14 @@ int  snes_lobby_spectator_slot(int index);
  * base -- and a spectator without one must not launch, because sending as a
  * player slot is exactly what it must not do. */
 int  snes_lobby_local_wire_slot(void);
+
+/* ---- lobby chat --------------------------------------------------------
+ * Spectators take part: the server fans a line out to everyone in the room,
+ * and talking is not affecting the match. */
+int  snes_lobby_send_chat(const char *text);
+int  snes_lobby_chat_count(void);
+int  snes_lobby_chat_get(int index, SnesLobbyChatMsg *out);
+void snes_lobby_chat_clear(void);
 
 /* Host: remove the player seated in `slot` (not the host). Returns 0 if sent. */
 int  snes_lobby_kick(int slot);
