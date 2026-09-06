@@ -16,6 +16,17 @@
 
 enum { kSuperFxWsMaxExtra = 288, kSuperFxWsMaxWidth = 800 };
 
+typedef struct SuperFxPresentationReplay {
+  SuperFx clone;
+  uint8_t *ram;
+  uint8_t bank;
+  uint16_t address;
+  bool active, pending;
+  SuperFxReplayPrepare *prepare;
+  SuperFxReplayComplete *complete;
+  void *context;
+} SuperFxPresentationReplay;
+
 enum {
   SFR_Z = 1u << 1, SFR_CY = 1u << 2, SFR_S = 1u << 3,
   SFR_OV = 1u << 4, SFR_G = 1u << 5, SFR_R = 1u << 6,
@@ -266,6 +277,10 @@ static void set_sz(SuperFx *f, uint16_t v) {
 static void instruction(SuperFx *f, uint8_t op) {
   unsigned n = op & 15, a = alt(f);
   if (op == 0x00) {
+    if (f->presentation && f->presentation->active) {
+      f->presentation->active = false;
+      f->presentation->pending = true;
+    }
     if (f->ws_render_active) {
       f->ws_render_active = false;
       if (f->enhancement_mode ==
@@ -443,6 +458,56 @@ static bool render_widescreen_frame(SuperFx *f) {
   return complete;
 }
 
+bool superfx_replay_snapshot(const SuperFx *source, uint8_t *private_ram,
+                             SuperFx *result) {
+  if (!source || !private_ram || !result || source == result ||
+      private_ram == source->ram ||
+      source->enhancement_mode != kSuperFxEnhancement_PresentationReplay)
+    return false;
+  *result = *source;
+  result->ram = private_ram;
+  result->presentation = NULL;
+  result->enhancement_mode = kSuperFxEnhancement_None;
+  result->ws_render_active = result->ws_replay_pending = result->ws_replay_mode = false;
+  unsigned guard = 0;
+  while ((result->sfr & SFR_G) && guard++ < 20000000)
+    run_one(result);
+  return !(result->sfr & SFR_G);
+}
+
+static void finish_presentation_replay(SuperFx *f) {
+  SuperFxPresentationReplay *p = f->presentation;
+  p->pending = false;
+  unsigned guard = 0;
+  while ((p->clone.sfr & SFR_G) && guard++ < 20000000)
+    run_one(&p->clone);
+  if (p->complete)
+    p->complete(p->context, (p->clone.sfr & SFR_G) ? NULL : &p->clone);
+}
+
+bool superfx_set_presentation_replay(SuperFx *f, uint8_t bank,
+                                     uint16_t address,
+                                     SuperFxReplayPrepare *prepare,
+                                     SuperFxReplayComplete *complete,
+                                     void *context) {
+  if (!f || f->enhancement_mode != kSuperFxEnhancement_PresentationReplay)
+    return false;
+  if (!f->presentation) {
+    SuperFxPresentationReplay *p = calloc(1, sizeof(*p));
+    if (!p) return false;
+    p->ram = malloc(f->ram_size);
+    if (!p->ram) { free(p); return false; }
+    f->presentation = p;
+  }
+  SuperFxPresentationReplay *p = f->presentation;
+  if (p->bank != bank || p->address != address || p->prepare != prepare ||
+      p->complete != complete || p->context != context)
+    p->active = p->pending = false;
+  p->bank = bank; p->address = address;
+  p->prepare = prepare; p->complete = complete; p->context = context;
+  return true;
+}
+
 static void finish_widescreen_replay(SuperFx *f) {
   f->ws_replay_pending = false;
   memset(f->ws_pixels, 0, (size_t)kSuperFxWsMaxWidth * 192);
@@ -464,6 +529,10 @@ void superfx_destroy(SuperFx *f) {
   free(f->ws_present_valid);
   free(f->ws_task_state);
   free(f->ws_task_ram);
+  if (f->presentation) {
+    free(f->presentation->ram);
+    free(f->presentation);
+  }
   free(f);
 }
 void superfx_reset(SuperFx *f) {
@@ -473,6 +542,7 @@ void superfx_reset(SuperFx *f) {
   uint8_t *ws_present_valid=f->ws_present_valid;
   void *ws_task_state=f->ws_task_state; uint8_t *ws_task_ram=f->ws_task_ram;
   SuperFxEnhancementMode enhancement_mode=f->enhancement_mode;
+  SuperFxPresentationReplay *presentation=f->presentation;
   uint16_t ws_extra=f->ws_extra;
   memset(f,0,sizeof(*f)); f->rom=rom;f->rom_size=rs;f->rom_mask=rs-1;f->ram=ram;f->ram_size=rm;f->ram_mask=rm-1;
   f->ws_pixels=ws_pixels;f->ws_valid=ws_valid;f->ws_task_state=ws_task_state;
@@ -480,6 +550,8 @@ void superfx_reset(SuperFx *f) {
   f->ws_present_valid=ws_present_valid;
   f->ws_task_ram=ws_task_ram;f->ws_extra=ws_extra;
   f->enhancement_mode=enhancement_mode;
+  f->presentation=presentation;
+  if (presentation) presentation->active=presentation->pending=false;
   f->vcr=4; f->pipeline=1; f->pixel[0].offset=f->pixel[1].offset=UINT16_MAX;
 }
 void superfx_sync(SuperFx *f, uint64_t master) {
@@ -489,6 +561,8 @@ void superfx_sync(SuperFx *f, uint64_t master) {
   /* Six clocks is the longest idle quantum and the normal uncached access. */
   unsigned guard=0; while(f->clock_credit>=6 && guard++<2000000) {
     run_one(f);
+    if (f->presentation && f->presentation->pending)
+      finish_presentation_replay(f);
     if (f->ws_replay_pending)
       finish_widescreen_replay(f);
   }
@@ -512,6 +586,19 @@ void superfx_cpu_write_io(SuperFx *f, uint16_t a, uint8_t v) {
   if(a<=0x301f){unsigned n=(a>>1)&15;uint16_t q=rv(f,n);wr(f,n,(a&1)?((q&255)|(v<<8)):((q&0xff00)|v));if(n==14)update_rom_buffer(f);if(a==0x301f){
     f->ws_last_task=rv(f,15);
     f->sfr|=SFR_G;
+    SuperFxPresentationReplay *p = f->presentation;
+    if (f->enhancement_mode == kSuperFxEnhancement_PresentationReplay && p &&
+        p->prepare && p->bank == f->pbr && p->address == rv(f,15)) {
+      p->clone = *f;
+      memcpy(p->ram, f->ram, f->ram_size);
+      p->clone.ram = p->ram;
+      p->clone.presentation = NULL;
+      p->clone.enhancement_mode = kSuperFxEnhancement_None;
+      p->clone.ws_render_active = p->clone.ws_replay_pending = false;
+      p->clone.ws_replay_mode = false;
+      p->active = p->prepare(p->context, f, p->ram);
+      p->pending = false;
+    }
     /* Snapshot the configured rendering task so presentation-only side
      * passes can replay it after the authoritative native pass. */
     if(f->enhancement_mode ==
@@ -556,12 +643,15 @@ void superfx_set_enhancement_mode(SuperFx *f,
                                   SuperFxEnhancementMode mode) {
   if (!f) return;
   if (mode != kSuperFxEnhancement_None &&
-      mode != kSuperFxEnhancement_WidescreenLinearProjection)
+      mode != kSuperFxEnhancement_WidescreenLinearProjection &&
+      mode != kSuperFxEnhancement_PresentationReplay)
     mode = kSuperFxEnhancement_None;
   if (f->enhancement_mode == mode)
     return;
 
   f->enhancement_mode = mode;
+  if (f->presentation)
+    f->presentation->active = f->presentation->pending = false;
   f->ws_extra = 0;
   f->ws_width = 0;
   f->ws_height = 0;

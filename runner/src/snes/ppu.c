@@ -707,7 +707,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2 | (bits >> (21 - i)) & 4 | (bits >> (28 - i)) & 8; \
   if (VIEWPORT_ALLOWED(i) && (bits & (0x80808080 >> i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
-#define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
+#define READ_BITS(ta, tile) (addr = &PpuRenderVram(ppu)[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -721,14 +721,14 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &ppu->vram[sc_offs & 0x7fff],
-    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
+    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
   bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -845,7 +845,7 @@ static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer,
         sc += 0x400;
       sc += (sx >> tile_shift) & 31;
 
-      uint16 tile = ppu->vram[sc & 0x7fff];
+      uint16 tile = PpuRenderVram(ppu)[sc & 0x7fff];
       unsigned px = (unsigned)sx & tile_mask;
       unsigned py = (unsigned)sy & tile_mask;
       if (tile & 0x4000) px = tile_mask - px;
@@ -857,10 +857,10 @@ static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer,
       const unsigned row = py & 7;
       const unsigned bit = 7 - (px & 7);
       const unsigned addr = (tileadr + character * 32 + row) & 0x7fff;
-      const uint16 p01 = ppu->vram[addr];
-      const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
-      const uint16 p45 = ppu->vram[(addr + 16) & 0x7fff];
-      const uint16 p67 = ppu->vram[(addr + 24) & 0x7fff];
+      const uint16 p01 = PpuRenderVram(ppu)[addr];
+      const uint16 p23 = PpuRenderVram(ppu)[(addr + 8) & 0x7fff];
+      const uint16 p45 = PpuRenderVram(ppu)[(addr + 16) & 0x7fff];
+      const uint16 p67 = PpuRenderVram(ppu)[(addr + 24) & 0x7fff];
       const unsigned pixel =
           ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
           (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3) |
@@ -910,7 +910,7 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
       if (((sx >> 9) & 1) && PPU_bgTilemapWider(ppu, layer))
         sc += 0x400;
       sc += (sx >> 4) & 31;
-      uint16 tile = ppu->vram[sc & 0x7fff];
+      uint16 tile = PpuRenderVram(ppu)[sc & 0x7fff];
       unsigned px = (unsigned)sx & 15, py = (unsigned)sy & 15;
       /* Margins: world-keyed shadow tile + matching world pixel phase.
        * Using live hScroll/vScroll for px/py while the tile key used the
@@ -935,10 +935,10 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
           ((tile & 0x3ff) + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
       const unsigned addr = (tileadr + character * words + (py & 7)) & 0x7fff;
       const unsigned bit = 7 - (px & 7);
-      const uint16 p01 = ppu->vram[addr];
+      const uint16 p01 = PpuRenderVram(ppu)[addr];
       unsigned pixel = ((p01 >> bit) & 1) | (((p01 >> (8 + bit)) & 1) << 1);
       if (bpp == 4) {
-        const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+        const uint16 p23 = PpuRenderVram(ppu)[(addr + 8) & 0x7fff];
         pixel |= (((p23 >> bit) & 1) << 2) | (((p23 >> (8 + bit)) & 1) << 3);
       }
       const PpuZbufType z =
@@ -955,7 +955,7 @@ static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
     addr += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   if (((tx >> 5) & 1) && PPU_bgTilemapWider(ppu, layer))
     addr += 0x400;
-  return ppu->vram[addr & 0x7fff];
+  return PpuRenderVram(ppu)[addr & 0x7fff];
 }
 
 /* Capture a native-width Mode 1 4bpp layer independently of the compositor.
@@ -1010,8 +1010,8 @@ static void PpuCaptureBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer) {
             (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
       const unsigned addr =
           (tileadr + character * 16 + (py & 7)) & 0x7fff;
-      const uint16 p01 = ppu->vram[addr];
-      const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+      const uint16 p01 = PpuRenderVram(ppu)[addr];
+      const uint16 p23 = PpuRenderVram(ppu)[(addr + 8) & 0x7fff];
       const unsigned bit = 7 - (px & 7);
       const unsigned pixel =
           ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
@@ -1122,8 +1122,8 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
               (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
         const unsigned addr =
             (tileadr + character * 16 + (py & 7)) & 0x7fff;
-        const uint16 p01 = ppu->vram[addr];
-        const uint16 p23 = ppu->vram[(addr + 8) & 0x7fff];
+        const uint16 p01 = PpuRenderVram(ppu)[addr];
+        const uint16 p23 = PpuRenderVram(ppu)[(addr + 8) & 0x7fff];
         const unsigned bit = 7 - (px & 7);
         const unsigned pixel =
             ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
@@ -1156,7 +1156,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
-#define READ_BITS(ta, tile) (addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
+#define READ_BITS(ta, tile) (addr = &PpuRenderVram(ppu)[(ta) + (tile) * 8 & 0x7fff], addr[0])
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1197,8 +1197,8 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &ppu->vram[sc_offs & 0x7fff],
-    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
+    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
@@ -1290,7 +1290,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
       (int)(dstz + (i) - dstbuf->data - kPpuExtraLeftRight))
 #define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8
 #define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2 | (bits >> 21) & 4 | (bits >> 28) & 8
-#define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
+#define READ_BITS(ta, tile) (addr = &PpuRenderVram(ppu)[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1301,14 +1301,14 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &ppu->vram[sc_offs & 0x7fff],
-    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
+    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
   bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -1479,7 +1479,7 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, int y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 #define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2
 #define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2
-#define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 8) & 0x7fff], addr[0])
+#define READ_BITS(ta, tile) (addr = &PpuRenderVram(ppu)[((ta) + (tile) * 8) & 0x7fff], addr[0])
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1490,8 +1490,8 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, in
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &ppu->vram[sc_offs & 0x7fff],
-    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
+    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
@@ -1582,9 +1582,9 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, 
             continue;
           tile = 0;
         } else {
-          tile = ppu->vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+          tile = PpuRenderVram(ppu)[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
         }
-        uint8 pixel = ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        uint8 pixel = PpuRenderVram(ppu)[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
         if (pixel) {
           int i = 0;
           do dstz[i] = pixel + z; while (++i != w);
@@ -1597,9 +1597,9 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, 
             continue;
           tile = 0;
         } else {
-          tile = ppu->vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+          tile = PpuRenderVram(ppu)[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
         }
-        uint8 pixel = ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        uint8 pixel = PpuRenderVram(ppu)[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
         if (pixel)
           dstz[0] = pixel + z;
       } while (xpos += dx, ypos += dy, ++dstz != dstz_end);
@@ -2146,7 +2146,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
       int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) |
                      (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
-            uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
+            const uint16 *addr = &PpuRenderVram(ppu)[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
             uint32 plane = addr[0] | addr[8] << 16;
             int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
             int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);

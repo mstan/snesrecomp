@@ -264,6 +264,9 @@ struct Ppu {
   PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];
   uint32_t renderPitch;
   uint8_t *renderBuffer;
+  /* Optional host picture memory. Drawing only: CPU ports and save states
+   * always use vram. The caller owns 32768 words until unbound. */
+  const uint16_t *renderVram;
   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
   uint8_t brightnessMult[32 + 31];
@@ -289,6 +292,9 @@ struct Ppu {
 
 // Host-only debug render filter (SNESRECOMP_LAYER_MASK env; ppu.c). Guest
 // state and savestates are untouched — this only gates final composition.
+static inline const uint16_t *PpuRenderVram(const Ppu *ppu) {
+  return ppu->renderVram ? ppu->renderVram : ppu->vram;
+}
 extern uint8_t g_snes_ppu_dbg_layer_mask;
 #define IS_SCREEN_ENABLED(ppu, sub, layer) \
   (ppu->screenEnabled[sub] & g_snes_ppu_dbg_layer_mask & (1 << layer))

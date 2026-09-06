@@ -59,7 +59,68 @@ static void destroy_fixture(SuperFx *fx, uint8_t *rom, uint8_t *ram) {
   free(ram);
 }
 
+static unsigned prepared, completed;
+static bool prepare_replay(void *context, const SuperFx *source, uint8_t *ram) {
+  (void)context;
+  check(ram != source->ram, "replay callback gets private RAM");
+  check(source->ram[0x100] == 3, "native color input remains original");
+  ram[0x100] = 1;
+  prepared++;
+  return true;
+}
+static void complete_replay(void *context, const SuperFx *result) {
+  (void)context;
+  check(result != NULL, "presentation replay terminates");
+  if (result) {
+    check(result->r[0].data == 1, "replay plots and reads its changed color");
+    check(result->presentation == NULL, "replay cannot recursively capture itself");
+  }
+  completed++;
+}
+
+static void test_private_replay(void) {
+  uint8_t *rom[2], *ram[2];
+  SuperFx *fx[2];
+  const uint8_t program[] = {0x43, 0x4e, 0x4c, 0xe1, 0x3d, 0x4c, 0x00};
+  for (unsigned i = 0; i < 2; i++) {
+    fx[i] = make_superfx(&rom[i], &ram[i]);
+    if (!fx[i]) abort();
+    memcpy(rom[i], program, sizeof(program));
+    fx[i]->r[3].data = 0x100;
+    ram[i][0x100] = 3;
+  }
+  check(!superfx_set_presentation_replay(fx[0], 0, 0, prepare_replay,
+                                        complete_replay, NULL) &&
+        fx[0]->presentation == NULL,
+        "faithful mode rejects replay configuration without allocating");
+  SuperFx extra;
+  check(!superfx_replay_snapshot(fx[0], ram[1], &extra),
+        "faithful snapshots reject additional replay passes");
+  superfx_set_enhancement_mode(fx[1], kSuperFxEnhancement_PresentationReplay);
+  check(superfx_set_presentation_replay(fx[1], 0, 0, prepare_replay,
+                                       complete_replay, NULL), "configure replay");
+  check(!superfx_replay_snapshot(fx[1], ram[1], &extra),
+        "additional replay rejects the authoritative RAM buffer");
+  check(!superfx_replay_snapshot(fx[1], ram[0], fx[1]),
+        "additional replay rejects overwriting its source core");
+  start_at_zero(fx[0]);
+  start_at_zero(fx[1]);
+  check(prepared == 1 && completed == 1, "matching task completes exactly once");
+  check(fx[0]->r[0].data == 3, "original task reads original plotted color");
+  check(memcmp(ram[0], ram[1], kRamSize) == 0, "replay preserves every native RAM byte");
+  check(memcmp((uint8_t *)fx[0] + offsetof(SuperFx, r),
+               (uint8_t *)fx[1] + offsetof(SuperFx, r),
+               offsetof(SuperFx, enhancement_mode) - offsetof(SuperFx, r)) == 0,
+        "private replay preserves every architectural register, cache and clock");
+  superfx_reset(fx[1]);
+  superfx_set_enhancement_mode(fx[1], kSuperFxEnhancement_None);
+  start_at_zero(fx[1]);
+  check(prepared == 1 && completed == 1, "disabled replay never calls title callbacks");
+  for (unsigned i = 0; i < 2; i++) destroy_fixture(fx[i], rom[i], ram[i]);
+}
+
 int main(void) {
+  test_private_replay();
   uint8_t *native_rom = NULL, *native_ram = NULL;
   uint8_t *optin_rom = NULL, *optin_ram = NULL;
   SuperFx *native = make_superfx(&native_rom, &native_ram);

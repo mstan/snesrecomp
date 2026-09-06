@@ -285,7 +285,7 @@ static uint16_t ppu_read_offset(Ppu *ppu, int col, int row) {
   uint16_t tilemapAdr = PPU_bgTilemapAdr(ppu, 2) + (((y >> tileBits) & 0x1f) << 5 | ((x >> tileBits) & 0x1f));
   if ((x & tileHighBit) && PPU_bgTilemapWider(ppu, 2)) tilemapAdr += 0x400;
   if ((y & tileHighBit) && PPU_bgTilemapHigher(ppu, 2)) tilemapAdr += PPU_bgTilemapWider(ppu, 2) ? 0x800 : 0x400;
-  return ppu->vram[tilemapAdr & 0x7fff];
+  return PpuRenderVram(ppu)[tilemapAdr & 0x7fff];
 }
 
 static int ppu_sample_bg(Ppu *ppu, int x, int y, int layer, bool priority) {
@@ -298,7 +298,7 @@ static int ppu_sample_bg(Ppu *ppu, int x, int y, int layer, bool priority) {
   uint16_t tilemapAdr = PPU_bgTilemapAdr(ppu, layer) + (((y >> tileBitsY) & 0x1f) << 5 | ((x >> tileBitsX) & 0x1f));
   if ((x & tileHighBitX) && PPU_bgTilemapWider(ppu, layer)) tilemapAdr += 0x400;
   if ((y & tileHighBitY) && PPU_bgTilemapHigher(ppu, layer)) tilemapAdr += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
-  uint16_t tile = ppu->vram[tilemapAdr & 0x7fff];
+  uint16_t tile = PpuRenderVram(ppu)[tilemapAdr & 0x7fff];
   // check priority, get palette
   if (((bool)(tile & 0x2000)) != priority) return 0; // wrong priority
   int paletteNum = (tile & 0x1c00) >> 10;
@@ -319,23 +319,23 @@ static int ppu_sample_bg(Ppu *ppu, int x, int y, int layer, bool priority) {
   if (PPU_mode(ppu) == 0) paletteNum += 8 * layer;
   // plane 1 (always)
   int paletteSize = 4;
-  uint16_t plane1 = ppu->vram[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + row) & 0x7fff];
+  uint16_t plane1 = PpuRenderVram(ppu)[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + row) & 0x7fff];
   int pixel = (plane1 >> col) & 1;
   pixel |= ((plane1 >> (8 + col)) & 1) << 1;
   // plane 2 (for 4bpp, 8bpp)
   if (bitDepth > 2) {
     paletteSize = 16;
-    uint16_t plane2 = ppu->vram[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 8 + row) & 0x7fff];
+    uint16_t plane2 = PpuRenderVram(ppu)[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 8 + row) & 0x7fff];
     pixel |= ((plane2 >> col) & 1) << 2;
     pixel |= ((plane2 >> (8 + col)) & 1) << 3;
   }
   // plane 3 & 4 (for 8bpp)
   if (bitDepth > 4) {
     paletteSize = 256;
-    uint16_t plane3 = ppu->vram[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 16 + row) & 0x7fff];
+    uint16_t plane3 = PpuRenderVram(ppu)[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 16 + row) & 0x7fff];
     pixel |= ((plane3 >> col) & 1) << 4;
     pixel |= ((plane3 >> (8 + col)) & 1) << 5;
-    uint16_t plane4 = ppu->vram[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 24 + row) & 0x7fff];
+    uint16_t plane4 = PpuRenderVram(ppu)[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 24 + row) & 0x7fff];
     pixel |= ((plane4 >> col) & 1) << 6;
     pixel |= ((plane4 >> (8 + col)) & 1) << 7;
   }
@@ -380,8 +380,8 @@ static int ppu_sample_mode7(Ppu *ppu, int x, int layer, bool priority) {
   xPos &= 0x3ff;
   yPos &= 0x3ff;
   if (!PPU_m7largeField(ppu)) outsideMap = false;
-  uint8_t tile = outsideMap ? 0 : ppu->vram[(yPos >> 3) * 128 + (xPos >> 3)] & 0xff;
-  uint8_t pixel = outsideMap && !PPU_m7charFill(ppu) ? 0 : ppu->vram[tile * 64 + (yPos & 7) * 8 + (xPos & 7)] >> 8;
+  uint8_t tile = outsideMap ? 0 : PpuRenderVram(ppu)[(yPos >> 3) * 128 + (xPos >> 3)] & 0xff;
+  uint8_t pixel = outsideMap && !PPU_m7charFill(ppu) ? 0 : PpuRenderVram(ppu)[tile * 64 + (yPos & 7) * 8 + (xPos & 7)] >> 8;
   if (layer == 1) {
     if (((bool)(pixel & 0x80)) != priority) return 0;
     return pixel & 0x7f;

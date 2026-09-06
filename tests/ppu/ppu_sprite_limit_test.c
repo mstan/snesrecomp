@@ -130,6 +130,44 @@ int main(void) {
     Ppu *ppu = ppu_init();
     int failures = 0;
     if (!ppu) return 2;
+    /* Presentation VRAM changes scanout in both renderers, but never CPU
+     * reads/writes, the real tile memory, or the default-off picture. */
+    for (unsigned flags = 0; flags <= 1; flags++) {
+        uint16_t picture[32768], original[32768];
+        uint8_t baseline[kPitch], changed[kPitch], restored[kPitch];
+        ppu_reset(ppu);
+        setup_mode2_offset_bg1(ppu);
+        memcpy(original, ppu->vram, sizeof(original));
+        memcpy(picture, original, sizeof(picture));
+        for (unsigned row = 0; row < 8; row++) picture[0x1000 + row] = 0xff00;
+        PpuBeginDrawing(ppu, baseline, kPitch, flags);
+        render_one_line(ppu);
+        ppu->renderVram = picture;
+        PpuBeginDrawing(ppu, changed, kPitch, flags);
+        render_one_line(ppu);
+        failures += check(memcmp(baseline, changed, kPitch) != 0,
+                          "explicit picture memory changes scanout");
+        failures += check(!memcmp(ppu->vram, original, sizeof(original)),
+                          "picture rendering preserves real VRAM");
+        ppu->vramPointer = 0x1000;
+        ppu_write(ppu, 0x16, 0);
+        ppu_write(ppu, 0x17, 0x10);
+        failures += check(ppu->vramReadBuffer == original[0x1000],
+                          "CPU VRAM read buffer ignores picture memory");
+        ppu_write(ppu, 0x18, 0x55);
+        failures += check((ppu->vram[0x1000] & 255) == 0x55 &&
+                          picture[0x1000] == 0xff00,
+                          "CPU writes update real memory only");
+        memcpy(ppu->vram, original, sizeof(original));
+        ppu->renderVram = NULL;
+        PpuBeginDrawing(ppu, restored, kPitch, flags);
+        render_one_line(ppu);
+        failures += check(!memcmp(baseline, restored, kPitch),
+                          "unbinding restores the faithful picture");
+        ppu->renderVram = picture;
+        ppu_reset(ppu);
+        failures += check(ppu->renderVram == NULL, "reset discards picture binding");
+    }
     memset(pixels, 0, sizeof pixels);
     ppu_reset(ppu);
     PpuBeginDrawing(ppu, pixels, kPitch, kPpuRenderFlags_NewRenderer);
