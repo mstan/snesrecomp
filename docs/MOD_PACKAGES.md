@@ -32,19 +32,41 @@ extraction, validates the manifest, and publishes a version atomically.
 
 ## Package layout
 
-Installed packages live beside the executable:
+The runtime is initialized with a root directory beside the executable, and
+everything else hangs off that root:
 
 ```text
-mods/
-  state.toml
+<exe-dir>/mods/preloaded/          <- the root a scaffolded title passes to
+  state.toml                          snes_mod_runtime_initialize_c()
   packages/
     example.display/
       1.0.0/
         manifest.toml
 ```
 
-A game may preload built-in packages with a post-build copy into this same
-layout. Built-in features should default to disabled.
+`state.toml` is USER state (which features are on, with which options), written
+at run time. `packages/` is BUILD output.
+
+**A title never spells that destination.** It declares where its own packages
+come from and the framework stages them:
+
+```cmake
+snesrecomp_target_mod_catalog(<target> ${CMAKE_SOURCE_DIR}/mods/preloaded)
+```
+
+`runner.cmake` owns the layout, so changing it later touches one file instead
+of every port, and two guards make "the title forgot" impossible: a project
+with packages that never declares them fails to CONFIGURE, and a declared
+package that does not arrive fails the BUILD. Pass `NONE` instead of a
+directory to state, explicitly, that a title ships no catalog. Built-in
+features should default to disabled.
+
+Older titles predate this: they hand-wrote a `copy_directory` into
+`<exe-dir>/mods` and initialize the runtime from `mods` rather than
+`mods/preloaded`. That layout still works — the root is whatever the title
+passes — but it is per-title, which is exactly what the function above exists
+to end. Moving one is two lines: the CMake call, and the root string in
+`main.c`.
 
 ## Manifest format 1
 

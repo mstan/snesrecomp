@@ -393,6 +393,172 @@ function(snesrecomp_target_stage_dir target source_dir dest_rel)
         VERBATIM)
 endfunction()
 
+# ── The mod catalog — THE FRAMEWORK OWNS THE LAYOUT ─────────────────────────
+#
+# snesrecomp_target_mod_catalog(<target> <preloaded_dir>|NONE)
+#
+# A title says WHERE its packages live and never HOW they are laid out beside
+# the executable. `<preloaded_dir>` is the directory shaped like
+# <repo>/mods/preloaded, holding packages/<id>/<version>/manifest.toml.
+#
+# WHY THIS REPLACES A HAND-WRITTEN COPY. Every mod-carrying SNES title spelled
+# the destination itself:
+#
+#     snesrecomp_target_stage_dir(<target> "${CMAKE_SOURCE_DIR}/mods" mods)
+#
+# which is the same shape psxrecomp had to withdraw after renaming its staged
+# directory broke five titles at once, silently, because the path was a string
+# in six repositories (psxrecomp runtime.cmake, "Mod catalog staging"). The
+# SNES failure did not even need a rename: a title that simply never wrote the
+# line shipped a binary whose Mods page is empty, and nothing in a configure, a
+# build or a test says so. Measured across this workspace: of eight SNES titles
+# with a package catalog or a mods/ tree, three staged nothing at all.
+#
+# Two guards, so "the title forgot" stops being a thing that can happen:
+#
+#   * configure time — a project with packages under mods/preloaded/packages
+#     that never declares them is a hard error, naming the call to add. An
+#     EMPTY packages/ (the scaffold's initial state) configures fine, because
+#     a title that has not written a mod yet must still build.
+#   * build time — snes_check_mod_catalog.cmake runs after the staging copy and
+#     fails the build if a declared package did not arrive. A staging step that
+#     half-worked is otherwise indistinguishable from a title with no mods.
+#
+# It also refuses a catalog that no loader will read: packages present with
+# SNESRECOMP_ENABLE_MODS OFF means the files ship and the Mods page stays dark,
+# which is the same empty page by a different route.
+#
+# POST_BUILD on the executable, for the reason snesrecomp_target_stage_dir
+# gives above: a sibling ALL target is skipped by `cmake --build --target <exe>`,
+# which is how the launcher's own Generate & rebuild produces a game.
+
+# Immediate subdirectory names of `root` (package ids), sorted. CONFIGURE_DEPENDS
+# so that creating the first package re-runs configure and trips the guard
+# rather than waiting for someone to notice at release time.
+function(_snesrecomp_package_ids root out_var)
+    set(_ids "")
+    file(GLOB _entries CONFIGURE_DEPENDS LIST_DIRECTORIES true "${root}/*")
+    foreach(_e IN LISTS _entries)
+        if(IS_DIRECTORY "${_e}")
+            get_filename_component(_n "${_e}" NAME)
+            list(APPEND _ids "${_n}")
+        endif()
+    endforeach()
+    list(SORT _ids)
+    set(${out_var} "${_ids}" PARENT_SCOPE)
+endfunction()
+
+# The one place the staged layout is written down.
+set(SNESRECOMP_MOD_CATALOG_DEST "mods/preloaded/packages")
+
+function(snesrecomp_target_mod_catalog target preloaded_dir)
+    if(NOT TARGET ${target})
+        message(FATAL_ERROR
+            "snesrecomp_target_mod_catalog: no such target '${target}'")
+    endif()
+    set_property(GLOBAL APPEND PROPERTY SNESRECOMP_MOD_CATALOG_TARGETS "${target}")
+
+    if(preloaded_dir STREQUAL "NONE")
+        # An explicit "this title ships no catalog". Recorded, so the guard
+        # below can tell it apart from a title that never called this at all.
+        return()
+    endif()
+    if(NOT IS_DIRECTORY "${preloaded_dir}")
+        message(FATAL_ERROR
+            "snesrecomp_target_mod_catalog(${target}): ${preloaded_dir} is not "
+            "a directory. Pass the directory shaped like "
+            "<repo>/mods/preloaded, or the literal NONE.")
+    endif()
+
+    set(_pkg_src "${preloaded_dir}/packages")
+    set(_ids "")
+    if(IS_DIRECTORY "${_pkg_src}")
+        _snesrecomp_package_ids("${_pkg_src}" _ids)
+    endif()
+
+    if(_ids AND NOT SNESRECOMP_ENABLE_MODS)
+        list(JOIN _ids "\n    " _pretty)
+        message(FATAL_ERROR
+            "This project ships a mod catalog:\n"
+            "    ${_pretty}\n"
+            "but SNESRECOMP_ENABLE_MODS is OFF, so the loader is not compiled "
+            "and the Mods page cannot show any of it. The packages would be "
+            "copied beside the executable and read by nothing.\n\n"
+            "Set it before including runner.cmake:\n\n"
+            "    set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL \"\" FORCE)\n")
+    endif()
+
+    # Nothing to stage yet: a scaffold with an empty packages/ is a valid
+    # state, and copy_directory on a missing source is a build error.
+    if(NOT IS_DIRECTORY "${_pkg_src}")
+        return()
+    endif()
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${_pkg_src}"
+            "$<TARGET_FILE_DIR:${target}>/${SNESRECOMP_MOD_CATALOG_DEST}"
+        COMMENT "${target}: staging the mod catalog into ${SNESRECOMP_MOD_CATALOG_DEST}/"
+        VERBATIM)
+
+    if(_ids)
+        # Verify rather than assume. copy_directory reports its own failures,
+        # but a catalog that arrives incomplete (a package removed from the
+        # source tree between configure and build, a destination someone else's
+        # POST_BUILD wiped) looks exactly like a title with fewer mods.
+        list(JOIN _ids "|" _ids_arg)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DSNES_MOD_DEST=$<TARGET_FILE_DIR:${target}>/${SNESRECOMP_MOD_CATALOG_DEST}"
+                "-DSNES_MOD_IDS=${_ids_arg}"
+                "-DSNES_MOD_TARGET=${target}"
+                -P "${SNESRECOMP_RUNNER_ROOT}/snes_check_mod_catalog.cmake"
+            COMMENT "${target}: verifying the staged mod catalog"
+            VERBATIM)
+    endif()
+endfunction()
+
+# Runs at the end of the directory that included runner.cmake, i.e. after the
+# title has had every chance to declare its catalog.
+function(_snesrecomp_finalize_mod_catalog_guard)
+    get_property(_declared GLOBAL PROPERTY SNESRECOMP_MOD_CATALOG_TARGETS)
+    if(_declared)
+        return()
+    endif()
+    set(_ids "")
+    if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/mods/preloaded/packages")
+        _snesrecomp_package_ids(
+            "${CMAKE_SOURCE_DIR}/mods/preloaded/packages" _ids)
+    endif()
+    if(NOT _ids)
+        return()
+    endif()
+    list(JOIN _ids "\n    " _pretty)
+    message(FATAL_ERROR
+        "This project has a mod catalog at "
+        "${CMAKE_SOURCE_DIR}/mods/preloaded/packages:\n"
+        "    ${_pretty}\n"
+        "but no target declared it, so those packages would never be staged "
+        "beside the executable and the Mods page would be empty in every "
+        "build and every release zip.\n\n"
+        "Add, after the target exists:\n\n"
+        "    snesrecomp_target_mod_catalog(<target>\n"
+        "        \"\${CMAKE_SOURCE_DIR}/mods/preloaded\")\n\n"
+        "and DELETE any snesrecomp_target_stage_dir(... mods) or "
+        "add_custom_command(... copy_directory ... /mods) block: the framework "
+        "owns the destination layout now, so a future rename touches "
+        "runner.cmake and nothing else. Pass NONE instead of a directory if "
+        "this title genuinely ships no catalog.")
+endfunction()
+
+# cmake_language(DEFER) is 3.19+. Titles scaffolded against 3.16 still build on
+# a newer cmake binary, so gate on what is running rather than on the policy
+# version -- and when it is genuinely unavailable, the per-call checks above
+# still apply; only the "never called it at all" guard is lost.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.19)
+    cmake_language(DEFER CALL _snesrecomp_finalize_mod_catalog_guard)
+endif()
+
 # ── ROM identity ────────────────────────────────────────────────────────────
 #
 # snesrecomp_rom_identity(<target> <identity_file>)
