@@ -897,15 +897,22 @@ static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
     if (n < 0 || (size_t)n >= cap) return 0;
     used = (size_t)n;
     for (i = 0; i < count; ++i) {
+        char id_esc[JSON_ESC_CAP(SNES_LOBBY_MOD_ID_LEN)];
+        char ver_esc[JSON_ESC_CAP(SNES_LOBBY_MOD_VER_LEN)];
         char name_esc[SNES_LOBBY_MOD_NAME_LEN * 2 + 4];
         char feats_esc[SNES_LOBBY_MOD_FEATS_LEN * 2 + 4];
         if (!pkgs[i].id[0] || !pkgs[i].ver[0]) continue;
+        /* id and ver are escaped for the same reason n and f already were:
+         * they come from package metadata, which a crafted package -- or an
+         * edited client -- chooses. */
+        json_escape(pkgs[i].id, id_esc, sizeof(id_esc));
+        json_escape(pkgs[i].ver, ver_esc, sizeof(ver_esc));
         json_escape(pkgs[i].name, name_esc, sizeof(name_esc));
         json_escape(pkgs[i].feats, feats_esc, sizeof(feats_esc));
         n = snprintf(dst + used, cap - used,
                      "%s{\"id\":\"%s\",\"ver\":\"%s\",\"n\":\"%s\",\"f\":\"%s\"}",
                      wrote ? "," : "",
-                     pkgs[i].id, pkgs[i].ver, name_esc, feats_esc);
+                     id_esc, ver_esc, name_esc, feats_esc);
         if (n < 0 || (size_t)n >= cap - used) return 0;
         used += (size_t)n;
         wrote++;
@@ -2325,7 +2332,7 @@ static void snes_lobby_normalize_guest_bind(const char *guest_bind, char *out,
 
 int snes_lobby_join(const char *lobby_id, const char *password, const char *guest_bind)
 {
-    char msg[SNES_LOBBY_MAX_MODS * 256 + 1024];
+    char msg[SNES_LOBBY_MAX_MODS * 256 + 1792];
     char offer[SNES_LOBBY_MAX_MODS * 256 + 64];
     char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
     char pw_esc[JSON_ESC_CAP(128)];
@@ -2334,6 +2341,12 @@ int snes_lobby_join(const char *lobby_id, const char *password, const char *gues
     char gn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
     char gv_esc[JSON_ESC_CAP(SNES_LOBBY_VERSION_LEN)];
     int n;
+    char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
+    char pw_esc[JSON_ESC_CAP(128)];
+    char bind_esc[JSON_ESC_CAP(SNES_LOBBY_ENDPOINT_LEN)];
+    char dn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
+    char gn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
+    char gv_esc[JSON_ESC_CAP(SNES_LOBBY_VERSION_LEN)];
     const char *gn;
     const char *gv;
     int n;
@@ -2542,10 +2555,14 @@ int snes_lobby_seat_swap_respond(int accept)
     if (!g_lc.swap_in_valid) return -1;
     g_lc.swap_in_valid = 0;
     if (!snes_lobby_connected() || !g_lc.in_lobby) return -1;
-    snprintf(msg, sizeof(msg),
-             "{\"op\":\"seat_swap_answer\",\"accept\":%s,"
-             "\"asker_player_id\":\"%s\"}",
-             accept ? "true" : "false", g_lc.swap_in_asker_id);
+    {
+        char asker_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
+        json_escape(g_lc.swap_in_asker_id, asker_esc, sizeof(asker_esc));
+        snprintf(msg, sizeof(msg),
+                 "{\"op\":\"seat_swap_answer\",\"accept\":%s,"
+                 "\"asker_player_id\":\"%s\"}",
+                 accept ? "true" : "false", asker_esc);
+    }
     queue_send(msg);
     flush_pending();
     return 0;
@@ -2584,6 +2601,7 @@ int snes_lobby_chat_count(void)
 int snes_lobby_send_server_chat(const char *text)
 {
     char esc[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 8];
+    char game_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
     char msg[SNES_LOBBY_CHAT_TEXT_LEN * 2 + 256];
     int n;
     if (!snes_lobby_connected()) return -1;
@@ -2591,9 +2609,10 @@ int snes_lobby_send_server_chat(const char *text)
     json_escape(text, esc, sizeof(esc));
     /* Carry the title on the line itself: the server scopes by it, and this
      * works even against a server that has not seen our `list` yet. */
+    json_escape(g_lc.filter_game_name, game_esc, sizeof(game_esc));
     n = snprintf(msg, sizeof(msg),
                  "{\"op\":\"server_chat\",\"game_name\":\"%s\",\"text\":\"%s\"}",
-                 g_lc.filter_game_name, esc);
+                 game_esc, esc);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
     queue_send(msg);
     flush_pending();
@@ -3558,6 +3577,8 @@ int snes_lobby_send_signal_to(const char *to_player_id, int type, int flag,
 {
     char esc[4096];
     char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
+    char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
+    char to_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
     char msg[4608];
     const char *lid;
     if (!snes_lobby_connected() || !g_lc.in_lobby) {
@@ -3570,10 +3591,12 @@ int snes_lobby_send_signal_to(const char *to_player_id, int type, int flag,
      * right for the game's own ICE but wrong for a transfer: a third player
      * would push a stranger's SDP into their agent and corrupt a negotiation
      * they are not part of. */
+    json_escape(lid, lid_esc, sizeof(lid_esc));
+    json_escape(to_player_id ? to_player_id : "", to_esc, sizeof(to_esc));
     snprintf(msg, sizeof(msg),
              "{\"op\":\"signal\",\"lobby_id\":\"%s\",\"to_player_id\":\"%s\","
              "\"type\":%d,\"flag\":%d,\"text\":\"%s\"}",
-             lid_esc, to_player_id ? to_player_id : "", type, flag, esc);
+             lid_esc, to_esc, type, flag, esc);
     /* Write immediately — ICE candidates arrive in bursts larger than pending_tx. */
     if (g_lc.handshake_done && g_lc.fd >= 0) {
         if (rnet_ws_write_text(g_lc.fd, msg, 1) < 0)
