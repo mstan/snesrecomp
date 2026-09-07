@@ -37,6 +37,15 @@ void joypad_reset_state(void)
      * nothing. */
     g_jp.tap[0] = tap0;
     g_jp.tap[1] = tap1;
+    /* $4201 (WRIO) powers up with every output high, so both IOBit lines
+     * rest at 1 and a tap reports its first pad pair until the guest says
+     * otherwise.  Zeroing them instead only looked harmless while no tap
+     * existed: with a tap on port 2 it hands $421A the tap's THIRD pad, so a
+     * game that never writes $4201 -- Super Mario World reads only the
+     * automatic registers -- would quietly drive player two from player
+     * four's controller. */
+    g_jp.iobit[0] = 1u;
+    g_jp.iobit[1] = 1u;
     for (i = 0; i < joypad_player_count(); i++)
         g_jp.connected[i] = 1;
 }

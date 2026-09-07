@@ -379,6 +379,47 @@ static void test_tap_on_port_one(void)
         "the lone port 2 controller is seat 4");
 }
 
+
+/*
+ * $4201 (WRIO) powers up with every output high, so both IOBit lines rest at
+ * 1 and a tap reports its FIRST pad pair before the guest writes anything.
+ *
+ * This matters to games that never touch $4201 at all.  Super Mario World
+ * reads only the automatic registers: with a tap on port 2 and the lines
+ * resting low instead, $421A would answer with the tap's third pad, and
+ * player two would silently be driven by player four's controller.  Every
+ * other test here writes IOBit before reading, so none of them would notice.
+ */
+static void test_iobit_powers_up_high(void)
+{
+  Snes s;
+  uint16_t w;
+
+  memset(&s, 0, sizeof(s));
+  joypad_set_multitap(0, 0);
+  joypad_set_multitap(1, 1);
+  joypad_reset_state();
+  /* Deliberately no joypad_write_iobit: this is the power-on state. */
+  check(joypad_read_iobit() == 0xc0u, "both IOBit lines rest high at power-on");
+
+  joypad_set_pad(0, BTN_B);
+  joypad_set_pad(1, BTN_START);
+  joypad_set_pad(2, BTN_UP);
+  joypad_set_pad(3, BTN_RIGHT);
+  joypad_auto_read(&s);
+
+  w = (uint16_t)(joypad_auto_read_reg_addr(&s, 0x4218) |
+                 ((uint16_t)joypad_auto_read_reg_addr(&s, 0x4219) << 8));
+  check(w == joypad_auto_read_word(BTN_B), "$4218 is seat 0 with no write to $4201");
+  w = (uint16_t)(joypad_auto_read_reg_addr(&s, 0x421a) |
+                 ((uint16_t)joypad_auto_read_reg_addr(&s, 0x421b) << 8));
+  check(w == joypad_auto_read_word(BTN_START),
+        "$421A is seat 1, not the tap's third pad, with no write to $4201");
+  w = (uint16_t)(joypad_auto_read_reg_addr(&s, 0x421e) |
+                 ((uint16_t)joypad_auto_read_reg_addr(&s, 0x421f) << 8));
+  check(w == joypad_auto_read_word(BTN_UP), "$421E is seat 2 at power-on");
+}
+
 int main(void)
 {
   test_no_tap_unchanged();
@@ -391,6 +432,7 @@ int main(void)
   test_eight_players();
   test_tap_enabled_after_reset();
   test_tap_on_port_one();
+  test_iobit_powers_up_high();
 
   if (g_failures) {
     fprintf(stderr, "multitap_test: %d FAILURES\n", g_failures);
