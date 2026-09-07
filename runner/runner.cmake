@@ -120,6 +120,7 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/ppu.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/ppu_legacy.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/sa1.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/sdd1.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/ws_shadow.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/snes.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/snes_other.c
@@ -148,18 +149,9 @@ message(STATUS "Cx4: instruction-level HG51B S169 core (ares, ISC)")
 # a normal playable build; opt in with -DSNESRECOMP_ENABLE_TRACE=ON.
 option(SNESRECOMP_ENABLE_TRACE "Build the TCP debug server / observability rings" OFF)
 if(SNESRECOMP_ENABLE_TRACE)
-    # Compiling debug_server.c is only half of turning tracing on. The header
-    # keys off SNESRECOMP_TRACE, not off the option, and defaults it to 0 — so
-    # without this define every translation unit (debug_server.c included) sees
-    # the no-op stubs, and debug_server.c's real definitions collide with the
-    # stubs it just pulled in from its own header. The option was inert before
-    # this: -DSNESRECOMP_ENABLE_TRACE=ON did not build, it only failed.
     add_compile_definitions(SNESRECOMP_TRACE=1)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         ${SNESRECOMP_RUNNER_ROOT}/src/debug_server.c
-        # debug_server.c's on-demand dump calls recomp_post_mortem_dump(), and
-        # this is the only translation unit that defines it. It is not in the
-        # base source list, so a trace build does not link without it.
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop/post_mortem.c
     )
     if(EXISTS ${SNESRECOMP_RUNNER_ROOT}/src/emu_oracle_cmds.c)
@@ -180,6 +172,7 @@ option(SNESRECOMP_ENABLE_MODS
 if(SNESRECOMP_ENABLE_MODS)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
         ${SNESRECOMP_RUNNER_ROOT}/src/mod_runtime.cpp
+        ${SNESRECOMP_RUNNER_ROOT}/src/snes_text_xlate.cpp
     )
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -200,7 +193,7 @@ if(NOT WIN32)
     list(APPEND SNESRECOMP_RUNNER_LIBRARIES m)
 endif()
 if(SNESRECOMP_ENABLE_TRACE AND WIN32)
-    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32)
+    list(APPEND SNESRECOMP_RUNNER_LIBRARIES ws2_32 dbghelp)
 endif()
 
 # Differential co-simulation (SNES_COSIM.md): full-state first-divergence oracle.
@@ -280,6 +273,139 @@ set_property(SOURCE
     APPEND PROPERTY COMPILE_DEFINITIONS
     SNESRECOMP_DISPATCH_HISTORY=${_SNESRECOMP_DISPATCH_HISTORY})
 unset(_SNESRECOMP_DISPATCH_HISTORY)
+
+# Runtime CPU/APU diagnostic helpers are useful for trace and co-sim, but are
+# not part of emulated hardware. Keep their storage and hot-path updates out of
+# production unless a build opts in explicitly.
+option(SNESRECOMP_ENABLE_FUNC_SNAPSHOT
+    "Capture function-boundary WRAM snapshots for debug-server bisection"
+    ${SNESRECOMP_ENABLE_TRACE})
+option(SNESRECOMP_ENABLE_STACK_BALANCE_DIAGNOSTICS
+    "Collect per-function stack-balance diagnostics"
+    ${SNESRECOMP_ENABLE_TRACE})
+option(SNESRECOMP_ENABLE_BOOT_WATCHDOG_DIAGNOSTICS
+    "Sample recomp stack during frame-0 boot stalls"
+    ${SNESRECOMP_ENABLE_TRACE})
+option(SNESRECOMP_ENABLE_CPU_HW_DIAGNOSTICS
+    "Collect CPU hardware-register touch diagnostics"
+    ${SNESRECOMP_ENABLE_TRACE})
+option(SNESRECOMP_ENABLE_SPC_DIAGNOSTICS
+    "Collect SPC PC histogram and port-write diagnostics"
+    ${SNESRECOMP_ENABLE_TRACE})
+if(SNES_COSIM OR SNESRECOMP_ENABLE_TRACE)
+    set(_SNESRECOMP_FUNC_SNAPSHOT 1)
+    set(_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS 1)
+    set(_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS 1)
+    set(_SNESRECOMP_CPU_HW_DIAGNOSTICS 1)
+    set(_SNESRECOMP_SPC_DIAGNOSTICS 1)
+else()
+    set(_SNESRECOMP_FUNC_SNAPSHOT ${SNESRECOMP_ENABLE_FUNC_SNAPSHOT})
+    set(_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
+        ${SNESRECOMP_ENABLE_STACK_BALANCE_DIAGNOSTICS})
+    set(_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS
+        ${SNESRECOMP_ENABLE_BOOT_WATCHDOG_DIAGNOSTICS})
+    set(_SNESRECOMP_CPU_HW_DIAGNOSTICS
+        ${SNESRECOMP_ENABLE_CPU_HW_DIAGNOSTICS})
+    set(_SNESRECOMP_SPC_DIAGNOSTICS ${SNESRECOMP_ENABLE_SPC_DIAGNOSTICS})
+endif()
+if(_SNESRECOMP_FUNC_SNAPSHOT)
+    set(_SNESRECOMP_FUNC_SNAPSHOT 1)
+else()
+    set(_SNESRECOMP_FUNC_SNAPSHOT 0)
+endif()
+if(_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS)
+    set(_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS 1)
+else()
+    set(_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS 0)
+endif()
+if(_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS)
+    set(_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS 1)
+else()
+    set(_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS 0)
+endif()
+if(_SNESRECOMP_CPU_HW_DIAGNOSTICS)
+    set(_SNESRECOMP_CPU_HW_DIAGNOSTICS 1)
+else()
+    set(_SNESRECOMP_CPU_HW_DIAGNOSTICS 0)
+endif()
+if(_SNESRECOMP_SPC_DIAGNOSTICS)
+    set(_SNESRECOMP_SPC_DIAGNOSTICS 1)
+else()
+    set(_SNESRECOMP_SPC_DIAGNOSTICS 0)
+endif()
+message(STATUS
+    "SNES runtime diagnostics: func_snapshot=${_SNESRECOMP_FUNC_SNAPSHOT}; "
+    "stack_balance=${_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS}; "
+    "boot_watchdog=${_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS}; "
+    "cpu_hw=${_SNESRECOMP_CPU_HW_DIAGNOSTICS}; "
+    "spc=${_SNESRECOMP_SPC_DIAGNOSTICS}")
+set_property(SOURCE
+    ${SNESRECOMP_RUNNER_ROOT}/src/common_cpu_infra.c
+    APPEND PROPERTY COMPILE_DEFINITIONS
+    SNESRECOMP_FUNC_SNAPSHOT=${_SNESRECOMP_FUNC_SNAPSHOT}
+    SNESRECOMP_STACK_BALANCE_DIAGNOSTICS=${_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS}
+    SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS=${_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS})
+set_property(SOURCE
+    ${SNESRECOMP_RUNNER_ROOT}/src/cpu_state.c
+    APPEND PROPERTY COMPILE_DEFINITIONS
+    SNESRECOMP_CPU_HW_DIAGNOSTICS=${_SNESRECOMP_CPU_HW_DIAGNOSTICS})
+set_property(SOURCE
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes/apu.c
+    APPEND PROPERTY COMPILE_DEFINITIONS
+    SNESRECOMP_SPC_DIAGNOSTICS=${_SNESRECOMP_SPC_DIAGNOSTICS})
+unset(_SNESRECOMP_FUNC_SNAPSHOT)
+unset(_SNESRECOMP_STACK_BALANCE_DIAGNOSTICS)
+unset(_SNESRECOMP_BOOT_WATCHDOG_DIAGNOSTICS)
+unset(_SNESRECOMP_CPU_HW_DIAGNOSTICS)
+unset(_SNESRECOMP_SPC_DIAGNOSTICS)
+
+# Audio counters are functional production telemetry used by the runtime and
+# reports. The large PCM/event/snapshot histories are forensic diagnostics:
+# useful in trace builds, expensive in the sample/DSP hot path, and large in
+# static storage. Co-simulation and trace builds force the historical full
+# rings. Production defaults to SMALL after serialized title A/B acceptance,
+# and can still be tested with:
+#
+#   -DSNESRECOMP_AUDIO_TRACE_HISTORY=COUNTERS
+#   -DSNESRECOMP_AUDIO_TRACE_HISTORY=SMALL
+#   -DSNESRECOMP_AUDIO_TRACE_HISTORY=FULL
+#   -DSNESRECOMP_AUDIO_TRACE_HISTORY=RESERVED
+#
+# SMALL retains about 2 s of native PCM, 16K events, and 512 one-second
+# snapshots (~8.5 min). FULL retains about 131 s of PCM, 512K events, and
+# 4096 snapshots (~68 min). SMALL drop-run fragmentation follows actual event
+# retention; that is debug telemetry fidelity, not emulated audio behavior.
+# RESERVED keeps full storage allocated but skips hot-path history writes,
+# which isolates layout/footprint effects from write bandwidth.
+set(SNESRECOMP_AUDIO_TRACE_HISTORY "SMALL" CACHE STRING
+    "Audio trace history retention (COUNTERS, SMALL, FULL, RESERVED)")
+set_property(CACHE SNESRECOMP_AUDIO_TRACE_HISTORY PROPERTY STRINGS
+    COUNTERS SMALL FULL RESERVED)
+string(TOUPPER "${SNESRECOMP_AUDIO_TRACE_HISTORY}" _SNESRECOMP_AUDIO_HISTORY)
+if(SNES_COSIM OR SNESRECOMP_ENABLE_TRACE)
+    set(_SNESRECOMP_AUDIO_HISTORY "FULL")
+endif()
+if(_SNESRECOMP_AUDIO_HISTORY STREQUAL "COUNTERS")
+    set(_SNESRECOMP_AUDIO_HISTORY_VALUE 0)
+elseif(_SNESRECOMP_AUDIO_HISTORY STREQUAL "SMALL")
+    set(_SNESRECOMP_AUDIO_HISTORY_VALUE 1)
+elseif(_SNESRECOMP_AUDIO_HISTORY STREQUAL "FULL")
+    set(_SNESRECOMP_AUDIO_HISTORY_VALUE 2)
+elseif(_SNESRECOMP_AUDIO_HISTORY STREQUAL "RESERVED")
+    set(_SNESRECOMP_AUDIO_HISTORY_VALUE 3)
+else()
+    message(FATAL_ERROR
+        "SNESRECOMP_AUDIO_TRACE_HISTORY must be COUNTERS, SMALL, FULL, "
+        "or RESERVED (got '${SNESRECOMP_AUDIO_TRACE_HISTORY}')")
+endif()
+message(STATUS
+    "SNES audio trace history: ${_SNESRECOMP_AUDIO_HISTORY}")
+set_property(SOURCE
+    ${SNESRECOMP_RUNNER_ROOT}/src/audio_trace.c
+    APPEND PROPERTY COMPILE_DEFINITIONS
+    SNESRECOMP_AUDIO_TRACE_HISTORY=${_SNESRECOMP_AUDIO_HISTORY_VALUE})
+unset(_SNESRECOMP_AUDIO_HISTORY)
+unset(_SNESRECOMP_AUDIO_HISTORY_VALUE)
 
 set(SNESRECOMP_RUNNER_INCLUDE_DIRS
     ${SNESRECOMP_RUNNER_ROOT}/src

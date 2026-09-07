@@ -32,12 +32,15 @@ enum {
   // capacity. This is a compile-time ceiling only; the actual extra columns
   // rendered each frame are the runtime ppu->extraLeftCur/extraRightCur, which
   // default to 0 (authentic 256-wide output). 272 per side allows up to an
-  // 800-pixel internal width, matching Star Fox Enhanced's 32:9 mode.
+  // 800-pixel internal width for opt-in 32:9 presentation.
   kPpuExtraLeftRight = 272,
   // Full internal width of the priority buffers (logical 256 + both borders).
   kPpuBufWidth = kPpuXPixels + kPpuExtraLeftRight * 2,
   // Split-screen games can assign distinct anchor layouts to each viewport.
   kPpuWsAnchorBands = 2,
+  // Number of stopped frames tolerated after a moving unhinted OBJ reaches the
+  // left widened margin.
+  kPpuWsOamMovingGraceFrames = 4,
 };
 
 typedef uint16_t PpuZbufType;
@@ -46,8 +49,13 @@ typedef struct PpuPixelPrioBufs {
   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
   // Sized for the widescreen border; logical screen x maps to
   // data[x + kPpuExtraLeftRight].
+  //
+  // 8-aligned because ClearBackdrop fills this through a uint64 pointer.
+  // The array itself only needs 2, so any member landing on a 4-mod-8
+  // offset aborts on ARM -- and which ones do shifts whenever a field
+  // above them grows.
   PpuZbufType data[kPpuBufWidth];
-} PpuPixelPrioBufs;
+} __attribute__((aligned(8))) PpuPixelPrioBufs;
 
 static inline void PpuWidescreenAdjustPinnedWindowEdges(
     int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,
@@ -87,8 +95,8 @@ typedef struct PpuOverlayCapture {
   int16_t x0, x1;
   int16_t y0, y1;
   uint8_t flags;
-  /* OBJ-only selector. Arming an OBJ capture selects all OAM slots by default;
-   * games can narrow this when they know the semantic slot range to export. */
+  /* OBJ-only selector. Arming selects all objects for compatibility. Titles
+   * can select a semantic slot range explicitly; count zero selects none. */
   uint8_t oamFirst, oamCount;
 } PpuOverlayCapture;
 
@@ -235,22 +243,29 @@ struct Ppu {
   // margins. Layer bits use the PPU window layer numbering (BG1..BG4, OBJ,
   // color); window bits select W1/W2. Zero is the hardware-authentic default.
   uint8_t wsWindowExpandLayers, wsWindowExpandWindows;
-  // Strict decode of ambiguous 9-bit OAM X margin bands. 1 bit per OAM slot.
-  // Left: sprites fully clipped by the authentic 256-wide viewport may become
-  // visible in [-extraLeftCur, 0). With strict left hints enabled, only marked
-  // slots render there; unmarked slots stay hardware-hidden.
-  // Right: raw X values in [256, 256+extraRightCur) are either genuine
-  // right-margin sprites or off-screen-left parked sprites wrapped through
-  // 9-bit OAM X. With strict right hints enabled, only marked slots keep the
-  // positive decode; unmarked slots wrap negative like hardware.
-  // Default off preserves the legacy margin behavior. Games publish hints per
-  // NMI after CPU-side OAM staging is final and before the frame is presented.
-  // A NULL hint pointer disables strict mode. Pass a zeroed array for strict
-  // mode with no slots marked.
+  // Strict decode of ambiguous left-margin OAM positions. A NULL hint pointer
+  // disables strict mode; a zeroed hint array enables strict mode with no slots
+  // explicitly allowed.
   uint8_t wsOamLeftHintStrict;
   uint8_t wsOamLeftHint[16];
+  // Strict decode of the ambiguous 9-bit OAM X band [256, 256+extraRightCur).
+  // A raw value there is either a genuine right-margin sprite (widescreen
+  // host emitted it on purpose) or a sprite the game parked off-screen-left
+  // at x-512 (invisible on hardware). When strict is set, only slots marked
+  // in wsOamRightHint keep the positive decode; unmarked slots wrap negative
+  // like hardware, so parked sprites don't ghost into the right margin.
+  // Default off preserves the legacy always-positive band (SMW relies on it).
+  // Games publish per NMI via PpuWsSetOamRightHints. 1 bit per OAM slot.
   uint8_t wsOamRightHintStrict;
   uint8_t wsOamRightHint[16];
+  /* Host-only temporal classifier for unhinted left-margin OBJ. It lets a
+   * game-authored sprite keep moving through the widened margin, then parks it
+   * again after its X stops changing for a few frames. */
+  int16_t wsOamMotionLastLine;
+  int16_t wsOamMotionX[128];
+  uint32_t wsOamMotionSig[128];
+  uint8_t wsOamMotionSeen[16];
+  uint8_t wsOamMotionGrace[128];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -405,6 +420,9 @@ void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
+void ppu_sec_reset(void);
+void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+                  double *compose, double *hdma);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 
@@ -420,6 +438,7 @@ void ppu_rasterApplyLine(Ppu *ppu, int line);
 int  ppu_rasterDebugDump(char *out, int cap);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
+void PpuResetWidescreenOamHistory(Ppu *ppu);
 
 // Replace stale BG1 tilemap pixels in widened side margins before final
 // composition. The callback is host-only and runs independently for main and
@@ -535,7 +554,6 @@ void PpuWsSetOamLeftHints(Ppu *ppu, const uint8_t *hints);
 // Publish this frame's OAM right-margin hints (see wsOamRightHintStrict).
 // `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or
 // NULL to disable strict decode and restore the legacy always-positive band.
-// Pass a zeroed array for strict mode with no right-margin slots marked.
 // Games that stage OAM CPU-side should call this each NMI, after the staging
 // buffer is final and before the frame is presented.
 void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints);
@@ -562,8 +580,6 @@ const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu);
 
 // Per-layer widescreen clamp: bit L keeps BG(L+1) in the authentic 256
 // columns while other layers extend into the margins. Re-apply per frame.
-// Requires PpuBeginDrawing(..., kPpuRenderFlags_NewRenderer); the legacy
-// renderer stores this policy but does not apply it.
 void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
 
 // Extend selected game-authored PPU windows by the current widescreen margins
@@ -575,14 +591,12 @@ void PpuSetWidescreenWindowExpansion(Ppu *ppu, uint8_t layer_mask,
 // Fill Mode-1 background margins by reflecting or cyclically repeating the
 // authentic rendered scanline. Rendering remains layer-, priority-, window-,
 // and color-math-correct. Repeat wins if both bits are set. Re-apply per frame.
-// Requires kPpuRenderFlags_NewRenderer; the legacy renderer ignores these
-// policies.
 void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
 void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
 
 // Apply clamp, cyclic-repeat, or stretch only on scanlines [y0,y1).
 // y1<=y0 disables. Repeat/stretch bands apply to Mode-1 4bpp and 2bpp
-// background paths. Requires kPpuRenderFlags_NewRenderer.
+// background paths.
 void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                     uint8_t y1);
 void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,

@@ -26,6 +26,22 @@ static int s_verbose_checked;
 static int s_verbose;
 static int s_default_enabled;
 
+void tier2_capture_set_default_enabled(int enabled) {
+    s_default_enabled = enabled != 0;
+}
+
+int tier2_capture_enabled(void) {
+    const char *value = getenv("SNESRECOMP_TIER2_CAPTURE");
+    if (!value || !*value) value = getenv("SNESRECOMP_TIER2");
+    if (value && *value)
+        return value[0] != '0' && value[0] != 'f' && value[0] != 'F' &&
+               value[0] != 'n' && value[0] != 'N' && value[0] != 'o' &&
+               value[0] != 'O';
+    // Preserve upstream's explicit journal-path opt-in.
+    value = getenv("SNESRECOMP_TIER2_JOURNAL");
+    return s_default_enabled || (value && *value && *value != '0');
+}
+
 static int tier2_verbose(void) {
     if (!s_verbose_checked) {
         const char *value = getenv("SNESRECOMP_TIER2_VERBOSE");
@@ -33,30 +49,6 @@ static int tier2_verbose(void) {
         s_verbose_checked = 1;
     }
     return s_verbose;
-}
-
-static int env_truthy(const char *value) {
-    if (!value || !*value) return 0;
-    return value[0] != '0' && value[0] != 'f' && value[0] != 'F' &&
-           value[0] != 'n' && value[0] != 'N' && value[0] != 'o' &&
-           value[0] != 'O';
-}
-
-static int env_present(const char *value) {
-    return value && *value;
-}
-
-void tier2_capture_set_default_enabled(int enabled) {
-    s_default_enabled = enabled ? 1 : 0;
-}
-
-int tier2_capture_enabled(void) {
-    const char *value = getenv("SNESRECOMP_TIER2_CAPTURE");
-    if (!env_present(value))
-        value = getenv("SNESRECOMP_TIER2");
-    if (env_present(value))
-        return env_truthy(value);
-    return s_default_enabled;
 }
 
 static void sanitize_romid(const char *title, char *out, size_t cap) {
@@ -155,8 +147,16 @@ int tier2_capture_append_discovery(const char *rom_title,
                                    const char *site_kind,
                                    int outcome,
                                    int32_t frame) {
-    if (!tier2_capture_enabled())
-        return 1;
+    if (!tier2_capture_enabled()) return 1;
+    static int s_off = -1;
+    if (s_off < 0) {
+        /* Journal is opt-in: it writes+fflushes per discovery, which on a slow
+         * disk makes the interpreter crawl and thrashes the HDD. Only enable it
+         * when SNESRECOMP_TIER2_JOURNAL is set to an explicit path. */
+        const char *v = getenv("SNESRECOMP_TIER2_JOURNAL");
+        s_off = (!v || !*v || v[0] == '0') ? 1 : 0;
+    }
+    if (s_off) return 1; /* journaling disabled (opt-in via SNESRECOMP_TIER2_JOURNAL) */
     init_paths(rom_title);
     if (!s_journal) {
         s_journal = fopen(s_journal_path, "a");

@@ -1,4 +1,3 @@
-
 #ifndef CART_H
 #define CART_H
 
@@ -13,6 +12,7 @@ typedef struct SuperFx SuperFx;
 typedef struct Cx4 Cx4;
 typedef struct Dsp1 Dsp1;
 typedef struct Sa1 Sa1;
+typedef struct Sdd1 Sdd1;
 
 #include "snes.h"
 
@@ -30,20 +30,24 @@ struct Cart {
   Cx4* cx4;
   Dsp1* dsp1;
   Sa1* sa1;
+  Sdd1* sdd1;
 };
 
-enum {
-  CART_LOROM = 1,
-  CART_HIROM = 2,
-  CART_SUPERFX = 3,
-  CART_CX4 = 4,
-  CART_DSP1 = 5,
-  CART_DSP1_HIROM = 6,
-  CART_SA1 = 7
-};
+#define CART_LOROM        1
+#define CART_HIROM        2
+#define CART_SUPERFX      3
+#define CART_CX4          4
+#define CART_DSP1         5
+#define CART_DSP1_HIROM   6
+#define CART_SA1          7
+#define CART_SDD1 8
 
 static inline bool cart_has_sa1(const Cart *cart) {
   return cart && cart->type == CART_SA1 && cart->sa1;
+}
+
+static inline bool cart_has_sdd1(const Cart *cart) {
+  return cart && cart->type == CART_SDD1 && cart->sdd1;
 }
 
 static inline bool cart_has_dsp1(const Cart* cart) {
@@ -56,7 +60,7 @@ static inline bool cart_has_dsp1(const Cart* cart) {
  * paths (cpu_state.c) use this to route to cart_read/cart_write instead of
  * falling through to a ROM pointer. */
 static inline bool cart_is_cx4_window(const Cart* cart, uint8_t bank,
-                                     uint16_t adr) {
+                                      uint16_t adr) {
   return cart && cart->type == CART_CX4 && adr >= 0x6000 && adr < 0x8000 &&
          (bank < 0x40 || (bank >= 0x80 && bank < 0xc0));
 }
@@ -66,7 +70,7 @@ static inline bool cart_is_cx4_window(const Cart* cart, uint8_t bank,
  * The mapper removes the low 12 address bits: $6000-$6FFF selects DR and
  * $7000-$7FFF selects SR. */
 static inline bool cart_is_dsp1_window(const Cart* cart, uint8_t bank,
-                                      uint16_t adr) {
+                                       uint16_t adr) {
   return cart_has_dsp1(cart) && adr >= 0x6000 && adr < 0x8000 &&
          (bank < 0x20 || (bank >= 0x80 && bank < 0xa0));
 }
@@ -81,6 +85,14 @@ static inline bool cart_is_dsp1_sram_window(const Cart* cart, uint8_t bank,
   return cart_has_dsp1(cart) && adr >= 0x6000 && adr < 0x8000 &&
          ((bank >= 0x20 && bank < 0x40) ||
           (bank >= 0xa0 && bank < 0xc0));
+}
+
+/* S-DD1 decompression chip registers:
+ * banks $00-$3F / $80-$BF, addresses $4800-$4807. */
+static inline bool cart_is_sdd1_window(const Cart* cart, uint8_t bank,
+                                       uint16_t adr) {
+  return cart && cart->type == CART_SDD1 && adr >= 0x4800 && adr < 0x4808 &&
+         (bank < 0x40 || (bank >= 0x80 && bank < 0xc0));
 }
 
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock);

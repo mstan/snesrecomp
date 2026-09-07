@@ -1,6 +1,4 @@
 #include "ppu.h"
-
-extern unsigned char g_snesrecomp_last_hdmaen;
 #include "ppu_legacy.h"
 
 #include <stdio.h>
@@ -12,19 +10,67 @@ extern unsigned char g_snesrecomp_last_hdmaen;
 
 #include "snes.h"
 #include "../debug_server.h"
+#if SNESRECOMP_ENABLE_MODS
+#include "../snes_text_xlate.h"
+#endif
 #include "snes_regs.h"
 #include "ws_shadow.h"
 
 
 extern Snes *g_snes;
+extern unsigned char g_snesrecomp_last_hdmaen;
+
+#ifdef SNESRECOMP_INTERP_PROFILE
+static double g_ppu_sec_eval_ms = 0;
+static double g_ppu_sec_line_ms = 0;
+static double g_ppu_sec_bg_ms = 0;
+static double g_ppu_sec_spr_ms = 0;
+double g_ppu_sec_hdma_ms = 0;
+uint64_t g_ppu_sec_eval_n = 0, g_ppu_sec_line_n = 0;
+static inline uint64_t ppu_sec_now(void) {
+  extern uint64_t snesrecomp_host_now_ns(void);
+  return snesrecomp_host_now_ns();
+}
+void ppu_sec_reset(void) {
+  g_ppu_sec_eval_ms = 0;
+  g_ppu_sec_line_ms = 0;
+  g_ppu_sec_bg_ms = 0;
+  g_ppu_sec_spr_ms = 0;
+  g_ppu_sec_hdma_ms = 0;
+  g_ppu_sec_eval_n = 0;
+  g_ppu_sec_line_n = 0;
+}
+void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+                  double *compose, double *hdma) {
+  *eval = g_ppu_sec_eval_ms;
+  *line = g_ppu_sec_line_ms;
+  *bg = g_ppu_sec_bg_ms;
+  *spr = g_ppu_sec_spr_ms;
+  *compose = g_ppu_sec_line_ms - g_ppu_sec_bg_ms - g_ppu_sec_spr_ms;
+  if (*compose < 0.0)
+    *compose = 0.0;
+  *hdma = g_ppu_sec_hdma_ms;
+}
+#define PPU_T0_DECL uint64_t _ppu_t;
+#define PPU_T0 (_ppu_t = ppu_sec_now())
+#define PPU_ACC(V) do { (V) += 1e-6 * (double)(ppu_sec_now() - _ppu_t); } while (0)
+#else
+#define PPU_T0_DECL
+#define PPU_T0 do { } while (0)
+#define PPU_ACC(V) do { } while (0)
+#endif
+
 static void PpuDrawWholeLine(Ppu *ppu, uint y);
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line);
 static uint16_t ppu_getVramRemap(Ppu* ppu);
+static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
 
 
 Ppu* ppu_init(void) {
   Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
+  if (ppu)
+    ppu->wsOamMotionLastLine = -1;
   return ppu;
 }
 
@@ -49,6 +95,7 @@ void ppu_reset(Ppu* ppu) {
     memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
   }
   ppu->vramIncrement = 1;
+  ppu->wsOamMotionLastLine = -1;
 }
 
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
@@ -58,6 +105,16 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
   sli->func(sli, version, 8);
   sli->func(sli, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
+}
+
+void PpuResetWidescreenOamHistory(Ppu *ppu) {
+  if (!ppu)
+    return;
+  ppu->wsOamMotionLastLine = -1;
+  memset(ppu->wsOamMotionX, 0, sizeof(ppu->wsOamMotionX));
+  memset(ppu->wsOamMotionSig, 0, sizeof(ppu->wsOamMotionSig));
+  memset(ppu->wsOamMotionSeen, 0, sizeof(ppu->wsOamMotionSeen));
+  memset(ppu->wsOamMotionGrace, 0, sizeof(ppu->wsOamMotionGrace));
 }
 
 // Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
@@ -129,13 +186,8 @@ bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
   capture->y0 = (int16_t)y0;
   capture->y1 = (int16_t)y1;
   capture->flags = flags & kPpuOverlayFlag_RemoveFromGame;
-  if (source == kPpuOverlaySource_Obj) {
-    capture->oamFirst = 0;
-    capture->oamCount = 128;
-  } else {
-    capture->oamFirst = 0;
-    capture->oamCount = 0;
-  }
+  capture->oamFirst = 0;
+  capture->oamCount = source == kPpuOverlaySource_Obj ? 128 : 0;
   return true;
 }
 
@@ -406,8 +458,35 @@ void ppu_handleVblank(Ppu* ppu) {
   ppu->frameInterlace = PPU_interlace(ppu); // set if we have a interlaced frame
 }
 
-static inline void ClearBackdrop(PpuPixelPrioBufs *buf) {
-  for (size_t i = 0; i != arraysize(buf->data); i += 4)
+// The columns anything can reach this frame: the 256 hardware ones plus the
+// per-side budget the host asked for. Every read of a priority buffer is
+// bounded by a window edge, and PpuWidescreenLayerExtra never hands out more
+// than extraLeftRight, so nothing outside this span is ever looked at.
+//
+// Rounded out to whole uint64 stores, because that is how ClearBackdrop
+// writes.
+static inline void PpuActiveSpan(const Ppu *ppu, size_t *begin,
+                                 size_t *end) {
+  size_t extra = ppu->extraLeftRight;
+  if (extra > kPpuExtraLeftRight)
+    extra = kPpuExtraLeftRight;
+  size_t b = ((size_t)kPpuExtraLeftRight - extra) & ~(size_t)3;
+  size_t e = ((size_t)kPpuExtraLeftRight + kPpuXPixels + extra + 3) &
+             ~(size_t)3;
+  if (e > kPpuBufWidth)
+    e = kPpuBufWidth;
+  *begin = b;
+  *end = e;
+}
+
+// Fills the active span only. At the full ultrawide budget that is the whole
+// buffer; below it the rest is never read, and clearing it anyway charges
+// every consumer for a border it did not ask for -- three buffers a line,
+// 224 lines, whether or not widescreen is on at all.
+static inline void ClearBackdrop(const Ppu *ppu, PpuPixelPrioBufs *buf) {
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  for (size_t i = begin; i < end; i += 4)
     *(uint64*)&buf->data[i] = 0x0500050005000500;
 }
 
@@ -425,6 +504,7 @@ static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
 static int s_oam_snap_frame = -1;
 
 void ppu_runLine(Ppu* ppu, int line) {
+  PPU_T0_DECL
   /* Per-line HDMA state must be captured here, not at end-of-frame: games can
    * rewrite windows and scroll registers before every scanline. */
   debug_server_on_ppu_line(line);
@@ -442,6 +522,7 @@ void ppu_runLine(Ppu* ppu, int line) {
     s_oam_snap_frame = snes_frame_counter;
     debug_server_on_oam_render();
   }
+  PpuUpdateWidescreenOamHistory(ppu, line);
   if(line == 0) {
     if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
       int mod = PPU_mosaicSize(ppu);
@@ -459,7 +540,7 @@ void ppu_runLine(Ppu* ppu, int line) {
     ppu->rangeOver = false;
     ppu->timeOver = false;
     ppu->evenFrame = !ppu->evenFrame;
-  } else {  
+  } else {
     // Cache the brightness computation
     if (PPU_brightness(ppu) != ppu->lastBrightnessMult) {
       uint8_t ppu_brightness = PPU_brightness(ppu);
@@ -472,14 +553,17 @@ void ppu_runLine(Ppu* ppu, int line) {
     }
 
     // evaluate sprites
-    ClearBackdrop(&ppu->objBuffer);
+    ClearBackdrop(ppu, &ppu->objBuffer);
     if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
       memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
     ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
 
     if (ppu->renderFlags & kPpuRenderFlags_NewRenderer) {
-      PpuDrawWholeLine(ppu, line);
+      PPU_T0; PpuDrawWholeLine(ppu, line); PPU_ACC(g_ppu_sec_line_ms);
+#ifdef SNESRECOMP_INTERP_PROFILE
+      g_ppu_sec_line_n++;
+#endif
     } else {
       ppu_draw_whole_line_legacy(ppu, line);
     }
@@ -890,7 +974,7 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
   const int sy = (int)(mosaic ? ppu->mosaicModulo[y] : y) + ppu->vScroll[layer];
   const int tileadr = PPU_bgTileAdr(ppu, layer);
   const int words = (bpp == 4) ? 16 : 8;          /* vram words per 8x8 char */
-  const unsigned pal_shift = (bpp == 4) ? 6 : 8;  /* palette * (1 << bpp) */
+  const unsigned pal_shift = (bpp == 4) ? 6 : 8;
 
   int sc_row = PPU_bgTilemapAdr(ppu, layer) + (((sy >> 4) & 31) << 5);
   if (((sy >> 9) & 1) && PPU_bgTilemapHigher(ppu, layer))
@@ -1330,7 +1414,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (tile & 0x4000) bits >>= x, GET_PIXEL(); else bits <<= x, GET_PIXEL_HFLIP();
       if (pixel) {
-        pixel += (tile & 0x1c00) >> kPaletteShift;
+        pixel += ((tile & 0x1c00) >> kPaletteShift);
         int i = 0;
         do {
           if (VIEWPORT_ALLOWED(i) && z > dstz[i])
@@ -1419,7 +1503,7 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   }
 
   PpuPixelPrioBufs layerbuf;
-  ClearBackdrop(&layerbuf);
+  ClearBackdrop(ppu, &layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
   else if (mosaic)
@@ -1458,7 +1542,7 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   }
 
   PpuPixelPrioBufs layerbuf;
-  ClearBackdrop(&layerbuf);
+  ClearBackdrop(ppu, &layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
   else if (mosaic)
@@ -1516,7 +1600,7 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, in
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (tile & 0x4000) bits >>= x, GET_PIXEL(); else bits <<= x, GET_PIXEL_HFLIP();
       if (pixel) {
-        pixel += (tile & 0x1c00) >> kPaletteShift;
+        pixel += ((tile & 0x1c00) >> kPaletteShift);
         uint i = 0;
         do {
           if (z > dstz[i])
@@ -1734,8 +1818,12 @@ static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
   PpuZbufType *dst = ppu->bgBuffers[sub].data;
   const PpuZbufType *src = layerbuf->data;
   bool remove = (capture->flags & kPpuOverlayFlag_RemoveFromGame) != 0;
-  for (int i = 0; i < kPpuBufWidth; i++) {
-    int x = i - kPpuExtraLeftRight;
+  // Same span as the backdrop clear: outside it dst holds last line's
+  // pixels and nothing reads either buffer there.
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  for (size_t i = begin; i < end; i++) {
+    int x = (int)i - kPpuExtraLeftRight;
     if (remove && x >= capture->x0 && x < capture->x1)
       continue;
     if (src[i] > dst[i])
@@ -1829,8 +1917,7 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x8000);
     PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, 0xb100, 0x7100);
   } else if (PPU_mode(ppu) == 3) {
-    if (ppu->lineHasSprites)
-      PpuDrawSprites(ppu, y, sub, true);
+    if (ppu->lineHasSprites) { PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
     if (PPU_bigTiles(ppu, 1))
       PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,
@@ -1858,7 +1945,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   }
 
   // Default background is backdrop
-  ClearBackdrop(&ppu->bgBuffers[0]);
+  ClearBackdrop(ppu, &ppu->bgBuffers[0]);
 
   // Render main screen
   PpuDrawBackgrounds(ppu, y, false);
@@ -1870,7 +1957,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   // Render also the subscreen?
   bool rendered_subscreen = false;
   if (PPU_preventMathMode(ppu) != 3 && PPU_addSubscreen(ppu) && PPU_mathEnabled(ppu)) {
-    ClearBackdrop(&ppu->bgBuffers[1]);
+    ClearBackdrop(ppu, &ppu->bgBuffers[1]);
     if (ppu->screenEnabled[1] != 0) {
       PpuDrawBackgrounds(ppu, y, true);
       if (ppu->widescreenLineEnhancer &&
@@ -1926,7 +2013,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   uint32 cw_clip_math = ((cwin.bits & kCwBitsMod[PPU_clipMode(ppu)]) ^ kCwBitsMod[PPU_clipMode(ppu) + 4]) |
     ((cwin.bits & kCwBitsMod[PPU_preventMathMode(ppu)]) ^ kCwBitsMod[PPU_preventMathMode(ppu) + 4]) << 8;
 
-  uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch];
+  uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch], *dst_org = dst;
 
   dst += compose_full_budget ? 0 : (ppu->extraLeftRight - ppu->extraLeftCur);
 
@@ -2057,6 +2144,49 @@ static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
   return x;
 }
 
+static uint32_t PpuOamMotionSignature(Ppu *ppu, uint8_t index) {
+  uint8_t slot = index >> 1;
+  uint32_t high_pair =
+      (ppu->highOam[slot >> 2] >> ((slot & 3) * 2)) & 0x3u;
+  return ((uint32_t)(ppu->oam[index] >> 8)) |
+         ((uint32_t)ppu->oam[index + 1] << 8) |
+         ((high_pair & 0x2u) << 23);
+}
+
+static bool PpuWsOamHistorySeen(Ppu *ppu, uint8_t slot) {
+  return (ppu->wsOamMotionSeen[slot >> 3] & (1u << (slot & 7))) != 0;
+}
+
+static void PpuWsOamHistoryMarkSeen(Ppu *ppu, uint8_t slot) {
+  ppu->wsOamMotionSeen[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+}
+
+static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line) {
+  if (ppu->wsOamMotionLastLine >= 0 && line > ppu->wsOamMotionLastLine) {
+    ppu->wsOamMotionLastLine = (int16_t)line;
+    return;
+  }
+  ppu->wsOamMotionLastLine = (int16_t)line;
+  for (uint8_t slot = 0; slot < 128; slot++) {
+    uint8_t index = (uint8_t)(slot * 2);
+    int16_t x = (int16_t)PpuDecodeOamX(ppu, index);
+    uint32_t sig = PpuOamMotionSignature(ppu, index);
+    if (PpuWsOamHistorySeen(ppu, slot) &&
+        sig == ppu->wsOamMotionSig[slot]) {
+      if (x != ppu->wsOamMotionX[slot]) {
+        ppu->wsOamMotionGrace[slot] = kPpuWsOamMovingGraceFrames;
+      } else if (ppu->wsOamMotionGrace[slot]) {
+        ppu->wsOamMotionGrace[slot]--;
+      }
+    } else {
+      ppu->wsOamMotionGrace[slot] = 0;
+      PpuWsOamHistoryMarkSeen(ppu, slot);
+    }
+    ppu->wsOamMotionX[slot] = x;
+    ppu->wsOamMotionSig[slot] = sig;
+  }
+}
+
 static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
                                            int sprite_size,
                                            int left_extra) {
@@ -2064,7 +2194,9 @@ static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
       x + sprite_size <= -left_extra)
     return true;
   int slot = index >> 1;
-  return (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) != 0;
+  if (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)))
+    return true;
+  return ppu->wsOamMotionGrace[slot] != 0;
 }
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
@@ -2609,6 +2741,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+#if SNESRECOMP_ENABLE_MODS
+      snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
+#endif
       WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
                           ppu->vram[vramAdr & 0x7fff]);
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
@@ -2619,6 +2754,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+#if SNESRECOMP_ENABLE_MODS
+      snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
+#endif
       WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
                           ppu->vram[vramAdr & 0x7fff]);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;

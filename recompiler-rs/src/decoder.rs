@@ -2867,14 +2867,25 @@ pub fn detect_inline_arg_bytes(
     fn mutates_y(opcode: u8) -> bool {
         matches!(
             opcode,
-            0xA0 | 0xA4 | 0xB4 | 0xAC | 0xBC | 0xC8 | 0x88 | 0x7A | 0xA8 | 0x9B
+            0x44 | 0x54 | 0xA0 | 0xA4 | 0xB4 | 0xAC | 0xBC | 0xC8 | 0x88 | 0x7A | 0xA8 | 0x9B
         )
     }
 
     fn mutates_x(opcode: u8) -> bool {
         matches!(
             opcode,
-            0xA2 | 0xA6 | 0xB6 | 0xAE | 0xBE | 0xE8 | 0xCA | 0xFA | 0xAA | 0xBA | 0xBB
+            0x44 | 0x54
+                | 0xA2
+                | 0xA6
+                | 0xB6
+                | 0xAE
+                | 0xBE
+                | 0xE8
+                | 0xCA
+                | 0xFA
+                | 0xAA
+                | 0xBA
+                | 0xBB
         )
     }
 
@@ -2905,16 +2916,72 @@ pub fn detect_inline_arg_bytes(
         )
     }
 
+    fn return_mask(start: i32, size: u8) -> u8 {
+        let end = start + i32::from(size);
+        let mut mask = 0;
+        if start <= 1 && 1 < end {
+            mask |= 0b01;
+        }
+        if start <= 2 && 2 < end {
+            mask |= 0b10;
+        }
+        mask
+    }
+
+    fn return_bytes_valid(valid: u8, start: i32, size: u8) -> bool {
+        if start != 1 || !matches!(size, 1 | 2) {
+            return false;
+        }
+        let mask = (1u8 << size) - 1;
+        valid & mask == mask
+    }
+
+    fn invalidate_stack_write(
+        valid: &mut u8,
+        status_slots: &mut HashMap<i32, (u8, u8, Option<u8>)>,
+        start: i32,
+        size: u8,
+    ) {
+        *valid &= !return_mask(start, size);
+        for pos in start..start + i32::from(size) {
+            status_slots.remove(&pos);
+        }
+    }
+
+    fn push_bytes(
+        depth: &mut i32,
+        valid: &mut u8,
+        status_slots: &mut HashMap<i32, (u8, u8, Option<u8>)>,
+        size: u8,
+    ) -> i32 {
+        *depth -= i32::from(size);
+        let start = *depth + 1;
+        invalidate_stack_write(valid, status_slots, start, size);
+        start
+    }
+
     let mut pc = addr & 0xFFFF;
     let mut m = entry_m & 1;
     let mut x = entry_x & 1;
+    let mut stack_depth = 0i32;
+    let mut return_valid = 0b11u8;
+    let mut status_slots: HashMap<i32, (u8, u8, Option<u8>)> = HashMap::new();
     let mut a_slot: Option<u8> = None;
+    let mut a_slot_size = 0u8;
     let mut a_pulled = false;
+    let mut a_pulled_size = 0u8;
     let mut a_added = 0u32;
+    let mut a_carry: Option<u8> = None;
+    // Decimal flag: Some(0) binary, Some(1) BCD, None unknown. ADC #imm only
+    // yields a usable constant in binary mode, so anything else stops the match.
+    let mut decimal: Option<u8> = Some(0);
     let mut y_slot: Option<u8> = None;
+    let mut y_slot_size = 0u8;
     let mut y_pulled = false;
+    let mut y_pulled_size = 0u8;
     let mut y_added = 0u32;
     let mut x_pulled = false;
+    let mut x_pulled_size = 0u8;
     let mut x_added = 0u32;
 
     for _ in 0..96 {
@@ -2930,113 +2997,320 @@ pub fn detect_inline_arg_bytes(
         match ins.mnem {
             "REP" => {
                 if ins.operand & 0x20 != 0 {
+                    let changed = m != 0;
                     m = 0;
+                    if changed {
+                        a_slot = None;
+                        a_slot_size = 0;
+                        a_pulled = false;
+                        a_pulled_size = 0;
+                        a_added = 0;
+                        a_carry = None;
+                    }
                 }
                 if ins.operand & 0x10 != 0 {
+                    let changed = x != 0;
                     x = 0;
-                    x_pulled = false;
-                    x_added = 0;
+                    if changed {
+                        y_slot = None;
+                        y_slot_size = 0;
+                        y_pulled = false;
+                        y_pulled_size = 0;
+                        y_added = 0;
+                        x_pulled = false;
+                        x_pulled_size = 0;
+                        x_added = 0;
+                    }
+                }
+                if ins.operand & 0x01 != 0 && (a_slot.is_some() || a_pulled) {
+                    a_carry = Some(0);
+                }
+                if ins.operand & 0x08 != 0 {
+                    decimal = Some(0);
                 }
             }
             "SEP" => {
                 if ins.operand & 0x20 != 0 {
+                    let changed = m != 1;
                     m = 1;
+                    if changed {
+                        a_slot = None;
+                        a_slot_size = 0;
+                        a_pulled = false;
+                        a_pulled_size = 0;
+                        a_added = 0;
+                        a_carry = None;
+                    }
                 }
                 if ins.operand & 0x10 != 0 {
+                    let changed = x != 1;
                     x = 1;
-                    x_pulled = false;
-                    x_added = 0;
+                    if changed {
+                        y_slot = None;
+                        y_slot_size = 0;
+                        y_pulled = false;
+                        y_pulled_size = 0;
+                        y_added = 0;
+                        x_pulled = false;
+                        x_pulled_size = 0;
+                        x_added = 0;
+                    }
+                }
+                if ins.operand & 0x01 != 0 && (a_slot.is_some() || a_pulled) {
+                    a_carry = Some(1);
+                }
+                if ins.operand & 0x08 != 0 {
+                    decimal = Some(1);
                 }
             }
             "LDA" if ins.mode == Mode::Stk => {
-                a_slot = Some((ins.operand & 0xFF) as u8);
+                let slot = (ins.operand & 0xFF) as u8;
+                let size = if m != 0 { 1 } else { 2 };
+                let tracked = return_bytes_valid(return_valid, stack_depth + i32::from(slot), size);
+                a_slot = tracked.then_some(slot);
+                a_slot_size = if tracked { size } else { 0 };
                 a_pulled = false;
+                a_pulled_size = 0;
                 a_added = 0;
+                a_carry = None;
             }
             "PLA" => {
+                let size = if m != 0 { 1 } else { 2 };
                 a_slot = None;
-                a_pulled = true;
+                a_slot_size = 0;
+                a_pulled = return_bytes_valid(return_valid, stack_depth + 1, size);
+                a_pulled_size = if a_pulled { size } else { 0 };
                 a_added = 0;
+                a_carry = None;
+                stack_depth += i32::from(size);
             }
             "TAY" => {
-                y_slot = a_slot;
-                y_pulled = a_pulled;
-                y_added = if a_slot.is_some() || a_pulled {
-                    a_added
-                } else {
-                    0
-                };
+                let tracked = m == x && (a_slot.is_some() || a_pulled);
+                y_slot = if tracked { a_slot } else { None };
+                y_slot_size = if tracked { a_slot_size } else { 0 };
+                y_pulled = tracked && a_pulled;
+                y_pulled_size = if y_pulled { a_pulled_size } else { 0 };
+                y_added = if tracked { a_added } else { 0 };
             }
             "TYA" => {
-                a_slot = y_slot;
-                a_pulled = y_pulled;
-                a_added = if y_slot.is_some() || y_pulled {
-                    y_added
-                } else {
-                    0
-                };
+                let tracked = m == x && (y_slot.is_some() || y_pulled);
+                a_slot = if tracked { y_slot } else { None };
+                a_slot_size = if tracked { y_slot_size } else { 0 };
+                a_pulled = tracked && y_pulled;
+                a_pulled_size = if a_pulled { y_pulled_size } else { 0 };
+                a_added = if tracked { y_added } else { 0 };
+                a_carry = None;
+            }
+            "CLC" => {
+                if a_slot.is_some() || a_pulled {
+                    a_carry = Some(0);
+                }
+            }
+            "SEC" => {
+                if a_slot.is_some() || a_pulled {
+                    a_carry = Some(1);
+                }
             }
             "ADC" if ins.opcode == 0x69 && (a_slot.is_some() || a_pulled) => {
-                a_added = (a_added + ins.operand) & 0xFFFF;
+                if let (Some(carry), Some(0)) = (a_carry, decimal) {
+                    let width_mask = if m != 0 { 0xFF } else { 0xFFFF };
+                    a_added = (a_added + ins.operand + u32::from(carry)) & width_mask;
+                } else {
+                    a_slot = None;
+                    a_slot_size = 0;
+                    a_pulled = false;
+                    a_pulled_size = 0;
+                    a_added = 0;
+                }
+                a_carry = None;
             }
             "STA" if ins.opcode == 0x83 && ins.mode == Mode::Stk => {
-                if a_slot == Some((ins.operand & 0xFF) as u8) && a_added != 0 {
-                    return Some((a_added & 0xFF) as u8);
+                let slot = (ins.operand & 0xFF) as u8;
+                let size = if m != 0 { 1 } else { 2 };
+                let start = stack_depth + i32::from(slot);
+                let writeback = a_slot == Some(slot) && a_slot_size == size && start == 1;
+                let mask = return_mask(start, size);
+                if writeback && a_added != 0 && (return_valid | mask) == 0b11 {
+                    return u8::try_from(a_added).ok();
+                }
+                invalidate_stack_write(&mut return_valid, &mut status_slots, start, size);
+                if writeback && a_added == 0 {
+                    return_valid |= mask;
                 }
             }
-            "PHA" if a_pulled => {
-                if a_added != 0 {
-                    return Some((a_added & 0xFF) as u8);
+            "PHA" => {
+                let size = if m != 0 { 1 } else { 2 };
+                let start =
+                    push_bytes(&mut stack_depth, &mut return_valid, &mut status_slots, size);
+                if a_pulled && a_pulled_size == size && start == 1 {
+                    if a_added != 0 {
+                        if (return_valid | return_mask(start, size)) == 0b11 {
+                            return u8::try_from(a_added).ok();
+                        }
+                    } else {
+                        return_valid |= return_mask(start, size);
+                    }
                 }
-                a_pulled = false;
-                a_added = 0;
             }
             "PLX" => {
-                x_pulled = true;
+                let size = if x != 0 { 1 } else { 2 };
+                x_pulled = return_bytes_valid(return_valid, stack_depth + 1, size);
+                x_pulled_size = if x_pulled { size } else { 0 };
                 x_added = 0;
+                stack_depth += i32::from(size);
             }
             "INX" if x_pulled => {
-                x_added = x_added.wrapping_add(1);
+                x_added = (x_added + 1) & 0xFFFF;
             }
-            "PHX" if x_pulled => {
-                if x_added != 0 {
-                    return Some((x_added & 0xFF) as u8);
+            "PHX" => {
+                let size = if x != 0 { 1 } else { 2 };
+                let start =
+                    push_bytes(&mut stack_depth, &mut return_valid, &mut status_slots, size);
+                if x_pulled && x_pulled_size == size && start == 1 {
+                    if x_added != 0 {
+                        if (return_valid | return_mask(start, size)) == 0b11 {
+                            return Some((x_added & 0xFF) as u8);
+                        }
+                    } else {
+                        return_valid |= return_mask(start, size);
+                    }
                 }
-                x_pulled = false;
-                x_added = 0;
             }
-            _ if breaks_carrier_flow(ins.opcode) => {
+            "PHY" => {
+                push_bytes(
+                    &mut stack_depth,
+                    &mut return_valid,
+                    &mut status_slots,
+                    if x != 0 { 1 } else { 2 },
+                );
+            }
+            "PHP" => {
+                let start = push_bytes(&mut stack_depth, &mut return_valid, &mut status_slots, 1);
+                status_slots.insert(start, (m, x, decimal));
+            }
+            "PHB" | "PHK" => {
+                push_bytes(&mut stack_depth, &mut return_valid, &mut status_slots, 1);
+            }
+            "PHD" => {
+                push_bytes(&mut stack_depth, &mut return_valid, &mut status_slots, 2);
+            }
+            "PEA" | "PEI" | "PER" => {
+                push_bytes(&mut stack_depth, &mut return_valid, &mut status_slots, 2);
                 a_slot = None;
+                a_slot_size = 0;
                 a_pulled = false;
+                a_pulled_size = 0;
                 a_added = 0;
+                a_carry = None;
+            }
+            "PLY" => {
+                stack_depth += if x != 0 { 1 } else { 2 };
+                a_slot = None;
+                a_slot_size = 0;
+                a_pulled = false;
+                a_pulled_size = 0;
+                a_added = 0;
+                a_carry = None;
                 y_slot = None;
+                y_slot_size = 0;
                 y_pulled = false;
+                y_pulled_size = 0;
+                y_added = 0;
+            }
+            "PLB" => {
+                stack_depth += 1;
+                a_slot = None;
+                a_slot_size = 0;
+                a_pulled = false;
+                a_pulled_size = 0;
+                a_added = 0;
+                a_carry = None;
+            }
+            "PLD" => {
+                stack_depth += 2;
+                a_slot = None;
+                a_slot_size = 0;
+                a_pulled = false;
+                a_pulled_size = 0;
+                a_added = 0;
+                a_carry = None;
+            }
+            "PLP" => {
+                let saved = status_slots.remove(&(stack_depth + 1))?;
+                stack_depth += 1;
+                // The pulled status byte carries D as well as M/X, so the
+                // matching PHP records all three.
+                (m, x, decimal) = saved;
+                a_slot = None;
+                a_slot_size = 0;
+                a_pulled = false;
+                a_pulled_size = 0;
+                a_added = 0;
+                a_carry = None;
+                y_slot = None;
+                y_slot_size = 0;
+                y_pulled = false;
+                y_pulled_size = 0;
                 y_added = 0;
                 x_pulled = false;
+                x_pulled_size = 0;
+                x_added = 0;
+            }
+            "TXS" | "TCS" | "XCE" => return None,
+            _ if breaks_carrier_flow(ins.opcode) => {
+                a_slot = None;
+                a_slot_size = 0;
+                a_pulled = false;
+                a_pulled_size = 0;
+                a_added = 0;
+                a_carry = None;
+                y_slot = None;
+                y_slot_size = 0;
+                y_pulled = false;
+                y_pulled_size = 0;
+                y_added = 0;
+                x_pulled = false;
+                x_pulled_size = 0;
                 x_added = 0;
             }
             _ if preserves_a(ins.opcode) => {
+                if matches!(ins.opcode, 0xE0 | 0xE4 | 0xEC | 0xC0 | 0xC4 | 0xCC) {
+                    a_carry = None;
+                } else if ins.opcode == 0xD8 {
+                    decimal = Some(0);
+                } else if ins.opcode == 0xF8 {
+                    decimal = Some(1);
+                }
                 if mutates_y(ins.opcode) {
                     y_slot = None;
+                    y_slot_size = 0;
                     y_pulled = false;
+                    y_pulled_size = 0;
                     y_added = 0;
                 }
                 if mutates_x(ins.opcode) {
                     x_pulled = false;
+                    x_pulled_size = 0;
                     x_added = 0;
                 }
             }
             _ => {
                 a_slot = None;
+                a_slot_size = 0;
                 a_pulled = false;
+                a_pulled_size = 0;
                 a_added = 0;
+                a_carry = None;
                 if mutates_y(ins.opcode) {
                     y_slot = None;
+                    y_slot_size = 0;
                     y_pulled = false;
+                    y_pulled_size = 0;
                     y_added = 0;
                 }
                 if mutates_x(ins.opcode) {
                     x_pulled = false;
+                    x_pulled_size = 0;
                     x_added = 0;
                 }
             }
@@ -3482,6 +3756,317 @@ mod tests {
     }
 
     #[test]
+    fn rejects_x_save_restore_as_inline_argument_adjustment() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x10, // REP #$10
+            0xDA, // PHX
+            0x20, 0x00, 0x81, // JSR $8100
+            0xFA, // PLX
+            0xE8, // INX
+            0xDA, // PHX
+            0x20, 0x00, 0x81, // JSR $8100
+            0xFA, // PLX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_a_save_restore_as_inline_argument_adjustment() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x20, // REP #$20
+            0x48, // PHA
+            0x20, 0x00, 0x81, // JSR $8100
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x20, 0x00, 0x81, // JSR $8100
+            0x68, // PLA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_local_stack_slot_adjustment() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xDA, // PHX
+            0xA3, 0x01, // LDA $01,S
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x83, 0x01, // STA $01,S
+            0xFA, // PLX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_return_slot_below_saved_register() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xDA, // PHX
+            0xA3, 0x03, // LDA $03,S
+            0x18, // CLC
+            0x69, 0x03, 0x00, // ADC #$0003
+            0x83, 0x03, // STA $03,S
+            0xFA, // PLX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn rejects_return_slot_overwritten_by_push() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xFA, // PLX
+            0x48, // PHA
+            0xA3, 0x01, // LDA $01,S
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x83, 0x01, // STA $01,S
+            0x68, // PLA
+            0xDA, // PHX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_return_slot_overwritten_by_stack_store() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xA9, 0x34, 0x12, // LDA #$1234
+            0x83, 0x01, // STA $01,S
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_partially_overwritten_return_slot() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xE2, 0x20, // SEP #$20
+            0xA9, 0x12, // LDA #$12
+            0x83, 0x01, // STA $01,S
+            0xC2, 0x20, // REP #$20
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_adjustment_with_other_return_byte_overwritten() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xE2, 0x20, // SEP #$20
+            0xA9, 0x12, // LDA #$12
+            0x83, 0x02, // STA $02,S
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x01, // ADC #$01
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_return_adjustment_after_unmodified_restore() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0x48, // PHA
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn detects_return_adjustment_after_balanced_php_plp() {
+        let rom = rom_at_8000(&[
+            0x08, // PHP
+            0x78, // SEI
+            0x28, // PLP
+            0xC2, 0x30, // REP #$30
+            0xFA, // PLX
+            0xE8, // INX
+            0xDA, // PHX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_plp_state() {
+        let rom = rom_at_8000(&[
+            0x28, // PLP
+            0xC2, 0x30, // REP #$30
+            0xFA, // PLX
+            0xE8, // INX
+            0xDA, // PHX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_plp_after_status_slot_overwrite() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x08, // PHP
+            0xAB, // PLB
+            0x48, // PHA
+            0xAB, // PLB
+            0x28, // PLP
+            0xFA, // PLX
+            0xE8, // INX
+            0xDA, // PHX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_adc_in_decimal_mode_after_sed() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0xF8, // SED
+            0x18, // CLC
+            0x69, 0x09, 0x00, // ADC #$0009 - BCD, not a byte count
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_adc_in_decimal_mode_after_sep_08() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0xE2, 0x08, // SEP #$08 - sets D
+            0x18, // CLC
+            0x69, 0x09, 0x00, // ADC #$0009
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn php_plp_restores_the_decimal_flag() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x08, // PHP - records binary mode
+            0xF8, // SED
+            0x28, // PLP - back to binary
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x03, 0x00, // ADC #$0003
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn accepts_adc_after_decimal_mode_is_cleared_again() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0xF8, // SED
+            0xD8, // CLD - back to binary before the add
+            0x18, // CLC
+            0x69, 0x09, 0x00, // ADC #$0009
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn rejects_xce_during_inline_argument_scan() {
+        let rom = rom_at_8000(&[
+            0xFB, // XCE
+            0xC2, 0x30, // REP #$30
+            0xFA, // PLX
+            0xE8, // INX
+            0xDA, // PHX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
     fn rejects_y_carrier_after_y_mutation() {
         let rom = rom_at_8000(&[
             0xC2, 0x30, // REP #$30
@@ -3497,6 +4082,187 @@ mod tests {
         assert_eq!(
             detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
             None
+        );
+    }
+
+    #[test]
+    fn rejects_x_carrier_after_block_move() {
+        for opcode in [0x44, 0x54] {
+            let rom = rom_at_8000(&[
+                0xC2, 0x10, // REP #$10
+                0xFA, // PLX
+                opcode, 0x00, 0x00, // MVP / MVN
+                0xE8, // INX
+                0xDA, // PHX
+                0x60, // RTS
+            ]);
+            assert_eq!(
+                detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_y_carrier_after_block_move() {
+        for opcode in [0x44, 0x54] {
+            let rom = rom_at_8000(&[
+                0xC2, 0x30, // REP #$30
+                0xA3, 0x01, // LDA $01,S
+                0xA8, // TAY
+                opcode, 0x00, 0x00, // MVP / MVN
+                0x98, // TYA
+                0x18, // CLC
+                0x69, 0x01, 0x00, // ADC #$0001
+                0x83, 0x01, // STA $01,S
+                0x60, // RTS
+            ]);
+            assert_eq!(
+                detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn detects_sec_adc_return_adjustment() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0x38, // SEC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rejects_adc_with_unknown_carry() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_adjustment_after_known_zero_delta_restore() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x00, 0x00, // ADC #$0000
+            0x48, // PHA
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x01, 0x00, // ADC #$0001
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn eight_bit_adc_wrap_is_not_an_adjustment() {
+        let rom = rom_at_8000(&[
+            0xE2, 0x20, // SEP #$20
+            0x68, // PLA
+            0x38, // SEC
+            0x69, 0xFF, // ADC #$FF
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_adjustment_larger_than_result_type() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0x18, // CLC
+            0x69, 0x00, 0x01, // ADC #$0100
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn a_carrier_survives_local_push() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xA3, 0x01, // LDA $01,S
+            0x18, // CLC
+            0x69, 0x03, 0x00, // ADC #$0003
+            0x48, // PHA
+            0xFA, // PLX
+            0x83, 0x01, // STA $01,S
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn x_carrier_survives_local_push() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0xFA, // PLX
+            0xE8, // INX
+            0x48, // PHA
+            0xDA, // PHX
+            0x7A, // PLY
+            0x68, // PLA
+            0xDA, // PHX
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn y_carrier_survives_local_push() {
+        let rom = rom_at_8000(&[
+            0xC2, 0x30, // REP #$30
+            0x68, // PLA
+            0xA8, // TAY
+            0x48, // PHA
+            0x5A, // PHY
+            0xFA, // PLX
+            0x2B, // PLD
+            0x98, // TYA
+            0x18, // CLC
+            0x69, 0x03, 0x00, // ADC #$0003
+            0x48, // PHA
+            0x60, // RTS
+        ]);
+        assert_eq!(
+            detect_inline_arg_bytes(&rom, RomMapping::LoRom, 0, 0x8000, 1, 1),
+            Some(3)
         );
     }
 

@@ -19,6 +19,19 @@
 
 #include "audio_shadow.h"
 
+#ifndef SNESRECOMP_TRACE
+#define SNESRECOMP_TRACE 0
+#endif
+
+/* Value-aware forensic gate. Production CMake defines SNESRECOMP_TRACE=0, so
+ * `defined(SNESRECOMP_TRACE)` is not a valid trace-build test. Co-sim retains
+ * the in-process reference checks used for audio divergence localization. */
+#if SNESRECOMP_TRACE || defined(SNES_COSIM)
+#define SNESRECOMP_DSP_FORENSICS 1
+#else
+#define SNESRECOMP_DSP_FORENSICS 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,6 +44,8 @@ typedef struct DspShadow {
 } DspShadow;
 
 // Allocate + init; reads SNESRECOMP_AUDIO_SHADOW (default off; "0" forces off).
+// Non-forensic production returns NULL while disabled, removing the per-sample
+// shadow call/allocation without changing canonical DSP output.
 DspShadow* dsp_shadow_create(void);
 void dsp_shadow_free(DspShadow* sh);
 
@@ -40,17 +55,17 @@ void dsp_shadow_free(DspShadow* sh);
 void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
                         int* outL, int* outR);
 
-// Dev faithful-reference (SNESRECOMP_TRACE): re-decode one BRR block with
+// Dev faithful-reference (SNESRECOMP_DSP_FORENSICS): re-decode one BRR block with
 // blargg's snes9x/bsnes algorithm from ARAM at `blockStart` seeded by the two
 // previous canon samples, and record the canon-vs-reference divergence into
 // audio_trace (brr_div). `canonOut16` points at canon's just-decoded 16 samples
-// (decodeBuffer+3). No-op outside trace builds (the call site is guarded).
+// (decodeBuffer+3). No-op outside forensic builds (the call site is guarded).
 void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
                            int oldSeed, int olderSeed, const int16_t* canonOut16);
 
-// Dev faithful-reference (SNESRECOMP_TRACE): recompute the echo 8-tap FIR with
+// Dev faithful-reference (SNESRECOMP_DSP_FORENSICS): recompute the echo 8-tap FIR with
 // blargg's snes9x/bsnes algorithm on canon's FIR history + coefficients, and
-// record the canon-vs-reference divergence (echo_div). No-op outside trace.
+// record the canon-vs-reference divergence (echo_div). No-op outside forensics.
 void dsp_shadow_verify_echo(const int16_t* firL, const int16_t* firR,
                             const int8_t* coeff, int idx,
                             int canonSumL, int canonSumR);

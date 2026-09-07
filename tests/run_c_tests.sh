@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$ROOT/build/c-tests"
+OUT="${OUT:-$ROOT/build/c-tests}"
 CC="${CC:-gcc}"
 mkdir -p "$OUT"
 
@@ -64,6 +64,7 @@ echo "=== interpreter and bridge ==="
     "$ROOT/tests/interp816/tier2_capture_test.c" \
     "$ROOT/runner/src/snes/tier2_capture.c" \
     -o "$OUT/tier2_capture_test"
+(cd "$OUT" && ./tier2_capture_test disabled)
 (cd "$OUT" && ./tier2_capture_test)
 
 "$CC" -std=c11 -Wall -Wextra -Wno-unused-parameter -O1 \
@@ -172,6 +173,15 @@ echo "=== runtime dispatch ==="
     -Wl,--gc-sections -lm -o "$OUT/known_lle_entry_test"
 "$OUT/known_lle_entry_test"
 
+echo "=== production diagnostic gates ==="
+"$CC" -std=c11 -Wall -Wextra -Werror \
+    -ffunction-sections -fdata-sections \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/runtime_dispatch/diagnostic_gates_test.c" \
+    "$ROOT/runner/src/common_cpu_infra.c" \
+    -Wl,--gc-sections -o "$OUT/diagnostic_gates_test"
+"$OUT/diagnostic_gates_test"
+
 echo "=== APU guest-time pacing ==="
 "$CC" -std=c11 -Wall -Wextra -Werror \
     -Wno-error=unknown-pragmas -Wno-error=comment \
@@ -183,3 +193,64 @@ echo "=== APU guest-time pacing ==="
     "$ROOT/runner/src/snes/dsp.c" \
     -Wl,--gc-sections -o "$OUT/apu_port_guest_time_test"
 "$OUT/apu_port_guest_time_test"
+
+echo "=== benchmark helper ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$ROOT/runner/src" \
+    "$ROOT/tests/benchmark/benchmark_helper_test.c" \
+    "$ROOT/runner/src/benchmark.c" \
+    -o "$OUT/benchmark_helper_test_phaseoff"
+"$OUT/benchmark_helper_test_phaseoff"
+
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -DSNESRECOMP_BENCHMARK_PHASES=1 \
+    -I "$ROOT/runner/src" \
+    "$ROOT/tests/benchmark/benchmark_helper_test.c" \
+    "$ROOT/runner/src/benchmark.c" \
+    -o "$OUT/benchmark_helper_test_phaseon"
+"$OUT/benchmark_helper_test_phaseon"
+
+echo "=== audio trace history modes ==="
+for mode in 0 1 2 3; do
+    "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+        -D_POSIX_C_SOURCE=200809L \
+        -DSNESRECOMP_AUDIO_TRACE_HISTORY="$mode" \
+        -I "$ROOT/runner/src" \
+        "$ROOT/tests/audio/audio_trace_history_test.c" \
+        "$ROOT/runner/src/audio_trace.c" \
+        -o "$OUT/audio_trace_history_test_$mode"
+    (cd "$OUT" && "./audio_trace_history_test_$mode")
+done
+
+echo "=== audio trace stats clock gate ==="
+for mode in 0 1 2 3; do
+    "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+        -D_POSIX_C_SOURCE=200809L \
+        -DSNESRECOMP_AUDIO_TRACE_HISTORY="$mode" \
+        -DSNESRECOMP_AUDIO_TRACE_TEST_WALL_MS=1 \
+        -DSNESRECOMP_AUDIO_TRACE_TEST_FOPEN=1 \
+        -DSNESRECOMP_AUDIO_TRACE_TEST_GETENV=1 \
+        -I "$ROOT/runner/src" \
+        "$ROOT/tests/audio/audio_trace_clock_gate_test.c" \
+        "$ROOT/runner/src/audio_trace.c" \
+        -o "$OUT/audio_trace_clock_gate_test_$mode"
+    (cd "$OUT" && env -u SNESRECOMP_AUDIO_STATS \
+        "./audio_trace_clock_gate_test_$mode" off)
+    (cd "$OUT" && env -u SNESRECOMP_AUDIO_STATS \
+        "./audio_trace_clock_gate_test_$mode" snap)
+    (cd "$OUT" && env -u SNESRECOMP_AUDIO_STATS \
+        "./audio_trace_clock_gate_test_$mode" off-empty)
+    (cd "$OUT" && env -u SNESRECOMP_AUDIO_STATS \
+        "./audio_trace_clock_gate_test_$mode" snap-empty)
+    (cd "$OUT" && env -u SNESRECOMP_AUDIO_STATS \
+        "./audio_trace_clock_gate_test_$mode" off-zero)
+    (cd "$OUT" && env -u SNESRECOMP_AUDIO_STATS \
+        "./audio_trace_clock_gate_test_$mode" snap-zero)
+    (cd "$OUT" && env SNESRECOMP_AUDIO_STATS=1 \
+        "./audio_trace_clock_gate_test_$mode" stderr)
+    (cd "$OUT" && env SNESRECOMP_AUDIO_STATS="audio_trace_clock_gate_stats_$mode.log" \
+        "./audio_trace_clock_gate_test_$mode" path)
+    (cd "$OUT" && env SNESRECOMP_AUDIO_STATS="audio_trace_clock_gate_fail_$mode.log" \
+        SNESRECOMP_AUDIO_TRACE_TEST_FOPEN_FAIL=1 \
+        "./audio_trace_clock_gate_test_$mode" open-fail)
+done

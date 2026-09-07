@@ -25,6 +25,7 @@
 #include "tier2_capture.h"
 #include "snes.h"            /* Snes storage for the bridge's APU clock hook */
 #include "sa1.h"
+#include "snes_cycles.h"
 
 CpuState g_cpu;
 
@@ -66,6 +67,15 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 void snes_refresh_charge(void) {}
+void rtl_sync_apu_to_cpu_locked(void) {}
+uint32_t cpu_region_speed(uint32_t addr24) {
+    return (uint32_t)snes_region_speed(addr24, g_memsel);
+}
+uint8_t sdd1_read(Sdd1 *sdd1, uint16_t addr) {
+    (void)sdd1;
+    (void)addr;
+    return 0;
+}
 
 /* Attribution-scope stubs (common_cpu_infra.c in the real runner). The test
  * doubles record what the bridge pushed so the interp scope is testable: the
@@ -323,7 +333,6 @@ int main(void) {
 #else
     setenv("SNESRECOMP_TIER2_JOURNAL", journal, 1);
 #endif
-    tier2_capture_set_default_enabled(1);
     RAM = malloc(MEMSZ);
 
     printf("S0 APU timeline policy remains cartridge-scoped\n");

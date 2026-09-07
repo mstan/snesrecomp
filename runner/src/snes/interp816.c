@@ -16,9 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#ifdef SNES_COSIM
 #include <stdio.h>
-#endif
 #include "interp816.h"
 
 static const int cyclesPerOpcode[256] = {
@@ -147,13 +145,126 @@ void interp816_dump_ring(const char* path, long n) {
  * actually run by the 65816 interpreter tier. Divided by g_cpu.master_cycles
  * (total guest cycles, AOT+interp) this gives the mode-independent fraction
  * of execution that is NOT statically recompiled. Read via interp816_*_total. */
+uint64_t snesrecomp_host_now_ns(void) {
+#ifdef _WIN32
+    /* QPC without pulling windows.h into this file. kernel32.lib is linked by
+     * default, so declaring the imports directly is safe. */
+    typedef union { long long QuadPart; } T_LARGE_INT;
+    int (__cdecl *qpc_fn)(T_LARGE_INT *) = (void *)0;
+    int (__cdecl *qpf_fn)(T_LARGE_INT *) = (void *)0;
+    {
+        /* Link-time import: kernel32.lib exports these by name. */
+        extern int __cdecl QueryPerformanceCounter(T_LARGE_INT *);
+        extern int __cdecl QueryPerformanceFrequency(T_LARGE_INT *);
+        static double s_scale = -1.0;
+        if (s_scale < 0.0) {
+            T_LARGE_INT f; f.QuadPart = 0;
+            s_scale = (QueryPerformanceFrequency(&f) && f.QuadPart > 0)
+                          ? 1e9 / (double)f.QuadPart : 0.0;
+        }
+        T_LARGE_INT c; c.QuadPart = 0;
+        if (s_scale > 0.0 && QueryPerformanceCounter(&c))
+            return (uint64_t)((double)c.QuadPart * s_scale);
+    }
+    (void)qpc_fn; (void)qpf_fn;
+    return 0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
 static uint64_t s_interp816_insns;
 static uint64_t s_interp816_cycles;
+uint64_t s_interp816_opcodes_run = 0; /* dev perf: per-bridge-call opcode count */
 uint64_t interp816_insns_total(void)  { return s_interp816_insns; }
 uint64_t interp816_cycles_total(void) { return s_interp816_cycles; }
 
+/* Dev hotspot sampler (SNESRECOMP_PHASE_MS): top EXACT PCs executed by the
+ * interpreter, dumped via interp816_perf_dump(). Keyed by a 12-bit hash of
+ * the full pc24 so the dump shows the precise hot instruction, not a page. */
+#define INTERP_PC_BUCKETS 4096
+static uint32_t s_pc_buckets[INTERP_PC_BUCKETS];
+static uint32_t s_pc24[INTERP_PC_BUCKETS];
+static uint32_t s_pc_bucket_total = 0;
+static uint32_t s_pc_sample_skip = 0;
+static uint32_t s_oh_count[256], s_oh_tot[256]; /* per-opcode: samples, host-ns */
+static uint32_t s_oh_sample; /* 1-in-64 probe counter */
+static int s_oh_on = -1;
+#define OPCODE_HIST_BEGIN() do { uint64_t _oh_t0 = 0; if (s_oh_on < 0) { const char *_e = getenv("SNESRECOMP_INTERP_OPCODE_HIST"); s_oh_on = (_e && _e[0] && _e[0] != '0') ? 1 : 0; } int _oh_s = (s_oh_on == 1 && (s_oh_sample++ & 63u) == 0); if (_oh_s) _oh_t0 = snesrecomp_host_now_ns();
+#define OPCODE_HIST_END(_op) if (_oh_s) { uint64_t _dt = snesrecomp_host_now_ns() - _oh_t0; s_oh_count[(_op)]++; s_oh_tot[(_op)] += (uint32_t)(_dt < 0xFFFFFFFFu ? _dt : 0xFFFFFFFFu); } } while(0)
+void interp816_perf_dump(void) {
+    uint32_t idx[INTERP_PC_BUCKETS];
+    for (int i = 0; i < INTERP_PC_BUCKETS; i++) idx[i] = i;
+    for (int i = 1; i < INTERP_PC_BUCKETS; i++) {
+        uint32_t v = idx[i]; int j = i - 1;
+        while (j >= 0 && s_pc_buckets[idx[j]] < s_pc_buckets[v]) { idx[j+1] = idx[j]; j--; }
+        idx[j+1] = v;
+    }
+    fprintf(stderr, "[phase] top interp PCs (sampled %u):\n", s_pc_bucket_total);
+    for (int k = 0; k < 16 && k < INTERP_PC_BUCKETS; k++) {
+        int i = idx[k];
+        if (!s_pc_buckets[i]) break;
+        fprintf(stderr, "  $%06X  %u (%.1f%%)\n", s_pc24[i],
+                s_pc_buckets[i], 100.0 * s_pc_buckets[i] / s_pc_bucket_total);
+    }
+    memset(s_pc_buckets, 0, sizeof(s_pc_buckets));
+    memset(s_pc24, 0, sizeof(s_pc24));
+    s_pc_bucket_total = 0;
+}
+
+/* Dump the opcode-cost histogram (SNESRECOMP_INTERP_OPCODE_HIST) sorted by
+ * total host-ns, with per-opcode sample count and avg ns/opcode. */
+void interp816_opcode_hist_dump(void) {
+    uint64_t sum = 0;
+    int cnt = 0;
+    int idx[256];
+    for (int i = 0; i < 256; i++) {
+        idx[i] = i;
+        sum += s_oh_tot[i];
+        cnt += s_oh_count[i];
+    }
+    for (int i = 1; i < 256; i++) {
+        uint32_t v = idx[i];
+        int j = i - 1;
+        while (j >= 0 && s_oh_tot[idx[j]] < s_oh_tot[v]) { idx[j+1] = idx[j]; j--; }
+        idx[j+1] = v;
+    }
+    fprintf(stderr, "[opcode_hist] samples=%d totalhost_ns=%llu\n",
+            cnt, (unsigned long long)sum);
+    for (int k = 0; k < 24 && k < 256; k++) {
+        int i = idx[k];
+        if (!s_oh_count[i]) break;
+        fprintf(stderr, "  op=%02X cnt=%u tot_ns=%u avg=%llu (%.1f%%)\n",
+                i, s_oh_count[i], s_oh_tot[i],
+                (unsigned long long)(s_oh_tot[i] / (s_oh_count[i] ? s_oh_count[i] : 1)),
+                100.0 * s_oh_tot[i] / (sum ? sum : 1));
+    }
+    memset(s_oh_count, 0, sizeof(s_oh_count));
+    memset(s_oh_tot, 0, sizeof(s_oh_tot));
+}
+
 int interp816_runOpcode(Interp816* cpu) {
   cpu->cyclesUsed = 0;
+  s_interp816_opcodes_run++;
+  /* getenv() walks the whole environment block on MSVC (~us) - cache it so
+   * the hot path pays a branch, not a CRT call, per interpreted instruction.
+   * Same value as getenv, so behaviour is bit-identical. */
+  {
+    static int s_phase_ms = -1;
+    if (s_phase_ms < 0) s_phase_ms = getenv("SNESRECOMP_PHASE_MS") ? 1 : 0;
+    if (s_phase_ms) {
+      if (++s_pc_sample_skip >= 8) {
+          s_pc_sample_skip = 0;
+          uint32_t pc = ((uint32_t)cpu->k << 16) | cpu->pc;
+          uint32_t h = (pc * 2654435761u) >> (32 - 12);
+          s_pc_buckets[h]++;
+          s_pc24[h] = pc;
+          s_pc_bucket_total++;
+      }
+    }
+  }
   if(cpu->stopped) return 1;
 
   bool interruptPending = cpu->nmiWanted || cpu->irqWanted;
@@ -182,7 +293,13 @@ int interp816_runOpcode(Interp816* cpu) {
   uint16_t _ain = cpu->a; uint8_t _mf = cpu->mf ? 1 : 0, _xf = cpu->xf ? 1 : 0;
 #endif
   cpu->cyclesUsed = cyclesPerOpcode[opcode];
+  /* Dev opcode-cost histogram (SNESRECOMP_INTERP_OPCODE_HIST). Measures host
+   * ns spent INSIDE doOpcode per opcode, sampled every 64 instructions so the
+   * probe itself doesn't skew the number under test. Dumped via
+   * interp816_opcode_hist_dump(). No behaviour change. */
+  OPCODE_HIST_BEGIN();
   interp816_doOpcode(cpu, opcode);
+  OPCODE_HIST_END(opcode);
   s_interp816_insns++;
   s_interp816_cycles += (uint64_t)cpu->cyclesUsed;
 #ifdef SNES_COSIM
@@ -364,9 +481,8 @@ static uint32_t interp816_adrIdy(Interp816* cpu, uint32_t* low, bool write) {
   uint8_t adr = interp816_readOpcode(cpu);
   if(cpu->dp & 0xff) cpu->cyclesUsed++; // dpr not 0: 1 extra cycle
   uint16_t pointer = interp816_readWord(cpu, (cpu->dp + adr) & 0xffff, (cpu->dp + adr + 1) & 0xffff);
-  bool crossed = (pointer >> 8) != ((pointer + cpu->y) >> 8);
-  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
-  // writes: x = 0 or page crossed; reads: page crossed
+  if(write && (!cpu->xf || ((pointer >> 8) != ((pointer + cpu->y) >> 8)))) cpu->cyclesUsed++;
+  // x = 0 or page crossed, with writing opcode: 1 extra cycle
   *low = ((cpu->db << 16) + pointer + cpu->y) & 0xffffff;
   return ((cpu->db << 16) + pointer + cpu->y + 1) & 0xffffff;
 }
@@ -410,18 +526,16 @@ static uint32_t interp816_adrAbs(Interp816* cpu, uint32_t* low) {
 
 static uint32_t interp816_adrAbx(Interp816* cpu, uint32_t* low, bool write) {
   uint16_t adr = interp816_readOpcodeWord(cpu);
-  bool crossed = (adr >> 8) != ((adr + cpu->x) >> 8);
-  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
-  // writes: x = 0 or page crossed; reads: page crossed
+  if(write && (!cpu->xf || ((adr >> 8) != ((adr + cpu->x) >> 8)))) cpu->cyclesUsed++;
+  // x = 0 or page crossed, with writing opcode: 1 extra cycle
   *low = ((cpu->db << 16) + adr + cpu->x) & 0xffffff;
   return ((cpu->db << 16) + adr + cpu->x + 1) & 0xffffff;
 }
 
 static uint32_t interp816_adrAby(Interp816* cpu, uint32_t* low, bool write) {
   uint16_t adr = interp816_readOpcodeWord(cpu);
-  bool crossed = (adr >> 8) != ((adr + cpu->y) >> 8);
-  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
-  // writes: x = 0 or page crossed; reads: page crossed
+  if(write && (!cpu->xf || ((adr >> 8) != ((adr + cpu->y) >> 8)))) cpu->cyclesUsed++;
+  // x = 0 or page crossed, with writing opcode: 1 extra cycle
   *low = ((cpu->db << 16) + adr + cpu->y) & 0xffffff;
   return ((cpu->db << 16) + adr + cpu->y + 1) & 0xffffff;
 }

@@ -1183,6 +1183,24 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    /* AOT block-charge probe (2026-08-31): env SNESRECOMP_AOTBLK="lo-hi"
+     * (frame window). Logs pc24 + master_cycles at every AOT block entry so
+     * the AOT charge per block can be diffed against the LLE per-block sums
+     * from SNESRECOMP_CYC_WATCH. Default off. */
+    {
+        extern int snes_frame_counter;
+        static int ab_init = 0; static long ab_lo = -1, ab_hi = -1;
+        if (!ab_init) {
+            ab_init = 1;
+            const char *_e = getenv("SNESRECOMP_AOTBLK");
+            if (_e) sscanf(_e, "%ld-%ld", &ab_lo, &ab_hi);
+        }
+        if (ab_lo >= 0 && snes_frame_counter >= ab_lo &&
+            snes_frame_counter <= ab_hi)
+            fprintf(stderr, "[aotblk] f=%d pc=$%06X master=%llu\n",
+                    snes_frame_counter, pc24,
+                    (unsigned long long)cpu->master_cycles);
+    }
     /* Investigation: block-boundary DB shadow. Catches EVERY DB change
      * (inline PLBs bypass cpu_trace_db_change), reporting the block where it
      * was first observed + the immediately-preceding block (which did it).
@@ -1808,14 +1826,6 @@ void cpu_trace_stack_op(CpuState *cpu, uint32_t pc24, uint8_t op_id,
      * for non-WRAM events, free to repurpose). */
     capture(cpu, pc24, CPU_TR_STACK_OP, op_id,
             (uint16_t)((uint16_t)(uint8_t)delta << 8));
-    /* capture() no-ops when the ring was never allocated — a trace-enabled
-     * binary that skipped cpu_trace_init(), which capture() documents as a
-     * supported configuration. Patching up "the event capture() just wrote"
-     * is only valid if it actually wrote one: otherwise g_cpu_trace_idx is
-     * still 0, just_idx underflows to UINT64_MAX, and the masked index runs
-     * off a NULL ring. Stack ops are on by default, so that is a guaranteed
-     * segfault on the first guest push rather than a rare one. */
-    if (!g_cpu_trace_ring || g_cpu_trace_capacity == 0) return;
     uint64_t just_idx = g_cpu_trace_idx - 1;
     CpuTraceEvent *just = &g_cpu_trace_ring[just_idx & (g_cpu_trace_capacity - 1)];
     just->addr16 = old_S;
