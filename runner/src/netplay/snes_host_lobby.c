@@ -1,4 +1,5 @@
 #include "snes_host_lobby.h"
+#include "../lobby/snes_netplay_auth.h"
 #include "snes_netplay_identity.h"
 
 #include <stdio.h>
@@ -1374,6 +1375,21 @@ static int cb_chat_get(void *ctx, int index,
 
 /* Server chat: per-game, online only. A LAN room has no server and no wider
  * audience, so the panel is hidden there (send refuses, count 0). */
+/* ---- optional Discord sign-in ------------------------------------------
+ * Thin adapters over snes_netplay_auth, which owns the HTTP, the worker
+ * thread and the device key. */
+static int cb_account_available(void *ctx) { (void)ctx; return snes_account_available(); }
+static int cb_account_login_begin(void *ctx) { (void)ctx; return snes_account_login_begin(); }
+static int cb_account_state(void *ctx) { (void)ctx; return snes_account_state(); }
+static const char *cb_account_handle(void *ctx) { (void)ctx; return snes_account_handle(); }
+static const char *cb_account_username(void *ctx) { (void)ctx; return snes_account_username(); }
+static const char *cb_account_error(void *ctx) { (void)ctx; return snes_account_error(); }
+static int cb_account_sign_out(void *ctx) { (void)ctx; return snes_account_sign_out(); }
+static int cb_account_set_handle(void *ctx, const char *h) {
+    (void)ctx;
+    return snes_account_set_handle(h);
+}
+
 static int cb_server_chat_send(void *ctx, const char *text)
 {
   (void)ctx;
@@ -2290,6 +2306,19 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .server_chat_send = cb_server_chat_send,
     .server_chat_count = cb_server_chat_count,
     .server_chat_get = cb_server_chat_get,
+#if defined(RECOMP_LAUNCHER_HAS_ACCOUNT)
+    /* Optional Discord sign-in. Guarded on the launcher ABI macro so this
+     * runner still builds against a recomp-ui that predates the callbacks --
+     * the UI and the runners can land in any order. */
+    .account_available = cb_account_available,
+    .account_login_begin = cb_account_login_begin,
+    .account_state = cb_account_state,
+    .account_handle = cb_account_handle,
+    .account_username = cb_account_username,
+    .account_error = cb_account_error,
+    .account_sign_out = cb_account_sign_out,
+    .account_set_handle = cb_account_set_handle,
+#endif
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)
