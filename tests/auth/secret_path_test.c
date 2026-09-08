@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -54,19 +55,36 @@ static int run_unreachable(void) {
     fprintf(f, "player-keep secret-keep\n");
     fclose(f);
 
-    rnet_account_set_secret_path(keep);
-    rnet_account_init("ws://127.0.0.1:59999");
-    for (i = 0; i < 150; i++) {
-        rnet_account_pump();
-        st = rnet_account_state();
-        if (st == 2 || st == 3) break;
-        usleep(20000);
+    {
+        struct timespec t0, t1;
+        long ms;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        rnet_account_set_secret_path(keep);
+        rnet_account_init("ws://127.0.0.1:59999");
+        for (i = 0; i < 400; i++) {
+            rnet_account_pump();
+            st = rnet_account_state();
+            if (st == 2 || st == 3) break;
+            usleep(20000);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+             (t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+        f = fopen(keep, "rb");
+        if (!f) { printf("    child: KEY WAS DELETED\n"); return 1; }
+        fclose(f);
+        if (st == 0) { printf("    child: fell back to GUEST silently\n"); return 1; }
+        /* The retries are the point. A refused connect returns instantly, so
+         * without them this settles in ~0ms; the 250+750ms backoffs put a
+         * floor under it. One lost connect used to end the attempt and send a
+         * player with a good key back to the Discord prompt. */
+        if (ms < 900) {
+            printf("    child: settled in %ldms -- retries did not run\n", ms);
+            return 1;
+        }
+        printf("    child: key kept, state=%d after %ldms of retries\n", st, ms);
     }
-    f = fopen(keep, "rb");
-    if (!f) { printf("    child: KEY WAS DELETED\n"); return 1; }
-    fclose(f);
-    if (st == 0) { printf("    child: fell back to GUEST silently\n"); return 1; }
-    printf("    child: key kept, state=%d, err=%s\n", st, rnet_account_error());
     return 0;
 }
 
@@ -180,8 +198,8 @@ int main(int argc, char **argv) {
         int rc;
         snprintf(cmd, sizeof(cmd), "\"%s\" --unreachable", self_path);
         rc = system(cmd);
-        check(rc == 0, "an unreachable sign-in server leaves the stored key "
-                       "alone and reports the failure (child process)");
+        check(rc == 0, "an unreachable server is retried, keeps the key, and "
+                       "reports the failure (child process)");
     }
 
     printf(failures ? "FAILED\n" : "PASSED\n");
