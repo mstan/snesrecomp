@@ -334,3 +334,13 @@ if [ -n "$OSD_SDL_LIBS" ]; then
 else
     echo "  (skipped: no SDL2/SDL3 pkg-config)"
 fi
+
+echo "=== account secret path (rebuild must not sign you out) ==="
+# _GNU_SOURCE: rnet_auth.c uses getaddrinfo, and the test uses mkdtemp.
+"$CC" -std=gnu11 -Wall -Wextra -O1 -D_GNU_SOURCE \
+    -I "$ROOT/lib/recomp-net/include" -I "$ROOT/lib/recomp-net/src" \
+    "$ROOT/tests/auth/secret_path_test.c" \
+    "$ROOT/lib/recomp-net/src/auth/rnet_auth.c" \
+    "$ROOT/lib/recomp-net/src/auth/rnet_sha256.c" \
+    -lpthread -o "$OUT/secret_path_test"
+"$OUT/secret_path_test"
