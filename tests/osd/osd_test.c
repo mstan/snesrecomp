@@ -47,6 +47,22 @@ int main(void) {
     check(snes_osd_image(&px, &w, &h) && px && w > 0 && h > 0,
           "and produces a non-empty image");
 
+    /* The readout must be right EARLY, not after a second of climbing.
+     *
+     * The rolling mean divides by the full 64-slot window, so before the
+     * window has filled the raw accumulator is diluted by the zeroed slots --
+     * which is exactly why the overlay used to count up from 0 to 60 over its
+     * first second. Ten frames at ~10ms is ~100fps; a diluted value would read
+     * around 10/64 of that. */
+    for (int i = 0; i < 10; i++) { snes_osd_note_frame(); SDL_Delay(10); }
+    {
+        const float early = snes_osd_fps();
+        printf("  ..  after 10 frames: %.1f fps (raw window would show ~%.1f)\n",
+               (double)early, (double)early * 10.0 / 64.0);
+        check(early > 40.0f,
+              "the average is window-corrected, so it does not ramp from zero");
+    }
+
     /* Feed frames at a known cadence and confirm the average lands near it.
      * Deliberately loose: SDL_Delay is not precise, and asserting an exact
      * fps here would be a test of the host's scheduler, not of the OSD. */
