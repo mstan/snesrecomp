@@ -208,6 +208,23 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     }
     return value;
 }
+/* Diagnostic env gates, read once.
+ *
+ * These four sites sit on the interpreter's memory bus and in its step loop,
+ * so an uncached getenv is a linear scan of the whole environment per guest
+ * memory access. That is invisible in a mostly-AOT port and expensive in one
+ * that runs mostly interpreted: profiling Endless Duel (whose compiled tier is
+ * 31 bank-$00 entries, so effectively all execution is LLE) put getenv at 2.1%
+ * of frame time, ahead of the SPC and the DSP. Every other env read in this
+ * file already caches in a static; these did not.
+ *
+ * Kept as the FIRST operand of each guard so the almost-always-false load
+ * short-circuits the port comparison behind it. */
+static int bridge_yield_diag(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("SNESRECOMP_YIELD_DIAG") ? 1 : 0;
+    return v;
+}
 static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
     bridge_timing_bus(adr);
     g_interp_bridge_write_epoch++;
@@ -1570,7 +1587,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 in.mf = 1;
                 in.db = in.k;
             }
-            if (getenv("SNESRECOMP_YIELD_DIAG") &&
+            if (bridge_yield_diag() &&
                 _yield_flag != yield_flag_value && steps > 16) {
                 static int _yield_diag_n;
                 if (_yield_diag_n < 64) {
