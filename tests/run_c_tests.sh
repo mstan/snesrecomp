@@ -344,3 +344,13 @@ echo "=== account secret path (rebuild must not sign you out) ==="
     "$ROOT/lib/recomp-net/src/auth/rnet_sha256.c" \
     -lpthread -o "$OUT/secret_path_test"
 "$OUT/secret_path_test"
+
+echo "=== rewind ring (ordering, clamping, what commit discards) ==="
+# The snapshot API is stubbed, so this tests the ring rather than re-testing
+# the save format the save-state menu already exercises.
+"$CC" -std=gnu11 -Wall -Wextra -O1 -D_GNU_SOURCE \
+    -I "$ROOT/runner/src" \
+    "$ROOT/tests/rewind/rewind_test.c" \
+    "$ROOT/runner/src/snes_rewind.c" \
+    -o "$OUT/rewind_test"
+"$OUT/rewind_test"

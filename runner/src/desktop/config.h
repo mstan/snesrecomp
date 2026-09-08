@@ -35,6 +35,9 @@ enum {
    * than inserted above so the kKeys_Load / kKeys_Save 20-slot ranges keep
    * their numbering — those are index arithmetic, not just enum labels. */
   kKeys_SaveStateMenu,
+  /* Local rewind filmstrip (snes_rewind.c). Appended for the same reason as
+   * SaveStateMenu: the Load/Save ranges above are index arithmetic. */
+  kKeys_Rewind,
   kKeys_Total,
 };
 

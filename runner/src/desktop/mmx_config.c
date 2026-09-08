@@ -47,6 +47,9 @@ static const uint16 kDefaultKbdControls[kKeys_Total] = {
    * (SaveStateMenu = F7), which is an explicit trade its player can see,
    * rather than one silently made for every port in the scaffold. */
   0,
+  /* Rewind — unbound for exactly the same reason. recomp-ui offers F8, which
+   * is LoadState slot 8 in the table above. */
+  0,
 };
 #undef _
 #undef A
@@ -67,7 +70,7 @@ static const KeyNameId kKeyNameId[] = {
   M(Load), M(Save),
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
-  S(SaveStateMenu),
+  S(SaveStateMenu), S(Rewind),
 };
 #undef S
 #undef M
