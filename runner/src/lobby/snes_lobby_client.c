@@ -1,4 +1,5 @@
 #include "snes_lobby_client.h"
+#include "snes_netplay_auth.h"   /* optional Discord session for `hello` */
 
 #include "recomp_net/ice_xfer.h"
 #include "recomp_net/chat_filter.h"
@@ -1424,12 +1425,25 @@ static void queue_hello(void)
 {
     char name_esc[SNES_LOBBY_NAME_LEN * 2 + 8];
     char game_esc[SNES_LOBBY_NAME_LEN * 2 + 8];
-    char msg[SNES_LOBBY_NAME_LEN * 4 + 64];
+    char sess_esc[2048];
+    char msg[SNES_LOBBY_NAME_LEN * 4 + 2176];
+    const char *sess = snes_account_session();
     json_escape(g_lc.display_name, name_esc, sizeof(name_esc));
     json_escape(g_lc.filter_game_name, game_esc, sizeof(game_esc));
-    snprintf(msg, sizeof(msg),
-             "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
-             name_esc, game_esc);
+    /* The session is OPTIONAL and omitted entirely when this client is a
+     * guest, which is what keeps an unauthenticated hello byte-identical to
+     * the one this client has always sent. */
+    if (sess && sess[0]) {
+        json_escape(sess, sess_esc, sizeof(sess_esc));
+        snprintf(msg, sizeof(msg),
+                 "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\","
+                 "\"session\":\"%s\"}",
+                 name_esc, game_esc, sess_esc);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
+                 name_esc, game_esc);
+    }
     queue_send(msg);
     flush_pending();
 }
