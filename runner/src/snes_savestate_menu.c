@@ -31,6 +31,7 @@
 #endif
 
 #include "snes_savestate_menu.h"
+#include "snes_osd.h"
 
 #include "common_rtl.h"
 #include "desktop/sdl_compat.h"
@@ -445,13 +446,22 @@ static void menu_submit(int save)
          * direct evidence a player gets that the state was actually
          * written, and this port had no save-state UI at all before now. */
         set_status("SAVED SLOT %02d", s_selected);
+        /* Also a host toast: the in-menu status above is only visible while
+         * the menu is, and a player who saves and immediately closes would
+         * otherwise get no confirmation that anything was written. */
+        snes_osd_push_slot_saved(s_selected);
         return;
     }
     if (!slot_exists(s_selected)) {
         set_status("SLOT %02d IS EMPTY", s_selected);
+        snes_osd_push_slot_empty(s_selected);
         return;
     }
     RtlSaveLoad(kSaveLoad_Load, s_selected);
+    /* A load CLOSES the menu, so set_status() here would draw one frame of a
+     * panel that is already gone. The toast outlives the menu, which is why
+     * the load path needs it more than the save path does. */
+    snes_osd_push_slot_loaded(s_selected);
     snes_savestate_menu_close();
 }
 

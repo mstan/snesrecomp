@@ -38,6 +38,15 @@ static const uint16 kDefaultKbdControls[kKeys_Total] = {
   A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), N, N, _(SDLK_f), _(SDLK_r), A(SDLK_w),
   // VolumeUp VolumeDown
   0, 0,
+  /* SaveStateMenu — deliberately UNBOUND by default.
+   *
+   * recomp-ui offers F7 for it, but on SNES F1..F10 are already the ten
+   * LoadState slots above, so a built-in F7 default would collide and
+   * KeyMapHash_Add would drop one of them with a "Duplicate key" line. A port
+   * that wants the menu on F7 says so in its own config.ini [KeyMap]
+   * (SaveStateMenu = F7), which is an explicit trade its player can see,
+   * rather than one silently made for every port in the scaffold. */
+  0,
 };
 #undef _
 #undef A
@@ -58,6 +67,7 @@ static const KeyNameId kKeyNameId[] = {
   M(Load), M(Save),
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
+  S(SaveStateMenu),
 };
 #undef S
 #undef M

@@ -305,3 +305,32 @@ echo "=== lobby mod plan (match_caps.mods wire shape) ==="
     "$ROOT"/runner/src/lobby/ws/*.c \
     -o "$OUT/lobby_mod_plan_test"
 "$OUT/lobby_mod_plan_test"
+
+echo "=== host OSD (FPS readout / turbo / toasts) ==="
+# Needs SDL for its clock only (no window; SDL_INIT_TIMER). Skipped rather than
+# failed where SDL headers are absent, so this stays a ROM-free harness that
+# also runs on a machine without the game's build deps.
+OSD_SDL_CFLAGS=""
+OSD_SDL_LIBS=""
+OSD_SDL_BACKEND=""
+if pkg-config --exists sdl3 2>/dev/null; then
+    OSD_SDL_CFLAGS="$(pkg-config --cflags sdl3)"
+    OSD_SDL_LIBS="$(pkg-config --libs sdl3)"
+    OSD_SDL_BACKEND="-DSNESRECOMP_SDL_BACKEND=3"
+elif pkg-config --exists sdl2 2>/dev/null; then
+    OSD_SDL_CFLAGS="$(pkg-config --cflags sdl2)"
+    OSD_SDL_LIBS="$(pkg-config --libs sdl2)"
+    OSD_SDL_BACKEND="-DSNESRECOMP_SDL_BACKEND=2"
+fi
+if [ -n "$OSD_SDL_LIBS" ]; then
+    # shellcheck disable=SC2086
+    "$CC" -std=c11 -Wall -Wextra -O1 \
+        -I "$ROOT/runner/src" -I "$ROOT/runner/src/desktop" \
+        $OSD_SDL_CFLAGS $OSD_SDL_BACKEND \
+        "$ROOT/tests/osd/osd_test.c" \
+        "$ROOT/runner/src/snes_osd.c" \
+        $OSD_SDL_LIBS -o "$OUT/osd_test"
+    "$OUT/osd_test"
+else
+    echo "  (skipped: no SDL2/SDL3 pkg-config)"
+fi
