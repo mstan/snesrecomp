@@ -832,6 +832,30 @@ static int cb_connected(void *ctx)
 static void cb_pump(void *ctx)
 {
   (void)ctx;
+  /* Point the account client at the lobby host, and pump it.
+   *
+   * rnet_auth.c derives its HTTP host from the ws:// URL handed to
+   * rnet_account_init, and its own comment says "Init runs from the netplay
+   * pump" -- but nothing called it. The linker then dead-stripped
+   * rnet_account_init out of the binary entirely, so g.host stayed the
+   * zero-initialised empty string and every /auth/* POST died in
+   * getaddrinfo("", "0"). That surfaces as "couldn't reach the lobby server
+   * to sign in" no matter which host is configured, which is exactly the
+   * wrong place to go looking.
+   *
+   * Re-init only when the URL actually changes rather than every pump: the
+   * worker thread reads g.host while a login is in flight, and memset-ing it
+   * under that read 60 times a second would be a data race for no gain. */
+  {
+    static char auth_url[256];
+    const char *url = cb_default_url(NULL);
+    if (url && url[0] && strcmp(url, auth_url) != 0) {
+      snprintf(auth_url, sizeof(auth_url), "%s", url);
+      rnet_account_init(url);
+    }
+  }
+  rnet_account_pump();
+
   snes_lobby_pump();
   dl_queue_step();
   host_caps_watch_step();
