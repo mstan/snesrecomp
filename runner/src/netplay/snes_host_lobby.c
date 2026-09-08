@@ -850,11 +850,43 @@ static void cb_pump(void *ctx)
     static char auth_url[256];
     const char *url = cb_default_url(NULL);
     if (url && url[0] && strcmp(url, auth_url) != 0) {
+      /* Anchor the secret to the EXECUTABLE directory before the first init.
+       * Its default is the bare relative name "netplay_secret", resolved
+       * against the working directory -- so the same install signed itself
+       * out depending on where it was launched from, and a rebuild run from a
+       * different directory read as a lost login. rnet_auth.c migrates an old
+       * CWD-relative file into this path on first load, so nobody is signed
+       * out by the move. */
+      char secret_path[512];
+      if (snesrecomp_exe_dir_path("netplay_secret", secret_path,
+                                  sizeof(secret_path)))
+        rnet_account_set_secret_path(secret_path);
       snprintf(auth_url, sizeof(auth_url), "%s", url);
       rnet_account_init(url);
     }
   }
   rnet_account_pump();
+
+  /* Publish the account name to the lobby.
+   *
+   * The lobby's display name is what seats and the players-online list show,
+   * and it defaults to the literal "Host" when empty (snes_lobby_client.c
+   * create path). Nothing pushed the account handle into it: signing in --
+   * including the automatic sign-in from a stored secret -- only updated the
+   * ACCOUNT, so a signed-in player created a lobby and appeared as "Host".
+   * Only an explicit rename through the name modal ever set it.
+   *
+   * Done here rather than at a sign-in edge because there is no single such
+   * edge: interactive login, stored-secret redemption and a server-side
+   * handle change all land asynchronously in the pump. Comparing against the
+   * live name makes this idempotent -- set_display_name only re-sends hello
+   * when the value actually changed. */
+  if (rnet_account_state() == RNET_ACCOUNT_SIGNED_IN) {
+    const char *handle = rnet_account_handle();
+    const char *shown = snes_lobby_display_name();
+    if (handle && handle[0] && (!shown || strcmp(shown, handle) != 0))
+      snes_lobby_set_display_name(handle);
+  }
 
   snes_lobby_pump();
   dl_queue_step();
