@@ -50,14 +50,20 @@ int  snes_osd_fps_visible(void);
 void snes_osd_set_fps_visible(int on);
 
 /*
- * Call once per presented frame. The OSD times the interval itself and keeps
- * a 64-frame rolling average, so every port reports FPS the same way instead
- * of each one inventing its own smoothing.
+ * Call once per EMULATED frame — right after RtlRunFrame, not at present time.
  *
- * Measures PRESENT-to-PRESENT wall time, which is the number a player means
- * by "fps". It is not emulation cost per frame — under a frame limiter this
- * pins to the refresh rate and says nothing about headroom. For headroom, use
- * the debug server, not this.
+ * That distinction is the whole point. A fast-forward runs several guest
+ * frames per present, so a counter placed at the present sits at the refresh
+ * rate and reports 60 no matter how fast the machine is actually running the
+ * game. Counting guest frames makes the readout mean "how fast is this
+ * emulating", which is what a player pressing turbo is asking.
+ *
+ * The OSD times the interval itself and keeps a 64-frame rolling average, so
+ * every port reports FPS the same way instead of inventing its own smoothing.
+ *
+ * Still not a headroom measurement: at 1x the frame limiter pins it to 60 and
+ * says nothing about how much time was spare. For headroom use the debug
+ * server, not this.
  */
 void snes_osd_note_frame(void);
 

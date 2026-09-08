@@ -182,6 +182,12 @@ static int msg_visible(void) {
     return 1;
 }
 
+/* Defined below; the status line must use the WINDOW-CORRECTED average, not
+ * the raw accumulator. The raw one is diluted by the still-zeroed history
+ * slots for the first 64 frames, which is why the readout used to climb from
+ * 0 to 60 over its first second instead of simply being right. */
+float snes_osd_fps(void);
+
 /* Rebuild the status line from fps + turbo. Marks the image dirty only when
  * the text actually changed, so a steady 60 fps rasterizes once. */
 static void status_refresh(void) {
@@ -189,9 +195,9 @@ static void status_refresh(void) {
     if (!s_fps_visible && !s_turbo) {
         next[0] = '\0';
     } else if (s_fps_visible && s_turbo) {
-        snprintf(next, sizeof(next), "%d FPS  TURBO", (int)(s_fps_average + 0.5f));
+        snprintf(next, sizeof(next), "%d FPS  TURBO", (int)(snes_osd_fps() + 0.5f));
     } else if (s_fps_visible) {
-        snprintf(next, sizeof(next), "%d FPS", (int)(s_fps_average + 0.5f));
+        snprintf(next, sizeof(next), "%d FPS", (int)(snes_osd_fps() + 0.5f));
     } else {
         snprintf(next, sizeof(next), "TURBO");
     }
