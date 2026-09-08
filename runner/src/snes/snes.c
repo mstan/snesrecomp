@@ -25,6 +25,31 @@
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
 
+bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out) {
+  if (!snes || !out) return false;
+  if (!snes->hIrqEnabled && !snes->vIrqEnabled) return false;
+  /* Mirrors the match test in snes_advance_beam(): the comparator fires when
+   * the beam crosses target_h on a line the V comparator accepts. */
+  const uint32_t target_h =
+      snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
+  if (target_h >= 1364u) return false;
+
+  uint32_t h = snes->hPos;
+  uint32_t v = snes->vPos;
+  uint64_t delta = 0;
+  for (uint32_t scanned = 0; scanned <= 262u; scanned++) {
+    const bool line_matches = !snes->vIrqEnabled || v == snes->vTimer;
+    if (line_matches && target_h >= h) {
+      *out = now + delta + (uint64_t)(target_h - h);
+      return true;
+    }
+    delta += 1364u - h;
+    h = 0;
+    v = (v + 1u) % 262u;
+  }
+  return false;
+}
+
 uint8_t snes_readReg(Snes* snes, uint16_t adr);
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
 

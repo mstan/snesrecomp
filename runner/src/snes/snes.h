@@ -85,6 +85,8 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
 void snes_advance_master_cycles(Snes *snes, uint32_t clocks);
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock);
+/* Next comparator edge for hosts that deliver each raster IRQ separately. */
+bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out);
 
 extern int snes_frame_counter;
 #endif
