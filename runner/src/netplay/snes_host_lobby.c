@@ -1,5 +1,5 @@
 #include "snes_host_lobby.h"
-#include "../lobby/snes_netplay_auth.h"
+#include "recomp_net/auth.h"
 #include "snes_netplay_identity.h"
 
 #include <stdio.h>
@@ -1378,16 +1378,16 @@ static int cb_chat_get(void *ctx, int index,
 /* ---- optional Discord sign-in ------------------------------------------
  * Thin adapters over snes_netplay_auth, which owns the HTTP, the worker
  * thread and the device key. */
-static int cb_account_available(void *ctx) { (void)ctx; return snes_account_available(); }
-static int cb_account_login_begin(void *ctx) { (void)ctx; return snes_account_login_begin(); }
-static int cb_account_state(void *ctx) { (void)ctx; return snes_account_state(); }
-static const char *cb_account_handle(void *ctx) { (void)ctx; return snes_account_handle(); }
-static const char *cb_account_username(void *ctx) { (void)ctx; return snes_account_username(); }
-static const char *cb_account_error(void *ctx) { (void)ctx; return snes_account_error(); }
-static int cb_account_sign_out(void *ctx) { (void)ctx; return snes_account_sign_out(); }
+static int cb_account_available(void *ctx) { (void)ctx; return rnet_account_available(); }
+static int cb_account_login_begin(void *ctx) { (void)ctx; return rnet_account_login_begin(); }
+static int cb_account_state(void *ctx) { (void)ctx; return rnet_account_state(); }
+static const char *cb_account_handle(void *ctx) { (void)ctx; return rnet_account_handle(); }
+static const char *cb_account_username(void *ctx) { (void)ctx; return rnet_account_username(); }
+static const char *cb_account_error(void *ctx) { (void)ctx; return rnet_account_error(); }
+static int cb_account_sign_out(void *ctx) { (void)ctx; return rnet_account_sign_out(); }
 static int cb_account_set_handle(void *ctx, const char *h) {
     (void)ctx;
-    return snes_account_set_handle(h);
+    return rnet_account_set_handle(h);
 }
 
 static int cb_server_chat_send(void *ctx, const char *text)

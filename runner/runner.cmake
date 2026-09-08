@@ -172,7 +172,6 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/rom_image_verify.c
     ${SNESRECOMP_RUNNER_ROOT}/src/crc32.c
     ${SNESRECOMP_RUNNER_ROOT}/src/sha256.c
-    ${SNESRECOMP_RUNNER_ROOT}/src/lobby/snes_netplay_auth.c
     ${SNESRECOMP_RUNNER_ROOT}/src/keybinds.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_savestate_menu.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_state.c

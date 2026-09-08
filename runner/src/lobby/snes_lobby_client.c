@@ -1,5 +1,5 @@
 #include "snes_lobby_client.h"
-#include "snes_netplay_auth.h"   /* optional Discord session for `hello` */
+#include "recomp_net/auth.h"   /* optional Discord session for `hello` */
 
 #include "recomp_net/ice_xfer.h"
 #include "recomp_net/chat_filter.h"
@@ -1427,7 +1427,7 @@ static void queue_hello(void)
     char game_esc[SNES_LOBBY_NAME_LEN * 2 + 8];
     char sess_esc[2048];
     char msg[SNES_LOBBY_NAME_LEN * 4 + 2176];
-    const char *sess = snes_account_session();
+    const char *sess = rnet_account_session();
     json_escape(g_lc.display_name, name_esc, sizeof(name_esc));
     json_escape(g_lc.filter_game_name, game_esc, sizeof(game_esc));
     /* The session is OPTIONAL and omitted entirely when this client is a
