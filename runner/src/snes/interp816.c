@@ -11,12 +11,19 @@
  * historical fallback-tier marker behavior or architectural vectoring. See
  * docs/MULTI_TIER.md.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <time.h>
+#endif
 #include "interp816.h"
 
 static const int cyclesPerOpcode[256] = {
