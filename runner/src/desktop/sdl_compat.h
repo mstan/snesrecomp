@@ -189,6 +189,16 @@ static inline bool snesrecomp_sdl_get_texture_size(
 #endif
 }
 
+/* SDL3 grew a modifier-state out-parameter on this; SDL2 takes the keycode
+ * alone. Callers that only want "which physical key is this" pass neither. */
+static inline SDL_Scancode snesrecomp_sdl_scancode_from_key(SDL_Keycode key) {
+#if SNESRECOMP_SDL3
+  return SDL_GetScancodeFromKey(key, NULL);
+#else
+  return SDL_GetScancodeFromKey(key);
+#endif
+}
+
 static inline void snesrecomp_sdl_render_texture(
     SDL_Renderer *renderer, SDL_Texture *texture, const SDL_Rect *source,
     const SDL_Rect *destination) {
