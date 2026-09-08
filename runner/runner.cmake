@@ -219,6 +219,52 @@ list(APPEND SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/snes/cx4.c)
 message(STATUS "Cx4: instruction-level HG51B S169 core (ares, ISC)")
 
+# Execution policy DEFAULT for optimized (HLE) replacements over the faithful
+# LLE floor. This chooses the default only — the policy itself is resolved at
+# runtime by snesrecomp_execution_mode() and can always be overridden with
+# SNESRECOMP_EXECUTION_MODE, or forced back to the floor with
+# SNESRECOMP_FORCE_FLOOR=1.
+#
+# It is deliberately NOT a compile-time split of which paths get built.
+# PRINCIPLES.md requires the faithful mode to stay "buildable, forceable, and
+# authoritative" in the shipped product; a release binary with the floor
+# compiled out has nothing to fall back to on a miss and nothing to force when
+# reproducing a player's bug report.
+#
+# Vocabulary is recomp-ai-rules/OPTIMIZATION.md §2: off|on|force|verify|auto.
+# Dev builds want "off" (prove the floor). A port flips its release default to
+# "on" only after a replacement has cleared its promotion gates — and there is
+# nothing to promote until a port actually has an optimized path.
+set(SNESRECOMP_EXECUTION_DEFAULT "off" CACHE STRING
+    "Default execution policy: off|on|force|verify|auto (runtime-overridable)")
+set_property(CACHE SNESRECOMP_EXECUTION_DEFAULT PROPERTY STRINGS
+    off on force verify auto)
+string(TOLOWER "${SNESRECOMP_EXECUTION_DEFAULT}" _SNESRECOMP_EXEC_DEFAULT)
+if(_SNESRECOMP_EXEC_DEFAULT STREQUAL "lle")
+    set(_SNESRECOMP_EXEC_DEFAULT "off")
+elseif(_SNESRECOMP_EXEC_DEFAULT STREQUAL "hle")
+    set(_SNESRECOMP_EXEC_DEFAULT "on")
+endif()
+if(NOT _SNESRECOMP_EXEC_DEFAULT MATCHES "^(off|on|force|verify|auto)$")
+    message(FATAL_ERROR
+        "SNESRECOMP_EXECUTION_DEFAULT='${SNESRECOMP_EXECUTION_DEFAULT}' is not "
+        "one of off|on|force|verify|auto (lle|hle accepted as legacy spellings).")
+endif()
+if(_SNESRECOMP_EXEC_DEFAULT STREQUAL "force")
+    # FORCE makes a fallback fatal. That is a gate-run policy; shipping it
+    # turns any unsupported input into a hard failure for the player.
+    message(WARNING
+        "SNESRECOMP_EXECUTION_DEFAULT=force builds a binary whose default "
+        "policy treats a fallback to the floor as a failure. Use it for gate "
+        "runs, not for a release build.")
+endif()
+string(TOUPPER "${_SNESRECOMP_EXEC_DEFAULT}" _SNESRECOMP_EXEC_DEFAULT_ENUM)
+add_compile_definitions(
+    SNESRECOMP_EXECUTION_DEFAULT_MODE=SNESRECOMP_EXECUTION_MODE_${_SNESRECOMP_EXEC_DEFAULT_ENUM})
+message(STATUS
+    "snesrecomp: execution policy default = ${_SNESRECOMP_EXEC_DEFAULT} "
+    "(runtime override: SNESRECOMP_EXECUTION_MODE / SNESRECOMP_FORCE_FLOOR)")
+
 # The TCP debug server + emulator-oracle command handlers are a developer-only
 # feature. debug_server.h provides static-inline no-op stubs when SNESRECOMP_TRACE
 # is 0 (the default), so debug_server.c must only be compiled when tracing is on —
