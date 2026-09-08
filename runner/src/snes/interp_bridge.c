@@ -547,7 +547,12 @@ void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
 #ifndef SNESRECOMP_LLE_BOUNCE_DEFAULT
 #define SNESRECOMP_LLE_BOUNCE_DEFAULT 1
 #endif
+static int s_scheduler_aot_policy = -1;
+void interp_bridge_set_scheduler_aot_policy(int enabled) {
+    s_scheduler_aot_policy = enabled < 0 ? -1 : enabled != 0;
+}
 static int lle_yield_bounce_enabled(void) {
+    if (s_scheduler_aot_policy >= 0) return s_scheduler_aot_policy;
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("SNESRECOMP_LLE_BOUNCE");

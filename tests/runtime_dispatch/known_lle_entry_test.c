@@ -263,6 +263,28 @@ int main(void) {
     fails += check(g_aot_calls == 2, "LoROM mirror finds exact AOT");
     fails += check(cpu.PB == 0x80, "requested mirror bank remains architectural PB");
 
+    const DispatchEntry alternate[] = {{0x008300u, {NULL, NULL, NULL, NULL}, 3}};
+    cpu_select_program(alternate, 1, NULL, 0);
+    fails += check(!cpu_dispatch_has_entry(&cpu, 0x008100u),
+                   "alternate program cannot reach stock AOT table");
+    fails += check(cpu_dispatch_inline_arg_bytes(0x008300u) == 3,
+                   "inline arguments use active program metadata");
+    cpu_select_program(NULL, 0, NULL, 0);
+    fails += check(cpu_dispatch_has_entry(&cpu, 0x008100u),
+                   "default program restores stock dispatch");
+
+    cpu_state_init(&cpu, ram);
+    cart.type = CART_LOROM;
+    cpu.open_bus = 0xa5;
+    fails += check(cpu_read8(&cpu, 0x1e, 0x7f99) == 0xa5,
+                   "unmapped LoROM byte preserves open bus");
+    fails += check(cpu_read16(&cpu, 0x9e, 0x7f99) == 0xa5a5,
+                   "unmapped mirrored LoROM word preserves latch");
+    g_test_rom[0xf0000] = 0x3c;
+    fails += check(cpu_read16(&cpu, 0x1e, 0x7fff) == 0x3ca5,
+                   "LoROM open bus to ROM word crosses mapping boundary");
+    fails += check(cpu.open_bus == 0x3c, "word high byte updates latch");
+
     if (fails) return 1;
     puts("known_lle_entry_test: PASS");
     return 0;

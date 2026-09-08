@@ -526,6 +526,13 @@ typedef struct RamRoutineGuard {
 extern const RamRoutineGuard g_ram_routine_guards[];
 extern const unsigned        g_ram_routine_guard_count;
 
+/* Select a statically linked program before entering guest execution. Tables
+ * must remain alive for the entire session and be sorted by pc24. Direct calls
+ * must belong to the same module; this API does not rewrite compiled calls.
+ * Passing NULL restores the original generated program. Never call mid-frame. */
+void cpu_select_program(const DispatchEntry *dispatch, unsigned count,
+                        const RamRoutineGuard *guards, unsigned guard_count);
+
 uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24);
 
 /* Dispatch on a popped trampoline target. A known row with no exact live M/X

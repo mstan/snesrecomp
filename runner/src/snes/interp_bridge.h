@@ -32,6 +32,10 @@
 #include <stdio.h>
 #include "cpu_state.h"
 
+/* Launch-time main-scheduler AOT policy: -1 default/environment, 0 floor,
+ * 1 accelerated. Native interrupt helpers retain their ordinary policy. */
+void interp_bridge_set_scheduler_aot_policy(int enabled);
+
 /* SA-1's frame timeline already advances the SPC to absolute guest time, so
  * its interpreter must not also apply the legacy relative catch-up. Ordinary
  * SNES cartridges still require that catch-up during interpreter-heavy boot

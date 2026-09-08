@@ -317,6 +317,31 @@ int main(void) {
                           "unselected world OAM remains centered");
     }
 
+    /* Deluxe's BG3 league menu is revealed by overlapping XOR windows.
+     * Check all hardware operations against the final rendered pixels. */
+    for (unsigned op = 0; op < 4; ++op) {
+        ppu_reset(ppu);
+        PpuBeginDrawing(ppu, pixels, kPitch, kPpuRenderFlags_NewRenderer);
+        ppu->inidisp = 15;
+        ppu->bgmode = 9;
+        ppu->screenEnabled[0] = ppu->screenWindowed[0] = 4;
+        ppu->windowsel = 0x0a00;
+        ppu->wbgobjlog = op << 4;
+        ppu->window1left = 32; ppu->window1right = 127;
+        ppu->window2left = 64; ppu->window2right = 159;
+        ppu->bgTileAdr = 0x100;
+        for (unsigned i = 0; i < 8; ++i) ppu->vram[0x1000 + i] = 0xff;
+        ppu->cgram[1] = 0x7fff;
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        for (unsigned x = 0; x < 256; ++x) {
+            bool a = x >= 32 && x <= 127, b = x >= 64 && x <= 159;
+            bool masked = op == 0 ? a || b : op == 1 ? a && b :
+                          op == 2 ? a != b : a == b;
+            failures += check((pixels[x * 4] != 0) == !masked,
+                              "BG3 window operation controls visible pixels");
+        }
+    }
     ppu_free(ppu);
     if (failures) return 1;
     puts("ppu_sprite_limit_test: PASS");

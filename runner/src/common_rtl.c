@@ -718,11 +718,13 @@ uint8 *RomPtr(uint32_t addr) {
       const char *verbose = getenv("SNESRECOMP_OFFRAILS_STDERR");
       if (verbose && verbose[0] && verbose[0] != '0') {
         extern const char *g_last_recomp_func;
+        extern uint32_t g_interp_wlog_pc24;
         fprintf(stderr,
                 "[off-rails-romptr] addr=$%06X PB=$%02X DB=$%02X "
-                "S=$%04X func=%s\n",
+                "S=$%04X func=%s interp=$%06X\n",
                 (unsigned)(addr & 0xFFFFFFu), g_cpu.PB, g_cpu.DB, g_cpu.S,
-                g_last_recomp_func ? g_last_recomp_func : "<none>");
+                g_last_recomp_func ? g_last_recomp_func : "<none>",
+                (unsigned)g_interp_wlog_pc24);
       }
       g_fail = true;
     }

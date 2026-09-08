@@ -348,6 +348,13 @@ uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
         return cpu_latch_read8(cpu, cart_read(g_snes->cart, bank, addr));
     int sram = cpu_sram_offset(bank, addr);
     if (sram >= 0) return cpu_latch_read8(cpu, g_sram[sram]);
+    /* Plain LoROM leaves $00-$3F/$80-$BF:$6000-$7FFF unmapped. Data
+     * reads there observe open bus; they are not invalid ROM pointers.
+     * BS Deluxe's absent Practice rival ($FF) reaches this window while
+     * fetching unused vehicle graphics. Keep RomPtr's pointer guard intact. */
+    if (g_snes && g_snes->cart && g_snes->cart->type == CART_LOROM &&
+        (bank & 0x7f) < 0x40 && addr >= 0x6000 && addr < 0x8000)
+        return cpu->open_bus;
     /* ROM read. RomPtr requires the global g_rom pointer to be live. */
     return cpu_latch_read8(cpu, *RomPtr(((uint32)bank << 16) | addr));
 }
@@ -427,6 +434,14 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
         uint8 hi = (sram_hi >= 0)
             ? g_sram[sram_hi]
             : cpu_read8(cpu, bank, (uint16)(addr + 1));
+        return cpu_latch_read16(cpu, (uint16)lo | ((uint16)hi << 8));
+    }
+    /* Split an unmapped LoROM word (including the $7FFF/$8000 boundary)
+     * through the byte bus so the second fetch observes the first latch. */
+    if (g_snes && g_snes->cart && g_snes->cart->type == CART_LOROM &&
+        (bank & 0x7f) < 0x40 && addr >= 0x6000 && addr < 0x8000) {
+        uint8 lo = cpu_read8(cpu, bank, addr);
+        uint8 hi = cpu_read8(cpu, bank, (uint16)(addr + 1));
         return cpu_latch_read16(cpu, (uint16)lo | ((uint16)hi << 8));
     }
     /* ROM word read. */
@@ -772,12 +787,31 @@ void CpuDispatchLogDumpJson(FILE *f) {
  * dispatch-resolution path consults _ram_guard_blocks() for RAM targets; a
  * mismatch (or a RAM body with no guard record — fail safe) suppresses the AOT
  * bounce so the interpreter floor runs the real bytes, and logs loudly. */
+static const DispatchEntry *s_program_dispatch;
+static unsigned s_program_dispatch_count;
+static const RamRoutineGuard *s_program_guards;
+static unsigned s_program_guard_count;
+
+void cpu_select_program(const DispatchEntry *dispatch, unsigned count,
+                        const RamRoutineGuard *guards, unsigned guard_count) {
+    s_program_dispatch = dispatch;
+    s_program_dispatch_count = count;
+    s_program_guards = guards;
+    s_program_guard_count = guard_count;
+}
+
+/* Keep the generated strong symbols as the default for existing consumers. */
+#define ACTIVE_DISPATCH (s_program_dispatch ? s_program_dispatch : g_dispatch_table)
+#define ACTIVE_DISPATCH_COUNT (s_program_dispatch ? s_program_dispatch_count : g_dispatch_table_count)
+#define ACTIVE_GUARDS (s_program_dispatch ? s_program_guards : g_ram_routine_guards)
+#define ACTIVE_GUARD_COUNT (s_program_dispatch ? s_program_guard_count : g_ram_routine_guard_count)
+
 static const RamRoutineGuard *_ram_guard_find(uint32 pc24) {
-    unsigned lo = 0, hi = g_ram_routine_guard_count;
+    unsigned lo = 0, hi = ACTIVE_GUARD_COUNT;
     while (lo < hi) {
         unsigned mid = lo + (hi - lo) / 2;
-        uint32 m = g_ram_routine_guards[mid].pc24;
-        if (m == pc24) return &g_ram_routine_guards[mid];
+        uint32 m = ACTIVE_GUARDS[mid].pc24;
+        if (m == pc24) return &ACTIVE_GUARDS[mid];
         if (m < pc24) lo = mid + 1;
         else          hi = mid;
     }
@@ -839,11 +873,11 @@ static int _ram_guard_blocks(CpuState *cpu, uint32 pc24) {
 
 static const DispatchEntry *_cpu_dispatch_find(uint32 pc24) {
     unsigned lo = 0;
-    unsigned hi = g_dispatch_table_count;
+    unsigned hi = ACTIVE_DISPATCH_COUNT;
     while (lo < hi) {
         unsigned mid = lo + (hi - lo) / 2;
-        uint32 mid_pc = g_dispatch_table[mid].pc24;
-        if (mid_pc == pc24) return &g_dispatch_table[mid];
+        uint32 mid_pc = ACTIVE_DISPATCH[mid].pc24;
+        if (mid_pc == pc24) return &ACTIVE_DISPATCH[mid];
         if (mid_pc < pc24) lo = mid + 1;
         else               hi = mid;
     }
@@ -1061,13 +1095,13 @@ int cpu_dispatch_has_entry(CpuState *cpu, uint32 pc24) {
 uint8 cpu_dispatch_inline_arg_bytes(uint32 pc24) {
     pc24 &= 0xFFFFFFu;
     for (int pass = 0; pass < 2; pass++) {
-        unsigned lo = 0, hi = g_dispatch_table_count;
+        unsigned lo = 0, hi = ACTIVE_DISPATCH_COUNT;
         while (lo < hi) {
             unsigned mid = lo + (hi - lo) / 2;
-            uint32 mid_pc = g_dispatch_table[mid].pc24;
+            uint32 mid_pc = ACTIVE_DISPATCH[mid].pc24;
             if (mid_pc < pc24) lo = mid + 1;
             else if (mid_pc > pc24) hi = mid;
-            else return g_dispatch_table[mid].inline_arg_bytes;
+            else return ACTIVE_DISPATCH[mid].inline_arg_bytes;
         }
         uint8 bank = (uint8)(pc24 >> 16);
         if (pass || !((bank < 0x40) || (bank >= 0x80 && bank < 0xC0)))

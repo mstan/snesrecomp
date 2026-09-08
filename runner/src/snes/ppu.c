@@ -551,7 +551,17 @@ static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
   }
   if ((winflags & (kWindow2Enabled | kWindow2Inversed)) == (kWindow2Enabled | kWindow2Inversed))
     w2_bits = ~w2_bits;
-  win->bits = w1_bits | w2_bits;
+  if ((winflags & (kWindow1Enabled | kWindow2Enabled)) ==
+      (kWindow1Enabled | kWindow2Enabled)) {
+    switch ((ppu->wbgobjlog >> (layer * 2)) & 3) {
+      case 0: win->bits = w1_bits | w2_bits; break;
+      case 1: win->bits = w1_bits & w2_bits; break;
+      case 2: win->bits = w1_bits ^ w2_bits; break;
+      case 3: win->bits = (uint8)~(w1_bits ^ w2_bits); break;
+    }
+  } else {
+    win->bits = w1_bits | w2_bits;
+  }
   debug_server_on_ppu_window(y, (int)layer, win->edges, win->nr, win->bits);
 }
 
