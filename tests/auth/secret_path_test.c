@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -68,6 +70,44 @@ static int run_unreachable(void) {
     return 0;
 }
 
+/* Child mode: prove what secret_load() actually parsed, without adding a
+ * test-only accessor. Put the credential at the LEGACY cwd-relative name and
+ * configure a different path: the migration then writes back exactly the
+ * player_id and secret it parsed, so the output file is the parse, on disk.
+ * A truncated read shows up as a short secret in that file. */
+static int run_roundtrip(const char *dir, const char *want_id, const char *want_secret) {
+    char out[512], line[512];
+    FILE *f;
+    size_t n;
+    if (chdir(dir) != 0) return 1;
+    f = fopen("netplay_secret", "wb");
+    if (!f) return 1;
+    fprintf(f, "%s %s\n", want_id, want_secret);
+    fclose(f);
+
+    snprintf(out, sizeof(out), "%s/migrated_secret", dir);
+    rnet_account_set_secret_path(out);
+    rnet_account_init("ws://127.0.0.1:59999");
+
+    f = fopen(out, "rb");
+    if (!f) { printf("    child: nothing migrated\n"); return 1; }
+    n = fread(line, 1, sizeof(line) - 1, f);
+    line[n] = '\0';
+    fclose(f);
+    {
+        char want[512];
+        snprintf(want, sizeof(want), "%s %s\n", want_id, want_secret);
+        if (strcmp(line, want) != 0) {
+            printf("    child: parsed %d bytes, wanted %d -- TRUNCATED\n",
+                   (int)strlen(line), (int)strlen(want));
+            return 1;
+        }
+    }
+    printf("    child: %d-char id + %d-char secret round-tripped intact\n",
+           (int)strlen(want_id), (int)strlen(want_secret));
+    return 0;
+}
+
 static const char *self_path;
 
 int main(int argc, char **argv) {
@@ -76,6 +116,8 @@ int main(int argc, char **argv) {
     char newpath[512];
     self_path = argv[0];
     if (argc > 1 && strcmp(argv[1], "--unreachable") == 0) return run_unreachable();
+    if (argc > 4 && strcmp(argv[1], "--roundtrip") == 0)
+        return run_roundtrip(argv[2], argv[3], argv[4]);
     dir = mkdtemp(tmpl);
     if (!dir) { printf("mkdtemp failed\n"); return 1; }
     if (chdir(dir) != 0) { printf("chdir failed\n"); return 1; }
@@ -98,6 +140,36 @@ int main(int argc, char **argv) {
     check(file_has("netplay_secret", "player-abc"),
           "the original is left in place — a credential is not deleted on the "
           "strength of an unconfirmed write");
+
+    /* ---- a real-length credential must round-trip intact ---------------
+     *
+     * The line is "<player_id> <secret>", and it used to be read into
+     * g.secret (SECRET_MAX = 96). A UUID id plus a 68-char key is 105
+     * characters, so fread's 95-byte cap silently truncated the secret to 58
+     * before it was split out. The proof was then wrong, the server said 401,
+     * and the key was thrown away as invalid -- which is why signing in
+     * worked and the NEXT launch always failed. Sizes here match a real
+     * credential exactly. */
+    {
+        const char *real_id = "1ade336d-7caa-4638-b7e2-089c30830e9f";  /* 36 */
+        char long_secret[69];
+        int i;
+        for (i = 0; i < 68; i++) long_secret[i] = (char)('a' + (i % 26));
+        long_secret[68] = '\0';
+
+        char rt_dir[512];
+        snprintf(rt_dir, sizeof(rt_dir), "%s/rt", dir);
+        if (mkdir(rt_dir, 0700) != 0) { check(0, "could not make rt dir"); }
+
+        /* Reload in a child: the module loads its secret once per process. */
+        {
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd), "\"%s\" --roundtrip \"%s\" \"%s\" \"%s\"",
+                     self_path, rt_dir, real_id, long_secret);
+            check(system(cmd) == 0,
+                  "a 36-char id and a 68-char secret survive the load intact");
+        }
+    }
 
     /* Scenario 2 runs as a SEPARATE PROCESS (below): the account client is a
      * process-lifetime singleton -- rnet_account_init only loads the secret
