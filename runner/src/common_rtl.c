@@ -19,6 +19,7 @@
 #include "snes/cx4.h"
 #include "snes/sa1.h"
 #include "snes/msu1.h"
+#include "mod_audio.h"
 #include "snes/ws_shadow.h"
 #if SNESRECOMP_ENABLE_MODS
 #include "mod_runtime.h"
@@ -42,6 +43,65 @@ Ppu *g_ppu;
 Dma *g_dma;
 uint8 g_snesrecomp_last_hdmaen;
 
+/* Guest -> APU port ($2140-$217F) write observers. Trusted host modules
+ * (sound replacement, telemetry) see every CPU-side port write in program
+ * order before it reaches the SPC; returning nonzero consumes the write so
+ * the SPC never hears it. Always compiled (independent of the mod package
+ * runtime) so a title can register one from plain C. */
+static RtlApuPortObserver s_apu_port_observers[RTL_APU_PORT_OBSERVER_MAX];
+static int s_apu_port_observer_count;
+static RtlApuPortReadObserver s_apu_read_observers[RTL_APU_PORT_OBSERVER_MAX];
+static int s_apu_read_observer_count;
+
+int RtlAddApuPortReadObserver(RtlApuPortReadObserver observer) {
+  if (!observer) return 0;
+  for (int i = 0; i < s_apu_read_observer_count; i++)
+    if (s_apu_read_observers[i] == observer) return 1;
+  if (s_apu_read_observer_count >= RTL_APU_PORT_OBSERVER_MAX) return 0;
+  s_apu_read_observers[s_apu_read_observer_count++] = observer;
+  return 1;
+}
+void RtlRemoveApuPortReadObserver(RtlApuPortReadObserver observer) {
+  for (int i = 0; i < s_apu_read_observer_count; i++) if (s_apu_read_observers[i] == observer) {
+    memmove(s_apu_read_observers+i, s_apu_read_observers+i+1,
+            (s_apu_read_observer_count-i-1)*sizeof(*s_apu_read_observers));
+    s_apu_read_observers[--s_apu_read_observer_count] = NULL; return;
+  }
+}
+uint8 rtl_apu_port_observers_read(uint16 reg, uint8 value) {
+  for (int i = 0; i < s_apu_read_observer_count; i++)
+    if (s_apu_read_observers[i](reg, &value)) break;
+  return value;
+}
+
+int RtlAddApuPortObserver(RtlApuPortObserver observer) {
+  if (!observer) return 0;
+  for (int i = 0; i < s_apu_port_observer_count; i++)
+    if (s_apu_port_observers[i] == observer) return 1;
+  if (s_apu_port_observer_count >= RTL_APU_PORT_OBSERVER_MAX) return 0;
+  s_apu_port_observers[s_apu_port_observer_count++] = observer;
+  return 1;
+}
+
+void RtlRemoveApuPortObserver(RtlApuPortObserver observer) {
+  for (int i = 0; i < s_apu_port_observer_count; i++) {
+    if (s_apu_port_observers[i] == observer) {
+      memmove(s_apu_port_observers + i, s_apu_port_observers + i + 1,
+              (s_apu_port_observer_count - i - 1) * sizeof(*s_apu_port_observers));
+      s_apu_port_observers[--s_apu_port_observer_count] = NULL;
+      return;
+    }
+  }
+}
+
+int rtl_apu_port_observers_filter(uint16 reg, uint8 value) {
+  int consumed = 0;
+  for (int i = 0; i < s_apu_port_observer_count; i++)
+    if (s_apu_port_observers[i] && s_apu_port_observers[i](reg, value))
+      consumed = 1;
+  return consumed;
+}
+
 /* Netplay suppresses the pre-frame wall-clock fallback below. Once frames
  * begin, every runner uses the same guest-frame/APU coupling, and the audio
  * callback only consumes samples without advancing emulation. */
@@ -51,6 +111,15 @@ static int rtl_netplay_locks_audio(void) {
 #else
   return 0;
 #endif
+}
+
+static int rtl_fps_heartbeat_enabled(void) {
+  static int s_enabled = -1;
+  if (s_enabled < 0) {
+    const char *env = getenv("SNESRECOMP_FPS");
+    s_enabled = env != NULL;
+  }
+  return s_enabled;
 }
 
 void RtlNetplayAudioReset(void) {
@@ -119,6 +188,16 @@ static bool g_apu_frame_time_valid;
 
 bool rtl_apu_frame_timeline_active(void) {
   return g_apu_frame_time_valid;
+}
+
+void rtl_apu_snapshot_pacing(uint64_t *frame_start_master, uint8_t *frame_time_valid) {
+  if (frame_start_master) *frame_start_master = g_apu_frame_start_master;
+  if (frame_time_valid) *frame_time_valid = g_apu_frame_time_valid ? 1 : 0;
+}
+
+void rtl_apu_restore_pacing(uint64_t frame_start_master, uint8_t frame_time_valid) {
+  g_apu_frame_start_master = frame_start_master;
+  g_apu_frame_time_valid = frame_time_valid != 0;
 }
 
 /* Fast-forward advances the real SPC/DSP state faster than the host device can
@@ -239,6 +318,7 @@ void RtlReset(int mode) {
   // g_cpu); anchor the sync pointer to its current value so the first post-reset
   // catch-up sees a zero delta rather than the whole run's accumulated cycles.
   g_apu_last_sync_master = g_cpu.master_cycles;
+  snes_mod_audio_stop_all();
   snes_reset(g_snes, true);
   g_snes->beamMasterLast = g_cpu.master_cycles;
   SnesEnterNativeMode();
@@ -425,9 +505,17 @@ bool RtlRunFrame(uint32 inputs) {
 #ifdef SNES_COSIM
   /* Co-sim (dev/diagnostics only): connect the coordinator once, before the
    * first frame executes. Boot ran deterministically already; the co-sim
-   * compares from frame 1 onward. */
+   * compares from frame 1 onward. SNES_COSIM_OFF=1 skips the engine entirely
+   * (used by the harness standalone mode: no coordinator, free-run). */
   { static int s_cosim_started = 0;
-    if (!s_cosim_started) { s_cosim_started = 1; cosim_init(); } }
+    const char *s_co = getenv("SNES_COSIM_OFF");
+    if (!s_cosim_started && !(s_co && s_co[0] && s_co[0] != '0')) {
+      s_cosim_started = 1;
+      cosim_init();
+    } else {
+      s_cosim_started = 1;
+    }
+  }
 #endif
   // Avoid up/down and left/right from being pressed at the same time
   if ((inputs & 0x30) == 0x30) inputs ^= 0x30;
@@ -537,9 +625,10 @@ bool RtlRunFrame(uint32 inputs) {
 
   /* Axis-2 soak instrumentation: env-gated FPS heartbeat to stderr. Counts
    * frames completed per wall-clock second (the frame loop caps at ~60 fps, so
-   * ~60 = full speed; a sustained dip = slowdown). Zero cost when off; never
-   * pauses the runtime (RULE 0). Enable with SNESRECOMP_FPS=1. */
-  if (getenv("SNESRECOMP_FPS")) {
+   * ~60 = full speed; a sustained dip = slowdown). When off, only the cached
+   * branch remains; no clock or output work runs. Enable by setting
+   * SNESRECOMP_FPS. */
+  if (rtl_fps_heartbeat_enabled()) {
     static long s_last_sec = 0;
     static int  s_frames = 0;
     long now = (long)time(NULL);
@@ -614,6 +703,8 @@ bool RtlLoadSnapshot(const char *filename) {
     return false;
   }
   g_snes->beamMasterLast = g_cpu.master_cycles;
+  snes_mod_audio_stop_all();
+  PpuResetWidescreenOamHistory(g_snes->ppu);
   /* Post-load reconciliation: host-side execution state (fibers, HLE
    * scheduler bookkeeping) cannot live in the guest snapshot; give the
    * game one hook to rebuild it against the freshly restored WRAM. */
@@ -661,6 +752,8 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   RtlApuUnlock();
   if (memory.error) return false;
   g_snes->beamMasterLast = g_cpu.master_cycles;
+  snes_mod_audio_stop_all();
+  PpuResetWidescreenOamHistory(g_snes->ppu);
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
@@ -743,6 +836,28 @@ uint8 *RomPtr(uint32_t addr) {
 static int _writereg_ppu_count = 0;
 static int _writereg_dma_count = 0;
 void WriteReg(uint16 reg, uint8 value) {
+  /* Advance emulated beam time before the write lands.
+   *
+   * AOT-compiled code never advances the PPU beam — only a $2137 read did, in
+   * ReadRegOpenBus below — so a compiled routine executes in zero PPU time no
+   * matter how many cycles it costs. The interpreter does the opposite: it
+   * calls snes_sync_master_clock after every opcode. That asymmetry is what
+   * loses raster splits scheduled close together: snes_advance_beam's IRQ
+   * comparator is a WINDOW test (target inside [h, h+span)), so a beam that
+   * jumps in one lump can step straight over a target and produce no IRQ at
+   * all rather than a late one.
+   *
+   * Measured on Gundam Wing: $00:888E is the line-21 split handler, it writes
+   * INIDISP = shadow & $80 (brightness 0, deliberate) and schedules the split
+   * that RESTORES brightness only two scanlines later at line 23. That second
+   * split was missed in ~85% of frames, leaving the gameplay demo black for
+   * ~1100 consecutive frames.
+   *
+   * Syncing on every hardware touch keeps compiled and interpreted code on the
+   * same clock. It is bounded work: register accesses are rare next to RAM, and
+   * frequent syncing keeps each delta small. */
+  if (g_snes)
+    snes_sync_master_clock(g_snes, g_cpu.master_cycles);
   // Direct dispatch — bypass emulator bus
   // MSU-1 ($2000-$2007). Inert unless a pack is armed, so the open-bus
   // default (no-op + log) is preserved byte-for-byte when disabled.
@@ -767,6 +882,8 @@ void WriteReg(uint16 reg, uint8 value) {
     cart_write(g_snes->cart, 0, reg, value);
   } else if (reg >= 0x2100 && reg < 0x2140) {
     ppu_write(g_ppu, reg & 0xff, value);
+    if (g_snes)
+      ppu_rasterRecord(reg, g_snes->vPos, value);
   } else if (reg >= 0x2140 && reg < 0x2180) {
 #if SNESRECOMP_ENABLE_MODS
     if (snes_mod_runtime_filter_apu_write_c(reg, value)) {
@@ -778,13 +895,27 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x2180 && reg < 0x2184) {
     snes_writeBBus(g_snes, reg & 0xff, value);
   } else if (reg >= 0x4200 && reg < 0x4220) {
-    if (reg == 0x420C)
+    if (reg == 0x420C) {
       g_snesrecomp_last_hdmaen = value;
+      if (g_snes)
+        ppu_rasterRecord(reg, g_snes->vPos, value);
+    }
     if (reg == 0x420D)
       g_memsel = (uint8_t)(value & 1);  /* FastROM select; paces $80-FF code */
     recomp_write_internal_reg(reg, value);
   } else if (reg >= 0x4300 && reg < 0x4380) {
     dma_write(g_dma, reg, value);
+  } else if (reg >= 0x4800 && reg < 0x4808 &&
+             g_snes && g_snes->cart &&
+             g_snes->cart->type == CART_SDD1) {
+    /* S-DD1 decompression-chip registers ($4800-$4807). The LLE
+     * interpreter's cpu_write8 funnels everything in $2000-$5FFF through
+     * WriteReg; without this case the game's $4800/$4801 enables and
+     * $4804-$4807 MMC selects were silently dropped and the chip could
+     * never activate (Star Ocean's boot hung in the SPC700 upload feeding
+     * it raw compressed data). */
+    cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+    cart_write(g_snes->cart, 0, reg, value);
   }
   debug_server_on_reg_write(reg, value);
 }
@@ -828,6 +959,13 @@ uint8 ReadRegOpenBus(uint16 reg, uint8 open_bus) {
     return recomp_read_internal_reg(reg);
   } else if (reg >= 0x4300 && reg < 0x4380) {
     return dma_read(g_dma, reg);
+  } else if (reg >= 0x4800 && reg < 0x4808 &&
+             g_snes && g_snes->cart &&
+             g_snes->cart->type == CART_SDD1) {
+    /* S-DD1 register reads: mirror the write path so ioRead (bsnes)
+     * semantics apply under the interpreter instead of returning open bus. */
+    cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+    return cart_read(g_snes->cart, 0, reg);
   }
   return open_bus;
 }
@@ -850,6 +988,8 @@ uint16 ReadRegWord(uint16 reg) {
     uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
     uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
     RtlApuUnlock();
+    lo = rtl_apu_port_observers_read(reg, lo);
+    hi = rtl_apu_port_observers_read(reg + 1, hi);
     g_cpu.open_bus = hi;
     return (uint16_t)lo | ((uint16_t)hi << 8);
   }
@@ -870,6 +1010,13 @@ static void WriteVramWord(Ppu *ppu, uint16 value) {
   debug_server_on_vram_write(byte_addr,     (uint8_t)(value & 0xff));
   debug_server_on_vram_write(byte_addr + 1, (uint8_t)(value >> 8));
   WsShadowOnVramWrite((uint16_t)(adr & 0x7fff), value);
+  /* With incOnHigh=1 (VMAIN bit 7), the pointer advances after the high
+   * byte ($2119). A 16-bit STA $2118 writes both bytes atomically, so
+   * the pointer advances by one word — same as the real hardware path
+   * (case 0x18 no-increment + case 0x19 increment). With incOnHigh=0,
+   * the pointer would advance after the low byte, placing the high byte
+   * in the NEXT word — but no sane game does 16-bit STA $2118 in that
+   * mode, so we unconditionally advance by one word. */
   ppu->vramPointer += ppu->vramIncrement;
 }
 
@@ -1033,9 +1180,21 @@ void rtl_accumulate_apu_catchup(void) {
   }
 }
 
+#ifdef SNESRECOMP_INTERP_PROFILE
+#include <time.h>
+uint64_t apuw_prof_calls = 0;
+double apuw_prof_ms = 0.0;
+#endif
 void RtlApuWrite(uint16 adr, uint8 val) {
-  assert(adr >= APUI00 && adr <= APUI03);
+  assert(adr >= 0x2140 && adr <= 0x217f);
+  if (rtl_apu_port_observers_filter(adr, val)) return;
   uint8_t port = (uint8_t)(adr & 3);
+#ifdef SNESRECOMP_INTERP_PROFILE
+  { extern uint64_t apuw_prof_calls; extern double apuw_prof_ms;
+    clock_t _t0 = clock();
+    apuw_prof_calls++; }
+  clock_t _t1 = clock();
+#endif
 
 #ifdef SNES_COSIM
   /* The shared-clock co-sim advances the SPC synchronously and compares two
@@ -1068,12 +1227,30 @@ void RtlApuWrite(uint16 adr, uint8 val) {
       apu_cycle(g_snes->apu);
   }
   RtlApuUnlock();
+#ifdef SNESRECOMP_INTERP_PROFILE
+  { extern uint64_t apuw_prof_calls; extern double apuw_prof_ms;
+    apuw_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
+#endif
 }
 
+#ifdef SNESRECOMP_INTERP_PROFILE
+uint64_t apus_prof_calls = 0;
+double apus_prof_ms = 0.0;
+#endif
 void rtl_sync_apu_to_cpu_locked(void) {
+#ifdef SNESRECOMP_INTERP_PROFILE
+  { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
+    clock_t _t0 = clock();
+    apus_prof_calls++; }
+  clock_t _t1 = clock();
+#endif
   if (!g_apu_frame_time_valid) {
     rtl_accumulate_apu_catchup();
     snes_catchupApu(g_snes);
+#ifdef SNESRECOMP_INTERP_PROFILE
+    { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
+      apus_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
+#endif
     return;
   }
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
@@ -1084,6 +1261,33 @@ void rtl_sync_apu_to_cpu_locked(void) {
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
   if (!synced)
     fprintf(stderr, "[apu] CPU-port guest-clock sync timed out\n");
+#ifdef SNESRECOMP_INTERP_PROFILE
+  { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
+    apus_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
+#endif
+}
+
+/* AOT APU pacing hook. Generated AOT code advances g_cpu.master_cycles but
+ * (unlike the interpreter bridge) never flushes the SPC periodically, so a
+ * long AOT block that doesn't touch APU ports ($2140-$2143) leaves the
+ * SPC700 frozen and the DSP output ring starves -> silent/choppy music.
+ * The interpreter bridge flushes every ~1024 master cycles; WatchdogCheck()
+ * runs per-block in generated code, so hooking the same periodic catch-up
+ * here restores that cadence for AOT execution. Caller: game thread only.
+ * The delta is measured against g_apu_last_sync_master, which the interp
+ * bridge also advances, so AOT/interp alternation never double-counts. */
+void rtl_apu_pace_check(void) {
+  /* Boot (frame 0) is paced by the interp bridge's progress checkpoints and
+   * the SPC IPL upload handshake; forcing an extra catch-up here from AOT
+   * blocks disturbs that pacing and can stall the vblank poll loop. Only
+   * pace once real frames are running. */
+  if (snes_frame_counter == 0) return;
+  uint64_t delta = g_cpu.master_cycles - g_apu_last_sync_master;
+  if (delta < 1024) return;
+  RtlApuLock();
+  g_apu_last_sync_master = g_cpu.master_cycles;
+  rtl_sync_apu_to_cpu_locked();
+  RtlApuUnlock();
 }
 
 static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu,
@@ -1222,11 +1426,35 @@ bool RtlHandleSpcUpload(CpuState *cpu) {
   return RtlUploadSpcImageFromDpInternal(cpu, true, false);
 }
 
+/* Dev perf: accumulated host ns in the per-frame SPC boundary sync. */
+static uint64_t s_apu_boundary_ns = 0;
+static uint64_t s_apu_boundary_calls = 0;
+void rtl_apu_perf_snapshot(uint64_t *ns, uint64_t *calls) {
+    if (ns) *ns = s_apu_boundary_ns;
+    if (calls) *calls = s_apu_boundary_calls;
+}
+
+#ifdef SNESRECOMP_INTERP_PROFILE
+#include <time.h>
+uint64_t apub_prof_calls = 0;
+double apub_prof_ms = 0.0;
+#endif
 static void rtl_sync_apu_frame_boundary(void) {
+#ifdef SNESRECOMP_INTERP_PROFILE
+  { extern uint64_t apub_prof_calls; extern double apub_prof_ms;
+    clock_t _t0 = clock();
+    apub_prof_calls++; }
+  clock_t _t1 = clock();
+#endif
   /* The game frame is the authoritative guest-time clock. The audio callback
    * may fill a host scheduling shortfall, but CPU->APU events must never wait
    * behind it: advance the real SPC through every event due by this completed
    * frame at normal speed and turbo alike. */
+  uint64_t _t0 = 0;
+  if (getenv("SNESRECOMP_PHASE_MS")) {
+    extern uint64_t snesrecomp_host_now_ns(void);
+    _t0 = snesrecomp_host_now_ns();
+  }
   RtlApuLock();
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
   uint64_t before = g_snes->apu->portClock;
@@ -1242,6 +1470,15 @@ static void rtl_sync_apu_frame_boundary(void) {
   if (!synced)
     fprintf(stderr, "[apu] frame-boundary guest-clock sync timed out\n");
   RtlApuUnlock();
+  if (_t0) {
+    extern uint64_t snesrecomp_host_now_ns(void);
+    s_apu_boundary_ns += snesrecomp_host_now_ns() - _t0;
+    s_apu_boundary_calls++;
+  }
+#ifdef SNESRECOMP_INTERP_PROFILE
+  { extern uint64_t apub_prof_calls; extern double apub_prof_ms;
+    apub_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
+#endif
 }
 
 void RtlAudioSetFastForward(bool active) {
@@ -1481,6 +1718,10 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * lock we already hold, which serialises it against MSU register
    * writes on the CPU thread (msu1_read/msu1_write take the same lock). */
   msu1_mix(audio_buffer, samples);
+  /* Overlay follows the native+MSU mix and precedes recovery fade, so trusted
+   * one-shots share the final discontinuity smoothing. */
+  snes_mod_audio_mix(audio_buffer, samples,
+                      (uint32_t)(RtlAudioOutputRate() + 0.5), channels);
   for (int i = 0; i < samples && g_audio_recovery_remaining != 0; i++) {
     uint32_t progressed = RTL_AUDIO_RECOVERY_RAMP -
                           g_audio_recovery_remaining + 1;

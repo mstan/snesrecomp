@@ -1590,11 +1590,23 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 # one outer frame per state transition.
                 _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
                         if not (is_jsr or is_call) else None)
+                # LLE-fallback frame size must match the frame this site
+                # actually enters handlers with (== the hrv emitted above):
+                # a real JSR (abs,X) pushes a 2-byte frame; the PEA+JMP /
+                # PHK+PEA+JML ptr-call idioms enter with call_frame_size
+                # (3 for the long form — its handlers return via RTL).
+                # Hardcoding 2 here made interp_tier_run_call_frame's
+                # post_call watermark one byte short for long ptr-calls: a
+                # CLEAN handler RTL then read as a non-local return,
+                # manufactured SKIP_1, and the dispatcher abandoned its own
+                # tail — leaking 2 bytes of guest stack per occurrence
+                # (Super Metroid attract wedge, beads-8wg.6.2).
+                _lle_frame = 2 if is_jsr else call_frame_size
                 body += variant_dispatch_case_lines(
                     tgt_addr, base_name, indent="  ", pre_call=_pre,
                     lle_fallback=(
                         f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
-                        f"0x{site_pc24:06x}u, 2, NULL)"
+                        f"0x{site_pc24:06x}u, {_lle_frame}, NULL)"
                         if is_jsr or is_call else
                         f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                         f"0x{site_pc24:06x}u, _entry_s, _hrv)"))
@@ -1783,11 +1795,15 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             # misclassify its own balanced return.
             _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
                     if not (is_jsr or is_call) else None)
+            # Same frame-size contract as the pointer-matched arm above:
+            # 2 only for a real JSR (abs,X) push; call_frame_size for the
+            # PEA+JMP / PHK+PEA+JML ptr-call idioms (see beads-8wg.6.2).
+            _lle_frame = 2 if is_jsr else call_frame_size
             body += variant_dispatch_case_lines(
                 tgt_addr, base_name, indent="  ", pre_call=_pre,
                 lle_fallback=(
                     f"interp_tier_run_call_frame(cpu, 0x{tgt_addr:06x}u, "
-                    f"0x{site_pc24:06x}u, 2, NULL)"
+                    f"0x{site_pc24:06x}u, {_lle_frame}, NULL)"
                     if is_jsr or is_call else
                     f"interp_tier_dispatch_tail(cpu, 0x{tgt_addr:06x}u, "
                     f"0x{site_pc24:06x}u, _entry_s, _hrv)"))

@@ -377,6 +377,18 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr);
 void   cpu_write8 (CpuState *cpu, uint8 bank, uint16 addr, uint8  v);
 void   cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
 
+/* Region-paced AOT bus (2026-08-31): the AOT emitter charges block const
+ * cycles minus data transfers, and paces each data/stack/pointer access
+ * here at its region speed so master_cycles matches the LLE per-transfer
+ * model exactly. Only generated (AOT) code calls the _paced forms; the
+ * interpreter's bridge shims use the plain accessors (they account
+ * transfers themselves). */
+uint32_t  cpu_region_speed(uint32_t adr);
+uint8  cpu_read8_paced (CpuState *cpu, uint8 bank, uint16 addr);
+uint16 cpu_read16_paced(CpuState *cpu, uint8 bank, uint16 addr);
+void   cpu_write8_paced (CpuState *cpu, uint8 bank, uint16 addr, uint8  v);
+void   cpu_write16_paced(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
+
 /* ── Interrupt-frame ABI (Option-1 cpu->S model) ────────────────────────── */
 
 /* Model the 65816 hardware interrupt-entry push. Hardware pushes, in order
@@ -447,6 +459,8 @@ extern CpuState g_cpu;
  * arm/disarm around a function scope (AOT body via RecompStackPush/Pop,
  * interp via interp_tier_dispatch_balanced). See cpu_state.c. */
 extern int g_wlog_active;
+extern int g_wlog_configured;
+int wlog_scope_available(void);
 void wlog_scope_enter(const char *tag);
 void wlog_scope_exit(void);
 

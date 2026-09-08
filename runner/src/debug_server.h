@@ -30,6 +30,9 @@
 #if SNESRECOMP_TRACE
 
 typedef struct CpuState CpuState;
+typedef void (*DebugServerGameSendLine)(const char *line);
+typedef int (*DebugServerGameCommandHandler)(
+    const char *cmd, const char *args, DebugServerGameSendLine send_line);
 
 // Initialize the debug TCP server on the given port. Non-blocking.
 // Returns 0 on success, -1 on failure.
@@ -75,6 +78,10 @@ void debug_server_record_frame(int frame);
 
 // Set pointers the server needs to inspect game state.
 void debug_server_set_ram(uint8_t *ram, uint32_t ram_size);
+
+// Register an optional game-owned TCP command handler. Commands are reached
+// through `game <subcommand> [args]` so runner commands remain generic.
+void debug_server_set_game_command_handler(DebugServerGameCommandHandler handler);
 
 // MMIO register-write trace. Call from snes_write paths after the write
 // completes. Captures entries for addresses in [s_reg_trace_lo, s_reg_trace_hi).
@@ -134,6 +141,10 @@ static inline uint32_t debug_server_get_controller_inputs(void) { return 0; }
 static inline uint32_t debug_server_get_controller_active_mask(void) { return 0; }
 static inline void debug_server_record_frame(int frame) { (void)frame; }
 static inline void debug_server_set_ram(uint8_t *ram, uint32_t ram_size) { (void)ram; (void)ram_size; }
+typedef void (*DebugServerGameSendLine)(const char *line);
+typedef int (*DebugServerGameCommandHandler)(
+    const char *cmd, const char *args, DebugServerGameSendLine send_line);
+static inline void debug_server_set_game_command_handler(DebugServerGameCommandHandler handler) { (void)handler; }
 static inline void debug_server_on_reg_write(uint16_t adr, uint8_t val) { (void)adr; (void)val; }
 static inline void debug_server_on_vram_write(uint32_t byte_addr, uint8_t value) { (void)byte_addr; (void)value; }
 static inline void debug_server_on_oracle_vram_write(uint32_t byte_addr, uint8_t value) { (void)byte_addr; (void)value; }

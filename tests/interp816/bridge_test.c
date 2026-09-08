@@ -25,6 +25,7 @@
 #include "tier2_capture.h"
 #include "snes.h"            /* Snes storage for the bridge's APU clock hook */
 #include "sa1.h"
+#include "snes_cycles.h"
 
 CpuState g_cpu;
 
@@ -37,6 +38,7 @@ static int      g_aot_interp_nlr;
 static int      g_aot_double_rewrite;
 static int      g_aot_crosses_interp_owner;
 static int      g_aot_skips_interp_owner;
+static int      g_aot_deadline_unwind;
 static int      g_owner_target_result;
 static int      g_aot_tail_chain_probe;
 static int      g_aot_skips_root;
@@ -64,6 +66,36 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
 }
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
+void snes_refresh_charge(void) {}
+void rtl_sync_apu_to_cpu_locked(void) {}
+uint32_t cpu_region_speed(uint32_t addr24) {
+    return (uint32_t)snes_region_speed(addr24, g_memsel);
+}
+uint8_t sdd1_read(Sdd1 *sdd1, uint16_t addr) {
+    (void)sdd1;
+    (void)addr;
+    return 0;
+}
+
+/* Attribution-scope stubs (common_cpu_infra.c in the real runner). The test
+ * doubles record what the bridge pushed so the interp scope is testable: the
+ * write rings copy g_last_recomp_func / the stack at write time, and if the
+ * bridge stops installing its interp@$ name, interpreted writes silently
+ * re-attribute to the stale enclosing AOT frame. */
+const char *g_last_recomp_func = "(none)";
+static const char *g_push_log[16];
+static int g_push_count = 0;
+static int g_push_depth = 0;
+static int g_pop_underflow = 0;
+void RecompStackPush(const char *name) {
+    if (g_push_count < 16) g_push_log[g_push_count] = name;
+    g_push_count++;
+    g_push_depth++;
+}
+void RecompStackPop(void) {
+    if (g_push_depth <= 0) g_pop_underflow = 1;
+    g_push_depth--;
+}
 void snes_catchupApu(Snes *snes) { (void)snes; }
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
     (void)snes; (void)master_clock;
@@ -71,6 +103,9 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
     (void)cart; (void)master_clock;
 }
+/* cpu_state.c isn't linked here; the bridge's constructor installs its
+ * step-ring dump into this hook, so provide the slot. */
+void (*g_interp_recent_dump_hook)(int n, FILE *out) = 0;
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
 }
@@ -147,6 +182,15 @@ RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
         g_recomp_stack_top = base;
         if (g_owner_target_result)
             return interp_bridge_lle_yield_unwind(cpu, 0x008003);
+        return RECOMP_RETURN_NORMAL;
+    }
+    if (g_aot_deadline_unwind && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        g_aot_called++;
+        cpu->master_cycles = 200;
+        if (interp_bridge_lle_master_deadline_reached(cpu))
+            return interp_bridge_lle_yield_unwind(cpu, 0x008100);
+        cpu->A = 0x0100;
+        cpu->S = (uint16)(cpu->S + frame_size);
         return RECOMP_RETURN_NORMAL;
     }
     if (g_aot_skips_root && (pc24 & 0xFFFFFF) == FAKE_AOT) {
@@ -289,7 +333,6 @@ int main(void) {
 #else
     setenv("SNESRECOMP_TIER2_JOURNAL", journal, 1);
 #endif
-    tier2_capture_set_default_enabled(1);
     RAM = malloc(MEMSZ);
 
     printf("S0 APU timeline policy remains cartridge-scoped\n");
@@ -319,12 +362,26 @@ int main(void) {
       uint8_t c[] = {0xA9,0x09, 0x60};
       load(0x8000, c, sizeof c);
       cpu_push_jsr_return_frame(&g_c);
+      g_push_count = 0; g_push_depth = 0; g_pop_underflow = 0;
+      const char *func_before = g_last_recomp_func;
       int rc = interp_bridge_run(&g_c, 0x008000);
       printf("S2 pure interp routine\n");
       CHECK(rc == 1, "rc=%d exp 1", rc);
       CHECK(g_aot_called == 0, "aot_called=%d exp 0", g_aot_called);
       CHECK((g_c.A & 0xFF) == 0x09, "A.lo=%02X exp 09", g_c.A & 0xFF);
-      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF", g_c.S); }
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF", g_c.S);
+      /* Attribution scope: the run pushed its interp@$ entry name, popped it
+       * on exit, and restored g_last_recomp_func. */
+      CHECK(g_push_count >= 1, "push_count=%d exp >=1 (interp scope pushed)",
+            g_push_count);
+      CHECK(g_push_count >= 1 && g_push_log[0] &&
+            strcmp(g_push_log[0], "interp@$008000") == 0,
+            "pushed name '%s' exp 'interp@$008000'",
+            g_push_count >= 1 && g_push_log[0] ? g_push_log[0] : "(null)");
+      CHECK(g_push_depth == 0, "push_depth=%d exp 0 (balanced)", g_push_depth);
+      CHECK(!g_pop_underflow, "pop underflow");
+      CHECK(g_last_recomp_func == func_before,
+            "g_last_recomp_func not restored after run"); }
 
     /* S3: JSR $8200 (NOT compiled) ; RTS  /  $8200: LDA #$33 ; RTS */
     { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
@@ -560,6 +617,35 @@ int main(void) {
             "A.lo=%02X exp 5A (scheduler continuation executed)", g_c.A & 0xFF);
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (JSL frame consumed once)", g_c.S);
       g_aot_skips_root = 0; }
+
+    /* S8c: a compiled callee that reaches the host's master deadline while
+     * bounced from scheduler mode must return to the host. It must not be
+     * treated like a cooperative yield primitive, because that would continue
+     * interpreting past the host's expired bound. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_deadline_unwind = 1;
+      interp_bridge_set_master_deadline(100);
+      uint8_t scheduler[] = {
+          0x22,0x00,0x81,0x00,                 /* JSL fake compiled root */
+          0xA9,0x5A,                           /* must not execute */
+          0xAD,0x20,0x00, 0xD0,0xFB            /* cooperative wait loop */
+      };
+      load(0x8000, scheduler, sizeof scheduler);
+      RAM[0x20] = 0;
+      int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008006, 0x0020, 0);
+      printf("S8c scheduler deadline unwind returns to host\n");
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_aot_called == 1, "aot_called=%d exp 1", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x00,
+            "A.lo=%02X exp 00 (scheduler continuation not executed)",
+            g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FC,
+            "S=%04X exp 01FC (compiled JSL frame retained)", g_c.S);
+      CHECK(interp_bridge_lle_resume_pc() == 0x008100,
+            "resume=$%06X exp $008100 (compiled deadline resume)",
+            (unsigned)interp_bridge_lle_resume_pc());
+      interp_bridge_set_master_deadline(0);
+      g_aot_deadline_unwind = 0; }
 
     /* S9: the same rewrite below the paired AOT root belongs to a compiled
      * ancestor, not directly to the scheduler interpreter.  Finish that

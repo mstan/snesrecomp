@@ -34,6 +34,10 @@
 #include "snes/cart.h"
 #include "snes/cx4.h"
 
+#ifndef SNESRECOMP_CPU_HW_DIAGNOSTICS
+#define SNESRECOMP_CPU_HW_DIAGNOSTICS 0
+#endif
+
 extern Snes *g_snes;
 
 CpuState g_cpu;
@@ -58,8 +62,10 @@ void cpu_set_stage_window_store_hook(CpuStageWindowStoreHook hook) {
  * between an all-AOT run and a denied(interp) run.
  *
  * Env: SNESRECOMP_WLOG=<path> enables; SNESRECOMP_WLOG_MAXCALLS caps captured
- * calls (default 3). Zero cost when SNESRECOMP_WLOG is unset. */
+ * calls (default 3). When unset, the hot path settles to one integer branch
+ * after the first probe. */
 int  g_wlog_active = 0;              /* fast-path gate read in cpu_write8/16 */
+int  g_wlog_configured = -1;         /* -1 unknown, 0 off, 1 configured */
 static FILE *g_wlog_fp = NULL;
 static int   g_wlog_inited = 0;
 static int   g_wlog_calls = 0;
@@ -75,8 +81,14 @@ static void wlog_lazy_init(void) {
     g_wlog_inited = 1;
     const char *p = getenv("SNESRECOMP_WLOG");
     if (p && p[0]) g_wlog_fp = fopen(p, "w");
+    g_wlog_configured = g_wlog_fp != NULL ? 1 : 0;
     const char *m = getenv("SNESRECOMP_WLOG_MAXCALLS");
     if (m && m[0]) g_wlog_max_calls = atoi(m);
+}
+
+int wlog_scope_available(void) {
+    wlog_lazy_init();
+    return g_wlog_configured && g_wlog_calls < g_wlog_max_calls;
 }
 
 void wlog_scope_enter(const char *tag) {
@@ -112,15 +124,16 @@ void wlog_scope_exit(void) {
  * (deny-all) run produce comparable streams; diffing them finds the first
  * divergent write (e.g. an APU command $2140-$2143) and, from the AOT stream's
  * function tag at that point, the culprit function. Env:
- * SNESRECOMP_WLOG_ADDR="LO:HI:PATH" (hex LO/HI). Zero cost when unset. */
-static int    g_wlog_addr_inited = 0;
+ * SNESRECOMP_WLOG_ADDR="LO:HI:PATH" (hex LO/HI). When unset, the hot path
+ * settles to one integer branch after the first probe. */
 static FILE  *g_wlog_addr_fp = NULL;
 static uint16 g_wlog_addr_lo = 0xFFFF, g_wlog_addr_hi = 0x0000;
 static long   g_wlog_addr_n = 0, g_wlog_addr_cap = 2000000;
 static int    g_wlog_addr_state = 0;
+static int    g_wlog_addr_enabled = -1;  /* -1 unknown, 0 off, 1 configured */
 
 static void wlog_addr_lazy(void) {
-    g_wlog_addr_inited = 1;
+    g_wlog_addr_enabled = 0;
     const char *p = getenv("SNESRECOMP_WLOG_ADDR");
     if (!p || !p[0]) return;
     unsigned lo = 0, hi = 0; char path[512] = {0};
@@ -135,14 +148,13 @@ static void wlog_addr_lazy(void) {
          * the game is still running. */
         if (g_wlog_addr_fp) setvbuf(g_wlog_addr_fp, NULL, _IONBF, 0);
     }
+    g_wlog_addr_enabled = g_wlog_addr_fp != NULL ? 1 : 0;
     const char *c = getenv("SNESRECOMP_WLOG_ADDR_CAP");
     if (c && c[0]) g_wlog_addr_cap = strtol(c, NULL, 0);
     g_wlog_addr_state = getenv("SNESRECOMP_WLOG_STATE") != NULL;
 }
 
 static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
-    if (!g_wlog_addr_inited) wlog_addr_lazy();
-    if (!g_wlog_addr_fp) return;
     if (addr < g_wlog_addr_lo || addr > g_wlog_addr_hi) return;
     if (g_wlog_addr_n++ >= g_wlog_addr_cap) return;
     extern int snes_frame_counter;
@@ -277,13 +289,36 @@ static inline void cpu_pace_cycles_word(uint16 addr) {
     cpu_pace_cycles(addr);
 }
 
+/* Master clocks for ONE bus access at a 24-bit address (region speed).
+ * Mirrors Recompiler/snes_cycles.py::region_speed exactly. The LLE
+ * (interp_bridge.c bridge_region_speed) and the AOT paced accessors below
+ * share this single C implementation so both tiers price transfers
+ * identically. */
+uint32_t cpu_region_speed(uint32_t adr) {
+    uint8_t bank = (uint8_t)(adr >> 16);
+    uint16_t a = (uint16_t)adr;
+    if (bank >= 0x40 && bank <= 0x7f) return 8;
+    if (bank >= 0xc0) return g_memsel ? 6 : 8;
+    if (a >= 0x8000) {
+        if (bank <= 0x3f) return 8;
+        return g_memsel ? 6 : 8;
+    }
+    if (a < 0x2000) return 8;
+    if (a < 0x4000) return 6;
+    if (a < 0x4200) return 12;
+    if (a < 0x6000) return 6;
+    return 8;
+}
+
 /* Optional debug — disabled in release. Set BUILD_CPU_HW_LOG=1 in the
  * build to enable verbose per-touch logging. */
 #define BUILD_CPU_HW_LOG 0
+#if BUILD_CPU_HW_LOG || SNESRECOMP_CPU_HW_DIAGNOSTICS
 static uint64_t s_hw_touch_count = 0;
 static uint16 s_last_hw_addr = 0;
 static int s_last_hw_was_read = 0;
 static int s_apu_writes_logged = 0;
+#endif
 
 /* Logger reachable from generated code. Disabled at release. */
 void cpu_dbg_funcname(const char *name) {
@@ -297,6 +332,7 @@ void cpu_dbg_funcname(const char *name) {
     }
 #endif
 }
+#if BUILD_CPU_HW_LOG || SNESRECOMP_CPU_HW_DIAGNOSTICS
 static void cpu_hw_log(uint16 addr, int is_read, uint16 val) {
     s_last_hw_addr = addr;
     s_last_hw_was_read = is_read;
@@ -314,6 +350,9 @@ static void cpu_hw_log(uint16 addr, int is_read, uint16 val) {
     (void)val;
 #endif
 }
+#else
+#define cpu_hw_log(addr, is_read, val) ((void)0)
+#endif
 
 static uint8 cpu_latch_read8(CpuState *cpu, uint8 value) {
     cpu->open_bus = value;
@@ -454,14 +493,17 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = v;
     if (g_wlog_active) wlog_note(bank, addr, v, 1);
-    wlog_addr_note(bank, addr, v, 1);
+    if (g_wlog_addr_enabled) {
+        if (g_wlog_addr_enabled < 0) wlog_addr_lazy();
+        if (g_wlog_addr_enabled > 0) wlog_addr_note(bank, addr, v, 1);
+    }
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
         cpu->ram[off] = v;
         /* Optional title hook for game-specific stage-window tracking. */
-        if (off >= 0x1E72 && off <= 0x1E79) {
-            if (g_stage_window_store_hook)
+        if (g_stage_window_store_hook) {
+            if (off >= 0x1E72 && off <= 0x1E79)
                 g_stage_window_store_hook((uint32_t)off, g_interp816_cur_pc);
         }
 #ifdef SNES_COSIM
@@ -481,11 +523,10 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
                                if (mx && mx[0]) wmax = strtol(mx, NULL, 0); }
             }
             if (wa >= 0 && wf && off == (int)wa && hits < wmax) {
-                extern int snes_frame_counter;
-                fprintf(wf, "[writewatch] f=%d $%04x = %02x (was %02x) bank=%02x addr=%04x "
-                            "by %s (m=%d x=%d) S=%04x\n",
+                extern int snes_frame_counter;                fprintf(wf, "[writewatch] f=%d $%04x = %02x (was %02x) bank=%02x addr=%04x "
+                        "by %s (m=%d x=%d) S=%04x pc=%06x\n",
                         snes_frame_counter, off, v, old, bank, addr, g_last_recomp_func,
-                        cpu->m_flag & 1, cpu->x_flag & 1, cpu->S);
+                        cpu->m_flag & 1, cpu->x_flag & 1, cpu->S, g_interp816_cur_pc);
                 fflush(wf); hits++;
             }
         }
@@ -530,7 +571,10 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = (uint8)v;
     if (g_wlog_active) wlog_note(bank, addr, v, 2);
-    wlog_addr_note(bank, addr, v, 2);
+    if (g_wlog_addr_enabled) {
+        if (g_wlog_addr_enabled < 0) wlog_addr_lazy();
+        if (g_wlog_addr_enabled > 0) wlog_addr_note(bank, addr, v, 2);
+    }
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint16 hi_addr = (uint16)(addr + 1);
@@ -550,9 +594,9 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
         cpu->open_bus = (uint8)(v >> 8);
-        if ((off >= 0x1E72 && off <= 0x1E79) ||
-            (off + 1 >= 0x1E72 && off + 1 <= 0x1E79)) {
-            if (g_stage_window_store_hook) {
+        if (g_stage_window_store_hook) {
+            if ((off >= 0x1E72 && off <= 0x1E79) ||
+                (off + 1 >= 0x1E72 && off + 1 <= 0x1E79)) {
                 /* Word store: tip = odd byte so the hook's hi-byte gate fires. */
                 uint32_t tip = (uint32_t)off;
                 if (off == 0x1E74 || off == 0x1E78)
@@ -639,6 +683,78 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     }
     /* ROM / unmapped write: drop. */
     cpu->open_bus = (uint8)(v >> 8);
+}
+
+/* ── Region-paced AOT bus (2026-08-31) ────────────────────────────────────
+ * The LLE charges master clocks PER BUS TRANSFER at the region speed
+ * (interp_bridge.c: master = Σ region_speed + internal×6). The AOT emitter's
+ * block const covers fetch+internal cycles only; every data/stack/pointer
+ * access in generated code calls these paced variants so the AOT master
+ * advance matches the LLE exactly. The plain cpu_read8/16 / cpu_write8/16
+ * stay UNPACED because the LLE's bridge shims call them inside their own
+ * per-transfer accounting (pacing there would double-count the interp path).
+ * The 16-bit forms charge both bytes at their own regions (they can straddle
+ * a region boundary, e.g. $00:1FFF->$00:2000). */
+uint8_t cpu_read8_paced(CpuState *cpu, uint8_t bank, uint16_t addr) {
+    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr);
+    cpu->master_cycles += _sp;
+    {
+        static int _pl = -1;
+        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
+        if (_pl) {
+            extern int snes_frame_counter;
+            fprintf(stderr, "[pace] f=%d r8 b=$%02X a=$%04X sp=%u\n",
+                    snes_frame_counter, bank, addr, _sp);
+        }
+    }
+    return cpu_read8(cpu, bank, addr);
+}
+
+uint16_t cpu_read16_paced(CpuState *cpu, uint8_t bank, uint16_t addr) {
+    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr) +
+        cpu_region_speed(((uint32_t)bank << 16) | (uint16_t)(addr + 1));
+    cpu->master_cycles += _sp;
+    {
+        static int _pl = -1;
+        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
+        if (_pl) {
+            extern int snes_frame_counter;
+            fprintf(stderr, "[pace] f=%d r16 b=$%02X a=$%04X sp=%u\n",
+                    snes_frame_counter, bank, addr, _sp);
+        }
+    }
+    return cpu_read16(cpu, bank, addr);
+}
+
+void cpu_write8_paced(CpuState *cpu, uint8_t bank, uint16_t addr, uint8_t v) {
+    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr);
+    cpu->master_cycles += _sp;
+    {
+        static int _pl = -1;
+        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
+        if (_pl) {
+            extern int snes_frame_counter;
+            fprintf(stderr, "[pace] f=%d w8 b=$%02X a=$%04X sp=%u\n",
+                    snes_frame_counter, bank, addr, _sp);
+        }
+    }
+    cpu_write8(cpu, bank, addr, v);
+}
+
+void cpu_write16_paced(CpuState *cpu, uint8_t bank, uint16_t addr, uint16_t v) {
+    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr) +
+        cpu_region_speed(((uint32_t)bank << 16) | (uint16_t)(addr + 1));
+    cpu->master_cycles += _sp;
+    {
+        static int _pl = -1;
+        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
+        if (_pl) {
+            extern int snes_frame_counter;
+            fprintf(stderr, "[pace] f=%d w16 b=$%02X a=$%04X sp=%u\n",
+                    snes_frame_counter, bank, addr, _sp);
+        }
+    }
+    cpu_write16(cpu, bank, addr, v);
 }
 
 /* ── PEI-trampoline dispatch helper (2026-05-24, narrow detector) ──────

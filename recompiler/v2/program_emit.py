@@ -162,6 +162,15 @@ def _cfg_name_maps(parsed):
                 continue
             name_for_pc[pc24] = nd.name
             claimed_names.add(nd.name)
+    for bank, _path, cfg in parsed:
+        for nd in getattr(cfg, "symbols", ()):
+            pc24 = nd.addr_24 & 0xFFFFFF
+            if pc24 in name_for_pc:
+                continue
+            if not nd.name or nd.name in claimed_names:
+                continue
+            name_for_pc[pc24] = nd.name
+            claimed_names.add(nd.name)
     return (name_for_pc, canonical_for_pc, templates_exact,
             templates_any, cfg_by_bank)
 

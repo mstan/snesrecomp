@@ -31,13 +31,16 @@ enum {
   // Maximum widescreen expansion *per side*, baked into the priority-buffer
   // capacity. This is a compile-time ceiling only; the actual extra columns
   // rendered each frame are the runtime ppu->extraLeftCur/extraRightCur, which
-  // default to 0 (authentic 256-wide output). 96 per side allows up to a
-  // 448-pixel internal width, comfortably past 16:9 at 224 lines.
-  kPpuExtraLeftRight = 96,
+  // default to 0 (authentic 256-wide output). 272 per side allows up to an
+  // 800-pixel internal width for opt-in 32:9 presentation.
+  kPpuExtraLeftRight = 272,
   // Full internal width of the priority buffers (logical 256 + both borders).
   kPpuBufWidth = kPpuXPixels + kPpuExtraLeftRight * 2,
   // Split-screen games can assign distinct anchor layouts to each viewport.
   kPpuWsAnchorBands = 2,
+  // Number of stopped frames tolerated after a moving unhinted OBJ reaches the
+  // left widened margin.
+  kPpuWsOamMovingGraceFrames = 4,
 };
 
 typedef uint16_t PpuZbufType;
@@ -46,8 +49,13 @@ typedef struct PpuPixelPrioBufs {
   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
   // Sized for the widescreen border; logical screen x maps to
   // data[x + kPpuExtraLeftRight].
+  //
+  // 8-aligned because ClearBackdrop fills this through a uint64 pointer.
+  // The array itself only needs 2, so any member landing on a 4-mod-8
+  // offset aborts on ARM -- and which ones do shifts whenever a field
+  // above them grows.
   PpuZbufType data[kPpuBufWidth];
-} PpuPixelPrioBufs;
+} __attribute__((aligned(8))) PpuPixelPrioBufs;
 
 static inline void PpuWidescreenAdjustPinnedWindowEdges(
     int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,
@@ -87,8 +95,8 @@ typedef struct PpuOverlayCapture {
   int16_t x0, x1;
   int16_t y0, y1;
   uint8_t flags;
-  /* OBJ-only selector. A zero count captures no objects. Games validate any
-   * semantic identity (HUD icon, portrait, etc.) before supplying the range. */
+  /* OBJ-only selector. Arming selects all objects for compatibility. Titles
+   * can select a semantic slot range explicitly; count zero selects none. */
   uint8_t oamFirst, oamCount;
 } PpuOverlayCapture;
 
@@ -182,7 +190,8 @@ struct Ppu {
   // pixel buffer (xbgr)
   // times 2 for even and odd frame
 
-  uint8_t extraLeftCur, extraRightCur, extraLeftRight, extraBottomCur;
+  uint16_t extraLeftCur, extraRightCur, extraLeftRight;
+  uint8_t extraBottomCur;
   // Widescreen BG3 HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
   // Widescreen HUD OAM anchor (see PpuSetWsHudOamShiftRange): an OAM slot
@@ -234,6 +243,11 @@ struct Ppu {
   // margins. Layer bits use the PPU window layer numbering (BG1..BG4, OBJ,
   // color); window bits select W1/W2. Zero is the hardware-authentic default.
   uint8_t wsWindowExpandLayers, wsWindowExpandWindows;
+  // Strict decode of ambiguous left-margin OAM positions. A NULL hint pointer
+  // disables strict mode; a zeroed hint array enables strict mode with no slots
+  // explicitly allowed.
+  uint8_t wsOamLeftHintStrict;
+  uint8_t wsOamLeftHint[16];
   // Strict decode of the ambiguous 9-bit OAM X band [256, 256+extraRightCur).
   // A raw value there is either a genuine right-margin sprite (widescreen
   // host emitted it on purpose) or a sprite the game parked off-screen-left
@@ -244,6 +258,14 @@ struct Ppu {
   // Games publish per NMI via PpuWsSetOamRightHints. 1 bit per OAM slot.
   uint8_t wsOamRightHintStrict;
   uint8_t wsOamRightHint[16];
+  /* Host-only temporal classifier for unhinted left-margin OBJ. It lets a
+   * game-authored sprite keep moving through the widened margin, then parks it
+   * again after its X stops changing for a few frames. */
+  int16_t wsOamMotionLastLine;
+  int16_t wsOamMotionX[128];
+  uint32_t wsOamMotionSig[128];
+  uint8_t wsOamMotionSeen[16];
+  uint8_t wsOamMotionGrace[128];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -257,6 +279,9 @@ struct Ppu {
   PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];
   uint32_t renderPitch;
   uint8_t *renderBuffer;
+  /* Optional host picture memory. Drawing only: CPU ports and save states
+   * always use vram. The caller owns 32768 words until unbound. */
+  const uint16_t *renderVram;
   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
   uint8_t brightnessMult[32 + 31];
@@ -282,6 +307,9 @@ struct Ppu {
 
 // Host-only debug render filter (SNESRECOMP_LAYER_MASK env; ppu.c). Guest
 // state and savestates are untouched — this only gates final composition.
+static inline const uint16_t *PpuRenderVram(const Ppu *ppu) {
+  return ppu->renderVram ? ppu->renderVram : ppu->vram;
+}
 extern uint8_t g_snes_ppu_dbg_layer_mask;
 #define IS_SCREEN_ENABLED(ppu, sub, layer) \
   (ppu->screenEnabled[sub] & g_snes_ppu_dbg_layer_mask & (1 << layer))
@@ -392,10 +420,25 @@ void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
+void ppu_sec_reset(void);
+void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+                  double *compose, double *hdma);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
+
+/* Raster journal — per-line replay of mid-frame INIDISP writes for frame-model
+ * hosts. See the block comment in ppu.c. Host calls Begin after its
+ * vblank-edge work and ApplyLine in its render loop; the register write path
+ * calls Record with the beam line. */
+void ppu_rasterBegin(Ppu *ppu);
+void ppu_rasterRenderBegin(Ppu *ppu);
+int  ppu_rasterTakeHdmaen(uint8_t *out);
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
+void ppu_rasterApplyLine(Ppu *ppu, int line);
+int  ppu_rasterDebugDump(char *out, int cap);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
+void PpuResetWidescreenOamHistory(Ppu *ppu);
 
 // Replace stale BG1 tilemap pixels in widened side margins before final
 // composition. The callback is host-only and runs independently for main and
@@ -437,12 +480,12 @@ bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
 // render width becomes 256 + 2*extra. Drives the dormant extraLeftCur/
 // extraRightCur/extraLeftRight machinery used by the line renderer.
-void PpuSetExtraSpace(Ppu *ppu, uint8_t extra);
+void PpuSetExtraSpace(Ppu *ppu, uint16_t extra);
 
 // Render authentic 256-wide content centered within a `budget`-per-side wider
 // framebuffer (no border columns drawn). For bounded screens; caller blacks
 // out the side margins to pillarbox.
-void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget);
+void PpuSetExtraSpaceCentered(Ppu *ppu, uint16_t budget);
 
 // Asymmetric per-side widescreen margin (the snesrev/zelda3 model, see
 // attribution in IMPROVEMENTS.md). The centering budget (extraLeftRight) must
@@ -502,6 +545,12 @@ void PpuSetWsHudOamShiftRange(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
  * reserve. nslots 0 disables. Publish every frame like the first range. */
 void PpuSetWsHudOamShiftRange2(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
 
+// Publish this frame's OAM left-margin hints (see wsOamLeftHintStrict).
+// `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or
+// NULL to disable strict decode and restore the legacy left-margin behavior.
+// Pass a zeroed array for strict mode with no left-margin slots marked.
+void PpuWsSetOamLeftHints(Ppu *ppu, const uint8_t *hints);
+
 // Publish this frame's OAM right-margin hints (see wsOamRightHintStrict).
 // `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or
 // NULL to disable strict decode and restore the legacy always-positive band.
@@ -531,8 +580,6 @@ const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu);
 
 // Per-layer widescreen clamp: bit L keeps BG(L+1) in the authentic 256
 // columns while other layers extend into the margins. Re-apply per frame.
-// Requires PpuBeginDrawing(..., kPpuRenderFlags_NewRenderer); the legacy
-// renderer stores this policy but does not apply it.
 void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
 
 // Extend selected game-authored PPU windows by the current widescreen margins
@@ -544,14 +591,12 @@ void PpuSetWidescreenWindowExpansion(Ppu *ppu, uint8_t layer_mask,
 // Fill Mode-1 background margins by reflecting or cyclically repeating the
 // authentic rendered scanline. Rendering remains layer-, priority-, window-,
 // and color-math-correct. Repeat wins if both bits are set. Re-apply per frame.
-// Requires kPpuRenderFlags_NewRenderer; the legacy renderer ignores these
-// policies.
 void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
 void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
 
 // Apply clamp, cyclic-repeat, or stretch only on scanlines [y0,y1).
 // y1<=y0 disables. Repeat/stretch bands apply to Mode-1 4bpp and 2bpp
-// background paths. Requires kPpuRenderFlags_NewRenderer.
+// background paths.
 void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                     uint8_t y1);
 void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,

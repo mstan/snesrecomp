@@ -13,6 +13,7 @@
  * production definition lives in interp_bridge.c, which this focused dispatch
  * harness intentionally does not link. */
 uint32_t g_interp_wlog_pc24 = 0;
+uint8 g_memsel;
 
 static int g_aot_calls;
 static int g_lle_calls;

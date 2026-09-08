@@ -343,8 +343,7 @@ static void handle_pos_stuff(Snes *snes) {
             ppu_runLine(g_ppu, snes->vPos);
         if (snes->vPos == 0) {
             snes->inVblank = false; snes->inNmi = false;
-            /* re-arm HDMA for the new frame */
-            dma_startDma(snes->dma, 0, true);
+            dma_initHdma(snes->dma);
         } else if (snes->vPos == 225) {
             startingVblank = !ppu_checkOverscan(g_ppu);
         } else if (snes->vPos == 240) {
@@ -358,7 +357,7 @@ static void handle_pos_stuff(Snes *snes) {
             if (snes->autoJoyRead) snes->autoJoyTimer = 4224;
         }
     } else if (snes->hPos == 1024) {
-        if (!snes->inVblank) dma_cycle(snes->dma);          /* per-line HDMA */
+        if (!snes->inVblank) dma_doHdma(snes->dma);
     }
 
     snes->hPos += 2;

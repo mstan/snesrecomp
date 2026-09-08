@@ -86,10 +86,8 @@ uint8_t  interp816_getFlags(Interp816 *cpu);
 void     interp816_setFlags(Interp816 *cpu, uint8_t val);
 void     interp816_saveload(Interp816 *cpu, SaveLoadInfo *sli);
 
-/* Historical bridge callback retained for source compatibility. Current bridge
- * dispatch uses explicit JSR/JSL interception rather than BRK traps, and this
- * is not a per-opcode host extension point. Use
- * interp_bridge_set_pre_opcode_hook() for that. */
+/* Historical bridge callback retained for source compatibility. Current
+ * bridge dispatch uses explicit JSR/JSL interception rather than BRK traps. */
 extern int interp816_opcode_hook(uint32_t addr);
 
 #endif /* INTERP816_H */

@@ -45,12 +45,11 @@ extern bool g_ws_active;
 // clamped to room bounds) is set separately via PpuSetExtraSideSpace.
 extern int g_ws_extra;
 
-// Hard cap on g_ws_extra from the SNES 9-bit OAM x space (see ppu.c and
-// ENHANCEMENTS Rule 5): the wrap threshold is 256+extra and the widest
-// left-margin sprite tiles sit at 512-(64+extra), which must stay >= the
-// threshold => 2*extra <= 192 => extra <= 95. Beyond this, outer-margin
-// sprites are unrepresentable. Every consumer clamps to this same constant.
-enum { kWsExtraMax = 95 };
+// Hard cap on g_ws_extra for the shared host framebuffer. Classic 9-bit OAM
+// positions only represent a limited right margin without game-provided hints,
+// so wide-aspect titles must still own their sprite/HUD policy. The buffer cap
+// itself is large enough for 800x224 output (Star Fox Enhanced's 32:9 mode).
+enum { kWsExtraMax = 272 };
 
 // Per-frame present: copy the PPU's rendered framebuffer `src` (rows of
 // row_bytes = snes_width*4, as written by the line renderer at that pitch)

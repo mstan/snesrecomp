@@ -7,6 +7,30 @@
 
 uint64_t g_apu_timer0_total_ticks;
 int snes_frame_counter;
+#ifndef SNESRECOMP_TRACE
+#define SNESRECOMP_TRACE 0
+#endif
+#ifndef SNESRECOMP_SPC_DIAGNOSTICS
+#define SNESRECOMP_SPC_DIAGNOSTICS SNESRECOMP_TRACE
+#endif
+
+#if SNESRECOMP_SPC_DIAGNOSTICS || SNESRECOMP_TRACE
+extern uint64_t g_spc_pc_histogram[0x10000];
+extern uint64_t g_spc_write_counts[0x100];
+extern uint64_t g_spc_outport_value_counts[4 * 256];
+#else
+extern uint64_t g_spc_pc_histogram[1];
+extern uint64_t g_spc_write_counts[1];
+extern uint64_t g_spc_outport_value_counts[1];
+#endif
+extern int g_spc_pc_max_seen;
+extern int g_spc_recent_outport_idx;
+
+#ifdef EXPECT_SPC_DIAGNOSTICS_ON
+#if SNESRECOMP_SPC_DIAGNOSTICS != 1
+#error "SNESRECOMP_SPC_DIAGNOSTICS must be numeric 1 when opt-in diagnostics are enabled"
+#endif
+#endif
 
 static unsigned applied_count;
 
@@ -66,6 +90,20 @@ static int check(int condition, const char *message) {
 int main(void) {
   int failures = 0;
   Apu *apu = apu_init();
+
+#if !SNESRECOMP_SPC_DIAGNOSTICS
+  apu_cpuWrite(apu, 0x00, 0x77);
+  failures += check(g_spc_write_counts[0] == 0 &&
+                    g_spc_outport_value_counts[0] == 0 &&
+                    g_spc_recent_outport_idx == 0,
+                    "SPC diagnostics stay inert by default");
+#else
+  apu_cpuWrite(apu, 0xf4, 0x77);
+  failures += check(g_spc_write_counts[0xf4] == 1 &&
+                    g_spc_outport_value_counts[0 * 256 + 0x77] == 1 &&
+                    g_spc_recent_outport_idx == 1,
+                    "SPC diagnostics update when enabled");
+#endif
 
   /* SMW writes a nonzero command in one NMI and clears it in the next.
    * Host callback phase must not shorten that emulated frame. */
@@ -159,6 +197,12 @@ int main(void) {
                     apu->dsp->sampleRead == 355 &&
                     apu->dsp->sampleWrite == 419,
                     "fast-forward recovery retains only the requested newest PCM");
+
+#if !SNESRECOMP_SPC_DIAGNOSTICS
+  failures += check(g_spc_pc_histogram[0] == 0 &&
+                    g_spc_pc_max_seen == 0,
+                    "SPC PC histogram stays inert by default");
+#endif
 
   apu_free(apu);
   if (failures)

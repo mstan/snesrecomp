@@ -59,6 +59,9 @@ extern int snes_frame_counter;
 #include "snes/interp_bridge.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
+#if SNESRECOMP_ENABLE_MODS
+#include "snes_text_xlate.h"
+#endif
 extern Ppu *g_ppu;
 extern Cpu *g_snes_cpu;
 extern Dma *g_dma;
@@ -83,6 +86,7 @@ extern int g_recomp_stack_top;
 // Server state
 static socket_t s_listen_sock = SOCKET_INVALID;
 static socket_t s_client_sock = SOCKET_INVALID;
+static DebugServerGameCommandHandler s_game_command_handler = NULL;
 static uint8_t *s_ram = NULL;
 static uint32_t s_ram_size = 0;
 // Note: s_frame_counter pointer removed — use snes_frame_counter directly
@@ -290,6 +294,7 @@ static struct {
         int frame;
         uint16_t adr;
         uint8_t val;
+        uint16_t vpos, hpos;   /* beam position at the write (V/H timing) */
         char func[64];
         const char *stack[TRACE_STACK_DEPTH];
         int stack_depth;
@@ -652,6 +657,13 @@ void debug_server_on_reg_write(uint16_t adr, uint8_t val) {
     s_reg_trace.log[idx].frame = snes_frame_counter;
     s_reg_trace.log[idx].adr = adr;
     s_reg_trace.log[idx].val = val;
+    if (g_snes) {
+        s_reg_trace.log[idx].vpos = g_snes->vPos;
+        s_reg_trace.log[idx].hpos = g_snes->hPos;
+    } else {
+        s_reg_trace.log[idx].vpos = 0;
+        s_reg_trace.log[idx].hpos = 0;
+    }
     if (g_last_recomp_func)
         strncpy(s_reg_trace.log[idx].func, g_last_recomp_func, 63);
     else
@@ -1903,6 +1915,34 @@ static void cmd_ping(const char *args) {
     send_fmt("{\"ok\":true,\"frame\":%d}", snes_frame_counter);
 }
 
+static void cmd_game(const char *args) {
+    char cmd[64];
+    size_t n;
+    const char *rest;
+    if (!args) args = "";
+    while (*args == ' ') args++;
+    if (!*args) {
+        send_line("{\"error\":\"missing game command\"}");
+        return;
+    }
+    rest = strchr(args, ' ');
+    n = rest ? (size_t)(rest - args) : strlen(args);
+    if (n >= sizeof(cmd))
+        n = sizeof(cmd) - 1;
+    memcpy(cmd, args, n);
+    cmd[n] = 0;
+    if (rest) {
+        while (*rest == ' ') rest++;
+    } else {
+        rest = "";
+    }
+    if (s_game_command_handler &&
+        s_game_command_handler(cmd, rest, send_line)) {
+        return;
+    }
+    send_fmt("{\"error\":\"unknown game command\",\"cmd\":\"%s\"}", cmd);
+}
+
 static void cmd_frame(const char *args) {
     send_fmt("{\"frame\":%d,\"func\":\"%s\"}", snes_frame_counter,
              g_last_recomp_func ? g_last_recomp_func : "?");
@@ -1959,6 +1999,53 @@ static void cmd_dump_ram(const char *args) {
         send(s_client_sock, chunk, pos, 0);
     }
     send(s_client_sock, "\"}\n", 3, 0);
+}
+
+// dump_cart: compact hex dump of the live, in-memory cartridge ROM. This is
+// useful for validating runtime-only ROM patches without writing patched ROMs.
+// Usage: dump_cart <start_hex> <len_decimal>
+static void cmd_dump_cart(const char *args) {
+    unsigned int addr = 0, len = 256;
+    sscanf(args, "%x %u", &addr, &len);
+    if (!g_snes || !g_snes->cart || !g_snes->cart->rom) {
+        send_fmt("{\"error\":\"cart rom unavailable\"}");
+        return;
+    }
+    uint32_t rom_size = g_snes->cart->romSize;
+    if (len > rom_size) len = rom_size;
+    if (addr > rom_size || (uint64_t)addr + (uint64_t)len > (uint64_t)rom_size) {
+        send_fmt("{\"error\":\"out of range\",\"addr\":\"0x%x\",\"len\":%u,"
+                 "\"rom_size\":\"0x%x\"}", addr, len, rom_size);
+        return;
+    }
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "{\"addr\":\"0x%x\",\"len\":%u,\"hex\":\"", addr, len);
+    if (s_client_sock == SOCKET_INVALID) return;
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    char chunk[4096];
+    for (unsigned int i = 0; i < len; ) {
+        int pos = 0;
+        for (; i < len && pos < 4000; i++)
+            pos += snprintf(chunk + pos, sizeof(chunk) - pos, "%02x",
+                            g_snes->cart->rom[addr + i]);
+        send(s_client_sock, chunk, pos, 0);
+    }
+    send(s_client_sock, "\"}\n", 3, 0);
+}
+
+static void cmd_xlate_stats(const char *args) {
+#if SNESRECOMP_ENABLE_MODS
+    char buf[4096];
+    const char *subcmd = (args && args[0]) ? args : "stats";
+    if (snes_text_xlate_debug_json_c(subcmd, buf, (int)sizeof(buf)) < 0) {
+        send_fmt("{\"ok\":false,\"error\":\"xlate debug unavailable\"}");
+        return;
+    }
+    send_line(buf);
+#else
+    (void)args;
+    send_fmt("{\"ok\":false,\"error\":\"SNESRECOMP_ENABLE_MODS not enabled\"}");
+#endif
 }
 
 static void cmd_read_sram(const char *args) {
@@ -3677,19 +3764,23 @@ static void cmd_get_reg_trace(const char *args) {
         int idx = (start + i) % REG_TRACE_LOG_SIZE;
         if (nostack) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"func\":\"%s\"}",
+                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"V\":%d,\"H\":%d,\"func\":\"%s\"}",
                 i ? "," : "",
                 s_reg_trace.log[idx].frame,
                 s_reg_trace.log[idx].adr,
                 s_reg_trace.log[idx].val,
+                s_reg_trace.log[idx].vpos,
+                s_reg_trace.log[idx].hpos,
                 s_reg_trace.log[idx].func);
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"func\":\"%s\",\"stack\":[",
+                "%s{\"f\":%d,\"adr\":\"0x%04x\",\"val\":\"0x%02x\",\"V\":%d,\"H\":%d,\"func\":\"%s\",\"stack\":[",
                 i ? "," : "",
                 s_reg_trace.log[idx].frame,
                 s_reg_trace.log[idx].adr,
                 s_reg_trace.log[idx].val,
+                s_reg_trace.log[idx].vpos,
+                s_reg_trace.log[idx].hpos,
                 s_reg_trace.log[idx].func);
             for (int s = 0; s < s_reg_trace.log[idx].stack_depth; s++) {
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -3951,6 +4042,7 @@ static void cmd_load_state(const char *args) {
         send_fmt("{\"error\":\"read failed after %zu bytes\"}", fs.total);
         return;
     }
+    PpuResetWidescreenOamHistory(g_snes->ppu);
     send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
 }
 
@@ -4357,6 +4449,32 @@ static void cmd_dump_frame_wram(const char *args) {
     memcpy(tmp, r->wram + addr, len);
     unlock_mutex();
     send_hex_blob(tmp, len);
+    send(s_client_sock, "\"}\n", 3, 0);
+}
+
+// Historical CGRAM dump: reads the ring-buffer snapshot for a specific
+// frame. Args: `<frame>`. Returns all 512 bytes of CGRAM.
+static void cmd_dump_frame_cgram(const char *args) {
+    int frame_num = -1;
+    if (sscanf(args, "%d", &frame_num) < 1) {
+        send_fmt("{\"error\":\"usage: dump_frame_cgram <frame>\"}");
+        return;
+    }
+    lock_mutex();
+    FrameRecord *r = find_frame(frame_num);
+    if (!r) {
+        unlock_mutex();
+        send_fmt("{\"error\":\"frame %d not in ring buffer\"}", frame_num);
+        return;
+    }
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr),
+             "{\"frame\":%d,\"len\":512,\"hex\":\"", frame_num);
+    send(s_client_sock, hdr, (int)strlen(hdr), 0);
+    static uint8_t tmp[512];
+    memcpy(tmp, r->cgram, sizeof(tmp));
+    unlock_mutex();
+    send_hex_blob(tmp, sizeof(tmp));
     send(s_client_sock, "\"}\n", 3, 0);
 }
 
@@ -7480,6 +7598,7 @@ static void cmd_spc_dump(const char *args) {
 
 typedef struct { const char *name; void (*handler)(const char *args); } CmdEntry;
 static const CmdEntry s_commands[] = {
+    {"game",          cmd_game},
     {"cyc_anchor",       cmd_cyc_anchor},
     {"cyc_region",       cmd_cyc_region},
     {"cyc_anchor_reset", cmd_cyc_anchor_reset},
@@ -7564,6 +7683,8 @@ static const CmdEntry s_commands[] = {
     {"frame",         cmd_frame},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
+    {"dump_cart",     cmd_dump_cart},
+    {"xlate_stats",   cmd_xlate_stats},
     {"read_sram",     cmd_read_sram},
     {"call_stack",    cmd_call_stack},
     {"watch",         cmd_watch},
@@ -7653,6 +7774,7 @@ static const CmdEntry s_commands[] = {
     {"dump_vram",     cmd_dump_vram},
     {"dump_frame_vram", cmd_dump_frame_vram},
     {"dump_frame_wram", cmd_dump_frame_wram},
+    {"dump_frame_cgram", cmd_dump_frame_cgram},
     {"dump_cgram",    cmd_dump_cgram},
     {"dump_oam",      cmd_dump_oam},
     {"get_ppu_state", cmd_get_ppu_state},
@@ -7822,6 +7944,10 @@ int debug_server_init(int port) {
     fprintf(stderr, "[debug_server] Listening on port %d (threaded)\n", port);
     s_server_ready = 1;
     return 0;
+}
+
+void debug_server_set_game_command_handler(DebugServerGameCommandHandler handler) {
+    s_game_command_handler = handler;
 }
 
 void debug_server_set_ram(uint8_t *ram, uint32_t ram_size) {
