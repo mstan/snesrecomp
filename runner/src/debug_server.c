@@ -5866,23 +5866,55 @@ static void cmd_interp_stats(const char *args) {
     unsigned long long clean = 0, bail = 0;
     interp_tier2_stats(&sites, &clean, &bail);
     double pct = total ? (100.0 * (double)f0 / (double)total) : 0.0;
-    /* Mode-independent truth: guest cycles run by the 65816 interpreter vs
-     * total guest cycles (AOT+interp). 100 - interp_cycle_pct == the fraction
-     * of execution that ran as statically-recompiled C, in HLE OR LLE. */
+    /*
+     * Interpreted share of guest execution, against the CPU-cycle counter --
+     * NOT the master clock.
+     *
+     * This divided interp816_cycles_total() by g_cpu.master_cycles and called
+     * the remainder "the fraction that ran as statically-recompiled C". Those
+     * are different units. interp816 charges CPU (bus) cycles --
+     * interp816.c sets cyclesUsed = 7 for an interrupt -- while master_cycles
+     * is the 21.477 MHz master clock, where one CPU cycle is 6, 8 or 12.
+     * Master cycles also advance for DMA, HDMA and time the CPU is not
+     * executing at all, so it is not a measure of execution in the first
+     * place.
+     *
+     * The error flattered the AOT tier by roughly 6-8x. On a Gundam Wing
+     * build whose AOT graph is 908 instructions -- the reset and interrupt
+     * vectors, nothing else -- it reported 91% "recompiled C" while the
+     * interpreter was in fact running the entire guest instruction stream
+     * (~9,100 interpreter instructions per frame against a frame's ~29,830
+     * CPU cycles). Anyone reading that to decide where to optimise would have
+     * concluded the interpreter was nearly irrelevant.
+     *
+     * g_cpu.cycles is the right denominator: the AOT tier charges it per
+     * block (cpu->cycles += <const> in the generated C) and the interpreter
+     * charges it from the same bus-cycle count (interp_bridge.c), so the two
+     * are the same unit and the ratio is meaningful. master_cycles is still
+     * reported, because pacing and APU work want it -- it is just not what
+     * the share is computed from.
+     */
     uint64_t icyc = interp816_cycles_total();
     uint64_t iins = interp816_insns_total();
     uint64_t mcyc = g_cpu.master_cycles;
-    double icyc_pct = mcyc ? (100.0 * (double)icyc / (double)mcyc) : 0.0;
+    uint64_t ccyc = g_cpu.cycles;
+    double icyc_pct = ccyc ? (100.0 * (double)icyc / (double)ccyc) : 0.0;
+    /* Clamped for report only: the interpreter's own bus-cycle rounding can
+     * put it a hair over the total, and a headline reading 100.4% invites a
+     * bug hunt into what is a sub-percent accounting artifact. */
+    if (icyc_pct > 100.0) icyc_pct = 100.0;
     send_fmt("{\"ok\":true,\"dispatch_total\":%u,"
              "\"found1\":%llu,\"found0\":%llu,\"found0_pct\":%.3f,"
              "\"tier_hits\":%ld,\"tier2_sites\":%d,"
              "\"tier2_clean\":%llu,\"tier2_bail\":%llu,"
              "\"interp_insns\":%llu,\"interp_cycles\":%llu,"
-             "\"master_cycles\":%llu,\"interp_cycle_pct\":%.4f}",
+             "\"cpu_cycles\":%llu,\"master_cycles\":%llu,"
+             "\"interp_cycle_pct\":%.4f,\"aot_cycle_pct\":%.4f}",
              total, (unsigned long long)f1, (unsigned long long)f0, pct,
              interp_tier_hit_count(), sites, clean, bail,
              (unsigned long long)iins, (unsigned long long)icyc,
-             (unsigned long long)mcyc, icyc_pct);
+             (unsigned long long)ccyc, (unsigned long long)mcyc,
+             icyc_pct, 100.0 - icyc_pct);
 }
 
 /* tier2_dump [path]
