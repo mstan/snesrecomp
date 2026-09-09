@@ -264,10 +264,38 @@ runner copy and adapted into the shared runner cartridge/DMA layer.
   decompression research
 - Additional public lineage: Snes9x S-DD1 decompressor by Brad Jorsch, with
   research by Andreas Naive and John Weidman
-- License status: review required before treating this as generally
-  redistributable framework code. The known public lineage includes
-  non-commercial and GPL-family emulator code, so downstream distribution must
-  satisfy the applicable original license terms.
+- License: **Public Domain**, with attribution kept as a courtesy.
+
+The load-bearing ported material is the Golomb / PEM / CM / OL decompression
+engine and its `run_count[256]` table, which come from bsnes-plus
+`bsnes/snes/chip/sdd1/sdd1emu.cpp`. That file is **not** under bsnes' GPL: it
+carries its own notice, verified against upstream on 2026-09-09, reading
+
+> S-DD1'algorithm emulation code
+> Author: Andreas Naive, August 2003, last update October 2004
+> This code is Public Domain. There is no copyright holded by the author.
+> Said this, the author wish to explicitly emphasize his inalienable moral
+> rights over this piece of intelectual work and the previous research that
+> made it possible, as recognized by most of the copyright laws around the
+> world.
+
+so it is freely redistributable and carries no field-of-use restriction. The
+author asks for recognition rather than a license grant, which is why the
+credit above stays attached to the file and to this notice. The Snes9x
+decompressor shares that same Naive lineage; none of Snes9x's own code is used
+here.
+
+Nothing is taken from bsnes' GPL-licensed `sdd1.cpp` glue. The chip's
+host-visible behaviour in `sdd1.c` — the `$4800-$4807` register window, MMC
+window resolution, `$43x0-$43x7` DMA-register spying, and the address-match
+decompress-on-read path — is written directly against that hardware behaviour
+in this project's own C, structured around the runner's `Cart`/DMA seams
+rather than bsnes' MMIO-hook and C++ component model.
+
+**This is therefore not a constraint on SNESRecomp's PolyForm Noncommercial
+license.** Earlier revisions of this notice flagged the file as needing review
+before it could be treated as redistributable framework code; that review is
+the paragraph above, and it came back clean.
 
 ### Derivation / modifications
 
