@@ -58,6 +58,9 @@ void snes_refresh_state_set(uint64_t phase, uint64_t charged_upto);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
+/* Pop for an LLE yield unwind: the frame is unfinished, so no balance figure
+ * is recorded. See common_cpu_infra.c. */
+void RecompStackPopYield(void);
 /* Optional stack-balance auditor (see common_cpu_infra.c): reports stack
  * movement beyond consumption of the caller's materialized JSR/JSL frame when
  * SNESRECOMP_STACK_BALANCE_DIAGNOSTICS is enabled. */

@@ -470,6 +470,25 @@ void RecompStackPush(const char *name) {
         (g_cpu.host_return_valid == 2 || g_cpu.host_return_valid == 3)
             ? g_cpu.host_return_valid
             : 0;
+    /* Seed the entry-S baseline HERE, not only in the generated prologue.
+     *
+     * The prologue's `g_cpu_entry_s[g_recomp_stack_top-1] = _entry_s` runs
+     * AFTER the two early-exit yield checks (master deadline, in-LLE-
+     * scheduler), and both of those call RecompStackPop() on the way out. So
+     * for that window the slot still held whatever an unrelated earlier call
+     * at the same depth left there, and the auditor differenced live S against
+     * a stranger's baseline. That is where bank_07_8004_M0X0's
+     * "total_delta +7866, calls 23, nonzero 23" came from -- and the ~+4000
+     * magnitudes on the interp@ entries, which are two unrelated stack
+     * pointers subtracted, not drift.
+     *
+     * The ancestor scans (cpu_resolve_ancestor_skip / _post_return_skip) only
+     * read strict ancestors at i <= top-2, which have necessarily run their
+     * prologue, so they were never exposed to the stale window. Seeding here
+     * makes that an invariant instead of an argument. The prologue still
+     * overwrites with its tailcall-adjusted _entry_s, so no established
+     * behaviour changes. */
+    g_cpu_entry_s[slot] = g_cpu.S;
   } else if (getenv("SNESRECOMP_STACK_CAP_ABORT")) {
     /* Diagnostic-only: stop at the first host-call-depth overflow while the
      * bounded attribution stack still contains the causal chain.  Letting C
@@ -535,6 +554,7 @@ typedef struct {
   long long   total_delta;  /* sum of (exit_s - entry_s) across all returns */
   long        calls;
   long        nonzero;      /* # returns with a nonzero delta */
+  long        yields;       /* # exits via an LLE yield unwind (not balanced) */
   int         last_delta;
 } StackBalEntry;
 #if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
@@ -580,9 +600,11 @@ void RecompStackBalDumpStderr(int topn) {
 #if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
   fprintf(stderr, "=== stack-balance auditor: top %d net-imbalanced funcs ===\n", n);
   for (int i = 0; i < n; i++)
-    fprintf(stderr, "  %+lld bytes net over %ld calls (%ld nonzero, last %+d): %s\n",
+    fprintf(stderr,
+            "  %+lld bytes net over %ld calls (%ld nonzero, %ld yielded, last %+d): %s\n",
             top[i]->total_delta, top[i]->calls, top[i]->nonzero,
-            top[i]->last_delta, top[i]->name ? top[i]->name : "?");
+            top[i]->yields, top[i]->last_delta,
+            top[i]->name ? top[i]->name : "?");
 #else
   (void)n;
   fprintf(stderr, "=== stack-balance auditor: disabled ===\n");
@@ -597,9 +619,10 @@ void RecompStackBalDumpJson(FILE *f) {
   fprintf(f, "  \"stack_balance\": [");
   for (int i = 0; i < n; i++)
     fprintf(f, "%s{\"name\":\"%s\",\"total_delta\":%lld,\"calls\":%ld,"
-               "\"nonzero\":%ld,\"last_delta\":%d}",
+               "\"nonzero\":%ld,\"yields\":%ld,\"last_delta\":%d}",
             (i ? "," : ""), top[i]->name ? top[i]->name : "?",
-            top[i]->total_delta, top[i]->calls, top[i]->nonzero, top[i]->last_delta);
+            top[i]->total_delta, top[i]->calls, top[i]->nonzero, top[i]->yields,
+            top[i]->last_delta);
   fprintf(f, "],\n");
 #else
   (void)n;
@@ -608,7 +631,10 @@ void RecompStackBalDumpJson(FILE *f) {
 #endif
 }
 
-void RecompStackPop(void) {
+/* audit != 0: this exit is a real return, so the guest stack effect is
+ * complete and (exit_s - entry_s) is a meaningful balance figure.
+ * audit == 0: this exit is an LLE yield unwind — see RecompStackPopYield. */
+static void recomp_stack_pop_common(int audit) {
 #ifdef SNESRECOMP_INTERP_PROFILE
   if (g_aotprof_on < 0) aotprof_latch_env();
   if (g_aotprof_on == 1) {
@@ -626,12 +652,17 @@ void RecompStackPop(void) {
     const char *fn = g_recomp_stack[g_recomp_stack_top - 1];
 #if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
     int slot = g_recomp_stack_top - 1;
-    int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
-                (int)g_cpu_entry_return_frame[slot];
-    StackBalEntry *e = stackbal_find(fn);
-    if (e) {
-      e->calls++;
-      if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
+    if (audit) {
+      int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
+                  (int)g_cpu_entry_return_frame[slot];
+      StackBalEntry *e = stackbal_find(fn);
+      if (e) {
+        e->calls++;
+        if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
+      }
+    } else {
+      StackBalEntry *e = stackbal_find(fn);
+      if (e) e->yields++;
     }
 #else
     (void)fn;
@@ -645,6 +676,29 @@ void RecompStackPop(void) {
   }
   g_last_recomp_func = g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)";
 }
+
+void RecompStackPop(void) { recomp_stack_pop_common(1); }
+
+/* Pop for an LLE yield unwind (interp_bridge_lle_yield_unwind).
+ *
+ * The frame is NOT finished: the bounce site resumes the INTERPRETER at
+ * resume_pc24 "with cpu exactly as the compiled callsite left it"
+ * (cpu_state.h), and the interpreter runs the rest of the routine —
+ * including the pops matching any PHP/PHA this frame already executed. So
+ * (S - entry_s) at a yield is mid-flight by construction, not an imbalance,
+ * and folding it into total_delta manufactures an offender.
+ *
+ * That is what happened to $07:8004, the SPC700 upload routine: it is a PHP
+ * entry wrapped around unbounded `CMP $2140 / BNE` MMIO spins, so it yields
+ * on nearly every call with pushed state live. The auditor read
+ * "total_delta +7866, calls 23, nonzero 23" and recomp/bank07.cfg cited
+ * that as proof the native ABI could not represent the routine —
+ * force_lle'ing it, which prunes decode through the boot call chain and
+ * costs 1563 exact AOT variants down to 34.
+ *
+ * Yields are counted separately so "how often does this frame leave through
+ * a yield" stays visible without contaminating the balance figure. */
+void RecompStackPopYield(void) { recomp_stack_pop_common(0); }
 
 // Frame watchdog: detect infinite loops in generated code.
 // Set before calling run_frame, checked by generated code periodically.
