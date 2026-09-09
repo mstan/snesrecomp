@@ -27,6 +27,36 @@ upstream 65816 CPU core is separately attributed under
 [LakeSnes](#lakesnes--65816-cpu-core) below, which is the same MIT lineage
 (elzo_d) that snesrev vendored.
 
+### How the two licenses sit together
+
+MIT permits sublicensing, so this project's work built on top of that code is
+licensed under **PolyForm Noncommercial 1.0.0** like the rest of the
+repository, while the **retained upstream material stays MIT**. Carrying the
+notice is not the same as relicensing the derivative: the notice above
+discharges the MIT obligation, and it does not place SNESRecomp's own
+contributions under MIT.
+
+Nothing here restricts snesrev's work. Their code remains available under MIT
+from upstream, and anyone who wants it unmodified should take it from there.
+The files that are essentially verbatim upstream — `glsl_shader.c`/`.h`,
+`snes/snes_regs.h`, `snes/dsp_regs.h` — contain little or nothing of this
+project's own authorship, so treating them as the MIT files they are costs
+this project nothing.
+
+Every file listed above carries a header naming its upstream origin, so the
+provenance is visible while editing rather than only here.
+
+### Is the retained code load-bearing?
+
+Yes, measured 2026-09-09 rather than assumed. `util.c`, `common_rtl.c` and
+`snes/ppu_legacy.c` are in `SNESRECOMP_RUNNER_SOURCES` and therefore compile
+into every title; `ppu.c:568` calls `ppu_draw_whole_line_legacy()` on the live
+render path, so the "legacy" name is not dead code. The opt-in
+`snesrecomp_target_glsl_shader()` is used by FZeroRecomp,
+LegendofZeldaAlttpRecomp, MegamanXRecomp, MegamanX2Recomp, MegamanX3SNESRecomp
+and SuperMarioWorldRecomp; `snesrecomp_target_mmx_config()` by the three Mega
+Man X titles. This is foundational code in shipped products, not residue.
+
 ### MIT License
 
 ```

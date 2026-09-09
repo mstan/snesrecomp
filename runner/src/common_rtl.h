@@ -1,3 +1,7 @@
+// Partly derived from snesrev/smw src/common_rtl.h (MIT, (c) 2023 snesrev,
+// (c) 2021 elzo_d); the recomp runtime contract around it is this project's.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

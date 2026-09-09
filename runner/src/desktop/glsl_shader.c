@@ -1,3 +1,7 @@
+// Vendored essentially verbatim from snesrev/smw src/glsl_shader.c (MIT,
+// (c) 2023 snesrev, (c) 2021 elzo_d). The Snes9x credit below came with it.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 // Shared desktop GLSL preset renderer. Heavily influenced by Snes9x.
 #include "third_party/gl_core/gl_core_3_1.h"
 #include "glsl_shader.h"

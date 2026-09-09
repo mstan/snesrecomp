@@ -1,3 +1,7 @@
+// Vendored from snesrev/smw src/snes/snes_regs.h (MIT, (c) 2023 snesrev,
+// (c) 2021 elzo_d). SNES register addresses; hardware facts.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #ifndef SNES_SNES_REGS_H_
 #define SNES_SNES_REGS_H_
 #pragma once

@@ -1,3 +1,7 @@
+// Derived from snesrev/zelda3 src/util.h (MIT, (c) 2022 snesrev, (c) 2021
+// elzo_d) -- hence the ZELDA3_UTIL_H_ guard.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #ifndef ZELDA3_UTIL_H_
 #define ZELDA3_UTIL_H_
 
