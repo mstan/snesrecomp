@@ -1,7 +1,7 @@
 # lib/CMakeLists.txt — optional Windows-oriented superbuild helpers.
 #
 # The Dear ImGui launcher is not vendored here — games that need it add
-# mstan/recomp-ui at their own repo root (see docs/LAUNCHER_DESIGN.md).
+# RetroPortingToolKit/recomp-ui at their own repo root (see docs/LAUNCHER_DESIGN.md).
 #
 # This file optionally builds recomp-net for MSBuild-era consumers that still
 # want a packaged static library from lib/:
