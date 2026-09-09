@@ -6,6 +6,74 @@ SNESRecomp's original code is licensed under the PolyForm Noncommercial
 License 1.0.0 in [`LICENSE`](LICENSE). The notices below describe the licenses
 that continue to apply to identified third-party material.
 
+## snesrev — zelda3 / smw reverse-engineered ports
+
+The C runner is substantially based on snesrev's reverse-engineered ports. The
+README's Acknowledgements has always credited this; the license notice belongs
+here, because the code reaches **every shipped game binary** and MIT requires
+the notice to travel with binary distributions, not just source.
+
+- Upstream: https://github.com/snesrev/zelda3 and https://github.com/snesrev/smw
+- License: **MIT** (both repositories; verified against upstream 2026-09-09)
+- Local scope: the C SNES hardware core under `runner/src/snes/` as vendored by
+  snesrev, plus runtime utilities (`runner/src/util.h` still carries zelda3's
+  `ZELDA3_UTIL_H_` include guard), ROM verification, the SHA-256 helper
+  (`runner/src/sha256.c`), the asymmetric extra-side-space widescreen PPU model
+  (`runner/src/snes/ppu.c`, `runner/src/widescreen.h`), function-boundary
+  conventions, and the default input layout (`runner/src/keybinds.c`).
+
+Individual algorithms inside that core are credited inline to snes9x; the
+upstream 65816 CPU core is separately attributed under
+[LakeSnes](#lakesnes--65816-cpu-core) below, which is the same MIT lineage
+(elzo_d) that snesrev vendored.
+
+### MIT License
+
+```
+Copyright (c) 2022 snesrev
+Copyright (c) 2023 snesrev
+Copyright (c) 2021 elzo_d
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Distributing a build
+
+A game executable built on this framework statically links third-party code
+whose licenses require the notice to be reproduced in binary redistributions:
+snesrev/zelda3 and snesrev/smw (MIT), LakeSnes (MIT), and the ares-derived
+Cx4, DSP-1, and SA-1 coprocessor cores (ISC). **Ship this file with any
+package that contains the runner.** It carries every required notice text, and
+it is the one file to update when a new dependency lands. The framework's own
+`snesrecomp` CLI package already stages `LICENSE` and this file
+(`tools/build_cli.py`, asserted by `tools/smoke_cli_package.py`); per-title
+release packaging lives in the game repositories and must do the same.
+
+## IsoFrieze/SMWDisX — Super Mario World disassembly reference
+
+Used as the symbol and RAM-map basis and as a conformance reference for Super
+Mario World bring-up. **The upstream repository publishes no license file**
+(confirmed 2026-09-09), so no grant has been given and none should be assumed.
+Symbol names, RAM addresses, and hardware facts are used as facts; no upstream
+text or code is vendored here. SMWDisX itself credits mikeyk's original 2013
+disassembly and loveemu's SPC700 work.
+
 ## libretro API header
 
 `tools/snesref/libretro.h` is the libretro API header from the RetroArch team.

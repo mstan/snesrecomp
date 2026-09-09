@@ -4,6 +4,8 @@
 
 # SNESRecomp
 
+> ℹ️ **Note from mstan:** This repo and I are now part of [RetroPortingToolkit](https://retroportingtoolkit.com/). I remain a primary maintainer of snesrecomp alongside the team. [More info](https://1379.tech/forming-a-collective-retro-porting-toolkit/).
+
 **A general-purpose static recompiler for the Super Nintendo Entertainment
 System (Super Famicom).** SNESRecomp translates 65816 machine code into C,
 compiles it into a native executable, and links it against a shared SNES
@@ -491,11 +493,19 @@ reverse-engineering and emulation work:
 ## License
 
 SNESRecomp's original code is licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). Third-party components retain
-their own licenses as documented in [Acknowledgements](#acknowledgements) and
+[PolyForm Noncommercial License 1.0.0](LICENSE). Copyright © 2026 Matthew
+Stanley; commercial licensing inquiries go to him at <https://1379.tech>.
+Third-party components retain their own licenses as documented in
+[Acknowledgements](#acknowledgements) and
 [`THIRD_PARTY_ATTRIBUTION.md`](THIRD_PARTY_ATTRIBUTION.md). The `snesref` tool
 loads a separately supplied libretro emulator core at runtime; no emulator core
 source or binary is vendored or released by this repository.
+
+**If you distribute a build:** the runner statically links code whose licenses
+require the notice to travel with binaries — snesrev's zelda3/smw ports and
+LakeSnes (MIT) and the ares-derived coprocessor cores (ISC). Ship
+[`THIRD_PARTY_ATTRIBUTION.md`](THIRD_PARTY_ATTRIBUTION.md) with any package
+that contains the runner; it carries every required notice text.
 
 ---
 
