@@ -557,7 +557,7 @@ def emit_function(rom: bytes, bank: int, start: int,
             "        return (RecompReturn)_anc_skip;  /* HLE RTS return-to-ancestor */ }",
             "      if (interp_bridge_return_targets_owner(_ret_s, cpu->S)) {",
             "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
-            "        RecompStackPop();",
+            "        RecompStackPopYield();",
             "        return interp_bridge_lle_yield_unwind(cpu, _rpc24);  /* HLE RTS return-to-interpreter-owner */ }",
             "    }",
             "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
@@ -1984,7 +1984,39 @@ def emit_function(rom: bytes, bank: int, start: int,
                 lines.append(_goto_or_return(succs[0], source_pc24=blk_pc24)
                              + " /* implicit fall-through */")
             else:
-                lines.append("return RECOMP_RETURN_NORMAL; /* no terminator, no successor */")
+                # No terminator AND no successor = the decoder TRUNCATED here.
+                # The usual cause is a call (JSR/JSL) whose callee published no
+                # exit (m,x), so the fall-through instruction's width is unknown
+                # and it was never decoded (two-fixpoints gap, COVERAGE.md §2).
+                #
+                # Emitting `return RECOMP_RETURN_NORMAL` here is a stub: it
+                # host-returns to the caller WITHOUT the guest ever executing
+                # its own RTS/RTL, so this function's hardware return frame is
+                # left unpopped. Measured on Gundam Wing: $04:8654 reaches
+                # $04:8664 `JSL $02:80FE`; $02:80FE publishes no exit mode, so
+                # the RTS at $04:866A was never emitted and this stub ran
+                # instead — leaking 2 stack bytes per call. Two calls/frame
+                # misaligned the stack, the enclosing RTL at $04:83F6 popped a
+                # garbage bank ($D1), and the interpreter ran off into
+                # $D1:83DA, corrupting game_state and blanking the screen.
+                #
+                # Bridge honestly instead (PRINCIPLES: no stubs — never
+                # synthesize a result to get past uncovered code): tier down to
+                # the interpreter at the fall-through PC. It runs the real
+                # continuation (including the guest RTS/RTL that pops this
+                # frame), bouncing any sub-calls back into compiled code, and
+                # returns balanced; on a wedge it drops through the stack-safe
+                # abandon, never worse than the old stub.
+                # Fall-through PC = block start + the bytes of every decoded
+                # instruction in it (Insn carries .length, not an address; the
+                # block's start address is key.pc).
+                fall_pc16 = (key.pc + sum(int(insn.length)
+                                          for insn, _ in pairs)) & 0xFFFF
+                fall_pc24 = ((bank & 0xFF) << 16) | fall_pc16
+                lines.append(
+                    f"return interp_tier_dispatch_balanced(cpu, 0x{fall_pc24:06x}u, "
+                    f"0x{fall_pc24:06x}u, _entry_s, _hrv); "
+                    f"/* truncated (no successor): interpret continuation, balanced */")
         block_lines[key] = lines
 
     # Compose the function source with labels per block.
@@ -2004,14 +2036,14 @@ def emit_function(rom: bytes, bank: int, start: int,
     # entering the next architectural callee so the owning interpreter can
     # deliver NMI/IRQ without discarding the already-pushed guest return frame.
     src.append('  if (interp_bridge_lle_master_deadline_reached(cpu)) {')
-    src.append('    RecompStackPop();')
+    src.append('    RecompStackPopYield();')
     src.append(
         f'    return interp_bridge_lle_yield_unwind(cpu, 0x{fn_entry_pc:06X}u);'
     )
     src.append('  }')
     if has_lle_memory_poll:
         src.append('  if (interp_bridge_in_lle_scheduler()) {')
-        src.append('    RecompStackPop();')
+        src.append('    RecompStackPopYield();')
         src.append(
             f'    return interp_bridge_lle_yield_unwind(cpu, 0x{fn_entry_pc:06X}u);'
         )
@@ -2100,7 +2132,7 @@ def emit_function(rom: bytes, bank: int, start: int,
         # exact PC through the owning interpreter after host events run.
         src.append(
             f'    if (interp_bridge_lle_master_deadline_reached(cpu)) {{')
-        src.append('      RecompStackPop();')
+        src.append('      RecompStackPopYield();')
         src.append(
             f'      return interp_bridge_lle_yield_unwind('
             f'cpu, 0x{block_pc24:06X}u);')
@@ -2126,10 +2158,17 @@ def emit_function(rom: bytes, bank: int, start: int,
             else:
                 src.append(f'    cpu->master_cycles += {_cyc_const} * {_spd_expr};')
         for ln in block_lines[key]:
-            # Inject RecompStackPop before any return so the stack stays balanced.
+            # Inject a stack-auditor pop before any return so the shadow
+            # stack stays balanced. An LLE yield unwind is NOT a return: the
+            # bounce site resumes the interpreter mid-routine with pushed
+            # guest state live, so (S - entry_s) there is mid-flight, not an
+            # imbalance. Pop it without recording a balance figure.
             stripped = ln.strip()
             if stripped.startswith("return"):
-                src.append(f"    RecompStackPop();")
+                _pop = ("RecompStackPopYield"
+                        if "interp_bridge_lle_yield_unwind" in stripped
+                        else "RecompStackPop")
+                src.append(f"    {_pop}();")
             src.append(f"    {ln}")
     # Defensive trailing return so a missing terminator doesn't fall off
     # the end of the function in the C compiler's view.

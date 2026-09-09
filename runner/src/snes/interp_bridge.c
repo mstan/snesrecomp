@@ -1232,6 +1232,36 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             _g->sp = in.sp; _g->op = op; _g->pad = 0;
         }
 
+        /* DIAGNOSTIC (SNESRECOMP_TRAP_BADPB=1): the interpreter must never
+         * step into a program bank this cartridge does not have. For a LoROM
+         * image the valid exec banks are $00-$3F, their $80-$BF mirrors, and
+         * WRAM $7E/$7F; a PB in $40-$7D or $C0-$FF means a control transfer
+         * handed us a corrupted target (e.g. an RTL that popped a garbage
+         * return-frame bank byte). Trap the FIRST such step and dump the
+         * recent ring — the transfer that produced it is the last few lines.
+         * Env-gated so it costs nothing in normal runs. */
+        {
+            static int _tbp = -1;
+            if (_tbp < 0) _tbp = getenv("SNESRECOMP_TRAP_BADPB") ? 1 : 0;
+            if (_tbp) {
+                uint8_t _pbnk = (uint8_t)((pc_before >> 16) & 0xFF);
+                int _valid = (_pbnk <= 0x3F) ||
+                             (_pbnk >= 0x80 && _pbnk <= 0xBF) ||
+                             (_pbnk == 0x7E || _pbnk == 0x7F);
+                if (!_valid) {
+                    extern int snes_frame_counter;
+                    fprintf(stderr,
+                        "[trap-badpb] interp entered PB=$%02X at pc=$%06X "
+                        "op=$%02X frame=%d sp=$%04X — corrupted control transfer\n",
+                        _pbnk, (unsigned)pc_before, op, snes_frame_counter,
+                        (unsigned)in.sp);
+                    interp_bridge_dump_recent_steps(64, stderr);
+                    fflush(stderr);
+                    exit(43);
+                }
+            }
+        }
+
         /* Subroutine calls: JSR abs (0x20, 3B), JSL (0x22, 4B),
          * JSR (abs,X) (0xFC, 3B). RTS (0x60) / RTL (0x6B) are returns. */
         const int is_call  = (op == 0x20 || op == 0x22 || op == 0xFC);
