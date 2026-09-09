@@ -989,6 +989,41 @@ void dbg_oam_block_trace(CpuState *cpu, uint32_t pc24) {
 // it here exactly as cpu_dispatch_pc_from / _emit_return would.
 void dbg_rts_trace(CpuState *cpu, uint32_t src_pc, uint16_t entry_s,
                    uint16_t ret_s, uint32_t popped_pc, uint8_t hrv) {
+    /* DIAGNOSTIC (SNESRECOMP_TRAP_RTS=<hex pc24>): real-time stderr dump of
+     * ONE RTS/RTL site's return decision. A rare mis-return can't be caught by
+     * frame-gating a run whose frame counters have already diverged under
+     * corruption, so print on the condition instead. Shows whether the frame
+     * is balanced (ret_s==entry_s) and correctly framed (hrv), what the site
+     * popped, and — the caller-side question — what the return frame the caller
+     * left at [entry_s+1..3] actually decodes to (frame@entry). If frame@entry
+     * is not the caller's real return, the caller set the frame up wrong; if it
+     * differs from popped, the frame was disturbed mid-body. Env-gated, off by
+     * default. Placed before the rtst range check so it needs no arming. */
+    {
+        static long s_trap_rts = -2;
+        if (s_trap_rts == -2) {
+            const char *e = getenv("SNESRECOMP_TRAP_RTS");
+            s_trap_rts = (e && e[0]) ? (long)strtol(e, NULL, 16) : -1;
+        }
+        if (s_trap_rts >= 0 && (uint32_t)s_trap_rts == src_pc) {
+            extern int cpu_dispatch_has_entry(CpuState *, uint32_t);
+            uint16_t _rl = g_ram[(uint16_t)(entry_s + 1)];
+            uint16_t _rh = g_ram[(uint16_t)(entry_s + 2)];
+            uint8_t  _rb = g_ram[(uint16_t)(entry_s + 3)];
+            uint32_t _framed = ((uint32_t)_rb << 16) |
+                (uint16_t)((((_rh << 8) | _rl) + 1) & 0xFFFF);
+            const char *_caller = (g_recomp_stack_top >= 2 &&
+                                   g_recomp_stack[g_recomp_stack_top - 2])
+                ? g_recomp_stack[g_recomp_stack_top - 2] : "?";
+            fprintf(stderr,
+                "[trap-rts $%06X] f%d entry_s=$%04X ret_s=$%04X s_eq=%d hrv=%u "
+                "popped=$%06X frame@entry=$%06X pop_has_body=%d caller=%s\n",
+                src_pc, snes_frame_counter, entry_s, ret_s,
+                (int)(ret_s == entry_s), (unsigned)hrv, popped_pc, _framed,
+                cpu_dispatch_has_entry(cpu, popped_pc), _caller);
+            fflush(stderr);
+        }
+    }
     extern uint8_t g_boundary_frozen;
     if (g_boundary_frozen) return;
     if (src_pc < g_rtst_lo || src_pc > g_rtst_hi) return;

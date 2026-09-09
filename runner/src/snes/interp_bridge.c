@@ -612,6 +612,37 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
 }
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
+    /* DIAGNOSTIC (SNESRECOMP_TRAP_YIELD=<lo>-<hi> hex pc24 range): print every
+     * LLE yield unwind whose resume PC falls in the range, with the live guest
+     * S and the function that yielded. A yield mid-body returns the unwind
+     * sentinel, which every caller propagates as `return _r - 1` — so a yield
+     * deep in a call chain makes each ancestor exit without its epilogue. This
+     * names the originating block. Env-gated, zero cost when unset. */
+    {
+        static int s_ty_init = 0;
+        static unsigned long s_ty_lo = 0, s_ty_hi = 0;
+        if (!s_ty_init) {
+            s_ty_init = 1;
+            const char *e = getenv("SNESRECOMP_TRAP_YIELD");
+            if (!e || sscanf(e, "%lx-%lx", &s_ty_lo, &s_ty_hi) != 2) {
+                s_ty_lo = 1; s_ty_hi = 0;   /* empty range = disabled */
+            }
+        }
+        if (s_ty_lo <= s_ty_hi &&
+            (unsigned long)(resume_pc24 & 0xFFFFFFu) >= s_ty_lo &&
+            (unsigned long)(resume_pc24 & 0xFFFFFFu) <= s_ty_hi) {
+            extern int snes_frame_counter;
+            extern const char *g_last_recomp_func;
+            fprintf(stderr,
+                "[trap-yield] f%d resume=$%06X S=$%04X func=%s deadline=%d depth=%d\n",
+                snes_frame_counter, (unsigned)(resume_pc24 & 0xFFFFFFu),
+                (unsigned)cpu->S,
+                g_last_recomp_func ? g_last_recomp_func : "?",
+                (int)s_lle_next_unwind_is_deadline,
+                (int)s_interp_bounce_owner_depth);
+            fflush(stderr);
+        }
+    }
     (void)cpu;
     /* A JMP-reached primitive (task-die / scheduler-dispatch) arrives via a
      * gen tail-call that armed a tailcall return context for a callee that

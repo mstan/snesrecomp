@@ -103,6 +103,32 @@ static int        s_active_top = 0;
 static uint8_t s_pending_exit_kind = BD_EXIT_KIND_NORMAL;
 
 void cpu_trace_mark_nlr_exit(uint8_t kind) {
+    /* DIAGNOSTIC (SNESRECOMP_TRAP_NLR=<substr of function name>): print each
+     * non-local-return exit taken by a matching generated function, with the
+     * live guest S. A generated body that propagates a callee's non-NORMAL
+     * return (`return _r - 1`) exits WITHOUT running its own epilogue, so any
+     * prologue pushes it made (PHB/PHK/PLB, PHA...) are left on the stack.
+     * That is correct for a genuine guest non-local return and a silent leak
+     * otherwise — this is how you tell which one you have. Env-gated. */
+    {
+        static const char *s_trap_nlr = (const char *)-1;
+        if (s_trap_nlr == (const char *)-1) s_trap_nlr = getenv("SNESRECOMP_TRAP_NLR");
+        if (s_trap_nlr && *s_trap_nlr && g_last_recomp_func &&
+            strstr(g_last_recomp_func, s_trap_nlr)) {
+            extern CpuState g_cpu;
+            extern int snes_frame_counter;
+            extern uint16_t g_cpu_entry_s[];
+            extern int g_recomp_stack_top;
+            uint16_t es = (g_recomp_stack_top >= 1)
+                ? g_cpu_entry_s[g_recomp_stack_top - 1] : 0;
+            fprintf(stderr,
+                "[trap-nlr] f%d func=%s kind=%u S=$%04X entry_s=$%04X delta=%d\n",
+                snes_frame_counter, g_last_recomp_func, (unsigned)kind,
+                (unsigned)g_cpu.S, (unsigned)es,
+                (int)(int16_t)((uint16_t)g_cpu.S - es));
+            fflush(stderr);
+        }
+    }
     s_pending_exit_kind = kind;
 }
 
