@@ -69,6 +69,9 @@ void apu_clearPortQueue(Apu* apu) {
   apu->portTargetAnchor = 0;
   apu->portLastGuest = 0;
   apu->portLastTarget = 0;
+  memset(apu->portLastTargetByPort, 0, sizeof(apu->portLastTargetByPort));
+  memset(apu->portLastValueByPort, 0, sizeof(apu->portLastValueByPort));
+  memset(apu->portLastValueValid, 0, sizeof(apu->portLastValueValid));
   apu->portTimeValid = false;
 }
 
@@ -90,6 +93,7 @@ bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
                            uint64_t guest_cycle) {
   if (apu_portQueueDepth(apu) >= APU_PORT_QUEUE_LEN)
     return false;
+  port &= 3;
 
   /* Establish a correspondence between guest time and wherever the
    * callback-driven SPC is now. If the callback later runs ahead, rebase at
@@ -110,13 +114,29 @@ bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
   if (target < apu->portLastTarget)
     target = apu->portLastTarget;
 
+  if (apu->portLastValueValid[port] && apu->portLastValueByPort[port] != val) {
+    uint64_t min_target = apu->portLastTargetByPort[port] + APU_PORT_MIN_DWELL;
+    if (target < min_target)
+      target = min_target;
+
+    uint64_t ceiling = apu->portClock +
+                       (uint64_t)audio_trace_consume_quantum() * 8u;
+    if (target > ceiling)
+      target = ceiling;
+    if (target < apu->portLastTarget)
+      target = apu->portLastTarget;
+  }
+
   ApuPortWrite *w = &apu->portQueue[apu->portQTail & (APU_PORT_QUEUE_LEN - 1)];
   w->target_cycle = target;
-  w->port = (uint8_t)(port & 3);
+  w->port = port;
   w->val = val;
   apu->portQTail++;
   apu->portLastGuest = guest_cycle;
   apu->portLastTarget = target;
+  apu->portLastTargetByPort[port] = target;
+  apu->portLastValueByPort[port] = val;
+  apu->portLastValueValid[port] = true;
   return true;
 }
 

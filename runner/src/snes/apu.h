@@ -28,6 +28,7 @@ typedef struct Timer {
  * caller advances the SPC until space exists; no event is overwritten or
  * force-applied before its guest timestamp. */
 #define APU_PORT_QUEUE_LEN 1024u
+#define APU_PORT_MIN_DWELL 128u
 
 typedef struct ApuPortWrite {
   uint64_t target_cycle; /* apply when portClock reaches this APU cycle */
@@ -58,6 +59,9 @@ struct Apu {
   uint64_t portTargetAnchor; /* matching portClock origin */
   uint64_t portLastGuest;
   uint64_t portLastTarget;
+  uint64_t portLastTargetByPort[4];
+  uint8_t portLastValueByPort[4];
+  bool portLastValueValid[4];
   bool portTimeValid;
 };
 
