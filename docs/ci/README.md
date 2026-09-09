@@ -52,12 +52,12 @@ host could generate but never rebuild.
 in the game's `main.c`, drives the recomp-ui first-run wizard:
 
 1. **Toolchain.** Looks for a `cmake-clang-v1` pack: `RETCOMM_TOOLCHAIN_DIR`,
-   then `toolchain/` beside the executable (embedded), then the RetComM cache
+   then `toolchain/` beside the executable (embedded), then the Retro cache
    (`%LOCALAPPDATA%\retcomm\toolchains\cmake-clang-v1`, or
    `$XDG_DATA_HOME`/`~/.local/share/retcomm/toolchains/cmake-clang-v1`), then
    cmake + a C compiler + python on `PATH`. If none, the wizard offers to
-   download the pack from `TechnicallyComputers/retcomm-toolchains` (or take a
-   zip the player fetched) into that cache — shared with RetComM and psxrecomp
+   download the pack from `RetroPortingToolKit/RetroPorting-Toolchains` (or take a
+   zip the player fetched) into that cache — shared with Retro and psxrecomp
    hosts, so one download per machine.
 2. **ROM.** The player picks their copy; digests are checked.
 3. **Generate.** `snesrecomp_cli.py generate` with the pack's Python (or

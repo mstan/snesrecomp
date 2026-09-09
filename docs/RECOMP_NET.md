@@ -1,6 +1,6 @@
 # recomp-net (netcode)
 
-snesrecomp vendors [recomp-net](https://github.com/TechnicallyComputers/recomp-net)
+snesrecomp vendors [recomp-net](https://github.com/RetroPortingToolKit/recomp-net)
 as a git submodule at `lib/recomp-net`. Any game that builds with
 `runner/runner.cmake` can link the library and drive delay-sync multiplayer
 from the game main loop.
@@ -469,7 +469,7 @@ recomp-ui policy mirror: `docs/HOST_NETPLAY.md` → “Where to put fixes”.
 | snesrecomp (`lib/recomp-net`, `snes_netplay`, `snes_host_session`, lobby)     | Vendors netcode, pad/admit facade, MotK WS + ICE; guest bind normalize; `try_fill_launch`; rematch SDL ensure + soft-exit + `session_reset` dispatch |
 | [recomp-ui](https://github.com/mstan/recomp-ui)                                | Waiting-room UI, UDP create/join port prep (`guest_bind`), resume-room flags   |
 | Game runtime                                                                   | Thin callbacks → helpers above; `RtlGameInfo` hooks; pad sample / `RtlRunFrame` |
-| [recomp-net-server](https://github.com/TechnicallyComputers/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
+| [recomp-net-server](https://github.com/RetroPortingToolKit/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
 
 ## Windows MSBuild / `lib/` superbuild
 

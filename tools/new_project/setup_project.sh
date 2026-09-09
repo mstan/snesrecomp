@@ -22,7 +22,7 @@
 #   --publisher <name>    README metadata
 #   --year <yyyy>         README metadata
 #   --region <code>       Default: from the cartridge header
-#   --github-owner <org>  Default: TechnicallyComputers
+#   --github-owner <org>  Default: RetroPortingToolKit
 #   --github-repo <name>  Default: the project name
 #
 # Always on (no flag): mod packages. Every project builds the loader, the
@@ -125,7 +125,7 @@ ROM=""; PARENT="."; NAME=""; PLAYERS=""; MULTITAP=""; ZIP_PREFIX=""
 DESCRIPTION=""; PUBLISHER=""; YEAR=""; REGION_OVERRIDE=""
 SET_NETPLAY=0; SET_ROLLBACK=0; SET_CI=0; SET_RECOMP_UI=0
 SET_GENERATE=0; SET_BUILD=0; SET_GITHUB=0
-GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
+GITHUB_OWNER="RetroPortingToolKit"; GITHUB_REPO=""
 ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
 FETCH_BOXART=0; SET_BOXART=0
 ADD_SUBMODULES=1

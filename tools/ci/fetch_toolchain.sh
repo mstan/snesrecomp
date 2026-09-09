@@ -22,7 +22,7 @@ ARTIFACT=""
 TAG=""
 DL_DIR=".cache/toolchain-dl"
 OUT_DIR=".cache/toolchain-pack"
-REPO="TechnicallyComputers/retcomm-toolchains"
+REPO="RetroPortingToolKit/RetroPorting-Toolchains"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

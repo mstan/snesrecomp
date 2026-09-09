@@ -30,9 +30,9 @@ extern char** environ;
 
 /* The portable toolchain this host knows how to fetch: cmake + ninja (+ clang
  * and static SDL3 on Linux/Windows; macOS uses Xcode's clang) published as
- * one zip per platform by retcomm-toolchains. RetComM installs the same pack
+ * one zip per platform by retcomm-toolchains. Retro installs the same pack
  * into the same cache, so a machine that has one never downloads twice. */
-#define SNESRECOMP_TC_REPO   "TechnicallyComputers/retcomm-toolchains"
+#define SNESRECOMP_TC_REPO   "RetroPortingToolKit/RetroPorting-Toolchains"
 #define SNESRECOMP_TC_PACK   "cmake-clang-v1"
 #if defined(_WIN32)
 #  define SNESRECOMP_TC_ASSET "cmake-clang-v1-windows-x64.zip"
@@ -390,16 +390,16 @@ static int resolve_build_paths(void) {
  *
  *   1. RETCOMM_TOOLCHAIN_DIR                 explicit override
  *   2. <exe dir>/toolchain, <root>/toolchain a pack embedded in the zip
- *   3. the RetComM cache                     %LOCALAPPDATA%/retcomm/toolchains/
+ *   3. the Retro cache                     %LOCALAPPDATA%/retcomm/toolchains/
  *                                            cmake-clang-v1 (Windows),
  *                                            $XDG_DATA_HOME or ~/.local/share/
  *                                            retcomm/toolchains/cmake-clang-v1
  *   4. cmake + a C compiler + python on PATH  a developer machine
  *
- * The cache is shared with RetComM and psxrecomp hosts on purpose: one 800 MB
+ * The cache is shared with Retro and psxrecomp hosts on purpose: one 800 MB
  * download per machine, not one per game. Within a cache root, `latest/` is
  * what this host installs, `offline/` is a player-supplied zip, and any other
- * child with bin/cmake is a pack RetComM installed (e.g. v1.0.14/). */
+ * child with bin/cmake is a pack Retro installed (e.g. v1.0.14/). */
 
 #if defined(_WIN32)
 #  define SNESRECOMP_EXE_SUFFIX ".exe"
@@ -450,7 +450,7 @@ static int resolve_pack_under(const char* dir, char* out, size_t cap) {
             return 1;
         }
     }
-    /* Any child directory that is a pack (RetComM installs as <version>/). */
+    /* Any child directory that is a pack (Retro installs as <version>/). */
 #if defined(_WIN32)
     WIN32_FIND_DATAA fd;
     char pattern[1400];

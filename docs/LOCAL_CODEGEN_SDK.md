@@ -1,7 +1,7 @@
 # Local codegen SDK
 
 Headless contract for regenerating an existing SNESRecomp game project from a
-user-supplied ROM. Intended for `recomp-ui` setup flows and RetComM launcher
+user-supplied ROM. Intended for `recomp-ui` setup flows and Retro launcher
 automation. This does **not** redistribute ROM data.
 
 ## Commands
@@ -93,7 +93,7 @@ Defaults cover `recomp/`, `src/gen/`, `snesrecomp/snesrecomp_cli.py`, and
 | Linux / macOS | In-process `cmake --build`, then `exec` the new binary |
 | Windows | Writes `build/recomp_deferred_rebuild.cmd`, exits; helper waits for the game PID, builds, starts the new exe (avoids a locked `.exe`) |
 
-Folder layout stays `build/` on every OS so RetComM and other tools can treat
+Folder layout stays `build/` on every OS so Retro and other tools can treat
 projects uniformly.
 
 ### Game regen scripts
@@ -122,7 +122,7 @@ never needed:
 | step | behaviour |
 |------|-----------|
 | project root | also searched upward from the **executable's directory**, not just the cwd — a double-clicked zip has an unrelated cwd |
-| toolchain | `setup_needs_toolchain` + `toolchain_is_ready` / `ensure_toolchain_with_progress` / `toolchain_update_available`: finds a `cmake-clang-v1` pack (`RETCOMM_TOOLCHAIN_DIR`, `toolchain/` beside the exe, the RetComM cache) or downloads it from `TechnicallyComputers/retcomm-toolchains` into that cache; falls back to cmake/cc/python on `PATH` |
+| toolchain | `setup_needs_toolchain` + `toolchain_is_ready` / `ensure_toolchain_with_progress` / `toolchain_update_available`: finds a `cmake-clang-v1` pack (`RETCOMM_TOOLCHAIN_DIR`, `toolchain/` beside the exe, the Retro cache) or downloads it from `RetroPortingToolKit/RetroPorting-Toolchains` into that cache; falls back to cmake/cc/python on `PATH` |
 | configure | when `build/CMakeCache.txt` is absent, `cmake -S -B -G Ninja -DCMAKE_BUILD_TYPE=Release` runs before `--build`, with the pack's `env.sh` sourced (POSIX) or `env.bat` called (the Windows deferred helper) |
 
 `setup_wizard_supported` is set by `apply()`; without it recomp-ui keeps the
