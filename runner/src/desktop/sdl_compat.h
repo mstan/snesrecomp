@@ -115,6 +115,23 @@ static inline SDL_Renderer *snesrecomp_sdl_create_renderer(
 #endif
 }
 
+/* Render drivers this SDL build actually has, so a host can offer the ones
+ * that exist rather than a hardcoded platform matrix that goes stale. SDL2
+ * reports through a struct, SDL3 returns the name directly. */
+static inline int snesrecomp_sdl_num_render_drivers(void) {
+  return SDL_GetNumRenderDrivers();
+}
+
+static inline const char *snesrecomp_sdl_render_driver_name(int index) {
+#if SNESRECOMP_SDL3
+  return SDL_GetRenderDriver(index);
+#else
+  static SDL_RendererInfo info;
+  if (SDL_GetRenderDriverInfo(index, &info) != 0) return NULL;
+  return info.name;
+#endif
+}
+
 static inline const char *snesrecomp_sdl_renderer_name(
     SDL_Renderer *renderer) {
 #if SNESRECOMP_SDL3
