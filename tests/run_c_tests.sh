@@ -38,23 +38,27 @@ echo "=== PPU sprite limits ==="
 "$OUT/ppu_sprite_limit_test"
 
 echo "=== DMA / HDMA ==="
-"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+# sdd1.c is intentionally linked with dma.c; its disabled-path condition is
+# not type-limits clean under the harness's stricter -Werror policy.
+"$CC" -std=c11 -Wall -Wextra -Werror -Wno-error=type-limits -O1 \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
     "$ROOT/tests/dma/hdma_test.c" \
     "$ROOT/runner/src/snes/dma.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
     -o "$OUT/hdma_test"
 "$OUT/hdma_test"
 
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -Wno-error=parentheses -Wno-error=unused-variable \
-    -Wno-error=unused-const-variable \
+    -Wno-error=unused-const-variable -Wno-error=type-limits \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
     -ffunction-sections -fdata-sections \
     -I "$ROOT/tests/dma" -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
     "$ROOT/tests/dma/hdma_timing_test.c" \
     "$ROOT/runner/src/snes/dma.c" \
     "$ROOT/runner/src/snes/snes.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
     -Wl,--gc-sections -o "$OUT/hdma_timing_test"
 "$OUT/hdma_timing_test"
 
@@ -165,6 +169,7 @@ echo "=== runtime dispatch ==="
     "$ROOT/tests/runtime_dispatch/known_lle_entry_test.c" \
     "$ROOT/runner/src/cpu_state.c" \
     "$ROOT/runner/src/snes/cart.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
     "$ROOT/runner/src/snes/cx4.c" \
     "$ROOT/runner/src/snes/dsp1.c" \
     "$ROOT/runner/src/snes/dsp1_hle.c" \

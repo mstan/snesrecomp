@@ -60,6 +60,7 @@ void dma_free(Dma* dma) {
 }
 
 void dma_reset(Dma* dma) {
+  dma->hdmaPendingInit = 0;
   for(int i = 0; i < 8; i++) {
     dma->channel[i].bAdr = 0xff;
     dma->channel[i].aAdr = 0xffff;
@@ -337,6 +338,91 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
 #endif
 }
 
+/* HDMA uses a table descriptor per active channel. It is separate from the
+ * regular-DMA cycle engine because the host invokes it at scanline edges. */
+uint64_t dma_hdmaMasterEstimate(Dma* dma) {
+  static const uint8_t bytesPerUnit[8] = {1, 2, 2, 4, 4, 4, 2, 4};
+  uint64_t perLine = 0;
+  bool any = false;
+  for (int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if (!ch->hdmaActive) continue;
+    any = true;
+    perLine += 8u + 8u * bytesPerUnit[ch->mode & 7];
+    if (ch->indirect) perLine += 16u;
+  }
+  return any ? (18u + perLine) * 224u + 128u : 0;
+}
+
+static void dma_hdmaLoadDescriptor(Dma* dma, DmaChannel* ch) {
+  ch->repCount = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+  ch->terminated = ch->repCount == 0;
+  if (ch->indirect && !ch->terminated) {
+    ch->size = snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++);
+    ch->size |= snes_read(dma->snes, (ch->aBank << 16) | ch->tableAdr++) << 8;
+  }
+  ch->doTransfer = !ch->terminated;
+}
+
+void dma_initHdma(Dma* dma) {
+  for (int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if (!ch->hdmaActive) continue;
+    dma->hdmaPendingInit &= (uint8_t)~(1u << i);
+    ch->tableAdr = ch->aAdr;
+    dma_hdmaLoadDescriptor(dma, ch);
+    ch->offIndex = 0;
+  }
+}
+
+void dma_primeHdmaFirstLine(Dma* dma) {
+  for (int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if (!ch->hdmaActive || ch->terminated || !ch->doTransfer) continue;
+    DmaChannel save = *ch;
+    int len = transferLength[ch->mode & 7];
+    for (int j = 0; j < len; j++) {
+      uint8_t bAdr = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode & 7][j]);
+      if (ch->indirect)
+        dma_transferByte(dma, ch->size++, ch->indBank, bAdr, false, i);
+      else
+        dma_transferByte(dma, ch->tableAdr++, ch->aBank, bAdr, false, i);
+    }
+    *ch = save;
+  }
+}
+
+void dma_doHdma(Dma* dma) {
+  for (int i = 0; i < 8; i++) {
+    DmaChannel* ch = &dma->channel[i];
+    if (!ch->hdmaActive) continue;
+    if (dma->hdmaPendingInit & (1u << i)) {
+      dma->hdmaPendingInit &= (uint8_t)~(1u << i);
+      ch->tableAdr = ch->aAdr;
+      dma_hdmaLoadDescriptor(dma, ch);
+      ch->offIndex = 0;
+      continue;
+    }
+    if (ch->terminated) continue;
+
+    if (ch->doTransfer) {
+      int len = transferLength[ch->mode & 7];
+      for (int j = 0; j < len; j++) {
+        uint8_t bAdr = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode & 7][j]);
+        if (ch->indirect)
+          dma_transferByte(dma, ch->size++, ch->indBank, bAdr, false, i);
+        else
+          dma_transferByte(dma, ch->tableAdr++, ch->aBank, bAdr, false, i);
+      }
+    }
+
+    ch->repCount--;
+    ch->doTransfer = (ch->repCount & 0x80) != 0;
+    if ((ch->repCount & 0x7f) == 0)
+      dma_hdmaLoadDescriptor(dma, ch);
+  }
+}
+
 bool dma_cycle(Dma* dma) {
   if(dma->dmaBusy) {
     dma_doDma(dma);
@@ -348,7 +434,12 @@ bool dma_cycle(Dma* dma) {
 void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
   for(int i = 0; i < 8; i++) {
     if(hdma) {
-      dma->channel[i].hdmaActive = val & (1 << i);
+      bool now_on = (val & (1 << i)) != 0;
+      if(now_on && !dma->channel[i].hdmaActive)
+        dma->hdmaPendingInit |= (uint8_t)(1u << i);
+      else if(!now_on)
+        dma->hdmaPendingInit &= (uint8_t)~(1u << i);
+      dma->channel[i].hdmaActive = now_on;
     } else {
       dma->channel[i].dmaActive = val & (1 << i);
     }
