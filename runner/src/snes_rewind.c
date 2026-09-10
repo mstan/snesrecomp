@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "snes_overlay_draw.h"
 #include "common_rtl.h"
 #include "netplay/snes_netplay.h"
 
@@ -254,7 +255,7 @@ void snes_rewind_close(void) { s_open = 0; s_sel = 0; }
  * game rect with the same destination it already computes.
  */
 #define RW_STRIP_W   512
-#define RW_STRIP_H   140
+#define RW_STRIP_H   176   /* caption 34 + thumbs 63 + hint row 32 + margins */
 #define RW_CELL_W     72
 #define RW_CELL_H     63
 #define RW_CELL_GAP    6
@@ -262,9 +263,14 @@ void snes_rewind_close(void) { s_open = 0; s_sel = 0; }
 
 static uint32_t s_strip[RW_STRIP_W * RW_STRIP_H];
 
-/* The 8x8 font lives in snes_osd.c; rather than a second copy, the caption is
- * drawn with the same simple block digits the save-state menu uses for its
- * slot numbers. Keeping one font in one file is worth a plainer caption. */
+/* Text and face buttons come from snes_overlay_draw.c.
+ *
+ * The comment that used to sit here said the 8x8 font lived only in
+ * snes_osd.c and that a plain progress bar was worth avoiding a second copy.
+ * That was already untrue -- snes_savestate_menu.c had its own FONT8 -- so
+ * the strip was doing without a caption to avoid a duplication that had
+ * happened anyway. The font now lives in one place and all three overlays
+ * share it. */
 static void strip_fill(int x0, int y0, int w, int h, uint32_t col) {
     int x, y;
     for (y = y0; y < y0 + h; y++) {
@@ -295,22 +301,66 @@ static void strip_thumb(const uint32_t *thumb, int x0, int y0, int w, int h) {
     }
 }
 
-/* "-1.2s" as a bar whose length tracks how far back we are: a readable cue
- * without dragging a glyph table in. Full width = the whole ring. */
+/* Title and how far back the selection is, over a bar tracking the same thing.
+ * Full bar = the whole ring. */
 static void strip_caption(void) {
     const int track_x = 12, track_w = RW_STRIP_W - 24, track_h = 4;
-    int fill;
-    strip_fill(track_x, RW_CAPTION_Y, track_w, track_h, 0xFF303030u);
+    const int bar_y = RW_CAPTION_Y + 20;
+    char buf[48];
+    float secs = snes_rewind_selected_seconds();
+    int fill, whole, tenths;
+
+    snes_ovl_draw_text(s_strip, RW_STRIP_W, RW_STRIP_H,
+                       12, RW_CAPTION_Y, "REWIND", 0xFFFFD24Du, 2);
+
+    /* -1.2s, formatted without printf's float support: some runner targets
+     * build against a minimal libc where %f is not linked in. */
+    whole = (int)secs;
+    tenths = (int)((secs - (float)whole) * 10.0f + 0.5f);
+    if (tenths > 9) { whole += 1; tenths = 0; }
+    snprintf(buf, sizeof(buf), "-%d.%dS", whole, tenths);
+    snes_ovl_draw_text(s_strip, RW_STRIP_W, RW_STRIP_H,
+                       RW_STRIP_W - 12 - (int)strlen(buf) * 16,
+                       RW_CAPTION_Y, buf, 0xFFE2E5EBu, 2);
+
+    strip_fill(track_x, bar_y, track_w, track_h, 0xFF303030u);
     if (s_count > 1) {
         fill = track_w - (int)((long)track_w * s_sel / (s_count - 1));
         if (fill < 2) fill = 2;
-        strip_fill(track_x, RW_CAPTION_Y, fill, track_h, 0xFFE0E0E0u);
+        strip_fill(track_x, bar_y, fill, track_h, 0xFFE0E0E0u);
     }
+}
+
+/* Face-button glyphs and nothing else.
+ *
+ * This started as a copy of the save-state menu's hint row: two glyph+label
+ * pairs, then "LEFT RIGHT SCRUB", then a line of keyboard equivalents. In the
+ * filmstrip that reads as clutter -- the strip is one horizontal row of
+ * thumbnails with an obvious direction, so naming the directions explains
+ * nothing, and the keyboard line repeats what the glyphs already say. Only the
+ * two actions a player has to be told survive, and they get the whole band. */
+static void strip_hints(void) {
+    const int band_y = RW_STRIP_H - 44;
+    const int band_h = RW_STRIP_H - band_y;
+    const int btn_y  = band_y + (band_h - 18) / 2;
+
+    snes_ovl_fill_rect(s_strip, RW_STRIP_W, RW_STRIP_H,
+                       0, band_y, RW_STRIP_W, band_h, 0xFF171B25u);
+    snes_ovl_draw_button(s_strip, RW_STRIP_W, RW_STRIP_H,
+                         12, btn_y, 'A', SNES_OVL_COL_A);
+    snes_ovl_draw_text(s_strip, RW_STRIP_W, RW_STRIP_H,
+                       36, btn_y + 5, "SELECT", 0xFFE2E5EBu, 1);
+    snes_ovl_draw_button(s_strip, RW_STRIP_W, RW_STRIP_H,
+                         120, btn_y, 'B', SNES_OVL_COL_B);
+    snes_ovl_draw_text(s_strip, RW_STRIP_W, RW_STRIP_H,
+                       144, btn_y + 5, "BACK", 0xFFE2E5EBu, 1);
 }
 
 int snes_rewind_overlay_image(const uint32_t **pixels, int *w, int *h) {
     int i, visible, first, x;
-    const int strip_y = RW_CAPTION_Y + 14;
+    /* Below the caption: title text (8px cell x2 scale = 16) plus the bar at
+     * +20 and 4 tall, so 34 is the first free row. */
+    const int strip_y = RW_CAPTION_Y + 32;
 
     if (!s_open) {
         if (pixels) *pixels = NULL;
@@ -323,6 +373,7 @@ int snes_rewind_overlay_image(const uint32_t **pixels, int *w, int *h) {
         s_strip[i] = 0xE0101014u;      /* translucent-looking dark panel */
 
     strip_caption();
+    strip_hints();
 
     /* Show a window of cells centred on the selection, newest to the right. */
     visible = (RW_STRIP_W - 24) / (RW_CELL_W + RW_CELL_GAP);
