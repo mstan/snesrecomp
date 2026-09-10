@@ -36,6 +36,9 @@
 #include "cosim.h"
 #if defined(SNESRECOMP_NET)
 #include "snes_netplay.h"
+
+/* See RtlSetSpeculativeFrame in common_rtl.h. */
+static bool g_rtl_speculative_frame;
 #endif
 
 uint8 g_ram[0x20000];
@@ -748,7 +751,10 @@ bool RtlRunFrame(uint32 inputs) {
   rtl_sync_apu_frame_boundary();
 
 #if SNESRECOMP_ENABLE_MODS
-  snes_mod_runtime_frame_tick_c();
+  /* Not on a speculative frame: the player never sees it, so a mod counting
+   * frames must not count it. See RtlSetSpeculativeFrame in common_rtl.h. */
+  if (!g_rtl_speculative_frame)
+    snes_mod_runtime_frame_tick_c();
 #endif
 
 #ifdef SNES_COSIM
@@ -1848,6 +1854,9 @@ static void rtl_sync_apu_frame_boundary(void) {
     apub_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
 #endif
 }
+
+void RtlSetSpeculativeFrame(bool on) { g_rtl_speculative_frame = on; }
+bool RtlSpeculativeFrame(void) { return g_rtl_speculative_frame; }
 
 void RtlAudioSetFastForward(bool active) {
   if (!active && !g_audio_fast_forward && g_audio_recovery_frames == 0)

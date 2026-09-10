@@ -356,6 +356,23 @@ size_t RtlRollbackSnapshotBound(void);
 
 /* Read / rewind the DSP output-ring producer cursor, so a resim can discard
  * the audio it re-produced for ticks the player has already heard. */
+/*
+ * Speculative frames: frames the guest runs that the player will never see,
+ * because the caller is about to rewind them (run-ahead; netplay resim could
+ * use this too).
+ *
+ * While set, RtlRunFrame does not fire the per-frame mod hook. A mod counting
+ * frames -- the performance log above all -- must count what reached the
+ * screen, not what was speculated and thrown away. Everything else about the
+ * frame is unchanged, so determinism is untouched.
+ *
+ * The frame COUNTER is deliberately not gated here: leaving it to advance
+ * keeps RtlRunFrame byte-identical between real and speculative frames, and
+ * the caller restores it after rewinding.
+ */
+void RtlSetSpeculativeFrame(bool on);
+bool RtlSpeculativeFrame(void);
+
 uint32_t RtlAudioProducerCursor(void);
 void RtlAudioRewindProducer(uint32_t cursor);
 
