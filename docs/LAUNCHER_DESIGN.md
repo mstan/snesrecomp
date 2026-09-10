@@ -4,7 +4,7 @@ Status: **SHIPPED via recomp-ui** · 2026-07-23
 
 The pre-boot launcher is not part of the snesrecomp engine tree. Games that
 need the shared Dear ImGui launcher vendor
-[mstan/recomp-ui](https://github.com/mstan/recomp-ui) as a **repo-root**
+[RetroPortingToolKit/recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui) as a **repo-root**
 submodule and wire it themselves. snesrecomp keeps only recomp-net (and the
 lobby / netplay host facades that recomp-ui drives through callbacks).
 
@@ -12,7 +12,7 @@ lobby / netplay host facades that recomp-ui drives through callbacks).
 
 ```cmake
 # In the game repo (not snesrecomp):
-#   git submodule add https://github.com/mstan/recomp-ui.git recomp-ui
+#   git submodule add https://github.com/RetroPortingToolKit/recomp-ui.git recomp-ui
 
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 add_executable(MyGame ...)
