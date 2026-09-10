@@ -122,6 +122,13 @@ uint16_t g_cpu_entry_s[RECOMP_STACK_DEPTH];
 /* Expected positive S delta when a generated callee consumes the hardware
  * return frame that its generated caller pushed. */
 static uint8_t g_cpu_entry_return_frame[RECOMP_STACK_DEPTH];
+/* Per-slot: this frame was entered by a guest TAIL call (JMP/JML), so it
+ * shares its caller's guest frame and its caller returns its RecompReturn
+ * VERBATIM rather than decrementing it. Set by cpu_take_tailcall_return_context
+ * when a prologue actually adopts the context; cleared by RecompStackPush.
+ * Consulted when converting a host-frame index into a SKIP_N unwind depth —
+ * see cpu_resolve_unwind_depth(). */
+static uint8_t g_cpu_entry_tailcall[RECOMP_STACK_DEPTH];
 static uint8_t g_tailcall_context_valid;
 static uint16_t g_tailcall_entry_s;
 static uint8_t g_tailcall_hrv;
@@ -150,6 +157,13 @@ int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv) {
   if (entry_s) *entry_s = g_tailcall_entry_s;
   if (hrv) *hrv = g_tailcall_hrv;
   g_tailcall_context_valid = 0;
+  /* A caller passing NULL is SWALLOWING a stale context, not adopting one
+   * (the HLE wrappers and the LLE unwind path do this deliberately), so it
+   * must not be recorded as a tail entry. A prologue that asks for the
+   * entry_s/hrv out-params is the real tail-entered case: its RecompStackPush
+   * already ran, so top-1 is its own slot. */
+  if (entry_s && g_recomp_stack_top > 0)
+    g_cpu_entry_tailcall[g_recomp_stack_top - 1] = 1;
   return 1;
 }
 
@@ -258,6 +272,64 @@ void CpuUnresolvedAbandonDumpJson(FILE *f) {
   fprintf(f, "\n    ]\n  },\n");
 }
 
+/* Convert a matched ancestor's frame INDEX into the SKIP_N unwind depth the
+ * generated return contract expects.
+ *
+ * Those are not the same number. `g_recomp_stack` counts HOST frames; the
+ * SKIP_N contract decrements once per GUEST frame, because the decrement is
+ * emitted at a call site (`return _r - 1;`). A guest TAIL call (JMP/JML)
+ * creates a host frame without creating a guest frame: the emitted caller
+ * does `_r = callee(cpu); RecompStackPop(); return _r;` — verbatim, no
+ * decrement — since caller and callee share one guest frame. Every such frame
+ * on the unwind path therefore inflates a raw host-frame count by one.
+ *
+ * Measured (GWED f3305, bank_00_A6EB black-screen): the live array was
+ *
+ *   [5] A7F0 entry_s=$0FD9  <- tail-entered from A765 (shares its entry_s)
+ *   [4] A765 entry_s=$0FD9
+ *   [3] A729 entry_s=$0FDB  <- match, ret_s=$0FDB
+ *   [2] A6EB entry_s=$0FE0
+ *
+ * The raw count (top-1)-i gave 2, but only ONE decrement happens on the way
+ * down (A765 returns A7F0's value verbatim), so A729 emitted 1 instead of 0,
+ * A6EB took SKIP_PROPAGATION instead of absorbing, and skipped the PLA/PLB
+ * epilogue that restores its PHB/PHK/PLB+PHA prologue pushes — the -3 that
+ * ends as a return into WRAM and a wild stack.
+ *
+ * Derivation: with value_k the RecompReturn frame k emits, and frame k
+ * returning verbatim exactly when frame k+1 was tail-entered,
+ *     value_k = value_{k+1} - (tailcall[k+1] ? 0 : 1)
+ * and the matched ancestor i must itself decrement to NORMAL, i.e.
+ * value_{i+1} == 1. Hence
+ *     N = 1 + |{ m in [i+2, top-1] : !tailcall[m] }|
+ * which collapses to the previous (top-1)-i whenever no frame on the path was
+ * tail-entered, so chains without tail calls are bit-identical. */
+static int cpu_resolve_unwind_depth(int i, int top) {
+  int n = 1;
+  for (int m = i + 2; m <= top - 1; m++)
+    if (!g_cpu_entry_tailcall[m]) n++;
+  return n;
+}
+
+/* DIAGNOSTIC: print the live recomp frame array — every slot's function name,
+ * its guest S at entry, and the return-frame size (hrv) recorded for it. The
+ * unwind depth a non-local return needs is a property of THIS array, not of
+ * the call graph read off the generated source: a chain can contain frames
+ * that are not obvious from a callee list, so an assumed caller/callee
+ * adjacency in g_cpu_entry_s[] can simply be wrong. `mark` (0 for none) is
+ * highlighted so a resolve target can be located in the real layout. */
+void recomp_dump_frame_array(FILE *out, uint16_t mark) {
+  int top = g_recomp_stack_top;
+  for (int i = top - 1; i >= 0; i--)
+    fprintf(out, "    [%2d] entry_s=$%04X hrv=%u %s%s%s%s\n", i,
+            (unsigned)g_cpu_entry_s[i], (unsigned)g_cpu_entry_return_frame[i],
+            g_recomp_stack[i] ? g_recomp_stack[i] : "?",
+            g_cpu_entry_tailcall[i] ? " (tail)" : "",
+            (i == top - 1) ? "   <- innermost" : "",
+            (mark && g_cpu_entry_s[i] == mark) ? "   <== MATCH" : "");
+  fflush(out);
+}
+
 int cpu_resolve_ancestor_skip(uint16_t ret_s) {
   /* The current (top-1) frame is the one whose RTS we are resolving; it
    * is NOT a match (its entry_s != ret_s, else the balanced host-return
@@ -269,10 +341,58 @@ int cpu_resolve_ancestor_skip(uint16_t ret_s) {
    * in behavior). */
   int top = g_recomp_stack_top;
   if (top < 2 || top > RECOMP_STACK_DEPTH) return -1;
+  int result = -1;
   for (int i = top - 2; i >= 0; i--) {
-    if (g_cpu_entry_s[i] == ret_s) return (top - 1) - i;
+    if (g_cpu_entry_s[i] == ret_s) {
+      result = cpu_resolve_unwind_depth(i, top);
+      break;
+    }
   }
-  return -1;
+  /* DIAGNOSTIC (SNESRECOMP_TRAP_ANCESTOR=<substr of a function name>): dump
+   * the LIVE frame array whenever a matching function is anywhere on the
+   * recomp stack, with the target and the resolved skip count. Reasoning about
+   * unwind depth from the generated source is unreliable — call chains contain
+   * intermediate frames that are not obvious from the callee list, so an
+   * assumed caller/callee adjacency in g_cpu_entry_s[] can simply be wrong.
+   * This prints the real layout at the moment the decision is made, so the
+   * skip count can be checked against actual frames rather than a model.
+   * Behaviour is unchanged: `result` is computed exactly as before. */
+  {
+    static const char *s_ta = (const char *)-1;
+    static int s_lo = 0, s_hi = 0;
+    if (s_ta == (const char *)-1) {
+      s_ta = getenv("SNESRECOMP_TRAP_ANCESTOR");
+      const char *r = getenv("SNESRECOMP_TRAP_ANCESTOR_FRAMES");
+      if (r && sscanf(r, "%d-%d", &s_lo, &s_hi) != 2) s_lo = s_hi = 0;
+    }
+    extern int snes_frame_counter;
+    if (s_ta && *s_ta &&
+        (s_hi == 0 ||
+         (snes_frame_counter >= s_lo && snes_frame_counter <= s_hi))) {
+      int hit = 0;
+      for (int i = 0; i < top && !hit; i++) {
+        if (!g_recomp_stack[i]) continue;
+        const char *p = s_ta;
+        while (*p && !hit) {
+          const char *c = strchr(p, ',');
+          size_t n = c ? (size_t)(c - p) : strlen(p);
+          if (n) {
+            char buf[64];
+            if (n >= sizeof buf) n = sizeof buf - 1;
+            memcpy(buf, p, n); buf[n] = 0;
+            if (strstr(g_recomp_stack[i], buf)) hit = 1;
+          }
+          p = c ? c + 1 : p + strlen(p);
+        }
+      }
+      if (hit) {
+        fprintf(stderr, "[trap-anc] f%d ret_s=$%04X top=%d -> skip=%d\n",
+                snes_frame_counter, (unsigned)ret_s, top, result);
+        recomp_dump_frame_array(stderr, ret_s);
+      }
+    }
+  }
+  return result;
 }
 
 int cpu_resolve_post_return_skip(uint16_t post_s) {
@@ -286,7 +406,11 @@ int cpu_resolve_post_return_skip(uint16_t post_s) {
   for (int i = top - 2; i >= 0; i--) {
     uint16_t expected = (uint16_t)(g_cpu_entry_s[i] +
                                    g_cpu_entry_return_frame[i]);
-    if (expected == post_s) return (top - 1) - i;
+    /* Same host-frame-vs-guest-frame conversion as the ancestor resolver:
+     * this feeds the identical SKIP_N decrement contract, so a tail-entered
+     * frame on the path inflates a raw count here too. Identical to the old
+     * (top-1)-i when no frame on the path was tail-entered. */
+    if (expected == post_s) return cpu_resolve_unwind_depth(i, top);
   }
   return -1;
 }
@@ -381,6 +505,8 @@ void RecompStackPush(const char *name) {
      * overwrites with its tailcall-adjusted _entry_s, so no established
      * behaviour changes. */
     g_cpu_entry_s[slot] = g_cpu.S;
+    g_cpu_entry_tailcall[slot] = 0;  /* set only if this prologue adopts a
+                                      * tailcall return context (below) */
   } else if (getenv("SNESRECOMP_STACK_CAP_ABORT")) {
     /* Diagnostic-only: stop at the first host-call-depth overflow while the
      * bounded attribution stack still contains the causal chain.  Letting C

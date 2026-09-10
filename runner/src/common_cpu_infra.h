@@ -81,6 +81,9 @@ void CpuDispatchLogDumpJson(FILE *f);
 extern int g_recomp_stack_top;
 extern uint16_t g_cpu_entry_s[];
 int cpu_resolve_ancestor_skip(uint16_t ret_s);
+/* DIAGNOSTIC: dump the live recomp frame array (name, entry S, hrv per slot)
+ * to `out`, highlighting any slot whose entry S equals `mark` (0 = none). */
+void recomp_dump_frame_array(FILE *out, uint16_t mark);
 int cpu_resolve_post_return_skip(uint16_t post_s);
 typedef struct CpuTailcallContextSave {
   uint8_t valid;
