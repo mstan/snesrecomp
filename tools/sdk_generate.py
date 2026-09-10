@@ -61,6 +61,7 @@ def generate(
     cfg_roots: bool = False,
     no_host_root_scan: bool = False,
     source_roots: Optional[Sequence[pathlib.Path]] = None,
+    profile_manifests: Optional[Sequence[pathlib.Path]] = None,
     analysis_backend: str = "auto",
     expected_crc32: Optional[str] = None,
     expected_sha256: Optional[str] = None,
@@ -109,6 +110,14 @@ def generate(
         emit_args.append("--no-host-root-scan")
     for root in source_roots or ():
         emit_args.extend(["--source-root", str(pathlib.Path(root).resolve())])
+    # Tier-2 coverage profile (the burn-down loop's promote step). Influences
+    # only materialization: bailed observations are excluded, the LLE fallback
+    # is never removed, and only hardware call landings or independently
+    # declared function boundaries become roots. See
+    # v2/program_emit.py:discover_profile_roots.
+    for manifest in profile_manifests or ():
+        emit_args.extend(
+            ["--profile-manifest", str(pathlib.Path(manifest).resolve())])
 
     def run_captured(tool, arguments: Sequence[str]) -> int:
         """Run a tools.* main(), keeping stdout JSONL-clean when needed."""
@@ -221,6 +230,10 @@ def generate_command(args: argparse.Namespace, progress: ProgressReporter) -> in
             source_roots=[
                 _resolve_under(project_root, root) for root in args.source_root
             ],
+            profile_manifests=[
+                _resolve_under(project_root, m)
+                for m in getattr(args, "profile_manifest", []) or []
+            ],
             analysis_backend=args.analysis_backend,
             expected_crc32=args.expected_crc32,
             expected_sha256=args.expected_sha256,
@@ -287,6 +300,13 @@ def add_generate_parser(subparsers) -> None:
         action="append",
         default=[],
         help="extra host source root for root discovery (repeatable)",
+    )
+    generate_parser.add_argument(
+        "--profile-manifest",
+        action="append",
+        default=[],
+        help="tier-2 coverage manifest to seed optional AOT roots from "
+             "(repeatable); clean call landings only, bails excluded",
     )
     generate_parser.add_argument(
         "--analysis-backend",
