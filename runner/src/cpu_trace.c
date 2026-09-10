@@ -4,6 +4,7 @@
 
 #if SNESRECOMP_TRACE
 
+#include "common_cpu_infra.h"
 #include "debug_server.h"
 #include <stdio.h>
 #include <string.h>
@@ -113,8 +114,24 @@ void cpu_trace_mark_nlr_exit(uint8_t kind) {
     {
         static const char *s_trap_nlr = (const char *)-1;
         if (s_trap_nlr == (const char *)-1) s_trap_nlr = getenv("SNESRECOMP_TRAP_NLR");
-        if (s_trap_nlr && *s_trap_nlr && g_last_recomp_func &&
-            strstr(g_last_recomp_func, s_trap_nlr)) {
+        int _nlr_hit = 0;
+        if (s_trap_nlr && *s_trap_nlr && g_last_recomp_func) {
+            /* comma-separated substring list, so one run can watch a whole
+             * call chain and the ordering between its exits is readable. */
+            const char *p = s_trap_nlr;
+            while (*p && !_nlr_hit) {
+                const char *c = strchr(p, ',');
+                size_t n = c ? (size_t)(c - p) : strlen(p);
+                if (n) {
+                    char buf[64];
+                    if (n >= sizeof buf) n = sizeof buf - 1;
+                    memcpy(buf, p, n); buf[n] = 0;
+                    if (strstr(g_last_recomp_func, buf)) _nlr_hit = 1;
+                }
+                p = c ? c + 1 : p + strlen(p);
+            }
+        }
+        if (_nlr_hit) {
             extern CpuState g_cpu;
             extern int snes_frame_counter;
             extern uint16_t g_cpu_entry_s[];
@@ -126,6 +143,11 @@ void cpu_trace_mark_nlr_exit(uint8_t kind) {
                 snes_frame_counter, g_last_recomp_func, (unsigned)kind,
                 (unsigned)g_cpu.S, (unsigned)es,
                 (int)(int16_t)((uint16_t)g_cpu.S - es));
+            /* The exit kind alone does not say whether the unwind depth is
+             * right — that depends on which live frame the return is aimed
+             * at. Dump the real frame array, marking any slot whose entry S
+             * matches the guest S this exit leaves behind. */
+            recomp_dump_frame_array(stderr, (uint16_t)g_cpu.S);
             fflush(stderr);
         }
     }
