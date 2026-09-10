@@ -37,6 +37,10 @@ void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 void rtl_sync_apu_to_cpu_locked(void) {}
 void RtlApuWrite(uint16_t adr, uint8_t val) { (void)adr; (void)val; }
+uint8_t rtl_apu_port_observers_read(uint16_t adr, uint8_t value) {
+    (void)adr;
+    return value;
+}
 void audio_trace_on_cpu_port_read(uint8_t port, uint8_t value) {
     (void)port;
     (void)value;

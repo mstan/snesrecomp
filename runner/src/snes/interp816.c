@@ -488,8 +488,10 @@ static uint32_t interp816_adrIdy(Interp816* cpu, uint32_t* low, bool write) {
   uint8_t adr = interp816_readOpcode(cpu);
   if(cpu->dp & 0xff) cpu->cyclesUsed++; // dpr not 0: 1 extra cycle
   uint16_t pointer = interp816_readWord(cpu, (cpu->dp + adr) & 0xffff, (cpu->dp + adr + 1) & 0xffff);
-  if(write && (!cpu->xf || ((pointer >> 8) != ((pointer + cpu->y) >> 8)))) cpu->cyclesUsed++;
-  // x = 0 or page crossed, with writing opcode: 1 extra cycle
+  bool crossed = (pointer >> 8) != ((pointer + cpu->y) >> 8);
+  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
+  // Reads pay only on a page crossing. Stores retain their existing 16-bit
+  // index/page-crossing penalty.
   *low = ((cpu->db << 16) + pointer + cpu->y) & 0xffffff;
   return ((cpu->db << 16) + pointer + cpu->y + 1) & 0xffffff;
 }
@@ -533,16 +535,16 @@ static uint32_t interp816_adrAbs(Interp816* cpu, uint32_t* low) {
 
 static uint32_t interp816_adrAbx(Interp816* cpu, uint32_t* low, bool write) {
   uint16_t adr = interp816_readOpcodeWord(cpu);
-  if(write && (!cpu->xf || ((adr >> 8) != ((adr + cpu->x) >> 8)))) cpu->cyclesUsed++;
-  // x = 0 or page crossed, with writing opcode: 1 extra cycle
+  bool crossed = (adr >> 8) != ((adr + cpu->x) >> 8);
+  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
   *low = ((cpu->db << 16) + adr + cpu->x) & 0xffffff;
   return ((cpu->db << 16) + adr + cpu->x + 1) & 0xffffff;
 }
 
 static uint32_t interp816_adrAby(Interp816* cpu, uint32_t* low, bool write) {
   uint16_t adr = interp816_readOpcodeWord(cpu);
-  if(write && (!cpu->xf || ((adr >> 8) != ((adr + cpu->y) >> 8)))) cpu->cyclesUsed++;
-  // x = 0 or page crossed, with writing opcode: 1 extra cycle
+  bool crossed = (adr >> 8) != ((adr + cpu->y) >> 8);
+  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
   *low = ((cpu->db << 16) + adr + cpu->y) & 0xffffff;
   return ((cpu->db << 16) + adr + cpu->y + 1) & 0xffffff;
 }

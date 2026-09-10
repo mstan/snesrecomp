@@ -412,6 +412,8 @@ static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static int      s_lle_unwind_owner_depth = 0;
+static int      s_lle_unwind_is_deadline = 0;
+static int      s_lle_next_unwind_is_deadline = 0;
 static uint32_t s_lle_resume_pc24   = 0;
 static int      s_lle_wai_yield     = 0;
 static int      s_lle_quiescent_yield = 0;
@@ -522,9 +524,13 @@ void interp_bridge_set_master_deadline(uint64_t master_clock) {
 }
 
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
-    return cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
-           s_lle_master_deadline != 0 &&
-           cpu->master_cycles >= s_lle_master_deadline;
+    const int reached =
+        cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
+        s_lle_master_deadline != 0 &&
+        cpu->master_cycles >= s_lle_master_deadline;
+    if (reached)
+        s_lle_next_unwind_is_deadline = 1;
+    return reached;
 }
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
@@ -538,6 +544,8 @@ RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     s_lle_unwind_active = 1;
     s_lle_unwind_pc24   = resume_pc24 & 0xFFFFFFu;
     s_lle_unwind_owner_depth = s_interp_bounce_owner_depth;
+    s_lle_unwind_is_deadline = s_lle_next_unwind_is_deadline;
+    s_lle_next_unwind_is_deadline = 0;
     return (RecompReturn)RECOMP_RETURN_LLE_UNWIND_BASE;
 }
 
@@ -1891,6 +1899,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 if (_air != RECOMP_RETURN_NORMAL) {
                     if (s_lle_unwind_active) {
                         if (s_lle_unwind_owner_depth == s_interp_bridge_depth) {
+                            if (s_lle_unwind_is_deadline) {
+                                s_lle_resume_pc24 = s_lle_unwind_pc24;
+                                s_lle_unwind_active = 0;
+                                s_lle_unwind_owner_depth = 0;
+                                s_lle_unwind_is_deadline = 0;
+                                sync_interp_to_cpu(&in, cpu);
+                                bridge_apu_flush(cpu);
+                                return 1;
+                            }
                             if (getenv("SNESRECOMP_YIELD_STACK_DIAG") &&
                                 snes_frame_counter >= 5390) {
                                 fprintf(stderr,
@@ -1911,6 +1928,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                              * switch runs byte-exact. */
                             s_lle_unwind_active = 0;
                             s_lle_unwind_owner_depth = 0;
+                            s_lle_unwind_is_deadline = 0;
                             sync_cpu_to_interp(cpu, &in);
                             in.k  = (uint8)((s_lle_unwind_pc24 >> 16) & 0xFF);
                             in.pc = (uint16)(s_lle_unwind_pc24 & 0xFFFF);
@@ -2081,6 +2099,32 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     return 0;
 }
 
+/* Each bridge run installs a stable interpreted-function name so debug write
+ * attribution does not leak an enclosing AOT frame. */
+extern const char *g_last_recomp_func;
+#define INTERP_SCOPE_NAMES 4096u
+static char s_interp_scope_names[INTERP_SCOPE_NAMES][20];
+static uint32_t s_interp_scope_pc[INTERP_SCOPE_NAMES];
+static uint8_t s_interp_scope_used[INTERP_SCOPE_NAMES];
+
+static const char *interp_scope_name(uint32_t pc24) {
+    pc24 &= 0xFFFFFFu;
+    uint32_t slot = (pc24 * 2654435761u) & (INTERP_SCOPE_NAMES - 1u);
+    for (uint32_t probe = 0; probe < INTERP_SCOPE_NAMES; probe++) {
+        uint32_t i = (slot + probe) & (INTERP_SCOPE_NAMES - 1u);
+        if (!s_interp_scope_used[i]) {
+            s_interp_scope_used[i] = 1;
+            s_interp_scope_pc[i] = pc24;
+            snprintf(s_interp_scope_names[i], sizeof(s_interp_scope_names[i]),
+                     "interp@$%06X", (unsigned)pc24);
+            return s_interp_scope_names[i];
+        }
+        if (s_interp_scope_pc[i] == pc24)
+            return s_interp_scope_names[i];
+    }
+    return "interp@(table full)";
+}
+
 /* Wrapper: mark the interp tier as APU-driving for the whole run (nesting-safe
  * save/restore) so rtl_accumulate_apu_catchup skips the per-touch synthetic
  * estimate — the core advances the SPC per opcode instead. */
@@ -2105,11 +2149,17 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     s_interp_owner_exit_s = s_exit;
     s_interp_owner_exit_valid = 1;
     s_interp_bridge_depth++;
+    const char *_saved_func = g_last_recomp_func;
+    const char *_scope_name = interp_scope_name(entry_pc24);
+    g_last_recomp_func = _scope_name;
+    RecompStackPush(_scope_name);
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
+    RecompStackPop();
+    g_last_recomp_func = _saved_func;
     s_interp_bridge_depth--;
     s_interp_owner_exit_s = _saved_owner_exit_s;
     s_interp_owner_exit_valid = _saved_owner_exit_valid;
@@ -2121,6 +2171,8 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
         if (s_lle_unwind_active) {
             s_lle_unwind_active = 0;
             s_lle_unwind_owner_depth = 0;
+            s_lle_unwind_is_deadline = 0;
+            s_lle_next_unwind_is_deadline = 0;
             fprintf(stderr, "[interp_bridge] stale LLE yield unwind cleared "
                     "at scheduler exit (pc=$%06X)\n",
                     (unsigned)s_lle_unwind_pc24);
