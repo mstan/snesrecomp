@@ -18,7 +18,9 @@ else()
     target_link_libraries(snesref PRIVATE PkgConfig::SDL2)
 endif()
 
-if(CMAKE_DL_LIBS)
+# The loader uses LoadLibrary on all Windows toolchains.  MinGW exposes a
+# CMAKE_DL_LIBS value even though it does not ship libdl.
+if(CMAKE_DL_LIBS AND NOT WIN32 AND NOT MINGW AND NOT MSYS)
     target_link_libraries(snesref PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
