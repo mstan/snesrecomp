@@ -775,6 +775,36 @@ _TERMINATORS = frozenset({'RTS', 'RTL', 'RTI', 'STP', 'WAI', 'BRK'})
 _COND_BRANCHES = frozenset({'BPL', 'BMI', 'BVC', 'BVS', 'BCC', 'BCS', 'BNE', 'BEQ'})
 
 
+
+def _reject_unimplemented_pointer_mode(auth, site_pc24, insn, consumer):
+    """Fail loudly when a cfg indirect_dispatch names a pointer mode this
+    site's opcode cannot implement.
+
+    The pointer modes are opcode-scoped: `rtsstack` is recognised only on a
+    PEI site (the PEI;RTS synthetic-frame idiom). Before this check, a
+    `rtsstack` directive on any other opcode was accepted by the cfg loader,
+    silently dropped here, and then handled by the GENERIC indexed path --
+    which selects a target with `_idx = cpu->X / entry_size`. That produces C
+    that compiles, links and runs, and dispatches on a register having nothing
+    to do with the intended selector.
+
+    Measured cost of the silence (GWED $00:8F77, a `JML [$00E0]` whose target
+    is a rewritten return address): the build reached 66% AOT share and wiped
+    the screen at f3127 behind a runaway stack leak, because case 0 fired for
+    almost every call. Nothing in the toolchain said the directive had been
+    ignored -- the fault was only visible by reading the emitted C.
+    """
+    if not auth.get('rts_stack'):
+        return
+    raise ValueError(
+        f"indirect_dispatch at ${site_pc24:06X}: `rtsstack` is implemented "
+        f"only for a PEI site (the PEI;RTS synthetic-frame idiom), but this "
+        f"site is {insn.mnem} (reached by the {consumer} handler). It would "
+        f"otherwise be silently ignored and the site dispatched by INDEX on "
+        f"{auth.get('idx_reg', 'X')}, which is not the intended selector. If "
+        f"the target is derived from a return address, it is a function of "
+        f"the CALLER and no indexed target list at this site can express it.")
+
 def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
                                        auth: dict) -> Optional[List[int]]:
     """Read N dispatch targets from ROM per the cfg `indirect_dispatch`
@@ -2441,6 +2471,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                             '_single_target': True,
                         }
             if auth is not None:
+                _reject_unimplemented_pointer_mode(
+                    auth, site_pc24, insn, 'JMP/JML indirect')
                 entries = _resolve_indirect_dispatch_targets(
                     rom, bank, insn, auth)
                 if entries is not None:
@@ -2612,6 +2644,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             site_pc24 = (bank << 16) | pc
             auth = (indirect_dispatch or {}).get(site_pc24)
             if auth is not None:
+                _reject_unimplemented_pointer_mode(
+                    auth, site_pc24, insn, 'PHA RTS-stack')
                 entries = _resolve_indirect_dispatch_targets(
                     rom, bank, insn, auth)
                 if entries is not None:
