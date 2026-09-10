@@ -6030,9 +6030,18 @@ static void cmd_dispatch_log_get(const char *args) {
  *     dispatch_total : all runtime indirect dispatches
  *     found1/found0  : hit an exact AOT body / fell to the interp tier
  *     found0_pct     : found0 as % of dispatch_total (interp-fallback rate)
- *     tier_hits      : total interp tier-down invocations
+ *     tier_hits      : tier-downs entered from a GENERATED dispatch default,
+ *                      i.e. the five interp_tier_* entry points. NOT a total:
+ *                      the interpreter's own in-loop gap discovery
+ *                      (TIER2_KIND_GOTO_GAP, TIER2_KIND_CALL_GAP) records
+ *                      into the tier-2 manifest without passing through them,
+ *                      so a config whose gaps are all found that way reads
+ *                      tier_hits:0 next to a large tier2_clean. That is not a
+ *                      contradiction -- they count different things, and the
+ *                      manifest, not this counter, is the complete record.
  *     tier2_sites    : distinct (site,target,m/x) interp gaps
- *     tier2_clean/bail : summed clean vs bail (bail = interp step-cap = risk)
+ *     tier2_clean/bail : summed clean vs bail (bail = interp step-cap = risk).
+ *                      Recorded from every gap path, so this IS the total.
  */
 extern unsigned cpu_dispatch_log_count(void);
 extern void cpu_dispatch_found_totals(uint64_t *found1, uint64_t *found0);
