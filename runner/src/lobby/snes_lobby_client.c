@@ -97,6 +97,25 @@ int  snes_lobby_match_blocked_by_mods(char *w, size_t wc, char *t, size_t tc)
 int  snes_lobby_local_missing_mods(void) { return 0; }
 int  snes_lobby_set_match_caps(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_member_count(void) { return 0; }
+void snes_lobby_set_disc_fp(const char *hex) { (void)hex; }
+const char *snes_lobby_disc_fp(void) { return ""; }
+/* Automatch: absent without a lobby, and IDLE is the resting state that
+ * means exactly that -- a build that never queues sits in it forever. */
+int  snes_lobby_automatch_request_rulesets(void) { return -1; }
+int  snes_lobby_automatch_available(void) { return 0; }
+int  snes_lobby_automatch_ruleset_count(void) { return 0; }
+int  snes_lobby_automatch_ruleset_get(int i, SnesLobbyRuleset *out)
+{ (void)i; (void)out; return 0; }
+int  snes_lobby_automatch_queue(const char *r, int m) { (void)r; (void)m; return -1; }
+int  snes_lobby_automatch_cancel(void) { return -1; }
+int  snes_lobby_automatch_state(void) { return SNES_LOBBY_AUTOMATCH_IDLE; }
+int  snes_lobby_automatch_queued_secs(void) { return 0; }
+int  snes_lobby_automatch_pool(void) { return 0; }
+int  snes_lobby_automatch_found_get(SnesLobbyAutomatchFound *out)
+{ (void)out; return 0; }
+int  snes_lobby_automatch_accept(int a) { (void)a; return -1; }
+void snes_lobby_automatch_refuse_local(const char *w) { (void)w; }
+const char *snes_lobby_automatch_error(void) { return ""; }
 int  snes_lobby_send_chat(const char *text) { (void)text; return -1; }
 int  snes_lobby_send_server_chat(const char *text) { (void)text; return -1; }
 int  snes_lobby_server_chat_count(void) { return 0; }
@@ -350,10 +369,448 @@ static uint64_t lobby_mono_ms(void)
 /* Defined later; used by waiting-room RTT signal handling. */
 int snes_lobby_send_signal(int type, int flag, const char *text);
 
+
 static LobbyClient g_lc = {
     .fd = -1,
     .filter_game_version = SNES_GAME_VERSION,
 };
+
+/* ── Automatch state ────────────────────────────────────────────────────────
+ *
+ * Deliberately its own struct rather than more fields on LobbyClient: none of
+ * it is lobby membership, its lifetime is the queue rather than the room, and
+ * a `joined` arriving from a pairing must clear it without disturbing the room
+ * state that the same message is setting up.
+ */
+typedef struct {
+    int  have_rulesets;          /* a rulesets_ok has been seen at all */
+    /* A rulesets query is out. The launcher polls availability EVERY
+     * FRAME while the netplay page is up, so without this the gap
+     * before the first reply becomes a request per frame -- measured
+     * as seven answers to one question. */
+    int  rulesets_in_flight;
+    int  ruleset_count;
+    SnesLobbyRuleset rulesets[SNES_LOBBY_MAX_RULESETS];
+
+    int  state;                  /* SNES_LOBBY_AUTOMATCH_* */
+    char ticket_id[SNES_LOBBY_ID_LEN];
+    int  queued_secs;
+    int  pool;
+    char error[160];
+
+    SnesLobbyAutomatchFound found;
+
+    /* Where to send the latency probe, published on rulesets_ok and again on
+     * automatch_queued. Kept from whichever arrived last. */
+    char probe_host[128];
+    int  probe_port;
+    unsigned probe_magic;
+    int  probe_type;
+    /* The measurement, and the nonce that identifies our outstanding probe. */
+    int      rtt_ms;             /* <0 = not measured yet */
+    uint32_t probe_nonce;
+    uint64_t probe_sent_ms;      /* 0 = none outstanding */
+    int      probe_socket;       /* -1 = not open */
+    int      rtt_reported;       /* the server has our number */
+    /* A queue op is out and its answer -- automatch_queued, or an error --
+     * has not arrived. Without it a refusal of the FIRST queue attempt
+     * (need_account is the common one) would arrive while state is still
+     * IDLE and be filed as somebody else's error. */
+    int      queue_in_flight;
+} LobbyAutomatch;
+
+static LobbyAutomatch g_am = { .rtt_ms = -1, .probe_socket = -1 };
+
+static void automatch_reset_queue_state(void)
+{
+    g_am.state = SNES_LOBBY_AUTOMATCH_IDLE;
+    g_am.queue_in_flight = 0;
+    g_am.ticket_id[0] = '\0';
+    g_am.queued_secs = 0;
+    g_am.pool = 0;
+    g_am.rtt_reported = 0;
+    memset(&g_am.found, 0, sizeof(g_am.found));
+}
+
+static void automatch_fail(const char *why)
+{
+    g_am.state = SNES_LOBBY_AUTOMATCH_FAILED;
+    snprintf(g_am.error, sizeof(g_am.error), "%s", why ? why : "automatch failed");
+    fprintf(stderr, "snes_lobby: automatch failed: %s\n", g_am.error);
+}
+
+/* ── Latency probe ──────────────────────────────────────────────────────────
+ *
+ * Every online match goes through one relay, so the only latency that matters
+ * is each peer -> relay, and a ticket can be qualified on its own before any
+ * pairing. The relay answers packet type 200 with 201 -- the same 14 bytes
+ * back, nonce included -- BEFORE any session lookup, precisely so a client
+ * sitting in a queue with no session can measure the path.
+ *
+ * Fire-and-forget over an unconnected UDP socket, polled from the same pump
+ * as the WebSocket. A reply that never comes costs one socket and a number
+ * that stays -1: a ticket that has not measured is held out of pairing for a
+ * few seconds and then matches anyway, so a silent relay delays a match
+ * rather than preventing one.
+ *
+ * The value is CLIENT-REPORTED, and the server clamps it. Reporting high to
+ * force delay on an opponent is the grief case; reporting low only stalls the
+ * liar's own sim, which is its own answer.
+ */
+#define AUTOMATCH_PROBE_LEN 14
+
+static int set_nonblock(int fd);   /* defined with the WS socket helpers */
+static const char *effective_game_version(const char *override_ver);
+static void queue_send(const char *json);
+static const char *json_get_str(const char *json, const char *key, char *out, size_t cap);
+static int json_get_int(const char *json, const char *key, int def);
+static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
+static size_t json_escape(const char *in, char *out, size_t cap);
+static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out);
+
+static void automatch_probe_close(void)
+{
+    if (g_am.probe_socket >= 0) {
+        close(g_am.probe_socket);
+        g_am.probe_socket = -1;
+    }
+    g_am.probe_sent_ms = 0;
+}
+
+/*
+ * The 14-byte probe: magic, type, then a nonce.
+ *
+ * LITTLE-ENDIAN, because that is what the relay's header is (`read_u32_le` /
+ * `read_u16_le` in input_relay.rs) -- and a big-endian magic is simply not
+ * this protocol's magic, so the packet is dropped on the `magic` counter
+ * with no reply and nothing to see from here but a timeout. The nonce sits at
+ * offset 6, where an ordinary packet carries its session id; the relay echoes
+ * those bytes untouched and only rewrites the type, so it comes back as sent.
+ */
+static void automatch_probe_pack(unsigned char *out, uint32_t nonce)
+{
+    const unsigned magic = g_am.probe_magic;
+    const int type = g_am.probe_type ? g_am.probe_type : 200;
+    memset(out, 0, AUTOMATCH_PROBE_LEN);
+    out[0] = (unsigned char)(magic & 0xFF);
+    out[1] = (unsigned char)((magic >> 8) & 0xFF);
+    out[2] = (unsigned char)((magic >> 16) & 0xFF);
+    out[3] = (unsigned char)((magic >> 24) & 0xFF);
+    out[4] = (unsigned char)(type & 0xFF);
+    out[5] = (unsigned char)((type >> 8) & 0xFF);
+    out[6] = (unsigned char)(nonce & 0xFF);
+    out[7] = (unsigned char)((nonce >> 8) & 0xFF);
+    out[8] = (unsigned char)((nonce >> 16) & 0xFF);
+    out[9] = (unsigned char)((nonce >> 24) & 0xFF);
+}
+
+static int automatch_probe_send(void)
+{
+    struct addrinfo hints, *res = NULL;
+    unsigned char pkt[AUTOMATCH_PROBE_LEN];
+    char portstr[16];
+    int fd;
+
+    if (!g_am.probe_host[0] || g_am.probe_port <= 0) return -1;
+    if (g_am.probe_sent_ms) return 0;   /* one outstanding at a time */
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    snprintf(portstr, sizeof(portstr), "%d", g_am.probe_port);
+    if (getaddrinfo(g_am.probe_host, portstr, &hints, &res) != 0 || !res)
+        return -1;
+
+    fd = (int)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    set_nonblock(fd);
+
+    /* A fresh nonce per attempt, so a late reply to a previous probe cannot
+     * be timed against this one's clock and report an absurdly low number. */
+    g_am.probe_nonce = (uint32_t)(lobby_mono_ms() * 2654435761u) ^ 0x9E3779B9u;
+    automatch_probe_pack(pkt, g_am.probe_nonce);
+
+    if (sendto(fd, (const char *)pkt, (int)sizeof(pkt), 0,
+               res->ai_addr, (int)res->ai_addrlen) < 0) {
+        close(fd);
+        freeaddrinfo(res);
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    automatch_probe_close();
+    g_am.probe_socket = fd;
+    g_am.probe_sent_ms = lobby_mono_ms();
+    return 0;
+}
+
+static void automatch_send_rtt(void);
+
+/* Polled every pump. Times the 201 reply, or gives up after 2 s. */
+static void automatch_probe_poll(void)
+{
+    unsigned char buf[64];
+    uint64_t now;
+
+    if (g_am.probe_socket < 0 || !g_am.probe_sent_ms) return;
+    now = lobby_mono_ms();
+
+    for (;;) {
+        int n = (int)recv(g_am.probe_socket, (char *)buf, (int)sizeof(buf), 0);
+        if (n < 0) break;
+        if (n < 10) continue;
+        /* Match the nonce: the socket is unconnected and anything can arrive
+         * on it, and an unrelated packet timed as our reply is a wrong number
+         * reported as fact. */
+        if (((uint32_t)buf[6] | (uint32_t)buf[7] << 8 |
+             (uint32_t)buf[8] << 16 | (uint32_t)buf[9] << 24) != g_am.probe_nonce)
+            continue;
+        g_am.rtt_ms = (int)(now - g_am.probe_sent_ms);
+        if (g_am.rtt_ms < 0) g_am.rtt_ms = 0;
+        if (g_am.rtt_ms > 2000) g_am.rtt_ms = 2000;   /* the server clamps here too */
+        fprintf(stderr, "snes_lobby: automatch probe %s:%d rtt=%d ms\n",
+                g_am.probe_host, g_am.probe_port, g_am.rtt_ms);
+        automatch_probe_close();
+        /* Queued already? Then the ticket was enqueued on an unknown latency
+         * and the server is holding it out of pairing for the probe grace --
+         * tell it now rather than letting the grace lapse. */
+        if (g_am.state == SNES_LOBBY_AUTOMATCH_QUEUED) automatch_send_rtt();
+        return;
+    }
+    if (now - g_am.probe_sent_ms > 2000) {
+        fprintf(stderr, "snes_lobby: automatch probe timed out (%s:%d) -- "
+                        "queueing without a latency estimate\n",
+                g_am.probe_host, g_am.probe_port);
+        automatch_probe_close();
+    }
+}
+
+static char g_disc_fp[65];
+
+void snes_lobby_set_disc_fp(const char *hex)
+{
+    size_t i;
+    g_disc_fp[0] = '\0';
+    if (!hex) return;
+    /* Validated, not trusted: the wire contract is 64 lower-case hex, and a
+     * malformed value would be refused by the server as need_disc_fp far from
+     * where it was set. Accept upper-case by folding it, refuse anything else
+     * outright rather than sending a fingerprint that names nothing. */
+    if (strlen(hex) != 64) return;
+    for (i = 0; i < 64; ++i) {
+        char c = hex[i];
+        if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            g_disc_fp[0] = '\0';
+            return;
+        }
+        g_disc_fp[i] = c;
+    }
+    g_disc_fp[64] = '\0';
+    fprintf(stderr, "snes_lobby: rom fingerprint %.16s... (disc_fp)\n", g_disc_fp);
+}
+
+const char *snes_lobby_disc_fp(void) { return g_disc_fp; }
+
+/* Walk to the next {...} in an array, copying it out. Returns 0 at ']'. */
+static int automatch_next_object(const char **pp, char *out, size_t cap)
+{
+    const char *p = *pp;
+    const char *start;
+    int depth = 0;
+    size_t n;
+
+    while (*p && *p != '{') {
+        if (*p == ']') { *pp = p; return 0; }
+        ++p;
+    }
+    if (*p != '{') { *pp = p; return 0; }
+    start = p;
+    do {
+        if (*p == '{') ++depth;
+        else if (*p == '}') --depth;
+        ++p;
+    } while (*p && depth > 0);
+    n = (size_t)(p - start);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    *pp = p;
+    return 1;
+}
+
+/* `probe: { endpoint, magic, type }` -- where to measure the path. Published
+ * on both rulesets_ok and queued, and taken from whichever arrived last. */
+static void automatch_ingest_probe(const char *obj)
+{
+    char endpoint[160];
+    char *colon;
+    endpoint[0] = '\0';
+    json_get_str(obj, "endpoint", endpoint, sizeof(endpoint));
+    /* Rightmost colon: an IPv6 literal has several, and the port is last. */
+    colon = strrchr(endpoint, ':');
+    if (!colon || !colon[1]) return;
+    *colon = '\0';
+    snprintf(g_am.probe_host, sizeof(g_am.probe_host), "%s", endpoint);
+    g_am.probe_port = atoi(colon + 1);
+    g_am.probe_magic = (unsigned)json_get_int(obj, "magic", 0);
+    g_am.probe_type = json_get_int(obj, "type", 200);
+}
+
+/* `titles: [ { ..., pool: N } ]` -- this host queues one title, so the first
+ * row is the one the player is waiting in. */
+static int automatch_first_pool(const char *json)
+{
+    const char *p = strstr(json, "\"titles\"");
+    char obj[512];
+    if (!p) return g_am.pool;
+    p = strchr(p, '[');
+    if (!p) return g_am.pool;
+    ++p;
+    if (!automatch_next_object(&p, obj, sizeof(obj))) return 0;
+    return json_get_int(obj, "pool", 0);
+}
+
+static void automatch_send_rtt(void)
+{
+    char msg[128];
+    if (g_am.rtt_ms < 0 || g_am.rtt_reported) return;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"automatch_rtt\",\"rtt_ms\":%d}", g_am.rtt_ms);
+    queue_send(msg);
+    g_am.rtt_reported = 1;
+}
+
+int snes_lobby_automatch_request_rulesets(void)
+{
+    char msg[256];
+    char gn_esc[SNES_LOBBY_NAME_LEN * 2 + 4];
+    const char *gn = g_lc.filter_game_name;
+    if (!gn || !gn[0]) return -1;
+    if (g_am.rulesets_in_flight) return 0;
+    json_escape(gn, gn_esc, sizeof(gn_esc));
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"automatch_rulesets\",\"game_name\":\"%s\"}", gn_esc);
+    queue_send(msg);
+    g_am.rulesets_in_flight = 1;
+    return 0;
+}
+
+int snes_lobby_automatch_available(void)
+{
+    /* Zero rulesets is a real answer and means the same as "no": this
+     * deployment has none loaded for this title. Not having ASKED yet is also
+     * no -- the button must not be offered on an assumption. */
+    return g_am.have_rulesets && g_am.ruleset_count > 0;
+}
+
+int snes_lobby_automatch_ruleset_count(void) { return g_am.ruleset_count; }
+
+int snes_lobby_automatch_ruleset_get(int index, SnesLobbyRuleset *out)
+{
+    if (!out || index < 0 || index >= g_am.ruleset_count) return 0;
+    *out = g_am.rulesets[index];
+    return 1;
+}
+
+int snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled)
+{
+    char msg[1024];
+    char gn_esc[SNES_LOBBY_NAME_LEN * 2 + 4];
+    char gv_esc[SNES_LOBBY_VERSION_LEN * 2 + 4];
+    char rid_esc[SNES_LOBBY_RULESET_ID_LEN * 2 + 4];
+    const char *rid = (ruleset_id && ruleset_id[0]) ? ruleset_id
+                      : (g_am.ruleset_count > 0 ? g_am.rulesets[0].id : "");
+    const char *disc_fp = snes_lobby_disc_fp();
+    char rtt[48];
+
+    if (!g_lc.connected) return -1;
+    if (!rid[0]) return -1;
+    if (g_am.state == SNES_LOBBY_AUTOMATCH_QUEUED ||
+        g_am.state == SNES_LOBBY_AUTOMATCH_FOUND)
+        return -1;
+    /* The queue key REQUIRES a fingerprint: in `join` an empty one means
+     * "legacy host, no check", and a wildcard in a queue silently pairs a
+     * different dump against this one. Refuse here rather than let the server
+     * answer need_disc_fp, so the reason is available before the round trip. */
+    if (!disc_fp || strlen(disc_fp) != 64) {
+        automatch_fail("this build cannot fingerprint its ROM, so it cannot queue");
+        return -1;
+    }
+
+    json_escape(g_lc.filter_game_name, gn_esc, sizeof(gn_esc));
+    json_escape(effective_game_version(NULL), gv_esc, sizeof(gv_esc));
+    json_escape(rid, rid_esc, sizeof(rid_esc));
+
+    /* Measure before queueing when we can: a client that probes first never
+     * waits out the server's probe grace at all. */
+    if (g_am.rtt_ms < 0) automatch_probe_send();
+    rtt[0] = '\0';
+    if (g_am.rtt_ms >= 0)
+        snprintf(rtt, sizeof(rtt), ",\"rtt_ms\":%d", g_am.rtt_ms);
+
+    /* One title: this host runs one game. A multi-title launcher sends
+     * several here, in preference order; the wire has always allowed it. */
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"automatch_queue\",\"titles\":[{"
+             "\"game_name\":\"%s\",\"game_version\":\"%s\","
+             "\"disc_fp\":\"%s\",\"ruleset_id\":\"%s\",\"max_slots\":2}],"
+             "\"mods_enabled\":%s%s}",
+             gn_esc, gv_esc, disc_fp, rid_esc,
+             mods_enabled ? "true" : "false", rtt);
+    queue_send(msg);
+    g_am.error[0] = '\0';
+    g_am.queue_in_flight = 1;
+    g_am.rtt_reported = (g_am.rtt_ms >= 0);
+    return 0;
+}
+
+int snes_lobby_automatch_cancel(void)
+{
+    if (!g_lc.connected) return -1;
+    queue_send("{\"op\":\"automatch_cancel\"}");
+    return 0;
+}
+
+int snes_lobby_automatch_state(void) { return g_am.state; }
+int snes_lobby_automatch_queued_secs(void) { return g_am.queued_secs; }
+int snes_lobby_automatch_pool(void) { return g_am.pool; }
+
+int snes_lobby_automatch_found_get(SnesLobbyAutomatchFound *out)
+{
+    if (!out || g_am.state != SNES_LOBBY_AUTOMATCH_FOUND) return 0;
+    *out = g_am.found;
+    return 1;
+}
+
+int snes_lobby_automatch_accept(int accept)
+{
+    char msg[160];
+    char tid_esc[SNES_LOBBY_ID_LEN * 2 + 4];
+    if (!g_lc.connected) return -1;
+    if (g_am.state != SNES_LOBBY_AUTOMATCH_FOUND) return -1;
+    /* The ticket id is echoed so a late answer to a LAPSED offer is discarded
+     * rather than applied to whatever offer is current by then. */
+    json_escape(g_am.ticket_id, tid_esc, sizeof(tid_esc));
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"automatch_accept\",\"ticket_id\":\"%s\","
+             "\"accept\":%s}", tid_esc, accept ? "true" : "false");
+    queue_send(msg);
+    if (accept) {
+        g_am.state = SNES_LOBBY_AUTOMATCH_ACCEPTED;
+    } else {
+        /* Declining ends the ticket. The strike is the server's to record. */
+        automatch_reset_queue_state();
+    }
+    return 0;
+}
+
+void snes_lobby_automatch_refuse_local(const char *why)
+{
+    automatch_fail(why);
+}
+
+const char *snes_lobby_automatch_error(void) { return g_am.error; }
 
 static void member_rtt_clear(void)
 {
@@ -455,17 +912,38 @@ static const char *effective_game_version(const char *override_ver)
     return SNES_GAME_VERSION;
 }
 
+static const char *identity_version_override(void);   /* fwd */
+
 static int list_filter_version_strict(void)
 {
-    /* Any dev build lists UNFILTERED, including the "dev+<sha>" ones.
+    /* A run under SNES_NET_GAME_VERSION lists UNFILTERED whatever the pin
+     * looks like. The override exists to put two development machines in one
+     * pool, and the mistake that session invites is setting it on ONE of them
+     * -- at which point strict filtering hides the other's lobby and hands
+     * back exactly the "my friend's lobby isn't showing up" symptom the rest
+     * of this function exists to prevent, in the situation least able to
+     * afford it. Show every lobby and let the join explain the mismatch. */
+    if (identity_version_override()) return 0;
+
+    /* Otherwise: any build that is not a plain released version lists
+     * UNFILTERED.
      *
      * The version pin is still enforced -- the server refuses the join with
      * version_mismatch -- but a filtered list would hide the mismatched lobby
      * instead of explaining it, and "my friend's lobby isn't showing up" is a
-     * much worse thing to debug than "this lobby is a different build". Prefix,
-     * not equality: dev+abc12345 and dev+abc12345-dirty are both dev. */
+     * much worse thing to debug than "this lobby is a different build".
+     *
+     * The test is the QUALIFIER, not a "dev" prefix. A pin is unqualified only
+     * for a clean release build ("0.1.5"); every other shape carries a '+' and
+     * what follows it: "dev+abc12345", "dev+abc12345-dirty.1234abcd", and --
+     * the case the old prefix test missed -- "0.1.5+abc12345-dirty.1234abcd",
+     * which is what CMake stamps for a Release-TYPE build from a modified
+     * tree. That is an ordinary local build, and it was being classified as a
+     * release and silently filtering every other build out of its own lobby
+     * list, which is precisely the debugging pain this function exists to
+     * prevent. */
     const char *gv = effective_game_version(NULL);
-    return gv && gv[0] && strncmp(gv, "dev", 3) != 0;
+    return gv && gv[0] && strchr(gv, '+') == NULL;
 }
 
 static void queue_send(const char *json);
@@ -1639,6 +2117,16 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "joined") == 0) {
         snes_lobby_chat_clear();
+        /* A ticket that reached a room is spent. `joined` is that moment for
+         * automatch (docs/AUTOMATCH.md 8: automatch_accept_ok -> both accepted
+         * -> joined -> lobby_update -> launch), and nothing else used to leave
+         * ACCEPTED: the state survived the whole match and the accept gate
+         * reopened over the lobby list on the way out, offering to wait for a
+         * peer to answer an offer the server had closed to create this room.
+         * Not an automatch special case -- the server refuses to queue an
+         * account that is already in a lobby (`already_in_lobby`), so holding
+         * a ticket and being seated are mutually exclusive either way. */
+        automatch_reset_queue_state();
         g_lc.in_lobby = 1;
         g_lc.is_host = 0;
         g_lc.join.ok = 1;
@@ -1901,8 +2389,148 @@ static void handle_server_json(const char *json)
                     "a plan it could not parse -- check the host's build\n");
         return;
     }
+    /* ── automatch ─────────────────────────────────────────────────────── */
+    if (strcmp(op, "automatch_rulesets_ok") == 0) {
+        const char *p2 = strstr(json, "\"rulesets\"");
+        char probe[256];
+        int n = 0;
+        g_am.have_rulesets = 1;
+        g_am.rulesets_in_flight = 0;
+        g_am.ruleset_count = 0;
+        if (json_extract_object(json, "probe", probe, sizeof(probe)))
+            automatch_ingest_probe(probe);
+        if (!p2) return;
+        p2 = strchr(p2, '[');
+        if (!p2) return;
+        ++p2;
+        while (*p2 && n < SNES_LOBBY_MAX_RULESETS) {
+            char obj[1024];
+            if (!automatch_next_object(&p2, obj, sizeof(obj))) break;
+            {
+                SnesLobbyRuleset *r = &g_am.rulesets[n];
+                char caps[512];
+                memset(r, 0, sizeof(*r));
+                json_get_str(obj, "id", r->id, sizeof(r->id));
+                json_get_str(obj, "label", r->label, sizeof(r->label));
+                json_get_str(obj, "caps_summary", r->caps_summary,
+                             sizeof(r->caps_summary));
+                json_get_str(obj, "game_version", r->game_version,
+                             sizeof(r->game_version));
+                if (json_extract_object(obj, "match_caps", caps, sizeof(caps)))
+                    parse_match_caps_object(caps, &r->caps);
+                if (r->id[0]) ++n;
+            }
+        }
+        g_am.ruleset_count = n;
+        fprintf(stderr, "snes_lobby: automatch %d ruleset(s) for \"%s\"\n",
+                n, g_lc.filter_game_name);
+        /* Measure now rather than at queue time: a client that has already
+         * probed never waits out the server's probe grace. */
+        if (n > 0 && g_am.rtt_ms < 0) automatch_probe_send();
+        return;
+    }
+    if (strcmp(op, "automatch_queued") == 0) {
+        char probe[256];
+        g_am.state = SNES_LOBBY_AUTOMATCH_QUEUED;
+        g_am.error[0] = '\0';
+        g_am.queue_in_flight = 0;
+        json_get_str(json, "ticket_id", g_am.ticket_id, sizeof(g_am.ticket_id));
+        g_am.queued_secs = 0;
+        g_am.pool = automatch_first_pool(json);
+        if (json_extract_object(json, "probe", probe, sizeof(probe)))
+            automatch_ingest_probe(probe);
+        if (g_am.rtt_ms < 0) automatch_probe_send();
+        else automatch_send_rtt();
+        fprintf(stderr, "snes_lobby: automatch queued (pool=%d)\n", g_am.pool);
+        return;
+    }
+    if (strcmp(op, "automatch_status") == 0) {
+        /* Pushed at most 1 Hz while queued. Not a state change: a status for
+         * a ticket we already gave up on must not resurrect the queue. */
+        if (g_am.state != SNES_LOBBY_AUTOMATCH_QUEUED) return;
+        g_am.queued_secs = json_get_int(json, "queued_secs", g_am.queued_secs);
+        g_am.pool = automatch_first_pool(json);
+        return;
+    }
+    if (strcmp(op, "automatch_found") == 0) {
+        memset(&g_am.found, 0, sizeof(g_am.found));
+        json_get_str(json, "ticket_id", g_am.ticket_id, sizeof(g_am.ticket_id));
+        json_get_str(json, "opponent", g_am.found.opponent,
+                     sizeof(g_am.found.opponent));
+        json_get_str(json, "opponent_country", g_am.found.opponent_country,
+                     sizeof(g_am.found.opponent_country));
+        json_get_str(json, "ruleset_id", g_am.found.ruleset_id,
+                     sizeof(g_am.found.ruleset_id));
+        json_get_str(json, "label", g_am.found.ruleset_label,
+                     sizeof(g_am.found.ruleset_label));
+        g_am.found.est_rtt_ms = json_get_int(json, "est_rtt_ms", 0);
+        g_am.found.accept_secs = json_get_int(json, "accept_secs", 15);
+        g_am.state = SNES_LOBBY_AUTOMATCH_FOUND;
+        fprintf(stderr, "snes_lobby: automatch found opponent=\"%s\" "
+                        "est_rtt=%d ms, %d s to answer\n",
+                g_am.found.opponent, g_am.found.est_rtt_ms,
+                g_am.found.accept_secs);
+        return;
+    }
+    if (strcmp(op, "automatch_accept_ok") == 0) {
+        g_am.state = SNES_LOBBY_AUTOMATCH_ACCEPTED;
+        return;
+    }
+    if (strcmp(op, "automatch_requeue") == 0) {
+        /* The other side declined or let it lapse. Back to waiting, with the
+         * ticket intact -- this is not a failure and must not read as one. */
+        g_am.state = SNES_LOBBY_AUTOMATCH_QUEUED;
+        memset(&g_am.found, 0, sizeof(g_am.found));
+        g_am.pool = automatch_first_pool(json);
+        fprintf(stderr, "snes_lobby: automatch re-queued (the offer lapsed)\n");
+        return;
+    }
+    if (strcmp(op, "automatch_cancelled") == 0) {
+        automatch_reset_queue_state();
+        return;
+    }
+    if (strcmp(op, "automatch_rtt_ok") == 0) {
+        return;   /* acknowledgement only */
+    }
     if (strcmp(op, "error") == 0) {
         json_get_str(json, "code", g_lc.join.last_error, sizeof(g_lc.join.last_error));
+        /* An automatch refusal arrives as a plain error, so it has to be
+         * claimed here or it would be filed as a join failure and the queue
+         * would sit waiting for a pairing that was never going to come. Only
+         * while an automatch attempt is actually in flight: these codes are
+         * automatch's, but `error` is everyone's. */
+        if (g_am.queue_in_flight ||
+            g_am.state == SNES_LOBBY_AUTOMATCH_QUEUED ||
+            g_am.state == SNES_LOBBY_AUTOMATCH_FOUND ||
+            g_am.state == SNES_LOBBY_AUTOMATCH_ACCEPTED) {
+            const char *code = g_lc.join.last_error;
+            const char *why = NULL;
+            char line[160];
+            if      (!strcmp(code, "need_account"))       why = "Sign in to use automatch";
+            else if (!strcmp(code, "automatch_off"))      why = "This server has no automatch queues";
+            else if (!strcmp(code, "already_queued"))     why = "This account is already in a queue";
+            else if (!strcmp(code, "already_in_lobby"))   why = "Leave the room first";
+            else if (!strcmp(code, "unknown_ruleset"))    why = "That queue type is gone -- refresh";
+            else if (!strcmp(code, "need_disc_fp"))       why = "The server needs a ROM fingerprint this build did not send";
+            else if (!strcmp(code, "version_not_pooled")) why = "This release is not the one this queue pools";
+            else if (!strcmp(code, "mods_not_pooled"))    why = "Turn off sim-affecting mods to queue";
+            else if (!strcmp(code, "slots_not_pooled"))   why = "Automatch is two-player only";
+            else if (!strcmp(code, "queue_full"))         why = "The queue is full -- try again shortly";
+            else if (!strcmp(code, "cooldown")) {
+                int retry = json_get_int(json, "retry_secs", 0);
+                if (retry > 0)
+                    snprintf(line, sizeof(line),
+                             "Declining put you on a %d s cooldown", retry);
+                else
+                    snprintf(line, sizeof(line), "You are on a queue cooldown");
+                why = line;
+            }
+            if (why) {
+                g_am.queue_in_flight = 0;
+                automatch_fail(why);
+                return;
+            }
+        }
         /* Keep seating valid: start/need_players/etc. must not block a later
          * successful op:launch from filling netplay_launch. */
         if (!g_lc.in_lobby)
@@ -1912,6 +2540,10 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
         strcmp(op, "kicked") == 0) {
         snes_lobby_chat_clear();
+        /* Leaving a room must never leave a queue ticket looking live. The
+         * reset on `joined` above should already have done this; repeating it
+         * here means a missed or reordered `joined` cannot strand the gate. */
+        automatch_reset_queue_state();
         g_lc.swap_in_valid = 0;
         g_lc.swap_out = 0;
         g_lc.in_lobby = 0;
@@ -2135,6 +2767,11 @@ void snes_lobby_pump(void)
      * before the connected() check: an agent mid-handshake still has to be
      * pumped so it can fail cleanly rather than hang if the WS drops. */
     snes_lobby_mod_xfer_pump();
+    /* Same reasoning as the transfer above: the probe runs while the player
+     * sits in a queue, which is a state with no session and no room, so
+     * nothing else would drive it. Before the connected() check so an
+     * outstanding probe still times out cleanly if the WS drops. */
+    automatch_probe_poll();
     if (!snes_lobby_connected()) {
         return;
     }
@@ -2220,15 +2857,61 @@ void snes_lobby_pump(void)
     }
 }
 
+/*
+ * SNES_NET_GAME_VERSION -- pin the announced version for one run.
+ *
+ * The derived pin deliberately makes two builds match ONLY when they really
+ * are the same build: a clean release is its tag, and a development build
+ * carries its commit plus a hash of its uncommitted diff. That is what stops
+ * two peers whose trees differ from pairing and then desyncing, and it must
+ * stay the default for anyone who does not ask otherwise.
+ *
+ * But it also makes DEVELOPMENT testing awkward. Two machines mid-change are
+ * exactly the pair that will not match, and reconfiguring both to agree means
+ * a CMake cache edit and a rebuild on each -- for a run whose whole purpose is
+ * to test the change that made them differ.
+ *
+ * So the override is here, deliberately as an environment variable: it is
+ * per-run rather than baked into an artifact, it takes an explicit act on both
+ * machines, and it announces itself loudly enough that nobody mistakes an
+ * overridden build for an honest one. It is a TESTING tool. Two peers who set
+ * it to the same string are asserting their builds agree; the runtime cannot
+ * check that for them, and a desync under an override is the answer to a
+ * question the override asked.
+ */
+static const char *identity_version_override(void)
+{
+    const char *e = getenv("SNES_NET_GAME_VERSION");
+    return (e && e[0]) ? e : NULL;
+}
+
 void snes_lobby_set_game_identity(const char *game_name,
                                   const char *game_version)
 {
+    const char *forced = identity_version_override();
+
     if (game_name) {
         strncpy(g_lc.filter_game_name, game_name,
                 sizeof(g_lc.filter_game_name) - 1);
         g_lc.filter_game_name[sizeof(g_lc.filter_game_name) - 1] = '\0';
     } else {
         g_lc.filter_game_name[0] = '\0';
+    }
+    if (forced) {
+        strncpy(g_lc.filter_game_version, forced,
+                sizeof(g_lc.filter_game_version) - 1);
+        g_lc.filter_game_version[sizeof(g_lc.filter_game_version) - 1] = '\0';
+        /* Said on every identity change, not once: the honest pin this is
+         * standing in for is the thing a later desync report needs, and a
+         * line printed only at startup is the line nobody scrolls back to. */
+        fprintf(stderr,
+                "snes_lobby: game_version FORCED to \"%s\" by "
+                "SNES_NET_GAME_VERSION (this build is really \"%s\"). "
+                "Testing override -- both peers must be the same build.\n",
+                g_lc.filter_game_version,
+                (game_version && game_version[0]) ? game_version
+                                                  : SNES_GAME_VERSION);
+        return;
     }
     if (game_version && game_version[0]) {
         strncpy(g_lc.filter_game_version, game_version,

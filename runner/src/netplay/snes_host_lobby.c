@@ -838,7 +838,7 @@ static void cb_pump(void *ctx)
    * rnet_account_init, and its own comment says "Init runs from the netplay
    * pump" -- but nothing called it. The linker then dead-stripped
    * rnet_account_init out of the binary entirely, so g.host stayed the
-   * zero-initialised empty string and every /auth/* POST died in
+   * zero-initialised empty string and every "/auth" POST died in
    * getaddrinfo("", "0"). That surfaces as "couldn't reach the lobby server
    * to sign in" no matter which host is configured, which is exactly the
    * wrong place to go looking.
@@ -1441,6 +1441,135 @@ static const char *cb_account_handle(void *ctx) { (void)ctx; return rnet_account
 static const char *cb_account_username(void *ctx) { (void)ctx; return rnet_account_username(); }
 static const char *cb_account_error(void *ctx) { (void)ctx; return rnet_account_error(); }
 static int cb_account_sign_out(void *ctx) { (void)ctx; return rnet_account_sign_out(); }
+/* ── automatch ──────────────────────────────────────────────────────────────
+ *
+ * Thin: the lobby client owns the protocol and the state machine, and this
+ * layer only translates its vocabulary into the launcher's. The one piece of
+ * POLICY here is mods_enabled -- see cb_automatch_queue.
+ */
+#if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
+static int cb_automatch_available(void *ctx)
+{
+    (void)ctx;
+    /* Ask once the answer could exist. The launcher polls this every frame
+     * while the netplay page is up, which is exactly when a reply is useful,
+     * and the client refuses to re-send while one is outstanding. */
+    if (snes_lobby_connected() && !snes_lobby_automatch_available())
+        snes_lobby_automatch_request_rulesets();
+    return snes_lobby_automatch_available();
+}
+
+static int cb_automatch_ruleset_count(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_ruleset_count();
+}
+
+static int cb_automatch_ruleset_get(void *ctx, int index,
+                                    RecompLauncherCNetplayRuleset *out)
+{
+    SnesLobbyRuleset r;
+    (void)ctx;
+    if (!out || !snes_lobby_automatch_ruleset_get(index, &r)) return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->id, sizeof(out->id), "%s", r.id);
+    snprintf(out->label, sizeof(out->label), "%s", r.label);
+    snprintf(out->caps_summary, sizeof(out->caps_summary), "%s", r.caps_summary);
+    snprintf(out->game_version, sizeof(out->game_version), "%s", r.game_version);
+    out->max_slots = 2;
+    return 1;
+}
+
+static int cb_automatch_queue(void *ctx, const char *ruleset_id)
+{
+    (void)ctx;
+    /*
+     * mods_enabled asserts that a SIM-AFFECTING mod feature is on locally
+     * BEYOND whatever the chosen ruleset itself imposes.
+     *
+     * The distinction matters and is not pedantry. A ruleset that pins the
+     * widescreen margin has both peers running the same patched sim by the
+     * server's own instruction -- that is the ruleset, not a divergence. A
+     * feature the ruleset says nothing about is a divergence, and it is the
+     * desync §5 is about.
+     *
+     * The server cannot check either one. It takes this client's word, and
+     * the assertion exists so that a modified client is making a deliberate
+     * false statement rather than exploiting an omission. Which is why the
+     * answer is computed by the GAME (SnesHostLobbyOpts.mods_enabled) rather
+     * than assumed here: only the game knows what its own features do.
+     */
+    char why[160];
+    int mods;
+    why[0] = '\0';
+    mods = g_opts.mods_enabled
+               ? g_opts.mods_enabled(g_opts.mods_ctx, ruleset_id, why, sizeof(why))
+               : 0;
+    if (mods) {
+        /* Refuse here rather than sending a ticket the server will certainly
+         * bounce: mods_not_pooled comes back as one generic line, and this
+         * side knows exactly which feature caused it. */
+        snes_lobby_automatch_refuse_local(
+            why[0] ? why : "Turn off sim-affecting mods to queue");
+        return -1;
+    }
+    return snes_lobby_automatch_queue(ruleset_id, 0) == 0 ? 0 : -1;
+}
+
+static int cb_automatch_cancel(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_cancel();
+}
+
+static int cb_automatch_state(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_state();
+}
+
+static int cb_automatch_queued_secs(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_queued_secs();
+}
+
+static int cb_automatch_pool(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_pool();
+}
+
+static int cb_automatch_found_get(void *ctx, RecompLauncherCNetplayFound *out)
+{
+    SnesLobbyAutomatchFound f;
+    (void)ctx;
+    if (!out || !snes_lobby_automatch_found_get(&f)) return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->handle, sizeof(out->handle), "%s", f.opponent);
+    snprintf(out->country, sizeof(out->country), "%s", f.opponent_country);
+    snprintf(out->ruleset_label, sizeof(out->ruleset_label), "%s",
+             f.ruleset_label);
+    /* <0 rather than 0 when the server offered none: zero is a legitimate
+     * estimate on a LAN and must not read as "unknown". */
+    out->est_rtt_ms = f.est_rtt_ms > 0 ? f.est_rtt_ms : -1;
+    out->accept_secs_left = f.accept_secs;
+    return 1;
+}
+
+static int cb_automatch_accept(void *ctx, int accept)
+{
+    (void)ctx;
+    return snes_lobby_automatch_accept(accept);
+}
+
+static const char *cb_automatch_error(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_error();
+}
+#endif /* RECOMP_LAUNCHER_HAS_AUTOMATCH */
+
 static int cb_account_set_handle(void *ctx, const char *h) {
     (void)ctx;
     return rnet_account_set_handle(h);
@@ -2374,6 +2503,21 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .account_error = cb_account_error,
     .account_sign_out = cb_account_sign_out,
     .account_set_handle = cb_account_set_handle,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
+    /* Guarded like the account block above, and for the same reason: this
+     * runner still builds against a recomp-ui that predates the callbacks. */
+    .automatch_available = cb_automatch_available,
+    .automatch_ruleset_count = cb_automatch_ruleset_count,
+    .automatch_ruleset_get = cb_automatch_ruleset_get,
+    .automatch_queue = cb_automatch_queue,
+    .automatch_cancel = cb_automatch_cancel,
+    .automatch_state = cb_automatch_state,
+    .automatch_queued_secs = cb_automatch_queued_secs,
+    .automatch_pool = cb_automatch_pool,
+    .automatch_found_get = cb_automatch_found_get,
+    .automatch_accept = cb_automatch_accept,
+    .automatch_error = cb_automatch_error,
 #endif
 };
 
