@@ -89,6 +89,15 @@ typedef struct SnesLobbyChatMsg {
     char     account[SNES_LOBBY_ID_LEN];
     char     from[SNES_LOBBY_NAME_LEN];
     char     text[SNES_LOBBY_CHAT_TEXT_LEN];
+    /* The SERVER's id for this line, and what snes_lobby_report_chat names.
+     * Empty for a system line, for a locally generated one, and for anything
+     * relayed by a server too old to assign one -- in all three cases the
+     * line cannot be reported, because there is no agreed referent for it.
+     *
+     * A report carries this and NOT the text: the server writes down what it
+     * relayed under this id. Sending the words would let a client fabricate a
+     * message and have somebody sanctioned for it. */
+    char     mid[40];
     int      is_local;
     int      is_system;
     uint32_t seq;
@@ -381,6 +390,25 @@ int  snes_lobby_local_wire_slot(void);
 /* ---- lobby chat --------------------------------------------------------
  * Spectators take part: the server fans a line out to everyone in the room,
  * and talking is not affecting the match. */
+/* Report somebody's chat line to the server for moderation.
+ *
+ * `mids` are SnesLobbyChatMsg.mid values -- several at once, because
+ * harassment is usually a burst rather than a line. An entry with an empty id
+ * is skipped; a line with no id cannot be reported at all. `reason` is one of
+ * RNET_REPORT_* (anything unrecognised is filed as "other" rather than
+ * refused); `note` is an optional sentence for whoever reads the queue.
+ *
+ * The text is never sent: see SnesLobbyChatMsg.mid.
+ *
+ * Returns 0 if the report was handed to the server. That is not the same as
+ * accepted -- the server refuses a line that has scrolled out of its ring
+ * ("message_expired"), one from a signed-out sender, one that is your own, and
+ * anything over the per-account rate limit. */
+/* Categories live in recomp_net/chat_report.h (RNET_REPORT_*), because they
+ * are the same list on every console and the server matches on them. */
+int  snes_lobby_report_chat(const char *const *mids, int mid_count,
+                            const char *reason, const char *note);
+
 int  snes_lobby_send_chat(const char *text);
 
 /* Server chat: per-game, outside any room (op server_chat). Its own ring,
