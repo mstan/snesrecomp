@@ -34,10 +34,11 @@
 #include "cosim.h"
 #if defined(SNESRECOMP_NET)
 #include "snes_netplay.h"
-
-/* See RtlSetSpeculativeFrame in common_rtl.h. */
-static bool g_rtl_speculative_frame;
 #endif
+
+/* See RtlSetSpeculativeFrame in common_rtl.h. Run-ahead drives this on every
+ * build, netplay or not, so it must not sit behind the netplay guard. */
+static bool g_rtl_speculative_frame;
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;

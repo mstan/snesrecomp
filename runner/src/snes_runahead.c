@@ -44,7 +44,9 @@ int snes_runahead_active(void)
     if (!g_snes) return 0;
     /* Offline only. See the header: two peers cannot each speculate about a
      * shared timeline, and netplay owns this same rollback machinery. */
+#if defined(SNESRECOMP_NET)
     if (snes_netplay_active()) return 0;
+#endif
     return 1;
 }
 
