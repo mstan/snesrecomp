@@ -101,6 +101,7 @@ typedef struct AudioTraceStats {
   uint64_t fast_forward_discarded; /* stale queued samples removed only
                                     * on the fast-forward -> normal edge */
   uint64_t output_underflows; /* callbacks with <1 guest-produced block */
+  uint64_t output_missing_frames; /* device-rate stereo frames without PCM */
   uint64_t consume_calls;     /* dsp_getSamples calls (audio callbacks) */
   uint64_t reg_writes;        /* DSP register writes                    */
   uint64_t kon_writes;        /* writes to $4C (KON)                    */
@@ -202,7 +203,7 @@ void audio_trace_on_pace(int consumer_active, uint32_t baseline_cycles);
 void audio_trace_on_guest_sync(int frame_boundary, uint64_t cycles);
 void audio_trace_on_fast_forward_discard(uint32_t samples,
                                          uint32_t occupancy_after);
-void audio_trace_on_output_underflow(uint32_t occupancy);
+void audio_trace_on_output_underflow(uint32_t occupancy, uint32_t missing_frames);
 /* CPU<->SPC port traffic. port = 0-3. All call sites hold RtlApuLock.
  * The SPC-read / CPU-read hooks gate internally (value change or fresh
  * counterpart write); callers pass every access unconditionally. */

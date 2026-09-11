@@ -1479,7 +1479,7 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
      * cutting, then hold silence. */
     s_render_starved = 1;
     s_render_fade_pos = 0;
-    audio_trace_on_output_underflow(available);
+    audio_trace_on_output_underflow(available, (uint32_t)(frames - usable));
     int fade = frames - usable;
     if (fade > RTL_AUDIO_FADE_FRAMES) fade = RTL_AUDIO_FADE_FRAMES;
     for (int i = 0; i < fade; i++) {
