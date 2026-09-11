@@ -141,7 +141,7 @@ int main(void) {
 
   audio_trace_on_consume(0, 640, 12);
   audio_trace_on_fast_forward_discard(3, 9);
-  audio_trace_on_output_underflow(1);
+  audio_trace_on_output_underflow(1, 17);
   audio_trace_on_pace(1, 77);
   audio_trace_on_guest_sync(1, 1000);
   audio_trace_on_guest_sync(0, 2000);
@@ -166,6 +166,7 @@ int main(void) {
   expect_u32("occupancy_current", st.occupancy_current, 1);
   expect_u64("fast_forward_discarded", st.fast_forward_discarded, 3);
   expect_u64("output_underflows", st.output_underflows, 1);
+  expect_u64("output_missing_frames", st.output_missing_frames, 17);
   expect_u64("pace_baseline_cycles", st.pace_baseline_cycles, 77);
   expect_u64("pace_accumulate_calls", st.pace_accumulate_calls, 1);
   expect_u32("pace_consumer_active", st.pace_consumer_active, 1);
