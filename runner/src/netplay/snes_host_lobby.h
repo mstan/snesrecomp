@@ -31,11 +31,42 @@ typedef void (*SnesHostFillMatchCapsFn)(void *ctx,
                                         const void *settings /* RecompLauncherCSettings* */,
                                         SnesLobbyMatchCaps *out);
 
+/*
+ * "Is a SIM-AFFECTING mod feature on locally, beyond what `ruleset_id` itself
+ * imposes?" Answered by the GAME, because only the game knows which of its
+ * features touch the sim and which are presentation.
+ *
+ * It becomes the ticket's `mods_enabled` assertion. A true is refused by the
+ * server with mods_not_pooled, which is correct: a player with an extra
+ * sim-affecting feature on boots a different sim from a vanilla opponent, and
+ * that is a desync rather than a fairness complaint.
+ *
+ * Note the "beyond what the ruleset imposes". A ruleset that pins, say, a
+ * widescreen margin has BOTH peers running that patched sim on the server's
+ * instruction -- it is the ruleset, not a divergence, and answering 1 for it
+ * would make the queue permanently unusable for the very feature it exists to
+ * standardize. `ruleset_id` is passed so the game can make that distinction;
+ * NULL/"" means the first ruleset.
+ *
+ * NULL leaves the assertion at 0, which is right for a game with no
+ * sim-affecting mods at all.
+ */
+/* `why` receives a player-facing reason when the answer is 1 -- the FEATURE in
+ * the way, not the fact that something is. "Turn off sim-affecting mods" sends
+ * a player to a Mods page with several toggles and no indication which one
+ * matters; naming it is the difference between a fixable message and a
+ * mystery. May be left empty. */
+typedef int (*SnesHostModsEnabledFn)(void *ctx, const char *ruleset_id,
+                                     char *why, size_t why_cap);
+
 typedef struct SnesHostLobbyOpts {
   int auto_ready_guests;  /* 1: set_ready(1) for non-hosts in Pump (SMW) */
   int rematch_set_ready;  /* 1: set_ready(1) on soft-return prepare (MW) */
   SnesHostFillMatchCapsFn fill_match_caps; /* NULL → delay=2, no ws */
   void *caps_ctx;
+  /* Appended: a runner built before this field zero-fills it and asserts 0. */
+  SnesHostModsEnabledFn mods_enabled;
+  void *mods_ctx;
 } SnesHostLobbyOpts;
 
 /* Init once before first launcher open. Returns 0 on success. */

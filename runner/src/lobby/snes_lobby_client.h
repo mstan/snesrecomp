@@ -263,9 +263,18 @@ const char *snes_lobby_player_id(void);
 /* Non-blocking pump — call every frame from the launcher. */
 void snes_lobby_pump(void);
 
-/* Title + release pin used for create/join matching and list filters. */
+/* Title + release pin used for create/join matching and list filters.
+ *
+ * SNES_NET_GAME_VERSION overrides the pin for one run, for TESTING two
+ * development builds against each other without reconfiguring and rebuilding
+ * both. Set the same string on both machines. It is announced on stderr with
+ * the real pin beside it every time the identity is set, because a build
+ * lying about which build it is has to be visible in the log a desync report
+ * is written from. Unset (the normal case) keeps the derived pin, which
+ * matches only builds that really are the same build. */
 void snes_lobby_set_game_identity(const char *game_name,
                                   const char *game_version);
+/* The pin actually presented on the wire -- the override when one is set. */
 const char *snes_lobby_game_version(void);
 
 void snes_lobby_request_list(void);
@@ -520,6 +529,107 @@ typedef struct SnesLobbyTurnCredentials {
 int  snes_lobby_request_turn_credentials(void);
 /* Non-NULL; valid==0 when unavailable / expired / STUN-only. */
 const SnesLobbyTurnCredentials *snes_lobby_turn_credentials(void);
+
+/* ── ROM fingerprint ────────────────────────────────────────────────────────
+ *
+ * Lower-case hex SHA-256 of the guest image this build is actually running,
+ * 64 characters. The host sets it once at startup; "" means unknown.
+ *
+ * In `join` an empty fingerprint means "legacy host, no check" -- a wildcard.
+ * That is tolerable between two people who chose each other's room and can
+ * talk about it. It is NOT tolerable in a queue: a wildcard there silently
+ * pairs a Track-01-only dump against a full one, which is exactly what the
+ * fingerprint was added to catch, so automatch refuses to queue without a
+ * real one.
+ */
+void snes_lobby_set_disc_fp(const char *hex64);
+const char *snes_lobby_disc_fp(void);
+
+/* ── Automatch ──────────────────────────────────────────────────────────────
+ *
+ * Server-run pairing: the player asks for a match and the SERVER creates the
+ * room, is its host, and owns its match_caps from a named ruleset. Protocol:
+ * recomp-net-server docs/AUTOMATCH.md. Everything downstream of the pairing is
+ * the ordinary `joined` / `lobby_update` / `launch` path already in this file,
+ * so this adds a queue and an accept gate and nothing else.
+ *
+ * Requires a signed-in account: the accept gate charges a dodge cooldown, and
+ * a cost that reconnecting erases is not a cost.
+ */
+#define SNES_LOBBY_MAX_RULESETS 8
+#define SNES_LOBBY_RULESET_ID_LEN 48
+#define SNES_LOBBY_RULESET_LABEL_LEN 64
+#define SNES_LOBBY_CAPS_SUMMARY_LEN 96
+
+/* One queue type this server offers for this title. */
+typedef struct SnesLobbyRuleset {
+    char id[SNES_LOBBY_RULESET_ID_LEN];
+    char label[SNES_LOBBY_RULESET_LABEL_LEN];
+    /* Server-derived one-liner ("Delay 2 - Rollback on"). Derived from the
+     * caps rather than authored, so it cannot drift from what the match runs. */
+    char caps_summary[SNES_LOBBY_CAPS_SUMMARY_LEN];
+    /* The caps the match will run. Parsed like a host's blob, because that is
+     * exactly what it is -- the server is the host of an automatch room. */
+    SnesLobbyMatchCaps caps;
+    /* Empty = any release may queue (still only pooling with its own). */
+    char game_version[SNES_LOBBY_VERSION_LEN];
+} SnesLobbyRuleset;
+
+/* Matches RECOMP_LAUNCHER_AUTOMATCH_* so the host layer can hand these
+ * straight to the launcher without a translation table that could drift. */
+enum {
+    SNES_LOBBY_AUTOMATCH_IDLE = 0,
+    SNES_LOBBY_AUTOMATCH_QUEUED = 1,
+    SNES_LOBBY_AUTOMATCH_FOUND = 2,
+    SNES_LOBBY_AUTOMATCH_ACCEPTED = 3,
+    SNES_LOBBY_AUTOMATCH_FAILED = 4
+};
+
+/* The offer on the table while state is FOUND. */
+typedef struct SnesLobbyAutomatchFound {
+    char opponent[SNES_LOBBY_NAME_LEN];
+    char opponent_country[8];
+    char ruleset_id[SNES_LOBBY_RULESET_ID_LEN];
+    char ruleset_label[SNES_LOBBY_RULESET_LABEL_LEN];
+    int  est_rtt_ms;      /* the pair's estimate: rtt_a + rtt_b */
+    int  accept_secs;     /* seconds left to answer */
+} SnesLobbyAutomatchFound;
+
+/* Ask the server what queues it offers for this title. Answered into
+ * snes_lobby_ruleset_count/get; 0 of them means automatch is off here. */
+int  snes_lobby_automatch_request_rulesets(void);
+int  snes_lobby_automatch_available(void);
+int  snes_lobby_automatch_ruleset_count(void);
+int  snes_lobby_automatch_ruleset_get(int index, SnesLobbyRuleset *out);
+
+/*
+ * Join the queue. `ruleset_id` NULL/"" takes the first one.
+ *
+ * `mods_enabled` is the caller's assertion that a SIM-AFFECTING mod feature is
+ * on locally, beyond whatever the ruleset itself imposes. The server refuses a
+ * true with mods_not_pooled and cannot check it -- the assertion exists so a
+ * modified client makes a deliberate false statement rather than exploiting an
+ * omission (AUTOMATCH.md §5). The host layer decides it; this file only
+ * carries it.
+ *
+ * 0 = sent. <0 = refused locally (not connected, no account, already queued).
+ * A server refusal arrives asynchronously as state FAILED with a reason in
+ * snes_lobby_automatch_error().
+ */
+int  snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled);
+int  snes_lobby_automatch_cancel(void);
+int  snes_lobby_automatch_state(void);
+int  snes_lobby_automatch_queued_secs(void);
+int  snes_lobby_automatch_pool(void);
+int  snes_lobby_automatch_found_get(SnesLobbyAutomatchFound *out);
+/* accept != 0 accepts; 0 declines and takes the dodge strike. */
+int  snes_lobby_automatch_accept(int accept);
+/* Refuse a queue locally, with the reason the player sees. Used when the HOST
+ * already knows the server would bounce the ticket -- there is no value in a
+ * round trip that ends in a generic code when the client can name the actual
+ * feature that is in the way. */
+void snes_lobby_automatch_refuse_local(const char *why);
+const char *snes_lobby_automatch_error(void);
 
 #ifdef __cplusplus
 }
