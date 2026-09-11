@@ -985,6 +985,18 @@ static void cb_request_list(void *ctx)
  * launcher that never calls the setter. */
 static int g_list_scope;
 
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+static int cb_chat_report(void *ctx, const char *const *mids, int mid_count,
+                          const char *reason, const char *note)
+{
+  (void)ctx;
+  /* Thin on purpose: the frame is built once in recomp-net so the rule about
+   * what may be reported does not end up written five times, and this layer's
+   * whole job is to pass it on. */
+  return snes_lobby_report_chat(mids, mid_count, reason, note);
+}
+#endif
+
 #if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
 static int cb_list_scope_set(void *ctx, int scope)
 {
@@ -1508,6 +1520,12 @@ static int cb_chat_get(void *ctx, int index,
 #if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
   snprintf(out->account, sizeof(out->account), "%s", msg.account);
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+  /* Empty against a server that predates message ids, which the UI reads as
+   * "this line cannot be reported" rather than offering an action that would
+   * be refused. */
+  snprintf(out->mid, sizeof(out->mid), "%s", msg.mid);
+#endif
   snprintf(out->text, sizeof(out->text), "%s", msg.text);
   out->is_local = msg.is_local;
   out->is_system = msg.is_system;
@@ -1759,6 +1777,12 @@ static int cb_server_chat_get(void *ctx, int index,
   snprintf(out->from, sizeof(out->from), "%s", msg.from);
 #if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
   snprintf(out->account, sizeof(out->account), "%s", msg.account);
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+  /* Empty against a server that predates message ids, which the UI reads as
+   * "this line cannot be reported" rather than offering an action that would
+   * be refused. */
+  snprintf(out->mid, sizeof(out->mid), "%s", msg.mid);
 #endif
   snprintf(out->text, sizeof(out->text), "%s", msg.text);
   out->is_local = msg.is_local;
@@ -2744,6 +2768,9 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .account_error = cb_account_error,
     .account_sign_out = cb_account_sign_out,
     .account_set_handle = cb_account_set_handle,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+    .chat_report = cb_chat_report,
 #endif
 #if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
     .list_scope_set = cb_list_scope_set,
