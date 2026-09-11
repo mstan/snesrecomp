@@ -1289,6 +1289,8 @@ static void lobby_list_parse_players(const char *json)
                      sizeof(g_lc.online[n].lobby_name));
         g_lc.online[n].hosting = json_get_bool(chunk, "hosting", 0);
         json_get_str(chunk, "tag", g_lc.online[n].tag, sizeof(g_lc.online[n].tag));
+        json_get_str(chunk, "account", g_lc.online[n].account,
+                     sizeof(g_lc.online[n].account));
         json_get_str(chunk, "game_name", g_lc.online[n].game_name,
                      sizeof(g_lc.online[n].game_name));
         /* Players of another title are not "online" for this one. A row
@@ -1838,8 +1840,8 @@ static int parse_seat_array(const char *json, const char *key, int is_spectator,
     return n;
 }
 
-static void chat_push(const char *player_id, const char *from, const char *text,
-                      int is_system)
+static void chat_push(const char *player_id, const char *account,
+                      const char *from, const char *text, int is_system)
 {
     SnesLobbyChatMsg *m;
     int idx;
@@ -1854,6 +1856,7 @@ static void chat_push(const char *player_id, const char *from, const char *text,
     m = &g_lc.chat[idx];
     memset(m, 0, sizeof(*m));
     snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->account, sizeof(m->account), "%s", account ? account : "");
     snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
     snprintf(m->text, sizeof(m->text), "%s", text);
     /* Masked on arrival, whatever relayed it: the server already did this,
@@ -1869,7 +1872,8 @@ static void chat_push(const char *player_id, const char *from, const char *text,
     m->seq = ++g_lc.chat_seq;
 }
 
-static void schat_push(const char *player_id, const char *from, const char *text)
+static void schat_push(const char *player_id, const char *account,
+                       const char *from, const char *text)
 {
     SnesLobbyChatMsg *m;
     int idx;
@@ -1884,6 +1888,7 @@ static void schat_push(const char *player_id, const char *from, const char *text
     m = &g_lc.schat[idx];
     memset(m, 0, sizeof(*m));
     snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->account, sizeof(m->account), "%s", account ? account : "");
     snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
     snprintf(m->text, sizeof(m->text), "%s", text);
     (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
@@ -2328,27 +2333,33 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "server_chat") == 0) {
         char text[SNES_LOBBY_CHAT_TEXT_LEN];
         char from_id[SNES_LOBBY_ID_LEN];
+        char from_acct[SNES_LOBBY_ID_LEN];
         char from[SNES_LOBBY_NAME_LEN];
         text[0] = '\0';
         from_id[0] = '\0';
+        from_acct[0] = '\0';
         from[0] = '\0';
         json_get_str(json, "text", text, sizeof(text));
         json_get_str(json, "from_player_id", from_id, sizeof(from_id));
+        json_get_str(json, "from_account", from_acct, sizeof(from_acct));
         json_get_str(json, "from", from, sizeof(from));
-        schat_push(from_id, from, text);
+        schat_push(from_id, from_acct, from, text);
         return;
     }
     if (strcmp(op, "chat") == 0) {
         char text[SNES_LOBBY_CHAT_TEXT_LEN];
         char from_id[SNES_LOBBY_ID_LEN];
+        char from_acct[SNES_LOBBY_ID_LEN];
         char from[SNES_LOBBY_NAME_LEN];
         text[0] = '\0';
         from_id[0] = '\0';
+        from_acct[0] = '\0';
         from[0] = '\0';
         json_get_str(json, "text", text, sizeof(text));
         json_get_str(json, "from_player_id", from_id, sizeof(from_id));
+        json_get_str(json, "from_account", from_acct, sizeof(from_acct));
         json_get_str(json, "from", from, sizeof(from));
-        chat_push(from_id, from, text, json_get_bool(json, "system", 0));
+        chat_push(from_id, from_acct, from, text, json_get_bool(json, "system", 0));
         return;
     }
     if (strcmp(op, "signal") == 0) {
