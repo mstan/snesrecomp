@@ -1,4 +1,5 @@
 #include "common_rtl.h"
+#include "apu_frame_clock.h"
 #include "common_cpu_infra.h"
 #include <setjmp.h>
 #include <time.h>
@@ -112,13 +113,26 @@ uint64_t g_apu_last_sync_master = 0;
  * 357368 SNES master cycles and 17088 SPC cycles in this runtime's 60 Hz
  * model. g_cpu.master_cycles supplies only the within-frame position because
  * its total per frame varies with recompilation coverage. */
-#define RTL_MASTER_CYCLES_PER_FRAME 357368ull
-#define RTL_APU_CYCLES_PER_FRAME     17088ull
 static uint64_t g_apu_frame_start_master;
+static RtlApuFrameClock g_apu_frame_clock;
+static bool g_extended_frame_timing;
 static bool g_apu_frame_time_valid;
 
 bool rtl_apu_frame_timeline_active(void) {
   return g_apu_frame_time_valid;
+}
+
+double RtlLastFramePeriods(void) {
+  return g_extended_frame_timing && g_apu_frame_clock.last_duration
+      ? (double)g_apu_frame_clock.last_duration / RTL_APU_CYCLES_PER_FRAME : 1.0;
+}
+
+void RtlEnableExtendedFrameTiming(void) {
+  g_extended_frame_timing = true;
+}
+
+bool rtl_apu_extended_frame_timing(void) {
+  return g_extended_frame_timing;
 }
 
 /* Fast-forward advances the real SPC/DSP state faster than the host device can
@@ -136,6 +150,8 @@ static int16 g_audio_last_output_r;
 static void rtl_sync_apu_frame_boundary(void);
 
 static uint64_t rtl_apu_guest_cycle(void) {
+  if (g_extended_frame_timing)
+    return rtl_apu_clock_now(&g_apu_frame_clock, g_cpu.master_cycles);
   uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
   /* `within` is deliberately NOT clamped to one frame.
    *
@@ -163,12 +179,12 @@ static uint64_t rtl_apu_guest_cycle(void) {
    * parked in WAI (which executes almost no master cycles) still gets a full
    * frame of APU time per frame.
    *
-   * Monotonicity is safe without a clamp here: after a long section this can
+   * Legacy hosts still use frame-count time: after a long section this can
    * fall behind the next frame boundary, and apu_runToGuestCycle (apu.c:135)
    * absorbs that -- a target below portGuestAnchor is a no-op and it ratchets
    * `target` up to portLastTarget. The SPC idles until the frame counter
-   * catches up, mirroring the wall time the transfer would have taken on
-   * hardware. */
+   * catches up. Hosts supporting extended iterations instead use the carried
+   * clock above and pace by RtlLastFramePeriods, avoiding this audio stall. */
   return (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME +
          within * RTL_APU_CYCLES_PER_FRAME /
              RTL_MASTER_CYCLES_PER_FRAME;
@@ -261,6 +277,7 @@ static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 void RtlReset(int mode) {
   snes_frame_counter = 0;
   g_apu_frame_time_valid = false;
+  g_apu_frame_clock = (RtlApuFrameClock){0};
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_main_cpu_cycles_estimate = 0;
   g_apu_pace_cycles_estimate = 0;
@@ -474,6 +491,7 @@ bool RtlRunFrame(uint32 inputs) {
    * duration. */
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_apu_frame_time_valid = true;
+  rtl_apu_clock_begin(&g_apu_frame_clock, g_cpu.master_cycles);
   WatchdogFrameStart();
   // Watchdog guard: WatchdogCheck() (called per-block in v2 gen) longjmps
   // here when a frame exceeds 5s, so an infinite loop in recompiled code
@@ -1251,18 +1269,17 @@ bool RtlHandleSpcUpload(CpuState *cpu) {
 }
 
 static void rtl_sync_apu_frame_boundary(void) {
-  /* The game frame is the authoritative guest-time clock. The audio callback
-   * may fill a host scheduling shortfall, but CPU->APU events must never wait
-   * behind it: advance the real SPC through every event due by this completed
-   * frame at normal speed and turbo alike. */
+  /* Advance the real SPC through all events due in this iteration. Audio
+   * callbacks only consume PCM; they never advance the guest clock. */
   RtlApuLock();
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
   uint64_t before = g_snes->apu->portClock;
   /* RtlRunFrame has already incremented snes_frame_counter. This is the exact
    * boundary after the completed frame; adding its stale within-frame master
    * offset here would count the frame body twice. */
-  uint64_t boundary = (uint64_t)snes_frame_counter *
-                      RTL_APU_CYCLES_PER_FRAME;
+  uint64_t boundary = g_extended_frame_timing
+      ? rtl_apu_clock_finish(&g_apu_frame_clock, g_cpu.master_cycles)
+      : (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME;
   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
                                     1u << 20);
   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);

@@ -24,6 +24,7 @@
 #include "interp_bridge.h"   /* -> cpu_state.h (types, inline frame helpers) */
 #include "tier2_capture.h"
 #include "snes.h"            /* Snes storage for the bridge's APU clock hook */
+#include "apu.h"
 #include "sa1.h"
 
 CpuState g_cpu;
@@ -55,7 +56,11 @@ static Snes g_test_snes;
 Snes *g_snes = &g_test_snes;
 uint64_t g_apu_last_sync_master;
 int g_interp_apu_driving;
-bool rtl_apu_frame_timeline_active(void) { return false; }
+static bool g_frame_timeline, g_extended_frames;
+static unsigned g_absolute_syncs, g_relative_syncs;
+bool rtl_apu_frame_timeline_active(void) { return g_frame_timeline; }
+bool rtl_apu_extended_frame_timing(void) { return g_extended_frames; }
+void rtl_sync_apu_to_cpu_locked(void) { ++g_absolute_syncs; }
 bool sa1_cpu_irq_pending(const Sa1 *sa1) { (void)sa1; return false; }
 int g_recomp_stack_top;
 uint16_t g_cpu_entry_s[64];
@@ -65,7 +70,7 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
 }
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
-void snes_catchupApu(Snes *snes) { (void)snes; }
+void snes_catchupApu(Snes *snes) { (void)snes; ++g_relative_syncs; }
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
     (void)snes; (void)master_clock;
 }
@@ -306,14 +311,43 @@ int main(void) {
     RAM = malloc(MEMSZ);
 
     printf("S0 APU timeline policy remains cartridge-scoped\n");
-    CHECK(!interp_bridge_use_absolute_apu_timeline(false, false),
+    CHECK(!interp_bridge_use_absolute_apu_timeline(false, false, false),
           "inactive non-SA1 timeline must use legacy catch-up");
-    CHECK(!interp_bridge_use_absolute_apu_timeline(true, false),
+    CHECK(!interp_bridge_use_absolute_apu_timeline(true, false, false),
           "active non-SA1 timeline must use legacy catch-up");
-    CHECK(!interp_bridge_use_absolute_apu_timeline(false, true),
+    CHECK(!interp_bridge_use_absolute_apu_timeline(false, true, false),
           "inactive SA1 timeline must use legacy catch-up");
-    CHECK(interp_bridge_use_absolute_apu_timeline(true, true),
+    CHECK(interp_bridge_use_absolute_apu_timeline(true, true, false),
           "active SA1 timeline must suppress duplicate catch-up");
+    CHECK(interp_bridge_use_absolute_apu_timeline(true, false, true),
+          "mapped extended frames must suppress duplicate catch-up");
+    CHECK(!interp_bridge_use_absolute_apu_timeline(false, false, true),
+          "mapped time before the frame loop must retain bootstrap catch-up");
+
+    /* No APU port touches: long interpreted work must periodically sync the
+     * absolute clock, while unmapped boot still uses relative catch-up. */
+    { Apu apu = {0};
+      g_test_snes.apu = &apu;
+      g_frame_timeline = true;
+      for (unsigned mode = 0; mode < 3; ++mode) {
+        memset(RAM, 0, MEMSZ); init_cpu();
+        uint8_t c[] = {0xA2,0xFF,0xCA,0xD0,0xFD,0x60};
+        load(0x8000, c, sizeof c);
+        cpu_push_jsr_return_frame(&g_c);
+        g_extended_frames = mode != 0;
+        apu.portTimeValid = mode == 2;
+        g_absolute_syncs = g_relative_syncs = 0;
+        CHECK(interp_bridge_run(&g_c, 0x008000) == 1, "timed loop returns");
+        if (mode == 2)
+          CHECK(g_absolute_syncs > 1 && g_relative_syncs == 0,
+                "mapped work syncs repeatedly without double-driving SPC");
+        else
+          CHECK(g_relative_syncs > 1 && g_absolute_syncs == 0,
+                "legacy and unmapped boot retain relative progress");
+      }
+      g_test_snes.apu = NULL;
+      g_frame_timeline = g_extended_frames = false;
+    }
 
     /* S1: LDA #$01 ; JSR $8100 (compiled) ; RTS */
     { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
