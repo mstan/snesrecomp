@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(lua_bridge_test C)
+set(CMAKE_C_STANDARD 11)
+include(../../runner/lua.cmake)
+add_executable(lua_bridge_host host.c)
+target_include_directories(lua_bridge_host PRIVATE ../../runner/src)
+target_link_libraries(lua_bridge_host PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES})
