@@ -28,12 +28,31 @@ void SnesEnterNativeMode(void);
 typedef void CpuInfraInitializeFunc(void);
 typedef void RunOneFrameOfGameFunc(void);
 
+typedef enum RtlEnhancedRenderResult {
+  kRtlEnhancedRender_NotHandled = 0,
+  kRtlEnhancedRender_Handled = 1,
+} RtlEnhancedRenderResult;
+
+typedef struct RtlEnhancedRendererFrame {
+  uint8 *pixels;
+  size_t pitch;
+  int width;
+  int height;
+  uint32 render_flags;
+  uint16 widescreen_extra;
+  int default_renderer_done;
+} RtlEnhancedRendererFrame;
+
+typedef RtlEnhancedRenderResult RtlEnhancedRenderFrameFunc(
+    RtlEnhancedRendererFrame *frame);
+
 void WatchdogCheck(void);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
-/* Always-on stack-balance auditor (see common_cpu_infra.c): reports stack
- * movement beyond consumption of the caller's materialized JSR/JSL frame. */
+/* Optional stack-balance auditor (see common_cpu_infra.c): reports stack
+ * movement beyond consumption of the caller's materialized JSR/JSL frame when
+ * SNESRECOMP_STACK_BALANCE_DIAGNOSTICS is enabled. */
 void RecompStackBalDumpStderr(int topn);
 void RecompStackBalDumpJson(FILE *f);
 /* Always-on unresolved-abandon hit table (see cpu_unresolved_abandon_balanced
@@ -80,6 +99,9 @@ typedef struct RtlGameInfo {
   CpuInfraInitializeFunc *initialize;
   RunOneFrameOfGameFunc *run_frame;
   RunOneFrameOfGameFunc *draw_ppu_frame;
+  /* Optional title-owned native/enhanced presentation hook. Hosts must keep
+   * this opt-in and leave draw_ppu_frame as the default console renderer. */
+  RtlEnhancedRenderFrameFunc *enhanced_render_frame;
   // Filename prefix used by RtlSaveLoad, e.g. "save" produces
   // "saves/save%d.sav". If NULL, framework uses "%s_save" with title.
   const char *save_name_prefix;

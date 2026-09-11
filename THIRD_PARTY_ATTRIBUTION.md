@@ -6,6 +6,104 @@ SNESRecomp's original code is licensed under the PolyForm Noncommercial
 License 1.0.0 in [`LICENSE`](LICENSE). The notices below describe the licenses
 that continue to apply to identified third-party material.
 
+## snesrev — zelda3 / smw reverse-engineered ports
+
+The C runner is substantially based on snesrev's reverse-engineered ports. The
+README's Acknowledgements has always credited this; the license notice belongs
+here, because the code reaches **every shipped game binary** and MIT requires
+the notice to travel with binary distributions, not just source.
+
+- Upstream: https://github.com/snesrev/zelda3 and https://github.com/snesrev/smw
+- License: **MIT** (both repositories; verified against upstream 2026-09-09)
+- Local scope: the C SNES hardware core under `runner/src/snes/` as vendored by
+  snesrev, plus runtime utilities (`runner/src/util.h` still carries zelda3's
+  `ZELDA3_UTIL_H_` include guard), ROM verification, the SHA-256 helper
+  (`runner/src/sha256.c`), the asymmetric extra-side-space widescreen PPU model
+  (`runner/src/snes/ppu.c`, `runner/src/widescreen.h`), function-boundary
+  conventions, and the default input layout (`runner/src/keybinds.c`).
+
+Individual algorithms inside that core are credited inline to snes9x; the
+upstream 65816 CPU core is separately attributed under
+[LakeSnes](#lakesnes--65816-cpu-core) below, which is the same MIT lineage
+(elzo_d) that snesrev vendored.
+
+### How the two licenses sit together
+
+MIT permits sublicensing, so this project's work built on top of that code is
+licensed under **PolyForm Noncommercial 1.0.0** like the rest of the
+repository, while the **retained upstream material stays MIT**. Carrying the
+notice is not the same as relicensing the derivative: the notice above
+discharges the MIT obligation, and it does not place SNESRecomp's own
+contributions under MIT.
+
+Nothing here restricts snesrev's work. Their code remains available under MIT
+from upstream, and anyone who wants it unmodified should take it from there.
+The files that are essentially verbatim upstream — `glsl_shader.c`/`.h`,
+`snes/snes_regs.h`, `snes/dsp_regs.h` — contain little or nothing of this
+project's own authorship, so treating them as the MIT files they are costs
+this project nothing.
+
+Every file listed above carries a header naming its upstream origin, so the
+provenance is visible while editing rather than only here.
+
+### Is the retained code load-bearing?
+
+Yes, measured 2026-09-09 rather than assumed. `util.c`, `common_rtl.c` and
+`snes/ppu_legacy.c` are in `SNESRECOMP_RUNNER_SOURCES` and therefore compile
+into every title; `ppu.c:568` calls `ppu_draw_whole_line_legacy()` on the live
+render path, so the "legacy" name is not dead code. The opt-in
+`snesrecomp_target_glsl_shader()` is used by FZeroRecomp,
+LegendofZeldaAlttpRecomp, MegamanXRecomp, MegamanX2Recomp, MegamanX3SNESRecomp
+and SuperMarioWorldRecomp; `snesrecomp_target_mmx_config()` by the three Mega
+Man X titles. This is foundational code in shipped products, not residue.
+
+### MIT License
+
+```
+Copyright (c) 2022 snesrev
+Copyright (c) 2023 snesrev
+Copyright (c) 2021 elzo_d
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Distributing a build
+
+A game executable built on this framework statically links third-party code
+whose licenses require the notice to be reproduced in binary redistributions:
+snesrev/zelda3 and snesrev/smw (MIT), LakeSnes (MIT), and the ares-derived
+Cx4, DSP-1, and SA-1 coprocessor cores (ISC). **Ship this file with any
+package that contains the runner.** It carries every required notice text, and
+it is the one file to update when a new dependency lands. The framework's own
+`snesrecomp` CLI package already stages `LICENSE` and this file
+(`tools/build_cli.py`, asserted by `tools/smoke_cli_package.py`); per-title
+release packaging lives in the game repositories and must do the same.
+
+## IsoFrieze/SMWDisX — Super Mario World disassembly reference
+
+Used as the symbol and RAM-map basis and as a conformance reference for Super
+Mario World bring-up. **The upstream repository publishes no license file**
+(confirmed 2026-09-09), so no grant has been given and none should be assumed.
+Symbol names, RAM addresses, and hardware facts are used as facts; no upstream
+text or code is vendored here. SMWDisX itself credits mikeyk's original 2013
+disassembly and loveemu's SPC700 work.
+
 ## libretro API header
 
 `tools/snesref/libretro.h` is the libretro API header from the RetroArch team.
@@ -253,6 +351,58 @@ MIT-licensed LakeSnes-derived `interp816` core.
 - ares' debugger, serialization framework, and scheduler were replaced with
   the runner's saveload and observability interfaces.
 - No title-specific address, command shortcut, or firmware data is present.
+
+## S-DD1 decompression implementation
+
+`runner/src/snes/sdd1.{c,h}` was extracted from the StarOceanSNESRecomp vendored
+runner copy and adapted into the shared runner cartridge/DMA layer.
+
+- Immediate source: https://github.com/SupraBT/StarOceanSNESRecomp
+- Declared source lineage in that file: bsnes-plus / Andreas Naive S-DD1
+  decompression research
+- Additional public lineage: Snes9x S-DD1 decompressor by Brad Jorsch, with
+  research by Andreas Naive and John Weidman
+- License: **Public Domain**, with attribution kept as a courtesy.
+
+The load-bearing ported material is the Golomb / PEM / CM / OL decompression
+engine and its `run_count[256]` table, which come from bsnes-plus
+`bsnes/snes/chip/sdd1/sdd1emu.cpp`. That file is **not** under bsnes' GPL: it
+carries its own notice, verified against upstream on 2026-09-09, reading
+
+> S-DD1'algorithm emulation code
+> Author: Andreas Naive, August 2003, last update October 2004
+> This code is Public Domain. There is no copyright holded by the author.
+> Said this, the author wish to explicitly emphasize his inalienable moral
+> rights over this piece of intelectual work and the previous research that
+> made it possible, as recognized by most of the copyright laws around the
+> world.
+
+so it is freely redistributable and carries no field-of-use restriction. The
+author asks for recognition rather than a license grant, which is why the
+credit above stays attached to the file and to this notice. The Snes9x
+decompressor shares that same Naive lineage; none of Snes9x's own code is used
+here.
+
+Nothing is taken from bsnes' GPL-licensed `sdd1.cpp` glue. The chip's
+host-visible behaviour in `sdd1.c` — the `$4800-$4807` register window, MMC
+window resolution, `$43x0-$43x7` DMA-register spying, and the address-match
+decompress-on-read path — is written directly against that hardware behaviour
+in this project's own C, structured around the runner's `Cart`/DMA seams
+rather than bsnes' MMIO-hook and C++ component model.
+
+**This is therefore not a constraint on SNESRecomp's PolyForm Noncommercial
+license.** Earlier revisions of this notice flagged the file as needing review
+before it could be treated as redistributable framework code; that review is
+the paragraph above, and it came back clean.
+
+### Derivation / modifications
+
+- Wired the chip through `Cart` as `CART_SDD1`, including reset, saveload, and
+  cart read/write dispatch.
+- Added S-DD1 MMC resolution for `$C0-$FF` ROM windows and the `$4800-$4807`
+  CPU-visible register window.
+- Added DMA-register spying and per-channel decompressed byte feeding so S-DD1
+  transfers can populate PPU destinations through the existing DMA engine.
 
 ## LakeSnes — 65816 CPU core
 

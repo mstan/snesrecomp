@@ -107,6 +107,7 @@ pub struct BankCfg {
     pub includes: Vec<String>,
     pub entries: Vec<BankEntry>,
     pub names: Vec<NameDecl>,
+    pub symbols: Vec<NameDecl>,
     /// Exact 24-bit executable function boundaries which must remain LLE.
     pub force_lle: BTreeSet<u32>,
     pub exclude_ranges: Vec<(u32, u32)>,
@@ -693,6 +694,25 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                 Err(_) => continue,
             };
             cfg.names.push(NameDecl {
+                addr_24: addr,
+                name: tokens[2].to_string(),
+            });
+            continue;
+        }
+        // symbol <hex_addr> <friendly_name>
+        //
+        // Non-promoting label overlay. Unlike `name`, this is not
+        // auto-promoted into cfg.entries; it is only a friendly label for
+        // code discovered through real control flow.
+        if head == "symbol" {
+            if tokens.len() < 3 {
+                continue;
+            }
+            let addr = match parse_hex(tokens[1]) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            cfg.symbols.push(NameDecl {
                 addr_24: addr,
                 name: tokens[2].to_string(),
             });

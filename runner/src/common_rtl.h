@@ -1,4 +1,10 @@
+// Partly derived from snesrev/smw src/common_rtl.h (MIT, (c) 2023 snesrev,
+// (c) 2021 elzo_d); the recomp runtime contract around it is this project's.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #pragma once
+#include <stdint.h>
+#include <stddef.h>
 #include "types.h"
 #include "snes/snes_regs.h"
 #include "debug_server.h"
@@ -55,10 +61,15 @@ bool rtl_apu_frame_timeline_active(void);
 void RtlEnableExtendedFrameTiming(void);
 double RtlLastFramePeriods(void);
 bool rtl_apu_extended_frame_timing(void);
+void rtl_apu_snapshot_pacing(uint64_t *frame_start_master, uint8_t *frame_time_valid);
+void rtl_apu_restore_pacing(uint64_t frame_start_master, uint8_t frame_time_valid);
 void rtl_accumulate_apu_catchup(void);
 /* Caller holds RtlApuLock. Before the first frame, retain bootstrap synthetic
  * pacing; afterward synchronize reads to the authoritative guest timestamp. */
 void rtl_sync_apu_to_cpu_locked(void);
+/* AOT APU pacing: called per-block from WatchdogCheck (generated code) so long
+ * AOT runs flush the SPC every ~1024 master cycles like the interp bridge. */
+void rtl_apu_pace_check(void);
 
 #ifdef SNES_COSIM
 // Co-sim shared APU clock (SNES_COSIM_APU_SHARED=1, dev-only): pace the SPC
@@ -87,6 +98,12 @@ extern int snes_frame_counter;
 void MemCpy(void *dst, const void *src, int size);
 bool Unreachable();
 
+// Forward declaration: RomPtr must be declared before any inline that calls it
+// (e.g. RomFixedPtr in the _DEBUG block below).  Without this, MSVC in C11
+// mode implicitly declares it as int RomPtr(), which then clashes with the
+// real prototype below (C2040 error).
+uint8 *RomPtr(uint32_t addr);
+
 #if defined(_DEBUG)
 // Gives better warning messages but non inlined on tcc
 static inline uint16 GET_WORD(const uint8 *p) { return *(uint16 *)(p); }
@@ -107,8 +124,6 @@ static inline LongPtr MAKE_LONG(uint16 lo, uint8 bank) {
   ((uint8 *)&lp)[2] = bank;
   return lp;
 }
-
-uint8 *RomPtr(uint32_t addr);
 
 static inline uint8 *RomPtr_RAM(uint16_t addr) { assert(addr < 0x2000); return g_ram + addr; }
 static inline const uint8 *RomPtr_00(uint16_t addr) { return RomPtr(0x000000 | addr); }
@@ -308,6 +323,21 @@ size_t RtlSaveSnapshotToMemory(void *data, size_t capacity);
 bool RtlLoadSnapshotFromMemory(const void *data, size_t size);
 
 void RtlApuWrite(uint16 adr, uint8 val);
+
+/* APU port write observers: called for every guest write to $2140-$217F
+ * before the SPC sees it; return nonzero to consume the write. Observers run
+ * in registration order; any consumer wins. */
+typedef int (*RtlApuPortObserver)(uint16 reg, uint8 value);
+#define RTL_APU_PORT_OBSERVER_MAX 8
+int RtlAddApuPortObserver(RtlApuPortObserver observer);
+void RtlRemoveApuPortObserver(RtlApuPortObserver observer);
+int rtl_apu_port_observers_filter(uint16 reg, uint8 value);
+/* Optional host acknowledgement of consumed requests. The original SPC value
+ * is provided after time synchronization; return nonzero after replacing it. */
+typedef int (*RtlApuPortReadObserver)(uint16 reg, uint8 *value);
+int RtlAddApuPortReadObserver(RtlApuPortReadObserver observer);
+void RtlRemoveApuPortReadObserver(RtlApuPortReadObserver observer);
+uint8 rtl_apu_port_observers_read(uint16 reg, uint8 value);
 
 
 enum {

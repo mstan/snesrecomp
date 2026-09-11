@@ -32,6 +32,10 @@
 #include <stdio.h>
 #include "cpu_state.h"
 
+/* Launch-time main-scheduler AOT policy: -1 default/environment, 0 floor,
+ * 1 accelerated. Native interrupt helpers retain their ordinary policy. */
+void interp_bridge_set_scheduler_aot_policy(int enabled);
+
 /* Once port time is mapped, the frame timeline and interpreter catch-up
  * describe the same elapsed time. Extended-frame hosts use absolute sync;
  * legacy hosts and unmapped boot (e.g. Mega Man X's IPL polling) keep relative
@@ -52,10 +56,6 @@ typedef void (*InterpPreOpcodeHook)(CpuState *cpu, uint32_t pc24);
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook);
 void interp_bridge_pre_opcode_redirect(uint32_t pc24);
-/* Dump the last n entries of the always-on global interp step ring
- * (pc/op/sp/frame per interpreted opcode) to `out` (NULL = stderr). */
-#include <stdio.h>
-void interp_bridge_dump_recent_steps(int n, FILE *out);
 
 /*
  * Run the interpreter over guest code at entry_pc24, in the context of `cpu`.
@@ -93,11 +93,18 @@ uint32_t interp_bridge_lle_resume_pc(void);
  * Sticky until read (then cleared). */
 int interp_bridge_lle_took_wai(void);
 
+/* True if the most recent auto-quiescent yield was a read-only spin (stable
+ * CPU/memory state, no WAI) — e.g. a game polling $4210 for the NMI flag.
+ * The host should deliver NMI to such a blocked game when NMI is enabled.
+ * Sticky until read (then cleared). */
+int interp_bridge_lle_took_quiescent(void);
+
 /* Optional whole-program LLE deadline.  When nonzero, the auto-quiescent
  * bridge yields at the first architectural instruction boundary whose master
  * clock reaches this value.  Event-driven game schedulers use this to prevent
  * a productive CPU/MMIO loop from running across multiple vblanks atomically. */
 void interp_bridge_set_master_deadline(uint64_t master_clock);
+void interp_bridge_reset_dynamic_cache(void);
 
 /* True only while a paired AOT bounce is executing inside an auto-quiescent
  * scheduler whose current frame deadline has been reached. Long,
@@ -106,10 +113,7 @@ void interp_bridge_set_master_deadline(uint64_t master_clock);
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu);
 
 /* Execute an architectural interrupt handler through its terminal RTI. The
- * caller has already materialized the hardware interrupt frame, usually with
- * cpu_push_interrupt_frame_at(). Do not enter an interrupt body directly from a
- * host scheduler unless that frame is on the guest stack for the terminal RTI
- * to consume. */
+ * caller has already materialized the hardware interrupt frame. */
 int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24);
 
 /* Save-state task resume: interpret a suspended cooperative task from its

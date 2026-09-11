@@ -86,12 +86,44 @@ void spc_saveload(Spc *spc, SaveLoadInfo *sli) {
   sli->func(sli, &spc->a, offsetof(Spc, cyclesUsed) - offsetof(Spc, a));
 }
 
+/* Opt-in SPC instruction trace (SNESRECOMP_SPC_TRACE=1): ring of the last
+ * executed (pc, opcode) pairs, dumped when the core halts on SLEEP/STOP so
+ * the exact path into the halt can be inspected. */
+#define SPC_TRACE_RING 65536
+static uint16_t s_spc_trace_pc[SPC_TRACE_RING];
+static uint8_t s_spc_trace_op[SPC_TRACE_RING];
+static uint32_t s_spc_trace_head = 0;
+static uint32_t s_spc_trace_count = 0;
+static int s_spc_trace_on = -1;
+
 int spc_runOpcode(Spc* spc) {
   spc->cyclesUsed = 0;
   if(spc->stopped) return 1;
   uint8_t opcode = spc_readOpcode(spc);
+  if (s_spc_trace_on < 0)
+    s_spc_trace_on = getenv("SNESRECOMP_SPC_TRACE") ? 1 : 0;
+  if (s_spc_trace_on) {
+    s_spc_trace_pc[s_spc_trace_head] = (uint16_t)(spc->pc - 1);
+    s_spc_trace_op[s_spc_trace_head] = opcode;
+    s_spc_trace_head = (s_spc_trace_head + 1) % SPC_TRACE_RING;
+    if (s_spc_trace_count < SPC_TRACE_RING) s_spc_trace_count++;
+  }
   spc->cyclesUsed = cyclesPerOpcode[opcode];
   spc_doOpcode(spc, opcode);
+  if (spc->stopped && s_spc_trace_on) {
+    fprintf(stderr, "[spc] HALT at pc=%04x opcode=%02x (%s) after %u traced insns\n",
+            (unsigned)(spc->pc - 1), opcode,
+            opcode == 0xef ? "SLEEP" : (opcode == 0xff ? "STOP" : "other"),
+            s_spc_trace_count);
+    uint32_t n = s_spc_trace_count < SPC_TRACE_RING ? s_spc_trace_count : SPC_TRACE_RING;
+    uint32_t first = 0;  /* dump the whole ring */
+    uint32_t start = (s_spc_trace_head + SPC_TRACE_RING - n) % SPC_TRACE_RING;
+    for (uint32_t k = first; k < n; k++) {
+      uint32_t idx = (start + k) % SPC_TRACE_RING;
+      fprintf(stderr, "[spc] %04x: %02x\n", s_spc_trace_pc[idx], s_spc_trace_op[idx]);
+    }
+    s_spc_trace_count = 0;  /* dump once */
+  }
   return spc->cyclesUsed;
 }
 

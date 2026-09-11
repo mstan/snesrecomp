@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <assert.h>
+#include <time.h>
 #include "snes.h"
 #include "cpu.h"
 #include "apu.h"
@@ -15,14 +16,39 @@
 #include "joypad.h"
 #include "variables.h"
 #include "../common_rtl.h"
-#include "../cpu_state.h"
 #include "../debug_server.h"
 #include "../audio_trace.h"
 #include "../cpu_trace.h"
+#include "sdd1.h"
 #include "../ppu_dma_trace.h"
 
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
+
+bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out) {
+  if (!snes || !out) return false;
+  if (!snes->hIrqEnabled && !snes->vIrqEnabled) return false;
+  /* Mirrors the match test in snes_advance_beam(): the comparator fires when
+   * the beam crosses target_h on a line the V comparator accepts. */
+  const uint32_t target_h =
+      snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
+  if (target_h >= 1364u) return false;
+
+  uint32_t h = snes->hPos;
+  uint32_t v = snes->vPos;
+  uint64_t delta = 0;
+  for (uint32_t scanned = 0; scanned <= 262u; scanned++) {
+    const bool line_matches = !snes->vIrqEnabled || v == snes->vTimer;
+    if (line_matches && target_h >= h) {
+      *out = now + delta + (uint64_t)(target_h - h);
+      return true;
+    }
+    delta += 1364u - h;
+    h = 0;
+    v = (v + 1u) % 262u;
+  }
+  return false;
+}
 
 uint8_t snes_readReg(Snes* snes, uint16_t adr);
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
@@ -146,6 +172,10 @@ void snes_reset(Snes* snes, bool hard) {
 static uint64_t s_catchup_calls = 0;
 static uint64_t s_catchup_cycles_total = 0;
 uint64_t g_apu_timer0_total_ticks = 0;
+#ifdef SNESRECOMP_INTERP_PROFILE
+uint64_t apucyc_prof_calls = 0;
+double apucyc_prof_ms = 0.0;
+#endif
 
 void snes_catchupApu(Snes* snes) {
   /* Upper cap is a guard against accumulator runaway after a long
@@ -171,9 +201,16 @@ void snes_catchupApu(Snes* snes) {
   if (catchupCycles < 0) catchupCycles = 0;
 
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
+#ifdef SNESRECOMP_INTERP_PROFILE
+  apucyc_prof_calls++;
+  clock_t _t1 = clock();
+#endif
   for(int i = 0; i < catchupCycles; i++) {
     apu_cycle(snes->apu);
   }
+#ifdef SNESRECOMP_INTERP_PROFILE
+  apucyc_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC;
+#endif
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
   snes->apuCatchupCycles -= (double) catchupCycles;
   if (snes->apuCatchupCycles < 0.0) snes->apuCatchupCycles = 0.0;
@@ -196,6 +233,7 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     RtlApuLock();
     rtl_sync_apu_to_cpu_locked();
     uint8_t v = snes->apu->outPorts[adr & 0x3];
+    v = rtl_apu_port_observers_read(0x2100 + adr, v);
     audio_trace_on_cpu_port_read((uint8_t)(adr & 0x3), v);
     RtlApuUnlock();
     return v;
@@ -229,7 +267,6 @@ void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val) {
       uint32_t wa = snes->ramAdr & 0x1ffffu;
       uint8_t old = snes->ram[wa];
       snes->ram[wa] = val;
-      wlog_addr_note_direct(wa, val, "wmdata");
 #if SNESRECOMP_TRACE
       snes_trace_direct_wram_write(wa, old, val);
 #endif
@@ -272,6 +309,10 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
   uint32_t v = snes->vPos;
   while (clocks) {
     uint32_t span = 1364u - h;
+    /* Stop at HBlank so the HDMA transfer occurs at its hardware edge rather
+     * than after the rest of the scanline has already been consumed. */
+    if (check_irq && v < 225u && h < 1024u && span > 1024u - h)
+      span = 1024u - h;
     if (span > clocks) span = clocks;
 
     /* Automatic joypad polling begins at vblank and keeps HVBJOY.0 asserted
@@ -285,7 +326,8 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
                          ? 0 : (uint16_t)(snes->autoJoyTimer - span);
     }
 
-    if (check_irq && (snes->hIrqEnabled || snes->vIrqEnabled)) {
+    if (check_irq &&
+        (snes->hIrqEnabled || snes->vIrqEnabled)) {
       bool line_matches = !snes->vIrqEnabled || v == snes->vTimer;
       uint32_t target = snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
       if (line_matches && target < 1364u && target >= h && target < h + span)
@@ -294,10 +336,16 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
 
     h += span;
     clocks -= span;
+    if (check_irq && v < 225u && h == 1024u)
+      dma_doHdma(snes->dma);
     if (h >= 1364u) {
       h = 0;
       v++;
-      if (v >= 262u) v = 0;
+      if (v >= 262u) {
+        v = 0;
+        if (check_irq)
+          dma_initHdma(snes->dma);
+      }
     }
   }
   snes->hPos = (uint16_t)h;
@@ -321,31 +369,6 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
     snes_advance_master_cycles(snes,chunk);
     delta-=chunk;
   }
-}
-
-bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out) {
-  if (!snes || !out) return false;
-  if (!snes->hIrqEnabled && !snes->vIrqEnabled) return false;
-  /* Mirrors the match test in snes_advance_beam(): the comparator fires when
-   * the beam crosses target_h on a line the V comparator accepts. */
-  const uint32_t target_h =
-      snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
-  if (target_h >= 1364u) return false;
-
-  uint32_t h = snes->hPos;
-  uint32_t v = snes->vPos;
-  uint64_t delta = 0;
-  for (uint32_t scanned = 0; scanned <= 262u; scanned++) {
-    const bool line_matches = !snes->vIrqEnabled || v == snes->vTimer;
-    if (line_matches && target_h >= h) {
-      *out = now + delta + (uint64_t)(target_h - h);
-      return true;
-    }
-    delta += 1364u - h;
-    h = 0;
-    v = (v + 1u) % 262u;
-  }
-  return false;
 }
 
 uint8_t snes_readReg(Snes* snes, uint16_t adr) {
@@ -438,6 +461,13 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       if(!snes->autoJoyRead) snes->autoJoyTimer = 0;
       snes->hIrqEnabled = val & 0x10;
       snes->vIrqEnabled = val & 0x20;
+      { static int nmi_log = 0;
+        if (nmi_log < 20) {
+          fprintf(stderr, "[CPU_W] $4200=$%02X (NMI=%d IRQ_h=%d IRQ_v=%d AJR=%d)\n",
+                  val, (val >> 7) & 1, (val >> 4) & 1, (val >> 5) & 1, val & 1);
+          nmi_log++;
+        }
+      }
       snes->nmiEnabled = val & 0x80;
       if(!snes->hIrqEnabled && !snes->vIrqEnabled) {
         snes->inIrq = false;
@@ -497,8 +527,19 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420b: {
-      /* Always-on observability: record each triggered channel's config
-       * before the transfer consumes aAdr/size (see ppu_dma_trace.h). */
+      /* Log DMA triggers */
+      { static int dma420b_log = 0;
+        if (val != 0 && dma420b_log < 30) {
+          for (int ch = 0; ch < 8; ch++) {
+            if (val & (1 << ch)) {
+              DmaChannel *c = &snes->dma->channel[ch];
+              fprintf(stderr, "[DMA_TRIG] ch%d bAdr=$%02X src=%02X:%04X size=$%04X\n",
+                      ch, c->bAdr, c->aBank, c->aAdr, c->size);
+            }
+          }
+          dma420b_log++;
+        }
+      }
       for (int ch = 0; ch < 8; ch++) {
         if (val & (1 << ch)) {
           DmaChannel *c = &snes->dma->channel[ch];
@@ -556,7 +597,6 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     uint32_t addr = ((bank & 1) << 16) | adr;
     uint8_t old = snes->ram[addr];
     snes->ram[addr] = val; // ram
-    wlog_addr_note_direct(addr, val, "snes_write");
 #if SNESRECOMP_TRACE
     snes_trace_direct_wram_write(addr, old, val);
 #endif
@@ -569,7 +609,6 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     if(adr < 0x2000) {
       uint8_t old = snes->ram[adr];
       snes->ram[adr] = val; // ram mirror
-      wlog_addr_note_direct((uint32_t)adr, val, "snes_write_mirror");
 #if SNESRECOMP_TRACE
       snes_trace_direct_wram_write((uint32_t)adr, old, val);
 #endif
@@ -589,6 +628,9 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     }
     if(adr >= 0x4300 && adr < 0x4380) {
       dma_write(snes->dma, adr, val); // dma registers
+      /* S-DD1 spies on DMA channel register writes */
+      if (snes->cart && snes->cart->type == CART_SDD1 && snes->cart->sdd1)
+        sdd1_dma_channel_write(snes->cart->sdd1, adr, val);
     }
     if(adr >= 0x2100 && adr < 0x4400) {
       debug_server_on_reg_write(adr, val);

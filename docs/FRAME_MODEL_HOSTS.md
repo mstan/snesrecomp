@@ -13,9 +13,11 @@ advances an independent beam can split a frame between two clocks. Device work
 derived from only the host-side clock can then miss edges that the bridge-side
 clock crossed.
 
-Prefer scheduling host device work from the shared `Snes` beam state, or keep a
-single explicit host-owned beam and audit every framework edge that must be
-called manually.
+`interp_bridge_run_loop()` and related LLE bridge entry points are therefore not
+"CPU only" helpers. While they execute guest instructions, they also advance the
+shared `Snes` beam to the interpreted CPU master clock. Prefer scheduling host
+device work from that shared `Snes` beam state, or keep a single explicit
+host-owned beam and audit every framework edge that must be called manually.
 
 Frame-model hosts that own HBlank/VBlank edges are responsible for hardware
 work normally driven by the framework timeline, including:
@@ -35,10 +37,12 @@ part of the requested SPC time. Frame-model hosts should catch up the APU at
 smaller timing slices or use the framework frame runner that owns the audio
 timeline.
 
-When the bridge is running with the absolute SA-1 frame timeline, interpreted
-APU deltas are consumed by that absolute clock. Hosts outside that model should
-not assume bridge exits alone have advanced all deferred SPC time; flush or
-catch up at explicit integration points.
+Ordinary SNES interpreter fallback still applies relative bridge catch-up for
+interpreted CPU time. Only the active SA-1 absolute frame timeline suppresses
+that relative catch-up, because its port accesses and frame boundary sync to the
+same guest timestamp. Hosts outside that model should not assume bridge exits
+alone have advanced all deferred SPC time; flush or catch up at explicit
+integration points.
 
 ## Bridge Hooks
 

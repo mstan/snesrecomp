@@ -25,6 +25,9 @@ v2 KEEPS:
 - `name <hex_addr> <name>` — friendly-naming for cross-bank labels.
   v2 emits these as `void NAME(CpuState *cpu);` forward declarations
   in funcs.h (Phase 6e/f). For now we just retain them.
+- `symbol <hex_addr> <name>` — non-promoting friendly label. Unlike
+  `name`, this never creates an emit entry or funcs.h declaration; it
+  only names an address if analysis reaches it through real code flow.
 - `force_lle <pc24>` — keep an exact architectural function boundary on
   the interpreter tier even when profile promotion or static reachability
   would otherwise materialise it as native code.
@@ -80,6 +83,7 @@ class BankCfg:
     includes: List[str] = field(default_factory=list)
     entries: List[BankEntry] = field(default_factory=list)
     names: List[NameDecl] = field(default_factory=list)
+    symbols: List[NameDecl] = field(default_factory=list)
     # Exact 24-bit function boundaries which must stay interpreter-only.
     # Unlike exclude_range, these are executable ROM routines; they merely
     # rely on behavior (for example return-stack rewriting) that the native
@@ -730,6 +734,22 @@ def load_bank_cfg(path: str) -> BankCfg:
                     continue
                 friendly = tokens[2]
                 cfg.names.append(NameDecl(addr_24=addr, name=friendly))
+                continue
+
+            # symbol <hex_addr> <friendly_name>
+            #
+            # Non-promoting label overlay. This feeds the name resolver for
+            # analysis/emission comments and discovered functions, but unlike
+            # `name` it never auto-promotes same-bank labels into cfg.entries.
+            if head == 'symbol':
+                if len(tokens) < 3:
+                    continue
+                try:
+                    addr = _parse_hex(tokens[1])
+                except ValueError:
+                    continue
+                friendly = tokens[2]
+                cfg.symbols.append(NameDecl(addr_24=addr, name=friendly))
                 continue
 
             # exclude_range <start> <end>

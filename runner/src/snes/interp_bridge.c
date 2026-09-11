@@ -13,6 +13,7 @@
 #include "superfx.h"
 #include "cx4.h"
 #include "sa1.h"
+#include "sdd1.h"
 #include "debug_server.h"
 #include "common_rtl.h"
 #include "cosim.h"  /* cosim_insn — instruction-granular lockstep (no-op unless SNES_COSIM) */
@@ -28,7 +29,6 @@
  * poll, so the SPC stayed frozen (co-sim: A outPorts=0000 vs B outPorts=AABB).
  * Scoped to the interp tier — the compiled path never enters here. */
 extern Snes *g_snes;
-extern int snes_frame_counter;
 extern uint64_t g_apu_last_sync_master;   /* common_rtl.c — keep synced so a bounce's accurate-mode delta excludes interp opcodes */
 extern int g_interp_apu_driving;          /* common_rtl.c — suppresses the per-touch synthetic catch-up while set */
 #ifdef SNES_COSIM
@@ -59,58 +59,75 @@ static uint64_t bridge_bounce_flush_thresh(void) {
     static int64_t s_t = -1;
     if (s_t < 0) {
         const char *e = getenv("SNESRECOMP_LLE_APU_FLUSH_THRESH");
-        s_t = (e && e[0]) ? (int64_t)strtoll(e, NULL, 0) : 4096;
+        s_t = (e && e[0]) ? (int64_t)strtoll(e, NULL, 0) : 1024;
         if (s_t < 0) s_t = 0;
     }
     return (uint64_t)s_t;
 }
-/* SNESRECOMP_YIELD_STACK_DIAG enables immediately. Set
- * SNESRECOMP_YIELD_STACK_DIAG_FROM=<frame> to delay noisy captures. */
-static int bridge_yield_stack_diag_enabled(void) {
-    const char *diag = getenv("SNESRECOMP_YIELD_STACK_DIAG");
-    if (!diag || !diag[0]) return 0;
-
-    const char *from = getenv("SNESRECOMP_YIELD_STACK_DIAG_FROM");
-    if (!from || !from[0]) return 1;
-
-    char *end = NULL;
-    long first_frame = strtol(from, &end, 0);
-    if (end == from) return 1;
-    return snes_frame_counter >= first_frame;
-}
+#ifdef SNESRECOMP_INTERP_PROFILE
+#include <time.h>
+uint64_t apu_prof_calls = 0;
+double apu_prof_ms = 0.0;
+uint64_t bridgeq_prof_calls = 0;
+double bridgeq_prof_ms = 0.0;
+#endif
 static void bridge_apu_flush(CpuState *cpu) {
     if (!s_apu_pending_master) return;
-    /* RtlRunFrame's absolute guest-cycle clock and this legacy relative
-     * catch-up describe the same elapsed time. Running both made interpreted
-     * SPC handshakes complete at about twice hardware speed (first exposed by
-     * Super Mario RPG's long boot upload). Port accesses and the frame-boundary
-     * sync already advance the SPC to the exact absolute timestamp. */
+#ifdef SNESRECOMP_INTERP_PROFILE
+    { extern uint64_t apu_prof_calls; extern double apu_prof_ms;
+      apu_prof_calls++; }
+    clock_t _t0 = clock();
+#endif
     if (interp_bridge_use_absolute_apu_timeline(
             rtl_apu_frame_timeline_active(),
             g_snes && cart_has_sa1(g_snes->cart),
             rtl_apu_extended_frame_timing() &&
             g_snes && g_snes->apu && g_snes->apu->portTimeValid)) {
-        s_apu_pending_master = 0;
+        /* Skip snes_catchupApu (legacy relative catch-up) to avoid
+         * double-counting with the absolute guest-clock sync below.
+         * But we MUST still call rtl_sync_apu_to_cpu_locked() to advance
+         * the SPC to the current guest time — otherwise port writes queued
+         * by RtlApuWrite are never drained and the SPC never processes them.
+         * Star Ocean's name-entry music transfer writes data to $2140-$2143
+         * and polls for a response; without this sync the SPC is frozen. */
+        RtlApuLock();
         g_apu_last_sync_master = cpu->master_cycles;
-        if (rtl_apu_extended_frame_timing()) {
-            RtlApuLock();
-            rtl_sync_apu_to_cpu_locked();
-            RtlApuUnlock();
-        }
+        rtl_sync_apu_to_cpu_locked();
+        RtlApuUnlock();
+        s_apu_pending_master = 0;
         return;
     }
     RtlApuLock();
     g_snes->apuCatchupCycles += (double)s_apu_pending_master * kInterpApuPerMaster;
     g_apu_last_sync_master = cpu->master_cycles;
     snes_catchupApu(g_snes);
+    /* After the relative catch-up, resync the SPC to the absolute guest clock.
+     * snes_catchupApu advances portClock proportionally to master cycles, but
+     * when the bridge runs the CPU faster than real-time (interpreted mode),
+     * portClock can overshoot the guest-time target computed by
+     * apu_runToGuestCycle.  Calling rtl_sync_apu_to_cpu_locked re-anchors the
+     * SPC to the correct absolute position so port writes scheduled by the
+     * CPU are visible when the CPU reads them back. */
+    rtl_sync_apu_to_cpu_locked();
     RtlApuUnlock();
     s_apu_pending_master = 0;
+#ifdef SNESRECOMP_INTERP_PROFILE
+    { extern uint64_t apu_prof_calls; extern double apu_prof_ms;
+      apu_prof_ms += 1000.0 * ((double)(clock() - _t0)) / CLOCKS_PER_SEC; }
+#endif
 }
 static int bridge_is_apu_port(uint32_t adr) {
     uint16_t a = (uint16_t)(adr & 0xFFFF);
     if (a < 0x2140 || a > 0x217F) return 0;
     uint8_t bank = (uint8_t)((adr >> 16) & 0xFF);
     return bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF);
+}
+
+static int bridge_apu_port_diag_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("SNESRECOMP_APU_PORT_DIAG") != NULL;
+    return enabled;
 }
 
 /* ── memory bus shim ───────────────────────────────────────────────────────
@@ -126,24 +143,23 @@ static int s_interp_bus_timing_active;
 typedef struct BridgeDynamicValue { uint32_t address; uint8_t value, valid; } BridgeDynamicValue;
 static BridgeDynamicValue s_bridge_dynamic_values[64];
 
+void interp_bridge_reset_dynamic_cache(void) {
+    memset(s_bridge_dynamic_values, 0, sizeof(s_bridge_dynamic_values));
+    s_interp_continuous_read_epoch = 0;
+    s_interp_dynamic_progress_epoch = 0;
+    g_interp_bridge_write_epoch = 0;
+}
+
 /* Match Recompiler/snes_cycles.py::region_speed. During an interpreted
  * instruction the callbacks see every real bus transfer (opcode/operand
  * fetches, data, stack and vectors), so charging those addresses directly and
  * the remaining internal cycles at 6 master clocks is both more faithful and
  * less tier-divergent than the old blanket `cpu_cycles * 8` estimate. */
 static unsigned bridge_region_speed(uint32_t adr) {
-    uint8_t bank=(uint8_t)(adr>>16); uint16_t a=(uint16_t)adr;
-    if (bank>=0x40 && bank<=0x7f) return 8;
-    if (bank>=0xc0) return g_memsel ? 6 : 8;
-    if (a>=0x8000) {
-        if (bank<=0x3f) return 8;
-        return g_memsel ? 6 : 8;
-    }
-    if (a<0x2000) return 8;
-    if (a<0x4000) return 6;
-    if (a<0x4200) return 12;
-    if (a<0x6000) return 6;
-    return 8;
+    /* Single C implementation shared with the AOT paced accessors
+     * (cpu_state.c cpu_region_speed) so both tiers price transfers
+     * identically. */
+    return (unsigned)cpu_region_speed(adr);
 }
 
 static void bridge_timing_bus(uint32_t adr) {
@@ -154,10 +170,22 @@ static void bridge_timing_bus(uint32_t adr) {
 
 static int bridge_continuous_read(uint32_t adr) {
     uint8_t bank=(uint8_t)(adr>>16); uint16_t a=(uint16_t)adr;
-    if (!(bank<=0x3f || (bank>=0x80 && bank<=0xbf))) return 0;
+    if (!(bank<=0x3f || (bank>=0x80 && bank<=0xbf))) {
+        /* Banks $C0-$FF in S-DD1 carts: the MMC window returns data that
+         * changes as the decompression engine advances its source pointer.
+         * Marking these as dynamic prevents the quiescent detector from
+         * mistaking the S-DD1 decompression inner loop for a stable spin. */
+        if (g_snes && g_snes->cart && g_snes->cart->type == CART_SDD1)
+            return 1;
+        return 0;
+    }
     /* Devices in these windows advance from CPU/master time or from the read
      * protocol itself. Repeating CPU registers around such a read is not a
      * quiescent interrupt wait: keep executing so the device can answer. */
+    /* Zero-page and direct-page reads are used by S-DD1 decompression
+     * loops and other game logic that must not be mistaken for quiescent
+     * polling.  Mark them dynamic so the epoch advances. */
+    if (a < 0x2000) return 1;
     if (a>=0x2134 && a<0x2180) return 1;       /* PPU counters + APU ports */
     if (a>=0x3000 && a<0x3300) return 1;       /* GSU registers/cache */
     if (a==0x4016 || a==0x4017 || a==0x4212) return 1;
@@ -184,13 +212,24 @@ static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
     bridge_timing_bus(adr);
     g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && bridge_is_apu_port(adr)) {
+    const int is_apu_port = bridge_is_apu_port(adr);
+    if (is_apu_port && bridge_apu_port_diag_enabled()) {
         static unsigned reports;
-        if(reports++<256) fprintf(stderr,"[apu_port] write $%04X=%02X master=%llu\n",
+        if(reports++<131072) fprintf(stderr,"[apu_port] write $%04X=%02X master=%llu\n",
           (unsigned)(uint16_t)adr,val,(unsigned long long)cpu->master_cycles);
     }
-    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
+    if (is_apu_port) bridge_apu_flush(cpu);
     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
+    /* Re-sync the SPC after the port write so it can see the new data.
+     * bridge_apu_flush above consumed s_apu_pending_master, so calling it
+     * again would be a no-op.  Instead advance the SPC directly so the
+     * IPL loop can read the just-written port value (Star Ocean SPC700
+     * upload handshake: writes to $2140-$2143, polls $2140 for $6B). */
+    if (is_apu_port && g_snes && g_snes->apu) {
+        RtlApuLock();
+        rtl_sync_apu_to_cpu_locked();
+        RtlApuUnlock();
+    }
 }
 
 /* Word bus (interp816 read_word/write_word): claim a CONTIGUOUS pair that
@@ -221,9 +260,10 @@ static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
     if (bridge_continuous_read(adrl) || bridge_continuous_read(adrh))
         s_interp_continuous_read_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    const int is_apu_port = bridge_is_apu_port(adrl);
+    if (is_apu_port) bridge_apu_flush(cpu);
     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && (uint16_t)adrl == 0x2140) {
+    if ((uint16_t)adrl == 0x2140 && bridge_apu_port_diag_enabled()) {
         static uint16_t last=0xffff; static unsigned reports;
         if (*out!=last && reports++<256) {
             fprintf(stderr,"[apu_port] read $2140=%04X pc-master=%llu pending=%llu\n",
@@ -252,15 +292,34 @@ static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
     bridge_timing_bus(adrh);
     g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && bridge_is_apu_port(adrl)) {
+    const int is_apu_port = bridge_is_apu_port(adrl);
+    if (is_apu_port && bridge_apu_port_diag_enabled()) {
         static unsigned reports;
-        if(reports++<256) fprintf(stderr,"[apu_port] writew $%04X=%04X master=%llu\n",
+        if(reports++<131072) fprintf(stderr,"[apu_port] writew $%04X=%04X master=%llu\n",
           (unsigned)(uint16_t)adrl,val,(unsigned long long)cpu->master_cycles);
     }
-    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    if (is_apu_port) bridge_apu_flush(cpu);
     cpu_write16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF), val);
+    /* Re-sync SPC after port write so it can see the new data (same as
+     * bridge_bus_write byte path). */
+    if (is_apu_port && g_snes && g_snes->apu) {
+        RtlApuLock();
+        rtl_sync_apu_to_cpu_locked();
+        RtlApuUnlock();
+    }
     return true;
 }
+
+#ifdef SNESRECOMP_APU_PORT_DIAG_TEST
+void interp_bridge_test_apu_port_diag_probe(CpuState *cpu, int apu_port) {
+    uint16_t value;
+    const uint32_t lo = apu_port ? 0x002140u : 0x002100u;
+    s_apu_pending_master = 1364;
+    bridge_bus_write(cpu, lo, 0x12);
+    (void)bridge_bus_read_word(cpu, lo, lo + 1, &value);
+    (void)bridge_bus_write_word(cpu, lo, lo + 1, 0x3456, false);
+}
+#endif
 
 /* ── register/flag sync ────────────────────────────────────────────────────
  * interp816 carries flags as discrete bools + an `e` (emulation) bit; CpuState
@@ -360,6 +419,7 @@ static int      s_lle_unwind_is_deadline = 0;
 static int      s_lle_next_unwind_is_deadline = 0;
 static uint32_t s_lle_resume_pc24   = 0;
 static int      s_lle_wai_yield     = 0;
+static int      s_lle_quiescent_yield = 0;
 static uint64_t s_lle_master_deadline = 0;
 /* Depth of nested interpreter runs and the run that owns the current paired
  * AOT bounce. A rewritten/non-local return from that AOT root must resume the
@@ -445,10 +505,21 @@ int rtl_aot_node_denied(uint32 pc24) {
 
 int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
+void interp_bridge_set_lle_resume_pc(uint32_t pc) { s_lle_resume_pc24 = pc; }
 
 int interp_bridge_lle_took_wai(void) {
     const int v = s_lle_wai_yield;
     s_lle_wai_yield = 0;
+    return v;
+}
+/* The last yield was a quiescent read-only spin (stable CPU/memory state)
+ * rather than a WAI. Whole-program LLE games that block on NMI by polling
+ * $4210 (Star Ocean's $00:F6F5 wait) yield this way; the frame driver needs
+ * to distinguish it from IRQ/deadline returns so it can deliver the vblank
+ * NMI to a blocked game the same way it does after a WAI. */
+int interp_bridge_lle_took_quiescent(void) {
+    const int v = s_lle_quiescent_yield;
+    s_lle_quiescent_yield = 0;
     return v;
 }
 void interp_bridge_set_master_deadline(uint64_t master_clock) {
@@ -563,7 +634,12 @@ void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
 #ifndef SNESRECOMP_LLE_BOUNCE_DEFAULT
 #define SNESRECOMP_LLE_BOUNCE_DEFAULT 1
 #endif
+static int s_scheduler_aot_policy = -1;
+void interp_bridge_set_scheduler_aot_policy(int enabled) {
+    s_scheduler_aot_policy = enabled < 0 ? -1 : enabled != 0;
+}
 static int lle_yield_bounce_enabled(void) {
+    if (s_scheduler_aot_policy >= 0) return s_scheduler_aot_policy;
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("SNESRECOMP_LLE_BOUNCE");
@@ -645,38 +721,6 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
     }
 }
 
-/* ── Always-on global interp step ring ─────────────────────────────────
- * The per-run head[]/ring[] above are stack locals — invisible to a
- * post-mortem or halt fired mid-run. This ring records EVERY interpreted
- * step (pc, op, sp, frame) continuously so a late observer can read the
- * interpreter's recent control flow backward (ring-buffer doctrine: no
- * arm-then-capture). 8192 entries ≈ several frames of pure-interp code. */
-#define ITRACE_RECENT_LEN 8192
-typedef struct { uint32_t pc; int32_t frame; uint16_t sp; uint8_t op; uint8_t pad; } ITraceRecentEnt;
-static ITraceRecentEnt g_itrace_recent[ITRACE_RECENT_LEN];
-static uint64_t g_itrace_recent_n = 0;
-
-void interp_bridge_dump_recent_steps(int n, FILE *out) {
-    if (!out) out = stderr;
-    if (n <= 0 || (uint64_t)n > g_itrace_recent_n) n = (int)(g_itrace_recent_n < ITRACE_RECENT_LEN
-                                                            ? g_itrace_recent_n : ITRACE_RECENT_LEN);
-    if ((uint64_t)n > g_itrace_recent_n) n = (int)g_itrace_recent_n;
-    fprintf(out, "[interp_recent] last %d interp steps (of %llu total):\n",
-            n, (unsigned long long)g_itrace_recent_n);
-    for (int i = n; i >= 1; i--) {
-        const ITraceRecentEnt *e =
-            &g_itrace_recent[(g_itrace_recent_n - (uint64_t)i) & (ITRACE_RECENT_LEN - 1)];
-        fprintf(out, "  f%-6d $%06X op=%02X sp=%04X\n", e->frame, e->pc, e->op, e->sp);
-    }
-}
-
-/* Install the ring dump as cpu_state.c's halt-path hook (explicit hook, not
- * a PE weak symbol — see cpu_state.c). Constructor runs at image load. */
-__attribute__((constructor))
-static void itrace_install_dump_hook(void) {
-    g_interp_recent_dump_hook = interp_bridge_dump_recent_steps;
-}
-
 /* Tier-2 coverage table (definitions below, § gap manifest): shared by the
  * tier-down entries AND the in-bridge gap recorders in the core loop. */
 enum { TIER2_KIND_DISPATCH = 0, TIER2_KIND_INDIRECT_GOTO = 1,
@@ -706,6 +750,109 @@ static uint8_t tier2_entry_mx(const CpuState *cpu);
  * the return-past-entry watermark exit is DISABLED, because such loops reset
  * their own stack (MMX: LDX #$02FF; TXS at $8099), which would otherwise trip
  * the is_ret watermark on the first task RTS. */
+#ifdef SNESRECOMP_INTERP_PROFILE
+/* Dev-only per-PC histogram of interpreted steps. Compiled ONLY when the
+ * cosim toolchain passes -DSNESRECOMP_INTERP_PROFILE; production builds
+ * (2.Beta / 1.Release) never define it, so they are byte-identical in
+ * behavior. Dumps the top PCs to stderr at exit. */
+#define PROFILE_HIST_CAP 65536
+uint64_t g_interp_total_steps = 0;
+typedef struct { uint32_t pc24; uint64_t n; double ms; } InterpHistEnt;
+static InterpHistEnt s_interp_hist[PROFILE_HIST_CAP];
+static long s_interp_prof_start = -1;
+static long s_interp_prof_end = -1;
+static long s_interp_ppu_start_frame = -1;   /* bracket for per-frame PPU split */
+static void interp_hist_add(uint32_t pc24) {
+    uint32_t h = (pc24 * 2654435761u) & (PROFILE_HIST_CAP - 1);
+    for (unsigned i = 0; i < PROFILE_HIST_CAP; i++) {
+        uint32_t idx = (h + i) & (PROFILE_HIST_CAP - 1);
+        if (s_interp_hist[idx].pc24 == pc24) { s_interp_hist[idx].n++; return; }
+        if (s_interp_hist[idx].pc24 == 0 && s_interp_hist[idx].n == 0) {
+            s_interp_hist[idx].pc24 = pc24; s_interp_hist[idx].n = 1; return;
+        }
+    }
+}
+static void interp_hist_time(uint32_t pc24, double dms) {
+    if (dms <= 0.0) return;
+    uint32_t h = (pc24 * 2654435761u) & (PROFILE_HIST_CAP - 1);
+    for (unsigned i = 0; i < PROFILE_HIST_CAP; i++) {
+        uint32_t idx = (h + i) & (PROFILE_HIST_CAP - 1);
+        if (s_interp_hist[idx].pc24 == pc24) { s_interp_hist[idx].ms += dms; return; }
+        if (s_interp_hist[idx].pc24 == 0 && s_interp_hist[idx].n == 0) {
+            s_interp_hist[idx].pc24 = pc24; s_interp_hist[idx].ms = dms; return;
+        }
+    }
+}
+static int _hist_cmp(const void *a, const void *b) {
+    const double na = ((const InterpHistEnt *)a)->ms;
+    const double nb = ((const InterpHistEnt *)b)->ms;
+    return na < nb ? 1 : (na > nb ? -1 : 0);
+}
+static void interp_hist_dump(void) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < PROFILE_HIST_CAP; i++)
+        if (s_interp_hist[i].n) count++;
+    fprintf(stderr, "\n[interp_profile] %u distinct PCs, top 60 by host-ms (n = steps):\n", count);
+    qsort(s_interp_hist, PROFILE_HIST_CAP, sizeof s_interp_hist[0], _hist_cmp);
+    double total_ms = 0.0;
+    uint64_t total = 0;
+    for (unsigned i = 0; i < PROFILE_HIST_CAP; i++) { total += s_interp_hist[i].n; total_ms += s_interp_hist[i].ms; }
+    for (unsigned i = 0; i < 60 && i < PROFILE_HIST_CAP && s_interp_hist[i].n; i++)
+        fprintf(stderr, "  $%06X  %10.1f ms  %12llu  (%5.2f%% ms)\n",
+                (unsigned)s_interp_hist[i].pc24,
+                s_interp_hist[i].ms,
+                (unsigned long long)s_interp_hist[i].n,
+                total_ms > 0.0 ? 100.0 * s_interp_hist[i].ms / total_ms : 0.0);
+    extern int snes_frame_counter;
+    extern void ppu_sec_read(double*, double*, double*, double*, double*, double*);
+    double ev = 0, ln = 0, bg = 0, sp = 0, cp = 0, hd = 0;
+    ppu_sec_read(&ev, &ln, &bg, &sp, &cp, &hd);
+    long nframes = snes_frame_counter - s_interp_ppu_start_frame;
+    if (nframes <= 0) nframes = 1;
+    /* Per-bank LLE coverage: distinct PCs and steps per ROM bank. AOT'd
+     * blocks are not interpreted, so they never appear here; complement
+     * with the VFF/AOT logs when judging candidates. */
+    unsigned bank_pcs[256] = {0};
+    unsigned long long bank_steps[256] = {0};
+    for (unsigned i = 0; i < PROFILE_HIST_CAP; i++)
+        if (s_interp_hist[i].n) {
+            unsigned b = (s_interp_hist[i].pc24 >> 16) & 0xff;
+            bank_pcs[b]++;
+            bank_steps[b] += s_interp_hist[i].n;
+        }
+    fprintf(stderr, "\n[coverage] per-bank LLE (distinct PCs / steps):\n");
+    for (unsigned b = 0; b < 256; b++)
+        if (bank_pcs[b])
+            fprintf(stderr, "  $%02X  %5u PCs  %12llu steps\n", b, bank_pcs[b],
+                    (unsigned long long)bank_steps[b]);
+    fprintf(stderr,
+        "\n[ppu_split] frames=%ld facade=%.1fms => phases per frame:\n",
+        nframes, (ln + hd) / nframes);
+    fprintf(stderr,
+        "  eval(sprites-oam) %8.3f ms/f  %6.1f%%\n"
+        "  bg(main+sub)      %8.3f ms/f  %6.1f%%   <- BG1/BG2/BG3 tile blit\n"
+        "  sprites(draw)     %8.3f ms/f  %6.1f%%\n"
+        "  compose/colormath %8.3f ms/f  %6.1f%%   <- window+color math mix\n"
+        "  hdma              %8.3f ms/f  %6.1f%%\n",
+        ev / nframes, ev / (ln + hd) * 100.0,
+        bg / nframes, bg / (ln + hd) * 100.0,
+        sp / nframes, sp / (ln + hd) * 100.0,
+        cp / nframes, cp / (ln + hd) * 100.0,
+        hd / nframes, hd / (ln + hd) * 100.0);
+}
+static void interp_hist_init(void) {
+    static int _done = 0;
+    if (!_done) {
+        _done = 1;
+        const char *s = getenv("SNESRECOMP_INTERP_PROFILE_START");
+        const char *e = getenv("SNESRECOMP_INTERP_PROFILE_END");
+        if (s && *s) s_interp_prof_start = strtol(s, NULL, 0);
+        if (e && *e) s_interp_prof_end = strtol(e, NULL, 0);
+        atexit(interp_hist_dump);
+    }
+}
+#endif
+
 static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  uint16_t s_exit, uint32_t *out_landing,
                                  uint32_t *out_return_pc,
@@ -786,8 +933,54 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     long steps = 0;
     uint64_t progress_write_epoch=g_interp_bridge_write_epoch;
     uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
+    /* The pre-opcode poll-shape recognition below reads the instruction bytes
+     * (pc_before, pc_before+3) on every interpreted opcode.  All three checks
+     * that consume them require yield_pc && !auto_quiescent, which is never
+     * true in a whole-program auto-quiescent run — those two ROM reads (and
+     * their S-DD1 dynamic-read epoch bumps) were pure per-opcode overhead
+     * there.  Skip them in that mode; SNESRECOMP_NO_POLLGATE=1 restores the
+     * old always-read behavior for A/B validation.  The reads happen outside
+     * the bus-timing window (s_interp_bus_timing_active), so they never
+     * contributed to master_cycles. */
+    static int s_poll_gate = -1;
+    static int s_d9ff = -1;
+    if (s_d9ff < 0) {
+        const char *_e = getenv("SNESRECOMP_NO_D9FF");
+        s_d9ff = (_e && _e[0] && _e[0] != '0') ? 0 : 1;
+    }
+    if (s_poll_gate < 0) {
+        const char *_e = getenv("SNESRECOMP_NO_POLLGATE");
+        s_poll_gate = (_e && _e[0] && _e[0] != '0') ? 0 : 1;
+    }
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+#ifdef SNESRECOMP_INTERP_PROFILE
+        g_interp_total_steps++;
+        interp_hist_init();
+        if ((steps & 255u) == 0) {
+            static int _it_on = -1;
+            if (_it_on < 0) { const char *_e = getenv("SNESRECOMP_INTERP_MS_PROF");
+                              _it_on = (_e && _e[0] && _e[0] != '0') ? 1 : 0; }
+            if (_it_on == 1) {
+                static clock_t _it_last = 0;
+                static uint32_t _it_pc = 0;
+                clock_t _now = clock();
+                if (_it_last) interp_hist_time(_it_pc,
+                    1000.0 * (double)(_now - _it_last) / CLOCKS_PER_SEC);
+                _it_last = _now;
+                _it_pc = pc_before;
+            }
+        }
+        if ((s_interp_prof_start < 0 || snes_frame_counter >= s_interp_prof_start) &&
+            (s_interp_prof_end < 0 || snes_frame_counter <= s_interp_prof_end)) {
+            if (s_interp_prof_start >= 0 && s_interp_ppu_start_frame < 0) {
+                extern void ppu_sec_reset(void);
+                s_interp_ppu_start_frame = snes_frame_counter;
+                ppu_sec_reset();   /* PPU phase-ms split covers window only */
+            }
+            interp_hist_add(pc_before);
+        }
+#endif
 #if SNESRECOMP_REVERSE_DEBUG
         /* The reverse debugger must observe whichever execution tier owns the
          * next guest instruction. AOT blocks arrive through cpu_trace_block;
@@ -827,6 +1020,265 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             bridge_apu_flush(cpu);
             return 1;
         }
+        /* Star Ocean battle $00D9 work-wait specialization. This does not skip
+         * the wait; it executes the LDA $00D9 / BEQ loop with the same master
+         * timing and IRQ/deadline sampling, but avoids the full interpreter bus
+         * dispatch overhead in the battle vIRQ case. */
+        if (s_d9ff && auto_quiescent && g_snes && !in.i &&
+            !s_interp_bus_timing_active && in.mf && !in.e && !in.dp &&
+            in.k == 0xC0u && (in.pc == 0x84B2u || in.pc == 0x84B4u) &&
+            g_snes->vIrqEnabled && g_snes->vTimer == 216u) {
+            static int s_d9_bytes_ok = -1;
+            if (s_d9_bytes_ok < 0) {
+                s_d9_bytes_ok =
+                    bridge_bus_read(cpu, 0xC084B2u) == 0xA5u &&
+                    bridge_bus_read(cpu, 0xC084B3u) == 0xD9u &&
+                    bridge_bus_read(cpu, 0xC084B4u) == 0xF0u &&
+                    bridge_bus_read(cpu, 0xC084B5u) == 0xFCu;
+            }
+            if (s_d9_bytes_ok) {
+                for (;;) {
+                    if (auto_quiescent && !in.i && g_snes && g_snes->inIrq) {
+                        s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+                        sync_interp_to_cpu(&in, cpu);
+                        bridge_apu_flush(cpu);
+                        return 1;
+                    }
+                    if (auto_quiescent && s_lle_master_deadline &&
+                        cpu->master_cycles >= s_lle_master_deadline) {
+                        s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+                        sync_interp_to_cpu(&in, cpu);
+                        bridge_apu_flush(cpu);
+                        return 1;
+                    }
+                    if (in.pc == 0x84B4u) {
+                        if (in.z) {
+                            cpu->cycles += 3u;
+                            cpu->master_cycles += 18u;
+                            in.pc = 0x84B2u;
+                        } else {
+                            cpu->cycles += 2u;
+                            cpu->master_cycles += 12u;
+                            in.pc = 0x84B5u;
+                        }
+                        if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
+                        if (g_snes && g_snes->cart)
+                            cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
+                        cpu->coprocessor_master_cycles = cpu->master_cycles;
+                        if (in.pc == 0x84B5u) break;
+                        continue;
+                    }
+
+                    cpu->cycles += 3u;
+                    cpu->master_cycles += 18u;
+                    {
+                        const uint8_t v = (uint8_t)cpu->ram[0x00D9u];
+                        in.a = (uint16_t)((in.a & 0xFF00u) | v);
+                        in.z = (v == 0);
+                        in.n = (v & 0x80u) != 0;
+                    }
+                    if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
+                    if (g_snes && g_snes->cart)
+                        cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
+                    cpu->coprocessor_master_cycles = cpu->master_cycles;
+                    if (auto_quiescent && !in.i && g_snes && g_snes->inIrq) {
+                        s_lle_resume_pc24 = 0xC084B4u;
+                        sync_interp_to_cpu(&in, cpu);
+                        bridge_apu_flush(cpu);
+                        return 1;
+                    }
+                    if (auto_quiescent && s_lle_master_deadline &&
+                        cpu->master_cycles >= s_lle_master_deadline) {
+                        s_lle_resume_pc24 = 0xC084B4u;
+                        sync_interp_to_cpu(&in, cpu);
+                        bridge_apu_flush(cpu);
+                        return 1;
+                    }
+                    if (in.z) {
+                        cpu->cycles += 3u;
+                        cpu->master_cycles += 18u;
+                        if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
+                        if (g_snes && g_snes->cart)
+                            cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
+                        cpu->coprocessor_master_cycles = cpu->master_cycles;
+                    } else {
+                        cpu->cycles += 2u;
+                        cpu->master_cycles += 12u;
+                        in.pc = 0x84B5u;
+                        if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
+                        if (g_snes && g_snes->cart)
+                            cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
+                        cpu->coprocessor_master_cycles = cpu->master_cycles;
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        /* --- Star Ocean vblank-spin fast-forward ---
+         * The game has several copies of the same beam-wait routine: the
+         * main loop ($C8:F40F/F414/F425/F42A), battle engine ($CC:0538/3D/4E/53),
+         * title screen ($CA:6D13/18), intro ($C2:0B51/57 � LDA-long 0xAF),
+         * text screens ($C2:DB39/3E), and text zone ($C6:18D1/D6).
+         * Each pair is LDA $4212 + branch: BMI = vblank-end wait (vPos 225..261),
+         * BPL = vblank-start wait (vPos 1..224). The reads advance nothing
+         * while g_interp_apu_driving=1, the SPC is batch-synced, and the
+         * beam advance is path-independent (one big snes_sync_master_clock
+         * equals the sum of per-opcode advances), so jumping the beam to
+         * the natural exit point and flushing the skipped SPC time is
+         * state-exact. Disabled with SNESRECOMP_NO_VBLANK_FF=1. */
+        if (auto_quiescent && g_snes && !in.i && !s_lle_master_deadline &&
+            ((pc_before == 0xC8F425u || pc_before == 0xC8F42Au ||
+              pc_before == 0xC8F40Fu || pc_before == 0xC8F414u ||
+              pc_before == 0xCC0538u || pc_before == 0xCC053Du ||
+              pc_before == 0xCC054Eu || pc_before == 0xCC0553u
+              /* C2 text-screen vblank spin DB39/DB3E: byte-verified pure
+               * (LDA $4212; BMI-BPL), no per-iter work. Added 20260828+
+               * per FASE 2b so the spin FF-aligns the beam to the 42-mpq
+               * boundary while the dump (DB43+) runs AOT. Distinguish from
+               * $CA/$C2:0B51/$C6 which DO carry real work and stay out. */
+              || pc_before == 0xC2DB39u || pc_before == 0xC2DB3Eu
+              /* FASE 2b step 2 (20260828): title wait $CA:6D13/18 tried
+               * individually — validate A/B before keeping. */
+              || pc_before == 0xCA6D13u || pc_before == 0xCA6D18u
+              /* FASE 2b step 3 (20260828): text-zone $C6:18D1/D6 tried
+               * individually (intro $C2:0B51/57 REVERTED — diverges f284:
+               * its vblank spin is pure but NOT frame-last; FF from mid-
+               * field (v=138) shifts the phase of the title task's real
+               * work (writewatch: $01E5 writers ca6d13->ca6d16, ca6430->
+               * ca642f). Left LLE; see HANDOFF §4.8). */
+              || pc_before == 0xC618D1u || pc_before == 0xC618D6u
+              /* Intro $C2:0B51/57 (LDA-long 0xAF) — validated 20260828 (§4.9):
+               * its spin iteration costs 48 master cycles, not the 42 of the
+               * LDA-abs spins, so it needs the step=48 target rounding below.
+               * A/B 3050 frames bit-exact. */
+              || pc_before == 0xC20B51u || pc_before == 0xC20B57u
+              /* Field copy of the vblank wait at $C2:0B82/87 (LDA abs
+               * $4212; BMI/BPL, step 42 — same family as C8/CC/DB/6D/18).
+               * Added 20260830: game ground-truth profile showed this spin
+               * at ~57% of the field's interpreted opcodes (PC-watch:
+               * $C20B87/$C20B8A), with NO guard covering it. */
+              || pc_before == 0xC20B82u || pc_before == 0xC20B87u
+              || pc_before == 0xC0849Eu || pc_before == 0xC084A1u
+              || pc_before == 0xC084A3u || pc_before == 0xC084A6u))) {
+            static int s_vff_ok = -1;
+            static int s_vff_log = -1;
+            if (s_vff_ok < 0) {
+                const char *_e = getenv("SNESRECOMP_NO_VBLANK_FF");
+                s_vff_ok = (_e && _e[0] && _e[0] != '0') ? 0 : 1;
+                const char *_l = getenv("SNESRECOMP_VFF_LOG");
+                s_vff_log = (_l && _l[0] && _l[0] != '0') ? 1 : 0;
+            }
+            extern int snes_frame_counter;
+            if (s_vff_log) {
+                fprintf(stderr, "[VFF] entry f=%d pc=%06X m=%llu intra=%llu v=%u h=%u beamML=%llu apu_pend=%llu\n",
+                        snes_frame_counter, (unsigned)pc_before,
+                        (unsigned long long)cpu->master_cycles,
+                        (unsigned long long)(cpu->master_cycles % 357368u),
+                        g_snes->vPos, g_snes->hPos,
+                        (unsigned long long)g_snes->beamMasterLast,
+                        (unsigned long long)s_apu_pending_master);
+            }
+            if (s_vff_ok) {
+                extern int snes_frame_counter;
+                if (snes_frame_counter > 10 && !g_snes->hIrqEnabled) {
+                    const uint8_t op = bridge_bus_read(cpu, pc_before);
+                    const uint8_t lo = bridge_bus_read(cpu, pc_before + 1);
+                    const uint8_t hi = bridge_bus_read(cpu, pc_before + 2);
+                    /* Both LDA abs (0xAD, branch at pc+3) and LDA long
+                     * (0xAF, branch at pc+4) read $4212. Detect variant
+                     * and locate the branch opcode accordingly. */
+                    int is_abs = (op == 0xAD && lo == 0x12 && hi == 0x42);
+                    int is_long = (op == 0xAF && lo == 0x12 && hi == 0x42);
+                    if (is_abs || is_long) {
+                        const int br_off = is_long ? 4 : 3;
+                        const uint8_t br = bridge_bus_read(cpu, pc_before + br_off);
+                        const int is_bmi = (br == 0x30);
+                        const int is_bpl = (br == 0x10);
+                        const uint32_t v = g_snes->vPos;
+                        /* Step of the spin loop's repeated iteration in
+                         * master cycles: LDA abs $4212 + branch costs 42
+                         * (measured: validated spins C8/CC/DB/6D/18 all
+                         * bit-exact with mpq-42); the LDA LONG $4212 + branch
+                         * variant (0xAF, intro C2:0B51/57) costs 48 per
+                         * iteration (measured 20260828 f284: LLE reads at
+                         * intra 306894->306942 = +48; FF rounded to 42
+                         * landed 30 cycles early and shifted the phase of
+                         * the title task's real work). Use the variant's
+                         * real step so the FF lands on the same read the
+                         * LLE makes when it detects the vblank edge. */
+                        const uint64_t step = is_long ? 48u : 42u;
+                        uint64_t target = 0;
+                        if (is_bpl && v >= 1u && v < 225u) {
+                            if (!(g_snes->vIrqEnabled && g_snes->vTimer > v &&
+                                  g_snes->vTimer <= 224u)) {
+                                const uint64_t d = 225u * 1364u -
+                                    (cpu->master_cycles % 357368u);
+                                if (d >= step)
+                                    target = cpu->master_cycles +
+                                             step * ((d + step - 1u) / step);
+                            } else {
+                                const uint64_t trig =
+                                    (uint64_t)g_snes->vTimer * 1364u;
+                                const uint64_t pos =
+                                    cpu->master_cycles % 357368u;
+                                if (trig > pos) {
+                                    const uint64_t d = trig - pos;
+                                    const uint64_t k = (d - 1u) / step;
+                                    if (k >= 1u)
+                                        target = cpu->master_cycles + step * k;
+                                }
+                            }
+                        } else if (is_bmi && v >= 225u && v <= 261u) {
+                            if (!(g_snes->vIrqEnabled && g_snes->vTimer >= v &&
+                                  g_snes->vTimer <= 261u)) {
+                                const uint64_t d = 357368u -
+                                    (cpu->master_cycles % 357368u);
+                                if (d >= step)
+                                    target = cpu->master_cycles +
+                                             step * (d / step);
+                            }
+                        }
+                        if (target > cpu->master_cycles) {
+                            const uint64_t skip = target - cpu->master_cycles;
+                            if (s_vff_log) {
+                                fprintf(stderr, "[VFF] fire f=%d pc=%06X m=%llu v=%u h=%u d=%llu target=%llu skip=%llu\n",
+                                        snes_frame_counter, (unsigned)pc_before,
+                                        (unsigned long long)cpu->master_cycles,
+                                        g_snes->vPos, g_snes->hPos,
+                                        (unsigned long long)(target - cpu->master_cycles),
+                                        (unsigned long long)target,
+                                        (unsigned long long)skip);
+                            }
+                            /* CRITICAL: flush SPC BEFORE jumping master.
+                             * bridge_apu_flush -> rtl_sync_apu_to_cpu_locked
+                             * re-anchors SPC to current master. If master
+                             * is already at target, the first chunk pulls
+                             * portClock to full-skip and subsequent chunks
+                             * advance AGAIN (double count). Flushing
+                             * pre-jump anchors to pre-skip guest time
+                             * (no-op re-anchor), catchup adds exactly
+                             * skip * kInterpApuPerMaster. */
+                            s_apu_pending_master += skip;
+                            for (int _g = 0; s_apu_pending_master && _g < 64;
+                                 _g++) {
+                                const uint64_t _max_feed =
+                                    (uint64_t)(9000.0 / kInterpApuPerMaster);
+                                uint64_t _chunk = s_apu_pending_master;
+                                if (_chunk > _max_feed) _chunk = _max_feed;
+                                uint64_t _rest = s_apu_pending_master - _chunk;
+                                s_apu_pending_master = _chunk;
+                                bridge_apu_flush(cpu);
+                                s_apu_pending_master += _rest;
+                                if (!_chunk) break;
+                            }
+                            cpu->master_cycles = target;
+                            snes_sync_master_clock(g_snes, target);
+                        }
+                    }
+                }
+            }
+        }
         if (auto_quiescent) {
             QuiescentState now;
             memset(&now, 0, sizeof now);
@@ -838,7 +1290,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             now.continuous_read_epoch=s_interp_continuous_read_epoch;
             for (unsigned qi=0; qi<64; qi++) {
                 QuiescentState *old=&qring[qi];
-                if (old->step && steps-old->step<=64 &&
+                if (old->step && steps-old->step<=256 &&
                     old->pc==now.pc && old->a==now.a && old->x==now.x &&
                     old->y==now.y && old->sp==now.sp && old->dp==now.dp &&
                     old->db==now.db && old->k==now.k && old->c==now.c &&
@@ -859,8 +1311,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                          * mistaken for this path: continuous_read_epoch changes
                          * on every such read. */
                         s_lle_resume_pc24=pc_before;
-                        sync_interp_to_cpu(&in,cpu);
+                        s_lle_quiescent_yield = 1;
+                        /* Flush accumulated SPC time BEFORE yielding so the
+                         * SPC700 processes any pending port writes (Star Ocean
+                         * boot handshake: CPU writes to $2140-$2143 and polls
+                         * $2140 for response; without this flush the SPC stays
+                         * frozen and the game hangs at $C8F425). */
                         bridge_apu_flush(cpu);
+                        sync_interp_to_cpu(&in,cpu);
                         return 1;
                     }
                     break;
@@ -934,8 +1392,12 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          *   LDA abs; BMI/BPL -5
          *   BIT abs; BMI/BPL -5
          * while NMI/IRQ asynchronously changes bit 15. */
-        const uint8_t _poll_op = bridge_bus_read(cpu, pc_before);
-        const uint8_t _poll_branch = bridge_bus_read(cpu, pc_before + 3);
+        const uint8_t _poll_op =
+            (yield_pc && !auto_quiescent && s_poll_gate)
+                ? bridge_bus_read(cpu, pc_before) : 0;
+        const uint8_t _poll_branch =
+            (yield_pc && !auto_quiescent && s_poll_gate)
+                ? bridge_bus_read(cpu, pc_before + 3) : 0;
         const uint16_t _poll_pc16 = (uint16_t)pc_before;
         const int _secondary_poll_pc =
             _poll_pc16 == 0xE02C || _poll_pc16 == 0xE06B ||
@@ -1098,6 +1560,26 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
         }
         const uint8_t  op = bridge_bus_read(cpu, pc_before);
+#ifdef SNESRECOMP_INTERP_PROFILE
+        if ((steps & 8191u) == 0) {
+            static clock_t _rl_last = 0;
+            static uint32_t _rl_start_step = 0;
+            static int _rl_on = -1;
+            if (_rl_on < 0) _rl_on = getenv("SNESRECOMP_INTERP_RATE_LOG") ? 1 : 0;
+            if (_rl_on == 1) {
+                clock_t _now = clock();
+                if (_rl_last) {
+                    double _ms = 1000.0 * (double)(_now - _rl_last) / CLOCKS_PER_SEC;
+                    fprintf(stderr, "[rate] step=%ld pc=$%06X m=%llu 8192 steps in %.1f ms (%.0f ns/step)\n",
+                            (long)steps, (unsigned)pc_before,
+                            (unsigned long long)cpu->master_cycles, _ms,
+                            _ms * 1e6 / 8192.0);
+                }
+                _rl_last = _now;
+                _rl_start_step = (long)steps;
+            }
+        }
+#endif
         /* A COP reached by interpreted game code vectors to the ROM's invalid-
          * interrupt crash loop.  When the opt-in instruction trace is active,
          * report the first few COP arrivals with their immediate predecessor
@@ -1139,11 +1621,45 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             if (itn < 8) head[itn] = _e;
             if (trace) ring[itn & 255] = _e;
             itn++;
-            extern int snes_frame_counter;
-            ITraceRecentEnt *_g =
-                &g_itrace_recent[g_itrace_recent_n++ & (ITRACE_RECENT_LEN - 1)];
-            _g->pc = pc_before; _g->frame = snes_frame_counter;
-            _g->sp = in.sp; _g->op = op; _g->pad = 0;
+        }
+        /* Env-gated diagnostic (SNESRECOMP_C2WATCH=1): log every interpreted
+         * opcode in the menu-blit range $C2:FC40-$C2:FF00 with the live mode
+         * bits and the instruction bytes AS THE RECOMP FETCHES THEM through
+         * the runtime mapping (cpu_read8). Decisive for the C2 AOT: runtime
+         * bytes vs static ROM at addr&0xFFFFF (SDD1 MMC) vs classic LoROM
+         * ((bank-0xC0)<<15 | (pc16-0x8000)), and the real entry/mx. Capped
+         * at 3000 entries; off by default, zero cost when off. Reads happen
+         * outside the bus-timing window (pre-runOpcode), so no cycle effect. */
+        static int s_c2w = -1;
+        if (s_c2w < 0) s_c2w = getenv("SNESRECOMP_C2WATCH") ? 1 : 0;
+        if (s_c2w) {
+            static int s_c2w_n = 0;
+            if (s_c2w_n < 3000 && pc_before >= 0xC2FC40u &&
+                pc_before <= 0xC2FF00u) {
+                s_c2w_n++;
+                extern int snes_frame_counter;
+                uint8_t _r4804 = 0xFF, _r4805 = 0xFF, _r4806 = 0xFF,
+                        _r4807 = 0xFF;
+                if (g_snes && g_snes->cart && g_snes->cart->sdd1) {
+                    _r4804 = sdd1_read(g_snes->cart->sdd1, 0x4804);
+                    _r4805 = sdd1_read(g_snes->cart->sdd1, 0x4805);
+                    _r4806 = sdd1_read(g_snes->cart->sdd1, 0x4806);
+                    _r4807 = sdd1_read(g_snes->cart->sdd1, 0x4807);
+                }
+                fprintf(stderr,
+                        "[c2w] f=%d pc=$%06X m=%u x=%u e=%u db=$%02X "
+                        "sp=$%04X a=$%04X b=%02X %02X %02X %02X "
+                        "r4804=%02X r4805=%02X r4806=%02X r4807=%02X\n",
+                        snes_frame_counter, (unsigned)pc_before,
+                        in.mf, in.xf, in.e, in.db, in.sp, in.a, op,
+                        (unsigned)cpu_read8(cpu, in.k,
+                                            (uint16)(pc_before + 1)),
+                        (unsigned)cpu_read8(cpu, in.k,
+                                            (uint16)(pc_before + 2)),
+                        (unsigned)cpu_read8(cpu, in.k,
+                                            (uint16)(pc_before + 3)),
+                        _r4804, _r4805, _r4806, _r4807);
+            }
         }
 
         /* Subroutine calls: JSR abs (0x20, 3B), JSL (0x22, 4B),
@@ -1213,9 +1729,36 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         rtl_apu_frame_timeline_active(),
                         g_snes && cart_has_sa1(g_snes->cart), false)) {
                     s_apu_pending_master += _master;
-                    if (s_apu_pending_master >= 4096) bridge_apu_flush(cpu);
+                    if (s_apu_pending_master >= bridge_bounce_flush_thresh()) bridge_apu_flush(cpu);
                 }
             }
+        }
+
+        /* Env-gated per-instruction cycle watch (SNESRECOMP_CYC_WATCH="lo-hi"
+         * hex pc24): log the LLE charge components for each interpreted
+         * opcode in range, to diff against the AOT block charges and isolate
+         * cycle-accounting mismatches (e.g. the C2 blit AOT drift). */
+        static int s_cycw = -1;
+        static unsigned long s_cycw_lo = 0, s_cycw_hi = 0;
+        if (s_cycw < 0) {
+            const char *_e = getenv("SNESRECOMP_CYC_WATCH");
+            s_cycw = (_e && _e[0] &&
+                      sscanf(_e, "%lx-%lx", &s_cycw_lo, &s_cycw_hi) == 2) ? 1 : 0;
+        }
+        if (s_cycw && pc_before >= s_cycw_lo && pc_before <= s_cycw_hi) {
+            extern int snes_frame_counter;
+            fprintf(stderr,
+                    "[cyc] f=%d pc=$%06X op=$%02X cyc=%d bus_xfers=%u "
+                    "bus_master=%llu internal=%u master_delta=%llu\n",
+                    snes_frame_counter, (unsigned)pc_before, (unsigned)op,
+                    _cyc, s_interp_bus_cycles,
+                    (unsigned long long)s_interp_bus_master,
+                    (unsigned)((unsigned)_cyc > s_interp_bus_cycles
+                                   ? (unsigned)_cyc - s_interp_bus_cycles : 0),
+                    (unsigned long long)(s_interp_bus_master +
+                        (uint64_t)((unsigned)_cyc > s_interp_bus_cycles
+                                       ? (unsigned)_cyc - s_interp_bus_cycles
+                                       : 0) * 6u));
         }
 
         if (auto_quiescent &&
@@ -1223,6 +1766,12 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
              progress_dynamic_epoch != s_interp_dynamic_progress_epoch)) {
             progress_write_epoch=g_interp_bridge_write_epoch;
             progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
+            /* Flush accumulated SPC time on every progress checkpoint so the
+             * SPC700 keeps pace during boot handshakes (Star Ocean: SPC700
+             * upload → poll $2140 for response).  Without this the SPC only
+             * advances at port accesses and threshold crossings, which may
+             * leave it frozen during long code sequences. */
+            bridge_apu_flush(cpu);
             steps=0;
         }
 
@@ -1338,7 +1887,6 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 int _saved_bounce_owner = s_interp_bounce_owner_depth;
                 s_interp_bounce_recomp_base = g_recomp_stack_top;
                 s_interp_bounce_owner_depth = s_interp_bridge_depth;
-                s_lle_next_unwind_is_deadline = 0;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
                 s_interp_bounce_owner_depth = _saved_bounce_owner;
                 s_interp_bounce_recomp_base = _saved_bounce_base;
@@ -1355,15 +1903,6 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 if (_air != RECOMP_RETURN_NORMAL) {
                     if (s_lle_unwind_active) {
                         if (s_lle_unwind_owner_depth == s_interp_bridge_depth) {
-                            if (bridge_yield_stack_diag_enabled()) {
-                                fprintf(stderr,
-                                        "[yield_stack] frame=%d bounce=$%06X "
-                                        "sp_pre=$%04X sp_unwind=$%04X "
-                                        "resume=$%06X\n",
-                                        snes_frame_counter, (unsigned)target,
-                                        (unsigned)_sp_pre, (unsigned)in.sp,
-                                        (unsigned)s_lle_unwind_pc24);
-                            }
                             if (s_lle_unwind_is_deadline) {
                                 s_lle_resume_pc24 = s_lle_unwind_pc24;
                                 s_lle_unwind_active = 0;
@@ -1372,6 +1911,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                 sync_interp_to_cpu(&in, cpu);
                                 bridge_apu_flush(cpu);
                                 return 1;
+                            }
+                            if (getenv("SNESRECOMP_YIELD_STACK_DIAG") &&
+                                snes_frame_counter >= 5390) {
+                                fprintf(stderr,
+                                        "[yield_stack] frame=%d bounce=$%06X "
+                                        "sp_pre=$%04X sp_unwind=$%04X "
+                                        "resume=$%06X\n",
+                                        snes_frame_counter, (unsigned)target,
+                                        (unsigned)_sp_pre, (unsigned)in.sp,
+                                        (unsigned)s_lle_unwind_pc24);
                             }
                             /* Fiber-free yield: the bounced body reached a
                              * yield primitive; its stub unwound the host
@@ -1502,17 +2051,82 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     bridge_bus_read(cpu, last_pc), in.mf, in.xf, in.db,
                     in.sp, in.a,
                     yield_pc ? bridge_bus_read(cpu, yield_flag_addr) : 0);
-            fprintf(stderr, "[interp_cap] head:");
+            fprintf(stderr,                    "[interp_cap] head:");
             for (int hi = 0; hi < 8 && hi < itn; hi++)
                 fprintf(stderr, " $%06X/%02X", (unsigned)head[hi].pc,
                         head[hi].op);
             fputc('\n', stderr);
+
         }
     }
     if (trace) itrace_dump(entry_pc24, head, (int)(itn < 8 ? itn : 8), ring, itn);
+    /* Save the current PC so the frame driver can resume from where the
+     * interpreter left off, rather than restarting at the RESET vector.
+     * Without this, a step-cap bail during a vblank-poll or SPC-handshake
+     * loop causes the game to re-enter boot code every frame, stalling
+     * at $C8F425/$C085CD forever.
+     *
+     * CRITICAL: skip this for interrupt handlers (stop_on_rti). If an NMI
+     * or IRQ handler hits the step cap mid-execution, saving its PC as the
+     * resume point causes the main bridge to resume INSIDE the handler on
+     * the next frame — creating an infinite loop of NMI→step-cap→NMI.
+     * Interrupt handlers must complete (RTI) or be discarded entirely;
+     * the caller (so_rtl.c) saves/restores the CPU stack to handle bail. */
+    if (!stop_on_rti)
+        s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
     sync_interp_to_cpu(&in, cpu);
     bridge_apu_flush(cpu);
+    /* Post-sync diagnostic: decode the instruction at step-cap PC */
+    {
+        static uint32_t s_last_diag_pc;
+        uint32_t pc24 = ((uint32_t)in.k << 16) | in.pc;
+        if (pc24 != s_last_diag_pc) {
+            s_last_diag_pc = pc24;
+            uint8_t op = bridge_bus_read(cpu, pc24);
+            fprintf(stderr, "[diag] PC=$%06X op=$%02X m=%u x=%u db=$%02X a=$%04X x16=$%04X y16=$%04X sp=$%04X\n",
+                    (unsigned)pc24, (unsigned)op, (unsigned)in.mf, (unsigned)in.xf,
+                    (unsigned)in.db, (unsigned)in.a, (unsigned)in.x, (unsigned)in.y, (unsigned)in.sp);
+            if (op == 0xCD) { /* CMP abs */
+                uint8_t lo = bridge_bus_read(cpu, pc24 + 1);
+                uint8_t hi8 = bridge_bus_read(cpu, pc24 + 2);
+                uint16_t addr16 = (uint16_t)lo | ((uint16_t)hi8 << 8);
+                uint8_t memval = cpu_read8(cpu, in.db, addr16);
+                fprintf(stderr, "  -> CMP $%04X mem=$%02X\n",
+                        (unsigned)addr16, (unsigned)memval);
+            }
+        }
+    }
+#ifdef SNESRECOMP_INTERP_PROFILE
+    { extern uint64_t g_interp_total_steps;
+      g_interp_total_steps += (uint64_t)(steps > 0 ? steps : 0); }
+#endif
     return 0;
+}
+
+/* Each bridge run installs a stable interpreted-function name so debug write
+ * attribution does not leak an enclosing AOT frame. */
+extern const char *g_last_recomp_func;
+#define INTERP_SCOPE_NAMES 4096u
+static char s_interp_scope_names[INTERP_SCOPE_NAMES][20];
+static uint32_t s_interp_scope_pc[INTERP_SCOPE_NAMES];
+static uint8_t s_interp_scope_used[INTERP_SCOPE_NAMES];
+
+static const char *interp_scope_name(uint32_t pc24) {
+    pc24 &= 0xFFFFFFu;
+    uint32_t slot = (pc24 * 2654435761u) & (INTERP_SCOPE_NAMES - 1u);
+    for (uint32_t probe = 0; probe < INTERP_SCOPE_NAMES; probe++) {
+        uint32_t i = (slot + probe) & (INTERP_SCOPE_NAMES - 1u);
+        if (!s_interp_scope_used[i]) {
+            s_interp_scope_used[i] = 1;
+            s_interp_scope_pc[i] = pc24;
+            snprintf(s_interp_scope_names[i], sizeof(s_interp_scope_names[i]),
+                     "interp@$%06X", (unsigned)pc24);
+            return s_interp_scope_names[i];
+        }
+        if (s_interp_scope_pc[i] == pc24)
+            return s_interp_scope_names[i];
+    }
+    return "interp@(table full)";
 }
 
 /* Wrapper: mark the interp tier as APU-driving for the whole run (nesting-safe
@@ -1539,11 +2153,17 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     s_interp_owner_exit_s = s_exit;
     s_interp_owner_exit_valid = 1;
     s_interp_bridge_depth++;
+    const char *_saved_func = g_last_recomp_func;
+    const char *_scope_name = interp_scope_name(entry_pc24);
+    g_last_recomp_func = _scope_name;
+    RecompStackPush(_scope_name);
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
+    RecompStackPop();
+    g_last_recomp_func = _saved_func;
     s_interp_bridge_depth--;
     s_interp_owner_exit_s = _saved_owner_exit_s;
     s_interp_owner_exit_valid = _saved_owner_exit_valid;
@@ -1605,7 +2225,19 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
                                  flag_addr, flag_value, 0, NULL, 0, 0);
 }
 
+#ifdef SNESRECOMP_INTERP_PROFILE
+extern uint64_t bridgeq_prof_calls;
+extern double bridgeq_prof_ms;
+#endif
 int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24) {
+#ifdef SNESRECOMP_INTERP_PROFILE
+    { clock_t _t0 = clock();
+      bridgeq_prof_calls++;
+      int _r = interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
+                                     0xFFFFFFFEu, 0, 0, 0, NULL, 0, 0);
+      bridgeq_prof_ms += 1000.0 * ((double)(clock() - _t0)) / CLOCKS_PER_SEC;
+      return _r; }
+#endif
     return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
                                  0xFFFFFFFEu, 0, 0, 0, NULL, 0, 0);
 }
@@ -2305,8 +2937,7 @@ void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
 }
 
 void Tier2CoverageWriteDefaultManifest(const char *rom_title) {
-    if (!tier2_capture_enabled())
-        return;
+    if (!tier2_capture_enabled()) return;
     const char *path = tier2_capture_manifest_path(rom_title);
     Tier2CoverageWriteManifest(path, rom_title);
     if (tier2_verbose())

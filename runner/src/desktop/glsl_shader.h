@@ -1,3 +1,7 @@
+// Vendored from snesrev/smw src/glsl_shader.h (MIT, (c) 2023 snesrev,
+// (c) 2021 elzo_d).
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #ifndef SNESRECOMP_DESKTOP_GLSL_SHADER_H_
 #define SNESRECOMP_DESKTOP_GLSL_SHADER_H_
 

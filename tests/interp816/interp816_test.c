@@ -185,6 +185,33 @@ int main(void) {
     run(p,1);
     CHECK(p->a==0x0077, "handler A=%04X exp 0077", p->a); }
 
+  { uint8_t c[] = {0x18,0xFB, 0xC2,0x30, 0xA2,0x10,0x00, 0xBD,0xE0,0x20};
+    Interp816 *p = prep(c,sizeof c);
+    run(p,4);
+    MEM[0x20f0]=0x34; MEM[0x20f1]=0x12;
+    int cycles = interp816_runOpcode(p);
+    printf("T22 LDA abs,X read without page cross\n");
+    CHECK(cycles==5, "cycles=%d exp 5", cycles);
+    CHECK(p->a==0x1234, "A=%04X exp 1234", p->a); }
+
+  { uint8_t c[] = {0x18,0xFB, 0xC2,0x30, 0xA2,0x10,0x00, 0xBD,0xF8,0x20};
+    Interp816 *p = prep(c,sizeof c);
+    run(p,4);
+    MEM[0x2108]=0x78; MEM[0x2109]=0x56;
+    int cycles = interp816_runOpcode(p);
+    printf("T23 LDA abs,X read with page cross\n");
+    CHECK(cycles==6, "cycles=%d exp 6", cycles);
+    CHECK(p->a==0x5678, "A=%04X exp 5678", p->a); }
+
+  { uint8_t c[] = {0x18,0xFB, 0xC2,0x30, 0xA0,0x10,0x00, 0xB9,0xF8,0x20};
+    Interp816 *p = prep(c,sizeof c);
+    run(p,4);
+    MEM[0x2108]=0xBC; MEM[0x2109]=0x9A;
+    int cycles = interp816_runOpcode(p);
+    printf("T24 LDA abs,Y read with page cross\n");
+    CHECK(cycles==6, "cycles=%d exp 6", cycles);
+    CHECK(p->a==0x9ABC, "A=%04X exp 9ABC", p->a); }
+
   printf("\n==== interp816 Phase-0: %d/%d checks passed ====\n", g_check - g_fail, g_check);
   if (g_fail) { printf("RESULT: FAIL (%d)\n", g_fail); return 1; }
   printf("RESULT: PASS\n");

@@ -1,3 +1,7 @@
+// Derived from snesrev/smw src/types.h (MIT, (c) 2023 snesrev, (c) 2021
+// elzo_d) -- hence the SM_TYPES_H_ guard.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #ifndef SM_TYPES_H_
 #define SM_TYPES_H_
 

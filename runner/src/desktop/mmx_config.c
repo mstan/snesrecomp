@@ -1,3 +1,7 @@
+// Adapted from snesrev/smw src/config.c (MIT, (c) 2023 snesrev, (c) 2021
+// elzo_d), then substantially reworked for the Mega Man X trilogy hosts.
+// See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
+// Noncommercial, the retained upstream material stays MIT.
 #include "config.h"
 #include "types.h"
 #include <stdio.h>

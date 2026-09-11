@@ -1183,6 +1183,24 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    /* AOT block-charge probe (2026-08-31): env SNESRECOMP_AOTBLK="lo-hi"
+     * (frame window). Logs pc24 + master_cycles at every AOT block entry so
+     * the AOT charge per block can be diffed against the LLE per-block sums
+     * from SNESRECOMP_CYC_WATCH. Default off. */
+    {
+        extern int snes_frame_counter;
+        static int ab_init = 0; static long ab_lo = -1, ab_hi = -1;
+        if (!ab_init) {
+            ab_init = 1;
+            const char *_e = getenv("SNESRECOMP_AOTBLK");
+            if (_e) sscanf(_e, "%ld-%ld", &ab_lo, &ab_hi);
+        }
+        if (ab_lo >= 0 && snes_frame_counter >= ab_lo &&
+            snes_frame_counter <= ab_hi)
+            fprintf(stderr, "[aotblk] f=%d pc=$%06X master=%llu\n",
+                    snes_frame_counter, pc24,
+                    (unsigned long long)cpu->master_cycles);
+    }
     /* Investigation: block-boundary DB shadow. Catches EVERY DB change
      * (inline PLBs bypass cpu_trace_db_change), reporting the block where it
      * was first observed + the immediately-preceding block (which did it).

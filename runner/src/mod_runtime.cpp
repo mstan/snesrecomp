@@ -2209,6 +2209,41 @@ extern "C" const char* snes_mod_runtime_last_error_c(void) {
     return SNESRecomp::state().error.c_str();
 }
 
+extern "C" int snes_mod_runtime_feature_enabled_c(
+    const char* package_id, const char* feature_id) {
+    if (!package_id || !feature_id) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+    const SNESRecomp::Package* package =
+        SNESRecomp::selected_package(runtime, package_id);
+    if (!package) return 0;
+    const SNESRecomp::Feature* feature =
+        SNESRecomp::find_feature(*package, feature_id);
+    if (!feature) return 0;
+    return SNESRecomp::feature_enabled(runtime, *package, *feature) ? 1 : 0;
+}
+
+extern "C" int snes_mod_runtime_feature_option_value_c(
+    const char* package_id, const char* feature_id, const char* option_id,
+    char* out, uint32_t cap) {
+    if (!package_id || !feature_id || !option_id || !out || cap == 0)
+        return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+    const SNESRecomp::Package* package =
+        SNESRecomp::selected_package(runtime, package_id);
+    if (!package) return 0;
+    const SNESRecomp::Feature* feature =
+        SNESRecomp::find_feature(*package, feature_id);
+    const SNESRecomp::Option* option =
+        SNESRecomp::find_option(*package, feature_id, option_id);
+    if (!feature || !option) return 0;
+    const std::string value =
+        SNESRecomp::option_value(runtime, *package, *feature, *option);
+    std::snprintf(out, cap, "%s", value.c_str());
+    return 1;
+}
+
 extern "C" const RecompLauncherCModProvider*
 snes_mod_runtime_launcher_provider_c(void) {
 #if defined(RECOMP_LAUNCHER)

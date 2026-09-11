@@ -294,7 +294,11 @@ void cosim_insn(uint32_t pc24) {
     if (!s_insn_armed) {
         if ((pc24 & 0xFFFFu) != s_sync_pc16) return;  /* bank-agnostic (LoROM $00/$80 mirror) */
         s_insn_armed = 1;
+        if (getenv("SNES_COSIM_INSNDBG"))
+            fprintf(stderr, "[cosim] ARMED at pc=%06X\n", pc24);
     }
+    if (getenv("SNES_COSIM_INSNDBG") && (s_insn % 256) == 0)
+        fprintf(stderr, "[cosim] insn pc=%06X cp=%llu\n", pc24, (unsigned long long)s_cp);
     s_insn++;
     if (s_insn % s_istride) return;
     checkpoint();

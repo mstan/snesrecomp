@@ -40,6 +40,10 @@ typedef struct DmaChannel {
 
 struct Dma {
   Snes* snes;
+  /* Transient state for channels enabled between frame initializations. Keep
+   * this before channel so dma_saveload's serialized channel region remains
+   * byte-for-byte compatible with existing saves. */
+  uint8_t hdmaPendingInit;
   DmaChannel channel[8];
   uint32_t dmaTimer;
   bool dmaBusy;
@@ -51,6 +55,10 @@ void dma_reset(Dma* dma);
 uint8_t dma_read(Dma* dma, uint16_t adr); // 43x0-43xf
 void dma_write(Dma* dma, uint16_t adr, uint8_t val); // 43x0-43xf
 void dma_doDma(Dma* dma);
+void dma_initHdma(Dma* dma);
+void dma_doHdma(Dma* dma);
+void dma_primeHdmaFirstLine(Dma* dma);
+uint64_t dma_hdmaMasterEstimate(Dma* dma);
 bool dma_cycle(Dma* dma);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
 void dma_saveload(Dma *dma, SaveLoadInfo *sli);

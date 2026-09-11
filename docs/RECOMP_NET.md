@@ -1,6 +1,6 @@
 # recomp-net (netcode)
 
-snesrecomp vendors [recomp-net](https://github.com/TechnicallyComputers/recomp-net)
+snesrecomp vendors [recomp-net](https://github.com/RetroPortingToolKit/recomp-net)
 as a git submodule at `lib/recomp-net`. Any game that builds with
 `runner/runner.cmake` can link the library and drive delay-sync multiplayer
 from the game main loop.
@@ -428,7 +428,7 @@ games — that lives in `snes_host_lobby.c`.
 
 **Default:** put networking optimizations and launcher/netplay UX fixes in
 **snesrecomp** (`snes_netplay_*`, `snes_lobby_*`, `snes_host_*`) or
-**[recomp-ui](https://github.com/mstan/recomp-ui)** (presentation, UDP port
+**[recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui)** (presentation, UDP port
 prep, waiting-room flow) — **not** as one-off patches in each game’s
 `main.c` / RTL. New titles then inherit the fix when they bump submodules.
 
@@ -458,9 +458,9 @@ recomp-ui policy mirror: `docs/HOST_NETPLAY.md` → “Where to put fixes”.
 | Layer                                                                          | Responsibility                                                                 |
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
 | snesrecomp (`lib/recomp-net`, `snes_netplay`, `snes_host_session`, lobby)     | Vendors netcode, pad/admit facade, MotK WS + ICE; guest bind normalize; `try_fill_launch`; rematch SDL ensure + soft-exit + `session_reset` dispatch |
-| [recomp-ui](https://github.com/mstan/recomp-ui)                                | Waiting-room UI, UDP create/join port prep (`guest_bind`), resume-room flags   |
+| [recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui)                                | Waiting-room UI, UDP create/join port prep (`guest_bind`), resume-room flags   |
 | Game runtime                                                                   | Thin callbacks → helpers above; `RtlGameInfo` hooks; pad sample / `RtlRunFrame` |
-| [recomp-net-server](https://github.com/TechnicallyComputers/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
+| [recomp-net-server](https://github.com/RetroPortingToolKit/recomp-net-server) | Lobby membership, launch, ICE signal relay                                     |
 
 ## Windows MSBuild / `lib/` superbuild
 

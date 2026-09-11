@@ -1,3 +1,6 @@
+/* Adapted from snesrev/smw src/config.h (MIT, (c) 2023 snesrev, (c) 2021
+ * elzo_d). See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is
+ * PolyForm Noncommercial, the retained upstream material stays MIT. */
 #pragma once
 /* Shared Mega Man X trilogy desktop configuration contract. */
 #include "types.h"

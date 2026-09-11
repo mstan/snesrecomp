@@ -115,15 +115,36 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
     printf("Failed to load rom: unsupported type (%d)\n", headers[used].cartType);
     return false;
   }
-  if (headers[used].coprocessor == 0xf && headers[used].exCoprocessor != 0x10) {
-    /* SPC7110 / ST010 / ST011 / ST018 are not modelled. Load as plain LoROM
-     * so the failure surfaces through the off-rails ring (which names the
-     * unbacked window) rather than as a bare refusal — but say so plainly, a
-     * silent mismap is the worst outcome. */
-    printf("Warning! Unmodelled custom coprocessor ($FFBF sub-type %02x) — "
-           "its register window is unbacked; expect off-rails reads.\n",
-           headers[used].exCoprocessor);
-  }
+if (headers[used].coprocessor == 0xf && headers[used].exCoprocessor != 0x10) {
+     /* SPC7110 / ST010 / ST011 / ST018 are not modelled. Load as plain LoROM
+      * so the failure surfaces through the off-rails ring (which names the
+      * unbacked window) rather than as a bare refusal — but say so plainly, a
+      * silent mismap is the worst outcome. */
+     printf("Warning! Unmodelled custom coprocessor ($FFBF sub-type %02x) — "
+            "its register window is unbacked; expect off-rails reads.\n",
+            headers[used].exCoprocessor);
+   }
+
+   /* S-DD1 detection:
+    * - Star Ocean: coprocessor=4, chips=5, V3 header (maker=0x33)
+    * - Street Fighter Alpha 2 / Zero 2: coprocessor=4, chips=3, V3 header
+    * Fallback: ROM name check (snes9x approach)
+    */
+   bool has_sdd1 = headers[used].coprocessor == 4 &&
+                   (headers[used].chips == 5 || headers[used].chips == 3) &&
+                   headers[used].maker == 0x33;
+
+   bool has_sdd1_name = strncmp(headers[used].name, "STAR OCEAN", 10) == 0 ||
+                        strncmp(headers[used].name, "STREET FIGHTER ALPHA2", 21) == 0 ||
+                        strncmp(headers[used].name, "STREET FIGHTER ZERO2", 20) == 0;
+
+   if (has_sdd1 || has_sdd1_name)
+       headers[used].cartType = CART_SDD1;
+
+   printf("[snes_load] name=%s coproc=%d chips=%d maker=%02x -> cartType=%d\n",
+          headers[used].name,
+          headers[used].coprocessor, headers[used].chips,
+          headers[used].maker, headers[used].cartType);
   // expand to a power of 2
   int newLength = 0x8000;
   while(true) {
@@ -156,7 +177,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   else if (headers[used].cartType == CART_DSP1 ||
            headers[used].cartType == CART_DSP1_HIROM)
     cart_ram_size = headers[used].ramSize > 1024 ? headers[used].ramSize : 0;
-  else if (headers[used].cartType == CART_SA1)
+else if (headers[used].cartType == CART_SA1)
+    cart_ram_size = headers[used].ramSize > 1024 ? headers[used].ramSize : 0;
+  else if (headers[used].cartType == CART_SDD1)
     cart_ram_size = headers[used].ramSize > 1024 ? headers[used].ramSize : 0;
   else
     cart_ram_size = headers[used].chips > 0 ? headers[used].ramSize : 0;

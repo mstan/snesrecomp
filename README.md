@@ -4,6 +4,8 @@
 
 # SNESRecomp
 
+> ℹ️ **Note from mstan:** This repo and I are now part of [RetroPortingToolkit](https://retroportingtoolkit.com/). I remain a primary maintainer of snesrecomp alongside the team. [More info](https://1379.tech/forming-a-collective-retro-porting-toolkit/).
+
 **A general-purpose static recompiler for the Super Nintendo Entertainment
 System (Super Famicom).** SNESRecomp translates 65816 machine code into C,
 compiles it into a native executable, and links it against a shared SNES
@@ -60,7 +62,7 @@ repositories are authoritative for supported ROM regions and revisions.
 | MSU-1 | **Supported, opt-in** | The extension's registers, data channel, and PCM audio are implemented, but a game must integrate an MSU-1 driver and pack selection. See [`docs/MSU1.md`](docs/MSU1.md). |
 | ExLoROM, ExHiROM, and other custom mappings | **Not supported yet** | The current mapper layer handles standard LoROM, HiROM, SA-1, Cx4, and Super FX layouts only. |
 | Nintendo DSP-2, DSP-3, and DSP-4 | **Not supported yet** | These cartridge DSP firmwares use the same NEC family interface but need per-title board/firmware validation before being advertised. |
-| S-DD1 | **Not supported yet** | No decompression chip or cartridge mapping support is present. |
+| S-DD1 | **Experimental** | Cartridge register/MMC mapping and decompression hooks are present for Star Ocean validation. Treat as title-gated until provenance, savestate, and cross-title behavior are reviewed. |
 | SPC7110 and SPC7110 RTC | **Not supported yet** | No data-decompression, mapping, or RTC model is present. |
 | OBC-1, ST010, ST011, ST018, and S-RTC | **Not supported yet** | Their register windows and coprocessor behavior are not modeled. |
 | BS-X, Sufami Turbo, and Super Game Boy cartridge adapters | **Not supported yet** | Their special cartridge or subsystem behavior is outside the current mapper model. |
@@ -168,6 +170,10 @@ enable and integrate it. Mega Man X uses this path for its built-in
 true-widescreen feature. See
 [`docs/MOD_PACKAGES.md`](docs/MOD_PACKAGES.md) for the package format and trust
 model.
+
+Runtime localization uses the same data-only mod boundary for language-gated
+ROM, RAM, and VRAM patches. See
+[`docs/RUNTIME_LOCALIZATION.md`](docs/RUNTIME_LOCALIZATION.md).
 
 ## MSU-1 audio
 
@@ -487,11 +493,19 @@ reverse-engineering and emulation work:
 ## License
 
 SNESRecomp's original code is licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). Third-party components retain
-their own licenses as documented in [Acknowledgements](#acknowledgements) and
+[PolyForm Noncommercial License 1.0.0](LICENSE). Copyright © 2026 Matthew
+Stanley; commercial licensing inquiries go to him at <https://1379.tech>.
+Third-party components retain their own licenses as documented in
+[Acknowledgements](#acknowledgements) and
 [`THIRD_PARTY_ATTRIBUTION.md`](THIRD_PARTY_ATTRIBUTION.md). The `snesref` tool
 loads a separately supplied libretro emulator core at runtime; no emulator core
 source or binary is vendored or released by this repository.
+
+**If you distribute a build:** the runner statically links code whose licenses
+require the notice to travel with binaries — snesrev's zelda3/smw ports and
+LakeSnes (MIT) and the ares-derived coprocessor cores (ISC). Ship
+[`THIRD_PARTY_ATTRIBUTION.md`](THIRD_PARTY_ATTRIBUTION.md) with any package
+that contains the runner; it carries every required notice text.
 
 ---
 
