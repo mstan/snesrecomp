@@ -3053,13 +3053,48 @@ int snes_lobby_list_get(int index, SnesLobbyRow *out)
     return 1;
 }
 
+/*
+ * Serialise caps for an outbound op, or publish none at all.
+ *
+ * append_match_caps_json returns 0 when the object would not fit (or would
+ * exceed the 4096 the lobby server silently discards) -- but snprintf has
+ * already left a TRUNCATED, NUL-terminated string in `dst` by then. Every
+ * caller ignored that return and pasted the result straight into its message,
+ * so an oversized caps object did not drop out, it went in as a fragment cut
+ * mid-token. The op was then malformed JSON, the server dropped it, and the
+ * caller reported success.
+ *
+ * That is what made "Create Lobby" close its modal and create nothing. The
+ * same two lines existed in set_match_caps and in start, which would have
+ * failed the same silent way once the caps grew past their buffers -- so this
+ * is one function rather than three fixed copies.
+ *
+ * Caps are dropped rather than the op refused: widescreen and delay matter,
+ * but a lobby that exists without published caps is recoverable and a lobby
+ * that never exists is not. The log line is the part that must not be
+ * missing.
+ */
+static void caps_json_build(char *dst, size_t cap,
+                            const SnesLobbyMatchCaps *caps, const char *op)
+{
+    dst[0] = '\0';
+    if (!caps || !caps->valid) return;
+    if (append_match_caps_json(dst, cap, caps) > 0) return;
+    dst[0] = '\0';
+    fprintf(stderr, "snes_lobby: match caps would not serialise for `%s` -- "
+                    "sending it without them\n", op ? op : "?");
+}
+
 int snes_lobby_create(const char *name, const char *game_name,
                      const char *game_version, const char *password,
                      const char *host_bind, const SnesLobbyMatchCaps *match_caps,
                      int max_slots)
 {
-    char msg[2304];
-    char caps_json[512];
+    /* Sized against what append_match_caps_json will actually emit -- it caps
+     * itself at 4000 bytes -- rather than a round number that a mod plan, a
+     * mod_set and a digest-pinned allowlist grew past. */
+    char msg[5120];
+    char caps_json[4160];
     char name_esc[JSON_ESC_CAP(128)];
     char gn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
     char gv_esc[JSON_ESC_CAP(SNES_LOBBY_VERSION_LEN)];
@@ -3086,11 +3121,8 @@ int snes_lobby_create(const char *name, const char *game_name,
     strncpy(g_lc.my_bind, host_bind && host_bind[0] ? host_bind : "0.0.0.0:7777",
             sizeof(g_lc.my_bind) - 1);
     g_lc.join.last_error[0] = '\0';
-    caps_json[0] = '\0';
-    if (match_caps && match_caps->valid) {
-        g_lc.match_caps = *match_caps;
-        append_match_caps_json(caps_json, sizeof(caps_json), match_caps);
-    }
+    if (match_caps && match_caps->valid) g_lc.match_caps = *match_caps;
+    caps_json_build(caps_json, sizeof(caps_json), match_caps, "create");
     json_escape(name && name[0] ? name : "Lobby", name_esc, sizeof(name_esc));
     json_escape(gn, gn_esc, sizeof(gn_esc));
     json_escape(gv, gv_esc, sizeof(gv_esc));
@@ -3293,14 +3325,13 @@ const SnesLobbyMatchCaps *snes_lobby_match_caps(void)
 
 int snes_lobby_set_match_caps(const SnesLobbyMatchCaps *caps)
 {
-    char msg[768];
-    char caps_json[512];
+    char msg[4352];
+    char caps_json[4160];
     int n;
     if (!snes_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host || !caps || !caps->valid)
         return -1;
     g_lc.match_caps = *caps;
-    caps_json[0] = '\0';
-    append_match_caps_json(caps_json, sizeof(caps_json), caps);
+    caps_json_build(caps_json, sizeof(caps_json), caps, "set_match_caps");
     n = snprintf(msg, sizeof(msg), "{\"op\":\"set_match_caps\"%s}", caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
     queue_send(msg);
@@ -3766,11 +3797,8 @@ int snes_lobby_request_start(const SnesLobbyMatchCaps *match_caps)
                 who[0] ? who : "a player", what[0] ? what : "a required mod");
         return -1;
     }
-    caps_json[0] = '\0';
-    if (match_caps && match_caps->valid) {
-        g_lc.match_caps = *match_caps;
-        append_match_caps_json(caps_json, sizeof(caps_json), match_caps);
-    }
+    if (match_caps && match_caps->valid) g_lc.match_caps = *match_caps;
+    caps_json_build(caps_json, sizeof(caps_json), match_caps, "start");
     n = snprintf(msg, sizeof(msg), "{\"op\":\"start\"%s}", caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
     queue_send(msg);

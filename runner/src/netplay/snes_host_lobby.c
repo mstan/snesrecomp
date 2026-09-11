@@ -971,14 +971,41 @@ static void cb_request_list(void *ctx)
 /* The list is: hub rows, then the same-machine registry row (if any), then
  * the rooms heard on the LAN beacon. The registry row's endpoint is passed to
  * the beacon filter so a host on THIS machine is listed once, not twice. */
+/* Which sources the browser is currently asking for. The UI sets it from the
+ * fork the player took; 0 keeps the old merge-everything behaviour for a
+ * launcher that never calls the setter. */
+static int g_list_scope;
+
+#if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
+static int cb_list_scope_set(void *ctx, int scope)
+{
+  (void)ctx;
+  g_list_scope = scope;
+  return 0;
+}
+#endif
+
+static int list_want_online(void)
+{
+  return g_list_scope != RECOMP_LAUNCHER_LIST_SCOPE_LAN;
+}
+
+static int list_want_lan(void)
+{
+  return g_list_scope != RECOMP_LAUNCHER_LIST_SCOPE_ONLINE;
+}
+
 static int cb_list_count(void *ctx)
 {
   RecompLauncherCNetplayLobby lan;
   int have_lan;
   (void)ctx;
-  have_lan = fill_lan_row(&lan);
-  return snes_lobby_list_count() + (have_lan ? 1 : 0) +
-         beacon_row_count(have_lan ? lan.lobby_id + 4 : "");
+  have_lan = list_want_lan() && fill_lan_row(&lan);
+  return (list_want_online() ? snes_lobby_list_count() : 0) +
+         (have_lan ? 1 : 0) +
+         (list_want_lan()
+              ? beacon_row_count(have_lan ? lan.lobby_id + 4 : "")
+              : 0);
 }
 
 static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
@@ -988,10 +1015,12 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   (void)ctx;
   if (!out || index < 0)
     return 0;
-  remote_count = snes_lobby_list_count();
+  remote_count = list_want_online() ? snes_lobby_list_count() : 0;
   if (index >= remote_count) {
     RecompLauncherCNetplayLobby lan;
-    int have_lan = fill_lan_row(&lan);
+    int have_lan = list_want_lan() && fill_lan_row(&lan);
+    if (!list_want_lan())
+      return 0;
     index -= remote_count;
     if (have_lan) {
       if (index == 0) {
@@ -2668,6 +2697,9 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .account_error = cb_account_error,
     .account_sign_out = cb_account_sign_out,
     .account_set_handle = cb_account_set_handle,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
+    .list_scope_set = cb_list_scope_set,
 #endif
 #if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
     /* Guarded like the account block above, and for the same reason: this
