@@ -3,6 +3,7 @@
 
 #include "recomp_net/ice_xfer.h"
 #include "recomp_net/chat_filter.h"
+#include "recomp_net/chat_report.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -155,6 +156,9 @@ int  snes_lobby_all_ready(void) { return 0; }
 int  snes_lobby_set_ready(int ready) { (void)ready; return -1; }
 int  snes_lobby_report_desync(const SnesLobbyDesyncReport *r)
 { (void)r; return -1; }
+int  snes_lobby_report_chat(const char *const *m, int c, const char *r,
+                            const char *n)
+{ (void)m; (void)c; (void)r; (void)n; return -1; }
 int  snes_lobby_request_start(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_launch_pending(void) { return 0; }
 void snes_lobby_clear_launch_pending(void) {}
@@ -1841,7 +1845,8 @@ static int parse_seat_array(const char *json, const char *key, int is_spectator,
 }
 
 static void chat_push(const char *player_id, const char *account,
-                      const char *from, const char *text, int is_system)
+                      const char *from, const char *text, const char *mid,
+                      int is_system)
 {
     SnesLobbyChatMsg *m;
     int idx;
@@ -1859,6 +1864,7 @@ static void chat_push(const char *player_id, const char *account,
     snprintf(m->account, sizeof(m->account), "%s", account ? account : "");
     snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
     snprintf(m->text, sizeof(m->text), "%s", text);
+    snprintf(m->mid, sizeof(m->mid), "%s", (mid && !is_system) ? mid : "");
     /* Masked on arrival, whatever relayed it: the server already did this,
      * an older server did not, and the rule is that nothing unmasked is
      * ever shown. */
@@ -1873,7 +1879,7 @@ static void chat_push(const char *player_id, const char *account,
 }
 
 static void schat_push(const char *player_id, const char *account,
-                       const char *from, const char *text)
+                       const char *from, const char *text, const char *mid)
 {
     SnesLobbyChatMsg *m;
     int idx;
@@ -1891,6 +1897,7 @@ static void schat_push(const char *player_id, const char *account,
     snprintf(m->account, sizeof(m->account), "%s", account ? account : "");
     snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
     snprintf(m->text, sizeof(m->text), "%s", text);
+    snprintf(m->mid, sizeof(m->mid), "%s", mid ? mid : "");
     (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
     m->is_local = (g_lc.player_id[0] && player_id &&
                    strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
@@ -2335,15 +2342,18 @@ static void handle_server_json(const char *json)
         char from_id[SNES_LOBBY_ID_LEN];
         char from_acct[SNES_LOBBY_ID_LEN];
         char from[SNES_LOBBY_NAME_LEN];
+        char mid[40];
         text[0] = '\0';
         from_id[0] = '\0';
         from_acct[0] = '\0';
         from[0] = '\0';
+        mid[0] = '\0';
         json_get_str(json, "text", text, sizeof(text));
         json_get_str(json, "from_player_id", from_id, sizeof(from_id));
         json_get_str(json, "from_account", from_acct, sizeof(from_acct));
         json_get_str(json, "from", from, sizeof(from));
-        schat_push(from_id, from_acct, from, text);
+        json_get_str(json, "mid", mid, sizeof(mid));
+        schat_push(from_id, from_acct, from, text, mid);
         return;
     }
     if (strcmp(op, "chat") == 0) {
@@ -2351,15 +2361,19 @@ static void handle_server_json(const char *json)
         char from_id[SNES_LOBBY_ID_LEN];
         char from_acct[SNES_LOBBY_ID_LEN];
         char from[SNES_LOBBY_NAME_LEN];
+        char mid[40];
         text[0] = '\0';
         from_id[0] = '\0';
         from_acct[0] = '\0';
         from[0] = '\0';
+        mid[0] = '\0';
         json_get_str(json, "text", text, sizeof(text));
         json_get_str(json, "from_player_id", from_id, sizeof(from_id));
         json_get_str(json, "from_account", from_acct, sizeof(from_acct));
         json_get_str(json, "from", from, sizeof(from));
-        chat_push(from_id, from_acct, from, text, json_get_bool(json, "system", 0));
+        json_get_str(json, "mid", mid, sizeof(mid));
+        chat_push(from_id, from_acct, from, text, mid,
+                  json_get_bool(json, "system", 0));
         return;
     }
     if (strcmp(op, "signal") == 0) {
@@ -3418,6 +3432,41 @@ int snes_lobby_seat_swap_outgoing(void)
 void snes_lobby_seat_swap_clear(void)
 {
     if (g_lc.swap_out != 1) g_lc.swap_out = 0;
+}
+
+int snes_lobby_report_chat(const char *const *mids, int mid_count,
+                           const char *reason, const char *note)
+{
+    /* Thin on purpose. What a report CONTAINS is console-agnostic and lives in
+     * recomp-net (recomp_net/chat_report.h); this function's whole job is to
+     * say where this particular client is and hand the frame to the socket.
+     * The PSX lobby client's copy of this is the same eight lines. */
+    RNetChatReportMeta meta;
+    char msg[2048];
+    size_t n;
+
+    if (!snes_lobby_connected())
+        return -1;
+
+    memset(&meta, 0, sizeof(meta));
+    meta.game = g_lc.filter_game_name;
+    meta.game_version = effective_game_version(NULL);
+    /* Metadata only. Nothing downstream may name a file or a directory after
+     * it -- see the header: one queue, read by one person, and splitting the
+     * evidence by console fragments a moderation record along a line that has
+     * nothing to do with moderation. */
+    meta.platform = "snes";
+    meta.server = snes_lobby_url();
+    meta.lobby = g_lc.join.lobby_id[0] ? g_lc.join.lobby_id : "";
+    meta.scope = g_lc.in_lobby ? "lobby" : "server";
+
+    n = rnet_chat_report_build(msg, sizeof(msg), mids, mid_count,
+                               reason, note, &meta);
+    if (n == 0)
+        return -1;
+    queue_send(msg);
+    flush_pending();
+    return 0;
 }
 
 int snes_lobby_send_chat(const char *text)
