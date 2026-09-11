@@ -2504,7 +2504,20 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "automatch_accept_ok") == 0) {
-        g_am.state = SNES_LOBBY_AUTOMATCH_ACCEPTED;
+        /* The echo carries WHICH answer was acknowledged, and honouring it is
+         * not optional: this used to set ACCEPTED unconditionally, so a player
+         * who clicked Decline went to IDLE, received the server's ack a
+         * moment later, and had the accept gate reopen on them reading
+         * "Waiting for <opponent> to accept..." -- the dialog for the choice
+         * they had just refused, over a match that was already finished.
+         *
+         * A declined ack ends the ticket here. The server's automatch_cancelled
+         * follows and is idempotent with this. */
+        if (json_get_bool(json, "accept", 1)) {
+            g_am.state = SNES_LOBBY_AUTOMATCH_ACCEPTED;
+        } else {
+            automatch_reset_queue_state();
+        }
         return;
     }
     if (strcmp(op, "automatch_requeue") == 0) {
