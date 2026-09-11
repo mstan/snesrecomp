@@ -114,6 +114,7 @@ int  snes_lobby_automatch_pool(void) { return 0; }
 int  snes_lobby_automatch_found_get(SnesLobbyAutomatchFound *out)
 { (void)out; return 0; }
 int  snes_lobby_automatch_accept(int a) { (void)a; return -1; }
+int  snes_lobby_automatch_room(void) { return 0; }
 void snes_lobby_automatch_refuse_local(const char *w) { (void)w; }
 const char *snes_lobby_automatch_error(void) { return ""; }
 int  snes_lobby_send_chat(const char *text) { (void)text; return -1; }
@@ -399,6 +400,13 @@ typedef struct {
     char error[160];
 
     SnesLobbyAutomatchFound found;
+    /* When the offer lapses, as a monotonic timestamp rather than the count
+     * the server sent. The server states the deadline once; a client that
+     * stored the number and showed it unchanged would display "15s" for the
+     * whole fifteen seconds, which reads as a frozen dialog rather than a
+     * deadline. Counting locally also means the display ticks smoothly
+     * instead of jumping with a 1 Hz push. */
+    uint64_t found_deadline_ms;
 
     /* Where to send the latency probe, published on rulesets_ok and again on
      * automatch_queued. Kept from whichever arrived last. */
@@ -417,6 +425,8 @@ typedef struct {
      * (need_account is the common one) would arrive while state is still
      * IDLE and be filed as somebody else's error. */
     int      queue_in_flight;
+    /* This seat came from a pairing, not from a room somebody hosts. */
+    int      in_automatch_room;
 } LobbyAutomatch;
 
 static LobbyAutomatch g_am = { .rtt_ms = -1, .probe_socket = -1 };
@@ -780,6 +790,15 @@ int snes_lobby_automatch_found_get(SnesLobbyAutomatchFound *out)
 {
     if (!out || g_am.state != SNES_LOBBY_AUTOMATCH_FOUND) return 0;
     *out = g_am.found;
+    /* Recomputed on every read, so the caller can poll it each frame and get
+     * a live count. Never below 0: the offer is about to lapse, and a
+     * negative would draw as one. */
+    if (g_am.found_deadline_ms) {
+        uint64_t now = lobby_mono_ms();
+        out->accept_secs = now >= g_am.found_deadline_ms
+                               ? 0
+                               : (int)((g_am.found_deadline_ms - now + 999ull) / 1000ull);
+    }
     return 1;
 }
 
@@ -804,6 +823,8 @@ int snes_lobby_automatch_accept(int accept)
     }
     return 0;
 }
+
+int snes_lobby_automatch_room(void) { return g_am.in_automatch_room; }
 
 void snes_lobby_automatch_refuse_local(const char *why)
 {
@@ -2126,6 +2147,13 @@ static void handle_server_json(const char *json)
          * Not an automatch special case -- the server refuses to queue an
          * account that is already in a lobby (`already_in_lobby`), so holding
          * a ticket and being seated are mutually exclusive either way. */
+        /* Recorded before the reset below, which is what erases the evidence:
+         * ACCEPTED (or FOUND, if the pair resolved in the same breath) is the
+         * only signal that this seat came from a queue rather than from
+         * somebody's room. */
+        g_am.in_automatch_room =
+            (g_am.state == SNES_LOBBY_AUTOMATCH_ACCEPTED ||
+             g_am.state == SNES_LOBBY_AUTOMATCH_FOUND);
         automatch_reset_queue_state();
         g_lc.in_lobby = 1;
         g_lc.is_host = 0;
@@ -2465,6 +2493,9 @@ static void handle_server_json(const char *json)
                      sizeof(g_am.found.ruleset_label));
         g_am.found.est_rtt_ms = json_get_int(json, "est_rtt_ms", 0);
         g_am.found.accept_secs = json_get_int(json, "accept_secs", 15);
+        g_am.found_deadline_ms =
+            lobby_mono_ms() + (uint64_t)(g_am.found.accept_secs > 0
+                                             ? g_am.found.accept_secs : 0) * 1000ull;
         g_am.state = SNES_LOBBY_AUTOMATCH_FOUND;
         fprintf(stderr, "snes_lobby: automatch found opponent=\"%s\" "
                         "est_rtt=%d ms, %d s to answer\n",
@@ -2520,9 +2551,9 @@ static void handle_server_json(const char *json)
                 int retry = json_get_int(json, "retry_secs", 0);
                 if (retry > 0)
                     snprintf(line, sizeof(line),
-                             "Declining put you on a %d s cooldown", retry);
+                             "%d Second Cooldown For Declining", retry);
                 else
-                    snprintf(line, sizeof(line), "You are on a queue cooldown");
+                    snprintf(line, sizeof(line), "Cooldown For Declining");
                 why = line;
             }
             if (why) {
@@ -2544,6 +2575,7 @@ static void handle_server_json(const char *json)
          * reset on `joined` above should already have done this; repeating it
          * here means a missed or reordered `joined` cannot strand the gate. */
         automatch_reset_queue_state();
+        g_am.in_automatch_room = 0;   /* no longer seated anywhere */
         g_lc.swap_in_valid = 0;
         g_lc.swap_out = 0;
         g_lc.in_lobby = 0;
@@ -3092,6 +3124,7 @@ int snes_lobby_leave(void)
     queue_send("{\"op\":\"leave\"}");
     flush_pending();
     g_lc.in_lobby = 0;
+    g_am.in_automatch_room = 0;
     g_lc.is_host = 0;
     g_lc.host_player_id[0] = '\0';
     g_lc.member_count = 0;

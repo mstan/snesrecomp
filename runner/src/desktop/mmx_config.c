@@ -311,6 +311,14 @@ static int GetIniSection(const char *s) {
    * one would otherwise print "Invalid .ini section" on every start. */
   if (StringStartsWithNoCase(s, "[Controller."))
     return 8;
+  /* HOST-owned sections, for the same reason as [Controller.<guid>] above:
+   * the runner does not read them, but a per-game host does (its own
+   * config reader opens the same file), and every one of them printed
+   * "Invalid .ini section" on every start. A section this core has no
+   * business parsing is not a malformed file. */
+  if (StringEqualsNoCase(s, "[Video]") ||
+      StringEqualsNoCase(s, "[Emulation]"))
+    return 9;
   return -1;
 }
 
@@ -354,6 +362,8 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
     return true;
   } else if (section == 8) {
     return true;                 /* saved profile; launcher-owned */
+  } else if (section == 9) {
+    return true;                 /* host-owned; this core does not read it */
   } else if (section == 1) {
     if (StringEqualsNoCase(key, "WindowSize")) {
       char *s;

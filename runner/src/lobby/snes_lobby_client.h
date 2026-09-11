@@ -628,6 +628,19 @@ int  snes_lobby_automatch_accept(int accept);
  * already knows the server would bounce the ticket -- there is no value in a
  * round trip that ends in a generic code when the client can name the actual
  * feature that is in the way. */
+/*
+ * Non-zero while the room this client is seated in was created by AUTOMATCH.
+ *
+ * The distinction matters on the way OUT of a match. A human-hosted room is
+ * somebody's room: it survives the match, and staying seated is how a rematch
+ * happens. An automatch room is the server's, it is created at both-accept
+ * and is not joinable by anyone, and there is no host to rematch with -- so
+ * staying in it leaves the player parked in a room that can never fill, and
+ * the server refuses their next ticket with `already_in_lobby`.
+ *
+ * Cleared by leaving, and by anything else that ends the seating.
+ */
+int snes_lobby_automatch_room(void);
 void snes_lobby_automatch_refuse_local(const char *why);
 const char *snes_lobby_automatch_error(void);
 
