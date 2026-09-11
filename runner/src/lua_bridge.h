@@ -1,7 +1,10 @@
 #ifndef SNESRECOMP_LUA_BRIDGE_H
 #define SNESRECOMP_LUA_BRIDGE_H
 #include <stdint.h>
+#include <stddef.h>
 #if SNESRECOMP_ENABLE_LUA
+typedef int (*LuaBridgeGameCommand)(const char *name, const char *args, char *result, size_t capacity);
+void lua_bridge_set_game_command_handler(LuaBridgeGameCommand handler);
 /* All calls belong to the host/game thread, outside RtlRunFrame. Port 0 disables.
  * Inputs use the runner layout: B,Y,Select,Start,Up,Down,Left,Right,A,X,L,R.
  * frame_end must be called exactly once for every admitted frame. */

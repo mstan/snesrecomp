@@ -44,6 +44,16 @@ static char rx[LINE_CAP], tx[RESPONSE_CAP], last_error[512], output[4096];
 static unsigned next_id;
 static struct { int ref, phase; unsigned id; char name[96]; } callbacks[CALLBACK_CAP];
 static const char *buttons[] = {"B","Y","Select","Start","Up","Down","Left","Right","A","X","L","R"};
+static LuaBridgeGameCommand game_command;
+void lua_bridge_set_game_command_handler(LuaBridgeGameCommand handler) { game_command = handler; }
+static int call_game(lua_State *L) {
+    char result[4096] = {0};
+    if (!game_command) return luaL_error(L, "host has no game command handler");
+    int ok = game_command(luaL_checkstring(L, 1), luaL_optstring(L, 2, ""), result, sizeof(result));
+    result[sizeof(result)-1] = 0;
+    if (!ok) return luaL_error(L, "%s", result);
+    lua_pushstring(L, result); return 1;
+}
 
 static void *limited_alloc(void *ud, void *ptr, size_t old, size_t size) {
     (void)ud;
@@ -298,6 +308,7 @@ static int create_vm(void) {
     function(vm, "onframestart", event_add, 0); function(vm, "onframeend", event_add, 1);
     function(vm, "unregisterbyid", event_remove, 0); function(vm, "unregisterbyname", event_remove, 1);
     lua_setglobal(vm, "event");
+    lua_newtable(vm); function(vm, "command", call_game, 0); lua_setglobal(vm, "game");
     return 0;
 }
 static void stop_script(void) {
@@ -391,9 +402,11 @@ static void process(char *line) {
         else { paused = 1; steps = (int)n; }
     } else if (!strcmp(line, "stop")) { stop_script(); input_mask = input_values = 0; }
     else if (!strcmp(line, "reset")) {
+        if (game_command) { char ignored[64]; game_command("__reset", "", ignored, sizeof(ignored)); }
         stop_script();
         for (int i = 0; i < CALLBACK_CAP; ++i) remove_callback(i);
-        lua_close(vm); vm = NULL; input_mask = input_values = 0; selected_bus = 0; steps = 0;
+        lua_close(vm); vm = NULL;
+        input_mask = input_values = current_inputs = 0; selected_bus = 0; steps = 0;
         if (create_vm()) { lua_bridge_shutdown(); return; }
     } else if (strcmp(line, "status") && strcmp(line, "ping")) {
         ok = 0; snprintf(last_error, sizeof(last_error), "commands: eval HEX, run HEX, status, pause, resume, step N, stop, reset");
@@ -492,6 +505,8 @@ void lua_bridge_frame_end(void) {
     if (script) resume_script();
 }
 void lua_bridge_shutdown(void) {
+    if (game_command) { char ignored[64]; game_command("__reset", "", ignored, sizeof(ignored)); }
+    game_command = NULL;
     disconnect();
     if (listener != BAD_SOCKET) close_socket(listener);
     listener = BAD_SOCKET;

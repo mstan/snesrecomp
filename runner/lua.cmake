@@ -1,6 +1,9 @@
 # Opt-in, independently of the trace debugger. No Lua download in normal builds.
-option(SNESRECOMP_ENABLE_LUA "Build the local TCP Lua scripting spike" OFF)
+option(SNESRECOMP_ENABLE_LUA "Build opt-in local TCP Lua scripting" OFF)
 if(SNESRECOMP_ENABLE_LUA)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
     include(FetchContent)
     FetchContent_Declare(snes_lua
         URL https://www.lua.org/ftp/lua-5.4.9.tar.gz

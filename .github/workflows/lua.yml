@@ -1,0 +1,32 @@
+name: Lua TCP bridge
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  lua:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Verify build opt-out
+        run: |
+          cmake -S tests/lua -B build/lua-off -DSNESRECOMP_ENABLE_LUA=OFF
+          cmake --build build/lua-off --config Release
+      - name: Build Lua host
+        run: |
+          cmake -S tests/lua -B build/lua-on -DSNESRECOMP_ENABLE_LUA=ON
+          cmake --build build/lua-on --config Release
+      - name: Exercise real TCP bridge
+        shell: pwsh
+        run: |
+          $exe = if ($IsWindows) { 'build/lua-on/Release/lua_bridge_host.exe' } else { 'build/lua-on/lua_bridge_host' }
+          python tests/lua/test_bridge.py $exe

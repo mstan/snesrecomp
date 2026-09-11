@@ -128,8 +128,22 @@ actual game frame with `inputs = lua_bridge_frame_start(inputs)` and
 game thread, outside the CPU/frame runner; the socket has no worker thread.
 Input bits use the runner's 12 bits per player plus controller-present bits.
 
+Games may register `lua_bridge_set_game_command_handler(handler)` after init.
+The host extension `game.command(name, args)` dispatches strings to that handler
+on the game thread and returns its result string, or raises a Lua error on
+failure. This is not a BizHawk API. The handler also receives `__reset` on TCP
+VM reset and shutdown to clear its automation. SMW uses it for a separate
+fireball pool (`fire_stream`, `fire_stream_status`, `fire_stream_reset`), with
+Lua helpers for continuous emission and holding the normal fire buttons.
+
 The SMW spike supports stock single-player and rejects co-op builds. Use Lua's
 pause controls: a separate debugger breakpoint or the host pause key can still
 prevent frames from advancing. Lua state is not included in game saves or
 netplay. SMW validates the integration with `tools/lua/validate.py`, including
 real game navigation, spawning, projectile motion and cadence measurements.
+
+The ROM-free TCP regression harness is built with
+`cmake -S tests/lua -B build/lua-on -DSNESRECOMP_ENABLE_LUA=ON`, followed by
+`cmake --build build/lua-on`. Run `python tests/lua/test_bridge.py` with the
+resulting `lua_bridge_host` executable path. CI runs it on Windows, Linux and
+macOS, and separately builds with Lua disabled.
