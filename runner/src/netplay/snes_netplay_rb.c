@@ -112,6 +112,14 @@ static struct {
     uint32_t fork_tick;
     int      fork_seen;
     const char *fork_partition;
+    /* The two digests that disagreed, kept so a report can be CORROBORATED.
+     * A fork says "these two peers differ", never "the other one cheated" --
+     * the only way to tell those apart is to put both sides' numbers next to
+     * each other, across many matches and many opponents. A report carrying
+     * one peer's verdict would be the same mistake the automatch ticket made
+     * with mods_enabled. */
+    uint32_t fork_mine;
+    uint32_t fork_theirs;
     const char *stall_tag;
     uint32_t snap_interval;
     uint32_t snap_depth;
@@ -1917,6 +1925,8 @@ static void rb_baseline_try_compare(void)
      * moved — "the state differs" is not a diagnosis. */
     g_rb.fork_seen = 1;
     g_rb.fork_tick = g_rb.corr.load_tick;
+    g_rb.fork_mine = mine->master;
+    g_rb.fork_theirs = g_rb.peer_base_master;
     if (mine->wram != g_rb.peer_base_wram)
         g_rb.fork_partition = snes_state_digest_part_name(SNES_DIGEST_PART_WRAM);
     else if (mine->apu != g_rb.peer_base_apu)
@@ -2255,6 +2265,8 @@ static void rb_pump_episode(void)
                 g_rb.desync_count++;
                 g_rb.fork_seen = 1;
                 g_rb.fork_tick = g_rb.corr.target_tick;
+                g_rb.fork_mine = local;
+                g_rb.fork_theirs = g_rb.peer_post_digest;
                 g_rb.fork_partition = "post";
                 fprintf(stderr,
                         "snes_netplay: RB POST FORK tick=%u local=%08x "
@@ -2783,5 +2795,16 @@ int snes_netplay_rb_last_fork(uint32_t *tick, const char **partition)
         *tick = g_rb.fork_tick;
     if (partition)
         *partition = g_rb.fork_partition ? g_rb.fork_partition : "?";
+    return 1;
+}
+
+int snes_netplay_rb_fork_digests(uint32_t *mine, uint32_t *theirs)
+{
+    if (!g_rb.fork_seen)
+        return 0;
+    if (mine)
+        *mine = g_rb.fork_mine;
+    if (theirs)
+        *theirs = g_rb.fork_theirs;
     return 1;
 }

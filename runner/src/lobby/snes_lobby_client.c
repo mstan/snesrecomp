@@ -106,7 +106,8 @@ int  snes_lobby_automatch_available(void) { return 0; }
 int  snes_lobby_automatch_ruleset_count(void) { return 0; }
 int  snes_lobby_automatch_ruleset_get(int i, SnesLobbyRuleset *out)
 { (void)i; (void)out; return 0; }
-int  snes_lobby_automatch_queue(const char *r, int m) { (void)r; (void)m; return -1; }
+int  snes_lobby_automatch_queue(const char *r, int m, const char *e)
+{ (void)r; (void)m; (void)e; return -1; }
 int  snes_lobby_automatch_cancel(void) { return -1; }
 int  snes_lobby_automatch_state(void) { return SNES_LOBBY_AUTOMATCH_IDLE; }
 int  snes_lobby_automatch_queued_secs(void) { return 0; }
@@ -151,6 +152,8 @@ int  snes_lobby_member_is_host(const SnesLobbyMember *member)
 int  snes_lobby_local_ready(void) { return 0; }
 int  snes_lobby_all_ready(void) { return 0; }
 int  snes_lobby_set_ready(int ready) { (void)ready; return -1; }
+int  snes_lobby_report_desync(const SnesLobbyDesyncReport *r)
+{ (void)r; return -1; }
 int  snes_lobby_request_start(const SnesLobbyMatchCaps *c) { (void)c; return -1; }
 int  snes_lobby_launch_pending(void) { return 0; }
 void snes_lobby_clear_launch_pending(void) {}
@@ -723,9 +726,11 @@ int snes_lobby_automatch_ruleset_get(int index, SnesLobbyRuleset *out)
     return 1;
 }
 
-int snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled)
+int snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled,
+                               const char *mod_exempt)
 {
-    char msg[1024];
+    char msg[2048];
+    char exempt_json[768];
     char gn_esc[SNES_LOBBY_NAME_LEN * 2 + 4];
     char gv_esc[SNES_LOBBY_VERSION_LEN * 2 + 4];
     char rid_esc[SNES_LOBBY_RULESET_ID_LEN * 2 + 4];
@@ -752,6 +757,52 @@ int snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled)
     json_escape(effective_game_version(NULL), gv_esc, sizeof(gv_esc));
     json_escape(rid, rid_esc, sizeof(rid_esc));
 
+    /* The exemption evidence, as a JSON ARRAY of strings.
+     *
+     * An array rather than one ';'-joined string, and for a reason this
+     * codebase has already paid for once: match_caps.mod_plan shipped as a
+     * ';'-separated STRING, which is valid JSON that every reader using
+     * as_array() saw as empty -- so a host with a full plan read as a host
+     * requiring nothing, failing open and silently. A list of things the
+     * server must check is exactly the shape where that direction of failure
+     * is worst, so it goes on the wire as a list. */
+    {
+        size_t o = 0;
+        const char *p = mod_exempt;
+        int first = 1;
+        exempt_json[o++] = '[';
+        while (p && *p) {
+            const char *end = p;
+            char entry[160];
+            char esc[sizeof(entry) * 2 + 4];
+            size_t len;
+            while (*end && *end != ';' && *end != '\n') ++end;
+            len = (size_t)(end - p);
+            if (len && len < sizeof(entry)) {
+                memcpy(entry, p, len);
+                entry[len] = '\0';
+                json_escape(entry, esc, sizeof(esc));
+                if (o + strlen(esc) + 4 < sizeof(exempt_json)) {
+                    if (!first) exempt_json[o++] = ',';
+                    exempt_json[o++] = '"';
+                    memcpy(exempt_json + o, esc, strlen(esc));
+                    o += strlen(esc);
+                    exempt_json[o++] = '"';
+                    first = 0;
+                } else {
+                    /* Refuse rather than send a SHORT list: a truncated list
+                     * of exemptions is a list the server approves in full
+                     * while the client relies on more than it declared. */
+                    automatch_fail("too many mod exemptions to declare");
+                    return -1;
+                }
+            }
+            p = *end ? end + 1 : end;
+        }
+        exempt_json[o++] = ']';
+        exempt_json[o] = '\0';
+    }
+
     /* Measure before queueing when we can: a client that probes first never
      * waits out the server's probe grace at all. */
     if (g_am.rtt_ms < 0) automatch_probe_send();
@@ -765,9 +816,9 @@ int snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled)
              "{\"op\":\"automatch_queue\",\"titles\":[{"
              "\"game_name\":\"%s\",\"game_version\":\"%s\","
              "\"disc_fp\":\"%s\",\"ruleset_id\":\"%s\",\"max_slots\":2}],"
-             "\"mods_enabled\":%s%s}",
+             "\"mods_enabled\":%s,\"mod_exempt\":%s%s}",
              gn_esc, gv_esc, disc_fp, rid_esc,
-             mods_enabled ? "true" : "false", rtt);
+             mods_enabled ? "true" : "false", exempt_json, rtt);
     queue_send(msg);
     g_am.error[0] = '\0';
     g_am.queue_in_flight = 1;
@@ -1512,6 +1563,11 @@ static void parse_match_caps_object(const char *obj, SnesLobbyMatchCaps *out)
     out->mod_count = parse_mod_pkg_array(obj, "mod_plan", out->mods,
                                          SNES_LOBBY_MAX_MODS);
     json_get_str(obj, "mod_set", out->mod_set, sizeof(out->mod_set));
+    /* Absent => empty => nothing is exempt. The default has to be the strict
+     * one: a server or host that has never heard of cosmetic mods has granted
+     * nothing, and reading its silence as permission is the whole hole. */
+    json_get_str(obj, "mod_cosmetic_allow", out->mod_cosmetic_allow,
+                 sizeof(out->mod_cosmetic_allow));
     out->ignore_aspect = json_get_bool(obj, "ignore_aspect", 0);
     out->input_delay = json_get_int(obj, "input_delay", 6);
     if (out->input_delay < 2) out->input_delay = 2;
@@ -1538,6 +1594,7 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
 {
     char mods[SNES_LOBBY_MAX_MODS * 256 + 16];
     char set_esc[sizeof(caps->mod_set) * 2 + 4];
+    char allow_esc[sizeof(caps->mod_cosmetic_allow) * 2 + 4];
     int n;
 
     if (!dst || dst_cap < 8 || !caps || !caps->valid) return 0;
@@ -1548,11 +1605,13 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
                               caps->mod_count))
         return 0;
     json_escape(caps->mod_set, set_esc, sizeof(set_esc));
+    json_escape(caps->mod_cosmetic_allow, allow_esc, sizeof(allow_esc));
     n = snprintf(dst, dst_cap,
                  ",\"match_caps\":{\"v\":1,\"widescreen\":%s,\"widescreen_hud\":%s,"
                  "\"ignore_aspect\":%s,\"input_delay\":%d,\"ws_extra\":%d,"
                  "\"force_turn\":%s,\"force_input_relay\":%s,"
-                 "\"rollback\":%s,%s,\"mod_set\":\"%s\"}",
+                 "\"rollback\":%s,%s,\"mod_set\":\"%s\","
+                 "\"mod_cosmetic_allow\":\"%s\"}",
                  caps->widescreen ? "true" : "false",
                  caps->widescreen_hud ? "true" : "false",
                  caps->ignore_aspect ? "true" : "false",
@@ -1560,7 +1619,7 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const SnesLobbyMatc
                  caps->force_turn ? "true" : "false",
                  caps->force_input_relay ? "true" : "false",
                  caps->rollback ? "true" : "false",
-                 mods, set_esc);
+                 mods, set_esc, allow_esc);
     if (n < 0 || (size_t)n >= dst_cap) return 0;
     /* The lobby server drops a match_caps object over 4096 bytes ENTIRELY
      * (sanitize_match_caps returns None), which would take widescreen,
@@ -3518,6 +3577,74 @@ int snes_lobby_set_ready(int ready)
         return -1;
     }
     send_set_ready(ready);
+    flush_pending();
+    return 0;
+}
+
+/*
+ * Report a simulation-state fork to the server.
+ *
+ * WHAT THIS IS FOR, and what it is NOT.
+ *
+ * In rollback both peers digest the same simulation every tick, so any state
+ * divergence is visible by construction -- the entire class of cheats that
+ * alters the simulation cannot hide from it. Until now that signal was
+ * computed, named down to the subsystem, printed to a local log, and thrown
+ * away. Reporting it is what turns a detection nobody sees into evidence
+ * somebody can act on.
+ *
+ * A fork is NOT an accusation and this call must never be written as though
+ * it were. It says two peers disagreed. Version skew says that. A genuine
+ * emulation bug says that -- this project has found several, and each one
+ * would have produced these reports from two entirely honest players. Which
+ * side MOVED is unknowable from either end of a two-peer disagreement, and is
+ * only ever answerable by looking at many matches against many opponents,
+ * which is a thing a server with accounts can do and a client cannot. So both
+ * digests go on the wire, both peers report independently, and the server
+ * stores rather than judges.
+ *
+ * Best-effort: a report that cannot be sent is dropped rather than retried or
+ * queued. A desync usually ends the match, the connection often goes with it,
+ * and making a diagnostic hold a teardown open would be a worse bug than the
+ * missing row.
+ */
+int snes_lobby_report_desync(const SnesLobbyDesyncReport *r)
+{
+    char msg[1024];
+    char part_esc[96];
+    char exempt_esc[512];
+    char gv_esc[SNES_LOBBY_VERSION_LEN * 2 + 4];
+    const char *lid;
+    int n;
+
+    if (!r || !snes_lobby_connected())
+        return -1;
+    lid = g_lc.join.lobby_id[0] ? g_lc.join.lobby_id : "";
+
+    json_escape(r->partition ? r->partition : "?", part_esc, sizeof(part_esc));
+    json_escape(r->mod_exempt ? r->mod_exempt : "", exempt_esc,
+                sizeof(exempt_esc));
+    json_escape(effective_game_version(NULL), gv_esc, sizeof(gv_esc));
+
+    /* Digests as hex STRINGS, not numbers. They are 32-bit and JSON numbers
+     * are doubles in most readers; a value above 2^53 would be safe but a
+     * reader that decides to print one as 4.29497e+09 has silently destroyed
+     * the only field the row exists to compare. */
+    n = snprintf(msg, sizeof(msg),
+                 "{\"op\":\"desync_report\",\"v\":1,"
+                 "\"lobby_id\":\"%s\",\"game_version\":\"%s\","
+                 "\"tick\":%u,\"partition\":\"%s\","
+                 "\"mine\":\"%08x\",\"theirs\":\"%08x\","
+                 "\"role\":\"%s\",\"disc_fp\":\"%s\","
+                 "\"mod_exempt\":\"%s\"}",
+                 lid, gv_esc, (unsigned)r->tick, part_esc,
+                 (unsigned)r->mine, (unsigned)r->theirs,
+                 r->is_host ? "host" : "guest",
+                 snes_lobby_disc_fp() ? snes_lobby_disc_fp() : "",
+                 exempt_esc);
+    if (n < 0 || (size_t)n >= sizeof(msg))
+        return -1;
+    queue_send(msg);
     flush_pending();
     return 0;
 }

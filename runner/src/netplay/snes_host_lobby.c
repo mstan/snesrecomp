@@ -1,6 +1,10 @@
 #include "snes_host_lobby.h"
 #include "recomp_net/auth.h"
 #include "snes_netplay_identity.h"
+/* Fork detection lives in the rollback engine; this file only reports what it
+ * already found. Included unconditionally: the accessors compile to a "no
+ * fork" answer in a build without rollback. */
+#include "snes_netplay_rb.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -314,6 +318,7 @@ static const char *game_version(void)
 
 static void dl_queue_step(void);
 static void mod_set_sync_step(void);
+static void desync_report_step(void);
 static void cb_push_match_caps(void *ctx);
 static void host_caps_watch_step(void);
 
@@ -339,6 +344,13 @@ static void fill_caps_mods(SnesLobbyMatchCaps *caps)
 
   if (!caps)
     return;
+  /* Apply our own grant FIRST, because both the plan rows and the effective
+   * set below are computed through it: a host that publishes an allowlist and
+   * then reports a set built without it would advertise its own cosmetic mods
+   * as requirements, and guests would be told to install them. */
+  snprintf(caps->mod_cosmetic_allow, sizeof(caps->mod_cosmetic_allow), "%s",
+           g_opts.cosmetic_allow ? g_opts.cosmetic_allow : "");
+  snes_mod_runtime_set_cosmetic_allow_c(caps->mod_cosmetic_allow);
   caps->mod_count = 0;
   n = snes_mod_runtime_plan_rows_c(rows, SNES_LOBBY_MAX_MODS);
   for (i = 0; i < n && i < SNES_LOBBY_MAX_MODS; ++i) {
@@ -892,6 +904,7 @@ static void cb_pump(void *ctx)
   dl_queue_step();
   host_caps_watch_step();
   mod_set_sync_step();
+  desync_report_step();
   lan_chat_drain();
   beacon_listen_step();
   beacon_publish_step();
@@ -1502,6 +1515,60 @@ static int cb_automatch_queue(void *ctx, const char *ruleset_id)
     char why[160];
     int mods;
     why[0] = '\0';
+
+    /*
+     * The SERVER's grant, not ours, and applied before the game is asked
+     * anything -- the whole assertion below is computed through it.
+     *
+     * An automatch room is the server's room. Whatever this build would allow
+     * as a host is irrelevant here: a player queueing for a public pool does
+     * not get to decide which of their own mods are harmless, because that is
+     * precisely the decision a cheat would make in its own favour. A ruleset
+     * with no list grants nothing, so an unapproved cosmetic claim counts as
+     * simulation-affecting and the queue is refused.
+     */
+    {
+        SnesLobbyRuleset r;
+        char allow[512];
+        int i, n = snes_lobby_automatch_ruleset_count();
+        allow[0] = '\0';
+        for (i = 0; i < n; ++i) {
+            if (!snes_lobby_automatch_ruleset_get(i, &r)) continue;
+            /* NULL/"" selects the first, matching the client's own rule. */
+            if (ruleset_id && ruleset_id[0] && strcmp(r.id, ruleset_id) != 0)
+                continue;
+            snprintf(allow, sizeof(allow), "%s", r.caps.mod_cosmetic_allow);
+            break;
+        }
+        snes_mod_runtime_set_cosmetic_allow_c(allow);
+    }
+
+    /*
+     * Refuse an ungranted cosmetic claim here, by name, before the game's own
+     * assertion runs.
+     *
+     * The game's answer is derived from the effective set, which now excludes
+     * anything the server DID grant -- so without this check a mod the server
+     * never approved would simply be absent from the game's view and pass
+     * unnoticed. It is checked here rather than in the game because it is the
+     * framework's rule, not a per-title one, and a title that forgot to
+     * implement it would be the hole.
+     */
+#if SNESRECOMP_ENABLE_MODS
+    {
+        char bad[512];
+        if (snes_mod_runtime_unapproved_cosmetics_c(bad, sizeof(bad)) > 0 &&
+            bad[0]) {
+            char *nl = strchr(bad, '\n');
+            if (nl) *nl = '\0';
+            snprintf(why, sizeof(why),
+                     "%s is not on this queue's approved list", bad);
+            snes_lobby_automatch_refuse_local(why);
+            return -1;
+        }
+    }
+#endif
+
     mods = g_opts.mods_enabled
                ? g_opts.mods_enabled(g_opts.mods_ctx, ruleset_id, why, sizeof(why))
                : 0;
@@ -1513,7 +1580,24 @@ static int cb_automatch_queue(void *ctx, const char *ruleset_id)
             why[0] ? why : "Turn off sim-affecting mods to queue");
         return -1;
     }
-    return snes_lobby_automatch_queue(ruleset_id, 0) == 0 ? 0 : -1;
+    /* Declare the exemptions we are relying on, so the SERVER checks them
+     * against its own allowlist rather than taking the verdict above on
+     * trust. The two gates are layers: an old server ignores this field and
+     * the assertion still holds, a new one stops needing to believe us. */
+    {
+        char exempt[768];
+        exempt[0] = '\0';
+#if SNESRECOMP_ENABLE_MODS
+        if (snes_mod_runtime_exempted_packages_c(exempt, sizeof(exempt)) >=
+            (int)sizeof(exempt)) {
+            /* Never queue having declared less than we rely on. */
+            snes_lobby_automatch_refuse_local(
+                "too many mod exemptions to declare to the server");
+            return -1;
+        }
+#endif
+        return snes_lobby_automatch_queue(ruleset_id, 0, exempt) == 0 ? 0 : -1;
+    }
 }
 
 static int cb_automatch_cancel(void *ctx)
@@ -2214,10 +2298,23 @@ static void mod_set_sync_step(void)
 
   if (!snes_lobby_in_lobby() || snes_lobby_is_host()) {
     g_adopted_set[0] = '\0';
+    /* Out of a lobby, no authority is granting anything, so the exemption
+     * lapses rather than lingering from the last host we spoke to. A host
+     * sets its own grant in fill_caps_mods and must not be cleared here. */
+    if (!snes_lobby_in_lobby())
+      snes_mod_runtime_set_cosmetic_allow_c(NULL);
     return;
   }
   caps = snes_lobby_match_caps();
-  if (!caps || !caps->valid || !caps->mod_set[0])
+  if (!caps || !caps->valid)
+    return;
+  /* The host is the authority here, so its grant governs before anything is
+   * compared or adopted. Applied even when the host's own mod set is empty --
+   * a vanilla host that permits an accessibility filter is the ordinary case,
+   * and returning early on an empty set would leave a stale allowlist from a
+   * previous lobby in force. */
+  snes_mod_runtime_set_cosmetic_allow_c(caps->mod_cosmetic_allow);
+  if (!caps->mod_set[0])
     return;
   if (!strcmp(g_adopted_set, caps->mod_set))
     return;                      /* already tried this exact set */
@@ -2244,6 +2341,74 @@ static void mod_set_sync_step(void)
 #else
 static void mod_set_sync_step(void) {}
 #endif
+
+/*
+ * Report a simulation fork once per session, promptly.
+ *
+ * Promptly, not at teardown: a desync usually ENDS the match, and often takes
+ * the connection with it, so a report deferred to a clean shutdown is a report
+ * that mostly never gets sent. Once per session because the interesting fact
+ * is that the peers diverged and where -- a hundred rows from one broken match
+ * would drown the signal the rows exist to carry.
+ *
+ * Best-effort throughout. Nothing here may hold up a teardown or change what
+ * the player sees; it is a diagnostic, and a diagnostic that costs a match is
+ * not worth having.
+ */
+static void desync_report_step(void)
+{
+#if SNES_HAS_LOBBY_CLIENT
+  static int reported;
+  SnesLobbyDesyncReport r;
+  uint32_t tick = 0;
+  uint32_t mine = 0, theirs = 0;
+  const char *partition = "?";
+  char exempt[512];
+
+  if (!snes_lobby_connected()) {
+    /* A fresh connection is a fresh session: arm again so the next match can
+     * report its own fork. */
+    reported = 0;
+    return;
+  }
+  if (reported)
+    return;
+  if (!snes_netplay_rb_last_fork(&tick, &partition))
+    return;
+  snes_netplay_rb_fork_digests(&mine, &theirs);
+
+  exempt[0] = '\0';
+#if SNESRECOMP_ENABLE_MODS
+  /* What this peer was running, so the row can be read beside what the match
+   * approved. A fork under an unapproved exemption and a fork under none are
+   * different facts, and the row is worth little without which it was. */
+  (void)snes_mod_runtime_exempted_packages_c(exempt, sizeof(exempt));
+  {
+    /* Newlines to ';' -- the wire carries one line. */
+    char *p;
+    for (p = exempt; *p; ++p)
+      if (*p == '\n') *p = ';';
+    if (p > exempt && p[-1] == ';') p[-1] = '\0';
+  }
+#endif
+
+  memset(&r, 0, sizeof(r));
+  r.tick = tick;
+  r.partition = partition;
+  r.mine = mine;
+  r.theirs = theirs;
+  r.is_host = snes_lobby_is_host() ? 1 : 0;
+  r.mod_exempt = exempt;
+
+  reported = 1;    /* set before the send: a failed send must not retry */
+  if (snes_lobby_report_desync(&r) == 0)
+    fprintf(stderr,
+            "netplay: reported a state fork at tick %u (%s), local %08x vs "
+            "peer %08x -- this records that the two peers DIFFERED, not who "
+            "was wrong\n",
+            (unsigned)tick, partition, (unsigned)mine, (unsigned)theirs);
+#endif
+}
 
 static int cb_lobby_mods_can_download(void *ctx)
 {
