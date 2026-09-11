@@ -683,6 +683,20 @@ typedef struct SnesLobbyDesyncReport {
 
 int  snes_lobby_report_desync(const SnesLobbyDesyncReport *r);
 
+/*
+ * Tell the server which accounts this player has blocked.
+ *
+ * ';'-separated opaque account ids, replacing the whole set -- the client's
+ * own file is the authority, so an unblock needs no separate op.
+ *
+ * Sent to the SERVER rather than applied only here, because two of the three
+ * things a block has to do cannot be done from this side: the matchmaker must
+ * not pair the two, and the blocked player must not see or be able to join
+ * the blocker's room. A client can hide what it was sent; it cannot know it
+ * was blocked by somebody else, and that is the direction that matters.
+ */
+int  snes_lobby_set_blocks(const char *accounts);
+
 int  snes_lobby_automatch_request_rulesets(void);
 int  snes_lobby_automatch_available(void);
 int  snes_lobby_automatch_ruleset_count(void);
