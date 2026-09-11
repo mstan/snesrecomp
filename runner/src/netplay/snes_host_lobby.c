@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv: SNESRECOMP_LOBBY_LIST_DEBUG */
 #include <stdint.h>
 #include <time.h>
 
@@ -246,7 +247,15 @@ static int beacon_row_listed(const RNetLanBeaconRoom *room,
 {
   if (strcmp(room->game_name, game_name()) != 0)
     return 0;
-  if (room->game_version[0] && strcmp(room->game_version, game_version()) != 0)
+  /* Same rule the lobby-server browser applies, and for the same reason.
+   * This used to be an unconditional exact match, which is right for two
+   * shipped releases and wrong for everything else: every development build
+   * carries a dirty-diff hash of its own working tree, so two developers on
+   * one LAN could never see each other's rooms -- the beacon arrived, the
+   * row was dropped, and nothing said why. The join still refuses a real
+   * mismatch; it just gets to explain itself. */
+  if (snes_lobby_version_filter_strict() && room->game_version[0] &&
+      strcmp(room->game_version, game_version()) != 0)
     return 0;
   if (room->started)
     return 0;
@@ -1001,6 +1010,34 @@ static int cb_list_count(void *ctx)
   int have_lan;
   (void)ctx;
   have_lan = list_want_lan() && fill_lan_row(&lan);
+  /* SNESRECOMP_LOBBY_LIST_DEBUG=1: say where the browser's rows come from,
+   * once per change. "The list is empty" has four possible causes -- wrong
+   * scope, nothing on the server, no registry row, no beacons heard -- and
+   * they are indistinguishable from the screen. Off by default; this is a
+   * line to ask a player for, not one to print at everybody. */
+  {
+    static int enabled = -1;
+    if (enabled < 0) {
+      const char *e = getenv("SNESRECOMP_LOBBY_LIST_DEBUG");
+      enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (enabled) {
+      static int last_scope = -1, last_remote = -1, last_lan = -1, last_beacon = -1;
+      int remote = snes_lobby_list_count();
+      int beacons = beacon_row_count(have_lan ? lan.lobby_id + 4 : "");
+      if (last_scope != g_list_scope || last_remote != remote ||
+          last_lan != have_lan || last_beacon != beacons) {
+        last_scope = g_list_scope; last_remote = remote;
+        last_lan = have_lan; last_beacon = beacons;
+        fprintf(stderr,
+                "[lobby-list] scope=%s server_rows=%d local_registry=%d "
+                "lan_beacons=%d version=\"%s\" strict=%d\n",
+                g_list_scope == 1 ? "LAN" : g_list_scope == 2 ? "ONLINE" : "ANY",
+                remote, have_lan, beacons, game_version(),
+                snes_lobby_version_filter_strict());
+      }
+    }
+  }
   return (list_want_online() ? snes_lobby_list_count() : 0) +
          (have_lan ? 1 : 0) +
          (list_want_lan()
