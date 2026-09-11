@@ -32,6 +32,7 @@ int  snes_lobby_online_count(void) { return 0; }
 int  snes_lobby_online_get(int index, SnesLobbyOnlinePlayer *out) { (void)index; (void)out; return 0; }
 void snes_lobby_set_game_identity(const char *a, const char *b) { (void)a; (void)b; }
 const char *snes_lobby_game_version(void) { return SNES_GAME_VERSION; }
+int  snes_lobby_version_filter_strict(void) { return 0; }
 int  snes_lobby_create(const char *a, const char *b, const char *c, const char *d,
                        const char *e, const SnesLobbyMatchCaps *f, int max_slots)
 { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)max_slots; return -1; }
@@ -3031,6 +3032,11 @@ void snes_lobby_set_game_identity(const char *game_name,
 const char *snes_lobby_game_version(void)
 {
     return effective_game_version(NULL);
+}
+
+int snes_lobby_version_filter_strict(void)
+{
+    return list_filter_version_strict();
 }
 
 void snes_lobby_request_list(void)

@@ -293,6 +293,20 @@ void snes_lobby_set_game_identity(const char *game_name,
                                   const char *game_version);
 /* The pin actually presented on the wire -- the override when one is set. */
 const char *snes_lobby_game_version(void);
+/*
+ * Should a browser hide rooms whose game_version differs from ours?
+ *
+ * True only for a plain RELEASED version. Every development build carries a
+ * qualifier ("dev+abc12345", "0.1.5+abc12345-dirty.1234abcd") and lists
+ * UNFILTERED: the pin is still enforced at the join, but hiding the room robs
+ * the player of the explanation, and "my friend's lobby isn't showing up" is
+ * far worse to debug than "this lobby is a different build".
+ *
+ * Exported so the LAN beacon browser applies the SAME rule as the lobby-server
+ * browser. It did not, and two developers on one LAN -- whose dirty-diff
+ * hashes necessarily differ -- silently could not see each other at all.
+ */
+int snes_lobby_version_filter_strict(void);
 
 void snes_lobby_request_list(void);
 int  snes_lobby_list_count(void);
