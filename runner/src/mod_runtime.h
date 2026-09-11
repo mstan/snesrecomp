@@ -177,6 +177,44 @@ int snes_mod_runtime_check_set_c(const char* want, char* reason, uint32_t cap);
  *
  * This is what netplay peers must agree on: a mod that patches guest memory is
  * simulation state, and two peers running different sets cannot stay in sync. */
+/*
+ * The cosmetic allowlist in force for this session: which packages the
+ * AUTHORITY for this match (the automatch ruleset the server published, or
+ * the lobby host's caps) has granted the presentation-only exemption to.
+ *
+ * ';'-separated, each entry `id@version` or `id@version#sha256`, the digest
+ * being of the package packed by the runtime's own deterministic zip.
+ *
+ * NULL or "" revokes every exemption -- the safe default, and the one an
+ * older host or a ruleset without the key must produce. A manifest's
+ * `presentation_only = true` is only the mod asking; this is the grant.
+ */
+void snes_mod_runtime_set_cosmetic_allow_c(const char* allow);
+int snes_mod_runtime_get_cosmetic_allow_c(char* out, uint32_t cap);
+
+/* Deterministic content digest of an installed package, as 64 lowercase hex
+ * characters. Pass NULL/"" for `version` to use the selected one. 1 on
+ * success. Use it to WRITE an allowlist entry; matching one is the runtime's
+ * job. */
+int snes_mod_runtime_package_digest_c(const char* package_id,
+                                      const char* version,
+                                      char* out, uint32_t cap);
+
+/* The evidence for every exemption this build is actually taking, one
+ * `id@version#sha256` per package. Send it with an automatch ticket so the
+ * SERVER checks the exemptions against its own allowlist, instead of being
+ * handed this client's verdict and having to take it on faith. A package whose
+ * digest cannot be computed reports an empty one, which matches no pinned
+ * entry and so fails closed. Returns the bytes that WOULD be written. */
+int snes_mod_runtime_exempted_packages_c(char* out, uint32_t cap);
+
+/* Enabled features claiming the cosmetic exemption without a grant, one/* Enabled features claiming the cosmetic exemption without a grant, one
+ * `package@version/feature` per line; empty when there are none. A queue gate
+ * must treat these as simulation-affecting -- not because they necessarily
+ * are, but because no authority has said they are not. Returns the bytes that
+ * WOULD be written, so truncation is distinguishable from emptiness. */
+int snes_mod_runtime_unapproved_cosmetics_c(char* out, uint32_t cap);
+
 int snes_mod_runtime_effective_set_c(char* out, uint32_t cap);
 
 int snes_mod_runtime_feature_option_value_c(const char* package_id,
@@ -189,6 +227,26 @@ int snes_mod_runtime_feature_option_value_c(const char* package_id,
  * Register a trusted implementation. A .snesmod archive may select only this
  * stable id; archives never provide native code, symbols, or library paths.
  */
+/*
+ * Register a plugin AND classify it as presentation-only: this callback
+ * changes what the machine draws and touches no CPU, WRAM, VRAM, OAM, CGRAM,
+ * APU or save state.
+ *
+ * This is the EXECUTABLE vouching for a function it contains, and it is the
+ * only way that classification can be made. A manifest's
+ * `presentation_only = true` is the mod vouching for itself, which is worth
+ * nothing on its own -- a feature whose plugins were registered the ordinary
+ * way is refused the exemption however its manifest is written. So a package
+ * can only ever claim the exemption for behaviour this build already ships and
+ * has already classified; it cannot describe new cosmetic behaviour into
+ * existence, because it cannot introduce code at all.
+ *
+ * Use it only where that is demonstrably true. It is a security boundary, not
+ * a label.
+ */
+int snes_mod_register_presentation_plugin(const char* id,
+                                          SNESModActivationCallback callback);
+
 int snes_mod_register_activation_plugin(const char* id,
                                         SNESModActivationCallback callback);
 

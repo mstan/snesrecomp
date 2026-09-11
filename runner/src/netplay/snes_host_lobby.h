@@ -67,6 +67,22 @@ typedef struct SnesHostLobbyOpts {
   /* Appended: a runner built before this field zero-fills it and asserts 0. */
   SnesHostModsEnabledFn mods_enabled;
   void *mods_ctx;
+  /*
+   * What THIS BUILD grants the presentation-only exemption to when it is the
+   * host: ';'-separated `id@version` or `id@version#sha256`, published in
+   * match_caps.mod_cosmetic_allow.
+   *
+   * A host is an authority over its own lobby, so it may say which cosmetic
+   * mods its guests are free to run unilaterally -- an accessibility filter
+   * being the case this exists for. It is NOT a statement about the host's own
+   * mods, and it does not travel: in an automatch room the SERVER's ruleset
+   * supplies the list instead and this is ignored.
+   *
+   * NULL or "" grants nothing, which is the behaviour of every build that
+   * predates the field and the correct default: a mod's own manifest claiming
+   * `presentation_only` is only a request.
+   */
+  const char *cosmetic_allow;
 } SnesHostLobbyOpts;
 
 /* Init once before first launcher open. Returns 0 on success. */

@@ -62,6 +62,30 @@ struct Feature {
     std::string description;
     std::string group = "General";
     bool default_enabled = false;
+    /* This feature changes only what the local machine DRAWS, never what it
+     * simulates -- so it is left out of the effective set two netplay peers
+     * compare, and the two of them may differ on it freely.
+     *
+     * snes_mod_runtime_effective_set_c has always said that peers "must agree
+     * on every mod that touches guest memory"; this is the flag that finally
+     * lets a manifest say a mod does not. It was added for an accessibility
+     * filter (a photosensitivity flash guard), where requiring both sides to
+     * match would have made the feature useless in exactly the situation it
+     * exists for: a player who needs it does not get to pick their opponent,
+     * and should not have to ask one for permission to see fewer strobes.
+     *
+     * Declaring it is a CLAIM, and a false one desyncs a match. Set it only
+     * where the feature demonstrably touches no CPU, WRAM, VRAM, OAM, CGRAM,
+     * APU or save state -- a post-process on the presented framebuffer, a
+     * window or viewport policy, an overlay drawn after the guest frame. A
+     * mod that patches ROM text, freezes a RAM address or moves a sprite
+     * bound is simulation state whatever it looks like, and must NOT set it.
+     *
+     * Note that widescreen deliberately does NOT set this even though it is
+     * presentation-only: it negotiates a shared margin through the lobby's
+     * match caps so both peers run the same geometry, so agreement there is
+     * wanted rather than merely tolerated. */
+    bool presentation_only = false;
     std::vector<std::string> plugins;
 };
 
@@ -135,6 +159,20 @@ struct Validation {
 
 struct RegisteredPlugin {
     SNESModActivationCallback activation = nullptr;
+    /* The EXECUTABLE's word that this plugin only ever changes what is drawn.
+     *
+     * Set by snes_mod_register_presentation_plugin, i.e. by a line of C in a
+     * build somebody reviewed -- never by a manifest. That asymmetry is the
+     * whole value of the field: a manifest is authored by whoever authored the
+     * mod, so `presentation_only` there is the mod vouching for itself, while
+     * this is the program vouching for a function it contains.
+     *
+     * A manifest may therefore only ever claim the exemption for behaviour the
+     * shipped binary ALREADY implements and has already classified. It cannot
+     * introduce a new cosmetic behaviour, because it cannot introduce code at
+     * all: activation runs registered callbacks, and an unregistered id
+     * resolves to nothing. */
+    bool presentation = false;
 };
 
 std::map<std::string, RegisteredPlugin>& registered_plugins() {
@@ -172,6 +210,19 @@ struct Runtime {
     Validation committed;
     std::string error;
     bool initialized = false;
+
+    /* The cosmetic allowlist in force for this session -- see
+     * snes_mod_runtime_set_cosmetic_allow_c. EMPTY MEANS NOTHING IS EXEMPT,
+     * which is the only safe default: a manifest saying presentation_only is
+     * the mod's own claim about itself, and absent an authority to grant it,
+     * an unrecognised claim has to be worth nothing. */
+    std::string cosmetic_allow;
+    /* package id -> "version\0digest" memo, so a queue gate can pin package
+     * bytes without re-zipping a tree per check. Keyed by id@version. */
+    std::map<std::string, std::string> digest_cache;
+    /* id@version -> "carries nothing but manifest.toml", memoised for the same
+     * reason the digest is: it walks a directory. */
+    std::map<std::string, bool> manifest_only_cache;
 };
 
 Runtime& state() {
@@ -495,6 +546,9 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                 else if (key == "default_enabled") {
                     parsed = parse_bool(value, bool_value);
                     if (parsed) feature->default_enabled = bool_value;
+                } else if (key == "presentation_only") {
+                    parsed = parse_bool(value, bool_value);
+                    if (parsed) feature->presentation_only = bool_value;
                 } else known = false;
                 break;
             case Section::Option:
@@ -669,6 +723,192 @@ bool feature_enabled(Runtime& runtime, const Package& package,
     if (!selection.has_enabled)
         selection.enabled = feature.default_enabled;
     return selection.enabled;
+}
+
+/* Deterministic content digest of an installed package, memoised.
+ *
+ * zip_store_tree sorts its file list precisely so that the same package packs
+ * to byte-identical bytes on any machine, which is what makes a digest of it
+ * mean the same thing to a server and to a client. Declared before its use in
+ * cosmetic_allowed; defined further down, next to the packing code. */
+bool package_digest(Runtime& runtime, const std::string& package_id,
+                    const std::string& version, std::string& out);
+
+/*
+ * Does the session's allowlist grant this package the cosmetic exemption?
+ *
+ * The allowlist is ';'-separated, each entry one of:
+ *
+ *     <package_id>@<version>
+ *     <package_id>@<version>#<sha256 of the packed package>
+ *
+ * The digest form is the one worth using. Without it the list is keyed on a
+ * string the client chooses for itself, so a mod that wants the exemption
+ * simply calls itself by an allowlisted id -- which is not a whitelist, it is
+ * a naming convention. With it, the entry names specific bytes.
+ *
+ * What this can and cannot do is worth being exact about, because the
+ * difference decides whether anyone is misled. It stops a player from
+ * REDISTRIBUTING something that claims to be cosmetic and is not: a "flash
+ * guard" with a wallhack in it packs to different bytes and is refused on
+ * every machine that installs it. It does NOT stop someone who patches their
+ * own executable, because a patched client can report whatever it likes --
+ * defending against that needs server-side verification of the simulation,
+ * which does not exist here. The purpose is to close the omission, so that
+ * getting an unapproved mod into a match requires deliberate forgery rather
+ * than merely declaring a flag in a manifest nobody checks.
+ */
+bool cosmetic_allowed(Runtime& runtime, const Package& package) {
+    if (runtime.cosmetic_allow.empty()) return false;
+
+    /* The RESOLVED package's own id and version, not the selection map's.
+     * selected_package falls back to the newest installed version when a
+     * selection names none, so reading the selection here could check the
+     * allowlist against one version while the match runs another. */
+    const std::string& package_id = package.id;
+    const std::string& version = package.version;
+    if (package_id.empty() || version.empty()) return false;
+
+    const std::string want = package_id + "@" + version;
+    const std::string& list = runtime.cosmetic_allow;
+    std::size_t pos = 0;
+    while (pos <= list.size()) {
+        std::size_t end = list.find(';', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string entry = trim(list.substr(pos, end - pos));
+        pos = end + 1;
+        if (entry.empty()) continue;
+
+        std::string pinned;
+        const std::size_t hash = entry.find('#');
+        if (hash != std::string::npos) {
+            pinned = trim(entry.substr(hash + 1));
+            entry = trim(entry.substr(0, hash));
+        }
+        if (entry != want) continue;
+
+        if (pinned.empty())
+            return true;        /* named, not pinned */
+
+        std::string have;
+        if (!package_digest(runtime, package_id, version, have))
+            return false;       /* cannot prove it: refuse, never assume */
+        /* Case-insensitive on the hex, so a list written in either case works;
+         * the comparison is still the whole 64 characters. */
+        if (pinned.size() != have.size()) continue;
+        bool same = true;
+        for (std::size_t i = 0; i < have.size() && same; ++i)
+            same = std::tolower((unsigned char)pinned[i]) ==
+                   std::tolower((unsigned char)have[i]);
+        if (same) return true;
+    }
+    return false;
+}
+
+/*
+ * Does this package carry ANYTHING but its manifest?
+ *
+ * A package eligible for the cosmetic exemption may carry no payload at all --
+ * no data file, no patch table, no image, nothing. It may only SELECT among
+ * behaviour the executable already ships.
+ *
+ * This is the check that makes "presentation only" a property rather than a
+ * promise. A manifest cannot introduce code (activation runs only callbacks
+ * the binary registered, and an unregistered plugin id resolves to nothing),
+ * so the one way a package can still influence the guest is by shipping data
+ * that some built-in feature consumes -- which is exactly how localization
+ * patches ROM text, from a .toml inside its own package. A package with no
+ * files has no such lever, and the property is verifiable here rather than
+ * taken on trust.
+ *
+ * Note it is deliberately stricter than "declares no [[resource]]": the
+ * localization table is not a declared resource, it is simply a file the
+ * plugin opens by path. Counting declarations would have missed it.
+ */
+bool package_is_manifest_only(Runtime& runtime, const Package& package) {
+    const std::string key = package.id + "@" + package.version;
+    const auto hit = runtime.manifest_only_cache.find(key);
+    if (hit != runtime.manifest_only_cache.end()) return hit->second;
+
+    bool only = true;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(package.root, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) { only = false; break; }   /* cannot see it: do not vouch */
+        if (!it->is_regular_file(ec) || ec) continue;
+        const std::string name = it->path().filename().string();
+        if (name != "manifest.toml") { only = false; break; }
+    }
+    runtime.manifest_only_cache[key] = only;
+    return only;
+}
+
+/*
+ * Is the CLAIM even admissible, before asking whether anyone granted it?
+ *
+ * Three things, and none of them is the manifest's opinion of itself:
+ *
+ *   1. the manifest asks (feature.presentation_only) -- necessary, worthless
+ *      alone, because a cheat author writes manifests too;
+ *   2. every plugin the feature turns on was registered by the EXECUTABLE as
+ *      presentation-only. A manifest can only name plugins; whether a named
+ *      plugin merely draws is a fact about compiled code that a reviewer
+ *      classified, not something the package gets a say in. A feature naming a
+ *      plugin the binary registered normally -- or one it does not have at all
+ *      -- is not admissible however loudly its manifest claims otherwise;
+ *   3. the package carries nothing but its manifest, so it cannot feed data to
+ *      a built-in feature that patches the guest.
+ *
+ * This runs BEFORE the allowlist, so it holds even against a server that
+ * allowlists something it should not have. The grant decides whether an
+ * admissible claim is honoured; this decides whether it was ever a real claim.
+ */
+bool claim_admissible(Runtime& runtime, const Package& package,
+                      const Feature& feature) {
+    if (!feature.presentation_only) return false;
+    for (const std::string& plugin_id : feature.plugins) {
+        const auto registered = registered_plugins().find(plugin_id);
+        if (registered == registered_plugins().end() ||
+            !registered->second.activation ||
+            !registered->second.presentation) {
+            /* Loud, because this is what an attempt to smuggle a
+             * simulation-affecting feature past the mod comparison looks
+             * like, and it is otherwise indistinguishable from a typo. */
+            std::fprintf(stderr,
+                "mods: %s/%s claims presentation_only, but this build does not "
+                "classify plugin '%s' as presentation -- the claim is refused "
+                "and the feature is treated as simulation-affecting\n",
+                package.id.c_str(), feature.id.c_str(), plugin_id.c_str());
+            return false;
+        }
+    }
+    if (!package_is_manifest_only(runtime, package)) {
+        std::fprintf(stderr,
+            "mods: %s claims presentation_only but ships files beyond its "
+            "manifest -- the claim is refused\n", package.id.c_str());
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Is this enabled feature exempt from everything netplay compares?
+ *
+ * TWO conditions, and both are needed. The manifest's presentation_only is the
+ * mod ASKING; the session's allowlist is the authority GRANTING. A claim with
+ * no grant behind it is treated as an ordinary simulation-affecting feature --
+ * it appears in the compared set, it is published in the plan rows, and an
+ * adopt sweeps it off -- which is exactly how an unrecognised mod should be
+ * handled and is the behaviour that predates the flag.
+ *
+ * Every consumer that used to test `feature.presentation_only` directly must
+ * go through here instead. Testing the flag alone is the bug this function
+ * exists to prevent: it would let any manifest exempt itself.
+ */
+bool feature_exempt(Runtime& runtime, const Package& package,
+                    const Feature& feature) {
+    if (!claim_admissible(runtime, package, feature)) return false;
+    return cosmetic_allowed(runtime, package);
 }
 
 std::string option_value(Runtime& runtime, const Package& package,
@@ -1635,6 +1875,40 @@ bool zip_store_tree(const fs::path& root, std::vector<uint8_t>& out,
     return true;
 }
 
+std::string hex32(const uint8_t digest[32]);
+
+/* See the forward declaration above cosmetic_allowed for why this is stable
+ * across machines. Memoised because a queue gate asks once per attempt and
+ * packing a tree is real work; the cache is keyed by id@version, so an
+ * install or a version change cannot be answered from a stale entry. */
+bool package_digest(Runtime& runtime, const std::string& package_id,
+                    const std::string& version, std::string& out) {
+    const std::string key = package_id + "@" + version;
+    const auto hit = runtime.digest_cache.find(key);
+    if (hit != runtime.digest_cache.end()) {
+        out = hit->second;
+        return !out.empty();
+    }
+    /* Cache the failure too, as an empty string: a package that cannot be
+     * packed will not start packing on the next call either, and a queue gate
+     * that retries every frame should not retry the walk every frame. */
+    runtime.digest_cache[key] = std::string();
+
+    const auto by_id = runtime.packages.find(package_id);
+    if (by_id == runtime.packages.end()) return false;
+    const auto by_ver = by_id->second.find(version);
+    if (by_ver == by_id->second.end()) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!zip_store_tree(by_ver->second.root, bytes, nullptr)) return false;
+
+    uint8_t digest[32];
+    sha256_compute(bytes.data(), bytes.size(), digest);
+    out = hex32(digest);
+    runtime.digest_cache[key] = out;
+    return true;
+}
+
 std::string hex32(const uint8_t digest[32]) {
     static const char* kHex = "0123456789abcdef";
     std::string s;
@@ -2289,6 +2563,17 @@ extern "C" int snes_mod_register_activation_plugin(
     if (prior != plugins.end() && prior->second.activation != callback)
         return 0;
     plugins[id].activation = callback;
+    /* Never clears an existing classification, and never sets one: a plugin
+     * is presentation-only because a build said so through the call below,
+     * and registering the ordinary way leaves it unclassified, which is the
+     * safe answer for every plugin that predates the distinction. */
+    return 1;
+}
+
+extern "C" int snes_mod_register_presentation_plugin(
+    const char* id, SNESModActivationCallback callback) {
+    if (!snes_mod_register_activation_plugin(id, callback)) return 0;
+    SNESRecomp::registered_plugins()[id].presentation = true;
     return 1;
 }
 
@@ -2419,6 +2704,12 @@ extern "C" int snes_mod_runtime_feature_option_value_c(
  *
  *   - only ENABLED features appear; a disabled feature and an absent package
  *     are the same thing to the simulation, and must hash alike
+ *   - only features that AFFECT THE SIMULATION appear. A feature whose
+ *     manifest declares presentation_only draws differently and simulates
+ *     identically, so including it would refuse a match over a difference
+ *     that cannot desync one -- and would make an accessibility filter
+ *     something a player has to negotiate with their opponent. See the flag's
+ *     definition for what may and may not claim it
  *   - packages, features and options are emitted in sorted order, which
  *     std::map gives us, so map iteration order cannot leak into the value
  *   - the package VERSION is included: the same mod at a different version can
@@ -2430,6 +2721,179 @@ extern "C" int snes_mod_runtime_feature_option_value_c(
  * Returns the number of bytes that WOULD be written, so a caller can detect
  * truncation rather than silently compare prefixes.
  */
+/*
+ * The cosmetic allowlist in force for this session.
+ *
+ * WHO SETS IT. Not this machine. It comes from whoever is authoritative for
+ * the match: the automatch ruleset the SERVER published, or -- in a lobby --
+ * the host's match caps. The local build's own opinion of which of its mods
+ * are harmless is exactly the opinion that cannot be trusted, because writing
+ * `presentation_only = true` in a manifest costs a cheat author nothing.
+ *
+ * Format: ';'-separated `id@version` or `id@version#sha256`. See
+ * cosmetic_allowed for the matching rules and for the honest limits of what
+ * pinning bytes does and does not prevent.
+ *
+ * NULL or "" REVOKES EVERY EXEMPTION, and that is the correct default rather
+ * than a degenerate case. An older host, a ruleset with no such key, a server
+ * that has never heard of cosmetic mods -- each of those means "no authority
+ * has granted anything here", and the answer to that has to be no. The cost
+ * is that a player's filter counts as an ordinary mod against such a host and
+ * has to match or be switched off; the cost of the other default is that any
+ * mod on earth exempts itself by saying so.
+ *
+ * Offline, nobody calls this, nothing is exempt, and it does not matter: the
+ * exemption only ever affects what netplay compares.
+ */
+extern "C" void snes_mod_runtime_set_cosmetic_allow_c(const char* allow) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    const std::string next = allow ? allow : "";
+    if (next == runtime.cosmetic_allow) return;
+    runtime.cosmetic_allow = next;
+    /* Say it, once per change. Which mods a match treated as cosmetic is the
+     * first thing anyone will want to know after an argument about one. */
+    std::fprintf(stderr, "mods: cosmetic allowlist = %s\n",
+                 next.empty() ? "(nothing exempt)" : next.c_str());
+}
+
+extern "C" int snes_mod_runtime_get_cosmetic_allow_c(char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    const std::string& text = runtime.cosmetic_allow;
+    if (out && cap) std::snprintf(out, cap, "%s", text.c_str());
+    return (int)text.size();
+}
+
+extern "C" int snes_mod_runtime_package_digest_c(const char* package_id,
+                                                 const char* version,
+                                                 char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string digest;
+    if (out && cap) out[0] = '\0';
+    if (!package_id || !runtime.initialized) return 0;
+
+    std::string ver = version ? version : "";
+    if (ver.empty()) {
+        const SNESRecomp::Package* package =
+            SNESRecomp::selected_package(runtime, package_id);
+        if (!package) return 0;
+        ver = package->version;
+    }
+    if (!SNESRecomp::package_digest(runtime, package_id, ver, digest))
+        return 0;
+    if (out && cap) {
+        if (cap < digest.size() + 1) return 0;
+        std::memcpy(out, digest.c_str(), digest.size() + 1);
+    }
+    return 1;
+}
+
+/*
+ * The enabled features that CLAIM the cosmetic exemption and have not been
+ * granted it, one `package@version/feature` per line.
+ *
+ * This is the queue gate's evidence. An automatch ticket asserts that no
+ * simulation-affecting mod is on beyond what the ruleset imposes, and an
+ * ungranted cosmetic claim has to count as simulation-affecting -- not
+ * because it necessarily is, but because nobody in a position to know has
+ * said otherwise. Reporting them individually is what lets the refusal name
+ * the mod instead of saying "turn off your mods".
+ *
+ * Returns the number of bytes that WOULD be written, so a caller can tell
+ * truncation from emptiness.
+ */
+/*
+ * The EVIDENCE for every exemption this build is taking, one
+ * `id@version#sha256` per package, for the server to check against its own
+ * allowlist.
+ *
+ * This exists because the automatch ticket used to carry a VERDICT -- a single
+ * `mods_enabled` boolean -- and a verdict is computed by the one machine with
+ * an interest in the answer. The server could not see what had been claimed,
+ * only whether this build had decided it was acceptable, so every rule about
+ * which mods are cosmetic ran on the client and could be changed by changing
+ * the client.
+ *
+ * Reporting the packages instead moves the DECISION to the server: it holds
+ * the allowlist, it matches these digests against it, and a package it has
+ * not approved is refused however this build classified it. A stale or
+ * patched client cannot widen its own exemptions, only misreport them -- and
+ * a misreport is now a specific false factual claim about named bytes rather
+ * than an invisible flip of a boolean.
+ *
+ * Only packages with at least one ACTUALLY exempted feature appear: the list
+ * is what is being relied on, not what might have been. Sorted (std::map
+ * iteration) so two machines in the same state produce identical text.
+ */
+extern "C" int snes_mod_runtime_exempted_packages_c(char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string text;
+    if (runtime.initialized) {
+        for (const auto& sel_entry : runtime.selections) {
+            const SNESRecomp::Package* package =
+                SNESRecomp::selected_package(runtime, sel_entry.first.c_str());
+            if (!package) continue;
+            bool any = false;
+            for (const SNESRecomp::Feature& feature : package->features) {
+                if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                if (SNESRecomp::feature_exempt(runtime, *package, feature)) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) continue;
+            std::string digest;
+            /* A digest we cannot compute is reported as empty rather than
+             * omitted. Dropping the row would hide an exemption from the very
+             * check this function exists to feed; an empty digest matches no
+             * pinned allowlist entry, so it fails closed at the server. */
+            SNESRecomp::package_digest(runtime, package->id, package->version,
+                                       digest);
+            text += package->id;
+            text += '@';
+            text += package->version;
+            text += '#';
+            text += digest;
+            text += '\n';
+        }
+    }
+    if (out && cap) std::snprintf(out, cap, "%s", text.c_str());
+    return (int)text.size();
+}
+
+extern "C" int snes_mod_runtime_unapproved_cosmetics_c(char* out,
+                                                       uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string text;
+    if (runtime.initialized) {
+        for (const auto& sel_entry : runtime.selections) {
+            const SNESRecomp::Package* package =
+                SNESRecomp::selected_package(runtime, sel_entry.first.c_str());
+            if (!package) continue;
+            for (const SNESRecomp::Feature& feature : package->features) {
+                if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                /* Admissible-but-ungranted only. An INADMISSIBLE claim is
+                 * already an ordinary simulation feature everywhere that
+                 * matters -- it is in the compared set, and the set comparison
+                 * refuses it with its own message. Listing it here too would
+                 * report the same mod twice under two different reasons. */
+                if (!SNESRecomp::claim_admissible(runtime, *package, feature))
+                    continue;
+                if (SNESRecomp::cosmetic_allowed(runtime, *package)) continue;
+                text += sel_entry.first;
+                text += '@';
+                text += sel_entry.second.version;
+                text += '/';
+                text += feature.id;
+                text += '\n';
+            }
+        }
+    }
+    if (out && cap) std::snprintf(out, cap, "%s", text.c_str());
+    return (int)text.size();
+}
+
 extern "C" int snes_mod_runtime_effective_set_c(char* out, uint32_t cap) {
     SNESRecomp::Runtime& runtime = SNESRecomp::state();
     std::string text;
@@ -2443,6 +2907,8 @@ extern "C" int snes_mod_runtime_effective_set_c(char* out, uint32_t cap) {
                 continue;
             for (const SNESRecomp::Feature& feature : package->features) {
                 if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                if (SNESRecomp::feature_exempt(runtime, *package, feature))
                     continue;
                 text += package_id;
                 text += '@';
@@ -2731,6 +3197,16 @@ extern "C" int snes_mod_runtime_plan_rows_c(SnesModPkgRow* out, int max) {
         for (const SNESRecomp::Feature& feature : package->features) {
             if (!SNESRecomp::feature_enabled(runtime, *package, feature))
                 continue;
+            /* Presentation-only features are not part of the plan, for the
+             * same reason they are not part of the effective set: this row is
+             * what the lobby server matches a joiner's offer against, so a row
+             * here tells a joiner to go and install something. A filter that
+             * changes only what THIS machine draws is not something to send
+             * anyone shopping for -- and refusing a joiner who lacks it would
+             * reintroduce, at the package grain, exactly the barrier the flag
+             * exists to remove at the feature grain. */
+            if (SNESRecomp::feature_exempt(runtime, *package, feature))
+                continue;
             if (!feats.empty()) feats += ',';
             feats += feature.id;
         }
@@ -2904,14 +3380,26 @@ extern "C" int snes_mod_runtime_adopt_set_c(const char* want, char* reason,
     }
 
     SNESRecomp::Runtime& runtime = SNESRecomp::state();
-    /* Disable everything first: the host's set is the whole truth. */
+    /* Disable everything first: the host's set is the whole truth.
+     *
+     * Everything the host's set can SPEAK for, that is. A presentation_only
+     * feature is deliberately absent from that set, so sweeping it off here
+     * and waiting for the set to turn it back on would switch it off for good
+     * the moment its owner joined a lobby -- and the first such feature is a
+     * photosensitivity filter, which failing silently and invisibly at the
+     * exact moment a player enters a match is the worst way it could fail.
+     * The host is authoritative over the simulation, not over what this
+     * machine's owner needs to look at. */
     for (auto& sel : runtime.selections) {
         const SNESRecomp::Package* package =
             SNESRecomp::selected_package(runtime, sel.first.c_str());
         if (!package) continue;
-        for (const SNESRecomp::Feature& feature : package->features)
+        for (const SNESRecomp::Feature& feature : package->features) {
+            if (SNESRecomp::feature_exempt(runtime, *package, feature))
+                continue;
             SNESRecomp::provider_feature_enable(nullptr, sel.first.c_str(),
                                     feature.id.c_str(), 0);
+        }
     }
 
     std::istringstream in{std::string(want)};

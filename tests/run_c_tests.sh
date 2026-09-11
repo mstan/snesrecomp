@@ -306,6 +306,22 @@ echo "=== lobby mod plan (match_caps.mods wire shape) ==="
     -o "$OUT/lobby_mod_plan_test"
 "$OUT/lobby_mod_plan_test"
 
+echo "=== mod runtime: presentation_only is not compared by netplay ==="
+# C++ because mod_runtime is C++, and it is compiled here rather than mocked so
+# the real manifest parser, the real effective-set text and the real adopt
+# sweep are what the cases run against. The fixture catalog is written into
+# $OUT by the test itself, so this stays ROM-free and leaves nothing in the
+# source tree.
+"${CXX:-g++}" -std=c++17 -Wall -Wextra -O1 \
+    -I "$ROOT/runner/src" \
+    -x c++ "$ROOT/tests/netplay/mod_presentation_only_test.c" \
+    "$ROOT/runner/src/mod_runtime.cpp" \
+    "$ROOT/runner/src/crc32.c" \
+    "$ROOT/runner/src/sha256.c" \
+    -o "$OUT/mod_presentation_only_test"
+rm -rf "$OUT/mod_presentation_only_fixture"
+"$OUT/mod_presentation_only_test" "$OUT/mod_presentation_only_fixture"
+
 echo "=== host OSD (FPS readout / turbo / toasts) ==="
 # Needs SDL for its clock only (no window; SDL_INIT_TIMER). Skipped rather than
 # failed where SDL headers are absent, so this stays a ROM-free harness that

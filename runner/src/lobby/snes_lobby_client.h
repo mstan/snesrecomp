@@ -207,6 +207,23 @@ typedef struct SnesLobbyMatchCaps {
      * Carried so a guest can match the host BEFORE launching rather than
      * discovering the difference from a refused match. */
     char mod_set[512];
+    /* Which packages this match's AUTHORITY grants the presentation-only
+     * exemption to: ';'-separated `id@version` or `id@version#sha256`.
+     *
+     * A mod declaring `presentation_only` in its own manifest is only asking.
+     * This is the grant, and it comes from the server (in an automatch
+     * ruleset) or from the host (in a lobby) -- never from the machine that
+     * wants the exemption, because a cheat author writes manifests too.
+     *
+     * EMPTY MEANS NOTHING IS EXEMPT, which is what an older host and a
+     * ruleset without the key both produce, and is the answer that fails
+     * safe: an ungranted claim is treated as an ordinary simulation mod, so
+     * it must match or be switched off.
+     *
+     * Names bytes, not just a string, when the `#sha256` form is used --
+     * otherwise the list is keyed on an id the client picks for itself, and a
+     * mod gets exempted by calling itself something allowlisted. */
+    char mod_cosmetic_allow[512];
 } SnesLobbyMatchCaps;
 
 typedef struct SnesLobbyJoinInfo {
@@ -597,6 +614,25 @@ typedef struct SnesLobbyAutomatchFound {
 
 /* Ask the server what queues it offers for this title. Answered into
  * snes_lobby_ruleset_count/get; 0 of them means automatch is off here. */
+/*
+ * One simulation-state fork, as reported to the server.
+ *
+ * Evidence, not a verdict: both digests, from both peers independently. See
+ * snes_lobby_report_desync for why a fork is never an accusation on its own.
+ */
+typedef struct SnesLobbyDesyncReport {
+    uint32_t tick;
+    const char *partition;   /* "wram", "apu", "ppu", "post", "other" */
+    uint32_t mine;           /* local master digest */
+    uint32_t theirs;         /* the peer's, as received */
+    int is_host;
+    /* The cosmetic exemptions this peer was running, so a report can be read
+     * beside what the match approved. ';'-separated `id@version#sha256`. */
+    const char *mod_exempt;
+} SnesLobbyDesyncReport;
+
+int  snes_lobby_report_desync(const SnesLobbyDesyncReport *r);
+
 int  snes_lobby_automatch_request_rulesets(void);
 int  snes_lobby_automatch_available(void);
 int  snes_lobby_automatch_ruleset_count(void);
@@ -616,7 +652,19 @@ int  snes_lobby_automatch_ruleset_get(int index, SnesLobbyRuleset *out);
  * A server refusal arrives asynchronously as state FAILED with a reason in
  * snes_lobby_automatch_error().
  */
-int  snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled);
+/*
+ * `mod_exempt` is the EVIDENCE for every cosmetic exemption this build is
+ * taking: ';'-separated `id@version#sha256`, from
+ * snes_mod_runtime_exempted_packages_c. NULL or "" means none.
+ *
+ * It is sent so the SERVER can check those exemptions against its own
+ * allowlist. `mods_enabled` beside it is still this client's own verdict and
+ * still refused when true -- the two are layers, not alternatives: an old
+ * server ignores the evidence and the boolean keeps working, a new server
+ * checks the evidence and stops trusting the boolean to be the whole story.
+ */
+int  snes_lobby_automatch_queue(const char *ruleset_id, int mods_enabled,
+                                const char *mod_exempt);
 int  snes_lobby_automatch_cancel(void);
 int  snes_lobby_automatch_state(void);
 int  snes_lobby_automatch_queued_secs(void);

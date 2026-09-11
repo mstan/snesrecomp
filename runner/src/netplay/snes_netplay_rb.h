@@ -135,6 +135,16 @@ const char *snes_netplay_rb_stall_tag(void);
  * and tick. Partition naming comes from snes_state_digest_part_name. */
 int  snes_netplay_rb_last_fork(uint32_t *tick, const char **partition);
 
+/* The two master digests that disagreed at that fork: ours and the peer's.
+ * 0 if no fork has happened.
+ *
+ * Both numbers, always. A fork means the two peers differ; which of them
+ * MOVED is not knowable from one side, and is only ever answerable by putting
+ * many matches against many opponents side by side. Anything that reports one
+ * peer's conclusion instead of both peers' evidence is repeating the mistake
+ * the automatch ticket made when it sent a verdict instead of its inputs. */
+int  snes_netplay_rb_fork_digests(uint32_t *mine, uint32_t *theirs);
+
 #ifdef __cplusplus
 }
 #endif
