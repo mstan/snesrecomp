@@ -63,6 +63,10 @@ typedef struct SnesLobbyOnlinePlayer {
     /* First 8 characters of the player's connection id: enough to tell
      * "which row is me" without publishing whole ids to browsers. */
     char tag[12];
+    /* Opaque account id behind this player; "" for a guest. Not a name and
+     * not a Discord identifier -- a key a local ignore/block list can use
+     * because it survives the player reconnecting and renaming. */
+    char account[SNES_LOBBY_ID_LEN];
     /* The title that player is browsing for; rows of other titles are
      * dropped at parse time when this client has a game identity. */
     char game_name[SNES_LOBBY_NAME_LEN];
@@ -79,6 +83,10 @@ typedef struct SnesLobbyOnlinePlayer {
 #define SNES_LOBBY_CHAT_RING 64
 typedef struct SnesLobbyChatMsg {
     char     player_id[SNES_LOBBY_ID_LEN];
+    /* Opaque account id behind this player; "" for a guest. Not a name and
+     * not a Discord identifier -- a key a local ignore/block list can use
+     * because it survives the player reconnecting and renaming. */
+    char     account[SNES_LOBBY_ID_LEN];
     char     from[SNES_LOBBY_NAME_LEN];
     char     text[SNES_LOBBY_CHAT_TEXT_LEN];
     int      is_local;

@@ -1102,6 +1102,10 @@ static int cb_online_get(void *ctx, int index, RecompLauncherCNetplayOnlinePlaye
     return 0;
   memset(out, 0, sizeof(*out));
   snprintf(out->display_name, sizeof(out->display_name), "%s", p.display_name);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
+  /* The key a local ignore/block list uses. Empty for a guest. */
+  snprintf(out->account, sizeof(out->account), "%s", p.account);
+#endif
   snprintf(out->country, sizeof(out->country), "%s", p.country);
   snprintf(out->lobby_name, sizeof(out->lobby_name), "%s", p.lobby_name);
   out->in_lobby = p.lobby_id[0] != '\0';
@@ -1501,6 +1505,9 @@ static int cb_chat_get(void *ctx, int index,
     return 0;
   }
   snprintf(out->from, sizeof(out->from), "%s", msg.from);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
+  snprintf(out->account, sizeof(out->account), "%s", msg.account);
+#endif
   snprintf(out->text, sizeof(out->text), "%s", msg.text);
   out->is_local = msg.is_local;
   out->is_system = msg.is_system;
@@ -1750,6 +1757,9 @@ static int cb_server_chat_get(void *ctx, int index,
     return 0;
   memset(out, 0, sizeof(*out));
   snprintf(out->from, sizeof(out->from), "%s", msg.from);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
+  snprintf(out->account, sizeof(out->account), "%s", msg.account);
+#endif
   snprintf(out->text, sizeof(out->text), "%s", msg.text);
   out->is_local = msg.is_local;
   out->is_system = msg.is_system;
