@@ -985,6 +985,14 @@ static void cb_request_list(void *ctx)
  * launcher that never calls the setter. */
 static int g_list_scope;
 
+#if defined(RECOMP_LAUNCHER_HAS_SET_BLOCKS)
+static int cb_set_blocks(void *ctx, const char *accounts)
+{
+  (void)ctx;
+  return snes_lobby_set_blocks(accounts);
+}
+#endif
+
 #if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
 static int cb_chat_report(void *ctx, const char *const *mids, int mid_count,
                           const char *reason, const char *note)
@@ -2768,6 +2776,9 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     .account_error = cb_account_error,
     .account_sign_out = cb_account_sign_out,
     .account_set_handle = cb_account_set_handle,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_SET_BLOCKS)
+    .set_blocks = cb_set_blocks,
 #endif
 #if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
     .chat_report = cb_chat_report,

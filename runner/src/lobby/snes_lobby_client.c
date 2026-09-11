@@ -103,6 +103,7 @@ void snes_lobby_set_disc_fp(const char *hex) { (void)hex; }
 const char *snes_lobby_disc_fp(void) { return ""; }
 /* Automatch: absent without a lobby, and IDLE is the resting state that
  * means exactly that -- a build that never queues sits in it forever. */
+int  snes_lobby_set_blocks(const char *a) { (void)a; return -1; }
 int  snes_lobby_automatch_request_rulesets(void) { return -1; }
 int  snes_lobby_automatch_available(void) { return 0; }
 int  snes_lobby_automatch_ruleset_count(void) { return 0; }
@@ -480,6 +481,7 @@ static void automatch_fail(const char *why)
 static int set_nonblock(int fd);   /* defined with the WS socket helpers */
 static const char *effective_game_version(const char *override_ver);
 static void queue_send(const char *json);
+static void flush_pending(void);
 static const char *json_get_str(const char *json, const char *key, char *out, size_t cap);
 static int json_get_int(const char *json, const char *key, int def);
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
@@ -697,6 +699,42 @@ static void automatch_send_rtt(void)
              "{\"op\":\"automatch_rtt\",\"rtt_ms\":%d}", g_am.rtt_ms);
     queue_send(msg);
     g_am.rtt_reported = 1;
+}
+
+int snes_lobby_set_blocks(const char *accounts)
+{
+    /* Room for the server's cap (256 ids) at 40 characters each, plus the
+     * separators and the envelope. A list that would not fit is truncated at
+     * a separator rather than sent malformed -- a half-written id at the end
+     * would name nobody, and a malformed op would leave the server enforcing
+     * nothing at all. */
+    static char msg[256 * 41 + 64];
+    char list[256 * 41];
+    size_t n = 0;
+    int first = 1;
+    const char *p = accounts ? accounts : "";
+
+    if (!g_lc.connected) return -1;
+    list[0] = '\0';
+    while (*p) {
+        const char *sep = strchr(p, ';');
+        size_t len = sep ? (size_t)(sep - p) : strlen(p);
+        if (len && len < 40 && n + len + 8 < sizeof(list)) {
+            if (!first) { list[n++] = ','; }
+            list[n++] = '"';
+            memcpy(list + n, p, len);
+            n += len;
+            list[n++] = '"';
+            list[n] = '\0';
+            first = 0;
+        }
+        if (!sep) break;
+        p = sep + 1;
+    }
+    snprintf(msg, sizeof(msg), "{\"op\":\"set_blocks\",\"accounts\":[%s]}", list);
+    queue_send(msg);
+    flush_pending();
+    return 0;
 }
 
 int snes_lobby_automatch_request_rulesets(void)
