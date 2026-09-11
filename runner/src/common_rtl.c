@@ -1,4 +1,5 @@
 #include "common_rtl.h"
+#include "apu_frame_clock.h"
 #include "common_cpu_infra.h"
 #include <setjmp.h>
 #include <time.h>
@@ -181,13 +182,26 @@ uint64_t g_apu_last_sync_master = 0;
  * 357368 SNES master cycles and 17088 SPC cycles in this runtime's 60 Hz
  * model. g_cpu.master_cycles supplies only the within-frame position because
  * its total per frame varies with recompilation coverage. */
-#define RTL_MASTER_CYCLES_PER_FRAME 357368ull
-#define RTL_APU_CYCLES_PER_FRAME     17088ull
 static uint64_t g_apu_frame_start_master;
+static RtlApuFrameClock g_apu_frame_clock;
+static bool g_extended_frame_timing;
 static bool g_apu_frame_time_valid;
 
 bool rtl_apu_frame_timeline_active(void) {
   return g_apu_frame_time_valid;
+}
+
+double RtlLastFramePeriods(void) {
+  return g_extended_frame_timing && g_apu_frame_clock.last_duration
+      ? (double)g_apu_frame_clock.last_duration / RTL_APU_CYCLES_PER_FRAME : 1.0;
+}
+
+void RtlEnableExtendedFrameTiming(void) {
+  g_extended_frame_timing = true;
+}
+
+bool rtl_apu_extended_frame_timing(void) {
+  return g_extended_frame_timing;
 }
 
 void rtl_apu_snapshot_pacing(uint64_t *frame_start_master, uint8_t *frame_time_valid) {
@@ -215,6 +229,8 @@ static int16 g_audio_last_output_r;
 static void rtl_sync_apu_frame_boundary(void);
 
 static uint64_t rtl_apu_guest_cycle(void) {
+  if (g_extended_frame_timing)
+    return rtl_apu_clock_now(&g_apu_frame_clock, g_cpu.master_cycles);
   uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
   if (within >= RTL_MASTER_CYCLES_PER_FRAME)
     within = RTL_MASTER_CYCLES_PER_FRAME - 1;
@@ -310,6 +326,7 @@ static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 void RtlReset(int mode) {
   snes_frame_counter = 0;
   g_apu_frame_time_valid = false;
+  g_apu_frame_clock = (RtlApuFrameClock){0};
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_main_cpu_cycles_estimate = 0;
   g_apu_pace_cycles_estimate = 0;
@@ -532,6 +549,7 @@ bool RtlRunFrame(uint32 inputs) {
    * duration. */
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_apu_frame_time_valid = true;
+  rtl_apu_clock_begin(&g_apu_frame_clock, g_cpu.master_cycles);
   WatchdogFrameStart();
   // Watchdog guard: WatchdogCheck() (called per-block in v2 gen) longjmps
   // here when a frame exceeds 5s, so an infinite loop in recompiled code
@@ -1461,8 +1479,9 @@ static void rtl_sync_apu_frame_boundary(void) {
   /* RtlRunFrame has already incremented snes_frame_counter. This is the exact
    * boundary after the completed frame; adding its stale within-frame master
    * offset here would count the frame body twice. */
-  uint64_t boundary = (uint64_t)snes_frame_counter *
-                      RTL_APU_CYCLES_PER_FRAME;
+  uint64_t boundary = g_extended_frame_timing
+      ? rtl_apu_clock_finish(&g_apu_frame_clock, g_cpu.master_cycles)
+      : (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME;
   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
                                     1u << 20);
   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
@@ -1688,7 +1707,7 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
      * cutting, then hold silence. */
     s_render_starved = 1;
     s_render_fade_pos = 0;
-    audio_trace_on_output_underflow(available);
+    audio_trace_on_output_underflow(available, (uint32_t)(frames - usable));
     int fade = frames - usable;
     if (fade > RTL_AUDIO_FADE_FRAMES) fade = RTL_AUDIO_FADE_FRAMES;
     for (int i = 0; i < fade; i++) {

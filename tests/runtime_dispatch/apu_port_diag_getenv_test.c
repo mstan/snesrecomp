@@ -42,6 +42,7 @@ char *__wrap_getenv(const char *name) {
 
 const char *rtl_game_title(void) { return "apu_port_diag_getenv_test"; }
 bool rtl_apu_frame_timeline_active(void) { return false; }
+bool rtl_apu_extended_frame_timing(void) { return false; }
 bool sa1_cpu_irq_pending(const Sa1 *sa1) { (void)sa1; return false; }
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}

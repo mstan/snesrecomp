@@ -9,6 +9,7 @@
 #include "interp816.h"
 #include "tier2_capture.h"
 #include "snes.h"   /* Snes, apuCatchupCycles, snes_catchupApu */
+#include "apu.h"
 #include "superfx.h"
 #include "cx4.h"
 #include "sa1.h"
@@ -79,7 +80,9 @@ static void bridge_apu_flush(CpuState *cpu) {
 #endif
     if (interp_bridge_use_absolute_apu_timeline(
             rtl_apu_frame_timeline_active(),
-            g_snes && cart_has_sa1(g_snes->cart))) {
+            g_snes && cart_has_sa1(g_snes->cart),
+            rtl_apu_extended_frame_timing() &&
+            g_snes && g_snes->apu && g_snes->apu->portTimeValid)) {
         /* Skip snes_catchupApu (legacy relative catch-up) to avoid
          * double-counting with the absolute guest-clock sync below.
          * But we MUST still call rtl_sync_apu_to_cpu_locked() to advance
@@ -1721,9 +1724,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             {
                 /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
                  * convert on APU-port access / ~4096 master / exits. */
-                if (!interp_bridge_use_absolute_apu_timeline(
+                if (rtl_apu_extended_frame_timing() ||
+                    !interp_bridge_use_absolute_apu_timeline(
                         rtl_apu_frame_timeline_active(),
-                        g_snes && cart_has_sa1(g_snes->cart))) {
+                        g_snes && cart_has_sa1(g_snes->cart), false)) {
                     s_apu_pending_master += _master;
                     if (s_apu_pending_master >= bridge_bounce_flush_thresh()) bridge_apu_flush(cpu);
                 }

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "apu.h"
+#include "apu_frame_clock.h"
 #include "dsp_shadow.h"
 
 uint64_t g_apu_timer0_total_ticks;
@@ -197,6 +198,43 @@ int main(void) {
                     apu->dsp->sampleRead == 355 &&
                     apu->dsp->sampleWrite == 419,
                     "fast-forward recovery retains only the requested newest PCM");
+
+  /* Long interpreted work advances the real SPC along one absolute clock;
+   * short frames afterward must produce PCM immediately, not wait 40 frames
+   * for a host frame counter to catch up. No ROM or wall-clock timing needed. */
+  apu_clearPortQueue(apu);
+  RtlApuFrameClock clock = {0};
+  rtl_apu_clock_begin(&clock, 0);
+  failures += check(apu_schedulePortWrite(apu, 0, 0, 0), "map extended clock");
+  uint64_t before_long = apu->portClock;
+  for (unsigned quarter = 1; quarter <= 160; ++quarter) {
+    uint64_t master = quarter * RTL_MASTER_CYCLES_PER_FRAME / 4;
+    failures += check(apu_runToGuestCycle(apu, rtl_apu_clock_now(&clock, master),
+                                          1u << 20), "progress inside long loader");
+    apu->dsp->sampleRead = apu->dsp->sampleWrite;
+  }
+  uint64_t master_end = 40 * RTL_MASTER_CYCLES_PER_FRAME;
+  uint64_t end = rtl_apu_clock_finish(&clock, master_end);
+  failures += check(clock.last_duration == 40 * RTL_APU_CYCLES_PER_FRAME &&
+                    apu->portClock - before_long == clock.last_duration,
+                    "long loader clocks the SPC once for all elapsed time");
+  failures += check(rtl_apu_clock_now(&clock, master_end) == end,
+                    "finishing must not add the stale within-frame offset again");
+  for (unsigned frame = 0; frame < 45; ++frame) {
+    rtl_apu_clock_begin(&clock, master_end);
+    failures += check(rtl_apu_clock_now(&clock, master_end) == end,
+                      "next iteration starts at the completed guest timestamp");
+    uint32_t samples_before = apu->dsp->sampleWrite;
+    master_end += 100;  /* Mostly WAI. */
+    end = rtl_apu_clock_finish(&clock, master_end);
+    failures += check(apu_runToGuestCycle(apu, end, 1u << 20) &&
+                      apu->dsp->sampleWrite - samples_before == 534,
+                      "every following short frame produces its normal PCM");
+    apu->dsp->sampleRead = apu->dsp->sampleWrite;
+  }
+  rtl_apu_clock_begin(&clock, master_end);
+  failures += check(rtl_apu_clock_now(&clock, 0) == clock.start_guest,
+                    "CPU reset cannot underflow the within-frame timestamp");
 
 #if !SNESRECOMP_SPC_DIAGNOSTICS
   failures += check(g_spc_pc_histogram[0] == 0 &&
