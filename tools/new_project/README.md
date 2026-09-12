@@ -91,6 +91,20 @@ packager).
 └── snesrecomp/             framework submodule (owns lib/recomp-net, lib/retcomm-rbengine)
 ```
 
+## Which framework the scaffold is cut from
+
+The project pins `snesrecomp` as a submodule at the ref you name
+(`--snesrecomp-ref`, default `main`), and every templated file is rendered
+from THAT checkout's `tools/new_project/templates`, not from the copy of this
+wizard that happens to be running. The two are the same only when you run the
+wizard out of the checkout that becomes the submodule; Studio runs it from a
+sibling checkout or its vendored copy, and a stale one there once rendered a
+host that predated the framework it pinned: a project that built and did not
+boot. The recomp-ui ref comes from the pinned framework's `RECOMP_UI_REF` the
+same way. A wizard older than the framework it pins fails at the render with
+the missing token named, rather than producing a project that is quietly
+wrong.
+
 ## Pieces
 
 | File | Role |

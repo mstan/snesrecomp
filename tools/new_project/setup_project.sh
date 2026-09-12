@@ -188,7 +188,7 @@ while [ $# -gt 0 ]; do
         --no-github) CREATE_GITHUB=0; SET_GITHUB=1; shift ;;
         --github-visibility) GITHUB_VISIBILITY=$2; shift 2 ;;
         --snesrecomp-ref) SNESRECOMP_REF=$2; shift 2 ;;
-        --recomp-ui-ref) RECOMP_UI_REF=$2; shift 2 ;;
+        --recomp-ui-ref) RECOMP_UI_REF=$2; SET_RECOMP_UI_REF=1; shift 2 ;;
         --recomp-net-ref) RECOMP_NET_REF=$2; shift 2 ;;
         --rbengine-ref) RBENGINE_REF=$2; shift 2 ;;
         --snesrecomp-url) SNESRECOMP_URL=$2; shift 2 ;;
@@ -625,21 +625,31 @@ fill() {
         --set "GITHUB_REPO=$GITHUB_REPO"
 }
 
-fill CMakeLists.txt.in   CMakeLists.txt
-fill VERSION.in          VERSION
-fill gitignore.in        .gitignore
-fill README.md.in        README.md
-fill main.c.in           src/main.c
-fill game_rtl.c.in       src/game_rtl.c
-fill game_rtl.h.in       src/game_rtl.h
-fill gen_stubs.c.in      src/gen_stubs.c
-fill variables.h.in      src/variables.h
-fill host_contract.c.in  src/host_contract.c
-fill rom_identity.txt.in rom_identity.txt
-fill regen.sh.in         tools/regen.sh
-fill package_release.sh.in scripts/package_release.sh
-fill symbols_readme.md.in  recomp/README.md
-chmod +x tools/regen.sh scripts/package_release.sh
+# Every templated file, in one place, so it can be rendered twice: once now
+# from the copy of the wizard that is running, and again below from the
+# framework the project actually pins (see "Rendering from the pinned
+# framework").
+render_templates() {
+    fill CMakeLists.txt.in   CMakeLists.txt
+    fill VERSION.in          VERSION
+    fill gitignore.in        .gitignore
+    fill README.md.in        README.md
+    fill main.c.in           src/main.c
+    fill game_rtl.c.in       src/game_rtl.c
+    fill game_rtl.h.in       src/game_rtl.h
+    fill gen_stubs.c.in      src/gen_stubs.c
+    fill variables.h.in      src/variables.h
+    fill host_contract.c.in  src/host_contract.c
+    fill rom_identity.txt.in rom_identity.txt
+    fill regen.sh.in         tools/regen.sh
+    fill package_release.sh.in scripts/package_release.sh
+    fill symbols_readme.md.in  recomp/README.md
+    chmod +x tools/regen.sh scripts/package_release.sh
+    if [ "$ENABLE_CI" -eq 1 ]; then
+        fill release.yml.in .github/workflows/release.yml
+    fi
+}
+render_templates
 
 # Empty mod catalog. CMakeLists.txt declares it to the framework
 # (snesrecomp_target_mod_catalog), which stages packages/ beside the executable
@@ -696,10 +706,6 @@ if [ "$FETCH_BOXART" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     fi
 fi
 
-if [ "$ENABLE_CI" -eq 1 ]; then
-    echo "== CI workflow =="
-    fill release.yml.in .github/workflows/release.yml
-fi
 
 # ── Submodules ────────────────────────────────────────────────────────────
 FRAMEWORK_GAPS=""
@@ -722,10 +728,49 @@ if [ "$FRAMEWORK_REF_UNPUSHED" -eq 1 ]; then
     # snapped straight back to the commit `submodule add` recorded.
     git add snesrecomp
 fi
+# The recomp-ui ref, like the templates below, is the PINNED framework's
+# call (its lobby client compiles against recomp-ui's API), not this copy of
+# the wizard's -- unless --recomp-ui-ref said otherwise.
+if [ -z "${SET_RECOMP_UI_REF:-}" ] && [ -f snesrecomp/tools/new_project/RECOMP_UI_REF ]; then
+    _pinned_ui_ref=$(sed -n '1{s/[[:space:]]*$//;p}' snesrecomp/tools/new_project/RECOMP_UI_REF)
+    if [ -n "$_pinned_ui_ref" ] && [ "$_pinned_ui_ref" != "$RECOMP_UI_REF" ]; then
+        echo "== recomp-ui ref from the pinned framework: $_pinned_ui_ref (this wizard said $RECOMP_UI_REF) =="
+        RECOMP_UI_REF=$_pinned_ui_ref
+    fi
+fi
 if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     git submodule add -q -b "$RECOMP_UI_REF" "$RECOMP_UI_URL" recomp-ui
 fi
 git submodule update --init --recursive
+
+# Render from the framework the project PINS, not from the copy of this wizard
+# that happens to be running. They are the same files only when this script
+# runs out of the checkout that becomes the submodule; Studio runs it from a
+# sibling checkout or its vendored copy, and a stale one there rendered a
+# host that predated the framework it pinned -- a scaffold that built, then
+# "did not boot", with nothing in it saying why. The pinned framework's
+# templates and its fill_tokens.py are authoritative for the code they
+# generate; a newer framework that needs a token this wizard does not know
+# fails loudly here rather than producing a project that is quietly wrong.
+if [ -f "$ROOT/snesrecomp/tools/new_project/templates/main.c.in" ]; then
+    _pinned_wizard="$ROOT/snesrecomp/tools/new_project"
+    if [ "$(cd "$_pinned_wizard" && pwd)" != "$SCRIPT_DIR" ]; then
+        echo "== Rendering from the pinned framework ($(git -C snesrecomp rev-parse --short HEAD)) =="
+        if ! diff -rq "$TEMPLATE_DIR" "$_pinned_wizard/templates" >/dev/null 2>&1; then
+            echo "   (this wizard's own templates differ from the pinned framework's;"
+            echo "    the pinned ones win -- they match the runtime the project builds)"
+        fi
+        TEMPLATE_DIR="$_pinned_wizard/templates"
+        FILL_TOKENS="$_pinned_wizard/fill_tokens.py"
+        if ! render_templates; then
+            echo "setup_project: the pinned framework's templates could not be" >&2
+            echo "  rendered by this copy of the wizard (it is older than the" >&2
+            echo "  framework). Run snesrecomp/tools/new_project/setup_project.sh" >&2
+            echo "  from a checkout of the ref you are pinning instead." >&2
+            exit 1
+        fi
+    fi
+fi
 
 # Nested modules live inside snesrecomp: recomp-net owns the wire and the
 # episode FSM, retcomm-rbengine the rollback host policy. The gitlink SHA the
