@@ -141,6 +141,8 @@ static void OpenOneGamepad(int i);
 static void OpenOneJoystick(int i);
 static uint32 GetActiveControllers(void);
 static void HandleVolumeAdjustment(int volume_adjustment);
+static void ApplyVolume(void);
+static bool g_volume_changed;
 static void HandleGamepadAxisInput(GamepadInfo *gi, int axis, Sint16 value);
 static int RemapSdlButton(int button);
 static void HandleGamepadInput(GamepadInfo *gi, int button, bool pressed);
@@ -894,6 +896,13 @@ static void ComposeOsd(uint8 *dst, int pitch, int dst_w, int dst_h, int scale_di
   if (snes_osd_image(&px, &w, &h) && px && w > 0 && h > 0)
     snes_ovl_blit_panel_rect(dst, pitch, dst_w, dst_h, px, w, h,
                              4 / scale_div, 4 / scale_div, w / scale_div, h / scale_div);
+  /* The volume bar sits at the right edge, vertically centred, while the
+   * volume was just changed. */
+  if (snes_osd_volume_image(&px, &w, &h) && px && w > 0 && h > 0) {
+    const int bw = w / scale_div, bh = h / scale_div;
+    snes_ovl_blit_panel_rect(dst, pitch, dst_w, dst_h, px, w, h,
+                             dst_w - bw - 4 / scale_div, (dst_h - bh) / 2, bw, bh);
+  }
   snes_osd_present_done();
 }
 
@@ -2059,6 +2068,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     }
   }
   if (game->after_config) game->after_config();
+  ApplyVolume();
   host_report_breadcrumb(
       "config parsed: output=%d new_renderer=%d scale=%d fullscreen=%d "
       "audio=%d freq=%d samples=%d",
@@ -2137,7 +2147,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         ls.linear_filter = g_config.linear_filtering;
         ls.enable_audio  = g_config.enable_audio;
         ls.audio_freq    = g_config.audio_freq;
-        ls.volume        = 100;
+        ls.volume        = g_config.volume;
         ls.player_src[0] = g_config.enable_gamepad[0] ? 2 : 1;
         ls.player_src[1] = g_config.enable_gamepad[1] ? 2 : 0;
         /* Config stores deadzone as a raw stick radius; the launcher edits a
@@ -2243,6 +2253,8 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
           g_config.linear_filtering    = ls.linear_filter != 0;
           g_config.enable_audio        = true;   /* always on */
           g_config.audio_freq          = (uint16)ls.audio_freq;
+          g_config.volume              = ls.volume;
+          ApplyVolume();
           g_config.enable_gamepad[0]   = ls.player_src[0] == 2;
           g_config.enable_gamepad[1]   = ls.player_src[1] == 2;
           g_config.gamepad_deadzone    = ls.deadzone[0] * 32767 / 100;
@@ -2725,6 +2737,17 @@ error_reading:;
     if (!running)
       break;
     OverlaySelftestPadMainTick(frameCtr);
+    /* SNESRECOMP_VOLUME_DEMO=<frame>: press VolumeDown once at that frame, so
+     * a headless screenshot can show the bar. */
+    {
+      static long demo = -2;
+      static unsigned done_at;
+      if (demo == -2) { const char *v = HostGetenv("VOLUME_DEMO"); demo = v ? strtol(v, NULL, 0) : -1; }
+      if (demo >= 0 && (long)frameCtr == demo && done_at != frameCtr) {
+        done_at = frameCtr;
+        HandleVolumeAdjustment(-1);
+      }
+    }
 
     ProfileEnd(kProfileEvents, event_profile_start);
     if (g_paused != audiopaused) {
@@ -3082,6 +3105,9 @@ error_reading:;
 
   if (g_config.autosave)
     HandleCommand(kKeys_Save + 0, true);
+  /* A volume set with the keys survives the session, like the launcher's. */
+  if (g_volume_changed)
+    WriteConfigFile(g_active_config_file);
 
   RtlWriteSram();
   snes_rewind_shutdown();
@@ -3323,16 +3349,22 @@ static void HandleGamepadInput(GamepadInfo *gi, int button, bool pressed) {
     SetPadButtonOrFallthrough(gi->last_cmd[button], pressed);
 }
 
-static void HandleVolumeAdjustment(int volume_adjustment) {
+/* [Sound] Volume (0..100) -> the mixer. The launcher's slider, the keys and
+ * config.ini all speak percent; only the mixer sees 0..128. */
+static void ApplyVolume(void) {
+  int v = g_config.volume < 0 ? 0 : g_config.volume > 100 ? 100 : g_config.volume;
+  g_config.volume = v;
 #if SYSTEM_VOLUME_MIXER_AVAILABLE
-  int current_volume = GetApplicationVolume();
-  int new_volume = IntMin(IntMax(0, current_volume + volume_adjustment * 5), 100);
-  SetApplicationVolume(new_volume);
-  printf("[System Volume]=%i\n", new_volume);
-#else
-  g_sdl_audio_mixer_volume = IntMin(IntMax(0, g_sdl_audio_mixer_volume + volume_adjustment * (SNESRECOMP_SDL_MIX_MAXVOLUME >> 4)), SNESRECOMP_SDL_MIX_MAXVOLUME);
-  printf("[SDL mixer volume]=%i\n", g_sdl_audio_mixer_volume);
+  SetApplicationVolume(v);
 #endif
+  g_sdl_audio_mixer_volume = (v * SNESRECOMP_SDL_MIX_MAXVOLUME + 50) / 100;
+}
+static void HandleVolumeAdjustment(int volume_adjustment) {
+  g_config.volume = IntMin(IntMax(0, g_config.volume + volume_adjustment * 5), 100);
+  ApplyVolume();
+  g_volume_changed = true;
+  /* The bar at the right edge of the frame, for a moment. */
+  snes_osd_note_volume(g_config.volume);
 }
 
 // Approximates atan2(y, x) normalized to the [0,4) range
@@ -3445,6 +3477,8 @@ static const char kDefaultConfigIniContent[] =
   "\n"
   "[Sound]\n"
   "EnableAudio = 1\n"
+  "# 0..100; VolumeUp / VolumeDown move it in 5% steps and show a bar.\n"
+  "Volume = 100\n"
   "AudioFreq = 32000\n"
   "AudioChannels = 2\n"
   "AudioSamples = 512\n"
@@ -3460,8 +3494,8 @@ static const char kDefaultConfigIniContent[] =
   "Turbo = Tab\n"
   "WindowBigger = Ctrl+Up\n"
   "WindowSmaller = Ctrl+Down\n"
-  "VolumeUp = Shift+=\n"
-  "VolumeDown = Shift+-\n"
+  "VolumeUp = Keypad +\n"
+  "VolumeDown = Keypad -\n"
   "DisplayPerf = f\n"
   "ToggleRenderer = r\n"
   "SaveStateMenu = F11\n"

@@ -101,6 +101,13 @@ int snes_osd_needs_present(void);
  * pixels. Call snes_osd_present_done() after compositing.
  */
 int  snes_osd_image(const uint32_t **pixels, int *w, int *h);
+
+/* Volume bar: a vertical level meter the host shows at the RIGHT edge of the
+ * frame for a moment after the player changes the volume. note_volume(pct)
+ * (0..100) shows it; volume_image() returns the panel (ARGB, alpha
+ * premultiplied like the other OSD images) while it is up, else 0. */
+void snes_osd_note_volume(int percent);
+int  snes_osd_volume_image(const uint32_t **pixels, int *w, int *h);
 void snes_osd_present_done(void);
 
 /* SDL_Renderer path: draw the overlay over the current backbuffer. */

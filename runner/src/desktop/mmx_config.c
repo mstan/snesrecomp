@@ -37,8 +37,10 @@ static uint16 kDefaultKbdControls[kKeys_Total] = {
   S(SDLK_F1), S(SDLK_F2), S(SDLK_F3), S(SDLK_F4), S(SDLK_F5), S(SDLK_F6), S(SDLK_F7), S(SDLK_F8), S(SDLK_F9), S(SDLK_F10), N, N, N, N, N, N, N, N, N, N,
   // Fullscreen, Reset, Pause, PauseDimmed, Turbo, WindowBigger, WindowSmaller, DisplayPerf, ToggleRenderer, ToggleWidescreen
   A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), N, N, _(SDLK_f), _(SDLK_r), A(SDLK_w),
-  // VolumeUp VolumeDown
-  0, 0,
+  // VolumeUp VolumeDown: the keypad's + and -, which collide with nothing
+  // else in this table. They were unbound, so a player had no way to change
+  // the volume in-game unless their config.ini said otherwise.
+  _(SDLK_KP_PLUS), _(SDLK_KP_MINUS),
   /* SaveStateMenu / Rewind. recomp-ui offers F7 / F8, but on SNES F1..F10
    * are the ten LoadState slots above, so those would collide and
    * KeyMapHash_Add would drop one with a "Duplicate key" line. They were
@@ -468,7 +470,11 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return true;
     }
   } else if (section == 2) {
-    if (StringEqualsNoCase(key, "EnableAudio")) {
+    if (StringEqualsNoCase(key, "Volume")) {
+      int v = (int)strtol(value, (char **)NULL, 10);
+      g_config.volume = v < 0 ? 0 : v > 100 ? 100 : v;
+      return true;
+    } else if (StringEqualsNoCase(key, "EnableAudio")) {
       return ParseBool(value, &g_config.enable_audio);
     } else if (StringEqualsNoCase(key, "AudioFreq")) {
       g_config.audio_freq = (uint16)strtol(value, (char**)NULL, 10);
@@ -546,6 +552,7 @@ static bool ParseOneConfigFile(const char *filename, int depth) {
 void ParseConfigFile(const char *filename) {
   g_config.enable_audio = true;
   g_config.vsync = true;
+  g_config.volume = 100;
   /* Audio defaults match the values shipped in config.ini's [Sound]
    * section. Without these a release with no config.ini next to the
    * exe leaves audio_freq/audio_channels/audio_samples at 0, which
@@ -714,6 +721,7 @@ void WriteConfigFile(const char *filename) {
     { "Graphics",   "VSync" },
     { "Graphics",   "Renderer" },
     { "General",    "RunAhead" },
+    { "Sound",      "Volume" },
   };
   const int N = (int)countof(kvs);
   static const char *const kDisplayAspectNames[kSnesDisplayAspect_Count] = {
@@ -740,6 +748,7 @@ void WriteConfigFile(const char *filename) {
   snprintf(kvs[14].val, sizeof(kvs[14].val), "%d", g_config.vsync ? 1 : 0);
   snprintf(kvs[15].val, sizeof(kvs[15].val), "%s", g_config.renderer[0] ? g_config.renderer : "auto");
   snprintf(kvs[16].val, sizeof(kvs[16].val), "%d", g_config.run_ahead);
+  snprintf(kvs[17].val, sizeof(kvs[17].val), "%d", g_config.volume);
 
   char *data = NULL;
   long sz = 0;

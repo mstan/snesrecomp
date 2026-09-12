@@ -307,10 +307,11 @@ void snes_osd_push_slot_empty(int slot) {
 
 /* ---- rasterizing --------------------------------------------------------- */
 
-static void draw_text_row(const char *msg, int row_y) {
-    const int n_max = OSD_MAX_CHARS;
+/* Glyphs into any ARGB buffer, at OSD_SCALE. (x, y) are unscaled origins. */
+static void draw_text_into(uint32_t *buf, int bw, int bh, int x_cells, int y_px,
+                           const char *msg, uint32_t colour) {
     int n = (int)strlen(msg);
-    if (n > n_max) n = n_max;
+    if (n > OSD_MAX_CHARS) n = OSD_MAX_CHARS;
     for (int ci = 0; ci < n; ci++) {
         unsigned char ch = (unsigned char)msg[ci];
         if (ch < 32 || ch > 126) ch = '?';
@@ -319,18 +320,101 @@ static void draw_text_row(const char *msg, int row_y) {
             const uint8_t bits = g[row];
             for (int col = 0; col < OSD_GLYPH_W; col++) {
                 if (!(bits & (1u << col))) continue;
-                const int x0 = (OSD_PAD_X + ci * OSD_GLYPH_W + col) * OSD_SCALE;
-                const int y0 = (row_y + row) * OSD_SCALE;
+                const int x0 = (x_cells + ci * OSD_GLYPH_W + col) * OSD_SCALE;
+                const int y0 = (y_px + row) * OSD_SCALE;
                 for (int dy = 0; dy < OSD_SCALE; dy++)
                     for (int dx = 0; dx < OSD_SCALE; dx++) {
                         const int x = x0 + dx, y = y0 + dy;
-                        if ((unsigned)x < (unsigned)s_img_w &&
-                            (unsigned)y < (unsigned)s_img_h)
-                            s_img[y * s_img_w + x] = 0xFFFFFFFFu;
+                        if ((unsigned)x < (unsigned)bw && (unsigned)y < (unsigned)bh)
+                            buf[y * bw + x] = colour;
                     }
             }
         }
     }
+}
+
+static void draw_text_row(const char *msg, int row_y) {
+    draw_text_into(s_img, s_img_w, s_img_h, OSD_PAD_X, row_y, msg, 0xFFFFFFFFu);
+}
+
+/* ---- volume bar ---------------------------------------------------------- */
+
+#define VOL_SHOW_MS   1500
+#define VOL_BAR_W     8      /* unscaled: the meter itself */
+#define VOL_BAR_H     64
+#define VOL_PANEL_W   (OSD_PAD_X * 2 + 3 * OSD_GLYPH_W + 2)   /* "100%" fits */
+#define VOL_PANEL_H   (OSD_PAD_Y * 2 + VOL_BAR_H + 3 + OSD_GLYPH_H + 1)
+#define VOL_IMG_W     (VOL_PANEL_W * OSD_SCALE)
+#define VOL_IMG_H     (VOL_PANEL_H * OSD_SCALE)
+static uint32_t s_vol_img[VOL_IMG_W * VOL_IMG_H];
+static int      s_vol_percent = -1;
+static uint32_t s_vol_expire_ms;
+static int      s_vol_active, s_vol_dirty;
+
+static void fill_rect_into(uint32_t *buf, int bw, int bh, int x, int y, int w, int h,
+                           uint32_t colour) {
+    for (int yy = y; yy < y + h; yy++)
+        for (int xx = x; xx < x + w; xx++)
+            if ((unsigned)xx < (unsigned)bw && (unsigned)yy < (unsigned)bh)
+                buf[yy * bw + xx] = colour;
+}
+
+static void volume_rasterize(void) {
+    const int S = OSD_SCALE;
+    memset(s_vol_img, 0, sizeof(s_vol_img));
+    /* The same translucent grey panel as the status line. */
+    fill_rect_into(s_vol_img, VOL_IMG_W, VOL_IMG_H, 0, 0, VOL_IMG_W, VOL_IMG_H, 0xC0202020u);
+    const int bar_x = (VOL_PANEL_W - VOL_BAR_W) / 2 * S;
+    const int bar_y = OSD_PAD_Y * S;
+    /* Trough, then the level from the bottom, then tick marks every 25%. */
+    fill_rect_into(s_vol_img, VOL_IMG_W, VOL_IMG_H, bar_x, bar_y, VOL_BAR_W * S, VOL_BAR_H * S, 0xFF505050u);
+    const int level = (VOL_BAR_H * s_vol_percent + 50) / 100;
+    fill_rect_into(s_vol_img, VOL_IMG_W, VOL_IMG_H, bar_x, bar_y + (VOL_BAR_H - level) * S,
+                   VOL_BAR_W * S, level * S, s_vol_percent ? 0xFFFFFFFFu : 0xFF808080u);
+    for (int q = 1; q < 4; q++) {
+        const int ty = bar_y + (VOL_BAR_H * q / 4) * S;
+        fill_rect_into(s_vol_img, VOL_IMG_W, VOL_IMG_H, bar_x - S, ty, S, S, 0xFFC0C0C0u);
+        fill_rect_into(s_vol_img, VOL_IMG_W, VOL_IMG_H, bar_x + VOL_BAR_W * S, ty, S, S, 0xFFC0C0C0u);
+    }
+    char pct[8];
+    snprintf(pct, sizeof(pct), "%d%%", s_vol_percent);
+    const int cells = (int)strlen(pct);
+    const int text_x = (VOL_PANEL_W - cells * OSD_GLYPH_W) / 2;
+    draw_text_into(s_vol_img, VOL_IMG_W, VOL_IMG_H, text_x, OSD_PAD_Y + VOL_BAR_H + 3, pct, 0xFFFFFFFFu);
+    s_vol_dirty = 0;
+}
+
+void snes_osd_note_volume(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    if (percent != s_vol_percent) s_vol_dirty = 1;
+    s_vol_percent = percent;
+    s_vol_active = 1;
+    s_vol_expire_ms = SDL_GetTicks() + VOL_SHOW_MS;
+}
+
+static int volume_visible(void) {
+    if (!s_vol_active) return 0;
+    if ((int32_t)(SDL_GetTicks() - s_vol_expire_ms) >= 0) {
+        s_vol_active = 0;
+        s_needs_clear = 1;
+        return 0;
+    }
+    return 1;
+}
+
+int snes_osd_volume_image(const uint32_t **pixels, int *w, int *h) {
+    if (!volume_visible()) {
+        if (pixels) *pixels = NULL;
+        if (w) *w = 0;
+        if (h) *h = 0;
+        return 0;
+    }
+    if (s_vol_dirty) volume_rasterize();
+    if (pixels) *pixels = s_vol_img;
+    if (w) *w = VOL_IMG_W;
+    if (h) *h = VOL_IMG_H;
+    return 1;
 }
 
 /*
@@ -367,7 +451,7 @@ static void rasterize(void) {
 /* ---- presenting ---------------------------------------------------------- */
 
 int snes_osd_needs_present(void) {
-    if (msg_visible() || s_status_active) return 1;
+    if (msg_visible() || s_status_active || volume_visible()) return 1;
     return s_needs_clear;
 }
 

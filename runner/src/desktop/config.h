@@ -105,6 +105,9 @@ typedef struct Config {
   bool vsync;
   int run_ahead;
   char renderer[32];
+  /* [Sound] Volume, 0..100 (default 100): the mixer level the VolumeUp /
+   * VolumeDown keys move in 5% steps and the launcher's slider edits. */
+  int volume;
 
   /* Oracle-build only. When false, main.c skips snes_oracle_init_default
    * and calls snes_oracle_set_disabled_by_game so the dispatcher refuses
