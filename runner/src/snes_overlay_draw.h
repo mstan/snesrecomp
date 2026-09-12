@@ -44,6 +44,18 @@
 #define SNES_OVL_REPEAT_DELAY 350u
 #define SNES_OVL_REPEAT_RATE   90u
 
+/* Composite an overlay panel (ARGB8888, from snes_savestate_menu_overlay_image
+ * or snes_rewind_overlay_image) into a host frame buffer, scaled to fit and
+ * centred, alpha-blended.
+ *
+ * For a host whose presenter is chosen at runtime -- SDL_Renderer or OpenGL,
+ * per config -- this is the only way to show an overlay once rather than once
+ * per backend: draw it into the frame the host is about to present, at the
+ * same seam where it would draw an FPS counter. `dst` is 32-bit ARGB at
+ * `pitch` BYTES per row. */
+void snes_ovl_blit_panel(uint8_t *dst, int pitch, int dst_w, int dst_h,
+                         const uint32_t *panel, int panel_w, int panel_h);
+
 void snes_ovl_fill_rect(uint32_t *dst, int stride, int h_max,
                         int x0, int y0, int w, int h, uint32_t col);
 void snes_ovl_stroke_rect(uint32_t *dst, int stride, int h_max,

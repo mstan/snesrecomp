@@ -495,3 +495,15 @@ It arrived here from the desktop hosts of the SNES ports, seven of which
 carried byte-identical copies of these two files alongside byte-identical
 copies of the GL presenter that uses them. It is vendored once, here, so that
 `runner/src/desktop/opengl.c` has a loader to call and a port does not.
+
+## third_party/stb — stb_image
+
+`third_party/stb/stb_image.h` is Sean Barrett's single-header image loader
+from [nothings/stb](https://github.com/nothings/stb), dual-licensed MIT /
+public domain. `runner/src/desktop/glsl_shader.c` uses it to load the textures
+a GLSL preset references.
+
+Vendored here for the same reason as the GL loader above: eight repositories
+in this workspace carried byte-identical copies, because the include in
+glsl_shader.c was spelled relative to a game repo's layout and so compiled
+nowhere else.

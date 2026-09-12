@@ -3,7 +3,12 @@
 // See THIRD_PARTY_ATTRIBUTION.md; this project's own work here is PolyForm
 // Noncommercial, the retained upstream material stays MIT.
 // Shared desktop GLSL preset renderer. Heavily influenced by Snes9x.
-#include "third_party/gl_core/gl_core_3_1.h"
+/* Plain paths, not "third_party/...": both are vendored in the framework now
+ * (snesrecomp/third_party) and snesrecomp_target_glsl_shader puts their
+ * directories on the include path. The old spelling was relative to a GAME
+ * repo's layout, so this file compiled only inside a port that happened to
+ * carry its own byte-identical copies -- which all eight of them did. */
+#include "gl_core_3_1.h"
 #include "glsl_shader.h"
 #include "util.h"
 #include "config.h"
@@ -15,7 +20,7 @@
 #define STBI_ONLY_PNG
 #define STBI_MAX_DIMENSIONS 4096
 #define STBI_NO_FAILURE_STRINGS
-#include "third_party/stb/stb_image.h"
+#include "stb/stb_image.h"
 
 static GlslPass *ParseConfigKeyPass(GlslShader *gs, const char *key, const char *match) {
   char *endp;

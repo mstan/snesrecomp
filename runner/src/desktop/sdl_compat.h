@@ -30,6 +30,7 @@
 #define SNESRECOMP_SDL_EVENT_BUTTON(event) ((event).gbutton.button)
 #define SNESRECOMP_SDL_EVENT_KEY(event) ((event).key.key)
 #define SNESRECOMP_SDL_EVENT_MOD(event) ((event).key.mod)
+#define SNESRECOMP_SDL_EVENT_REPEAT(event) ((event).key.repeat)
 #else
 #define SNESRECOMP_SDL_EVENT_DEVICE(event) ((event).cdevice.which)
 #define SNESRECOMP_SDL_EVENT_AXIS_DEVICE(event) ((event).caxis.which)
@@ -39,6 +40,7 @@
 #define SNESRECOMP_SDL_EVENT_BUTTON(event) ((event).cbutton.button)
 #define SNESRECOMP_SDL_EVENT_KEY(event) ((event).key.keysym.sym)
 #define SNESRECOMP_SDL_EVENT_MOD(event) ((event).key.keysym.mod)
+#define SNESRECOMP_SDL_EVENT_REPEAT(event) ((event).key.repeat)
 #endif
 
 static inline bool snesrecomp_sdl_init(Uint32 flags) {

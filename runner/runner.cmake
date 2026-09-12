@@ -905,7 +905,13 @@ function(snesrecomp_target_glsl_shader target)
     target_sources(${target} PRIVATE
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop/glsl_shader.c)
     target_include_directories(${target} PRIVATE
-        ${SNESRECOMP_RUNNER_ROOT}/src/desktop)
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop
+        # glsl_shader.c needs the GL loader's header and stb_image, both
+        # vendored here. Without these the file compiles only inside a port
+        # carrying its own copies under third_party/, which is why every one
+        # of them did.
+        ${SNESRECOMP_FRAMEWORK_ROOT}/third_party/gl_core
+        ${SNESRECOMP_FRAMEWORK_ROOT}/third_party)
     if(NOT MSVC)
         target_link_libraries(${target} PRIVATE m)
     endif()
