@@ -1213,8 +1213,16 @@ static void PresentFrozenWithOverlay(void) {
   if (!is_menu && !(snes_rewind_overlay_image(&panel, &pw, &ph) && panel))
     panel = NULL;
 
-  const int draw_w = (panel && pw > 0) ? pw : g_snes_width;
-  const int draw_h = (panel && ph > 0) ? ph : g_snes_height;
+  /* The draw buffer is the FROZEN FRAME at twice its size, whichever panel
+   * is up. It used to be the panel's own size, which is right for the
+   * browser (512x448, exactly twice the field) and wrong for the rewind
+   * filmstrip, whose image is a 512x176 strip: the whole frozen game was
+   * squashed into a strip-high buffer and presented letterboxed in the
+   * middle of the window. */
+  const int base_w = g_frozen_w > 0 ? g_frozen_w : g_snes_width;
+  const int base_h = g_frozen_h > 0 ? g_frozen_h : g_snes_height;
+  const int draw_w = base_w * 2;
+  const int draw_h = base_h * 2;
   uint8 *pixel_buffer = 0;
   int pitch = 0;
 
@@ -1236,21 +1244,25 @@ static void PresentFrozenWithOverlay(void) {
       snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
                                panel, pw, ph, 0, 0, draw_w, draw_h);
     } else {
-      const int strip_h = draw_h / 3;
+      /* Full width, anchored to the bottom, at the strip's own height when
+       * it fits (1:1 on the stock field, so its text stays crisp), else
+       * scaled to the bottom third the way the other ports place it. */
+      const int strip_h = ph > 0 && ph <= draw_h / 2 ? ph : draw_h / 3;
       snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
                                panel, pw, ph,
                                0, draw_h - strip_h, draw_w, strip_h);
     }
   }
   ComposeOsd(pixel_buffer, pitch, draw_w, draw_h, draw_w >= 512 ? 1 : 2);
-  /* SNESRECOMP_OVERLAY_DUMP=<path>: write the composited overlay frame as a
-   * PPM. The overlays can only be driven by a human, so this is the only way
+  /* SNESRECOMP_OVERLAY_DUMP=<path> (browser) / SNESRECOMP_REWIND_DUMP=<path>
+   * (filmstrip): write the composited overlay frame as a PPM. The overlays can only be driven by a human, so this is the only way
    * to check that a panel actually reaches the screen rather than inferring
    * it from the module reporting itself open. */
   {
-    const char *dump = HostGetenv("OVERLAY_DUMP");
-    static int dumped = 0;
-    if (dump && !dumped && panel) {
+    static int dumped_menu = 0, dumped_rewind = 0;
+    const char *dump = is_menu ? HostGetenv("OVERLAY_DUMP") : HostGetenv("REWIND_DUMP");
+    int *dumped = is_menu ? &dumped_menu : &dumped_rewind;
+    if (dump && !*dumped && panel) {
       FILE *f = fopen(dump, "wb");
       if (f) {
         fprintf(f, "P6\n%d %d\n255\n", draw_w, draw_h);
@@ -1262,7 +1274,7 @@ static void PresentFrozenWithOverlay(void) {
           }
         }
         fclose(f);
-        dumped = 1;
+        *dumped = 1;
         fprintf(stderr, "[overlay_dump] wrote %s (%dx%d, %s)\n", dump, draw_w, draw_h,
                 is_menu ? "save-state browser" : "rewind filmstrip");
       }
