@@ -524,6 +524,38 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 void PpuResetWidescreenOamHistory(Ppu *ppu);
 
+/* Rollback seam for PPU state that lives WITHIN a frame.
+ *
+ * ppu_saveload serializes the register window inidisp..cgwsel and the
+ * cgram/oam/vram memories. Everything below sits outside it, correctly so for
+ * a SAVESTATE: it is taken at a frame boundary, where ppu_handleVblank has
+ * just reloaded the OAM write port from oamaddl/oamaddh and the widescreen
+ * classifier can re-seed from the next frame.
+ *
+ * A ROLLBACK snapshot is taken MID-frame -- run-ahead and netplay resim both
+ * snapshot after the CPU half of the frame and before the render half that
+ * calls ppu_handleVblank -- so this state is live across exactly the boundary
+ * being rewound. Leaving it out let a speculative frame's $2104 writes walk
+ * oamAdr forward and kept that walk after the restore, so the real frame then
+ * wrote sprite attributes to the wrong OAM slots. */
+typedef struct PpuRollbackResidue {
+  uint8_t  oamAdr;
+  uint8_t  oamInHigh;
+  uint8_t  oamSecondWrite;
+  uint8_t  oamBuffer;
+  /* Presentation-only, and deliberately NOT digested (a digest carries the
+   * simulation; peers may render differently). Restored anyway so a rewind
+   * reproduces the same picture, which is the whole point of run-ahead. */
+  int16_t  wsOamMotionLastLine;
+  int16_t  wsOamMotionX[128];
+  uint32_t wsOamMotionSig[128];
+  uint8_t  wsOamMotionSeen[16];
+  uint8_t  wsOamMotionGrace[128];
+} PpuRollbackResidue;
+
+void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out);
+void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in);
+
 // Replace stale BG1 tilemap pixels in widened side margins before final
 // composition. The callback is host-only and runs independently for main and
 // subscreen buffers.

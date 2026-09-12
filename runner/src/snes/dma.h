@@ -56,6 +56,18 @@ struct Dma {
 Dma* dma_init(Snes* snes);
 void dma_free(Dma* dma);
 void dma_reset(Dma* dma);
+/* Rollback seam for `hdmaPendingInit`.
+ *
+ * It is deliberately outside dma_saveload's range (see the field), which is
+ * right for a SAVESTATE -- that is taken at a frame boundary, where no
+ * within-frame sequencing is outstanding. A ROLLBACK snapshot is not:
+ * run-ahead and netplay resim both snapshot between the CPU half of a frame
+ * and the render half that runs dma_doHdma(), so a channel switched on by the
+ * CPU half still owes its table init when the snapshot is taken. Restoring
+ * without it makes the replayed frame initialise a different set of channels
+ * than the frame it replaces. */
+uint8_t dma_hdma_pending_init_get(const Dma* dma);
+void dma_hdma_pending_init_set(Dma* dma, uint8_t mask);
 uint8_t dma_read(Dma* dma, uint16_t adr); // 43x0-43xf
 void dma_write(Dma* dma, uint16_t adr, uint8_t val); // 43x0-43xf
 void dma_doDma(Dma* dma);
