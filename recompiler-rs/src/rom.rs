@@ -254,23 +254,4 @@ mod tests {
         assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0x80, 0x8000), 0);
     }
 
-    #[test]
-    fn detects_and_maps_sdd1_exlorom_windows() {
-        let mut rom = vec![0u8; 0x600000];
-        rom[0x7FD5] = 0x32;
-        rom[0x7FFC..0x7FFE].copy_from_slice(&0xFEC1u16.to_le_bytes());
-        rom[0x7FDC..0x7FDE].copy_from_slice(&0xEC47u16.to_le_bytes());
-        rom[0x7FDE..0x7FE0].copy_from_slice(&0x13B8u16.to_le_bytes());
-        assert_eq!(detect_rom_mapping(&rom), RomMapping::Sdd1ExLoRom);
-        assert_eq!(vector_table_offset(&rom), 0x7FE0);
-        assert!(is_rom_address(RomMapping::Sdd1ExLoRom, 0xC0, 0x0000));
-        assert!(is_rom_address(RomMapping::Sdd1ExLoRom, 0xFF, 0xFFFF));
-        assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0xC0, 0x0000), 0);
-        assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0xD0, 0x0000), 0x100000);
-        assert_eq!(
-            rom_offset(RomMapping::Sdd1ExLoRom, 0xFF, 0xFFFF),
-            0x3FFFFF
-        );
-        assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0x80, 0x8000), 0);
-    }
 }
