@@ -39,6 +39,7 @@
 #include "launcher.h"        /* snesrecomp_launcher_resolve_rom_sha256 */
 #include "launcher_cache.h"  /* snesrecomp_rom_cache_read */
 #include "snesrecomp_rom_identity.h" /* generated from rom_identity.txt */
+#include "host_report.h"     /* breadcrumbs: the crash/exit report reads them */
 
 #if SNESRECOMP_ENABLE_MODS
 /* Mod packages -- always built (CMakeLists.txt sets SNESRECOMP_ENABLE_MODS).
@@ -427,6 +428,19 @@ int main(int argc, char **argv)
     SDL_Renderer *renderer;
     SDL_Texture *texture;
     int running = 1;
+    unsigned frames = 0;
+    const char *exit_reason = "loop ended";
+
+    /* Breadcrumbs from here on. They cost nothing, they land in the
+     * post-mortem report, and without them a host that exits cleanly before
+     * its first frame leaves no trace of WHY: the report of a scaffold that
+     * "launches and immediately exits with code 0" could not be diagnosed
+     * from its log because this file printed nothing between loading the ROM
+     * and returning. The mature ports all breadcrumb; the template did not. */
+    host_report_init("@DISPLAY_NAME@", SNES_GAME_VERSION);
+    host_report_breadcrumb("argv: positional=%s force_launcher=%d no_launcher=%d",
+                           has_positional ? argv[pos_arg] : "(none)",
+                           force_launcher, no_launcher);
 
     if (!has_positional)
         find_rom_beside_exe(beside_exe, sizeof(beside_exe));
@@ -469,8 +483,12 @@ int main(int argc, char **argv)
                 hint[0] = '\0';
             {
                 int lr = run_gui_launcher(hint, rom_path, sizeof(rom_path));
-                if (lr < 0)
+                host_report_breadcrumb("launcher: result=%d rom=%s", lr,
+                                       rom_path[0] ? rom_path : "(none)");
+                if (lr < 0) {
+                    host_report_breadcrumb("exit: player quit from the launcher");
                     return 0;          /* player quit from the launcher */
+                }
             }
         }
     }
@@ -526,6 +544,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "@PROJECT_NAME@: SnesInit failed\n");
         return 1;
     }
+    host_report_breadcrumb("SnesInit ok: rom=%d bytes", rom_size);
 #if SNESRECOMP_ENABLE_MODS
     /* Plugins act on a machine that exists: after SnesInit, before frame 1. */
     if (g_mods_ready)
@@ -580,6 +599,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
         return 1;
     }
+    host_report_breadcrumb("SDL init ok: video=%s; window %dx%d; renderer=%s",
+                           SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)",
+                           GAME_WIDTH * 3, GAME_HEIGHT * 3,
+                           snesrecomp_sdl_renderer_name(renderer)
+                               ? snesrecomp_sdl_renderer_name(renderer) : "(unknown)");
+    host_report_breadcrumb("entering main loop");
 
     while (running) {
         SDL_Event event;
@@ -591,12 +616,18 @@ int main(int argc, char **argv)
             /* SDL2 spellings: sdl_compat.h defines SDL_ENABLE_OLD_NAMES for
              * SDL3, so these compile against either backend. The SDL3-only
              * names (SDL_EVENT_QUIT, ...) do not. */
-            if (event.type == SDL_QUIT)
+            if (event.type == SDL_QUIT) {
                 running = 0;
+                exit_reason = "SDL_QUIT event";
+            }
             if (event.type == SDL_KEYDOWN &&
-                SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
+                SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE) {
                 running = 0;
+                exit_reason = "Escape pressed";
+            }
         }
+        if (!running)
+            break;
 
 #if defined(SNES_HAS_LOBBY_CLIENT)
         /* Netplay session: the delay-sync admit pump owns the frame cadence.
@@ -612,8 +643,10 @@ int main(int argc, char **argv)
             admitted = snes_host_barrier_admit(g_netplay_from_lobby, &run,
                                                &hooks);
             running = run;
-            if (!running)
+            if (!running) {
+                exit_reason = "netplay barrier requested exit";
                 break;
+            }
             if (admitted) {
                 int burst = 0;
                 for (;;) {
@@ -647,6 +680,8 @@ int main(int argc, char **argv)
          * snesrecomp/docs/MULTITAP.md. */
         inputs = read_keyboard();
         RtlRunFrame(inputs);
+        if (frames++ == 0)
+            host_report_breadcrumb("first frame simulated");
 
         if (snesrecomp_sdl_lock_texture(texture, NULL, &pixels, &pitch)) {
             RtlDrawPpuFrame((uint8 *)pixels, (size_t)pitch, 0);
@@ -657,6 +692,7 @@ int main(int argc, char **argv)
         SDL_RenderPresent(renderer);
     }
 
+    host_report_breadcrumb("exit: %s after %u frames", exit_reason, frames);
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
