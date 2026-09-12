@@ -78,7 +78,15 @@
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* recomp_launcher_run_window() */
 #include "launcher_profile.h"  /* launcher_profile_apply("snes", &gi) */
-#include "recomp_frame_blend.h" /* shared presentation blend (all titles) */
+/* The shared presentation blend is recomp-ui's (src/recomp_frame_blend.h,
+ * master since 2026-09). A project pinned to an older recomp-ui builds
+ * without it and simply gets no Frame blending row. */
+#if defined(__has_include)
+#if __has_include("recomp_frame_blend.h")
+#include "recomp_frame_blend.h"
+#define SNESRECOMP_HOST_HAS_BLEND 1
+#endif
+#endif
 /* Generate & rebuild is wired when the project compiles the framework's
  * codegen host (the template's launcher block does; see CMakeLists.txt.in).
  * The header lives in snesrecomp/host, which only that block puts on the
@@ -352,11 +360,11 @@ void snesrecomp_desktop_set_widescreen(int enabled) {
  * launcher's Display checkbox): each presented frame averaged with the
  * previous one, so alternate-frame flicker "transparency" reads as steady
  * translucency. The module is recomp-ui's, shared by every title. */
-#if defined(RECOMP_LAUNCHER)
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
 static RecompFrameBlend *g_blend;
 #endif
 static void FrameBlendConfigure(void) {
-#if defined(RECOMP_LAUNCHER)
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
   if (g_config.frame_blend && !g_blend) g_blend = recomp_frame_blend_create();
   if (g_config.frame_blend && !g_blend) {
     /* Out of memory for one frame. Say so and present unblended rather
@@ -372,7 +380,7 @@ static void FrameBlendConfigure(void) {
 
 static void GameReset(void) {
   if (g_game->on_reset) g_game->on_reset();
-#if defined(RECOMP_LAUNCHER)
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
   if (g_blend) recomp_frame_blend_reset(g_blend);   /* never blend across a jump */
 #endif
   g_reset_clock = true;
@@ -943,7 +951,7 @@ static void DrawPpuFrameWithPerf(void) {
   } else {
     RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
   }
-#if defined(RECOMP_LAUNCHER)
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
   /* The shared blend keeps the UNBLENDED frame, so the mix never feeds back
    * on itself, and the PPU's own renderBuffer stays pure for thumbnails. */
   if (g_config.frame_blend && g_blend && g_present_alpha >= 1)
@@ -2187,7 +2195,9 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         gi.msu1_supported = game->msu1_supported;
         /* Capability rows: each is drawn only because this host wires it. A
          * row that does nothing is worse than no row. */
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
         gi.has_frame_blend  = 1;
+#endif
         gi.has_run_ahead    = 1;   /* the runtime snapshots a machine in a frame */
         gi.has_vsync        = 1;
         gi.has_renderer     = 1;
@@ -3079,7 +3089,7 @@ error_reading:;
   RtlWriteSram();
   snes_rewind_shutdown();
   snes_runahead_shutdown();
-#if defined(RECOMP_LAUNCHER)
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
   if (g_blend) recomp_frame_blend_destroy(g_blend);
 #endif
 
