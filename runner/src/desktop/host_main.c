@@ -1436,10 +1436,12 @@ static void ResetAudioTimeline(void) {
   RtlApuLock();
   g_audiobuffer_end = g_audiobuffer_cur;
   g_audio_primed = false;
+  RtlApuUnlock();
 #if SNESRECOMP_SDL3
+  /* The stream callback takes the APU mutex: never acquire SDL's stream
+   * lock while holding that mutex in the opposite order. */
   if (g_audio_stream) SDL_ClearAudioStream(g_audio_stream);
 #endif
-  RtlApuUnlock();
 }
 
 void RtlApuLock(void) {
