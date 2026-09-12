@@ -68,6 +68,8 @@ TEST_MODULES = [
     # The C-side runtime contract (tests/interp816/run.sh). Registered here
     # because CI runs this driver and ran nothing else; see the module.
     'test_interp_bridge_contract',
+    # Shipped entry points must parse; see the module.
+    'test_cli_imports',
 ]
 
 

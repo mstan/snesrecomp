@@ -237,11 +237,18 @@ def build_project(args: argparse.Namespace) -> int:
     framework_root = ROOT / "framework"
     if not (framework_root / "LICENSE").is_file():
         framework_root = ROOT
-    shutil.copy2(framework_root / "LICENSE", framework_output)
-    shutil.copy2(
-        framework_root / "THIRD_PARTY_ATTRIBUTION.md", framework_output)
+    # Both notices, each with the same packaged-vs-source fallback. This was
+    # two straight-line copy2 calls with an orphaned `if not source.is_file()`
+    # fragment dangling off the second one -- the remains of this loop, left
+    # by a conflict resolution. It is a SyntaxError, so the whole module fails
+    # to import and `snesrecomp_cli.py generate` cannot run at all: every
+    # port's tools/regen.sh dies with IndentationError before it reaches the
+    # ROM. Nothing caught it because no test imports this file.
+    for notice in ("LICENSE", "THIRD_PARTY_ATTRIBUTION.md"):
+        source = framework_root / notice
         if not source.is_file():
             source = ROOT / "framework" / notice
+        shutil.copy2(source, framework_output)
 
     cmake = f"""cmake_minimum_required(VERSION 3.20)
 project({project_name} C)
