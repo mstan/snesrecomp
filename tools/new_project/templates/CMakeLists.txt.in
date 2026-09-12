@@ -80,8 +80,7 @@ snesrecomp_target_mod_catalog(@PROJECT_NAME@ ${CMAKE_SOURCE_DIR}/mods/preloaded)
 target_include_directories(@PROJECT_NAME@ PRIVATE
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
     # common_rtl.c includes "config.h": the desktop key-map / Config contract
-    # a host is expected to supply. The framework's shared version is used
-    # here; copy it into src/ and drop this line once this game needs its own.
+    # the framework host supplies (snesrecomp_target_desktop_host below).
     ${SNESRECOMP_ROOT}/runner/src/desktop
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/recomp
@@ -92,6 +91,14 @@ target_compile_definitions(@PROJECT_NAME@ PRIVATE
     SNES_GAME_TITLE="@WINDOW_TITLE@"
 )
 snesrecomp_target_sdl(@PROJECT_NAME@)
+
+# The desktop host: launcher flow, ROM resolution, config.ini + [KeyMap],
+# window + SDL/OpenGL presenters, audio, gamepads, the save-state browser and
+# rewind filmstrip, the pacing clock, crash handlers and the post-mortem
+# report. src/main.c is the shim that names this title and supplies its
+# hooks; the host is the framework's and improves on a submodule pull.
+# Add TIER2 once this port reads the interpreter-gap manifest after each run.
+snesrecomp_target_desktop_host(@PROJECT_NAME@)
 
 @LAUNCHER_BLOCK@
 

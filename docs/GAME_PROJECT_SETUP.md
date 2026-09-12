@@ -108,11 +108,19 @@ the host. The scaffold fills them in with the smallest honest implementation:
 
 | Symbol | What it decides |
 |---|---|
-| `Die` | what a fatal framework error does |
-| `RtlApuLock` / `RtlApuUnlock` | guest thread vs audio thread serialisation |
-| `g_spc_player` | optional SPC upload interception (NULL = guest's own path) |
-| `debug_on_block_enter`, `debug_on_wram_write_*` | trace hooks |
-| `RtlDrawPpuFrame` (in `main.c`) | how a finished frame reaches the screen |
+| `Die` | what a fatal framework error does (the framework host defines it) |
+| `RtlApuLock` / `RtlApuUnlock` | guest thread vs audio thread serialisation (framework host) |
+| `g_spc_player` | optional SPC upload interception; the host fills it from the descriptor's `create_spc_player` hook |
+| `debug_on_block_enter`, `debug_on_wram_write_*` | trace hooks (`src/host_contract.c`) |
+| `RtlDrawPpuFrame` | how a finished frame reaches the screen (framework host; a title composes through the `draw_frame` hook) |
+
+A scaffolded project links the framework's desktop host
+(`snesrecomp_target_desktop_host()` in CMakeLists.txt, `runner/src/desktop/
+host_main.h`), so `src/main.c` is a shim: a `SnesDesktopHostGame` descriptor
+with the title's identity and hooks, and one call to
+`snesrecomp_desktop_main()`. Launcher, ROM resolution, config, presenters,
+audio, gamepads, overlays, pacing and crash reporting all improve on a
+submodule pull rather than needing a per-port edit.
 
 ## 5. Regenerating
 

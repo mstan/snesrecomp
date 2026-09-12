@@ -538,13 +538,21 @@ def test_mods_are_built_into_every_project():
         assert cmake.count("snesrecomp_codegen_host.c") == 1, \
             "codegen host wired more than once"
 
-        main_c = (project / "src" / "main.c").read_text(encoding="utf-8")
+        # The runtime wiring lives in the framework's desktop host, which the
+        # scaffold links (snesrecomp_target_desktop_host); main.c is the shim
+        # that hands it the identity, game_id included.
+        assert "snesrecomp_target_desktop_host(FixtureQuestSNESRecomp" in cmake, \
+            "framework host not linked"
+        host_c = (REPO_ROOT / "runner" / "src" / "desktop" / "host_main.c").read_text(
+            encoding="utf-8")
         for call in ("snes_mod_runtime_initialize_c", "snes_mod_runtime_commit_c",
                      "snes_mod_runtime_activate_plugins_c",
                      "snes_mod_runtime_launcher_provider_c",
                      "snes_netplay_rb_set_modset"):
-            assert call in main_c, f"main.c does not call {call}"
+            assert call in host_c, f"the framework host does not call {call}"
+        main_c = (project / "src" / "main.c").read_text(encoding="utf-8")
         assert "SNESRECOMP_ROM_GAME_ID" in main_c, "game id not compiled in"
+        assert "snesrecomp_desktop_main(" in main_c, "main.c is not the host shim"
 
         identity = (project / "rom_identity.txt").read_text(encoding="utf-8")
         assert "game_id         = fixturequest-usa" in identity, identity

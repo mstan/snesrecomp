@@ -1,5 +1,11 @@
 /* Shared Mega Man X2/X3 desktop host shell.
  *
+ * SUPERSEDED for new work by host_main.h / host_main.c: the same host as a
+ * linkable unit parameterized by a SnesDesktopHostGame descriptor instead of
+ * MMX_* macros, with the in-game overlays, the frozen-frame present and the
+ * decoupled presentation clock. The X2/X3 hosts still include this file;
+ * migrate them by writing a descriptor (see SuperMetroidRecomp/src/main.c).
+ *
  * The including game wrapper supplies identity, header, display, widescreen,
  * mod, ROM-digest, and debug-port macros. Keeping this as an include makes the
  * process entry point compile in the game target while eliminating the two

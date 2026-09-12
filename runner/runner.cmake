@@ -977,6 +977,41 @@ function(snesrecomp_target_fiber_compat target)
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop)
 endfunction()
 
+# The desktop host, as a linkable unit (runner/src/desktop/host_main.h).
+#
+# A game's main.c becomes a thin shim: a SnesDesktopHostGame descriptor and a
+# call to snesrecomp_desktop_main(). The launcher flow, ROM resolution and
+# digest checks, config.ini/keybinds.ini, window + SDL/OpenGL presenters,
+# audio, gamepads, the save-state browser and rewind filmstrip, the OSD, the
+# pacing clock, crash handlers and the post-mortem report all come from here
+# and reach every port by pulling -- the same shape as the helpers above, one
+# level up. Bundles what the host needs: config, post-mortem (TIER2 forwarded),
+# and the GL presenter on desktop. Call snesrecomp_target_sdl() as well; the
+# host speaks the SDL2/SDL3 shim.
+#
+#   snesrecomp_target_desktop_host(<target> [TIER2])
+function(snesrecomp_target_desktop_host target)
+    set(options TIER2)
+    cmake_parse_arguments(DH "${options}" "" "" ${ARGN})
+    target_sources(${target} PRIVATE
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_main.c
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_clock.c)
+    target_include_directories(${target} PRIVATE
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop)
+    snesrecomp_target_mmx_config(${target})
+    if(DH_TIER2)
+        snesrecomp_target_post_mortem(${target} TIER2)
+    else()
+        snesrecomp_target_post_mortem(${target})
+    endif()
+    if(NOT ANDROID)
+        snesrecomp_target_opengl(${target})
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(${target} PRIVATE m)
+    endif()
+endfunction()
+
 # Optional delay-sync netcode (lib/recomp-net submodule). See docs/RECOMP_NET.md.
 # Does nothing unless SNESRECOMP_ENABLE_NET=ON or the game calls
 # snesrecomp_enable_recomp_net(<target>).

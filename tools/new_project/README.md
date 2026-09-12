@@ -83,7 +83,7 @@ packager).
 ├── recomp/                 bank*.cfg, symbols.toml — analysis input you own
 ├── rom_identity.txt        ROM digests + game_id — the one place a revision changes
 ├── mods/preloaded/         mod catalog (staged beside the exe; empty to start)
-├── src/                    main.c, game_rtl.c, host_contract.c
+├── src/                    main.c (host shim), game_rtl.c, host_contract.c
 │   └── gen/                generated C (gitignored — never committed)
 ├── tools/regen.sh          ROM → C, with digest verification
 ├── scripts/package_release.sh
@@ -147,8 +147,9 @@ The ROM is probed where it lies and is never copied in. `tools/regen.sh` takes
 generated `.gitignore` blocks `*.sfc` / `*.smc` / `src/gen/` regardless.
 `scripts/package_release.sh` refuses to build a zip that contains ROM data.
 
-Which means the scaffolded host has to *ask* for one, and `src/main.c` does —
-in this order, each candidate checked against the digests in
+Which means the host has to *ask* for one, and the framework's desktop host
+(`runner/src/desktop/host_main.c`, linked by `snesrecomp_target_desktop_host()`;
+`src/main.c` is the shim that names the title) does — in this order, each candidate checked against the digests in
 `rom_identity.txt`, the same ones the C was generated from. The build turns
 that file into `snesrecomp_rom_identity.h`; `tools/regen.sh` and the release
 workflow read it directly, so a revision bump is a one-line edit:
