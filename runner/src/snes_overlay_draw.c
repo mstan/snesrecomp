@@ -132,42 +132,73 @@ void snes_ovl_draw_button(uint32_t *dst, int stride, int h_max,
 void snes_ovl_blit_panel(uint8_t *dst, int pitch, int dst_w, int dst_h,
                          const uint32_t *panel, int panel_w, int panel_h)
 {
-    if (!dst || !panel || pitch <= 0 ||
-        dst_w <= 0 || dst_h <= 0 || panel_w <= 0 || panel_h <= 0)
+    if (panel_w <= 0 || panel_h <= 0 || dst_w <= 0 || dst_h <= 0)
         return;
-
     /* Largest whole-pixel fit, then centre what is left over. */
-    int scale_num = dst_w * panel_h < dst_h * panel_w ? dst_w : dst_h * panel_w / panel_h;
-    int out_w = scale_num;
+    int out_w = dst_w * panel_h < dst_h * panel_w ? dst_w : dst_h * panel_w / panel_h;
     int out_h = out_w * panel_h / panel_w;
     if (out_h > dst_h) {
         out_h = dst_h;
         out_w = out_h * panel_w / panel_h;
     }
-    if (out_w <= 0 || out_h <= 0)
+    snes_ovl_blit_panel_rect(dst, pitch, dst_w, dst_h, panel, panel_w, panel_h,
+                             (dst_w - out_w) / 2, (dst_h - out_h) / 2,
+                             out_w, out_h);
+}
+
+void snes_ovl_upscale_frame(uint8_t *dst, int pitch, int dst_w, int dst_h,
+                            const uint32_t *src, int src_pitch,
+                            int src_w, int src_h)
+{
+    if (!dst || !src || pitch <= 0 || src_pitch <= 0 ||
+        dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0)
         return;
-    const int ox = (dst_w - out_w) / 2;
-    const int oy = (dst_h - out_h) / 2;
+    for (int y = 0; y < dst_h; y++) {
+        const uint32_t *src_row =
+            (const uint32_t *)((const uint8_t *)src +
+                               (size_t)(y * src_h / dst_h) * (size_t)src_pitch);
+        uint32_t *dst_row = (uint32_t *)(dst + (size_t)y * (size_t)pitch);
+        for (int x = 0; x < dst_w; x++)
+            dst_row[x] = src_row[x * src_w / dst_w];
+    }
+}
+
+void snes_ovl_blit_panel_rect(uint8_t *dst, int pitch, int dst_w, int dst_h,
+                              const uint32_t *panel, int panel_w, int panel_h,
+                              int rx, int ry, int rw, int rh)
+{
+    if (!dst || !panel || pitch <= 0 ||
+        dst_w <= 0 || dst_h <= 0 || panel_w <= 0 || panel_h <= 0 ||
+        rw <= 0 || rh <= 0)
+        return;
+
+    const int out_w = rw, out_h = rh;
+    const int ox = rx, oy = ry;
 
     for (int y = 0; y < out_h; y++) {
+        const int dy = oy + y;
+        if (dy < 0 || dy >= dst_h)
+            continue;                    /* clip rather than scribble */
         const uint32_t *src_row = panel + (size_t)(y * panel_h / out_h) * panel_w;
-        uint32_t *dst_row = (uint32_t *)(dst + (size_t)(oy + y) * (size_t)pitch);
-        dst_row += ox;
+        uint32_t *dst_row = (uint32_t *)(dst + (size_t)dy * (size_t)pitch);
         for (int x = 0; x < out_w; x++) {
+            const int dx = ox + x;
+            if (dx < 0 || dx >= dst_w)
+                continue;
             const uint32_t s = src_row[x * panel_w / out_w];
             const uint32_t a = s >> 24;
             if (a == 0)
                 continue;            /* fully transparent: leave the game */
             if (a == 0xFFu) {
-                dst_row[x] = s;      /* the common case: opaque panel */
+                dst_row[dx] = s;     /* the common case: opaque panel */
                 continue;
             }
-            const uint32_t d = dst_row[x];
+            const uint32_t d = dst_row[dx];
             const uint32_t na = 255u - a;
             const uint32_t r = (((s >> 16) & 0xFFu) * a + ((d >> 16) & 0xFFu) * na) / 255u;
             const uint32_t g = (((s >>  8) & 0xFFu) * a + ((d >>  8) & 0xFFu) * na) / 255u;
             const uint32_t b = (((s      ) & 0xFFu) * a + ((d      ) & 0xFFu) * na) / 255u;
-            dst_row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            dst_row[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
 }

@@ -56,6 +56,27 @@
 void snes_ovl_blit_panel(uint8_t *dst, int pitch, int dst_w, int dst_h,
                          const uint32_t *panel, int panel_w, int panel_h);
 
+/* The same, into an explicit destination rectangle.
+ *
+ * The two overlays want different placements, and centring both is wrong:
+ * the save-state browser is an opaque panel over the whole game rect, while
+ * the rewind filmstrip belongs in the bottom third of it, annotating the
+ * frame it describes. A host that centres the filmstrip puts it across the
+ * middle of the screen, which is not what the module draws for. */
+void snes_ovl_blit_panel_rect(uint8_t *dst, int pitch, int dst_w, int dst_h,
+                              const uint32_t *panel, int panel_w, int panel_h,
+                              int rx, int ry, int rw, int rh);
+
+/* Nearest-neighbour upscale of an ARGB frame into a larger buffer.
+ *
+ * A host that freezes the guest to show an overlay still has to present
+ * something behind it, and presenting at the panel's own resolution rather
+ * than the game's is what keeps the panel's text crisp. The frozen field is
+ * scaled up to fill; it is a static backdrop, so nearest is right and cheap. */
+void snes_ovl_upscale_frame(uint8_t *dst, int pitch, int dst_w, int dst_h,
+                            const uint32_t *src, int src_pitch,
+                            int src_w, int src_h);
+
 void snes_ovl_fill_rect(uint32_t *dst, int stride, int h_max,
                         int x0, int y0, int w, int h, uint32_t col);
 void snes_ovl_stroke_rect(uint32_t *dst, int stride, int h_max,
