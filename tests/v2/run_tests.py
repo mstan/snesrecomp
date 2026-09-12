@@ -65,6 +65,9 @@ TEST_MODULES = [
     'test_variant_dispatch_lle_fallback',
     'test_program_profile_roots',
     'test_ingest_dkc2_disasm',
+    # The C-side runtime contract (tests/interp816/run.sh). Registered here
+    # because CI runs this driver and ran nothing else; see the module.
+    'test_interp_bridge_contract',
 ]
 
 

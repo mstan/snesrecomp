@@ -45,10 +45,14 @@
 #include <string.h>
 #include <time.h>
 
+#include <errno.h>
+
 #include "post_mortem.h"
 #include "host_report.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
+#include "common_cpu_infra.h"   /* stack-balance / abandon / dispatch dumps */
+#include "ppu_dma_trace.h"      /* ppudma_dump_json */
 
 #ifndef SNESRECOMP_POST_MORTEM_TIER2
 #define SNESRECOMP_POST_MORTEM_TIER2 0
@@ -72,6 +76,22 @@ extern const char *g_last_recomp_func;
 /* Output path — overwritten per dump. CWD-relative because main anchors the
  * working directory to the executable directory. */
 static const char *kReportPath = "last_run_report.json";
+
+/* Per-game section. A port that wants its own object in the report registers
+ * a writer here instead of forking this file — which is what
+ * SuperMetroidRecomp did for its "sm" block (game state, enemy slots), and
+ * the fork then carried 150 lines of generic dumps nothing else inherited.
+ *
+ * The callback writes complete `"name": {...},` JSON members at the top level
+ * of the report, trailing comma included, exactly as the dump_*_json helpers
+ * below do. It runs inside the dump lock, after the hardware state and before
+ * the rings, and must not allocate or take locks of its own: it is called
+ * from a crash handler. */
+static RecompPostMortemGameSectionFn g_game_section_fn;
+
+void recomp_post_mortem_set_game_section(RecompPostMortemGameSectionFn fn) {
+    g_game_section_fn = fn;
+}
 
 /* Mutex so on-demand TCP dump and SEH/atexit dump can't race. */
 #ifdef _WIN32
@@ -367,6 +387,88 @@ static void dump_tripwires_json(FILE *f) {
     }
     fprintf(f, "  },\n");
 
+    /* DB tripwire */
+    fprintf(f,
+        "  \"db_tripwire\": {\n"
+        "    \"armed\": %u, \"triggered\": %u, \"target_db\": %u",
+        (unsigned)g_db_tripwire.armed,
+        (unsigned)g_db_tripwire.triggered,
+        (unsigned)g_db_tripwire.target_db);
+    if (g_db_tripwire.triggered) {
+        char esc[128];
+        fprintf(f,
+            ",\n    \"frame\": %d, \"trip_pc24\": %u,\n"
+            "    \"old_db\": %u, \"new_db\": %u, \"trip_event_type\": %u,\n"
+            "    \"trip_boundary_seq\": %llu, \"trip_trace_idx\": %llu,\n"
+            "    \"cpu\": {\"A\":%u,\"X\":%u,\"Y\":%u,\"S\":%u,\"D\":%u,"
+            "\"DB\":%u,\"PB\":%u,\"P\":%u,"
+            "\"m_flag\":%u,\"x_flag\":%u,\"e_flag\":%u},\n",
+            g_db_tripwire.frame,
+            (unsigned)g_db_tripwire.trip_pc24,
+            (unsigned)g_db_tripwire.old_db,
+            (unsigned)g_db_tripwire.new_db,
+            (unsigned)g_db_tripwire.trip_event_type,
+            (unsigned long long)g_db_tripwire.trip_boundary_seq,
+            (unsigned long long)g_db_tripwire.trip_trace_idx,
+            (unsigned)g_db_tripwire.A, (unsigned)g_db_tripwire.X,
+            (unsigned)g_db_tripwire.Y, (unsigned)g_db_tripwire.S,
+            (unsigned)g_db_tripwire.D,
+            (unsigned)g_db_tripwire.DB, (unsigned)g_db_tripwire.PB,
+            (unsigned)g_db_tripwire.P,
+            (unsigned)g_db_tripwire.m_flag,
+            (unsigned)g_db_tripwire.x_flag,
+            (unsigned)g_db_tripwire.e_flag);
+        json_escape(g_db_tripwire.last_func, esc, sizeof(esc));
+        fprintf(f, "    \"last_func\": \"%s\",\n", esc);
+        fprintf(f, "    \"stack\": [");
+        for (int i = 0; i < g_db_tripwire.stack_depth; i++) {
+            json_escape(g_db_tripwire.stack[i], esc, sizeof(esc));
+            fprintf(f, "%s\"%s\"", (i ? "," : ""), esc);
+        }
+        fprintf(f, "],\n    \"dbpb_history\": [");
+        for (int i = 0; i < g_db_tripwire.dbpb_count; i++) {
+            const CpuDbpbEvent *d = &g_db_tripwire.dbpb_history[i];
+            fprintf(f,
+                "%s{\"pc24\":%u,\"type\":\"%s\",\"reg\":\"%s\","
+                "\"old\":%u,\"new\":%u,\"S\":%u}",
+                (i ? "," : ""),
+                (unsigned)d->pc24,
+                trace_event_name(d->event_type),
+                d->reg_id == 0 ? "DB" : "PB",
+                (unsigned)d->old_val,
+                (unsigned)d->new_val,
+                (unsigned)d->S);
+        }
+        fprintf(f, "],\n    \"boundary_history\": [");
+        {
+            int bd_count = g_db_tripwire.bd_count;
+            if (bd_count > 128) bd_count = 128;
+            for (int i = 0; i < bd_count; i++) {
+                const BoundaryEvent *e = &g_db_tripwire.bd_history[i];
+                json_escape(e->name, esc, sizeof(esc));
+                fprintf(f,
+                    "%s{\"seq\":%llu,\"entry_seq\":%llu,\"frame\":%d,"
+                    "\"kind\":%u,\"name\":\"%s\","
+                    "\"S\":%u,\"D\":%u,\"DB\":%u,\"PB\":%u,\"depth\":%u}",
+                    (i ? "," : ""),
+                    (unsigned long long)e->seq,
+                    (unsigned long long)e->entry_seq,
+                    e->frame,
+                    (unsigned)e->kind,
+                    esc,
+                    (unsigned)e->S,
+                    (unsigned)e->D,
+                    (unsigned)e->DB,
+                    (unsigned)e->PB,
+                    (unsigned)e->stack_depth);
+            }
+        }
+        fprintf(f, "]\n");
+    } else {
+        fprintf(f, "\n");
+    }
+    fprintf(f, "  },\n");
+
     /* PX tripwire */
     fprintf(f,
         "  \"px_tripwire\": {\n"
@@ -620,7 +722,17 @@ void recomp_post_mortem_dump(const char *reason, void *fault_info) {
         host_report_write_minidump(fault_info);
 
     FILE *f = fopen(kReportPath, "w");
-    if (!f) { dump_unlock(); return; }
+    if (!f) {
+        /* Silence here meant the report simply did not exist, with nothing
+         * said — and a tree whose working directory was not writable lost
+         * every dump that way. An always-on instrument reports its own
+         * failure (recomp-ai-rules/PRINCIPLES.md, "a known-broken tool is
+         * the task"). */
+        fprintf(stderr, "[post_mortem] cannot write %s: %s\n",
+                kReportPath, strerror(errno));
+        dump_unlock();
+        return;
+    }
 
     char timebuf[64] = "?";
     time_t tt = time(NULL);
@@ -647,10 +759,33 @@ void recomp_post_mortem_dump(const char *reason, void *fault_info) {
     dump_status_json(f);
     dump_hardware_state_json(f);
     dump_recomp_stack_json(f);
+    if (g_game_section_fn)
+        g_game_section_fn(f);
+    /* Unconditional: every one of these is a runner ring that exists in all
+     * configurations, and each answers a question this report was otherwise
+     * silent on — whether the guest stack balanced, what was abandoned
+     * unresolved, what the dispatcher actually routed, and what the PPU/DMA
+     * engine did last. They were in SuperMetroidRecomp's fork only. */
+    RecompStackBalDumpJson(f);
+    CpuUnresolvedAbandonDumpJson(f);
+    CpuDispatchLogDumpJson(f);
+    ppudma_dump_json(f);
 #if SNESRECOMP_POST_MORTEM_TIER2
     Tier2CoverageDumpJson(f);
 #endif
-    dump_trace_recent_json(f, 256);
+    /* Retained-trace depth. 256 events covers roughly eleven frames, which is
+     * not enough for a stall that has to be read BACKWARD to the last
+     * main-thread activity. Overridable so an investigation can widen the
+     * window without a rebuild. */
+    {
+        int trace_n = 256;
+        const char *tn = getenv("SNESRECOMP_POSTMORTEM_TRACE_N");
+        if (tn && *tn) {
+            long v = strtol(tn, NULL, 0);
+            if (v > 0 && v <= 2000000) trace_n = (int)v;
+        }
+        dump_trace_recent_json(f, trace_n);
+    }
     dump_dbpb_recent_json(f);
     dump_tripwires_json(f);
     dump_all_threads_json(f, fault_info);

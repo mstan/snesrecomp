@@ -482,3 +482,16 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## third_party/gl_core — OpenGL 3.1 core loader
+
+`third_party/gl_core/gl_core_3_1.{c,h}` is generated output from
+[glLoadGen](https://github.com/Alfonse/glLoadGen) (Jason McKesson, "Alfonse"),
+an OpenGL loader generator. glLoadGen is distributed under the MIT licence and
+its generated loaders are explicitly unencumbered — the generator's own
+documentation places no restriction on the output.
+
+It arrived here from the desktop hosts of the SNES ports, seven of which
+carried byte-identical copies of these two files alongside byte-identical
+copies of the GL presenter that uses them. It is vendored once, here, so that
+`runner/src/desktop/opengl.c` has a loader to call and a port does not.

@@ -12,6 +12,11 @@
 # of this list — it is a developer-only verify backend, off for normal builds.
 
 set(SNESRECOMP_RUNNER_ROOT ${CMAKE_CURRENT_LIST_DIR})
+# The framework checkout itself (runner/..). Derived, not taken from the
+# caller's SNESRECOMP_ROOT: that one is the includer's own spelling and a
+# project is free not to define it at all.
+get_filename_component(SNESRECOMP_FRAMEWORK_ROOT
+    "${SNESRECOMP_RUNNER_ROOT}/.." ABSOLUTE)
 
 # Portable toolchain packs (retcomm-toolchains cmake-clang-v1) compile and link
 # against a bundled sysroot -- clang.cfg passes --sysroot itself -- and their
@@ -904,6 +909,30 @@ function(snesrecomp_target_glsl_shader target)
     if(NOT MSVC)
         target_link_libraries(${target} PRIVATE m)
     endif()
+endfunction()
+
+# Shared desktop OpenGL presenter: the GL 3.1 loader, the GLSL preset
+# renderer, and the presenter that ties them to the window.
+#
+# util.h has always declared OpenGLRenderer_Create and mmx23_host_main.inc has
+# always called it, but no implementation shipped here -- so seven ports each
+# vendored their own ~225-line copy plus a byte-identical copy of the loader.
+# One of those copies centred the viewport only horizontally, for years,
+# because nothing compared them.
+#
+# Brings snesrecomp_target_glsl_shader() with it: a preset renderer with no
+# presenter to call it is not useful on its own, and the two were always
+# enabled together.
+function(snesrecomp_target_opengl target)
+    snesrecomp_target_glsl_shader(${target})
+    target_sources(${target} PRIVATE
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/opengl.c
+        ${SNESRECOMP_FRAMEWORK_ROOT}/third_party/gl_core/gl_core_3_1.c)
+    target_include_directories(${target} PRIVATE
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop
+        ${SNESRECOMP_FRAMEWORK_ROOT}/third_party/gl_core)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(${target} PRIVATE OpenGL::GL)
 endfunction()
 
 # Shared configuration/keybinding implementation used by the Mega Man X

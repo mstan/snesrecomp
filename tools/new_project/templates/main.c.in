@@ -124,12 +124,36 @@ static void netplay_poll_events(void *ctx, int *want_soft_exit)
 
 extern Ppu *g_ppu;
 
-/* The framework calls this to hand the host a frame. renderBuffer is the
- * PPU's composited output in the runner's native layout. */
+/* The PPU rasterizes into this, not straight into the host texture: the
+ * texture is only mapped for the instant of the present, while the line
+ * renderer needs a stable target for the whole field (and the raster IRQ
+ * runs guest code in the middle of it). Sized for the runner's maximum
+ * side-space budget so a widescreen build needs no second buffer. */
+static uint8_t g_my_pixels[kPpuBufWidth * 4 * 240];
+
+/* The framework calls this to hand the host a frame.
+ *
+ * Three steps, and leaving out any one of them produces a black window:
+ *
+ *   1. PpuBeginDrawing points the PPU at a render target. Without it
+ *      ppu->renderBuffer is NULL and the first ppu_runLine segfaults.
+ *   2. The game's own draw_ppu_frame() rasterizes the field — ppu_runLine
+ *      per line, HDMA, the raster IRQ. Nothing else in a production build
+ *      calls it: common_rtl.c's call site is inside #ifdef SNES_COSIM, so
+ *      the host is the only caller there is.
+ *   3. RtlWidescreenPresent copies the result into the mapped texture.
+ *
+ * Steps 1 and 2 were both missing here until 2026-09, so every project this
+ * template produced presented an untouched texture forever, and read as
+ * "the recompiler does not boot my game". */
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags)
 {
-    (void)render_flags;
-    if (!g_ppu || !g_ppu->renderBuffer)
+    if (!g_ppu)
+        return;
+    PpuBeginDrawing(g_ppu, g_my_pixels, GAME_WIDTH * 4, render_flags);
+    if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+        g_rtl_game_info->draw_ppu_frame();
+    if (!g_ppu->renderBuffer)
         return;
     RtlWidescreenPresent(pixel_buffer, pitch, g_ppu->renderBuffer,
                          GAME_WIDTH, GAME_HEIGHT);
