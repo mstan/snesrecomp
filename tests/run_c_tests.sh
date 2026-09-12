@@ -302,7 +302,8 @@ echo "=== lobby mod plan (match_caps.mods wire shape) ==="
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/lobby" \
     -I "$ROOT/runner/src/lobby/ws" -I "$ROOT/lib/recomp-net/include" \
     "$ROOT/tests/netplay/lobby_mod_plan_test.c" \
-    "$ROOT"/runner/src/lobby/ws/*.c \
+    "$ROOT/lib/recomp-net/src/chat/rnet_chat_filter.c" \
+    "$ROOT/lib/recomp-net/src/chat/rnet_chat_report.c" \
     -o "$OUT/lobby_mod_plan_test"
 "$OUT/lobby_mod_plan_test"
 
@@ -355,11 +356,11 @@ OSD_SDL_BACKEND=""
 if pkg-config --exists sdl3 2>/dev/null; then
     OSD_SDL_CFLAGS="$(pkg-config --cflags sdl3)"
     OSD_SDL_LIBS="$(pkg-config --libs sdl3)"
-    OSD_SDL_BACKEND="-DSNESRECOMP_SDL_BACKEND=3"
+    OSD_SDL_BACKEND="-DSNESRECOMP_SDL3=1"
 elif pkg-config --exists sdl2 2>/dev/null; then
     OSD_SDL_CFLAGS="$(pkg-config --cflags sdl2)"
     OSD_SDL_LIBS="$(pkg-config --libs sdl2)"
-    OSD_SDL_BACKEND="-DSNESRECOMP_SDL_BACKEND=2"
+    OSD_SDL_BACKEND=""
 fi
 if [ -n "$OSD_SDL_LIBS" ]; then
     # shellcheck disable=SC2086
@@ -391,5 +392,14 @@ echo "=== rewind ring (ordering, clamping, what commit discards) ==="
     -I "$ROOT/runner/src" \
     "$ROOT/tests/rewind/rewind_test.c" \
     "$ROOT/runner/src/snes_rewind.c" \
+    "$ROOT/runner/src/snes_overlay_draw.c" \
     -o "$OUT/rewind_test"
 "$OUT/rewind_test"
+
+echo "=== Super FX state and presentation isolation ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$ROOT/runner/src" \
+    "$ROOT/tests/superfx/enhancement_opt_in_test.c" \
+    "$ROOT/runner/src/snes/superfx.c" \
+    -o "$OUT/superfx_state_test"
+"$OUT/superfx_state_test"

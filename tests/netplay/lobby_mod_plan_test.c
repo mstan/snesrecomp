@@ -80,6 +80,11 @@ int rnet_ws_write_text(int fd, const char *text, int client_mask)
     abort();
 }
 
+const char *rnet_account_session(void)
+{
+    XFER_TRAP("rnet_account_session");
+}
+
 /* Stands in for the mod runtime: two installed packages. */
 static int two_pkg_offer(SnesLobbyModPkg *out, int max, void *ctx)
 {
@@ -684,9 +689,9 @@ static void case_chat_ring_keeps_room_order(void)
     memset(&g_lc, 0, sizeof(g_lc));
     snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "me");
 
-    chat_push("them", "Them", "first", 0);
-    chat_push("me",   "Me",   "second", 0);
-    chat_push("",     "",     "third", 1);
+    chat_push("them", "", "Them", "first", "", 0);
+    chat_push("me",   "", "Me",   "second", "", 0);
+    chat_push("",     "", "",     "third", "", 1);
 
     ck(snes_lobby_chat_count() == 3, "three lines land");
     ck(snes_lobby_chat_get(0, &got) && strcmp(got.text, "first") == 0,
@@ -726,7 +731,7 @@ static void case_chat_ring_wraps_oldest_first(void)
      * chat that discards what was just said is worse than no chat. */
     for (i = 0; i < SNES_LOBBY_CHAT_RING + 10; ++i) {
         snprintf(buf, sizeof(buf), "line%d", i);
-        chat_push("them", "Them", buf, 0);
+        chat_push("them", "", "Them", buf, "", 0);
     }
     ck(snes_lobby_chat_count() == SNES_LOBBY_CHAT_RING,
        "the ring stops at its capacity");
@@ -742,11 +747,11 @@ static void case_chat_ignores_empty_and_clears(void)
 {
     printf("  chat empty/clear\n");
     memset(&g_lc, 0, sizeof(g_lc));
-    chat_push("them", "Them", "", 0);
-    chat_push("them", "Them", NULL, 0);
+    chat_push("them", "", "Them", "", "", 0);
+    chat_push("them", "", "Them", NULL, "", 0);
     ck(snes_lobby_chat_count() == 0, "an empty line is not a line");
 
-    chat_push("them", "Them", "hello", 0);
+    chat_push("them", "", "Them", "hello", "", 0);
     ck(snes_lobby_chat_count() == 1, "a real line is");
     {
         SnesLobbyChatMsg m;
@@ -755,7 +760,7 @@ static void case_chat_ignores_empty_and_clears(void)
         before = m.seq;
         snes_lobby_chat_clear();
         ck(snes_lobby_chat_count() == 0, "clear empties the room log");
-        chat_push("them", "Them", "new room", 0);
+        chat_push("them", "", "Them", "new room", "", 0);
         (void)snes_lobby_chat_get(0, &m);
         /* seq must NOT restart: a UI tracking "newest seen" would otherwise
          * mistake the first line of a new room for one it already scrolled

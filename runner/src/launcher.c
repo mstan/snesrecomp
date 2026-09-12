@@ -39,10 +39,6 @@ static int first_positional_arg(int argc, char **argv) {
     return 0;
 }
 
-static int has_positional_rom(int argc, char **argv) {
-    return first_positional_arg(argc, argv) != 0;
-}
-
 static void copy_path_fallback(const char *path,
                                char *out_path, size_t max_len) {
     strncpy(out_path, path, max_len - 1);
