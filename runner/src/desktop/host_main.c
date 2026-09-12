@@ -886,6 +886,314 @@ static uint32 OverlayNavInputs(void) {
   return g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons;
 }
 
+/* Controller and joystick events, in ONE place, because the overlays' modal
+ * pumps must see them too. They did not: the save-state browser's loop
+ * handled quit and keyboard events only, so a pad's d-pad, B and shoulders
+ * never reached the panel while it was open. A controller player pressed
+ * Select+R, the guest froze as designed, and then nothing they pressed did
+ * anything -- which reads as "the save-state menu freezes the game". A
+ * keyboard player never saw it, and the headless self-test injects pad words
+ * below the event layer, so it never saw it either. Returns true when the
+ * event was one of ours. */
+static bool HandleDeviceEvent(const SDL_Event *event) {
+  GamepadInfo *gi;
+  switch (event->type) {
+  case SDL_CONTROLLERDEVICEADDED:
+    OpenOneGamepad(event->cdevice.which);
+    return true;
+  case SDL_CONTROLLERDEVICEREMOVED:
+    gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_DEVICE(*event));
+    if (gi) {
+      memset(gi, 0, sizeof(GamepadInfo));
+      gi->joystick_id = -1;
+    }
+    return true;
+  case SDL_CONTROLLERAXISMOTION:
+    gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_AXIS_DEVICE(*event));
+    if (gi)
+      HandleGamepadAxisInput(gi, SNESRECOMP_SDL_EVENT_AXIS(*event),
+                             SNESRECOMP_SDL_EVENT_AXIS_VALUE(*event));
+    return true;
+  case SDL_CONTROLLERBUTTONDOWN:
+  case SDL_CONTROLLERBUTTONUP:
+    gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_BUTTON_DEVICE(*event));
+    if (gi) {
+      int b = RemapSdlButton(SNESRECOMP_SDL_EVENT_BUTTON(*event));
+      if (b >= 0)
+        HandleGamepadInput(gi, b, event->type == SDL_CONTROLLERBUTTONDOWN);
+    }
+    return true;
+  /* Unmapped joysticks (no SDL_GameController mapping): the raw Steam
+   * virtual gamepad layout is the standard Xbox button order. */
+  case SDL_JOYDEVICEADDED:
+    OpenOneJoystick(event->jdevice.which);
+    return true;
+  case SDL_JOYDEVICEREMOVED:
+    gi = GetGamepadInfo(event->jdevice.which);
+    if (gi && gi->raw_joystick) {
+      if (gi->joystick) SDL_JoystickClose(gi->joystick);
+      memset(gi, 0, sizeof(GamepadInfo));
+      gi->joystick_id = -1;
+    }
+    return true;
+  case SDL_JOYAXISMOTION:
+    gi = GetGamepadInfo(event->jaxis.which);
+    if (gi && gi->raw_joystick)
+      HandleGamepadAxisInput(gi, event->jaxis.axis, event->jaxis.value);
+    return true;
+  case SDL_JOYBUTTONDOWN:
+  case SDL_JOYBUTTONUP:
+    gi = GetGamepadInfo(event->jbutton.which);
+    if (gi && gi->raw_joystick && event->jbutton.button < 15) {
+      static const uint8 raw_buttons[] = {
+        kGamepadBtn_A, kGamepadBtn_B, kGamepadBtn_X, kGamepadBtn_Y,
+        kGamepadBtn_Back, kGamepadBtn_Guide, kGamepadBtn_Start,
+        kGamepadBtn_L3, kGamepadBtn_R3, kGamepadBtn_L1, kGamepadBtn_R1,
+        kGamepadBtn_DpadUp, kGamepadBtn_DpadDown,
+        kGamepadBtn_DpadLeft, kGamepadBtn_DpadRight
+      };
+      HandleGamepadInput(gi, raw_buttons[event->jbutton.button],
+                         event->type == SDL_JOYBUTTONDOWN);
+    }
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* True while a panel owns the screen. Pad buttons bound to system commands
+ * (a state load on a gamepad button, say) are dropped meanwhile: the browser
+ * is asking which state to load, and a load behind it is the same class of
+ * bug as F1 through HandleInput. Controller bits still flow, so the panel
+ * can be navigated. */
+static bool g_overlay_modal;
+
+/* Buttons still held when a panel closed, masked from the guest until each
+ * is released. The button that closed the panel must not also act in the
+ * game: B closes rewind and B is jump or fire in most titles, so a frame of
+ * it leaking is a jump the player did not make. The save-state browser's
+ * module carries this guard for itself (snes_savestate_menu_filter_guest_input);
+ * the rewind module does not, so the host applies it to both. */
+static uint32 g_overlay_release_mask;
+static void OverlayNoteClosed(void) {
+  g_overlay_release_mask |= OverlayNavInputs();
+}
+static uint32 OverlayFilterGuestInput(uint32 inputs) {
+  g_overlay_release_mask &= inputs;   /* a released button drops out */
+  return inputs & ~g_overlay_release_mask;
+}
+
+/* The overlays' event pump. Quit ends the run; a key press goes to the panel
+ * through `key_down` and never through HandleInput; a key release still
+ * reaches HandleInput so a direction held across the close does not stick
+ * in the guest afterwards; and every controller event is handled exactly as
+ * the main loop handles it. */
+static void PumpOverlayEvents(bool *running, void (*key_down)(int key, int repeat)) {
+  SDL_Event event;
+  while (SDL_PollEvent(&event)) {
+    if (HandleDeviceEvent(&event))
+      continue;
+    switch (event.type) {
+    case SDL_QUIT:
+      *running = false;
+      break;
+    case SDL_KEYDOWN:
+      key_down(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_REPEAT(event));
+      break;
+    case SDL_KEYUP:
+      HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), false);
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+/* Rewind's controller gesture, config.ini [Controller] RewindGesture (default
+ * Select+R3; "none" disables). Pad buttons joined with '+': the SNES names
+ * (b y select start up down left right a x l r) come from seat 0's input
+ * word, and l3/r3 -- which the SNES pad has no bit for -- from the gamepad's
+ * own held-button set. A gesture of fewer than two buttons is refused: one
+ * ordinary button pressed in the middle of a fight is not a gesture, which
+ * is how a per-game host once opened rewind on a boost dash. */
+static uint16 g_rewind_gesture_pad;      /* SNES_PAD_* bits, all required */
+static uint32 g_rewind_gesture_raw;      /* kGamepadBtn_* bits, all required */
+static bool g_rewind_gesture_ok;
+static void RewindGestureConfigure(void) {
+  static const struct { const char *name; uint16 bit; } kNames[] = {
+    { "b", SNES_PAD_B }, { "y", SNES_PAD_Y }, { "select", SNES_PAD_SELECT },
+    { "back", SNES_PAD_SELECT }, { "start", SNES_PAD_START },
+    { "up", SNES_PAD_UP }, { "down", SNES_PAD_DOWN }, { "left", SNES_PAD_LEFT },
+    { "right", SNES_PAD_RIGHT }, { "a", SNES_PAD_A }, { "x", SNES_PAD_X },
+    { "l", SNES_PAD_L }, { "r", SNES_PAD_R },
+  };
+  char spec[sizeof(g_config.rewind_gesture)];
+  int bad = 0, held = 0;
+  g_rewind_gesture_pad = 0;
+  g_rewind_gesture_raw = 0;
+  g_rewind_gesture_ok = false;
+  snprintf(spec, sizeof(spec), "%s", g_config.rewind_gesture[0] ? g_config.rewind_gesture : "Select+R3");
+  for (char *c = spec; *c; c++)
+    if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+  if (!strcmp(spec, "none")) {
+    fprintf(stderr, "[rewind] pad gesture disabled ([Controller] RewindGesture = none)\n");
+    return;
+  }
+  for (const char *p = spec; *p; ) {
+    char tok[24];
+    size_t n = 0;
+    while (*p == ' ' || *p == '+') ++p;
+    while (*p && *p != '+' && *p != ' ' && n + 1 < sizeof(tok))
+      tok[n++] = *p++;
+    tok[n] = '\0';
+    while (*p && *p != '+') ++p;
+    if (!tok[0]) continue;
+    if (!strcmp(tok, "r3")) { g_rewind_gesture_raw |= 1u << kGamepadBtn_R3; held++; continue; }
+    if (!strcmp(tok, "l3")) { g_rewind_gesture_raw |= 1u << kGamepadBtn_L3; held++; continue; }
+    int hit = 0;
+    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i) {
+      if (strcmp(tok, kNames[i].name)) continue;
+      g_rewind_gesture_pad |= kNames[i].bit;
+      held++;
+      hit = 1;
+      break;
+    }
+    if (!hit) {
+      fprintf(stderr, "[rewind] unknown button \"%s\" in [Controller] RewindGesture\n", tok);
+      bad = 1;
+    }
+  }
+  if (bad || held < 2) {
+    fprintf(stderr, "[rewind] \"%s\" is not a usable gesture; using Select+R3\n", spec);
+    g_rewind_gesture_pad = SNES_PAD_SELECT;
+    g_rewind_gesture_raw = 1u << kGamepadBtn_R3;
+  }
+  g_rewind_gesture_ok = true;
+}
+/* Edge-triggered: true on the frame the whole gesture becomes held. */
+static bool RewindGesturePressed(void) {
+  static bool was_held;
+  if (!g_rewind_gesture_ok) return false;
+  const uint32 pad = OverlayNavInputs();
+  const uint32 raw = g_gamepad[0].modifiers;
+  const bool held = (pad & g_rewind_gesture_pad) == g_rewind_gesture_pad &&
+                    (raw & g_rewind_gesture_raw) == g_rewind_gesture_raw;
+  const bool pressed = held && !was_held;
+  was_held = held;
+  return pressed;
+}
+
+/* Pad self-test (SNESRECOMP_OVERLAY_SELFTEST_PAD=<frame>, off by default).
+ *
+ * Attaches a VIRTUAL gamepad and drives the overlays with it, so the whole
+ * path from SDL event to panel is exercised: device open, [GamepadMap]
+ * mapping, the modal pumps, the gestures. The word-injecting self-test above
+ * enters below the event layer and so proved nothing about a controller --
+ * the bug this exists for (pad events dropped while a panel was open) passed
+ * it. Sequence: at <frame> hold Select+R (the browser gesture); inside the
+ * browser release, press Down, then B to close; 60 frames later hold
+ * Select+R3 (the rewind gesture); inside rewind release, press Left, then B.
+ * Each panel must close from the pad within 40 pumps or the test says FAIL. */
+static SDL_Joystick *g_selftest_pad;
+static long g_selftest_pad_frame = -2;
+static int g_selftest_pad_phase;      /* 0 idle, 1 browser, 2 rewind */
+static int g_selftest_pad_failed;
+static int g_selftest_pad_opened;     /* bit 1: browser opened, bit 2: rewind */
+/* While the self-test is armed, only the virtual pad is opened: a real
+ * controller plugged in would take player 1 and the virtual one would land
+ * on seat 2, where no overlay gesture reads -- and a test that then finds
+ * nothing to fail inside the panels would report success. */
+static bool SelftestPadExcludes(SDL_JoystickID id) {
+  return g_selftest_pad && SDL_JoystickInstanceID(g_selftest_pad) != id;
+}
+static void SelftestPadSet(int button, bool down) {
+  if (!g_selftest_pad) return;
+#if SNESRECOMP_SDL3
+  SDL_SetJoystickVirtualButton(g_selftest_pad, button, down);
+#else
+  SDL_JoystickSetVirtualButton(g_selftest_pad, button, down ? SDL_PRESSED : SDL_RELEASED);
+#endif
+}
+static void SelftestPadReleaseAll(void) {
+  for (int b = 0; b < 15; b++) SelftestPadSet(b, false);
+}
+static void OverlaySelftestPadAttach(void) {
+  const char *v = HostGetenv("OVERLAY_SELFTEST_PAD");
+  g_selftest_pad_frame = v ? strtol(v, NULL, 0) : -1;
+  if (g_selftest_pad_frame < 0) return;
+#if SNESRECOMP_SDL3
+  SDL_VirtualJoystickDesc desc;
+  SDL_INIT_INTERFACE(&desc);
+  desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+  desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+  desc.nbuttons = 15;
+  desc.name = "snesrecomp self-test pad";
+  SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+  g_selftest_pad = id ? SDL_OpenJoystick(id) : NULL;
+#else
+  int index = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER,
+                                        SDL_CONTROLLER_AXIS_MAX, 15, 0);
+  g_selftest_pad = index >= 0 ? SDL_JoystickOpen(index) : NULL;
+#endif
+  fprintf(stderr, "[overlay_selftest_pad] virtual gamepad %s\n",
+          g_selftest_pad ? "attached" : "FAILED to attach");
+  if (!g_selftest_pad) g_selftest_pad_failed = 1;
+}
+/* Main-loop tick: presses the gestures on their frames, releases otherwise. */
+static void OverlaySelftestPadMainTick(unsigned frame) {
+  static unsigned last_frame = ~0u;
+  if (!g_selftest_pad) return;
+  /* The main loop iterates more than once per simulated frame while it
+   * paces; act once per frame. */
+  if (frame == last_frame) return;
+  last_frame = frame;
+  if ((long)frame == g_selftest_pad_frame) {
+    fprintf(stderr, "[overlay_selftest_pad] frame %u: holding Select+R on the pad\n", frame);
+    g_selftest_pad_phase = 1;
+    SelftestPadSet(SDL_CONTROLLER_BUTTON_BACK, true);
+    SelftestPadSet(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, true);
+  } else if ((long)frame == g_selftest_pad_frame + 60) {
+    fprintf(stderr, "[overlay_selftest_pad] frame %u: holding Select+R3 on the pad\n", frame);
+    g_selftest_pad_phase = 2;
+    SelftestPadSet(SDL_CONTROLLER_BUTTON_BACK, true);
+    SelftestPadSet(SDL_CONTROLLER_BUTTON_RIGHTSTICK, true);
+  } else if ((long)frame == g_selftest_pad_frame + 120) {
+    if (g_selftest_pad_opened != 3) {
+      fprintf(stderr, "[overlay_selftest_pad] FAIL: %s never opened from the pad gesture\n",
+              !(g_selftest_pad_opened & 1) ? "the save-state browser" : "rewind");
+      g_selftest_pad_failed = 1;
+    }
+    fprintf(stderr, "[overlay_selftest_pad] %s\n",
+            g_selftest_pad_failed ? "FAIL" : "ok: browser and rewind both opened and closed from the pad");
+  } else {
+    SelftestPadReleaseAll();
+  }
+}
+/* Modal-pump tick, called by both overlay loops. */
+static void OverlaySelftestPadTick(unsigned pump) {
+  if (!g_selftest_pad || !g_selftest_pad_phase) return;
+  const int nav = g_selftest_pad_phase == 1 ? SDL_CONTROLLER_BUTTON_DPAD_DOWN
+                                            : SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+  if (pump == 0) g_selftest_pad_opened |= g_selftest_pad_phase;
+  switch (pump) {
+  case 2:  SelftestPadReleaseAll(); break;
+  case 6:  SelftestPadSet(nav, true); break;
+  case 9:  SelftestPadSet(nav, false); break;
+  /* SDL's south button: SNES B under the default [GamepadMap] (pad "A"
+   * is the SNES B, pad "B" is the SNES A). The east button would be the
+   * SNES A -- load in the browser, commit in rewind -- which is exactly the
+   * wrong one to test "close" with, and this test first did. */
+  case 14: SelftestPadSet(SDL_CONTROLLER_BUTTON_A, true); break;
+  case 40:
+    fprintf(stderr, "[overlay_selftest_pad] FAIL: %s did not close from the pad within 40 pumps\n",
+            g_selftest_pad_phase == 1 ? "save-state browser" : "rewind");
+    g_selftest_pad_failed = 1;
+    if (g_selftest_pad_phase == 1) snes_savestate_menu_close(); else snes_rewind_close();
+    break;
+  default: break;
+  }
+}
+
 /* Present a frozen field with an overlay on top, WITHOUT running guest code.
  *
  * The draw buffer is requested at the panel's own resolution (512x448, twice
@@ -976,36 +1284,37 @@ static void RunSavestateMenuLoop(bool *running) {
   unsigned frames = 0;
   host_report_breadcrumb("save-state browser OPEN - guest frozen until it "
                          "closes (pad B, or Escape/Backspace on the keyboard)");
+  g_overlay_modal = true;
   while (snes_savestate_menu_is_open() && *running) {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-      switch (event.type) {
-      case SDL_QUIT:
-        *running = false;
-        snes_savestate_menu_close();
-        break;
-      case SDL_KEYDOWN:
-        /* Straight to the overlay, NOT through HandleInput: the game's own
-         * hotkeys must not fire while a panel owns the screen (F1 would load
-         * a state behind the browser that is asking which state to load). */
-        snes_savestate_menu_handle_key(SNESRECOMP_SDL_EVENT_KEY(event),
-                                       SNESRECOMP_SDL_EVENT_REPEAT(event));
-        break;
-      case SDL_KEYUP:
-        /* Keep the keyboard's view of held keys honest so a direction held
-         * across the close does not stick in the guest afterwards. */
-        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event),
-                    SNESRECOMP_SDL_EVENT_MOD(event), false);
-        break;
-      }
-    }
+    /* Key presses go straight to the overlay, NOT through HandleInput: the
+     * game's own hotkeys must not fire while a panel owns the screen (F1
+     * would load a state behind the browser that is asking which state to
+     * load). */
+    PumpOverlayEvents(running, &snes_savestate_menu_handle_key);
+    if (!*running)
+      snes_savestate_menu_close();
+    OverlaySelftestPadTick(frames);
     snes_savestate_menu_poll_nav(OverlayNavInputs(), SDL_GetTicks());
     PresentFrozenWithOverlay();
     SDL_Delay(8);
     frames++;
   }
+  g_overlay_modal = false;
+  OverlayNoteClosed();
   host_report_breadcrumb("save-state browser CLOSED after %u pumps - guest resuming",
                          frames);
+}
+
+static void RewindKeyDown(int key, int repeat) {
+  (void)repeat;
+  switch (key) {
+  case SDLK_LEFT:   snes_rewind_step(-1); break;
+  case SDLK_RIGHT:  snes_rewind_step(+1); break;
+  case SDLK_RETURN:
+  case SDLK_SPACE:  snes_rewind_commit(); break;
+  case SDLK_ESCAPE: snes_rewind_close();  break;
+  default: break;
+  }
 }
 
 /* Rewind's modal pump. It needs its own: snes_rewind exposes step/commit/close
@@ -1019,30 +1328,12 @@ static void RunRewindLoop(bool *running) {
   unsigned frames = 0;
   host_report_breadcrumb("rewind filmstrip OPEN - guest frozen until it closes "
                          "(pad B, or Escape; Left/Right scrub, A or Enter commits)");
+  g_overlay_modal = true;
   while (snes_rewind_is_open() && *running) {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-      switch (event.type) {
-      case SDL_QUIT:
-        *running = false;
-        snes_rewind_close();
-        break;
-      case SDL_KEYDOWN:
-        switch (SNESRECOMP_SDL_EVENT_KEY(event)) {
-        case SDLK_LEFT:   snes_rewind_step(-1); break;
-        case SDLK_RIGHT:  snes_rewind_step(+1); break;
-        case SDLK_RETURN:
-        case SDLK_SPACE:  snes_rewind_commit(); break;
-        case SDLK_ESCAPE: snes_rewind_close();  break;
-        default: break;
-        }
-        break;
-      case SDL_KEYUP:
-        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event),
-                    SNESRECOMP_SDL_EVENT_MOD(event), false);
-        break;
-      }
-    }
+    PumpOverlayEvents(running, &RewindKeyDown);
+    if (!*running)
+      snes_rewind_close();
+    OverlaySelftestPadTick(frames);
     {
       /* Edge-triggered, with a hold-to-repeat: holding Left must not sprint
        * through the whole ring in a single pass of this loop. */
@@ -1073,6 +1364,8 @@ static void RunRewindLoop(bool *running) {
     SDL_Delay(8);
     frames++;
   }
+  g_overlay_modal = false;
+  OverlayNoteClosed();
   host_report_breadcrumb("rewind filmstrip CLOSED after %u pumps - guest resuming",
                          frames);
   GameReset();
@@ -1596,6 +1889,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
       g_config.output_method, g_config.new_renderer, g_config.window_scale,
       g_config.fullscreen, g_config.enable_audio, g_config.audio_freq,
       g_config.audio_samples);
+  RewindGestureConfigure();
 
 #if SNESRECOMP_ENABLE_MODS
   /* Before the launcher, which needs the provider to show the Mods page.
@@ -2095,6 +2389,7 @@ error_reading:;
   MkDir("saves");
   RtlReadSram();
 
+  OverlaySelftestPadAttach();
   {
 #if SNESRECOMP_SDL3
     int njs = 0;
@@ -2155,7 +2450,6 @@ error_reading:;
   double profile_window_start = 0;
   double run_start = MonotonicSeconds();
   uint8 audiopaused = true;
-  GamepadInfo *gi;
   SnesHostClock video_clock;
   double presentation_hz = WantedPresentationHz(DisplayRefresh());
   if (presentation_hz <= 0) presentation_hz = g_simulation_hz;
@@ -2177,66 +2471,9 @@ error_reading:;
 
     double event_profile_start = ProfileStart();
     while (SDL_PollEvent(&event)) {
+      if (HandleDeviceEvent(&event))
+        continue;
       switch (event.type) {
-      case SDL_CONTROLLERDEVICEADDED:
-        OpenOneGamepad(event.cdevice.which);
-        break;
-      case SDL_CONTROLLERDEVICEREMOVED:
-        gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_DEVICE(event));
-        if (gi) {
-          memset(gi, 0, sizeof(GamepadInfo));
-          gi->joystick_id = -1;
-        }
-        break;
-      case SDL_CONTROLLERAXISMOTION:
-        gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_AXIS_DEVICE(event));
-        if (gi)
-          HandleGamepadAxisInput(gi, SNESRECOMP_SDL_EVENT_AXIS(event),
-                                 SNESRECOMP_SDL_EVENT_AXIS_VALUE(event));
-        break;
-      case SDL_CONTROLLERBUTTONDOWN:
-      case SDL_CONTROLLERBUTTONUP: {
-        gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_BUTTON_DEVICE(event));
-        if (gi) {
-          int b = RemapSdlButton(SNESRECOMP_SDL_EVENT_BUTTON(event));
-          if (b >= 0)
-            HandleGamepadInput(gi, b, event.type == SDL_CONTROLLERBUTTONDOWN);
-        }
-        break;
-      }
-      /* Unmapped joysticks (no SDL_GameController mapping): the raw Steam
-       * virtual gamepad layout is the standard Xbox button order. */
-      case SDL_JOYDEVICEADDED:
-        OpenOneJoystick(event.jdevice.which);
-        break;
-      case SDL_JOYDEVICEREMOVED:
-        gi = GetGamepadInfo(event.jdevice.which);
-        if (gi && gi->raw_joystick) {
-          if (gi->joystick) SDL_JoystickClose(gi->joystick);
-          memset(gi, 0, sizeof(GamepadInfo));
-          gi->joystick_id = -1;
-        }
-        break;
-      case SDL_JOYAXISMOTION:
-        gi = GetGamepadInfo(event.jaxis.which);
-        if (gi && gi->raw_joystick)
-          HandleGamepadAxisInput(gi, event.jaxis.axis, event.jaxis.value);
-        break;
-      case SDL_JOYBUTTONDOWN:
-      case SDL_JOYBUTTONUP:
-        gi = GetGamepadInfo(event.jbutton.which);
-        if (gi && gi->raw_joystick && event.jbutton.button < 15) {
-          static const uint8 raw_buttons[] = {
-            kGamepadBtn_A, kGamepadBtn_B, kGamepadBtn_X, kGamepadBtn_Y,
-            kGamepadBtn_Back, kGamepadBtn_Guide, kGamepadBtn_Start,
-            kGamepadBtn_L3, kGamepadBtn_R3, kGamepadBtn_L1, kGamepadBtn_R1,
-            kGamepadBtn_DpadUp, kGamepadBtn_DpadDown,
-            kGamepadBtn_DpadLeft, kGamepadBtn_DpadRight
-          };
-          HandleGamepadInput(gi, raw_buttons[event.jbutton.button],
-                             event.type == SDL_JOYBUTTONDOWN);
-        }
-        break;
       case SDL_MOUSEWHEEL:
         if (SDL_GetModState() & KMOD_CTRL && event.wheel.y != 0)
           ChangeWindowScale(event.wheel.y > 0 ? 1 : -1);
@@ -2265,6 +2502,7 @@ error_reading:;
     }
     if (!running)
       break;
+    OverlaySelftestPadMainTick(frameCtr);
 
     ProfileEnd(kProfileEvents, event_profile_start);
     if (g_paused != audiopaused) {
@@ -2429,10 +2667,9 @@ error_reading:;
       }
     }
 
-    uint32 human = snes_savestate_menu_filter_guest_input(OverlayNavInputs());
+    uint32 human = OverlayFilterGuestInput(
+        snes_savestate_menu_filter_guest_input(OverlayNavInputs()));
     uint32 inputs = human | (g_gamepad[1].axis_buttons << 12);
-    inputs |= TickScript();
-    inputs |= debug_server_get_controller_inputs();
 
     /* Overlay self-test (SNESRECOMP_OVERLAY_SELFTEST=<frame>, off by default).
      * The overlays can only be driven by a human, so nothing automated ever
@@ -2484,7 +2721,7 @@ error_reading:;
       }
     }
 
-    if (g_rewind_hotkey && !snes_rewind_is_open() &&
+    if ((g_rewind_hotkey || RewindGesturePressed()) && !snes_rewind_is_open() &&
         !snes_savestate_menu_is_open()) {
       /* Refused during netplay by snes_rewind_open() itself: one machine
        * cannot move its own clock backwards while a peer is watching. */
@@ -2507,6 +2744,12 @@ error_reading:;
       GameReset();
       continue;   /* guest was frozen: no frame to run or present */
     }
+    /* The script ticks HERE, after every path that can leave this iteration
+     * without running a frame. Ticked above the overlay checks, an
+     * iteration that opened a panel consumed a script frame the guest never
+     * saw, and every later scripted press landed a frame early. */
+    inputs |= TickScript();
+    inputs |= debug_server_get_controller_inputs();
     g_profile_frame = frameCtr + 1;
     if (profile_requested && !g_profile && g_profile_frame >= profile_first) {
       g_profile = true;
@@ -2786,12 +3029,15 @@ static void OpenOneGamepad(int i) {
   }
 
   uint32 joystick_id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
-  if (GetGamepadInfo(joystick_id)) {
+  if (GetGamepadInfo(joystick_id) || SelftestPadExcludes(joystick_id)) {
     SDL_GameControllerClose(controller);
     return;
   }
 
   uint8 scan_order[3] = { SDL_GameControllerGetPlayerIndex(controller), 0, 1 };
+  /* The self-test pad must be player 1: the overlay gestures read seat 0. */
+  if (g_selftest_pad && SDL_JoystickInstanceID(g_selftest_pad) == joystick_id)
+    scan_order[0] = 0;
 
   int found_idx = -1;
   for (int k = 0; k < 3; k++) {
@@ -2819,7 +3065,7 @@ static void OpenOneJoystick(int i) {
     return;
   }
   SDL_JoystickID id = SDL_JoystickInstanceID(joystick);
-  if (GetGamepadInfo(id)) { SDL_JoystickClose(joystick); return; }
+  if (GetGamepadInfo(id) || SelftestPadExcludes(id)) { SDL_JoystickClose(joystick); return; }
   int slot = -1;
   for (int j = 0; j < 2; ++j) {
     if (g_config.enable_gamepad[j] && g_gamepad[j].joystick_id == -1) {
@@ -2876,6 +3122,8 @@ static void SetPadButtonOrFallthrough(uint32 j, bool pressed) {
     g_pad_buttons = pressed ? (g_pad_buttons | m) : (g_pad_buttons & ~m);
     return;
   }
+  if (g_overlay_modal)
+    return;   /* a panel owns the screen: no state loads behind it */
   HandleCommand(j, pressed);
 }
 
@@ -3031,7 +3279,7 @@ static const char kDefaultConfigIniContent[] =
   "DisplayPerf = f\n"
   "ToggleRenderer = r\n"
   "SaveStateMenu = F11\n"
-  "Rewind = F8\n"
+  "Rewind = F12\n"
   "Load =      F1,     F2,     F3,     F4,     F5,     F6,     F7,     F8,     F9,     F10\n"
   "Save = Shift+F1,Shift+F2,Shift+F3,Shift+F4,Shift+F5,Shift+F6,Shift+F7,Shift+F8,Shift+F9,Shift+F10\n"
   "\n"

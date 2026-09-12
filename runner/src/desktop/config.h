@@ -84,6 +84,12 @@ typedef struct Config {
    * game's own config, which is how MetalWarriors carried it. */
   char netplay_player_name[64];
 
+  /* Rewind's controller gesture, config.ini [Controller] RewindGesture:
+   * pad buttons joined with '+', e.g. "Select+R3" (the default when empty),
+   * or "none". The host parses it; the SNES pad has no stick buttons, so
+   * L3/R3 come from the gamepad itself. */
+  char rewind_gesture[64];
+
   /* Oracle-build only. When false, main.c skips snes_oracle_init_default
    * and calls snes_oracle_set_disabled_by_game so the dispatcher refuses
    * every emu_* command with a structured warning naming the reason. For

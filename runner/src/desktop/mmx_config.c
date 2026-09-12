@@ -38,18 +38,16 @@ static const uint16 kDefaultKbdControls[kKeys_Total] = {
   A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), N, N, _(SDLK_f), _(SDLK_r), A(SDLK_w),
   // VolumeUp VolumeDown
   0, 0,
-  /* SaveStateMenu — deliberately UNBOUND by default.
-   *
-   * recomp-ui offers F7 for it, but on SNES F1..F10 are already the ten
-   * LoadState slots above, so a built-in F7 default would collide and
-   * KeyMapHash_Add would drop one of them with a "Duplicate key" line. A port
-   * that wants the menu on F7 says so in its own config.ini [KeyMap]
-   * (SaveStateMenu = F7), which is an explicit trade its player can see,
-   * rather than one silently made for every port in the scaffold. */
-  0,
-  /* Rewind — unbound for exactly the same reason. recomp-ui offers F8, which
-   * is LoadState slot 8 in the table above. */
-  0,
+  /* SaveStateMenu / Rewind. recomp-ui offers F7 / F8, but on SNES F1..F10
+   * are the ten LoadState slots above, so those would collide and
+   * KeyMapHash_Add would drop one with a "Duplicate key" line. They were
+   * left UNBOUND for that reason, which meant a keyboard player had no way
+   * into either overlay unless the port's config.ini said otherwise -- and
+   * Super Metroid's did not, so its rewind could not be opened at all. F11
+   * and F12 collide with nothing in this table. A port's [KeyMap] can still
+   * move them. */
+  _(SDLK_F11),
+  _(SDLK_F12),
 };
 #undef _
 #undef A
@@ -350,7 +348,10 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       }
     }
   } else if (section == 7) {
-    if (StringEqualsNoCase(key, "SourceP1")) {
+    if (StringEqualsNoCase(key, "RewindGesture")) {
+      snprintf(g_config.rewind_gesture, sizeof(g_config.rewind_gesture), "%s", value);
+      return true;
+    } else if (StringEqualsNoCase(key, "SourceP1")) {
       g_config.player_src[0] = (int)strtol(value, (char**)NULL, 10);
       return true;
     } else if (StringEqualsNoCase(key, "SourceP2")) {
