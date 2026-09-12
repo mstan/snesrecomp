@@ -32,7 +32,8 @@
 #
 # Toggles (each has a --no- form):
 #   --netplay / --no-netplay        recomp-net delay-sync (default: off)
-#   --rollback / --no-rollback      retcomm-rbengine rollback (implies netplay)
+#   --rollback                      same as --netplay: every netplay build
+#                                   carries the rollback engine (no --no-rollback)
 #   --ci / --no-ci                  .github/workflows/release.yml (default: on)
 #   --fetch-boxart / --no-fetch-boxart
 #                                   libretro Named_Boxarts art for the launcher
@@ -135,10 +136,10 @@ prompt_yn() {
 
 ROM=""; PARENT="."; NAME=""; PLAYERS=""; MULTITAP=""; ZIP_PREFIX=""
 DESCRIPTION=""; PUBLISHER=""; YEAR=""; REGION_OVERRIDE=""
-SET_NETPLAY=0; SET_ROLLBACK=0; SET_CI=0; SET_RECOMP_UI=0
+SET_NETPLAY=0; SET_CI=0; SET_RECOMP_UI=0
 SET_GENERATE=0; SET_BUILD=0; SET_GITHUB=0
 GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
-ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
+ENABLE_NETPLAY=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
 FETCH_BOXART=0; SET_BOXART=0
 ADD_SUBMODULES=1
 DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
@@ -188,9 +189,13 @@ while [ $# -gt 0 ]; do
         --year) YEAR=$2; shift 2 ;;
         --region) REGION_OVERRIDE=$2; shift 2 ;;
         --netplay) ENABLE_NETPLAY=1; SET_NETPLAY=1; shift ;;
-        --no-netplay) ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; SET_NETPLAY=1; SET_ROLLBACK=1; shift ;;
-        --rollback) ENABLE_ROLLBACK=1; ENABLE_NETPLAY=1; SET_NETPLAY=1; SET_ROLLBACK=1; shift ;;
-        --no-rollback) ENABLE_ROLLBACK=0; SET_ROLLBACK=1; shift ;;
+        --no-netplay) ENABLE_NETPLAY=0; SET_NETPLAY=1; shift ;;
+        --rollback)
+            # Rollback is part of netplay now, so the flag means "netplay".
+            ENABLE_NETPLAY=1; SET_NETPLAY=1; shift ;;
+        --no-rollback)
+            echo "note: --no-rollback is ignored -- every netplay build carries the rollback engine" >&2
+            shift ;;
         --recomp-ui) ENABLE_RECOMP_UI=1; SET_RECOMP_UI=1; shift ;;
         --no-recomp-ui) ENABLE_RECOMP_UI=0; SET_RECOMP_UI=1; shift ;;
         --ci) ENABLE_CI=1; SET_CI=1; shift ;;
@@ -375,20 +380,13 @@ if [ "$PLAYERS" -eq 1 ]; then
     if [ "$ENABLE_NETPLAY" -eq 1 ]; then
         echo "warning: netplay ignored for a 1-player title." >&2
     fi
-    ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0
-    SET_NETPLAY=1; SET_ROLLBACK=1
+    ENABLE_NETPLAY=0
+    SET_NETPLAY=1
 elif [ "$SET_NETPLAY" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-    prompt_yn "Enable netplay (recomp-net delay-sync)?" ENABLE_NETPLAY 0
+    prompt_yn "Enable netplay (recomp-net)?" ENABLE_NETPLAY 0
 fi
-
-if [ "$ENABLE_NETPLAY" -eq 1 ]; then
-    if [ "$SET_ROLLBACK" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-        prompt_yn "Also build rollback (retcomm-rbengine)?" ENABLE_ROLLBACK 1
-    fi
-elif [ "$ENABLE_ROLLBACK" -eq 1 ]; then
-    echo "warning: rollback needs netplay — enabling netplay." >&2
-    ENABLE_NETPLAY=1
-fi
+# No rollback question: every netplay build carries retcomm-rbengine
+# (snesrecomp_enable_recomp_net links it), delay-sync remains the default.
 
 if [ "$SET_CI" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
     prompt_yn "Add the GitHub Actions workflow?" ENABLE_CI 1
@@ -441,25 +439,20 @@ else
 beyond the second are driven with \`RtlSetPadState\` — see
 \`snesrecomp/docs/MULTITAP.md\`."
 fi
-if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
+if [ "$ENABLE_NETPLAY" -eq 1 ]; then
     PLAYERS_NOTE="$PLAYERS_NOTE
 
-Netplay is built with rollback available (\`SNES_NET_MODE=rollback\`); delay-sync
-remains the default. See \`snesrecomp/docs/ROLLBACK.md\`."
-elif [ "$ENABLE_NETPLAY" -eq 1 ]; then
-    PLAYERS_NOTE="$PLAYERS_NOTE
-
-Netplay is built with delay-sync. See \`snesrecomp/docs/RECOMP_NET.md\`."
+Netplay is built in: delay-sync by default, rollback available
+(\`SNES_NET_MODE=rollback\`). See \`snesrecomp/docs/RECOMP_NET.md\` and
+\`snesrecomp/docs/ROLLBACK.md\`."
 fi
 
 NETPLAY_BLOCK="# Netplay is not built into this target."
 if [ "$ENABLE_NETPLAY" -eq 1 ]; then
     NETPLAY_BLOCK="snesrecomp_enable_recomp_net($PROJECT_NAME)"
 fi
-if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
-    NETPLAY_BLOCK="$NETPLAY_BLOCK
-snesrecomp_enable_rollback($PROJECT_NAME)"
-fi
+# Rollback needs no line of its own: snesrecomp_enable_recomp_net links
+# retcomm-rbengine for every netplay port.
 # The pre-boot GUI launcher lives in recomp-ui, so it is wired only when that
 # submodule is present. Without it the host still resolves a ROM (positional ->
 # beside the exe -> rom.cfg -> native picker) — main.c compiles the GUI blocks
@@ -518,7 +511,7 @@ echo "  title:      $NAME"
 echo "  rom:        $ROM_FILE ($ROM_MAPPING, $REGION, crc32 $ROM_CRC32)"
 echo "  zip prefix: $ZIP_PREFIX"
 echo "  players:    $PLAYERS (multitap: $MULTITAP)"
-echo "  netplay:    $ENABLE_NETPLAY (rollback: $ENABLE_ROLLBACK)"
+echo "  netplay:    $ENABLE_NETPLAY (rollback engine included with netplay)"
 if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     echo "  recomp-ui:  $RECOMP_UI_REF (boxart: $FETCH_BOXART)"
 else
@@ -864,12 +857,11 @@ if [ "$ENABLE_NETPLAY" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ] &&
    ! grep -q 'lobby_mods_can_download' recomp-ui/src/recomp_launcher.h; then
     note_gap "netplay: recomp-ui ref '$RECOMP_UI_REF' lacks the lobby mod-transfer API the framework's lobby client needs (try --recomp-ui-ref $(cat "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || echo merge/frameblend-localization))"
 fi
-if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
-    if [ ! -f snesrecomp/lib/retcomm-rbengine/CMakeLists.txt ]; then
-        note_gap "rollback: snesrecomp/lib/retcomm-rbengine is missing"
-    elif ! grep -q "snesrecomp_enable_rollback" snesrecomp/runner/recomp_net.cmake 2>/dev/null; then
-        note_gap "rollback: the framework has no snesrecomp_enable_rollback()"
-    fi
+# Every netplay build links retcomm-rbengine, so its absence is a gap.
+if [ "$ENABLE_NETPLAY" -eq 1 ] && [ ! -f snesrecomp/lib/retcomm-rbengine/CMakeLists.txt ]; then
+    note_gap "rollback engine: snesrecomp/lib/retcomm-rbengine is missing (git submodule update --init --recursive)"
+elif ! grep -q "snesrecomp_enable_rollback" snesrecomp/runner/recomp_net.cmake 2>/dev/null; then
+    note_gap "rollback engine: the framework has no snesrecomp_enable_rollback()"
 fi
 
 if [ -n "$FRAMEWORK_GAPS" ]; then

@@ -1007,6 +1007,11 @@ function(snesrecomp_target_desktop_host target)
     if(NOT ANDROID)
         snesrecomp_target_opengl(${target})
     endif()
+    # Run-ahead and rewind are the host's (snes_runahead.c, snes_rewind.c,
+    # on the runtime's own snapshot API) and need no extra library. The
+    # rollback ENGINE (lib/retcomm-rbengine) is the netplay rollback session;
+    # snesrecomp_enable_recomp_net() links it for every netplay port -- it
+    # is no longer a scaffold choice.
     if(NOT MSVC)
         target_link_libraries(${target} PRIVATE m)
     endif()

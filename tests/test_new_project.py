@@ -218,11 +218,19 @@ def test_multitap_options_reach_the_build():
 
 
 def test_rollback_option_reaches_the_build():
+    """Rollback is part of netplay, not a second option: --rollback scaffolds
+    a netplay project, and the framework's snesrecomp_enable_recomp_net()
+    links retcomm-rbengine for it -- no per-project CMake line."""
     with tempfile.TemporaryDirectory() as directory:
         project = _scaffold(pathlib.Path(directory), "--rollback")
         cmake = (project / "CMakeLists.txt").read_text(encoding="utf-8")
         assert "snesrecomp_enable_recomp_net" in cmake
-        assert "snesrecomp_enable_rollback" in cmake
+        assert "snesrecomp_enable_rollback" not in cmake, "rollback is the framework's call"
+    net_cmake = (REPO_ROOT / "runner" / "recomp_net.cmake").read_text(encoding="utf-8")
+    body = net_cmake[net_cmake.index("function(snesrecomp_enable_recomp_net"):]
+    body = body[:body.index("endfunction()")]
+    assert "snesrecomp_enable_rollback(${target})" in body, \
+        "snesrecomp_enable_recomp_net must link the rollback engine"
 
     with tempfile.TemporaryDirectory() as directory:
         project = _scaffold(pathlib.Path(directory))
