@@ -410,12 +410,21 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
 
     h += span;
     clocks -= span;
-    if (check_irq && v < 225u && h == 1024u)
-      dma_doHdma(snes->dma);
     consumed += span;
     /* Beam-timeline HDMA (upstream #16), gated: a frame-model host whose
      * render loop walks the real HDMA tables per line clears
-     * hdmaBeamEnabled, or every table is consumed twice per frame. */
+     * hdmaBeamEnabled, or every table is consumed twice per frame.
+     *
+     * The gate landed beside the ungated call it was meant to replace
+     * (2026-08-28), so it gated nothing: with the beam owning HDMA every
+     * table was consumed TWICE per HBlank, and a host that walks the tables
+     * itself got the beam's pass on top of its own. Measured in Super
+     * Metroid's Ceres shaft, that second pass re-ran channel 3's BG-mode
+     * split from the frame's first entry while the host's raster loop had
+     * already advanced to the second: about one frame in eighty rendered the
+     * mode-7 shaft in mode 1, a full screen of garbage under an intact HUD.
+     * It fired from inside guest register writes, because those sync the
+     * master clock and the beam advance runs HDMA. One call, gated. */
     if (check_irq && !snes->hdmaBeamOff && v < 225u && h == 1024u)
       dma_doHdma(snes->dma);
     if (h >= 1364u) {
@@ -423,8 +432,6 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
       v++;
       if (v >= 262u) {
         v = 0;
-        if (check_irq)
-          dma_initHdma(snes->dma);
         if (check_irq && !snes->hdmaBeamOff)
           dma_initHdma(snes->dma);
         /* End of field. Armed the whole way round and nothing latched means

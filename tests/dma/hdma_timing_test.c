@@ -174,6 +174,62 @@ int main(void) {
     failures += check(dma->channel[0].tableAdr == 0x0203, "external beam owner consumed terminator");
     failures += check(dma->channel[0].hdmaActive, "external beam owner preserves HDMAEN state");
 
+    /* ONE transfer per HBlank, and none at all when the host owns HDMA.
+     *
+     * Two single-line entries writing different values to the same register:
+     * after the first HBlank the register must hold the FIRST entry's value.
+     * A beam that ran the table twice in one HBlank would show the second,
+     * which is what shipped between 2026-08-28 and 2026-09-12 -- the gate
+     * below was added beside the ungated call instead of replacing it, so
+     * every table was consumed twice and a host that walked the tables
+     * itself got the beam's pass on top of its own. */
+    dma_reset(dma);
+    memset(ram, 0, sizeof ram);
+    memset(ppu_regs, 0, sizeof ppu_regs);
+    snes.hPos = 0;
+    snes.vPos = 0;
+    snes.beamMasterLast = 0;
+    snes.hIrqEnabled = snes.vIrqEnabled = false;
+    snes.inIrq = false;
+    snes.hdmaBeamOff = false;
+
+    ram[0x0300] = 0x01;   /* one line */
+    ram[0x0301] = 0x11;
+    ram[0x0302] = 0x01;   /* one line */
+    ram[0x0303] = 0x22;
+    ram[0x0304] = 0x00;   /* terminator */
+    dma_write(dma, 0x4300, 0x00);
+    dma_write(dma, 0x4301, 0x28);
+    dma_write(dma, 0x4302, 0x00);
+    dma_write(dma, 0x4303, 0x03);
+    dma_write(dma, 0x4304, 0x7e);
+    dma_startDma(dma, 0x01, true);
+    dma_initHdma(dma);
+
+    snes_advance_master_cycles(&snes, 1024);
+    failures += check(ppu_regs[0x28] == 0x11,
+                      "beam HDMA transfers once per HBlank, not twice");
+
+    /* Same table, host-owned HDMA: the beam must not touch it at all. */
+    dma_reset(dma);
+    memset(ppu_regs, 0, sizeof ppu_regs);
+    snes.hPos = 0;
+    snes.vPos = 0;
+    snes.beamMasterLast = 0;
+    snes.hdmaBeamOff = true;
+    dma_write(dma, 0x4300, 0x00);
+    dma_write(dma, 0x4301, 0x28);
+    dma_write(dma, 0x4302, 0x00);
+    dma_write(dma, 0x4303, 0x03);
+    dma_write(dma, 0x4304, 0x7e);
+    dma_startDma(dma, 0x01, true);
+    dma_initHdma(dma);
+
+    snes_advance_master_cycles(&snes, 1024);
+    failures += check(ppu_regs[0x28] == 0x00,
+                      "snes_set_hdma_beam_enabled(false) keeps the beam off HDMA");
+    snes.hdmaBeamOff = false;
+
     /* A masked, pending IRQ must not freeze beam polling (Star Fox boot
      * waits for a later raster position before unmasking interrupts). */
     dma_reset(dma);
