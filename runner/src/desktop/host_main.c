@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <assert.h>
 #include <signal.h>
@@ -928,6 +929,29 @@ static uint16_t runner_to_snes_joypad(uint16_t r) {
 }
 #endif
 
+/* A presented frame as a binary PPM (see the SCREENSHOT knobs below). */
+static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
+                     int w, int h, unsigned frame, bool announce) {
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    host_report_breadcrumb("screenshot: cannot open %s", path);
+    return;
+  }
+  fprintf(f, "P6\n%d %d\n255\n", w, h);
+  for (int y = 0; y < h; y++) {
+    const uint32_t *row = (const uint32_t *)(pixel_buffer + (size_t)y * (size_t)pitch);
+    for (int x = 0; x < w; x++) {
+      uint32_t p = row[x];
+      fputc((p >> 16) & 0xFF, f); fputc((p >> 8) & 0xFF, f); fputc(p & 0xFF, f);
+    }
+  }
+  fclose(f);
+  /* A range dump writes hundreds of files; only the single shot is worth a
+   * breadcrumb in the crash report. */
+  if (announce)
+    host_report_breadcrumb("screenshot: wrote %s (%dx%d) at frame %u", path, w, h, frame);
+}
+
 static void DrawPpuFrameWithPerf(void) {
   double profile_start = ProfileStart();
   PreparePpuFrame();
@@ -987,24 +1011,75 @@ static void DrawPpuFrameWithPerf(void) {
     }
     const char *path = shot_done ? NULL : HostGetenv("SCREENSHOT");
     if (path && (long)g_screenshot_frame >= shot_frame) {
-      FILE *f = fopen(path, "wb");
-      if (f) {
-        const int w = g_snes_width * render_scale, h = g_snes_height * render_scale;
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        for (int y = 0; y < h; y++) {
-          const uint32_t *row = (const uint32_t *)(pixel_buffer + (size_t)y * (size_t)pitch);
-          for (int x = 0; x < w; x++) {
-            uint32_t p = row[x];
-            fputc((p >> 16) & 0xFF, f); fputc((p >> 8) & 0xFF, f); fputc(p & 0xFF, f);
-          }
-        }
-        fclose(f);
-        host_report_breadcrumb("screenshot: wrote %s (%dx%d) at frame %u", path, w, h,
-                               g_screenshot_frame);
-      } else {
-        host_report_breadcrumb("screenshot: cannot open %s", path);
-      }
+      WritePpm(path, pixel_buffer, pitch, g_snes_width * render_scale,
+               g_snes_height * render_scale, g_screenshot_frame, true);
       shot_done = 1;
+    }
+  }
+  /* SNESRECOMP_SCREENSHOT_DIR=<dir> [SNESRECOMP_SCREENSHOT_FROM=<a>]
+   * [SNESRECOMP_SCREENSHOT_TO=<b>]: every PRESENT while the simulated frame
+   * is in a..b, as <dir>/present_NNNNNN.ppm, plus <dir>/presents.csv listing
+   * present, frame and the interpolation weight each one was drawn with.
+   *
+   * Per present, not per simulated frame, and that is the whole point. A
+   * flicker is a claim about the RELATION between consecutive presents; a
+   * host with a decoupled presentation clock can present the same simulated
+   * frame twice with different weights, and a per-frame dump hides exactly
+   * the pair that differs. The frame numbers still index the guest timeline,
+   * so a range picks a scene the same way the snesref oracle's
+   * SNESREF_FRAME_DUMP_FROM/_TO does.
+   *
+   * SNESRECOMP_PRESENT_LOG=<path.csv> writes the same table WITHOUT the
+   * pictures, so a whole session can be scanned for the one present that is
+   * wrong before dumping anything. */
+  {
+    static const char *dir, *log_path;
+    static long from = -1, to = -1;
+    static unsigned presents;
+    static FILE *csv;
+    if (from == -1) {
+      dir = HostGetenv("SCREENSHOT_DIR");
+      if (dir && !dir[0]) dir = NULL;
+      log_path = HostGetenv("PRESENT_LOG");
+      if (log_path && !log_path[0]) log_path = NULL;
+      const char *v = HostGetenv("SCREENSHOT_FROM");
+      from = v ? strtol(v, NULL, 0) : 0;
+      v = HostGetenv("SCREENSHOT_TO");
+      to = v ? strtol(v, NULL, 0) : LONG_MAX;
+    }
+    if ((dir || log_path) && (long)g_screenshot_frame >= from &&
+        (long)g_screenshot_frame <= to) {
+      char path[1024];
+      const int w = g_snes_width * render_scale, h = g_snes_height * render_scale;
+      if (!csv) {
+        if (log_path) snprintf(path, sizeof(path), "%s", log_path);
+        else snprintf(path, sizeof(path), "%s/presents.csv", dir);
+        csv = fopen(path, "w");
+        if (csv) fprintf(csv, "present,frame,alpha,crc32,luma\n");
+      }
+      if (csv) {
+        /* A checksum and a mean over the pixels actually presented. Enough on
+         * their own to find a one-frame corruption or a duplicated present in
+         * a run too long to dump: scan for a luma outlier against its
+         * neighbours, then re-run the range with SCREENSHOT_DIR for pictures. */
+        uint32_t crc = 0;
+        double sum = 0;
+        for (int y = 0; y < h; y++) {
+          const uint8_t *row = pixel_buffer + (size_t)y * (size_t)pitch;
+          crc = crc32_update(crc, row, (size_t)w * 4);
+          const uint32_t *px = (const uint32_t *)row;
+          for (int x = 0; x < w; x++)
+            sum += ((px[x] >> 16) & 0xFF) + ((px[x] >> 8) & 0xFF) + (px[x] & 0xFF);
+        }
+        fprintf(csv, "%u,%u,%.4f,%08x,%.3f\n", presents, g_screenshot_frame,
+                g_present_alpha, crc, sum / (3.0 * w * h));
+        fflush(csv);
+      }
+      if (dir) {
+        snprintf(path, sizeof(path), "%s/present_%06u.ppm", dir, presents);
+        WritePpm(path, pixel_buffer, pitch, w, h, g_screenshot_frame, false);
+      }
+      ++presents;
     }
   }
 
