@@ -137,7 +137,6 @@ static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len);
 #endif
 static void SwitchDirectory(void);
 static void EnsureConfigIniNextToExe(const char *exe_path);
-static void RenderNumber(uint8 *dst, size_t pitch, int n, uint8 big);
 static void OpenOneGamepad(int i);
 static void OpenOneJoystick(int i);
 static uint32 GetActiveControllers(void);
@@ -238,8 +237,6 @@ static uint32 g_input_state;
  * main loop doesn't clear bits the gamepad just set. OR'd into `inputs`
  * once per frame alongside g_input_state and axis_buttons. */
 static uint32 g_pad_buttons;
-static bool g_display_perf;
-static int g_curr_fps;
 static int g_ppu_render_flags = 0;
 static int g_snes_width = 256, g_snes_height = 224;
 static double g_present_alpha = 1;
@@ -937,20 +934,7 @@ static void DrawPpuFrameWithPerf(void) {
     return;
   }
   profile_start = ProfileStart();
-  if (g_display_perf || g_config.display_perf_title) {
-    static float history[64], average;
-    static int history_pos;
-    uint64 before = SDL_GetPerformanceCounter();
-    RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
-    uint64 after = SDL_GetPerformanceCounter();
-    float v = (double)SDL_GetPerformanceFrequency() / (after - before);
-    average += v - history[history_pos];
-    history[history_pos] = v;
-    history_pos = (history_pos + 1) & 63;
-    g_curr_fps = average * (1.0f / 64);
-  } else {
-    RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
-  }
+  RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
 #if defined(SNESRECOMP_HOST_HAS_BLEND)
   /* The shared blend keeps the UNBLENDED frame, so the mix never feeds back
    * on itself, and the PPU's own renderBuffer stays pure for thumbnails. */
@@ -958,11 +942,29 @@ static void DrawPpuFrameWithPerf(void) {
     recomp_frame_blend_apply(g_blend, pixel_buffer, g_snes_width * render_scale,
                              g_snes_height * render_scale, (size_t)pitch);
 #endif
-  if (g_display_perf)
-    RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
-
+  /* Keep a copy of what was just presented. An overlay freezes the guest, and
+   * the backdrop behind it has to come from somewhere that is NOT another
+   * call to the game's draw_ppu_frame -- that runs guest code, so calling it
+   * from a modal loop pushes an interrupt frame every 8ms into a guest that
+   * is not executing. That is what locked Super Metroid up when the
+   * save-state browser was opened. */
+  {
+    const int rows = g_snes_height * render_scale;
+    const int row_bytes = g_snes_width * render_scale * 4;
+    if (rows > 0 && row_bytes > 0 &&
+        (size_t)rows * (size_t)row_bytes <= sizeof(g_frozen_frame)) {
+      for (int y = 0; y < rows; y++)
+        memcpy(g_frozen_frame + (size_t)y * (size_t)row_bytes,
+               pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
+      g_frozen_w = g_snes_width * render_scale;
+      g_frozen_h = rows;
+    }
+  }
+  ComposeOsd(pixel_buffer, pitch, g_snes_width * render_scale,
+             g_snes_height * render_scale, 2);
   /* SNESRECOMP_SCREENSHOT=<path.ppm> [SNESRECOMP_SCREENSHOT_FRAME=<n>]: write
-   * the frame presented at simulated frame n (default: the first) as a PPM.
+   * the frame presented at simulated frame n (default: the first) as a PPM,
+   * OSD included: it is what the player sees, not the bare field.
    * The doctrine says screenshot before asserting anything about visible
    * state, and a headless run (SDL_VIDEODRIVER=dummy) has no other way to
    * produce one. A black-frame report is then a file, not a description. */
@@ -996,26 +998,6 @@ static void DrawPpuFrameWithPerf(void) {
     }
   }
 
-  /* Keep a copy of what was just presented. An overlay freezes the guest, and
-   * the backdrop behind it has to come from somewhere that is NOT another
-   * call to the game's draw_ppu_frame -- that runs guest code, so calling it
-   * from a modal loop pushes an interrupt frame every 8ms into a guest that
-   * is not executing. That is what locked Super Metroid up when the
-   * save-state browser was opened. */
-  {
-    const int rows = g_snes_height * render_scale;
-    const int row_bytes = g_snes_width * render_scale * 4;
-    if (rows > 0 && row_bytes > 0 &&
-        (size_t)rows * (size_t)row_bytes <= sizeof(g_frozen_frame)) {
-      for (int y = 0; y < rows; y++)
-        memcpy(g_frozen_frame + (size_t)y * (size_t)row_bytes,
-               pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
-      g_frozen_w = g_snes_width * render_scale;
-      g_frozen_h = rows;
-    }
-  }
-  ComposeOsd(pixel_buffer, pitch, g_snes_width * render_scale,
-             g_snes_height * render_scale, 2);
 
   ProfileEnd(kProfileCompose, profile_start);
   profile_start = ProfileStart();
@@ -2010,13 +1992,22 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
    * to boot straight in. */
   int force_launcher = 0, no_launcher = 0;
   {
+    /* `--rom <path>` is the positional ROM under another spelling: Studio's
+     * `build run` passes it that way, and a host that did not know the flag
+     * treated the path as absent and asked for one. It goes to the END:
+     * the ordered flags below (--config, --paused, --script, --framedump)
+     * are consumed from the front and the positional follows them. */
+    char *rom_flag = NULL;
     int w = 0;
     for (int i = 0; i < argc; ++i) {
       if (argv[i] && strcmp(argv[i], "--launcher") == 0) { force_launcher = 1; continue; }
       if (argv[i] && strcmp(argv[i], "--no-launcher") == 0) { no_launcher = 1; continue; }
+      if (argv[i] && strcmp(argv[i], "--rom") == 0 && i + 1 < argc) { rom_flag = argv[++i]; continue; }
       argv[w++] = argv[i];
     }
     argc = w;
+    if (rom_flag)
+      argv[argc++] = rom_flag;
   }
   const char *config_file = NULL;
   if (argc >= 2 && strcmp(argv[0], "--config") == 0) {
@@ -2677,6 +2668,12 @@ error_reading:;
   /* Rewind ring: reads the env overrides and reserves slot headers; the
    * buffer itself is allocated lazily on the first capture. */
   snes_rewind_configure();
+  /* SNESRECOMP_OSD_FPS=1 (or [General] DisplayPerfInTitle): start with the
+   * FPS readout up. */
+  {
+    const char *v = HostGetenv("OSD_FPS");
+    if ((v && atoi(v)) || g_config.display_perf_title) snes_osd_set_fps_visible(1);
+  }
   g_state_generation = RtlStateGeneration();
 
   host_report_breadcrumb("entering main loop");
@@ -3114,50 +3111,10 @@ error_reading:;
 
 /* ── Input plumbing ───────────────────────────────────────────────────────── */
 
-static void RenderDigit(uint8 *dst, size_t pitch, int digit, uint32 color, bool big) {
-  static const uint8 kFont[] = {
-    0x1c, 0x36, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x36, 0x1c,
-    0x18, 0x1c, 0x1e, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7e,
-    0x3e, 0x63, 0x60, 0x30, 0x18, 0x0c, 0x06, 0x03, 0x63, 0x7f,
-    0x3e, 0x63, 0x60, 0x60, 0x3c, 0x60, 0x60, 0x60, 0x63, 0x3e,
-    0x30, 0x38, 0x3c, 0x36, 0x33, 0x7f, 0x30, 0x30, 0x30, 0x78,
-    0x7f, 0x03, 0x03, 0x03, 0x3f, 0x60, 0x60, 0x60, 0x63, 0x3e,
-    0x1c, 0x06, 0x03, 0x03, 0x3f, 0x63, 0x63, 0x63, 0x63, 0x3e,
-    0x7f, 0x63, 0x60, 0x60, 0x30, 0x18, 0x0c, 0x0c, 0x0c, 0x0c,
-    0x3e, 0x63, 0x63, 0x63, 0x3e, 0x63, 0x63, 0x63, 0x63, 0x3e,
-    0x3e, 0x63, 0x63, 0x63, 0x7e, 0x60, 0x60, 0x60, 0x30, 0x1e,
-  };
-  const uint8 *p = kFont + digit * 10;
-  if (!big) {
-    for (int y = 0; y < 10; y++, dst += pitch) {
-      int v = *p++;
-      for (int x = 0; v; x++, v >>= 1) {
-        if (v & 1)
-          ((uint32 *)dst)[x] = color;
-      }
-    }
-  } else {
-    for (int y = 0; y < 10; y++, dst += pitch * 2) {
-      int v = *p++;
-      for (int x = 0; v; x++, v >>= 1) {
-        if (v & 1) {
-          ((uint32 *)dst)[x * 2 + 1] = ((uint32 *)dst)[x * 2] = color;
-          ((uint32 *)(dst + pitch))[x * 2 + 1] = ((uint32 *)(dst + pitch))[x * 2] = color;
-        }
-      }
-    }
-  }
-}
-
-static void RenderNumber(uint8 *dst, size_t pitch, int n, uint8 big) {
-  char buf[32], *s;
-  int i;
-  sprintf(buf, "%d", n);
-  for (s = buf, i = 2 * 4; *s; s++, i += 8 * 4)
-    RenderDigit(dst + ((pitch + i + 4) << big), pitch, *s - '0', 0x404040, big);
-  for (s = buf, i = 2 * 4; *s; s++, i += 8 * 4)
-    RenderDigit(dst + (i << big), pitch, *s - '0', 0xffffff, big);
-}
+/* The FPS readout is the framework OSD's (snes_osd.c: grey panel, turbo and
+ * save-slot toasts share it), toggled by [KeyMap] DisplayPerf. The host used
+ * to draw a second one -- bare white digits in the frame's corner -- so a
+ * player who pressed the key saw two counters that disagreed. */
 
 static void HandleCommand(uint32 j, bool pressed) {
   static const uint8 kKbdRemap[] = { 4, 5, 6, 7, 2, 3, 8, 0, 9, 1, 10, 11 };
@@ -3214,10 +3171,7 @@ static void HandleCommand(uint32 j, bool pressed) {
       break;
     case kKeys_WindowBigger: ChangeWindowScale(1); break;
     case kKeys_WindowSmaller: ChangeWindowScale(-1); break;
-    case kKeys_DisplayPerf:
-      g_display_perf ^= 1;
-      snes_osd_set_fps_visible(g_display_perf);
-      break;
+    case kKeys_DisplayPerf: snes_osd_toggle_fps(); break;
     case kKeys_SaveStateMenu: g_savestate_menu_hotkey = 1; break;
     case kKeys_Rewind: g_rewind_hotkey = 1; break;
     case kKeys_ToggleRenderer:

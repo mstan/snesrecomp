@@ -155,6 +155,10 @@ def test_scaffold_carries_rom_identity_into_the_pipeline():
 
         identity = (project / "rom_identity.txt").read_text(encoding="utf-8")
         assert crc in identity, "rom_identity.txt is missing the ROM CRC32"
+        # The launcher's path cache is seeded with the dump the project was
+        # set up from, so the first launch does not ask for a ROM.
+        cache = (project / "rom.cfg").read_text(encoding="utf-8").strip()
+        assert cache == str((tmp / "fixture.sfc").resolve()), cache
         assert sha in identity, "rom_identity.txt is missing the ROM SHA-256"
         # The catalog matches on every digest; a submission takes them from
         # here instead of hashing the ROM again, so all of them are recorded.

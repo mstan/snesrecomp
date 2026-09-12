@@ -755,6 +755,11 @@ trusted-plugin registration a package can activate.
 EOF
 : > mods/preloaded/packages/.gitkeep
 : > src/gen/.gitkeep
+# The ROM this project was set up from, for the launcher: rom.cfg is the
+# path cache the host reads beside its executable, and the build stages
+# this copy there (snesrecomp_target_rom_cache), so the first launch opens
+# on the same dump instead of asking for one. Ignored by git.
+printf '%s\n' "$ROM_ABS" > rom.cfg
 
 echo "== Seeding analysis config =="
 "$PYTHON" "$PROBE_ROM" "$ROM_ABS" --quiet --display-name "$NAME" \

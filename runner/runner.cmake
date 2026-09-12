@@ -985,6 +985,23 @@ function(snesrecomp_target_fiber_compat target)
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop)
 endfunction()
 
+# The ROM path the project was set up with. tools/new_project writes the
+# absolute path of the dump it scaffolded from to <project>/rom.cfg (ignored
+# by git: it names a path on one machine). The launcher reads rom.cfg beside
+# the EXECUTABLE, so this stages the project's copy there -- only when none
+# exists yet: the launcher rewrites that file when the player picks another
+# ROM, and a rebuild must not undo their choice.
+#
+#   snesrecomp_target_rom_cache(<target>)
+function(snesrecomp_target_rom_cache target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DSRC=${CMAKE_SOURCE_DIR}/rom.cfg
+            -DDST=$<TARGET_FILE_DIR:${target}>/rom.cfg
+            -P ${SNESRECOMP_RUNNER_ROOT}/stage_if_missing.cmake
+        VERBATIM)
+endfunction()
+
 # The desktop host, as a linkable unit (runner/src/desktop/host_main.h).
 #
 # A game's main.c becomes a thin shim: a SnesDesktopHostGame descriptor and a
