@@ -111,7 +111,8 @@ def resolve_analyzer(backend: str) -> str:
 def run_emit(rom: pathlib.Path, cfg_dir: pathlib.Path, out_dir: pathlib.Path,
              *, backend: str = "auto", cfg_roots: bool = False,
              no_host_root_scan: bool = False,
-             source_roots: list[str] | None = None) -> None:
+             source_roots: list[str] | None = None,
+             profile_manifests: list[str] | None = None) -> None:
     """Generate C from a ROM plus its bank configs. Raises on failure."""
     resolved = resolve_analyzer(backend)
     arguments = [
@@ -126,6 +127,16 @@ def run_emit(rom: pathlib.Path, cfg_dir: pathlib.Path, out_dir: pathlib.Path,
         arguments.append("--no-host-root-scan")
     for root in source_roots or []:
         arguments.extend(["--source-root", root])
+    # Runtime profiles select OPTIONAL ahead-of-time work: a manifest of
+    # observed tier-2 coverage seeds extra AOT roots, so it changes which
+    # functions are compiled versus interpreted. v2_emit has always taken
+    # these; this front end did not forward them, which meant a project that
+    # used one could not be regenerated through the modern entry point at
+    # all -- SuperMetroidRecomp's tools/regen.sh had to call v2_emit
+    # directly, and a template sync that pointed it here silently dropped
+    # its profile and changed the emitted C.
+    for manifest in profile_manifests or []:
+        arguments.extend(["--profile-manifest", manifest])
     if run_tool(v2_emit, arguments):
         raise RuntimeError("source generation failed")
 
@@ -161,7 +172,8 @@ def generate_project(args: argparse.Namespace) -> int:
              backend=args.analysis_backend,
              cfg_roots=args.cfg_roots,
              no_host_root_scan=args.no_host_root_scan,
-             source_roots=args.source_root)
+             source_roots=args.source_root,
+             profile_manifests=args.profile_manifest)
 
     if args.funcs_h:
         funcs_h = under(args.funcs_h)
@@ -374,6 +386,10 @@ def parser() -> argparse.ArgumentParser:
                           help="do not scan host sources for additional AOT roots")
     generate.add_argument("--source-root", action="append", default=[],
                           help="extra host source root for root discovery (repeatable)")
+    generate.add_argument("--profile-manifest", action="append", default=[],
+                          help="runtime profile seeding optional AOT roots "
+                               "(repeatable); changes which functions are "
+                               "compiled rather than interpreted")
     generate.add_argument("--analysis-backend",
                           choices=("auto", "python", "native"), default="auto",
                           help="whole-program analyzer (default: auto)")
