@@ -959,8 +959,9 @@ if [ "$DO_BUILD" -eq 1 ] && [ "$GENERATED" -eq 1 ]; then
         [ -f "$GAME_EXE.exe" ] && GAME_EXE="$GAME_EXE.exe"
     else
         echo "warning: build failed — see the output above." >&2
-        echo "         A fresh scaffold is not expected to run yet; src/game_rtl.c" >&2
-        echo "         is where the port starts." >&2
+        echo "         A fresh scaffold is expected to build; the framework host" >&2
+        echo "         and the template frame model are complete. The failure" >&2
+        echo "         above is a toolchain or dependency problem, not the port." >&2
     fi
 fi
 
@@ -978,7 +979,6 @@ echo
 echo "Ready: $ROOT"
 if [ "$GENERATED" -eq 1 ]; then
     echo "  generated: $(find src/gen -name '*.c' | wc -l | tr -d ' ') C files in src/gen"
-    echo "  Expected build result: generated-code static library only"
 fi
 if [ "$BUILT" -eq 1 ] && [ -f "$GAME_EXE" ]; then
     echo "  built:     $GAME_EXE ($(du -h "$GAME_EXE" | cut -f1))"
@@ -986,7 +986,7 @@ if [ "$BUILT" -eq 1 ] && [ -f "$GAME_EXE" ]; then
     echo "Run it:"
     echo "  '$ROOT/$GAME_EXE' '$ROM_ABS'"
     echo
-    echo "It will not play yet — src/game_rtl.c is where the port starts."
+    echo "Boots to a black screen? src/game_rtl.c (the frame model) is where the port starts."
 fi
 echo
 echo "Next:"
