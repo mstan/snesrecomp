@@ -22,6 +22,7 @@ until the host work in `src/game_rtl.c` is done. See
 |---|---|
 | File | `@ROM_FILE@` |
 | Publisher | @PUBLISHER@ |
+| Developer | @DEVELOPER@ |
 | Year | @YEAR@ |
 | Mapping | @ROM_MAPPING@ |
 | Region | @REGION@ (@REGION_NAME@) |

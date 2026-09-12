@@ -35,7 +35,10 @@
 #   --rollback                      same as --netplay: every netplay build
 #                                   carries the rollback engine (no --no-rollback)
 #   --ci / --no-ci                  .github/workflows/release.yml (default: on)
-#   --fetch-boxart / --no-fetch-boxart
+#   --fetch-boxart / --no-fetch-boxart   "Fetch boxart and metadata": libretro
+#                                   Named_Boxarts for the launcher, plus publisher,
+#                                   developer and year from libretro-database
+#                                   (asked on a terminal; off for scripts)
 #                                   libretro Named_Boxarts art for the launcher
 #                                   (needs the network; asked on a terminal,
 #                                   off when non-interactive)
@@ -113,6 +116,16 @@ prompt_line() {
     read -r _ans </dev/tty || _ans=
     [ -n "$_ans" ] || _ans=$_def
     eval "$_var=\$_ans"
+}
+
+# Where custom art goes when none was fetched: the launcher stages
+# launcher_assets/img/boxart.tga beside the executable (CMakeLists.txt's
+# BOXART argument, EXISTS-guarded, so the file can arrive at any time).
+boxart_advice() {
+    echo "  No boxart in the project. To add your own, place it at:"
+    echo "    launcher_assets/img/boxart.tga   (32-bit uncompressed TGA; the launcher's art)"
+    echo "    launcher_assets/img/boxart.png   (optional copy for the README)"
+    echo "  It is staged beside the executable on the next build."
 }
 
 prompt_yn() {
@@ -298,15 +311,20 @@ fi
 INTERACTIVE=0
 if [ "$ASSUME_YES" != "1" ] && is_tty; then INTERACTIVE=1; fi
 
+# The title comes from the probe (the cartridge header, then the filename),
+# the same way Studio names a project; the folder and CMake name follow from
+# it (<Title>SNESRecomp). It is asked only when the probe produced nothing;
+# --name overrides it.
 if [ -z "$NAME" ]; then
-    if [ "$INTERACTIVE" -eq 1 ]; then
-        echo
-        prompt_line "Display name" NAME "$SUGGESTED_NAME"
-    else
+    if [ -n "$SUGGESTED_NAME" ]; then
         NAME="$SUGGESTED_NAME"
+        [ "$INTERACTIVE" -eq 0 ] || echo "  title: $NAME (from the ROM; --name to override)"
+    elif [ "$INTERACTIVE" -eq 1 ]; then
+        echo
+        prompt_line "Display name" NAME ""
     fi
 fi
-[ -n "$NAME" ] || { echo "setup_project: a display name is required" >&2; exit 1; }
+[ -n "$NAME" ] || { echo "setup_project: a display name is required (--name)" >&2; exit 1; }
 
 if [ -z "$PLAYERS" ]; then
     if [ "$INTERACTIVE" -eq 1 ]; then
@@ -354,6 +372,32 @@ if [ -z "$ZIP_PREFIX" ]; then
     fi
 fi
 
+# "Fetch boxart and metadata": one question covers the launcher's boxart
+# (libretro Named_Boxarts, fetched into the project below) and the README's
+# publisher / developer / year (libretro-database, keyed by the ROM's CRC32,
+# fetched now so the rendered files carry them). Both need the network, so a
+# non-interactive run stays offline unless --fetch-boxart says otherwise.
+# What the fetch does not supply -- libretro has no marketing descriptions --
+# is asked afterwards, and only then.
+if [ "$SET_BOXART" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
+    prompt_yn "Fetch boxart and metadata from libretro? (needs the network)" FETCH_BOXART 1
+fi
+DEVELOPER=""
+if [ "$FETCH_BOXART" -eq 1 ]; then
+    echo "== Fetching metadata (libretro-database, crc32 $ROM_CRC32) =="
+    META_JSON=$(mktemp)
+    if "$PYTHON" "$SCRIPT_DIR/fetch_metadata.py" --crc32 "$ROM_CRC32" \
+            --json-out "$META_JSON" >/dev/null 2>&1; then
+        meta_get() { "$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$META_JSON" "$1"; }
+        [ -n "$PUBLISHER" ] || PUBLISHER=$(meta_get publisher)
+        [ -n "$YEAR" ] || YEAR=$(meta_get year)
+        DEVELOPER=$(meta_get developer)
+        echo "  publisher: ${PUBLISHER:--}  developer: ${DEVELOPER:--}  year: ${YEAR:--}"
+    else
+        echo "  no libretro-database entry for this ROM (crc32 $ROM_CRC32)"
+    fi
+    rm -f "$META_JSON"
+fi
 if [ "$INTERACTIVE" -eq 1 ]; then
     [ -n "$DESCRIPTION" ] || prompt_line "Short description (optional)" DESCRIPTION ""
     [ -n "$PUBLISHER" ] || prompt_line "Publisher (optional)" PUBLISHER ""
@@ -367,13 +411,6 @@ GAME_ID="$ROM_SLUG-$(printf '%s' "$REGION" | tr 'A-Z' 'a-z')"
 
 if [ "$SET_RECOMP_UI" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
     prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 1
-fi
-
-# Boxart is a network fetch, so it is asked rather than assumed, and stays off
-# for a non-interactive run unless --fetch-boxart says otherwise -- a script
-# or a test should not reach the internet because a default said so.
-if [ "$ENABLE_RECOMP_UI" -eq 1 ] && [ "$SET_BOXART" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-    prompt_yn "Fetch libretro boxart for the launcher now? (needs the network)" FETCH_BOXART 1
 fi
 
 if [ "$PLAYERS" -eq 1 ]; then
@@ -501,6 +538,7 @@ fi
 
 # README metadata: blanks read badly in a table, so show an em dash.
 PUBLISHER_DISP=${PUBLISHER:-—}
+DEVELOPER_DISP=${DEVELOPER:-—}
 YEAR_DISP=${YEAR:-—}
 DESCRIPTION_MD="$DESCRIPTION"
 [ -n "$DESCRIPTION_MD" ] || DESCRIPTION_MD="_Add a short description here._"
@@ -513,7 +551,7 @@ echo "  zip prefix: $ZIP_PREFIX"
 echo "  players:    $PLAYERS (multitap: $MULTITAP)"
 echo "  netplay:    $ENABLE_NETPLAY (rollback engine included with netplay)"
 if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
-    echo "  recomp-ui:  $RECOMP_UI_REF (boxart: $FETCH_BOXART)"
+    echo "  recomp-ui:  $RECOMP_UI_REF (boxart + metadata fetched: $FETCH_BOXART)"
 else
     echo "  recomp-ui:  no (text-mode host)"
 fi
@@ -631,6 +669,7 @@ fill() {
         --set "SETUP_DATE=$SETUP_DATE" \
         --set "DESCRIPTION=$DESCRIPTION_MD" \
         --set "PUBLISHER=$PUBLISHER_DISP" \
+        --set "DEVELOPER=$DEVELOPER_DISP" \
         --set "YEAR=$YEAR_DISP" \
         --set "GITHUB_OWNER=$GITHUB_OWNER" \
         --set "GITHUB_REPO=$GITHUB_REPO"
@@ -714,9 +753,11 @@ if [ "$FETCH_BOXART" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
         --display-name "$NAME"; then
         :
     else
-        echo "warning: boxart fetch failed — launcher shows no art until" \
-             "launcher_assets/img/boxart.tga exists." >&2
+        echo "warning: boxart fetch failed." >&2
+        boxart_advice
     fi
+elif [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    boxart_advice
 fi
 
 

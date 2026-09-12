@@ -514,10 +514,14 @@ def test_the_interactive_flow_asks_and_listens():
         assert code == 0, out
 
         text = " | ".join(asked)
-        for question in ("Path to the ROM", "Display name", "Max players",
-                         "Multitap", "boxart", "netplay", "GitHub Actions",
+        for question in ("Path to the ROM", "Max players",
+                         "Multitap", "boxart and metadata", "netplay", "GitHub Actions",
                          "Generate C", "gh?", "Proceed?"):
             assert question in text, f"never asked {question!r}:\n{out}"
+        # The title is NOT asked: the probe names the project (header, then
+        # filename) the way Studio does, and says so.
+        assert "Display name" not in text, f"asked for a title the probe supplied:\n{out}"
+        assert "title: Fixture Quest (from the ROM" in out, out
 
         project = tmp / "FixtureQuestSNESRecomp"
         assert project.is_dir(), out
