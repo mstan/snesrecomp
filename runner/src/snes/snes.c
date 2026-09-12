@@ -628,6 +628,18 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   }
 }
 
+/* SNESRECOMP_REG_TRACE=1 turns on the ad-hoc register breadcrumbs below.
+ * They are capped per run, so they are a boot-time aid, not a ring -- read
+ * them as "the first N", never as "all of them". */
+static int snes_reg_trace_enabled(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("SNESRECOMP_REG_TRACE");
+    v = (e && e[0] && e[0] != '0') ? 1 : 0;
+  }
+  return v;
+}
+
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
   switch(adr) {
     case 0x4016:
@@ -638,7 +650,14 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       if(!snes->autoJoyRead) snes->autoJoyTimer = 0;
       snes->hIrqEnabled = val & 0x10;
       snes->vIrqEnabled = val & 0x20;
-      { static int nmi_log = 0;
+      /* Env-gated (SNESRECOMP_REG_TRACE). This printed unconditionally for
+       * the first 20 writes of every run, in every build, which is both the
+       * fprintf(stderr) the project's own rules forbid outright and an
+       * actively misleading instrument: the counter runs out mid-session and
+       * the line simply STOPS, which reads exactly like the guest having
+       * stopped writing the register. It cost a real debugging session. */
+      if (snes_reg_trace_enabled()) {
+        static int nmi_log = 0;
         if (nmi_log < 20) {
           fprintf(stderr, "[CPU_W] $4200=$%02X (NMI=%d IRQ_h=%d IRQ_v=%d AJR=%d)\n",
                   val, (val >> 7) & 1, (val >> 4) & 1, (val >> 5) & 1, val & 1);
@@ -729,7 +748,7 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
     case 0x420b: {
       /* Log DMA triggers */
       { static int dma420b_log = 0;
-        if (val != 0 && dma420b_log < 30) {
+        if (snes_reg_trace_enabled() && val != 0 && dma420b_log < 30) {
           for (int ch = 0; ch < 8; ch++) {
             if (val & (1 << ch)) {
               DmaChannel *c = &snes->dma->channel[ch];
