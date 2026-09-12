@@ -2178,6 +2178,12 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
                            "to Keypad + / Keypad - (rewriting config.ini)");
     WriteConfigFile(config_file);
   }
+  if (ConfigDeadzoneMigrated()) {
+    host_report_breadcrumb("config: GamepadDeadzone moved from the former default "
+                           "10000 (30%%) to %d (10%%) (rewriting config.ini)",
+                           SNES_CONFIG_DEFAULT_DEADZONE);
+    WriteConfigFile(config_file);
+  }
   host_report_breadcrumb(
       "config parsed: output=%d new_renderer=%d scale=%d fullscreen=%d "
       "audio=%d freq=%d samples=%d",
@@ -2263,8 +2269,12 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         ls.player_src[0] = g_config.enable_gamepad[0] ? 2 : 1;
         ls.player_src[1] = g_config.enable_gamepad[1] ? 2 : 0;
         /* Config stores deadzone as a raw stick radius; the launcher edits a
-         * 0-100%. Convert in both directions. */
-        ls.deadzone[0] = ls.deadzone[1] = g_config.gamepad_deadzone * 100 / 32767;
+         * 0-100%. Convert in both directions, ROUNDING each way: truncating
+         * both made the round trip lossy -- 10% saved as 32767/10 = 3276 read
+         * back as 9%, so the slider walked down a percent every time the
+         * player pressed Play. */
+        ls.deadzone[0] = ls.deadzone[1] =
+            (g_config.gamepad_deadzone * 100 + 32767 / 2) / 32767;
         ls.skip_launcher = g_config.skip_launcher;
         ls.msu1_enabled  = 0;
         /* Display rows the framework host wires (see FrameBlendConfigure,
@@ -2388,7 +2398,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
           ApplyVolume();
           g_config.enable_gamepad[0]   = ls.player_src[0] == 2;
           g_config.enable_gamepad[1]   = ls.player_src[1] == 2;
-          g_config.gamepad_deadzone    = ls.deadzone[0] * 32767 / 100;
+          g_config.gamepad_deadzone    = (ls.deadzone[0] * 32767 + 50) / 100;
           g_config.skip_launcher       = ls.skip_launcher != 0;
           g_config.frame_blend         = ls.frame_blend != 0;
           g_config.run_ahead           = ls.run_ahead;

@@ -24,6 +24,8 @@ static bool s_state_menu_defaults;
  * binding. See ParseKeyArray. */
 static bool s_keymap_migrated;
 bool ConfigKeyMapMigrated(void) { return s_keymap_migrated; }
+static bool s_deadzone_migrated;
+bool ConfigDeadzoneMigrated(void) { return s_deadzone_migrated; }
 
 #define REMAP_SDL_KEYCODE(key) ((key) & SDLK_SCANCODE_MASK ? kKeyMod_ScanCode : 0) | (key) & (kKeyMod_ScanCode - 1)
 #define _(x) REMAP_SDL_KEYCODE(x)
@@ -380,6 +382,17 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return ParseBool(value, &g_config.enable_gamepad[1]);
     } else if (StringEqualsNoCase(key, "GamepadDeadzone")) {
       g_config.gamepad_deadzone = (int)strtol(value, (char**)NULL, 10);
+      /* The generated default was 10000 raw units for years, which the
+       * launcher shows as 30% -- far past where any stick rests, so the first
+       * third of every throw was dead and the pad felt unresponsive. The
+       * default is 10% now. A file still carrying the old generated number is
+       * read as the new one and rewritten once, the same treatment the volume
+       * keys got; a deliberate 30% survives as any other value near it, e.g.
+       * 9999 or 10001. */
+      if (g_config.gamepad_deadzone == SNES_CONFIG_LEGACY_DEADZONE) {
+        g_config.gamepad_deadzone = SNES_CONFIG_DEFAULT_DEADZONE;
+        s_deadzone_migrated = true;
+      }
       return true;
     } else {
       for (int i = 0; i < countof(kKeyNameId); i++) {
@@ -596,7 +609,7 @@ void ParseConfigFile(const char *filename) {
    * keyboard away from every existing install. */
   g_config.player_src[0] = 1;   /* keyboard */
   g_config.player_src[1] = 0;   /* none */
-  g_config.gamepad_deadzone = 10000;
+  g_config.gamepad_deadzone = SNES_CONFIG_DEFAULT_DEADZONE;
   g_config.display_aspect = kSnesDisplayAspect_Crt4x3;
   g_config.skip_launcher = false;
   /* Default ON to preserve current behaviour across other ports that

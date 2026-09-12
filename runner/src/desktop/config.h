@@ -168,6 +168,16 @@ void ConfigReloadKeyMap(const char *filename);
  * generated default and mapped it to the current one; WriteConfigFile then
  * rewrites that line. The host writes the file once when this is set. */
 bool ConfigKeyMapMigrated(void);
+/* True when the file carried the former generated GamepadDeadzone (10000 raw
+ * units, 30%) and it was read as the current default instead. The caller
+ * rewrites config.ini once so the file says what the game is using. */
+bool ConfigDeadzoneMigrated(void);
+
+/* Analog stick deadzone, in raw axis units of a 32767 full scale. 10% is the
+ * default because it clears a resting stick on the pads players actually own
+ * without eating a third of the throw, which 10000 (30%) did. */
+#define SNES_CONFIG_DEFAULT_DEADZONE 3277
+#define SNES_CONFIG_LEGACY_DEADZONE  10000
 // Persist the launcher-editable settings back into `filename` (or config.ini)
 // with a surgical, comment-preserving in-place update. Called after the GUI
 // launcher returns PLAY.
