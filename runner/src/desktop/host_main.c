@@ -69,6 +69,7 @@
 #include "snes_rewind.h"
 #include "snes_overlay_draw.h"
 #include "snes_osd.h"
+#include "snes_runahead.h"
 
 #if SNESRECOMP_ENABLE_MODS
 #include "mod_runtime.h"
@@ -77,6 +78,7 @@
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* recomp_launcher_run_window() */
 #include "launcher_profile.h"  /* launcher_profile_apply("snes", &gi) */
+#include "recomp_frame_blend.h" /* shared presentation blend (all titles) */
 /* Generate & rebuild is wired when the project compiles the framework's
  * codegen host (the template's launcher block does; see CMakeLists.txt.in).
  * The header lives in snesrecomp/host, which only that block puts on the
@@ -139,6 +141,7 @@ static void HandleInput(int keyCode, int keyMod, bool pressed);
 static void HandleCommand(uint32 j, bool pressed);
 #ifndef __ANDROID__
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
+#include "opengl.h"   /* snesrecomp_opengl_set_vsync */
 #endif
 
 /* ── Symbols the framework leaves to the host ─────────────────────────────── */
@@ -345,9 +348,114 @@ void snesrecomp_desktop_set_widescreen(int enabled) {
   WriteConfigFile(g_active_config_file);
 }
 
+/* Presentation frame blending (config.ini [Graphics] FrameBlend, the
+ * launcher's Display checkbox): each presented frame averaged with the
+ * previous one, so alternate-frame flicker "transparency" reads as steady
+ * translucency. The module is recomp-ui's, shared by every title. */
+#if defined(RECOMP_LAUNCHER)
+static RecompFrameBlend *g_blend;
+#endif
+static void FrameBlendConfigure(void) {
+#if defined(RECOMP_LAUNCHER)
+  if (g_config.frame_blend && !g_blend) g_blend = recomp_frame_blend_create();
+  if (g_config.frame_blend && !g_blend) {
+    /* Out of memory for one frame. Say so and present unblended rather
+     * than silently leaving a checkbox on that does nothing. */
+    fprintf(stderr, "[video] frame blending unavailable (out of memory)\n");
+    g_config.frame_blend = false;
+  }
+  if (g_blend) recomp_frame_blend_reset(g_blend);
+  if (g_config.frame_blend)
+    host_report_breadcrumb("frame blending on ([Graphics] FrameBlend)");
+#endif
+}
+
 static void GameReset(void) {
   if (g_game->on_reset) g_game->on_reset();
+#if defined(RECOMP_LAUNCHER)
+  if (g_blend) recomp_frame_blend_reset(g_blend);   /* never blend across a jump */
+#endif
   g_reset_clock = true;
+}
+
+/* The renderer list (config.ini [Graphics] Renderer, the launcher's Renderer
+ * cycle). Index 0 is Auto: SDL's own pick of render driver, exactly the
+ * behaviour of a build that never had this control. "opengl" is the
+ * framework's native GL presenter (GLSL presets, its own vsync switch), not
+ * SDL's opengl driver, which is hidden so OpenGL does not appear twice.
+ * "software" is SDL's software renderer. Everything else is an SDL render
+ * driver this SDL build actually has, named for a player. */
+enum { kRendererMax = 12, kRendererNameMax = 32 };
+static char g_renderer_id[kRendererMax][kRendererNameMax];
+static char g_renderer_label[kRendererMax][kRendererNameMax];
+static const char *g_renderer_label_ptr[kRendererMax];
+static int g_renderer_count;
+static const char *RendererPretty(const char *id) {
+  if (!strcmp(id, "direct3d"))   return "Direct3D 9";
+  if (!strcmp(id, "direct3d11")) return "Direct3D 11";
+  if (!strcmp(id, "direct3d12")) return "Direct3D 12";
+  if (!strcmp(id, "vulkan"))     return "Vulkan";
+  if (!strcmp(id, "metal"))      return "Metal";
+  if (!strcmp(id, "gpu"))        return "SDL3_GPU";
+  if (!strcmp(id, "software"))   return "Software";
+  return id;
+}
+static void RendererEnumerate(void) {
+  if (g_renderer_count) return;
+  snprintf(g_renderer_id[0], kRendererNameMax, "auto");
+  snprintf(g_renderer_label[0], kRendererNameMax, "Auto");
+  g_renderer_count = 1;
+#ifndef __ANDROID__
+  snprintf(g_renderer_id[1], kRendererNameMax, "opengl");
+  snprintf(g_renderer_label[1], kRendererNameMax, "OpenGL");
+  g_renderer_count = 2;
+#endif
+  int n = snesrecomp_sdl_num_render_drivers();
+  for (int i = 0; i < n && g_renderer_count < kRendererMax; ++i) {
+    const char *id = snesrecomp_sdl_render_driver_name(i);
+    if (!id || !id[0]) continue;
+    /* opengles2 reaches the same hardware as OpenGL through a smaller API;
+     * SDL's opengl driver is the native presenter's twin. Neither is a
+     * choice a player should be offered. */
+    if (!strcmp(id, "opengl") || !strcmp(id, "opengles2") || !strcmp(id, "opengles"))
+      continue;
+    snprintf(g_renderer_id[g_renderer_count], kRendererNameMax, "%s", id);
+    snprintf(g_renderer_label[g_renderer_count], kRendererNameMax, "%s", RendererPretty(id));
+    g_renderer_count++;
+  }
+  for (int i = 0; i < g_renderer_count; ++i)
+    g_renderer_label_ptr[i] = g_renderer_label[i];
+}
+/* The current choice as a list index. An empty [Graphics] Renderer follows
+ * the older OutputMethod key, so an existing config keeps its presenter. */
+static int RendererChoice(void) {
+  RendererEnumerate();
+  const char *want = g_config.renderer;
+  if (!want[0])
+    want = g_config.output_method == kOutputMethod_OpenGL ? "opengl" :
+           g_config.output_method == kOutputMethod_SDLSoftware ? "software" : "auto";
+  for (int i = 0; i < g_renderer_count; ++i)
+    if (!strcmp(g_renderer_id[i], want)) return i;
+  if (strcmp(want, "auto"))
+    fprintf(stderr, "[video] Renderer '%s' is not available in this build; using Auto\n", want);
+  return 0;
+}
+/* Turn the choice into the presenter (OutputMethod) and, for the SDL
+ * presenter, the render driver hint SDL reads at renderer creation. */
+static void RendererApply(int choice) {
+  RendererEnumerate();
+  if (choice < 0 || choice >= g_renderer_count) choice = 0;
+  const char *id = g_renderer_id[choice];
+  snprintf(g_config.renderer, sizeof(g_config.renderer), "%s", id);
+  if (!strcmp(id, "opengl"))        g_config.output_method = kOutputMethod_OpenGL;
+  else if (!strcmp(id, "software")) g_config.output_method = kOutputMethod_SDLSoftware;
+  else {
+    g_config.output_method = kOutputMethod_SDL;
+    if (strcmp(id, "auto")) {
+      SDL_SetHint(SDL_HINT_RENDER_DRIVER, id);
+      host_report_breadcrumb("renderer request: %s ([Graphics] Renderer)", id);
+    }
+  }
 }
 
 static void PreparePpuFrame(void) {
@@ -835,6 +943,13 @@ static void DrawPpuFrameWithPerf(void) {
   } else {
     RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
   }
+#if defined(RECOMP_LAUNCHER)
+  /* The shared blend keeps the UNBLENDED frame, so the mix never feeds back
+   * on itself, and the PPU's own renderBuffer stays pure for thumbnails. */
+  if (g_config.frame_blend && g_blend && g_present_alpha >= 1)
+    recomp_frame_blend_apply(g_blend, pixel_buffer, g_snes_width * render_scale,
+                             g_snes_height * render_scale, (size_t)pitch);
+#endif
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
@@ -1243,8 +1358,16 @@ static void PresentFrozenWithOverlay(void) {
   if (!is_menu && !(snes_rewind_overlay_image(&panel, &pw, &ph) && panel))
     panel = NULL;
 
-  const int draw_w = (panel && pw > 0) ? pw : g_snes_width;
-  const int draw_h = (panel && ph > 0) ? ph : g_snes_height;
+  /* The draw buffer is the FROZEN FRAME at twice its size, whichever panel
+   * is up. It used to be the panel's own size, which is right for the
+   * browser (512x448, exactly twice the field) and wrong for the rewind
+   * filmstrip, whose image is a 512x176 strip: the whole frozen game was
+   * squashed into a strip-high buffer and presented letterboxed in the
+   * middle of the window. */
+  const int base_w = g_frozen_w > 0 ? g_frozen_w : g_snes_width;
+  const int base_h = g_frozen_h > 0 ? g_frozen_h : g_snes_height;
+  const int draw_w = base_w * 2;
+  const int draw_h = base_h * 2;
   uint8 *pixel_buffer = 0;
   int pitch = 0;
 
@@ -1266,21 +1389,25 @@ static void PresentFrozenWithOverlay(void) {
       snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
                                panel, pw, ph, 0, 0, draw_w, draw_h);
     } else {
-      const int strip_h = draw_h / 3;
+      /* Full width, anchored to the bottom, at the strip's own height when
+       * it fits (1:1 on the stock field, so its text stays crisp), else
+       * scaled to the bottom third the way the other ports place it. */
+      const int strip_h = ph > 0 && ph <= draw_h / 2 ? ph : draw_h / 3;
       snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
                                panel, pw, ph,
                                0, draw_h - strip_h, draw_w, strip_h);
     }
   }
   ComposeOsd(pixel_buffer, pitch, draw_w, draw_h, draw_w >= 512 ? 1 : 2);
-  /* SNESRECOMP_OVERLAY_DUMP=<path>: write the composited overlay frame as a
-   * PPM. The overlays can only be driven by a human, so this is the only way
+  /* SNESRECOMP_OVERLAY_DUMP=<path> (browser) / SNESRECOMP_REWIND_DUMP=<path>
+   * (filmstrip): write the composited overlay frame as a PPM. The overlays can only be driven by a human, so this is the only way
    * to check that a panel actually reaches the screen rather than inferring
    * it from the module reporting itself open. */
   {
-    const char *dump = HostGetenv("OVERLAY_DUMP");
-    static int dumped = 0;
-    if (dump && !dumped && panel) {
+    static int dumped_menu = 0, dumped_rewind = 0;
+    const char *dump = is_menu ? HostGetenv("OVERLAY_DUMP") : HostGetenv("REWIND_DUMP");
+    int *dumped = is_menu ? &dumped_menu : &dumped_rewind;
+    if (dump && !*dumped && panel) {
       FILE *f = fopen(dump, "wb");
       if (f) {
         fprintf(f, "P6\n%d %d\n255\n", draw_w, draw_h);
@@ -1292,7 +1419,7 @@ static void PresentFrozenWithOverlay(void) {
           }
         }
         fclose(f);
-        dumped = 1;
+        *dumped = 1;
         fprintf(stderr, "[overlay_dump] wrote %s (%dx%d, %s)\n", dump, draw_w, draw_h,
                 is_menu ? "save-state browser" : "rewind filmstrip");
       }
@@ -1582,7 +1709,7 @@ static bool SdlRenderer_Init(SDL_Window *window) {
   bool want_software = g_config.output_method == kOutputMethod_SDLSoftware;
   SDL_Renderer *renderer = snesrecomp_sdl_create_renderer(
       g_window, want_software,
-      /*vsync=*/!PresentationDecoupled() && !g_config.disable_frame_delay);
+      /*vsync=*/g_config.vsync && !PresentationDecoupled() && !g_config.disable_frame_delay);
   if (renderer == NULL) {
     printf("Failed to create renderer: %s\n", SDL_GetError());
     return false;
@@ -2019,6 +2146,13 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         ls.deadzone[0] = ls.deadzone[1] = g_config.gamepad_deadzone * 100 / 32767;
         ls.skip_launcher = g_config.skip_launcher;
         ls.msu1_enabled  = 0;
+        /* Display rows the framework host wires (see FrameBlendConfigure,
+         * RendererApply, the vsync flags at presenter creation, and
+         * snes_runahead_run_frame in the frame loop). */
+        ls.frame_blend   = g_config.frame_blend ? 1 : 0;
+        ls.run_ahead     = g_config.run_ahead;
+        ls.vsync         = g_config.vsync ? RECOMP_LAUNCHER_VSYNC_ON : RECOMP_LAUNCHER_VSYNC_OFF;
+        ls.renderer      = RendererChoice();
 
         /* Open on the ROM the player already has, so a second launch is PLAY
          * rather than Change-ROM: an explicit argument first, then the copy
@@ -2051,6 +2185,15 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         gi.num_known_sha256 = rom_identity_ok ? 1 : 0;
         gi.widescreen_supported = game->widescreen_supported;
         gi.msu1_supported = game->msu1_supported;
+        /* Capability rows: each is drawn only because this host wires it. A
+         * row that does nothing is worse than no row. */
+        gi.has_frame_blend  = 1;
+        gi.has_run_ahead    = 1;   /* the runtime snapshots a machine in a frame */
+        gi.has_vsync        = 1;
+        gi.has_renderer     = 1;
+        RendererEnumerate();
+        gi.renderer_labels  = g_renderer_label_ptr;
+        gi.num_renderers    = g_renderer_count;
         gi.config_path = config_file;  /* hotkey editor targets the live config */
         gi.mods = NULL;
         if (game->mods_provider)
@@ -2103,6 +2246,10 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
           g_config.enable_gamepad[1]   = ls.player_src[1] == 2;
           g_config.gamepad_deadzone    = ls.deadzone[0] * 32767 / 100;
           g_config.skip_launcher       = ls.skip_launcher != 0;
+          g_config.frame_blend         = ls.frame_blend != 0;
+          g_config.run_ahead           = ls.run_ahead;
+          g_config.vsync               = ls.vsync != RECOMP_LAUNCHER_VSYNC_OFF;
+          RendererApply(ls.renderer);   /* sets renderer + output_method */
           WriteConfigFile(config_file);
           /* The launcher's Hotkeys editor writes [KeyMap] straight into the
            * config file, which was parsed before the launcher ran — re-apply
@@ -2249,9 +2396,12 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   int window_height = custom_size ? g_config.window_height :
       g_current_window_scale * WindowBaseHeight();
 
+  RendererApply(RendererChoice());
 #ifndef __ANDROID__
   if (g_config.output_method == kOutputMethod_OpenGL) {
     g_win_flags |= SDL_WINDOW_OPENGL;
+    snesrecomp_opengl_set_vsync(g_config.vsync && !PresentationDecoupled() &&
+                                !g_config.disable_frame_delay);
     OpenGLRenderer_Create(&g_renderer_funcs);
   } else
 #endif
@@ -2316,6 +2466,14 @@ error_reading:;
 
   // Connect debug server to SNES RAM
   debug_server_set_ram(snes->ram, 0x20000);
+
+  FrameBlendConfigure();
+  /* Run-ahead (config.ini [General] RunAhead, the launcher's Display cycle):
+   * 0 disables; 1 is the useful setting for most titles. Offline only --
+   * snes_runahead_run_frame refuses during netplay regardless. The env
+   * override wins, for a one-off comparison without editing the file. */
+  snes_runahead_set_frames(g_config.run_ahead);
+  snes_runahead_configure();
 
 #ifdef ENABLE_ORACLE_BACKEND
   if (g_config.enable_snes9x_oracle) {
@@ -2817,7 +2975,17 @@ error_reading:;
     double guest_start = MonotonicSeconds();
     if (game->before_run_frame) game->before_run_frame();
     g_audio_producer_active = paced_realtime && g_audio_device != 0;
-    RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
+    /* Run-ahead owns the whole frame when it is on: it advances the guest
+     * once and speculates N further, so calling RtlRunFrame as well would
+     * double-advance. It declines (returns 0) during netplay and whenever
+     * the machine cannot snapshot, which is why this is a fallback rather
+     * than a branch. Never during turbo: speculating about frames that are
+     * being skipped costs work for a picture nobody is reading. */
+    {
+      const uint32 word = inputs | GetActiveControllers() | debug_server_get_controller_active_mask();
+      if (g_turbo || !snes_runahead_run_frame(word))
+        RtlRunFrame(word);
+    }
     ApplyScriptForcePokes();
     snes_osd_note_frame();
     ProfileEnd(kProfileGuest, profile_start);
@@ -2910,6 +3078,10 @@ error_reading:;
 
   RtlWriteSram();
   snes_rewind_shutdown();
+  snes_runahead_shutdown();
+#if defined(RECOMP_LAUNCHER)
+  if (g_blend) recomp_frame_blend_destroy(g_blend);
+#endif
 
   // clean sdl
   SetAudioPaused(true);

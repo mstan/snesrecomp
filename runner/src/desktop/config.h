@@ -90,6 +90,22 @@ typedef struct Config {
    * L3/R3 come from the gamepad itself. */
   char rewind_gesture[64];
 
+  /* Presentation and emulation options the desktop host offers through the
+   * launcher's Display page, persisted by WriteConfigFile:
+   *   [Graphics] FrameBlend  average each presented frame with the previous
+   *                          one (alternate-frame flicker reads as translucency)
+   *   [Graphics] VSync       driver vsync at present time (default on)
+   *   [Graphics] Renderer    "auto" (SDL's pick), "opengl" (the native GL
+   *                          presenter), "software", or an SDL render driver
+   *                          name such as "vulkan"; empty follows OutputMethod
+   *   [General]  RunAhead    frames of local input-latency hiding (0 = off)
+   * The [Video] / [Emulation] spellings a per-game host used for the same
+   * settings are accepted on read. */
+  bool frame_blend;
+  bool vsync;
+  int run_ahead;
+  char renderer[32];
+
   /* Oracle-build only. When false, main.c skips snes_oracle_init_default
    * and calls snes_oracle_set_disabled_by_game so the dispatcher refuses
    * every emu_* command with a structured warning naming the reason. For

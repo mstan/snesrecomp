@@ -387,9 +387,32 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
   } else if (section == 8) {
     return true;                 /* saved profile; launcher-owned */
   } else if (section == 9) {
-    return true;                 /* host-owned; this core does not read it */
+    /* [Video] / [Emulation]: the spellings a per-game host (Gundam Wing)
+     * used for the settings the framework host now owns. Accepted so a
+     * config.ini written for that host keeps meaning the same thing. */
+    if (StringEqualsNoCase(key, "FrameBlend")) {
+      return ParseBool(value, &g_config.frame_blend);
+    } else if (StringEqualsNoCase(key, "Vsync")) {
+      return ParseBool(value, &g_config.vsync);
+    } else if (StringEqualsNoCase(key, "Renderer")) {
+      snprintf(g_config.renderer, sizeof(g_config.renderer), "%s", value);
+      return true;
+    } else if (StringEqualsNoCase(key, "LinearFilter")) {
+      return ParseBool(value, &g_config.linear_filtering);
+    } else if (StringEqualsNoCase(key, "RunAhead")) {
+      g_config.run_ahead = (int)strtol(value, (char **)NULL, 10);
+      return true;
+    }
+    return true;                 /* other host-owned keys */
   } else if (section == 1) {
-    if (StringEqualsNoCase(key, "WindowSize")) {
+    if (StringEqualsNoCase(key, "FrameBlend")) {
+      return ParseBool(value, &g_config.frame_blend);
+    } else if (StringEqualsNoCase(key, "VSync")) {
+      return ParseBool(value, &g_config.vsync);
+    } else if (StringEqualsNoCase(key, "Renderer")) {
+      snprintf(g_config.renderer, sizeof(g_config.renderer), "%s", value);
+      return true;
+    } else if (StringEqualsNoCase(key, "WindowSize")) {
       char *s;
       if (StringEqualsNoCase(value, "Auto")){
         g_config.window_width  = 0;
@@ -458,7 +481,10 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return true;
     }
   } else if (section == 3) {
-    if (StringEqualsNoCase(key, "Autosave")) {
+    if (StringEqualsNoCase(key, "RunAhead")) {
+      g_config.run_ahead = (int)strtol(value, (char **)NULL, 10);
+      return true;
+    } else if (StringEqualsNoCase(key, "Autosave")) {
       g_config.autosave = (bool)strtol(value, (char **)NULL, 10);
       return true;
     } else if (StringEqualsNoCase(key, "DisplayPerfInTitle")) {
@@ -519,6 +545,7 @@ static bool ParseOneConfigFile(const char *filename, int depth) {
 
 void ParseConfigFile(const char *filename) {
   g_config.enable_audio = true;
+  g_config.vsync = true;
   /* Audio defaults match the values shipped in config.ini's [Sound]
    * section. Without these a release with no config.ini next to the
    * exe leaves audio_freq/audio_channels/audio_samples at 0, which
@@ -683,6 +710,10 @@ void WriteConfigFile(const char *filename) {
     { "General",    "SkipLauncher" },
     { "GamepadMap", "GamepadDeadzone" },
     { "Netplay",    "PlayerName" },
+    { "Graphics",   "FrameBlend" },
+    { "Graphics",   "VSync" },
+    { "Graphics",   "Renderer" },
+    { "General",    "RunAhead" },
   };
   const int N = (int)countof(kvs);
   static const char *const kDisplayAspectNames[kSnesDisplayAspect_Count] = {
@@ -705,6 +736,10 @@ void WriteConfigFile(const char *filename) {
   snprintf(kvs[10].val, sizeof(kvs[10].val), "%d", g_config.skip_launcher ? 1 : 0);
   snprintf(kvs[11].val, sizeof(kvs[11].val), "%d", g_config.gamepad_deadzone);
   snprintf(kvs[12].val, sizeof(kvs[12].val), "%s", g_config.netplay_player_name);
+  snprintf(kvs[13].val, sizeof(kvs[13].val), "%d", g_config.frame_blend ? 1 : 0);
+  snprintf(kvs[14].val, sizeof(kvs[14].val), "%d", g_config.vsync ? 1 : 0);
+  snprintf(kvs[15].val, sizeof(kvs[15].val), "%s", g_config.renderer[0] ? g_config.renderer : "auto");
+  snprintf(kvs[16].val, sizeof(kvs[16].val), "%d", g_config.run_ahead);
 
   char *data = NULL;
   long sz = 0;

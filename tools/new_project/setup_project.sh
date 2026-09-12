@@ -78,6 +78,18 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TEMPLATE_DIR="$SCRIPT_DIR/templates"
 FRAMEWORK_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+# Only a real snesrecomp checkout may supply the framework URL, ref, LICENSE
+# and local commits below. This script is also VENDORED into Retro Studio
+# (tools/new_project_layout/snes/), where two levels up is Studio's own
+# repository -- and deriving the URL from there added Retro-Studio itself as
+# the snesrecomp submodule: a scaffold with no runner and no CLI, which
+# failed to generate and failed to configure. A vendored copy pins the
+# canonical remote.
+if [ -f "$FRAMEWORK_ROOT/runner/runner.cmake" ] && [ -f "$FRAMEWORK_ROOT/snesrecomp_cli.py" ]; then
+    FRAMEWORK_IS_CHECKOUT=1
+else
+    FRAMEWORK_IS_CHECKOUT=0
+fi
 FILL_TOKENS="$SCRIPT_DIR/fill_tokens.py"
 PROBE_ROM="$SCRIPT_DIR/probe_rom.py"
 
@@ -135,7 +147,10 @@ DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
 # framework that checkout actually has. Hard-coding "main" silently produced
 # projects that could not generate or build whenever the work lived on a
 # branch.
-SNESRECOMP_REF=$(git -C "$FRAMEWORK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+SNESRECOMP_REF=""
+if [ "$FRAMEWORK_IS_CHECKOUT" -eq 1 ]; then
+    SNESRECOMP_REF=$(git -C "$FRAMEWORK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+fi
 [ -n "$SNESRECOMP_REF" ] || SNESRECOMP_REF="main"
 # recomp-ui is not a submodule of the framework, but the framework's lobby
 # client is compiled against its header, so the framework declares the ref
@@ -149,8 +164,11 @@ RECOMP_NET_REF=""; RBENGINE_REF=""
 # The framework URL comes from the checkout this script is running out of, so
 # it cannot drift from where snesrecomp actually lives. (It was hard-coded to
 # the wrong org once; deriving it removes the class.)
-SNESRECOMP_URL=$(git -C "$FRAMEWORK_ROOT" remote get-url origin 2>/dev/null || true)
-[ -n "$SNESRECOMP_URL" ] || SNESRECOMP_URL="https://github.com/mstan/snesrecomp.git"
+SNESRECOMP_URL=""
+if [ "$FRAMEWORK_IS_CHECKOUT" -eq 1 ]; then
+    SNESRECOMP_URL=$(git -C "$FRAMEWORK_ROOT" remote get-url origin 2>/dev/null || true)
+fi
+[ -n "$SNESRECOMP_URL" ] || SNESRECOMP_URL="https://github.com/RetroPortingToolKit/snesrecomp.git"
 RECOMP_UI_URL="https://github.com/mstan/recomp-ui.git"
 DEFAULT_BRANCH="main"
 ASSUME_YES=${SNESRECOMP_SETUP_YES:-0}
@@ -537,7 +555,7 @@ if [ "$ADD_SUBMODULES" -eq 1 ]; then
         esac
         if git ls-remote --exit-code "$_url" HEAD >/dev/null 2>&1; then
             echo "  ok  $_what -> $_url"
-            if [ "$_what" = "snesrecomp" ] &&
+            if [ "$_what" = "snesrecomp" ] && [ "$FRAMEWORK_IS_CHECKOUT" -eq 1 ] &&
                ! git ls-remote --exit-code --heads "$_url" "$SNESRECOMP_REF" \
                    >/dev/null 2>&1; then
                 echo "warning: the framework branch '$SNESRECOMP_REF' is not on" >&2
@@ -686,7 +704,9 @@ echo "== Seeding analysis config =="
 "$PYTHON" "$PROBE_ROM" "$ROM_ABS" --quiet --display-name "$NAME" \
     --write-seed-cfg "$ROOT/recomp/bank00.cfg" \
     --write-symbols "$ROOT/recomp/symbols.toml"
-cp "$FRAMEWORK_ROOT/LICENSE" "$ROOT/LICENSE" 2>/dev/null || true
+if [ "$FRAMEWORK_IS_CHECKOUT" -eq 1 ]; then
+    cp "$FRAMEWORK_ROOT/LICENSE" "$ROOT/LICENSE" 2>/dev/null || true
+fi
 
 if [ "$FETCH_BOXART" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     echo "== Fetching boxart (libretro Named_Boxarts) =="
@@ -742,6 +762,19 @@ if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     git submodule add -q -b "$RECOMP_UI_REF" "$RECOMP_UI_URL" recomp-ui
 fi
 git submodule update --init --recursive
+
+# What was just pinned must BE the framework. The gap check further down
+# compares subcommands; a repository that is not snesrecomp at all (the URL
+# was derived from the wrong checkout, or mistyped) has no CLI to compare
+# and used to be reported as "the framework does not support generate yet
+# -- the scaffold is still correct", which it was not.
+if [ ! -f snesrecomp/runner/runner.cmake ] || [ ! -f snesrecomp/snesrecomp_cli.py ]; then
+    echo "setup_project: $SNESRECOMP_URL ($SNESRECOMP_REF) is not a snesrecomp" >&2
+    echo "  checkout: it has no runner/runner.cmake or snesrecomp_cli.py. Pass" >&2
+    echo "  --snesrecomp-url <url> (and --snesrecomp-ref <ref>) naming the" >&2
+    echo "  framework repository. Nothing has been kept." >&2
+    exit 1
+fi
 
 # Render from the framework the project PINS, not from the copy of this wizard
 # that happens to be running. They are the same files only when this script
