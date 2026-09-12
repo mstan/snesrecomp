@@ -64,10 +64,10 @@ static void snes_trace_direct_wram_write(uint32_t off, uint8_t old, uint8_t val)
 }
 #endif
 
-}
-
 void snes_set_hdma_beam_enabled(Snes *snes, bool enabled) {
   snes->hdmaBeamOff = !enabled;
+}
+
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = calloc(1, sizeof(Snes));  /* zero padding: saveload/co-sim hash determinism */
     snes->ram = ram;
