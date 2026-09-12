@@ -1002,6 +1002,22 @@ function(snesrecomp_target_rom_cache target)
         VERBATIM)
 endfunction()
 
+# A project's tracked config.ini (its tuned defaults: hotkeys, renderer,
+# audio) seeds the config the host reads beside the executable -- only when
+# none is there yet, as with rom.cfg: after that the file is the player's.
+# Without this a fresh build tree got the framework's generic default text
+# instead of the project's own.
+#
+#   snesrecomp_target_config_seed(<target>)
+function(snesrecomp_target_config_seed target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DSRC=${CMAKE_SOURCE_DIR}/config.ini
+            -DDST=$<TARGET_FILE_DIR:${target}>/config.ini
+            -P ${SNESRECOMP_RUNNER_ROOT}/stage_if_missing.cmake
+        VERBATIM)
+endfunction()
+
 # The desktop host, as a linkable unit (runner/src/desktop/host_main.h).
 #
 # A game's main.c becomes a thin shim: a SnesDesktopHostGame descriptor and a

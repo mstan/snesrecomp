@@ -164,6 +164,10 @@ void ParseConfigFile(const char *filename);
 // the initial parse). Keyboard command map is rebuilt; gamepad map and all
 // scalar settings are left alone.
 void ConfigReloadKeyMap(const char *filename);
+/* True when ParseConfigFile read a [KeyMap] line that carried a former
+ * generated default and mapped it to the current one; WriteConfigFile then
+ * rewrites that line. The host writes the file once when this is set. */
+bool ConfigKeyMapMigrated(void);
 // Persist the launcher-editable settings back into `filename` (or config.ini)
 // with a surgical, comment-preserving in-place update. Called after the GUI
 // launcher returns PLAY.

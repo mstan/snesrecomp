@@ -18,6 +18,12 @@ enum {
 
 Config g_config;
 static bool s_state_menu_defaults;
+/* Set when a [KeyMap] line carried a binding this framework used to GENERATE
+ * as its default and has since changed; the line is read as the new default
+ * and WriteConfigFile rewrites it, so the file stops disagreeing with the
+ * binding. See ParseKeyArray. */
+static bool s_keymap_migrated;
+bool ConfigKeyMapMigrated(void) { return s_keymap_migrated; }
 
 #define REMAP_SDL_KEYCODE(key) ((key) & SDLK_SCANCODE_MASK ? kKeyMod_ScanCode : 0) | (key) & (kKeyMod_ScanCode - 1)
 #define _(x) REMAP_SDL_KEYCODE(x)
@@ -182,6 +188,19 @@ static void ParseKeyArray(char *value, int cmd, int size) {
      * Migrate those two defaults without rewriting the user's config. */
     if (s_state_menu_defaults && !key_with_mod && cmd == kKeys_Load + 6 && key == SDLK_F7) key = SDLK_F11;
     if (s_state_menu_defaults && !key_with_mod && cmd == kKeys_Load + 7 && key == SDLK_F8) key = SDLK_F12;
+    /* Volume keys. The config.ini this host wrote on a first launch said
+     * "VolumeUp = Shift+=" / "VolumeDown = Shift+-" for years; the defaults
+     * are Keypad + / Keypad - now (they collide with nothing, and Shift+=
+     * is not a key most players find). A file still carrying that generated
+     * pair is read as the new pair, rewritten once, and said so -- otherwise
+     * every existing install keeps the old keys forever and "the volume keys
+     * do nothing" is the report. A deliberate Shift+= can be kept by binding
+     * VolumeDown to anything but Shift+-. */
+    if (key_with_mod == kKeyMod_Shift && cmd == kKeys_VolumeUp && key == SDLK_EQUALS) {
+      key_with_mod = 0; key = SDLK_KP_PLUS; s_keymap_migrated = true;
+    } else if (key_with_mod == kKeyMod_Shift && cmd == kKeys_VolumeDown && key == SDLK_MINUS) {
+      key_with_mod = 0; key = SDLK_KP_MINUS; s_keymap_migrated = true;
+    }
     if (key == SDLK_UNKNOWN) {
       fprintf(stderr, "Unknown key: '%s'\n", s);
       continue;
@@ -722,6 +741,10 @@ void WriteConfigFile(const char *filename) {
     { "Graphics",   "Renderer" },
     { "General",    "RunAhead" },
     { "Sound",      "Volume" },
+    /* Only after a migration (see ParseKeyArray): [KeyMap] is otherwise the
+     * player's, and left exactly as written. */
+    { "KeyMap",     "VolumeUp" },
+    { "KeyMap",     "VolumeDown" },
   };
   const int N = (int)countof(kvs);
   static const char *const kDisplayAspectNames[kSnesDisplayAspect_Count] = {
@@ -749,6 +772,9 @@ void WriteConfigFile(const char *filename) {
   snprintf(kvs[15].val, sizeof(kvs[15].val), "%s", g_config.renderer[0] ? g_config.renderer : "auto");
   snprintf(kvs[16].val, sizeof(kvs[16].val), "%d", g_config.run_ahead);
   snprintf(kvs[17].val, sizeof(kvs[17].val), "%d", g_config.volume);
+  snprintf(kvs[18].val, sizeof(kvs[18].val), "Keypad +");
+  snprintf(kvs[19].val, sizeof(kvs[19].val), "Keypad -");
+  if (!s_keymap_migrated) kvs[18].done = kvs[19].done = 1;
 
   char *data = NULL;
   long sz = 0;

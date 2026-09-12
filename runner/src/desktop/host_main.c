@@ -2069,6 +2069,39 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   }
   if (game->after_config) game->after_config();
   ApplyVolume();
+  /* SNESRECOMP_KEYMAP_DUMP=1: what the system hotkeys resolved to, for a
+   * headless check that a binding really is bound (a config.ini beside the
+   * executable can say something other than the repository's). */
+  if (HostGetenv("KEYMAP_DUMP")) {
+    static const struct { const char *name; int cmd; } kProbe[] = {
+      { "VolumeUp", kKeys_VolumeUp }, { "VolumeDown", kKeys_VolumeDown },
+      { "SaveStateMenu", kKeys_SaveStateMenu }, { "Rewind", kKeys_Rewind },
+      { "DisplayPerf", kKeys_DisplayPerf }, { "Pause", kKeys_Pause },
+    };
+    static const SDL_Keycode kKeys[] = {
+      SDLK_KP_PLUS, SDLK_KP_MINUS, SDLK_F11, SDLK_F12, SDLK_f, SDLK_p, SDLK_EQUALS, SDLK_MINUS,
+    };
+    for (size_t i = 0; i < sizeof(kProbe) / sizeof(kProbe[0]); i++) {
+      const char *bound = "(unbound among the probed keys)";
+      char buf[64];
+      for (size_t k = 0; k < sizeof(kKeys) / sizeof(kKeys[0]); k++) {
+        for (int shift = 0; shift < 2; shift++) {
+          if (FindCmdForSdlKey(kKeys[k], shift ? KMOD_SHIFT : 0) == kProbe[i].cmd) {
+            snprintf(buf, sizeof(buf), "%s%s", shift ? "Shift+" : "", SDL_GetKeyName(kKeys[k]));
+            bound = buf;
+          }
+        }
+      }
+      fprintf(stderr, "[keymap] %s = %s\n", kProbe[i].name, bound);
+    }
+  }
+  if (ConfigKeyMapMigrated()) {
+    /* A [KeyMap] line still spelled a former generated default; the binding
+     * is the current one and the file is made to agree, once. */
+    host_report_breadcrumb("config: VolumeUp/VolumeDown moved from Shift+= / Shift+- "
+                           "to Keypad + / Keypad - (rewriting config.ini)");
+    WriteConfigFile(config_file);
+  }
   host_report_breadcrumb(
       "config parsed: output=%d new_renderer=%d scale=%d fullscreen=%d "
       "audio=%d freq=%d samples=%d",
