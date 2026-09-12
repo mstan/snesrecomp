@@ -66,8 +66,9 @@ void RtlRegisterGame(const RtlGameInfo *info) {
    * main.c may additionally call msu1_set_rom_path() to enable the
    * "auto" base-from-ROM-name mode. */
   msu1_init();
-  /* Register once when the title or developer opts into coverage capture.
-   * Normal release sessions do not create coverage artifacts. */
+  /* Harvest the interp-coverage manifest on exit only when the game or
+   * developer environment opts in. Registered once regardless of how many times
+   * a game re-registers (e.g. a reset path). */
   {
     static int coverage_atexit_registered = 0;
     if (tier2_capture_enabled() && !coverage_atexit_registered) {
@@ -125,6 +126,13 @@ uint16_t g_cpu_entry_s[RECOMP_STACK_DEPTH];
 /* Expected positive S delta when a generated callee consumes the hardware
  * return frame that its generated caller pushed. */
 static uint8_t g_cpu_entry_return_frame[RECOMP_STACK_DEPTH];
+/* Per-slot: this frame was entered by a guest TAIL call (JMP/JML), so it
+ * shares its caller's guest frame and its caller returns its RecompReturn
+ * VERBATIM rather than decrementing it. Set by cpu_take_tailcall_return_context
+ * when a prologue actually adopts the context; cleared by RecompStackPush.
+ * Consulted when converting a host-frame index into a SKIP_N unwind depth —
+ * see cpu_resolve_unwind_depth(). */
+static uint8_t g_cpu_entry_tailcall[RECOMP_STACK_DEPTH];
 static uint8_t g_tailcall_context_valid;
 static uint16_t g_tailcall_entry_s;
 static uint8_t g_tailcall_hrv;
@@ -153,6 +161,13 @@ int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv) {
   if (entry_s) *entry_s = g_tailcall_entry_s;
   if (hrv) *hrv = g_tailcall_hrv;
   g_tailcall_context_valid = 0;
+  /* A caller passing NULL is SWALLOWING a stale context, not adopting one
+   * (the HLE wrappers and the LLE unwind path do this deliberately), so it
+   * must not be recorded as a tail entry. A prologue that asks for the
+   * entry_s/hrv out-params is the real tail-entered case: its RecompStackPush
+   * already ran, so top-1 is its own slot. */
+  if (entry_s && g_recomp_stack_top > 0)
+    g_cpu_entry_tailcall[g_recomp_stack_top - 1] = 1;
   return 1;
 }
 
@@ -261,6 +276,64 @@ void CpuUnresolvedAbandonDumpJson(FILE *f) {
   fprintf(f, "\n    ]\n  },\n");
 }
 
+/* Convert a matched ancestor's frame INDEX into the SKIP_N unwind depth the
+ * generated return contract expects.
+ *
+ * Those are not the same number. `g_recomp_stack` counts HOST frames; the
+ * SKIP_N contract decrements once per GUEST frame, because the decrement is
+ * emitted at a call site (`return _r - 1;`). A guest TAIL call (JMP/JML)
+ * creates a host frame without creating a guest frame: the emitted caller
+ * does `_r = callee(cpu); RecompStackPop(); return _r;` — verbatim, no
+ * decrement — since caller and callee share one guest frame. Every such frame
+ * on the unwind path therefore inflates a raw host-frame count by one.
+ *
+ * Measured (GWED f3305, bank_00_A6EB black-screen): the live array was
+ *
+ *   [5] A7F0 entry_s=$0FD9  <- tail-entered from A765 (shares its entry_s)
+ *   [4] A765 entry_s=$0FD9
+ *   [3] A729 entry_s=$0FDB  <- match, ret_s=$0FDB
+ *   [2] A6EB entry_s=$0FE0
+ *
+ * The raw count (top-1)-i gave 2, but only ONE decrement happens on the way
+ * down (A765 returns A7F0's value verbatim), so A729 emitted 1 instead of 0,
+ * A6EB took SKIP_PROPAGATION instead of absorbing, and skipped the PLA/PLB
+ * epilogue that restores its PHB/PHK/PLB+PHA prologue pushes — the -3 that
+ * ends as a return into WRAM and a wild stack.
+ *
+ * Derivation: with value_k the RecompReturn frame k emits, and frame k
+ * returning verbatim exactly when frame k+1 was tail-entered,
+ *     value_k = value_{k+1} - (tailcall[k+1] ? 0 : 1)
+ * and the matched ancestor i must itself decrement to NORMAL, i.e.
+ * value_{i+1} == 1. Hence
+ *     N = 1 + |{ m in [i+2, top-1] : !tailcall[m] }|
+ * which collapses to the previous (top-1)-i whenever no frame on the path was
+ * tail-entered, so chains without tail calls are bit-identical. */
+static int cpu_resolve_unwind_depth(int i, int top) {
+  int n = 1;
+  for (int m = i + 2; m <= top - 1; m++)
+    if (!g_cpu_entry_tailcall[m]) n++;
+  return n;
+}
+
+/* DIAGNOSTIC: print the live recomp frame array — every slot's function name,
+ * its guest S at entry, and the return-frame size (hrv) recorded for it. The
+ * unwind depth a non-local return needs is a property of THIS array, not of
+ * the call graph read off the generated source: a chain can contain frames
+ * that are not obvious from a callee list, so an assumed caller/callee
+ * adjacency in g_cpu_entry_s[] can simply be wrong. `mark` (0 for none) is
+ * highlighted so a resolve target can be located in the real layout. */
+void recomp_dump_frame_array(FILE *out, uint16_t mark) {
+  int top = g_recomp_stack_top;
+  for (int i = top - 1; i >= 0; i--)
+    fprintf(out, "    [%2d] entry_s=$%04X hrv=%u %s%s%s%s\n", i,
+            (unsigned)g_cpu_entry_s[i], (unsigned)g_cpu_entry_return_frame[i],
+            g_recomp_stack[i] ? g_recomp_stack[i] : "?",
+            g_cpu_entry_tailcall[i] ? " (tail)" : "",
+            (i == top - 1) ? "   <- innermost" : "",
+            (mark && g_cpu_entry_s[i] == mark) ? "   <== MATCH" : "");
+  fflush(out);
+}
+
 int cpu_resolve_ancestor_skip(uint16_t ret_s) {
   /* The current (top-1) frame is the one whose RTS we are resolving; it
    * is NOT a match (its entry_s != ret_s, else the balanced host-return
@@ -272,10 +345,58 @@ int cpu_resolve_ancestor_skip(uint16_t ret_s) {
    * in behavior). */
   int top = g_recomp_stack_top;
   if (top < 2 || top > RECOMP_STACK_DEPTH) return -1;
+  int result = -1;
   for (int i = top - 2; i >= 0; i--) {
-    if (g_cpu_entry_s[i] == ret_s) return (top - 1) - i;
+    if (g_cpu_entry_s[i] == ret_s) {
+      result = cpu_resolve_unwind_depth(i, top);
+      break;
+    }
   }
-  return -1;
+  /* DIAGNOSTIC (SNESRECOMP_TRAP_ANCESTOR=<substr of a function name>): dump
+   * the LIVE frame array whenever a matching function is anywhere on the
+   * recomp stack, with the target and the resolved skip count. Reasoning about
+   * unwind depth from the generated source is unreliable — call chains contain
+   * intermediate frames that are not obvious from the callee list, so an
+   * assumed caller/callee adjacency in g_cpu_entry_s[] can simply be wrong.
+   * This prints the real layout at the moment the decision is made, so the
+   * skip count can be checked against actual frames rather than a model.
+   * Behaviour is unchanged: `result` is computed exactly as before. */
+  {
+    static const char *s_ta = (const char *)-1;
+    static int s_lo = 0, s_hi = 0;
+    if (s_ta == (const char *)-1) {
+      s_ta = getenv("SNESRECOMP_TRAP_ANCESTOR");
+      const char *r = getenv("SNESRECOMP_TRAP_ANCESTOR_FRAMES");
+      if (r && sscanf(r, "%d-%d", &s_lo, &s_hi) != 2) s_lo = s_hi = 0;
+    }
+    extern int snes_frame_counter;
+    if (s_ta && *s_ta &&
+        (s_hi == 0 ||
+         (snes_frame_counter >= s_lo && snes_frame_counter <= s_hi))) {
+      int hit = 0;
+      for (int i = 0; i < top && !hit; i++) {
+        if (!g_recomp_stack[i]) continue;
+        const char *p = s_ta;
+        while (*p && !hit) {
+          const char *c = strchr(p, ',');
+          size_t n = c ? (size_t)(c - p) : strlen(p);
+          if (n) {
+            char buf[64];
+            if (n >= sizeof buf) n = sizeof buf - 1;
+            memcpy(buf, p, n); buf[n] = 0;
+            if (strstr(g_recomp_stack[i], buf)) hit = 1;
+          }
+          p = c ? c + 1 : p + strlen(p);
+        }
+      }
+      if (hit) {
+        fprintf(stderr, "[trap-anc] f%d ret_s=$%04X top=%d -> skip=%d\n",
+                snes_frame_counter, (unsigned)ret_s, top, result);
+        recomp_dump_frame_array(stderr, ret_s);
+      }
+    }
+  }
+  return result;
 }
 
 int cpu_resolve_post_return_skip(uint16_t post_s) {
@@ -289,7 +410,11 @@ int cpu_resolve_post_return_skip(uint16_t post_s) {
   for (int i = top - 2; i >= 0; i--) {
     uint16_t expected = (uint16_t)(g_cpu_entry_s[i] +
                                    g_cpu_entry_return_frame[i]);
-    if (expected == post_s) return (top - 1) - i;
+    /* Same host-frame-vs-guest-frame conversion as the ancestor resolver:
+     * this feeds the identical SKIP_N decrement contract, so a tail-entered
+     * frame on the path inflates a raw count here too. Identical to the old
+     * (top-1)-i when no frame on the path was tail-entered. */
+    if (expected == post_s) return cpu_resolve_unwind_depth(i, top);
   }
   return -1;
 }
@@ -469,6 +594,27 @@ void RecompStackPush(const char *name) {
         (g_cpu.host_return_valid == 2 || g_cpu.host_return_valid == 3)
             ? g_cpu.host_return_valid
             : 0;
+    /* Seed the entry-S baseline HERE, not only in the generated prologue.
+     *
+     * The prologue's `g_cpu_entry_s[g_recomp_stack_top-1] = _entry_s` runs
+     * AFTER the two early-exit yield checks (master deadline, in-LLE-
+     * scheduler), and both of those call RecompStackPop() on the way out. So
+     * for that window the slot still held whatever an unrelated earlier call
+     * at the same depth left there, and the auditor differenced live S against
+     * a stranger's baseline. That is where bank_07_8004_M0X0's
+     * "total_delta +7866, calls 23, nonzero 23" came from -- and the ~+4000
+     * magnitudes on the interp@ entries, which are two unrelated stack
+     * pointers subtracted, not drift.
+     *
+     * The ancestor scans (cpu_resolve_ancestor_skip / _post_return_skip) only
+     * read strict ancestors at i <= top-2, which have necessarily run their
+     * prologue, so they were never exposed to the stale window. Seeding here
+     * makes that an invariant instead of an argument. The prologue still
+     * overwrites with its tailcall-adjusted _entry_s, so no established
+     * behaviour changes. */
+    g_cpu_entry_s[slot] = g_cpu.S;
+    g_cpu_entry_tailcall[slot] = 0;  /* set only if this prologue adopts a
+                                      * tailcall return context (below) */
   } else if (getenv("SNESRECOMP_STACK_CAP_ABORT")) {
     /* Diagnostic-only: stop at the first host-call-depth overflow while the
      * bounded attribution stack still contains the causal chain.  Letting C
@@ -534,6 +680,7 @@ typedef struct {
   long long   total_delta;  /* sum of (exit_s - entry_s) across all returns */
   long        calls;
   long        nonzero;      /* # returns with a nonzero delta */
+  long        yields;       /* # exits via an LLE yield unwind (not balanced) */
   int         last_delta;
 } StackBalEntry;
 #if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
@@ -579,9 +726,11 @@ void RecompStackBalDumpStderr(int topn) {
 #if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
   fprintf(stderr, "=== stack-balance auditor: top %d net-imbalanced funcs ===\n", n);
   for (int i = 0; i < n; i++)
-    fprintf(stderr, "  %+lld bytes net over %ld calls (%ld nonzero, last %+d): %s\n",
+    fprintf(stderr,
+            "  %+lld bytes net over %ld calls (%ld nonzero, %ld yielded, last %+d): %s\n",
             top[i]->total_delta, top[i]->calls, top[i]->nonzero,
-            top[i]->last_delta, top[i]->name ? top[i]->name : "?");
+            top[i]->yields, top[i]->last_delta,
+            top[i]->name ? top[i]->name : "?");
 #else
   (void)n;
   fprintf(stderr, "=== stack-balance auditor: disabled ===\n");
@@ -596,9 +745,10 @@ void RecompStackBalDumpJson(FILE *f) {
   fprintf(f, "  \"stack_balance\": [");
   for (int i = 0; i < n; i++)
     fprintf(f, "%s{\"name\":\"%s\",\"total_delta\":%lld,\"calls\":%ld,"
-               "\"nonzero\":%ld,\"last_delta\":%d}",
+               "\"nonzero\":%ld,\"yields\":%ld,\"last_delta\":%d}",
             (i ? "," : ""), top[i]->name ? top[i]->name : "?",
-            top[i]->total_delta, top[i]->calls, top[i]->nonzero, top[i]->last_delta);
+            top[i]->total_delta, top[i]->calls, top[i]->nonzero, top[i]->yields,
+            top[i]->last_delta);
   fprintf(f, "],\n");
 #else
   (void)n;
@@ -607,7 +757,10 @@ void RecompStackBalDumpJson(FILE *f) {
 #endif
 }
 
-void RecompStackPop(void) {
+/* audit != 0: this exit is a real return, so the guest stack effect is
+ * complete and (exit_s - entry_s) is a meaningful balance figure.
+ * audit == 0: this exit is an LLE yield unwind — see RecompStackPopYield. */
+static void recomp_stack_pop_common(int audit) {
 #ifdef SNESRECOMP_INTERP_PROFILE
   if (g_aotprof_on < 0) aotprof_latch_env();
   if (g_aotprof_on == 1) {
@@ -625,12 +778,17 @@ void RecompStackPop(void) {
     const char *fn = g_recomp_stack[g_recomp_stack_top - 1];
 #if SNESRECOMP_STACK_BALANCE_DIAGNOSTICS
     int slot = g_recomp_stack_top - 1;
-    int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
-                (int)g_cpu_entry_return_frame[slot];
-    StackBalEntry *e = stackbal_find(fn);
-    if (e) {
-      e->calls++;
-      if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
+    if (audit) {
+      int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
+                  (int)g_cpu_entry_return_frame[slot];
+      StackBalEntry *e = stackbal_find(fn);
+      if (e) {
+        e->calls++;
+        if (delta) { e->total_delta += delta; e->nonzero++; e->last_delta = delta; }
+      }
+    } else {
+      StackBalEntry *e = stackbal_find(fn);
+      if (e) e->yields++;
     }
 #else
     (void)fn;
@@ -644,6 +802,29 @@ void RecompStackPop(void) {
   }
   g_last_recomp_func = g_recomp_stack_top > 0 ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)";
 }
+
+void RecompStackPop(void) { recomp_stack_pop_common(1); }
+
+/* Pop for an LLE yield unwind (interp_bridge_lle_yield_unwind).
+ *
+ * The frame is NOT finished: the bounce site resumes the INTERPRETER at
+ * resume_pc24 "with cpu exactly as the compiled callsite left it"
+ * (cpu_state.h), and the interpreter runs the rest of the routine —
+ * including the pops matching any PHP/PHA this frame already executed. So
+ * (S - entry_s) at a yield is mid-flight by construction, not an imbalance,
+ * and folding it into total_delta manufactures an offender.
+ *
+ * That is what happened to $07:8004, the SPC700 upload routine: it is a PHP
+ * entry wrapped around unbounded `CMP $2140 / BNE` MMIO spins, so it yields
+ * on nearly every call with pushed state live. The auditor read
+ * "total_delta +7866, calls 23, nonzero 23" and recomp/bank07.cfg cited
+ * that as proof the native ABI could not represent the routine —
+ * force_lle'ing it, which prunes decode through the boot call chain and
+ * costs 1563 exact AOT variants down to 34.
+ *
+ * Yields are counted separately so "how often does this frame leave through
+ * a yield" stays visible without contaminating the balance figure. */
+void RecompStackPopYield(void) { recomp_stack_pop_common(0); }
 
 // Frame watchdog: detect infinite loops in generated code.
 // Set before calling run_frame, checked by generated code periodically.
@@ -663,8 +844,69 @@ void WatchdogFrameStart(void) {
   g_interrupt_context_depth = 0;
 }
 
+/* ── DRAM refresh ──
+ * Hardware stalls the CPU ~40 master clocks once per scanline, vblank
+ * included — a ~2.9% tax on execution this runtime never paid. Unpaid, a
+ * scene load completes its lag blocks early (measured 33/46/32 frames vs
+ * Mesen's 36/47/35 before this and the DMA-time charge), shifting the parity
+ * of the pass that spawns objects; the sprite hover (gated on the pass
+ * counter) then pairs with the wrong animation phase and publishes sprite
+ * tables hardware never shows.
+ *
+ * One watermark serves both tiers: generated code charges from
+ * WatchdogCheck() per block, the interpreter from its per-opcode advance.
+ * The park path (idle-spin skip) exempts its own jumps — parked time
+ * displaces no work, and taxing it would drift IRQ latch points. A jump of
+ * more than 4096 lines is treated as a teleport (boot, savestate load) and
+ * exempted rather than charged. */
+uint64_t g_refresh_charged_upto;
+static uint64_t s_refresh_phase;
+void snes_refresh_exempt(void) { g_refresh_charged_upto = g_cpu.master_cycles; }
+void snes_refresh_charge(void) {
+  uint64_t m = g_cpu.master_cycles;
+  if (g_refresh_charged_upto == 0 || m < g_refresh_charged_upto) {
+    g_refresh_charged_upto = m;
+    return;
+  }
+  uint64_t delta = m - g_refresh_charged_upto;
+  s_refresh_phase += delta;
+  uint64_t lines = s_refresh_phase / 1364u;
+  if (lines > 4096u) {            /* teleport, not execution */
+    s_refresh_phase = 0;
+    g_refresh_charged_upto = m;
+    return;
+  }
+  if (lines) {
+    s_refresh_phase -= lines * 1364u;
+    g_cpu.master_cycles += 40u * lines;
+  }
+  g_refresh_charged_upto = g_cpu.master_cycles;
+}
+
+/*
+ * Rollback accessors. s_refresh_phase is the sub-scanline remainder and
+ * g_refresh_charged_upto the high-water mark; together they decide how much
+ * refresh tax the next block pays. Neither is in snes_saveload — they are host
+ * accounting, not guest memory — so a rewind used to leave them holding the
+ * discarded timeline's phase and the replayed frame was charged a different
+ * number of cycles than the frame it replaced. Measured as hPos,
+ * apuCatchupCycles and autoJoyTimer diverging on the first replayed tick with
+ * guest memory byte-identical, both offline and across a real Linux/Windows
+ * match (RB POST FORK on episode #1, same digests every run).
+ */
+void snes_refresh_state_get(uint64_t *phase, uint64_t *charged_upto) {
+  if (phase) *phase = s_refresh_phase;
+  if (charged_upto) *charged_upto = g_refresh_charged_upto;
+}
+
+void snes_refresh_state_set(uint64_t phase, uint64_t charged_upto) {
+  s_refresh_phase = phase;
+  g_refresh_charged_upto = charged_upto;
+}
+
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
+  snes_refresh_charge();
 #ifdef SNES_COSIM
   /* Co-sim WRAM watchpoint (dev, env-gated): name the recompiled function that
    * writes a given low-WRAM address. WatchdogCheck runs per-block with
@@ -786,7 +1028,31 @@ void WatchdogCheck(void) {
 }
 
 Snes *SnesInit(const uint8 *data, int data_size) {
+#if defined(SNESRECOMP_SETUP_HOST)
+  /* A setup host carries no recompiled code (runner.cmake,
+   * snesrecomp_target_generated_code). Booting a guest here would run every
+   * instruction through the interpreter tier with nothing to hand off to --
+   * a build that "works" by never being the product. Refuse, and say what the
+   * player should do instead. Die() is the host's fatal path: the GUI
+   * launcher shows it, a console host prints it. */
+  (void)data;
+  (void)data_size;
+  Die("This is a setup build with no recompiled game code.\n"
+      "Start it with --launcher and use \"Generate & rebuild\" with your own "
+      "ROM; the rebuilt executable in build/ is the playable one.");
+  return NULL;
+#else
   g_snes = snes_init(g_ram);
+  /* The CpuState's WRAM pointer is host state, not simulation state: no reset
+   * path sets it, and a CpuState that never had it dereferences NULL on the
+   * first guest stack push (interp816_pushByte -> cpu_write8 -> cpu->ram[off])
+   * or the first WRAM read. Every port used to wire this itself from its
+   * initialize hook -- Endless Duel and Metal Warriors do -- and every port
+   * that did not crashed on frame 1 (a fresh scaffold: SIGSEGV in cpu_read8
+   * with rax = 0). The machine is being built here; the pointer belongs here.
+   * A port's own cpu_state_init() in its initialize hook, below, is harmless
+   * -- same call, same moment, before snes_reset(). */
+  cpu_state_init(&g_cpu, g_ram);
   cart_set_master_clock_source(g_snes->cart,
                                &g_cpu.coprocessor_master_cycles);
   g_snes_cpu = g_snes->cpu;
@@ -805,6 +1071,21 @@ Snes *SnesInit(const uint8 *data, int data_size) {
     if (g_rtl_game_info->initialize)
       g_rtl_game_info->initialize();
     snes_reset(g_snes, true); // reset after loading
+    /* The machine is new; the HOST-SIDE pacing that drives it must be too.
+     *
+     * snes_reset clears the guest (WRAM included). It does not touch the frame
+     * counter or the APU pacing anchors, which live in the runtime and outlive
+     * any one Snes -- so a rematch re-entered through SnesInit inherited the
+     * previous session's counter and anchors. The APU was then caught up by a
+     * different number of cycles than on a first boot, the CPU read different
+     * values from its ports while booting, and the two peers' WRAM and APU
+     * digests came out different at tick 0 -- a rematch that could never start
+     * even with nobody touching anything.
+     *
+     * RtlReset (the soft-reset path) has always done this. SnesInit is the
+     * other way into a fresh machine and has to agree with it: two entry
+     * points must not disagree about what "cold boot" means. */
+    rtl_reset_host_pacing();
     g_snes->beamMasterLast = g_cpu.master_cycles;
     SnesEnterNativeMode();
   } else {
@@ -820,4 +1101,6 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   g_sram = g_snes->cart->ram;
   g_sram_size = g_snes->cart->ramSize;
   return g_snes;
+#endif /* SNESRECOMP_SETUP_HOST */
 }
+

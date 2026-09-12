@@ -208,6 +208,23 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     }
     return value;
 }
+/* Diagnostic env gates, read once.
+ *
+ * These four sites sit on the interpreter's memory bus and in its step loop,
+ * so an uncached getenv is a linear scan of the whole environment per guest
+ * memory access. That is invisible in a mostly-AOT port and expensive in one
+ * that runs mostly interpreted: profiling Endless Duel (whose compiled tier is
+ * 31 bank-$00 entries, so effectively all execution is LLE) put getenv at 2.1%
+ * of frame time, ahead of the SPC and the DSP. Every other env read in this
+ * file already caches in a static; these did not.
+ *
+ * Kept as the FIRST operand of each guard so the almost-always-false load
+ * short-circuits the port comparison behind it. */
+static int bridge_yield_diag(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("SNESRECOMP_YIELD_DIAG") ? 1 : 0;
+    return v;
+}
 static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
     bridge_timing_bus(adr);
     g_interp_bridge_write_epoch++;
@@ -431,6 +448,35 @@ static int      s_interp_bounce_owner_depth = 0;
  * to a compiled ancestor, not to this interpreter's guest call chain. */
 static uint16_t s_interp_owner_exit_s = 0;
 static int      s_interp_owner_exit_valid = 0;
+/* ...but a SCHEDULER / whole-program frame (yield_pc != 0) has no such
+ * boundary. It entered at whatever S the previous frame yielded from --
+ * typically deep inside a wait-for-vblank routine -- and its guest program
+ * legitimately runs and returns ABOVE that S on every frame. Its s_exit is a
+ * resume point, not a compiled-ancestor boundary, so "S crossed above the
+ * watermark" proves nothing there. The RTS return-past-entry watermark was
+ * already disabled for yield_pc mode for exactly this reason; these three
+ * owner-crossing tests were not, which is the bug.
+ *
+ * Super Metroid, pressing Start at the title: FileSelectMenu_0_FadeOutConfigGfx
+ * ($81:944E) reaches WaitForNMI through a JSR, so the frame resumes at
+ * S=$1FEC; LoadInitialMenuTiles then JSLs SetupDmaTransfer ($80:91A9) at
+ * S=$1FF0, whose compiled body rewrites its return (+8 inline bytes). The
+ * rewrite was read as a compiled ancestor's, run in a nested tier frame, and
+ * surfaced as SKIP_1 that abandoned the live scheduler frame -- the next host
+ * frame then injected NMI at a stale PC over a half-unwound stack and ran
+ * garbage into InvalidInterrupt_Crash ($80:8573). */
+static int      s_interp_owner_is_scheduler = 0;
+
+/* Has a post-return S crossed above the owning interpreter frame's exit
+ * watermark, into a compiled ancestor? Never true for a scheduler owner.
+ * One predicate, three call sites: they must agree, and when they were
+ * spelled out separately they did not. */
+static int interp_owner_crossed(uint16_t post_s) {
+    if (!s_interp_owner_exit_valid || s_interp_owner_is_scheduler)
+        return 0;
+    const uint16_t d = (uint16_t)(post_s - s_interp_owner_exit_s);
+    return d != 0 && d < 0x8000u;
+}
 /* Recomp-stack depth immediately before any interpreter frame bounces into a
  * paired AOT root. A rewritten return in that root belongs directly to the
  * interpreter; one reached below that root belongs to a compiled ancestor
@@ -507,6 +553,64 @@ int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
 void interp_bridge_set_lle_resume_pc(uint32_t pc) { s_lle_resume_pc24 = pc; }
 
+/* ── rollback state (see interp_bridge.h) ─────────────────────────────── */
+
+typedef struct {
+    uint32_t magic;
+    uint64_t apu_pending_master;
+    uint64_t write_epoch;
+    uint64_t continuous_read_epoch;
+    uint64_t dynamic_progress_epoch;
+    uint64_t bus_master;
+    unsigned bus_cycles;
+    int      bus_timing_active;
+    uint32_t lle_resume_pc24;
+    int      lle_wai_yield;
+    uint64_t lle_master_deadline;
+    BridgeDynamicValue dynamic_values[64];
+} InterpBridgeRbState;
+
+#define INTERP_BRIDGE_RB_MAGIC 0x49425253u /* 'IBRS' */
+
+size_t interp_bridge_rb_state_size(void) { return sizeof(InterpBridgeRbState); }
+
+void interp_bridge_rb_state_save(void *out) {
+    InterpBridgeRbState *s = (InterpBridgeRbState *)out;
+    if (!s) return;
+    memset(s, 0, sizeof(*s));
+    s->magic                  = INTERP_BRIDGE_RB_MAGIC;
+    s->apu_pending_master     = s_apu_pending_master;
+    s->write_epoch            = g_interp_bridge_write_epoch;
+    s->continuous_read_epoch  = s_interp_continuous_read_epoch;
+    s->dynamic_progress_epoch = s_interp_dynamic_progress_epoch;
+    s->bus_master             = s_interp_bus_master;
+    s->bus_cycles             = s_interp_bus_cycles;
+    s->bus_timing_active      = s_interp_bus_timing_active;
+    s->lle_resume_pc24        = s_lle_resume_pc24;
+    s->lle_wai_yield          = s_lle_wai_yield;
+    s->lle_master_deadline    = s_lle_master_deadline;
+    memcpy(s->dynamic_values, s_bridge_dynamic_values,
+           sizeof(s->dynamic_values));
+}
+
+void interp_bridge_rb_state_load(const void *in) {
+    const InterpBridgeRbState *s = (const InterpBridgeRbState *)in;
+    if (!s || s->magic != INTERP_BRIDGE_RB_MAGIC)
+        return;
+    s_apu_pending_master          = s->apu_pending_master;
+    g_interp_bridge_write_epoch   = s->write_epoch;
+    s_interp_continuous_read_epoch = s->continuous_read_epoch;
+    s_interp_dynamic_progress_epoch = s->dynamic_progress_epoch;
+    s_interp_bus_master           = s->bus_master;
+    s_interp_bus_cycles           = s->bus_cycles;
+    s_interp_bus_timing_active    = s->bus_timing_active;
+    s_lle_resume_pc24             = s->lle_resume_pc24;
+    s_lle_wai_yield               = s->lle_wai_yield;
+    s_lle_master_deadline         = s->lle_master_deadline;
+    memcpy(s_bridge_dynamic_values, s->dynamic_values,
+           sizeof(s_bridge_dynamic_values));
+}
+
 int interp_bridge_lle_took_wai(void) {
     const int v = s_lle_wai_yield;
     s_lle_wai_yield = 0;
@@ -537,6 +641,37 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
 }
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
+    /* DIAGNOSTIC (SNESRECOMP_TRAP_YIELD=<lo>-<hi> hex pc24 range): print every
+     * LLE yield unwind whose resume PC falls in the range, with the live guest
+     * S and the function that yielded. A yield mid-body returns the unwind
+     * sentinel, which every caller propagates as `return _r - 1` — so a yield
+     * deep in a call chain makes each ancestor exit without its epilogue. This
+     * names the originating block. Env-gated, zero cost when unset. */
+    {
+        static int s_ty_init = 0;
+        static unsigned long s_ty_lo = 0, s_ty_hi = 0;
+        if (!s_ty_init) {
+            s_ty_init = 1;
+            const char *e = getenv("SNESRECOMP_TRAP_YIELD");
+            if (!e || sscanf(e, "%lx-%lx", &s_ty_lo, &s_ty_hi) != 2) {
+                s_ty_lo = 1; s_ty_hi = 0;   /* empty range = disabled */
+            }
+        }
+        if (s_ty_lo <= s_ty_hi &&
+            (unsigned long)(resume_pc24 & 0xFFFFFFu) >= s_ty_lo &&
+            (unsigned long)(resume_pc24 & 0xFFFFFFu) <= s_ty_hi) {
+            extern int snes_frame_counter;
+            extern const char *g_last_recomp_func;
+            fprintf(stderr,
+                "[trap-yield] f%d resume=$%06X S=$%04X func=%s deadline=%d depth=%d\n",
+                snes_frame_counter, (unsigned)(resume_pc24 & 0xFFFFFFu),
+                (unsigned)cpu->S,
+                g_last_recomp_func ? g_last_recomp_func : "?",
+                (int)s_lle_next_unwind_is_deadline,
+                (int)s_interp_bounce_owner_depth);
+            fflush(stderr);
+        }
+    }
     (void)cpu;
     /* A JMP-reached primitive (task-die / scheduler-dispatch) arrives via a
      * gen tail-call that armed a tailcall return context for a callee that
@@ -607,8 +742,7 @@ int interp_bridge_return_targets_owner(uint16 ret_s, uint16 post_s) {
     if (root_delta == 0 || root_delta >= 0x8000u)
         return 0;
 
-    const uint16 owner_delta = (uint16)(post_s - s_interp_owner_exit_s);
-    return owner_delta == 0 || owner_delta >= 0x8000u;
+    return !interp_owner_crossed(post_s);
 }
 
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
@@ -1512,7 +1646,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 in.mf = 1;
                 in.db = in.k;
             }
-            if (getenv("SNESRECOMP_YIELD_DIAG") &&
+            if (bridge_yield_diag() &&
                 _yield_flag != yield_flag_value && steps > 16) {
                 static int _yield_diag_n;
                 if (_yield_diag_n < 64) {
@@ -1662,6 +1796,45 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
         }
 
+        /* DIAGNOSTIC (SNESRECOMP_TRAP_BADPB=1): the interpreter must never
+         * step into a program bank this cartridge does not have. For a LoROM
+         * image the valid exec banks are $00-$3F, their $80-$BF mirrors, and
+         * WRAM $7E/$7F; a PB in $40-$7D or $C0-$FF means a control transfer
+         * handed us a corrupted target (e.g. an RTL that popped a garbage
+         * return-frame bank byte). Trap the FIRST such step and dump the
+         * recent ring — the transfer that produced it is the last few lines.
+         * Env-gated so it costs nothing in normal runs. */
+        {
+            static int _tbp = -1;
+            if (_tbp < 0) _tbp = getenv("SNESRECOMP_TRAP_BADPB") ? 1 : 0;
+            if (_tbp) {
+                uint8_t _pbnk = (uint8_t)((pc_before >> 16) & 0xFF);
+                int _valid = (_pbnk <= 0x3F) ||
+                             (_pbnk >= 0x80 && _pbnk <= 0xBF) ||
+                             (_pbnk == 0x7E || _pbnk == 0x7F);
+                if (!_valid) {
+                    extern int snes_frame_counter;
+                    fprintf(stderr,
+                        "[trap-badpb] interp entered PB=$%02X at pc=$%06X "
+                        "op=$%02X frame=%d sp=$%04X — corrupted control transfer\n",
+                        _pbnk, (unsigned)pc_before, op, snes_frame_counter,
+                        (unsigned)in.sp);
+                    /* Step history at the trap. This branch had an
+                     * always-on file-static ring (g_itrace_recent); main
+                     * replaced it with the function-local one above, so use
+                     * that instead of reviving a duplicate. `head` (first 8
+                     * steps) is always recorded; the 256-entry `ring` only
+                     * fills under SNESRECOMP_ITRACE, so pass total=0 when
+                     * untraced -- printing the entry path and claiming NO
+                     * spin history beats dumping an unfilled ring. */
+                    itrace_dump(entry_pc24, head, (int)(itn < 8 ? itn : 8),
+                                ring, trace ? itn : 0);
+                    fflush(stderr);
+                    exit(43);
+                }
+            }
+        }
+
         /* Subroutine calls: JSR abs (0x20, 3B), JSL (0x22, 4B),
          * JSR (abs,X) (0xFC, 3B). RTS (0x60) / RTL (0x6B) are returns. */
         const int is_call  = (op == 0x20 || op == 0x22 || op == 0xFC);
@@ -1708,6 +1881,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
+            /* DRAM refresh tax — shared watermark with the AOT tier's
+             * WatchdogCheck charge; see common_cpu_infra.c. */
+            snes_refresh_charge();
             cpu->coprocessor_master_cycles = cpu->master_cycles;
             if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
             if (g_snes && g_snes->cart)
@@ -1963,20 +2139,32 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                      * interpreter's watermark, belongs to an ancestor outside
                      * this interpreter frame. Preserve that non-local return
                      * instead of resuming at ret. */
-                    const uint16_t _owner_delta =
-                        (uint16_t)(in.sp - s_enter);
                     const int _skip_crossed_owner =
-                        _owner_delta != 0 && _owner_delta < 0x8000u;
+                        interp_owner_crossed(in.sp);
                     if (_air != RECOMP_RETURN_SKIP_1 ||
                         _skip_crossed_owner) {
                         if (yield_pc) {
+                            /* Nothing outside a scheduler frame can consume a
+                             * multi-level skip: it IS the outermost guest
+                             * program. Reporting the frame complete resumes
+                             * the next one at a stale PC over a half-unwound
+                             * stack. Bail contained instead, so the host sees
+                             * a failed frame rather than a wrong one. */
                             static int s_ynlr_logged = 0;
                             if (s_ynlr_logged < 8) {
                                 s_ynlr_logged++;
                                 fprintf(stderr, "[interp_bridge] yield-mode NLR "
-                                        "exit (non-unwind) _air=%d target=$%06X\n",
-                                        (int)_air, (unsigned)target);
+                                        "exit (non-unwind) _air=%d target=$%06X "
+                                        "frame=%d site=$%06X sp_pre=$%04X "
+                                        "sp=$%04X s_enter=$%04X - contained bail\n",
+                                        (int)_air, (unsigned)target,
+                                        snes_frame_counter, (unsigned)pc_before,
+                                        (unsigned)_sp_pre, (unsigned)in.sp,
+                                        (unsigned)s_enter);
                             }
+                            sync_interp_to_cpu(&in, cpu);
+                            bridge_apu_flush(cpu);
+                            return 0;
                         }
                         sync_interp_to_cpu(&in, cpu);
                         /* A nested non-scheduler tier run belongs to a compiled
@@ -2103,28 +2291,47 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     return 0;
 }
 
-/* Each bridge run installs a stable interpreted-function name so debug write
- * attribution does not leak an enclosing AOT frame. */
-extern const char *g_last_recomp_func;
-#define INTERP_SCOPE_NAMES 4096u
+
+/* ── interpreter attribution scope ────────────────────────────────────────
+ *
+ * Every bridge run pushes a synthesized name (interp@$XXXXXX, the entry PC)
+ * onto the recomp call stack and installs it as g_last_recomp_func for the
+ * run's duration. The debug server's write rings (VramTraceEntry.func/stack,
+ * OamWriteEntry.func) copy those at write time, so without this an
+ * interpreted write is attributed to the stale enclosing AOT frame — or, in
+ * a whole-program-LLE port, to nothing at all. The entry PC is the useful
+ * identity: it is a real guest function entry, the exact address a
+ * symbols.toml [[func]] would name. Nested calls that bounce to compiled
+ * bodies push their own names over this one, so only still-interpreted
+ * depth stays attributed to the bridge entry.
+ *
+ * Names are interned in a fixed open-addressed table: RecompStackPush keeps
+ * the pointer, not a copy, so it must outlive the run. On table overflow a
+ * shared static name is returned rather than evicting — attribution degrades
+ * to "some interpreted code", never to a dangling pointer.
+ */
+extern const char *g_last_recomp_func; /* common_cpu_infra.c */
+
+#define INTERP_SCOPE_NAMES 4096u /* power of two; ~1400 tier sites seen in MMX */
 static char s_interp_scope_names[INTERP_SCOPE_NAMES][20];
 static uint32_t s_interp_scope_pc[INTERP_SCOPE_NAMES];
 static uint8_t s_interp_scope_used[INTERP_SCOPE_NAMES];
 
 static const char *interp_scope_name(uint32_t pc24) {
     pc24 &= 0xFFFFFFu;
-    uint32_t slot = (pc24 * 2654435761u) & (INTERP_SCOPE_NAMES - 1u);
+    uint32_t h = (pc24 * 2654435761u) & (INTERP_SCOPE_NAMES - 1u);
     for (uint32_t probe = 0; probe < INTERP_SCOPE_NAMES; probe++) {
-        uint32_t i = (slot + probe) & (INTERP_SCOPE_NAMES - 1u);
-        if (!s_interp_scope_used[i]) {
-            s_interp_scope_used[i] = 1;
-            s_interp_scope_pc[i] = pc24;
-            snprintf(s_interp_scope_names[i], sizeof(s_interp_scope_names[i]),
+        uint32_t slot = (h + probe) & (INTERP_SCOPE_NAMES - 1u);
+        if (!s_interp_scope_used[slot]) {
+            s_interp_scope_used[slot] = 1;
+            s_interp_scope_pc[slot] = pc24;
+            snprintf(s_interp_scope_names[slot],
+                     sizeof(s_interp_scope_names[slot]),
                      "interp@$%06X", (unsigned)pc24);
-            return s_interp_scope_names[i];
+            return s_interp_scope_names[slot];
         }
-        if (s_interp_scope_pc[i] == pc24)
-            return s_interp_scope_names[i];
+        if (s_interp_scope_pc[slot] == pc24)
+            return s_interp_scope_names[slot];
     }
     return "interp@(table full)";
 }
@@ -2150,9 +2357,14 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     if (yield_pc) s_lle_sched_depth++;
     const uint16_t _saved_owner_exit_s = s_interp_owner_exit_s;
     const int _saved_owner_exit_valid = s_interp_owner_exit_valid;
+    const int _saved_owner_is_scheduler = s_interp_owner_is_scheduler;
     s_interp_owner_exit_s = s_exit;
     s_interp_owner_exit_valid = 1;
+    s_interp_owner_is_scheduler = yield_pc != 0;
     s_interp_bridge_depth++;
+    /* Attribution scope (see interp_scope_name above). Saved/restored rather
+     * than assumed clean: a bounce chain re-enters this wrapper with an AOT
+     * name installed, and that name must come back on our exit. */
     const char *_saved_func = g_last_recomp_func;
     const char *_scope_name = interp_scope_name(entry_pc24);
     g_last_recomp_func = _scope_name;
@@ -2167,6 +2379,7 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     s_interp_bridge_depth--;
     s_interp_owner_exit_s = _saved_owner_exit_s;
     s_interp_owner_exit_valid = _saved_owner_exit_valid;
+    s_interp_owner_is_scheduler = _saved_owner_is_scheduler;
     if (yield_pc) {
         s_lle_sched_depth--;
         /* A pending yield unwind must have been consumed by this frame's
@@ -2695,12 +2908,9 @@ RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
         /* If S crossed above this interpreter's entry watermark, the rewrite
          * landed in a compiled ancestor. Let the nested tier below consume
          * that ancestor continuation and return the matching SKIP_N. */
-        const uint16_t owner_delta =
-            (uint16_t)(cpu->S - s_interp_owner_exit_s);
         const int crossed_into_compiled_ancestor =
             s_interp_bounce_recomp_base > 0 &&
-            s_interp_owner_exit_valid &&
-            owner_delta != 0 && owner_delta < 0x8000u;
+            interp_owner_crossed(cpu->S);
         if (!crossed_into_compiled_ancestor)
             return interp_bridge_lle_yield_unwind(cpu, target_pc24);
     }

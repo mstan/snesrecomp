@@ -1,0 +1,73 @@
+/*
+ * The host contract for @DISPLAY_NAME@.
+ *
+ * The runner is a library, not an application: a handful of symbols are
+ * deliberately left for the host to define, because the right answer depends
+ * on the frontend. This file is the complete list, in its smallest honest
+ * form — link it, and the framework resolves.
+ *
+ * Every one of these is a real extension point, not boilerplate to ignore:
+ *
+ *   Die                     what a fatal framework error should do. A GUI
+ *                           frontend shows a dialog; this aborts loudly.
+ *   RtlApuLock/Unlock       serialises the guest thread against the audio
+ *                           callback thread, which drains the S-DSP output
+ *                           ring. Real once you open an audio device.
+ *   g_spc_player            optional SPC-upload interception. NULL means the
+ *                           guest's own APU upload path runs untouched.
+ *   debug_on_*              trace hooks. Empty here; snesrecomp's debug
+ *                           server fills them when built with
+ *                           -DSNESRECOMP_ENABLE_TRACE=ON.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <stdint.h>
+
+#include "common_rtl.h"
+#include "spc_player.h"
+#include "desktop/sdl_compat.h"
+
+void Die(const char *error)
+{
+    fprintf(stderr, "@PROJECT_NAME@: fatal: %s\n", error ? error : "(no message)");
+    abort();
+}
+
+/* One mutex, held whenever guest-thread code touches APU/DSP state that the
+ * audio thread also reads. A silent host still needs these to exist; they
+ * become load-bearing the moment SDL_OpenAudioDevice is called. */
+static SDL_mutex *g_apu_mutex;
+
+void RtlApuLock(void)
+{
+    if (!g_apu_mutex)
+        g_apu_mutex = SDL_CreateMutex();
+    if (g_apu_mutex)
+        SDL_LockMutex(g_apu_mutex);
+}
+
+void RtlApuUnlock(void)
+{
+    if (g_apu_mutex)
+        SDL_UnlockMutex(g_apu_mutex);
+}
+
+/* NULL = no interception; the guest uploads its own SPC program. */
+SpcPlayer *g_spc_player;
+
+void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y)
+{
+    (void)pc; (void)a; (void)x; (void)y;
+}
+
+void debug_on_wram_write_byte(uint32_t addr, uint8_t old_val, uint8_t new_val)
+{
+    (void)addr; (void)old_val; (void)new_val;
+}
+
+void debug_on_wram_write_word(uint32_t addr, uint16_t old_val, uint16_t new_val)
+{
+    (void)addr; (void)old_val; (void)new_val;
+}

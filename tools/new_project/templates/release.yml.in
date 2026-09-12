@@ -1,0 +1,375 @@
+# Build the @DISPLAY_NAME@ SETUP PACK for Linux, Windows, macOS
+# arm64 and macOS Intel, tag the commit, and publish the four zips as a
+# GitHub Release.
+#
+# HUMAN-TRIGGERED ONLY. There is no push, pull_request or schedule trigger and
+# there must never be one: a run is a release decision, made by a person on
+# the Actions page. Releases across the port set are driven from the studio
+# bulk tool, and a per-push run would compete with it for minutes and for the
+# meaning of "did CI pass".
+#
+# WHAT A RUN DOES, with the defaults:
+#   1. Picks the next version: the latest v* tag with its patch number bumped
+#      (or VERSION when there is no tag yet, or whatever `version` says).
+#   2. Builds the setup host for all four platforms with that version as the
+#      lobby pin, and packages it.
+#   3. Tags the commit the run was started from as vX.Y.Z and publishes a
+#      public GitHub Release with the four zips. Uncheck publish_release for a
+#      dry run that only uploads workflow artifacts.
+#
+# WHAT THIS BUILDS. Not the game. src/gen/*.c is recompiler output derived
+# from ROM bytes: never committed, never in CI, never in a zip. What CI can
+# honestly produce is the SETUP HOST -- the same executable built with
+# -DSNESRECOMP_SETUP_HOST=ON, i.e. without recompiled code -- packaged with
+# the recompiler and this source tree. On the player's machine the launcher
+# takes their own ROM, generates, rebuilds, and relaunches into the real game.
+#
+# THE TOOLCHAIN. Each pack is built with the retcomm-toolchains cmake-clang-v1
+# pack, because that is what the player's own rebuild uses: if it cannot build
+# this game, CI is where that must fail. By default the pack is embedded in
+# the zip (embed_toolchain) so first run downloads nothing; turn it off for a
+# lean zip that fetches the pack on demand (Linux pack ~800 MB, Windows
+# ~200 MB, macOS ~90 MB).
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Tag this commit and publish a public GitHub Release'
+        type: boolean
+        default: true
+      version:
+        description: 'Version to release, e.g. 0.2.0 (empty = bump the latest v* tag)'
+        type: string
+        default: ''
+      bump:
+        description: 'When version is empty, which part of the latest tag to bump'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      embed_toolchain:
+        description: 'Embed the cmake-clang-v1 pack in each zip (else the launcher downloads it)'
+        type: boolean
+        default: true
+      toolchain_tag:
+        description: 'retcomm-toolchains release to build with (empty = latest)'
+        type: string
+        default: ''
+      verify_pins:
+        description: 'Fail if the submodules disagree with framework_pins.txt'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  EXE_NAME: @PROJECT_NAME@
+  ZIP_PREFIX: @ZIP_PREFIX@
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Record framework pins
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [[ "${{ inputs.verify_pins }}" == "true" ]]; then
+            ARGS+=(--check framework_pins.txt)
+          fi
+          bash snesrecomp/tools/ci/record_pins.sh "${ARGS[@]}"
+
+      - name: Resolve release version
+        id: meta
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_BUMP: ${{ inputs.bump || 'patch' }}
+          IN_PUBLISH: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          PUBLISH=true
+          [[ "${IN_PUBLISH}" == "false" ]] && PUBLISH=false
+          FILE_VER="$(tr -d '[:space:]' < VERSION)"
+          RAW="$(printf '%s' "${IN_VERSION}" | tr -d '[:space:]')"
+          LATEST="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)"
+
+          if [[ -n "${RAW}" ]]; then
+            VER="${RAW#v}"
+            echo "version given: ${VER}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Started from an existing tag: release exactly that.
+            VER="${GITHUB_REF_NAME#v}"
+            echo "running on tag ${GITHUB_REF_NAME}: releasing ${VER}"
+          elif [[ -z "${LATEST}" ]]; then
+            # First release: VERSION says what it is.
+            VER="${FILE_VER}"
+            echo "no v* tag yet: first release is VERSION = ${VER}"
+          else
+            BASE="${LATEST#v}"; BASE="${BASE%%[-+]*}"
+            IFS=. read -r MA MI PA <<<"${BASE}"
+            case "${IN_BUMP}" in
+              major) MA=$((MA + 1)); MI=0; PA=0 ;;
+              minor) MI=$((MI + 1)); PA=0 ;;
+              *)     PA=$((PA + 1)) ;;
+            esac
+            VER="${MA}.${MI}.${PA}"
+            # A deliberate bump of VERSION in the tree outranks the automatic
+            # patch step, so a maintainer can move to 0.2.0 by editing the file.
+            if [[ "$(printf '%s\n%s\n' "${FILE_VER}" "${VER}" | sort -V | tail -n1)" == "${FILE_VER}" \
+                  && "${FILE_VER}" != "${BASE}" ]]; then
+              echo "VERSION (${FILE_VER}) is ahead of ${LATEST} bumped (${VER}); using VERSION"
+              VER="${FILE_VER}"
+            else
+              echo "auto-bump ${IN_BUMP}: ${LATEST} -> ${VER}"
+            fi
+          fi
+
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?$ ]]; then
+            echo "::error::'${VER}' is not a version (want X.Y.Z)"
+            exit 1
+          fi
+          TAG="v${VER}"
+          if [[ "${PUBLISH}" == "true" && "${GITHUB_REF}" != "refs/tags/${TAG}" ]] \
+             && git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} already exists at $(git rev-parse --short "${TAG}"). Pass a new version, or start the run from that tag to re-release it."
+            exit 1
+          fi
+
+          echo "version=${VER}" >>"$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >>"$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >>"$GITHUB_OUTPUT"
+          echo "release ${TAG} from ${GITHUB_SHA::12}; publish=${PUBLISH}"
+
+  build:
+    name: ${{ matrix.artifact }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: linux-x64
+          - os: windows-2022
+            artifact: windows-x64
+          - os: macos-15
+            artifact: macos-arm64
+          - os: macos-15-intel
+            artifact: macos-x64
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The lobby pin compiled into the binary and written into the pack's
+      # VERSION, so the tag, the binary and the player's own rebuild agree.
+      RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Record framework pins
+        run: bash snesrecomp/tools/ci/record_pins.sh
+
+      # A setup host is defined by what it lacks. The checkout must carry no
+      # generated C; if it ever does, that is committed ROM-derived output and
+      # the build must stop here rather than package it.
+      - name: Assert no generated C in the tree
+        run: |
+          set -euo pipefail
+          if compgen -G 'src/gen/*.c' >/dev/null || [[ -f recomp/funcs.h ]]; then
+            echo "::error::src/gen/*.c or recomp/funcs.h is present in the checkout."
+            exit 1
+          fi
+          echo "src/gen is empty — building the setup host."
+
+      - name: Cache toolchain pack
+        uses: actions/cache@v4
+        with:
+          path: .cache/toolchain-pack
+          key: cmake-clang-v1-${{ matrix.artifact }}-${{ inputs.toolchain_tag || 'latest' }}
+
+      - name: Fetch toolchain pack
+        run: |
+          set -euo pipefail
+          ARGS=(--artifact "${{ matrix.artifact }}")
+          if [[ -n "${{ inputs.toolchain_tag }}" ]]; then
+            ARGS+=(--tag "${{ inputs.toolchain_tag }}")
+          fi
+          bash snesrecomp/tools/ci/fetch_toolchain.sh "${ARGS[@]}"
+
+      # The macOS pack is cmake + ninja + python; SDL3 comes from
+      # runner.cmake's pinned source fallback. Prefetch the tarball with curl
+      # (HTTP/1.1) and cache it, so configure does not download.
+      - name: Cache SDL3 source (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: .cache/sdl3-src
+          key: sdl3-src-3.4.10
+
+      - name: Prefetch SDL3 source (macOS)
+        if: runner.os == 'macOS'
+        run: bash snesrecomp/tools/ci/prefetch_sdl3.sh --out-dir .cache/sdl3-src
+
+      - name: Configure and build the setup host
+        run: |
+          set -euo pipefail
+          # The pack's env.sh is its own statement of how to use it (PATH,
+          # CC/CXX, sysroot, SDL3_DIR). Source it rather than restate it.
+          # shellcheck disable=SC1091
+          source "${TOOLCHAIN_DIR}/env.sh"
+          echo "cmake: $(command -v cmake) ($(cmake --version | head -n1))"
+          echo "cc:    ${CC:-$(command -v cc)}"
+          EXTRA=()
+          if [[ -n "${SNESRECOMP_SDL3_SOURCE_DIR:-}" ]]; then
+            EXTRA+=("-DSNESRECOMP_SDL3_SOURCE_DIR=${SNESRECOMP_SDL3_SOURCE_DIR}")
+          fi
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
+          fi
+          JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+          cmake -S . -B build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSNESRECOMP_SETUP_HOST=ON \
+            -DSNESRECOMP_ENABLE_TRACE=OFF \
+            -DSNESRECOMP_BUILD_VERSION="${RELEASE_VERSION}" \
+            "${EXTRA[@]+"${EXTRA[@]}"}"
+          cmake --build build-ci -j"${JOBS}" --target "${EXE_NAME}"
+
+      - name: Package setup pack
+        run: |
+          set -euo pipefail
+          # The packager inspects the executable's imports and zips the
+          # stage; Git Bash on Windows has neither tool, the pack does.
+          # shellcheck disable=SC1091
+          source "${TOOLCHAIN_DIR}/env.sh"
+          ARGS=()
+          if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then
+            ARGS+=(--embed-toolchain)
+          fi
+          bash scripts/package_release.sh build-ci "${{ matrix.artifact }}" "${ARGS[@]+"${ARGS[@]}"}"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_PREFIX }}-${{ matrix.artifact }}
+          path: dist/${{ env.ZIP_PREFIX }}-*-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Tag and publish
+    needs: [preflight, build]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect zips
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name "${ZIP_PREFIX}-*.zip" -exec cp -v {} dist/ \;
+          # Four platforms in, four zips out. A release that silently carries
+          # three is the failure this counts for.
+          count="$(find dist -name "${ZIP_PREFIX}-*.zip" | wc -l | tr -d ' ')"
+          if [[ "${count}" -ne 4 ]]; then
+            echo "::error::expected 4 platform zips, found ${count}"
+            ls -la dist
+            exit 1
+          fi
+          ( cd dist && sha256sum "${ZIP_PREFIX}"-*.zip > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      # The tag is created here, after all four builds succeeded, so a failed
+      # build never leaves a version number claimed by nothing.
+      - name: Tag the commit
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} already exists at $(git rev-parse --short "${TAG}") (re-release from that tag)"
+          else
+            git tag -a "${TAG}" -m "@DISPLAY_NAME@ ${TAG}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${TAG}"
+            echo "tagged ${GITHUB_SHA::12} as ${TAG}"
+          fi
+
+      - name: Release notes
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # From rom_identity.txt, not a copy baked into this workflow.
+          ROM_FILE="$(python3 snesrecomp/tools/rom_identity.py rom_identity.txt --get rom_file)"
+          ROM_SHA256="$(python3 snesrecomp/tools/rom_identity.py rom_identity.txt --get expected_sha256)"
+          {
+            echo "@DISPLAY_NAME@ ${TAG} — setup packs"
+            echo
+            echo "These packs do not contain the game. Each holds a setup program, the"
+            echo "recompiler and the source; on first run it takes your own copy of"
+            echo "${ROM_FILE} (SHA-256 ${ROM_SHA256}), recompiles it locally, and builds"
+            echo "the playable game. No ROM data is included or downloaded."
+            echo
+            if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then
+              echo "The portable build tools (cmake-clang-v1) are embedded in every pack."
+            else
+              echo "The portable build tools (cmake-clang-v1) are downloaded on first run."
+            fi
+            echo
+            echo '### Framework revisions'
+            echo
+            echo '```'
+            bash snesrecomp/tools/ci/record_pins.sh
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "@DISPLAY_NAME@ ${{ needs.preflight.outputs.tag }}"
+          body_path: notes.md
+          files: |
+            dist/${{ env.ZIP_PREFIX }}-*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          make_latest: true

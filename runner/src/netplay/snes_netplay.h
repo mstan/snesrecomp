@@ -35,12 +35,39 @@ extern "C" {
  */
 
 #define SNES_NETPLAY_PAD_BYTES 4
+/* recomp-net carries up to RNET_MAX_SLOTS (8) seats; the SNES side reaches
+ * that many only with a Super Multitap in each port. See docs/MULTITAP.md. */
+#define SNES_NETPLAY_MAX_SLOTS 8
 
 typedef struct SnesNetplayConfig {
     int         enabled;
-    int         local_slot;    /* 0 or 1 — lobby / wire slot */
+    int         local_slot;    /* 0 .. slot_count-1 — lobby / wire slot */
+    /* Seats in this match, 2..SNES_NETPLAY_MAX_SLOTS. Anything above 2 needs
+     * a multitap configured on both peers, and every peer must agree: the
+     * seat count is part of the settled session requirement
+     * (recomp-ai-rules/NETPLAY.md §4). Env: SNES_NET_SLOTS. */
+    int         slot_count;
+    /* 1 = spectator: simulate the match, display it, contribute nothing.
+     * The session owns no seat (RNetConfig.local_slot == slot_count) and is
+     * never sampled for input, so the local pads never enter the pipeline at
+     * all -- which is the only version of "cannot affect the game" that
+     * survives a spectator with a controller in their hands. */
+    int         spectator;
+    /* Spectator only: slot in the input relay's namespace, at or above the
+     * relay's player count. Required when spectator is set; the relay uses it
+     * to refuse to forward anything this peer sends. */
+    int         spectator_wire_slot;
     int         input_player;  /* 0/1 host device index; -1 = auto */
     int         input_delay;   /* frames; default 2 */
+    /* Invent runway cap (P) for rollback; 0 = engine default. The lobby
+     * publishes P = 4 + D (RecompLauncherCNetplayLaunch.input_prediction).
+     * Env: SNES_RB_PREDICTION overrides. */
+    int         input_prediction;
+    /* Session mode: 1 = rollback (the framework default — recomp-ui's lobby
+     * settles it room-wide and defaults ON), 0 = delay-sync. Builds without
+     * the rollback host ignore it and run delay-sync. SNES_NET_MODE
+     * overrides both ways ("rollback"/"rb" or "delay"). */
+    int         rollback;
     uint32_t    session_id;
     char        bind_hostport[64];
     char        peer_hostport[64];
@@ -67,12 +94,25 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
                                       SnesNetplayApplySyncBytes apply);
 
 int  snes_netplay_active(void);
+/*
+ * 1 while this session's admit path is ROLLBACK rather than delay-sync.
+ *
+ * Host scaffolding that reasons about input runway must branch on this: the
+ * delay-sync starvation latch stalls when remote_lead falls below D, which is
+ * the normal, intended condition under rollback (running ahead of confirmed
+ * remote input is the whole mechanism). Leaving that latch armed throttles
+ * rollback back into lockstep.
+ */
+int  snes_netplay_rollback_active(void);
 int  snes_netplay_is_running(void);
 /* "ice", "lan", or "none"; useful for user-facing connection diagnostics. */
 const char *snes_netplay_transport_name(void);
 /* 1 when ICE transport reached FAILED (STUN/TURN path dead). */
 int  snes_netplay_ice_failed(void);
 int  snes_netplay_local_slot(void);
+/* 1 while this build is watching rather than playing: it simulates every seat
+ * from the wire and its own controllers reach nothing. */
+int  snes_netplay_is_spectator(void);
 /* Resolved host device index (0/1) used for local capture. */
 int  snes_netplay_input_player(void);
 uint32_t snes_netplay_sim_tick(void);
@@ -125,8 +165,15 @@ int  snes_netplay_input_delay(void);
 /* Re-apply the last slot-0 game sync bytes (normally done inside poll_admit). */
 void snes_netplay_apply_host_sync(void);
 
-/* P1 | (P2<<12) button bits from the last successful publish (0 if none). */
+/* P1 | (P2<<12) button bits from the last successful publish (0 if none).
+ * Seats 2..7 do not fit this word and are not carried by it: publish pushes
+ * them straight into the runtime through RtlSetPadState, the same door a
+ * local multitap game uses, so the game's frame loop is identical either
+ * way. */
 uint32_t snes_netplay_published_inputs(void);
+
+/* Seat count in the running session (2 when inactive). */
+int snes_netplay_slot_count(void);
 
 /* Both slots plugged: (3u << 30) for RtlRunFrame active-controller bits. */
 uint32_t snes_netplay_active_mask(void);
@@ -140,13 +187,18 @@ void snes_netplay_request_return_to_lobby(void);
 int  snes_netplay_return_to_lobby_requested(void);
 void snes_netplay_clear_return_to_lobby(void);
 
-/* Host-only savestate sync (chunked over recomp-net). Host applies/writes
- * immediately; guest catch-up is async (load/SRAM stall admit until applied).
+/* Host-only savestate sync (chunked over recomp-net). Load uses hash-probe
+ * first (skip transfer when guest already has the blob), then a short ready
+ * rendezvous before hard_resync. SAVE still ships async after host write.
  * Guests use saves/netplay/ so personal saves/ is never overwritten.
  * Returns 1 if netplay handled the request, 0 if offline — caller may RtlSaveLoad. */
 int  snes_netplay_is_host(void);
 int  snes_netplay_request_save(int slot);
 int  snes_netplay_request_load(int slot);
+
+/* 1 while a save/load/SRAM probe or transfer is in flight (app + library).
+ * Host barrier must not count these stalls toward delay_sync_starvation. */
+int  snes_netplay_state_barrier(void);
 
 /*
  * Netplay diagnostics JSONL dump (saves/netplay/net_diag_slot{N}.jsonl).

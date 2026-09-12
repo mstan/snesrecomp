@@ -22,6 +22,8 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
   snes_netplay_config_defaults(&out->net_cfg);
   out->net_cfg.enabled = 1;
   out->net_cfg.local_slot = net->local_slot;
+  out->net_cfg.spectator = net->is_spectator ? 1 : 0;
+  out->net_cfg.spectator_wire_slot = net->spectator_wire_slot;
   out->net_cfg.input_player =
       (net->input_player == 0 || net->input_player == 1) ? net->input_player
                                                          : -1;
@@ -31,9 +33,20 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
            net->bind_hostport);
   snprintf(out->net_cfg.peer_hostport, sizeof(out->net_cfg.peer_hostport), "%s",
            net->peer_hostport);
+  /* Room-settled mode from recomp-ui (its model defaults rollback ON).
+   * Before apply_env so SNES_NET_MODE stays the operator override. */
+  out->net_cfg.rollback = net->rollback ? 1 : 0;
   snes_netplay_apply_env(&out->net_cfg);
   if (net->input_delay >= 0 && net->input_delay <= 20)
     out->net_cfg.input_delay = net->input_delay;
+  /* Invent runway (P = 4 + D, computed by recomp-ui and published in the
+   * launch struct). This was being dropped on the floor: SNES fell back to
+   * the engine default of 8, so a session at D=9 ran with a runway SHORTER
+   * than its own delay — pred_depth walked to the cap on every relay stall
+   * and tripped pcap FREEZE. Measured over a hotspot/TURN session: 10
+   * RUNWAY_EMPTY events, one 209ms debt spike, mispredict never above 2. */
+  if (net->input_prediction >= 2 && net->input_prediction <= 32)
+    out->net_cfg.input_prediction = net->input_prediction;
   out->net_cfg.force_turn = 0;
   out->net_cfg.force_input_relay = net->force_input_relay ? 1 : 0;
   {
@@ -42,6 +55,10 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
       out->caps_ws_extra = caps->ws_extra;
       if (caps->force_turn)
         out->net_cfg.force_turn = 1;
+      /* Host-published settlement outranks the local UI mirror; the env
+       * override was already applied above and is not revisited. */
+      if (!getenv("SNES_NET_MODE"))
+        out->net_cfg.rollback = caps->rollback ? 1 : 0;
     }
   }
 }
@@ -176,6 +193,13 @@ static int barrier_poll_admit(int enter_need)
   }
 
   g_starv.just_cleared = 0;
+  /* Save/load/SRAM probe+xfer freezes admit by design — do not treat as
+   * delay-sync input starvation (that latch held the post-load freeze). */
+  if (snes_netplay_state_barrier()) {
+    g_starv.enter_run = 0;
+    return 0;
+  }
+
   g_starv.enter_run++;
   if (g_starv.enter_run >= enter_need) {
     g_starv.latched = 1;
@@ -285,6 +309,17 @@ int snes_host_barrier_admit(int from_lobby, int *running,
     g_starv.pending_consume = 0;
   }
 
+  /*
+   * Rollback owns its own pacing. The starvation latch below is delay-sync
+   * policy: it stalls when remote_lead drops under D, which under rollback is
+   * the ordinary running state rather than a fault — inventing past missing
+   * remote input is the mechanism, and retcomm-rbengine's scheduler already
+   * decides when to wait instead. Leaving the latch armed would throttle
+   * rollback straight back into lockstep.
+   */
+  if (snes_netplay_rollback_active())
+    return snes_netplay_poll_admit();
+
   {
     uint32_t sim = snes_netplay_sim_tick();
     int enter_need = starv_env_int("SNES_NET_STARVATION_ENTER_FRAMES",
@@ -300,6 +335,15 @@ int snes_host_barrier_admit(int from_lobby, int *running,
 
     if (g_starv.latched) {
       snes_netplay_pump();
+      /* Drop a stale latch if we entered a deliberate state barrier (load). */
+      if (snes_netplay_state_barrier()) {
+        g_starv.latched = 0;
+        g_starv.exit_run = 0;
+        g_starv.enter_run = 0;
+        g_starv.latch_logged = 0;
+        g_starv.just_cleared = 0;
+        return 0;
+      }
       if (starv_runway_ok()) {
         g_starv.exit_run++;
         if (g_starv.exit_run >= exit_need) {
@@ -331,6 +375,10 @@ int snes_host_catchup_budget(void)
   int cap;
 
   if (!snes_netplay_active())
+    return 0;
+  /* No delay-sync catch-up burst under rollback: the scheduler paces admit,
+   * and a burst here would race it. */
+  if (snes_netplay_rollback_active())
     return 0;
   cap = starv_env_int("SNES_NET_CATCHUP_CAP", SNES_CATCHUP_CAP_DEFAULT);
   if (cap <= 0 && g_starv.recovery_amount <= 0)

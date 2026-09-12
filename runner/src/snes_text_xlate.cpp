@@ -550,6 +550,28 @@ extern "C" int snes_text_xlate_init_c(const char* table_path,
     return 1;
 }
 
+extern "C" void snes_text_xlate_identity_c(char* out, int cap) {
+    if (!out || cap <= 0)
+        return;
+    /* "off" is the honest answer when the table never loaded, and it is what a
+     * peer without the mod reports too — so two such peers agree, which is
+     * correct: neither is patching guest memory.
+     *
+     * Gated on `initialized`, not on the language string alone. The language is
+     * recorded BEFORE the table is parsed, so a peer whose table is missing
+     * still holds "en" here — and reported "en" while translating nothing. Two
+     * peers then agreed on an identity that described only one of them: the
+     * one with the table patched ROM text, RAM and VRAM, the other did not,
+     * and the divergence surfaced later as a rollback chain stall. */
+    const std::string& lang = state().language;
+    const char* v = (!state().initialized || lang.empty()) ? "off"
+                                                           : lang.c_str();
+    int i = 0;
+    for (; i < cap - 1 && v[i]; ++i)
+        out[i] = v[i];
+    out[i] = '\0';
+}
+
 extern "C" void snes_text_xlate_set_language_c(const char* language) {
     state().language = language && language[0] ? language : "off";
     state().rom_dirty = true;

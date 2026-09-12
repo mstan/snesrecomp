@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Package a @DISPLAY_NAME@ release: a SETUP PACK.
+#
+# The zip does not contain the game. It contains a setup program (the host
+# built with -DSNESRECOMP_SETUP_HOST=ON, i.e. without recompiled code), the
+# recompiler and this source tree. On first run the player picks their own
+# ROM and the launcher recompiles and rebuilds locally. No ROM, no src/gen,
+# no recomp/funcs.h ever leaves this tree in a zip -- the framework's packager
+# enforces that mechanically.
+#
+# Usage:
+#   scripts/package_release.sh [<build-dir>] [<platform-tag>] [--embed-toolchain]
+#
+# Both positionals are optional; BUILD_DIR and PLATFORM still work as env vars.
+# Defaults: build, and the host's own <os>-<arch>. --embed-toolchain copies
+# the cmake-clang-v1 pack named by RETCOMM_TOOLCHAIN_DIR into the zip so the
+# player downloads nothing.
+#
+# Writes: dist/@ZIP_PREFIX@-<VERSION>-<platform-tag>.zip
+set -euo pipefail
+
+# A silent exit is the worst outcome a packaging step can have: the first
+# Windows CI run died here with exit 1 and not one line of output. Name the
+# command and line instead of leaving the reader to bisect a shell script.
+trap 'echo "::error::$(basename "${BASH_SOURCE[0]}") failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
+
+EXTRA=()
+POS=()
+for a in "$@"; do
+  case "$a" in
+    --embed-toolchain|--no-embed-toolchain) EXTRA+=("$a") ;;
+    *) POS+=("$a") ;;
+  esac
+done
+BUILD_DIR="${POS[0]:-${BUILD_DIR:-build}}"
+PLATFORM="${POS[1]:-${PLATFORM:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}}"
+
+IMPL="snesrecomp/tools/ci/stage_setup_host.sh"
+if [ ! -f "$IMPL" ]; then
+  echo "package_release.sh: $IMPL missing — the snesrecomp pin predates setup packs." >&2
+  echo "  Update the submodule: git submodule update --init --recursive" >&2
+  exit 1
+fi
+
+# The ROM hint and digests come from rom_identity.txt -- the same file the
+# build compiles in and tools/regen.sh verifies against -- so a revision bump
+# is one edit. stage_setup_host.sh already needs python3, so this does too.
+IDENTITY_TOOL="snesrecomp/tools/rom_identity.py"
+ROM_FILE="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get rom_file)"
+ROM_SHA256="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get expected_sha256)"
+ROM_CRC32="$(python3 "$IDENTITY_TOOL" rom_identity.txt --get expected_crc32)"
+
+# mods/ is the catalog the build stages beside the executable, and the package
+# a netplay host transfers to a guest. Add --runtime-dir <name> for any other
+# directory the game loads exe-relative (translations, ...).
+exec bash "$IMPL" \
+  --runtime-dir mods \
+  --build-dir "$BUILD_DIR" \
+  --artifact "$PLATFORM" \
+  --exe-name @PROJECT_NAME@ \
+  --zip-prefix @ZIP_PREFIX@ \
+  --display-name "@DISPLAY_NAME@" \
+  --rom-hint "$ROM_FILE" \
+  --rom-sha256 "$ROM_SHA256" \
+  --rom-crc32 "$ROM_CRC32" \
+  "${EXTRA[@]+"${EXTRA[@]}"}"

@@ -14,6 +14,7 @@
 #include "ppu.h"
 #include "cart.h"
 #include "joypad.h"
+#include "sdd1.h"
 #include "variables.h"
 #include "../common_rtl.h"
 #include "../debug_server.h"
@@ -63,9 +64,13 @@ static void snes_trace_direct_wram_write(uint32_t off, uint8_t old, uint8_t val)
 }
 #endif
 
+void snes_set_hdma_beam_enabled(Snes *snes, bool enabled) {
+  snes->hdmaBeamOff = !enabled;
+}
+
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = calloc(1, sizeof(Snes));  /* zero padding: saveload/co-sim hash determinism */
-  snes->ram = ram;
+    snes->ram = ram;
 
   snes->cpu = cpu_init();
   snes->apu = apu_init();
@@ -102,22 +107,35 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   cart_saveload(snes->cart, sli);
 
   if (s_saveload_version <= 5) {
-    /* Old layout: [hPos..vPos][pad][beamMasterLast][apuCatchup..divideResult].
-     * Read/write the legacy 48-byte tail and map into the current struct.
-     * Legacy size: 4 (hPos/vPos) + 4 pad + 8 beam + rest(=32) = 48. */
-    enum { kLegacySnesTail = 48 };
-    uint8_t blob[kLegacySnesTail];
-    const size_t new_tail = sizeof(*snes) - offsetof(Snes, hPos);
-    const size_t head = offsetof(Snes, apuCatchupCycles) - offsetof(Snes, hPos);
-    const size_t rest = new_tail - head; /* apuCatchupCycles .. end */
-    assert(new_tail == 40 && head == 8 && rest == 32);
-    memset(blob, 0, sizeof(blob));
-    memcpy(blob, &snes->hPos, 4);
-    memcpy(blob + 16, &snes->apuCatchupCycles, rest);
-    sli->func(sli, blob, kLegacySnesTail);
-    memcpy(&snes->hPos, blob, 4);
-    memcpy(&snes->apuCatchupCycles, blob + 16, rest);
+    /* Format 4/5 can no longer be mapped onto this struct, so refuse it
+     * rather than mis-load it.
+     *
+     * The old layout was [hPos..vPos][pad][beamMasterLast][apuCatchup..
+     * divideResult], and the code here copied that trailing region as one
+     * 32-byte block on the assumption that it was still contiguous and still
+     * 32 bytes. Both stopped being true: the dbgIrq / dbgNmi counters were
+     * later inserted between the interrupt fields and inVblank, so
+     * the region now measures 88 bytes AND has different contents in the
+     * middle. The copy therefore overran a 48-byte stack buffer by 56 bytes
+     * (caught by -Wfortify-source), and had it been merely clamped it would
+     * have loaded the wrong bytes into hTimer/vTimer and the IRQ flags --
+     * a silent corruption, which is worse than a refusal.
+     *
+     * Reconstructing a correct v4/v5 mapping is possible but untestable here
+     * with no such file to verify against, so this states the limit instead
+     * of guessing at it. RTL_SAV_VERSION_MIN is raised to 6 to match, which
+     * means this branch is unreachable through RtlLoadSnapshot; it stays as
+     * the explanation for anyone who tries to lower that bound again. */
+    assert(!"savestate format 4/5 is no longer supported");
   } else {
+    /* The savestate format IS this byte range. Adding or reordering any field
+     * after hPos silently changes it and quietly invalidates every existing
+     * save, so pin the size: if this fires, bump RTL_SAV_VERSION rather than
+     * deleting the assertion. (The blob is raw struct memory, so it was never
+     * portable across differing layouts; pinning it here at least makes a
+     * change visible at compile time.) */
+    _Static_assert(sizeof(Snes) - offsetof(Snes, hPos) == 96,
+                   "Snes savestate tail changed size -- bump RTL_SAV_VERSION");
     sli->func(sli, &snes->hPos, sizeof(*snes) - offsetof(Snes, hPos));
   }
   sli->func(sli, snes->ram, 0x20000);
@@ -133,6 +151,13 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
     snes->joypad1Index = snes->joypad2Index = 0;
     snes->joypad1Latched = snes->joypad2Latched = 0;
   }
+  /* v8: multitap seats, IOBit lines, per-bank shift counters and the latched
+   * automatic-read words. A state saved between the two halves of a
+   * five-player read has to resume in the same bank at the same bit, so this
+   * is guest-visible state, not host configuration. Older states simply
+   * leave the two-pad defaults in place. */
+  if (s_saveload_version >= 8)
+    joypad_saveload(sli);
 
   snes->cpu->e = 0;
 }
@@ -162,6 +187,7 @@ void snes_reset(Snes* snes, bool hard) {
   snes->joypadStrobe = false;
   snes->joypad1Index = snes->joypad2Index = 0;
   snes->joypad1Latched = snes->joypad2Latched = 0;
+  joypad_reset_state();
   snes->ppuLatch = false;
   snes->multiplyA = 0xff;
   snes->multiplyResult = 0xfe01;
@@ -296,7 +322,17 @@ uint16_t SwapInputBits(uint16_t x) {
   return joypad_auto_read_word(x);
 }
 
-static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
+/* Returns the master clocks actually consumed. Normally == clocks; less when
+ * the walk LATCHES an IRQ, where it stops one clock past the comparator match
+ * and leaves the remainder pending. An IRQ pre-empts: beam time between the
+ * latch and the handler belongs to code the real CPU would only execute after
+ * the handler returned, so walking it before the handler runs makes any split
+ * the handler schedules close ahead land in the past (Gundam Wing schedules
+ * VTIME=+2 lines from its line-21 handler; that split was lost ~85% of frames
+ * and the gameplay demo rendered black at brightness 0). While inIrq is
+ * pending the walk consumes nothing; the host frame loop dispatches promptly,
+ * the handler runs under snes_beam_hold, and the walk resumes on release. */
+static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
   /* One NTSC scanline is 1364 master clocks, 262 scanlines per frame. Keep
    * the live beam counters moving while LLE code executes so SLHV/OPHCT/OPVCT
    * polling observes hardware time rather than a frame-frozen PPU.
@@ -307,6 +343,9 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
    * H+V IRQ on scanline 228 and blocks until that IRQ completes an NMI task. */
   uint32_t h = snes->hPos;
   uint32_t v = snes->vPos;
+  uint32_t consumed = 0;
+  if (check_irq && snes->inIrq)
+    return 0;                      /* frozen until the pending IRQ is taken */
   while (clocks) {
     uint32_t span = 1364u - h;
     /* Stop at HBlank so the HDMA transfer occurs at its hardware edge rather
@@ -319,8 +358,14 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
      * for roughly 4224 master clocks.  The input registers are already backed
      * by the current controller snapshot; this timer supplies the missing
      * architectural start/busy/complete handshake. */
-    if (snes->autoJoyRead && v == 225u && h == 0u)
+    if (snes->autoJoyRead && v == 225u && h == 0u) {
       snes->autoJoyTimer = 4224;
+      /* The automatic read latches the pads and clocks them 16 times. With a
+       * multitap that is load-bearing: it leaves the selected bank's shift
+       * counter on the 17th (connection) bit, which is where the documented
+       * five-player sequence reads it from. */
+      joypad_auto_read(snes);
+    }
     if (snes->autoJoyTimer) {
       snes->autoJoyTimer = span >= snes->autoJoyTimer
                          ? 0 : (uint16_t)(snes->autoJoyTimer - span);
@@ -330,13 +375,47 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
         (snes->hIrqEnabled || snes->vIrqEnabled)) {
       bool line_matches = !snes->vIrqEnabled || v == snes->vTimer;
       uint32_t target = snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
-      if (line_matches && target < 1364u && target >= h && target < h + span)
+      /* Overshoot detection, exact. We are ON the target line but the beam is
+       * already PAST the target column, so the window test below cannot fire
+       * and the walk will leave this line without an interrupt. That is a lost
+       * match, and it is invisible to any external probe: the comparator stays
+       * armed and the beam keeps moving, which looks identical to a scene that
+       * simply has no split there.
+       *
+       * Deduplicated per (field, target): the span loop can visit one line in
+       * several iterations, and a repeat is the same miss, not a new one. */
+      if (line_matches && target < 1364u && target < h &&
+          !snes->dbgLatchedThisField &&
+          snes->dbgMissDedupe != (uint32_t)((v << 16) | target)) {
+        snes->dbgMissDedupe = (uint32_t)((v << 16) | target);
+        snes->dbgIrqOvershot++;
+        snes->dbgLastOvershotLine = (uint16_t)v;
+        snes->dbgLastOvershotBy = (uint16_t)(h - target);
+      }
+      if (line_matches && target < 1364u && target >= h && target < h + span) {
+        uint32_t upto = target - h + 1u;   /* stop one clock past the match */
         snes->inIrq = true;
+        snes->dbgIrqLatches++;
+        snes->dbgLatchedThisField = 1;
+        h += upto;
+        consumed += upto;
+        if (h >= 1364u) { h = 0; v++; if (v >= 262u) v = 0; }
+        snes->hPos = (uint16_t)h;
+        snes->vPos = (uint16_t)v;
+        snes->inVblank = v >= 225u;
+        return consumed;
+      }
     }
 
     h += span;
     clocks -= span;
     if (check_irq && v < 225u && h == 1024u)
+      dma_doHdma(snes->dma);
+    consumed += span;
+    /* Beam-timeline HDMA (upstream #16), gated: a frame-model host whose
+     * render loop walks the real HDMA tables per line clears
+     * hdmaBeamEnabled, or every table is consumed twice per frame. */
+    if (check_irq && !snes->hdmaBeamOff && v < 225u && h == 1024u)
       dma_doHdma(snes->dma);
     if (h >= 1364u) {
       h = 0;
@@ -345,20 +424,109 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
         v = 0;
         if (check_irq)
           dma_initHdma(snes->dma);
+        if (check_irq && !snes->hdmaBeamOff)
+          dma_initHdma(snes->dma);
+        /* End of field. Armed the whole way round and nothing latched means
+         * the beam swept past the target without firing — a LOST interrupt,
+         * not a pending one. */
+        if (check_irq && (snes->hIrqEnabled || snes->vIrqEnabled) &&
+            !snes->dbgLatchedThisField) {
+          snes->dbgIrqMissed++;
+          snes->dbgLastMissedLine = snes->vTimer;
+        }
+        snes->dbgLatchedThisField = 0;
       }
     }
   }
   snes->hPos = (uint16_t)h;
   snes->vPos = (uint16_t)v;
   snes->inVblank = v >= 225u;
+  return consumed;
 }
 
 void snes_advance_master_cycles(Snes *snes, uint32_t clocks) {
-  snes_advance_beam(snes, clocks, true);
-  snes->beamMasterLast += clocks;
+  uint32_t consumed = snes_advance_beam(snes, clocks, true);
+  snes->beamMasterLast += consumed;
 }
 
+/* Master clocks from the beam's current position to the start of scanline
+ * `line` in the CURRENT or next field. Zero when already exactly there.
+ *
+ * A frame-model host needs this to put its frame boundary on the PPU's field
+ * boundary. Without it the host's "one frame" is a fixed 357368-clock budget
+ * measured from wherever the previous frame happened to stop, so the phase
+ * between the host frame and the PPU field is arbitrary and drifts. NMI then
+ * arrives at a random scanline instead of at vblank, and any split the NMI
+ * schedules for an early line can already be behind the beam — which is a
+ * silently lost interrupt, because the comparator is a window test. Measured
+ * on Gundam Wing: NMI arrived at line 18 on the first attract loop and lines
+ * 30/34 on later ones, and from the moment it passed line 21 the raster chain
+ * lost its first link on every single frame. */
+uint32_t snes_master_clocks_until_line(const Snes *snes, uint32_t line) {
+  uint32_t h, v, lines;
+  if (!snes || line >= 262u) return 0;
+  h = snes->hPos;
+  v = snes->vPos;
+  if (v == line && h == 0u) return 0;
+  lines = (line > v) ? (line - v) : (262u - v + line);
+  return lines * 1364u - h;
+}
+
+uint32_t snes_master_clocks_until_irq(const Snes *snes) {
+  if (!snes) return 0;
+  if (snes->inIrq) return 0;                       /* already pending */
+  if (!snes->hIrqEnabled && !snes->vIrqEnabled) return 0;
+
+  uint32_t h = snes->hPos;
+  uint32_t v = snes->vPos;
+  uint32_t target_h = snes->hIrqEnabled ? (uint32_t)snes->hTimer * 4u : 0u;
+  if (target_h >= 1364u) return 0;                 /* unreachable H target */
+
+  if (!snes->vIrqEnabled) {
+    /* H-only: fires every line — later this line, or on the next. */
+    return target_h > h ? (target_h - h) : (1364u - h + target_h);
+  }
+
+  {
+    /* V (with or without H): one match per field, at (vTimer, target_h). */
+    uint32_t target_v = snes->vTimer;
+    uint32_t lines;
+    uint64_t d;
+    if (target_v >= 262u) return 0;
+    if (target_v > v)      lines = target_v - v;
+    else if (target_v < v) lines = 262u - v + target_v;
+    else                   lines = (target_h > h) ? 0u : 262u;
+    /* lines==0 implies target_h>h, so this stays positive; every other branch
+       adds at least a whole line, so the subtraction cannot underflow. */
+    d = (uint64_t)lines * 1364u + (uint64_t)target_h - (uint64_t)h;
+    return d > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)d;
+  }
+}
+
+/* ── beam hold ─────────────────────────────────────────────────────────────
+ * While set, snes_sync_master_clock is a no-op: the beam stays where it is and
+ * the CPU-time delta simply accumulates, to be walked on the first sync after
+ * release.
+ *
+ * Why this exists: a raster-IRQ handler on silicon runs within ~tens of master
+ * clocks of the latch — the beam barely moves before the handler's register
+ * writes land. This runtime cannot pre-empt AOT-compiled code mid-function, so
+ * by the time a handler is dispatched, master_cycles already carries scanlines
+ * of mainline execution the real CPU would have performed AFTER the handler.
+ * Letting the beam walk through that inflated delta DURING the handler makes
+ * the handler appear scanlines long, and any split it schedules close ahead
+ * (Gundam Wing: VTIME=+2 lines from the line-21 handler) lands in the past and
+ * never fires. Holding the beam for the handler's duration models the truth —
+ * handlers are short — rather than the artefact.
+ *
+ * While held, beam-position reads ($2137/$4212) return the latch-point line;
+ * that is exactly what a real handler racing its own splits would observe. */
+static int s_beam_hold;
+
+void snes_beam_hold(int hold) { s_beam_hold = hold; }
+
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
+  if (s_beam_hold) return;
   if (master_clock < snes->beamMasterLast) {
     snes->beamMasterLast = master_clock;
     return;
@@ -366,7 +534,13 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
   uint64_t delta=master_clock-snes->beamMasterLast;
   while(delta) {
     uint32_t chunk=delta>UINT32_MAX?UINT32_MAX:(uint32_t)delta;
+    uint64_t before=snes->beamMasterLast;
     snes_advance_master_cycles(snes,chunk);
+    /* A short walk means an IRQ latched (or is still pending): the beam
+     * pre-empts there. The remaining delta stays owed and is walked on the
+     * first sync after the handler has been taken. */
+    if (snes->beamMasterLast - before < chunk)
+      break;
     delta-=chunk;
   }
 }
@@ -418,7 +592,9 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return val;
     }
     case 0x4213:
-      return snes->ppuLatch << 7; // IO-port
+      /* RDIO: readback of the $4201 output latch. Bit 6 is port 1's IOBit
+       * and bit 7 is port 2's (which doubles as the PPU counter latch). */
+      return joypad_read_iobit();
     case 0x4214:
       return snes->divideResult & 0xff;
     case 0x4215:
@@ -427,23 +603,24 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return snes->multiplyResult & 0xff;
     case 0x4217:
       return snes->multiplyResult >> 8;
-    case 0x4016:  /* JOYSER0 — manual joypad read for controller 1. */
-    case 0x4017:  /* JOYSER1 — manual joypad read for controller 2. */
-      /* $4016 bit 0 latches both pads; reads shift B through R, then 1s. */
-      return joypad_read_serial(snes, adr - 0x4016);
+    case 0x4016:  /* JOYSER0 — manual joypad read, port 1. */
+    case 0x4017:  /* JOYSER1 — manual joypad read, port 2. */
+      /* $4016 bit 0 latches both ports; reads shift B through R, then 1s.
+       * Bit 0 is Data1 and bit 1 is Data2 — a standard controller drives
+       * Data1 only, a multitap drives both. */
+      return joypad_read_port(snes, adr - 0x4016);
+    /* $4218/9 = port1 Data1, $421A/B = port2 Data1,
+     * $421C/D = port1 Data2, $421E/F = port2 Data2. The Data2 pair is only
+     * ever driven by a multitap; with none present they read 0 as before. */
     case 0x4218:
-      return joypad_auto_read_reg(snes->input1_currentState, adr);
     case 0x4219:
-      return joypad_auto_read_reg(snes->input1_currentState, adr);
     case 0x421a:
-      return joypad_auto_read_reg(snes->input2_currentState, adr);
     case 0x421b:
-      return joypad_auto_read_reg(snes->input2_currentState, adr);
     case 0x421c:
-    case 0x421e:
     case 0x421d:
+    case 0x421e:
     case 0x421f:
-      return 0;
+      return joypad_auto_read_reg_addr(snes, adr);
 
     default: {
       return 0;
@@ -482,6 +659,9 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
         ppu_read(g_ppu, 0x37);
       }
       snes->ppuLatch = val & 0x80;
+      /* Bit 6 -> port 1 IOBit, bit 7 -> port 2 IOBit. A multitap uses its
+       * port's line to select which pad pair it reports. */
+      joypad_write_iobit(snes, val);
       break;
     }
     case 0x4202: {
@@ -520,6 +700,26 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
     }
     case 0x4209: {
       snes->vTimer = (snes->vTimer & 0x100) | val;
+      /* Was this target programmed into the PAST? A raster chain schedules its
+       * next split from inside the current one, so the new target is normally
+       * a few lines ahead of the beam. If it is already behind, the comparator
+       * cannot match until the counter wraps — and by then the NMI has reset
+       * the chain, so the split is lost for good.
+       *
+       * This is the one failure an external probe cannot see: the comparator
+       * stays armed, the beam keeps sweeping, nothing is "missed" on the target
+       * line because the beam is never on it. It looks exactly like a scene
+       * that simply has no split there. */
+      /* Only while the beam is in the VISIBLE field. A target programmed
+       * during vblank is for the next field and is legitimately "behind" the
+       * current beam position — counting it would flag correct scheduling as a
+       * fault, which is how an instrument invents a regression. */
+      if (snes->vIrqEnabled && snes->vPos < 225u &&
+          snes->vTimer < snes->vPos) {
+        snes->dbgTargetInPast++;
+        snes->dbgLastPastTarget = snes->vTimer;
+        snes->dbgLastPastBeam = snes->vPos;
+      }
       break;
     }
     case 0x420a: {
@@ -545,6 +745,31 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
           DmaChannel *c = &snes->dma->channel[ch];
           ppudma_record_dma(ch, c->fromB, c->aBank, c->aAdr, c->bAdr, c->size);
         }
+      }
+      /* Charge the transfer's guest time BEFORE running it. On hardware a
+       * general-purpose DMA halts the CPU for ~8 master clocks per byte plus
+       * small per-channel setup; this loop used to complete the whole
+       * transfer in ZERO guest time. That is not a rounding error: a scene
+       * load moves enough data that the free time let the loader finish its
+       * lag blocks measurably earlier than hardware (33/46/32 frames vs
+       * Mesen's 36/47/35 for the identical flow), which shifted the parity
+       * of the pass that spawns the mechs — and the sprite hover (gated on
+       * the pass counter) then paired with the wrong animation phase,
+       * publishing Y±1 sprite tables hardware never shows. See
+       * gundamwing-parity-root-cause. HDMA stays uncharged here (per-line,
+       * far smaller; out of scope for this fix). */
+      {
+        extern CpuState g_cpu;
+        uint64_t dma_master = 12;
+        for (int ch = 0; ch < 8; ch++) {
+          if (val & (1 << ch)) {
+            uint32_t n = snes->dma->channel[ch].size;
+            if (n == 0) n = 0x10000;
+            dma_master += 8 + (uint64_t)n * 8;
+          }
+        }
+        g_cpu.master_cycles += dma_master;
+        snes_sync_master_clock(snes, g_cpu.master_cycles);
       }
       dma_startDma(snes->dma, val, false);
       while (dma_cycle(snes->dma)) {}
@@ -630,6 +855,8 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
       dma_write(snes->dma, adr, val); // dma registers
       /* S-DD1 spies on DMA channel register writes */
       if (snes->cart && snes->cart->type == CART_SDD1 && snes->cart->sdd1)
+        sdd1_dma_channel_write(snes->cart->sdd1, adr, val);
+      if (cart_has_sdd1(snes->cart))
         sdd1_dma_channel_write(snes->cart->sdd1, adr, val);
     }
     if(adr >= 0x2100 && adr < 0x4400) {

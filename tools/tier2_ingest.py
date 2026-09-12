@@ -20,12 +20,17 @@ Discoveries split into two buckets:
   BOUNDARY     The interpreter ran the gap and returned cleanly (clean_hits>0,
                bail_hits==0): a genuine coverage gap, safe to profile.
                  * target has no existing `func`  -> emit
-                   an optional `func bank_BB_AAAA <addr16>` boundary for
-                   naming/slicing. A `func` declaration is not an AOT root.
+                   an optional `func bank_BB_AAAA <addr16> entry_mx:M,X`
+                   boundary. A `func` declaration becomes a reachability root
+                   only when generation runs with --cfg-roots; without it the
+                   declaration names the address but does not grow coverage.
                  * target IS already a `func`     -> the gap is the dispatch
-                   SITE; it needs an indirect_dispatch / indirect_call_table
-                   authorization. Flagged (NOT auto-written -- the index
-                   register and table layout aren't in a runtime tier-down).
+                   SITE; it needs an `indirect_dispatch` authorization.
+                   Flagged (NOT auto-written -- the index register and table
+                   layout aren't in a runtime tier-down).
+                   NOTE: `indirect_call_table` is NOT a cfg directive. It is a
+                   decoder parameter name; no cfg parser implements it, so a
+                   pasted `indirect_call_table` line is silently ignored.
 
   INVESTIGATE  The interpreter BAILED (bail_hits>0): it could not run the
                target -- e.g. a garbage indirect target from upstream recomp-
@@ -57,6 +62,10 @@ from collections import defaultdict
 FUNC_RE = re.compile(r'^\s*func\s+(\S+)\s+([0-9A-Fa-f]+)')
 BANK_FILE_RE = re.compile(r'bank([0-9A-Fa-f]{2})\.cfg$')
 
+
+
+# "M0X0" -> ("0", "0"): the entry width a discovery was observed at.
+MX_RE = re.compile(r"M([01])X([01])")
 
 def load_manifest(path):
     with open(path, 'r', encoding='utf-8') as f:
@@ -175,17 +184,34 @@ def main():
         for addr16, d in sorted(promote_func[bank]):
             kind = d.get('site_kind', '?')
             site = parse_pc24(d['site_pc24'])
-            out(f"  func bank_{bank:02X}_{addr16:04X} {addr16:04x}"
-                f"    # {d.get('entry_mx','?')} {kind}, "
+            # entry_mx is REQUIRED on the emitted line. The `func` directive
+            # defaults to entry_mx:1,1 (cfg_loader.py), and these observations
+            # are overwhelmingly M0X0, so a line pasted without it silently
+            # seeds the WRONG variant: the declared boundary is analyzed at a
+            # width the guest never enters it at, and the variant that actually
+            # runs stays interpreted. Emit the observed mode explicitly.
+            mx = str(d.get('entry_mx', ''))
+            m_ = MX_RE.fullmatch(mx)
+            if m_:
+                mx_tok = f" entry_mx:{m_.group(1)},{m_.group(2)}"
+                mx_note = ""
+            else:
+                mx_tok = ""
+                mx_note = "  << NO entry_mx OBSERVED: defaults to 1,1 -- CHECK"
+            out(f"  func bank_{bank:02X}_{addr16:04X} {addr16:04x}{mx_tok}"
+                f"    # {mx or '?'} {kind}, "
                 f"{int(d.get('clean_hits',0))} clean hit(s), "
-                f"from site $%06X, first frame {d.get('first_frame','?')}\n"
+                f"from site $%06X, first frame {d.get('first_frame','?')}"
+                f"{mx_note}\n"
                 % site)
 
     # SITE NEEDS AUTHORIZATION: target is already a func, the dispatch site isn't.
     out(f"\n-- SITE NEEDS DISPATCH AUTHORIZATION: {len(site_needs_auth)} "
         f"site(s) --\n")
     out("  (target already has a `func`; the indirect SITE needs an\n"
-        "   indirect_dispatch/indirect_call_table directive. The index reg +\n"
+        "   `indirect_dispatch` directive -- NOT `indirect_call_table`, which\n"
+        "   no cfg parser implements and which is silently ignored if pasted.\n"
+        "   The index reg +\n"
         "   table layout aren't in the runtime manifest, so verify against the\n"
         "   disassembly before authorizing -- not auto-generated.)\n")
     if not site_needs_auth:

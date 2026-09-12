@@ -12,6 +12,11 @@ void snes_text_xlate_shutdown_c(void);
 void snes_text_xlate_on_frame_c(void);
 void snes_text_xlate_on_vram_write_c(uint16_t word_addr);
 const char* snes_text_xlate_last_error_c(void);
+/* The active localization, as a short stable string ("off" when inactive).
+ * Netplay peers compare this: the translation patches ROM text, RAM and VRAM
+ * in GUEST memory, so two peers on different languages cannot simulate alike.
+ * Writes at most `cap` bytes and always NUL-terminates. */
+void snes_text_xlate_identity_c(char* out, int cap);
 int snes_text_xlate_debug_json_c(const char* subcmd, char* out, int cap);
 
 #ifdef __cplusplus

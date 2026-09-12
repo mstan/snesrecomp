@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Copy the shared libraries a staged executable needs next to it.
+#
+# A release zip that runs on the machine that built it and nowhere else is the
+# default outcome on all three platforms, for three different reasons: MinGW
+# links libgcc/libstdc++/libwinpthread and SDL3 as DLLs beside the compiler;
+# Homebrew dylibs carry absolute /opt/homebrew paths; a source-built SDL3 on
+# Linux lives in a CI cache directory that does not exist on a player's disk.
+#
+# This is one implementation of that for every SNES port, because getting it
+# wrong produces a zip that looks complete and fails at launch — the failure
+# mode a packaging step exists to prevent.
+#
+# Usage:
+#   snesrecomp/tools/ci/bundle_runtime_libs.sh --exe <staged exe> \
+#       [--stage DIR] [--build-dir DIR] [--strict]
+#
+# --stage defaults to the staged exe's directory. --strict turns "a library
+# the binary imports could not be found" into an error on every platform (it
+# already is on Windows).
+set -euo pipefail
+
+# A silent exit is the worst outcome a packaging step can have: the first
+# Windows CI run died here with exit 1 and not one line of output. Name the
+# command and line instead of leaving the reader to bisect a shell script.
+trap 'echo "::error::$(basename "${BASH_SOURCE[0]}") failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+
+EXE=""
+STAGE=""
+BUILD_DIR=""
+STRICT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --exe) EXE="${2:?}"; shift 2 ;;
+    --stage) STAGE="${2:?}"; shift 2 ;;
+    --build-dir) BUILD_DIR="${2:?}"; shift 2 ;;
+    --strict) STRICT=1; shift ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "error: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "${EXE}" || ! -f "${EXE}" ]]; then
+  echo "error: --exe <staged executable> is required and must exist" >&2
+  exit 2
+fi
+[[ -n "${STAGE}" ]] || STAGE="$(cd "$(dirname "${EXE}")" && pwd)"
+[[ -n "${BUILD_DIR}" ]] || BUILD_DIR="${STAGE}"
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) PLATFORM=windows ;;
+  Darwin)               PLATFORM=macos ;;
+  *)                    PLATFORM=linux ;;
+esac
+# A Windows binary can also be staged from a cross build; trust the name too.
+[[ "${EXE}" == *.exe ]] && PLATFORM=windows
+
+copied=0
+copy_lib() {
+  local src="$1"
+  local base
+  base="$(basename "${src}")"
+  if [[ -f "${STAGE}/${base}" ]]; then
+    return 0
+  fi
+  cp -f "${src}" "${STAGE}/${base}"
+  echo "  bundled ${base}"
+  copied=$((copied + 1))
+}
+
+case "${PLATFORM}" in
+windows)
+  # Import table of a PE file, read directly. objdump is not on a Windows
+  # runner's PATH, and the llvm-mingw pack's `<triple>-objdump` is a wrapper
+  # whose output and exit status differ from GNU's -- the first packaging run
+  # died exactly there. The PE format is small and fixed; Python is in the
+  # pack and on every runner. objdump remains a fallback for a host without
+  # Python.
+  PY="$(command -v python3 || command -v python || true)"
+  imports_of() {
+    if [[ -n "${PY}" ]]; then
+      "${PY}" - "$1" <<'PYEOF'
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+pe = struct.unpack_from("<I", data, 0x3C)[0]
+if data[pe:pe+4] != b"PE\0\0":
+    sys.exit("not a PE file")
+nsec, opt_size = struct.unpack_from("<H", data, pe+6)[0], struct.unpack_from("<H", data, pe+20)[0]
+opt = pe + 24
+magic = struct.unpack_from("<H", data, opt)[0]
+dd = opt + (112 if magic == 0x20B else 96)          # data directories
+imp_rva, imp_size = struct.unpack_from("<II", data, dd + 8)  # entry 1: imports
+secs = []
+st = opt + opt_size
+for i in range(nsec):
+    vsz, va, rsz, raw = struct.unpack_from("<IIII", data, st + i*40 + 8)
+    secs.append((va, max(vsz, rsz), raw))
+def off(rva):
+    for va, size, raw in secs:
+        if va <= rva < va + size:
+            return raw + (rva - va)
+    sys.exit(f"RVA {rva:#x} outside any section")
+if imp_rva == 0:
+    sys.exit(0)                                       # no imports at all
+o = off(imp_rva)
+names = set()
+while True:
+    ilt, ts, fwd, name_rva, iat = struct.unpack_from("<IIIII", data, o)
+    if name_rva == 0:
+        break
+    n = off(name_rva)
+    end = data.index(b"\0", n)
+    names.add(data[n:end].decode("ascii", "replace"))
+    o += 20
+# Bytes, not print(): Python on Windows would end each line with \r\n, and
+# "ADVAPI32.DLL\r" is neither a system DLL nor a file that exists.
+out = sys.stdout.buffer
+for n in sorted(names):
+    out.write((n + "\n").encode("ascii", "replace"))
+out.flush()
+PYEOF
+      return
+    fi
+    local objdump=""
+    for cand in x86_64-w64-mingw32-objdump objdump llvm-objdump; do
+      if command -v "${cand}" >/dev/null 2>&1; then objdump="${cand}"; break; fi
+    done
+    if [[ -z "${objdump}" ]]; then
+      echo "::error::neither python nor objdump available to read $(basename "$1")'s imports" >&2
+      return 1
+    fi
+    "${objdump}" -p "$1" | awk '/DLL Name:/{print $3}' | sort -u
+  }
+
+  RUNTIME_BINS=("${MINGW_PREFIX:-/mingw64}/bin")
+  if [[ -n "${RETCOMM_TOOLCHAIN_DIR:-}" ]]; then
+    RUNTIME_BINS+=("${RETCOMM_TOOLCHAIN_DIR}/bin" "${RETCOMM_TOOLCHAIN_DIR}/x86_64-w64-mingw32/bin")
+  fi
+  # Windows' own DLLs ship with the OS; copying them is at best noise and at
+  # worst a version conflict with the loader's.
+  #
+  # A name missing from this list is not a warning, it is a FAILED RELEASE: the
+  # bundler hunts for it in the MinGW sysroot, does not find it (it only exists
+  # on Windows), and exits 1. That is how DWrite.dll broke the setup-pack job --
+  # recomp-ui's Win32 emoji/font path imports DirectWrite, Direct2D and WIC, and
+  # none of the three was listed. When a new import shows up here, ask whether
+  # Windows ships it before reaching for a copy of it.
+  SYSTEM_RE='^(KERNEL32|KERNELBASE|USER32|GDI32|GDIPLUS|ADVAPI32|SHELL32|SHCORE|OLE32|OLEAUT32|WS2_32|WINMM|IMM32|SETUPAPI|VERSION|OPENGL32|GLU32|D2D1|DWRITE|DCOMP|DXGI|D3D[0-9]*|D3DCOMPILER_[0-9]*|WINDOWSCODECS|PROPSYS|COMCTL32|COMDLG32|RPCRT4|SHLWAPI|CRYPT32|BCRYPT|NCRYPT|IPHLPAPI|NSI|DNSAPI|MSVCRT|UCRTBASE|VCRUNTIME[0-9]*|MSVCP[0-9]*|DBGHELP|DWMAPI|UXTHEME|POWRPROF|CFGMGR32|HID|WINTRUST|MSIMG32|AVRT|MF[A-Z]*|AUDIOSES|DINPUT8|XINPUT[0-9_]*|USERENV|API-MS-.*|EXT-MS-.*)\.DLL$'
+
+  # Walk transitively: SDL3.dll itself pulls in the MinGW runtime DLLs, and a
+  # zip carrying SDL3.dll without them is the same broken zip one level down.
+  pending="$(imports_of "${EXE}" | tr -d '\r')"
+  seen=""
+  while [[ -n "${pending}" ]]; do
+    next=""
+    for dll in ${pending}; do
+      upper="$(printf '%s' "${dll}" | tr '[:lower:]' '[:upper:]')"
+      case " ${seen} " in *" ${upper} "*) continue ;; esac
+      seen="${seen} ${upper}"
+      if printf '%s' "${upper}" | grep -qE "${SYSTEM_RE}"; then
+        continue
+      fi
+      src=""
+      for dir in "$(dirname "${EXE}")" "${BUILD_DIR}" "${RUNTIME_BINS[@]}"; do
+        if [[ -f "${dir}/${dll}" ]]; then src="${dir}/${dll}"; break; fi
+      done
+      if [[ -z "${src}" ]]; then
+        echo "::error::required DLL not found: ${dll}" >&2
+        echo "  looked in $(dirname "${EXE}"), ${BUILD_DIR}, ${RUNTIME_BINS[*]}" >&2
+        exit 1
+      fi
+      copy_lib "${src}"
+      next="${next} $(imports_of "${src}" | tr -d '\r')"
+    done
+    pending="${next}"
+  done
+  ;;
+
+macos)
+  if ! command -v dylibbundler >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then
+      echo "Installing dylibbundler…"
+      brew install dylibbundler
+    fi
+  fi
+  if ! command -v dylibbundler >/dev/null 2>&1; then
+    echo "::error::dylibbundler not available — the zip would depend on this runner's Homebrew tree" >&2
+    exit 1
+  fi
+  mkdir -p "${STAGE}/libs"
+  # -od overwrite, -b bundle, -x the binary, -p the install_name prefix the
+  # loader will use at runtime.
+  dylibbundler -od -b -x "${EXE}" -d "${STAGE}/libs" -p "@executable_path/libs/"
+  copied="$(find "${STAGE}/libs" -type f -name '*.dylib' | wc -l | tr -d '[:space:]')"
+  # Prove it: any remaining absolute dependency outside the system prefixes is
+  # a library the player's machine will not have.
+  leftover="$(otool -L "${EXE}" | tail -n +2 | awk '{print $1}' \
+    | grep -vE '^(/usr/lib/|/System/|@executable_path/|@rpath/|@loader_path/)' || true)"
+  if [[ -n "${leftover}" ]]; then
+    echo "::error::executable still links absolute paths that will not exist on a player's Mac:" >&2
+    printf '  %s\n' ${leftover} >&2
+    [[ "${STRICT}" -eq 1 ]] && exit 1
+    exit 1
+  fi
+  ;;
+
+linux)
+  if ! command -v ldd >/dev/null 2>&1; then
+    echo "warning: ldd missing; skipping Linux library bundling" >&2
+    exit 0
+  fi
+
+  # Bundle anything resolved from outside the system library directories (a
+  # CI-built SDL3 lives in a cache dir), plus SDL3 wherever it came from: the
+  # player's distro is not guaranteed to package it at all. The C library, the
+  # loader, and the GCC runtime are deliberately NOT bundled — they have to
+  # match the player's kernel and their GL driver, and overriding them beside
+  # the executable is a well-known way to break both.
+  CANDIDATES=""
+  for lib in $(ldd "${EXE}" 2>/dev/null | awk '/=>/ {print $3}' | grep -v '^$' | sort -u); do
+    [[ -f "${lib}" ]] || continue
+    base="$(basename "${lib}")"
+    case "${base}" in
+      libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libgcc_s.so*|libstdc++.so*) continue ;;
+      libGL*|libEGL*|libGLX*|libOpenGL*|libGLdispatch*|libX11*|libxcb*|libXau*|libXdmcp*|libwayland*) continue ;;
+    esac
+    case "${lib}" in
+      /usr/lib/*|/lib/*|/usr/lib64/*|/lib64/*)
+        case "${base}" in
+          libSDL3.so*) ;;      # ship it anyway
+          *) continue ;;
+        esac
+        ;;
+    esac
+    CANDIDATES="${CANDIDATES} ${lib}"
+  done
+
+  if [[ -z "${CANDIDATES// /}" ]]; then
+    # A fully static SDL3 (the retcomm toolchain pack builds one) leaves
+    # nothing to bundle. That is a finished zip, not a skipped step.
+    echo "  nothing to bundle — every remaining dependency is a system library"
+    echo "Runtime libraries staged in ${STAGE}"
+    exit 0
+  fi
+
+  # $ORIGIN in the RUNPATH is what makes a lib beside the executable findable.
+  # Without it, copying one in is theatre, so say so rather than shipping it.
+  # Only demanded when there is actually something to bundle.
+  if command -v readelf >/dev/null 2>&1; then
+    if ! readelf -d "${EXE}" 2>/dev/null | grep -E 'RUNPATH|RPATH' | grep -q '\$ORIGIN'; then
+      echo "::error::$(basename "${EXE}") needs these libraries bundled, but has no \$ORIGIN RUNPATH," >&2
+      echo "  so the loader would never find them:" >&2
+      printf '    %s\n' ${CANDIDATES} >&2
+      echo "  Configure the build with -DCMAKE_BUILD_RPATH='\$ORIGIN'" >&2
+      exit 1
+    fi
+  else
+    echo "warning: readelf missing; cannot confirm \$ORIGIN RUNPATH" >&2
+  fi
+
+  for lib in ${CANDIDATES}; do
+    copy_lib "${lib}"
+  done
+  ;;
+esac
+
+echo "Runtime libraries staged in ${STAGE}"

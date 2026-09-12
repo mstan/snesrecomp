@@ -31,6 +31,13 @@ enum {
   kKeys_ToggleWidescreen,
   kKeys_VolumeUp,
   kKeys_VolumeDown,
+  /* Save-state slot browser (snes_savestate_menu.c). Appended here rather
+   * than inserted above so the kKeys_Load / kKeys_Save 20-slot ranges keep
+   * their numbering — those are index arithmetic, not just enum labels. */
+  kKeys_SaveStateMenu,
+  /* Local rewind filmstrip (snes_rewind.c). Appended for the same reason as
+   * SaveStateMenu: the Load/Save ranges above are index arithmetic. */
+  kKeys_Rewind,
   kKeys_Total,
 };
 
@@ -71,6 +78,12 @@ typedef struct Config {
   // --launcher argument or by setting SkipLauncher = 0 in config.ini.
   bool skip_launcher;
 
+  /* Netplay display name, persisted so the lobby does not prompt on every
+   * launch. Framework-owned (config.ini [Netplay] PlayerName) so every SNES
+   * port inherits it — the alternative was a copy of this field in each
+   * game's own config, which is how MetalWarriors carried it. */
+  char netplay_player_name[64];
+
   /* Oracle-build only. When false, main.c skips snes_oracle_init_default
    * and calls snes_oracle_set_disabled_by_game so the dispatcher refuses
    * every emu_* command with a structured warning naming the reason. For
@@ -84,6 +97,12 @@ typedef struct Config {
   const char *shader;
 
   bool enable_gamepad[2];
+  /* Which input device drives each player, from config.ini [Controller]
+   * SourceP1/SourceP2 as the launcher writes it: 0 none, 1 keyboard,
+   * 2 gamepad. Player 1 defaults to keyboard so a config without the section
+   * behaves as it always did; player 2 defaults to none, because a second
+   * keyboard player sharing one keyboard has to be asked for. */
+  int player_src[2];
   int gamepad_deadzone;
 
   // Which players have keyboard controls

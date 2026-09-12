@@ -61,6 +61,34 @@ struct Apu {
   bool portTimeValid;
 };
 
+/*
+ * CPU->APU port-write scheduler state, for rollback snapshots.
+ *
+ * apu_saveload deliberately stops at `pad` and leaves this out: for an
+ * ordinary savestate the queue is host lead that is better reset than
+ * restored. Rollback cannot accept that. The queue schedules guest-visible
+ * port writes against `portClock`, a monotonic APU-cycle count that a
+ * snapshot load does not rewind — so after a rewind the mapping from guest
+ * cycles to APU cycles no longer matches the SPC/DSP state the snapshot put
+ * back. Two peers rewinding at different ticks then drift apart in APU
+ * handshake timing, which is a desync with no visible cause. Rollback
+ * snapshots carry this alongside the guest blob.
+ */
+typedef struct ApuPortSched {
+  ApuPortWrite queue[APU_PORT_QUEUE_LEN];
+  uint32_t qHead;
+  uint32_t qTail;
+  uint64_t clock;
+  uint64_t guestAnchor;
+  uint64_t targetAnchor;
+  uint64_t lastGuest;
+  uint64_t lastTarget;
+  bool     timeValid;
+} ApuPortSched;
+
+void apu_port_sched_save(const Apu *apu, ApuPortSched *out);
+void apu_port_sched_restore(Apu *apu, const ApuPortSched *in);
+
 Apu* apu_init();
 void apu_free(Apu* apu);
 void apu_reset(Apu* apu);

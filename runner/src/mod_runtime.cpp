@@ -62,6 +62,30 @@ struct Feature {
     std::string description;
     std::string group = "General";
     bool default_enabled = false;
+    /* This feature changes only what the local machine DRAWS, never what it
+     * simulates -- so it is left out of the effective set two netplay peers
+     * compare, and the two of them may differ on it freely.
+     *
+     * snes_mod_runtime_effective_set_c has always said that peers "must agree
+     * on every mod that touches guest memory"; this is the flag that finally
+     * lets a manifest say a mod does not. It was added for an accessibility
+     * filter (a photosensitivity flash guard), where requiring both sides to
+     * match would have made the feature useless in exactly the situation it
+     * exists for: a player who needs it does not get to pick their opponent,
+     * and should not have to ask one for permission to see fewer strobes.
+     *
+     * Declaring it is a CLAIM, and a false one desyncs a match. Set it only
+     * where the feature demonstrably touches no CPU, WRAM, VRAM, OAM, CGRAM,
+     * APU or save state -- a post-process on the presented framebuffer, a
+     * window or viewport policy, an overlay drawn after the guest frame. A
+     * mod that patches ROM text, freezes a RAM address or moves a sprite
+     * bound is simulation state whatever it looks like, and must NOT set it.
+     *
+     * Note that widescreen deliberately does NOT set this even though it is
+     * presentation-only: it negotiates a shared margin through the lobby's
+     * match caps so both peers run the same geometry, so agreement there is
+     * wanted rather than merely tolerated. */
+    bool presentation_only = false;
     std::vector<std::string> plugins;
 };
 
@@ -135,6 +159,20 @@ struct Validation {
 
 struct RegisteredPlugin {
     SNESModActivationCallback activation = nullptr;
+    /* The EXECUTABLE's word that this plugin only ever changes what is drawn.
+     *
+     * Set by snes_mod_register_presentation_plugin, i.e. by a line of C in a
+     * build somebody reviewed -- never by a manifest. That asymmetry is the
+     * whole value of the field: a manifest is authored by whoever authored the
+     * mod, so `presentation_only` there is the mod vouching for itself, while
+     * this is the program vouching for a function it contains.
+     *
+     * A manifest may therefore only ever claim the exemption for behaviour the
+     * shipped binary ALREADY implements and has already classified. It cannot
+     * introduce a new cosmetic behaviour, because it cannot introduce code at
+     * all: activation runs registered callbacks, and an unregistered id
+     * resolves to nothing. */
+    bool presentation = false;
 };
 
 std::map<std::string, RegisteredPlugin>& registered_plugins() {
@@ -172,6 +210,19 @@ struct Runtime {
     Validation committed;
     std::string error;
     bool initialized = false;
+
+    /* The cosmetic allowlist in force for this session -- see
+     * snes_mod_runtime_set_cosmetic_allow_c. EMPTY MEANS NOTHING IS EXEMPT,
+     * which is the only safe default: a manifest saying presentation_only is
+     * the mod's own claim about itself, and absent an authority to grant it,
+     * an unrecognised claim has to be worth nothing. */
+    std::string cosmetic_allow;
+    /* package id -> "version\0digest" memo, so a queue gate can pin package
+     * bytes without re-zipping a tree per check. Keyed by id@version. */
+    std::map<std::string, std::string> digest_cache;
+    /* id@version -> "carries nothing but manifest.toml", memoised for the same
+     * reason the digest is: it walks a directory. */
+    std::map<std::string, bool> manifest_only_cache;
 };
 
 Runtime& state() {
@@ -495,6 +546,9 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                 else if (key == "default_enabled") {
                     parsed = parse_bool(value, bool_value);
                     if (parsed) feature->default_enabled = bool_value;
+                } else if (key == "presentation_only") {
+                    parsed = parse_bool(value, bool_value);
+                    if (parsed) feature->presentation_only = bool_value;
                 } else known = false;
                 break;
             case Section::Option:
@@ -669,6 +723,192 @@ bool feature_enabled(Runtime& runtime, const Package& package,
     if (!selection.has_enabled)
         selection.enabled = feature.default_enabled;
     return selection.enabled;
+}
+
+/* Deterministic content digest of an installed package, memoised.
+ *
+ * zip_store_tree sorts its file list precisely so that the same package packs
+ * to byte-identical bytes on any machine, which is what makes a digest of it
+ * mean the same thing to a server and to a client. Declared before its use in
+ * cosmetic_allowed; defined further down, next to the packing code. */
+bool package_digest(Runtime& runtime, const std::string& package_id,
+                    const std::string& version, std::string& out);
+
+/*
+ * Does the session's allowlist grant this package the cosmetic exemption?
+ *
+ * The allowlist is ';'-separated, each entry one of:
+ *
+ *     <package_id>@<version>
+ *     <package_id>@<version>#<sha256 of the packed package>
+ *
+ * The digest form is the one worth using. Without it the list is keyed on a
+ * string the client chooses for itself, so a mod that wants the exemption
+ * simply calls itself by an allowlisted id -- which is not a whitelist, it is
+ * a naming convention. With it, the entry names specific bytes.
+ *
+ * What this can and cannot do is worth being exact about, because the
+ * difference decides whether anyone is misled. It stops a player from
+ * REDISTRIBUTING something that claims to be cosmetic and is not: a "flash
+ * guard" with a wallhack in it packs to different bytes and is refused on
+ * every machine that installs it. It does NOT stop someone who patches their
+ * own executable, because a patched client can report whatever it likes --
+ * defending against that needs server-side verification of the simulation,
+ * which does not exist here. The purpose is to close the omission, so that
+ * getting an unapproved mod into a match requires deliberate forgery rather
+ * than merely declaring a flag in a manifest nobody checks.
+ */
+bool cosmetic_allowed(Runtime& runtime, const Package& package) {
+    if (runtime.cosmetic_allow.empty()) return false;
+
+    /* The RESOLVED package's own id and version, not the selection map's.
+     * selected_package falls back to the newest installed version when a
+     * selection names none, so reading the selection here could check the
+     * allowlist against one version while the match runs another. */
+    const std::string& package_id = package.id;
+    const std::string& version = package.version;
+    if (package_id.empty() || version.empty()) return false;
+
+    const std::string want = package_id + "@" + version;
+    const std::string& list = runtime.cosmetic_allow;
+    std::size_t pos = 0;
+    while (pos <= list.size()) {
+        std::size_t end = list.find(';', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string entry = trim(list.substr(pos, end - pos));
+        pos = end + 1;
+        if (entry.empty()) continue;
+
+        std::string pinned;
+        const std::size_t hash = entry.find('#');
+        if (hash != std::string::npos) {
+            pinned = trim(entry.substr(hash + 1));
+            entry = trim(entry.substr(0, hash));
+        }
+        if (entry != want) continue;
+
+        if (pinned.empty())
+            return true;        /* named, not pinned */
+
+        std::string have;
+        if (!package_digest(runtime, package_id, version, have))
+            return false;       /* cannot prove it: refuse, never assume */
+        /* Case-insensitive on the hex, so a list written in either case works;
+         * the comparison is still the whole 64 characters. */
+        if (pinned.size() != have.size()) continue;
+        bool same = true;
+        for (std::size_t i = 0; i < have.size() && same; ++i)
+            same = std::tolower((unsigned char)pinned[i]) ==
+                   std::tolower((unsigned char)have[i]);
+        if (same) return true;
+    }
+    return false;
+}
+
+/*
+ * Does this package carry ANYTHING but its manifest?
+ *
+ * A package eligible for the cosmetic exemption may carry no payload at all --
+ * no data file, no patch table, no image, nothing. It may only SELECT among
+ * behaviour the executable already ships.
+ *
+ * This is the check that makes "presentation only" a property rather than a
+ * promise. A manifest cannot introduce code (activation runs only callbacks
+ * the binary registered, and an unregistered plugin id resolves to nothing),
+ * so the one way a package can still influence the guest is by shipping data
+ * that some built-in feature consumes -- which is exactly how localization
+ * patches ROM text, from a .toml inside its own package. A package with no
+ * files has no such lever, and the property is verifiable here rather than
+ * taken on trust.
+ *
+ * Note it is deliberately stricter than "declares no [[resource]]": the
+ * localization table is not a declared resource, it is simply a file the
+ * plugin opens by path. Counting declarations would have missed it.
+ */
+bool package_is_manifest_only(Runtime& runtime, const Package& package) {
+    const std::string key = package.id + "@" + package.version;
+    const auto hit = runtime.manifest_only_cache.find(key);
+    if (hit != runtime.manifest_only_cache.end()) return hit->second;
+
+    bool only = true;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(package.root, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) { only = false; break; }   /* cannot see it: do not vouch */
+        if (!it->is_regular_file(ec) || ec) continue;
+        const std::string name = it->path().filename().string();
+        if (name != "manifest.toml") { only = false; break; }
+    }
+    runtime.manifest_only_cache[key] = only;
+    return only;
+}
+
+/*
+ * Is the CLAIM even admissible, before asking whether anyone granted it?
+ *
+ * Three things, and none of them is the manifest's opinion of itself:
+ *
+ *   1. the manifest asks (feature.presentation_only) -- necessary, worthless
+ *      alone, because a cheat author writes manifests too;
+ *   2. every plugin the feature turns on was registered by the EXECUTABLE as
+ *      presentation-only. A manifest can only name plugins; whether a named
+ *      plugin merely draws is a fact about compiled code that a reviewer
+ *      classified, not something the package gets a say in. A feature naming a
+ *      plugin the binary registered normally -- or one it does not have at all
+ *      -- is not admissible however loudly its manifest claims otherwise;
+ *   3. the package carries nothing but its manifest, so it cannot feed data to
+ *      a built-in feature that patches the guest.
+ *
+ * This runs BEFORE the allowlist, so it holds even against a server that
+ * allowlists something it should not have. The grant decides whether an
+ * admissible claim is honoured; this decides whether it was ever a real claim.
+ */
+bool claim_admissible(Runtime& runtime, const Package& package,
+                      const Feature& feature) {
+    if (!feature.presentation_only) return false;
+    for (const std::string& plugin_id : feature.plugins) {
+        const auto registered = registered_plugins().find(plugin_id);
+        if (registered == registered_plugins().end() ||
+            !registered->second.activation ||
+            !registered->second.presentation) {
+            /* Loud, because this is what an attempt to smuggle a
+             * simulation-affecting feature past the mod comparison looks
+             * like, and it is otherwise indistinguishable from a typo. */
+            std::fprintf(stderr,
+                "mods: %s/%s claims presentation_only, but this build does not "
+                "classify plugin '%s' as presentation -- the claim is refused "
+                "and the feature is treated as simulation-affecting\n",
+                package.id.c_str(), feature.id.c_str(), plugin_id.c_str());
+            return false;
+        }
+    }
+    if (!package_is_manifest_only(runtime, package)) {
+        std::fprintf(stderr,
+            "mods: %s claims presentation_only but ships files beyond its "
+            "manifest -- the claim is refused\n", package.id.c_str());
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Is this enabled feature exempt from everything netplay compares?
+ *
+ * TWO conditions, and both are needed. The manifest's presentation_only is the
+ * mod ASKING; the session's allowlist is the authority GRANTING. A claim with
+ * no grant behind it is treated as an ordinary simulation-affecting feature --
+ * it appears in the compared set, it is published in the plan rows, and an
+ * adopt sweeps it off -- which is exactly how an unrecognised mod should be
+ * handled and is the behaviour that predates the flag.
+ *
+ * Every consumer that used to test `feature.presentation_only` directly must
+ * go through here instead. Testing the flag alone is the bug this function
+ * exists to prevent: it would let any manifest exempt itself.
+ */
+bool feature_exempt(Runtime& runtime, const Package& package,
+                    const Feature& feature) {
+    if (!claim_admissible(runtime, package, feature)) return false;
+    return cosmetic_allowed(runtime, package);
 }
 
 std::string option_value(Runtime& runtime, const Package& package,
@@ -1506,10 +1746,185 @@ bool extract_zip(const std::vector<uint8_t>& bytes,
     return true;
 }
 
+/* ---- STORE-only ZIP32 writer -------------------------------------------
+ *
+ * The reader above handles STORE and DEFLATE; this writes STORE only. A mod
+ * package is a manifest and a handful of small assets, so the bytes saved by
+ * compressing them do not pay for a deflate encoder that would then need its
+ * own correctness argument. The lobby protocol specifies STORE zip32 anyway.
+ *
+ * Everything it produces must satisfy parse_zip() on the far side, including
+ * safe_archive_name() -- so names are relative, '/'-separated, and never
+ * absolute or dotted. */
+void put16(std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back((uint8_t)(x & 0xFF));
+    v.push_back((uint8_t)(x >> 8));
+}
+
+void put32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((uint8_t)(x & 0xFF));
+    v.push_back((uint8_t)((x >> 8) & 0xFF));
+    v.push_back((uint8_t)((x >> 16) & 0xFF));
+    v.push_back((uint8_t)((x >> 24) & 0xFF));
+}
+
+struct OutEntry {
+    std::string name;
+    uint32_t crc;
+    uint32_t size;
+    uint32_t local_offset;
+};
+
+bool zip_store_tree(const fs::path& root, std::vector<uint8_t>& out,
+                    std::string* error) {
+    std::vector<OutEntry> entries;
+    std::error_code ec;
+    std::vector<fs::path> files;
+
+    for (fs::recursive_directory_iterator it(root, ec), end; it != end;
+         it.increment(ec)) {
+        if (ec) {
+            set_error(error, "cannot walk the package: " + ec.message());
+            return false;
+        }
+        if (it->is_regular_file(ec)) files.push_back(it->path());
+    }
+    /* Sorted so the same package always produces byte-identical bytes, which
+     * is what lets a digest of the archive mean anything to two machines. */
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        set_error(error, "package directory is empty");
+        return false;
+    }
+    if (files.size() > kMaxArchiveFiles) {
+        set_error(error, "package has too many files");
+        return false;
+    }
+
+    for (const fs::path& file : files) {
+        const fs::path rel = fs::relative(file, root, ec);
+        if (ec || rel.empty()) {
+            set_error(error, "cannot relativize " + file.string());
+            return false;
+        }
+        std::string name = rel.generic_string();
+        if (!safe_archive_name(name)) {
+            set_error(error, "unsafe path in package: " + name);
+            return false;
+        }
+        std::vector<uint8_t> data;
+        if (!read_file(file, data, error)) return false;
+        if (out.size() + data.size() > kMaxArchiveBytes) {
+            set_error(error, "package exceeds the archive size limit");
+            return false;
+        }
+
+        OutEntry e;
+        e.name = name;
+        e.crc = crc32_compute(data.data(), data.size());
+        e.size = (uint32_t)data.size();
+        e.local_offset = (uint32_t)out.size();
+
+        put32(out, 0x04034b50u);          /* local file header */
+        put16(out, 20);                   /* version needed */
+        put16(out, 0);                    /* flags */
+        put16(out, 0);                    /* method: STORE */
+        put16(out, 0);                    /* mod time  */
+        put16(out, 0);                    /* mod date  */
+        put32(out, e.crc);
+        put32(out, e.size);               /* compressed == uncompressed */
+        put32(out, e.size);
+        put16(out, (uint16_t)name.size());
+        put16(out, 0);                    /* extra len */
+        out.insert(out.end(), name.begin(), name.end());
+        out.insert(out.end(), data.begin(), data.end());
+        entries.push_back(e);
+    }
+
+    const uint32_t cd_offset = (uint32_t)out.size();
+    for (const OutEntry& e : entries) {
+        put32(out, 0x02014b50u);          /* central directory header */
+        put16(out, 20);                   /* version made by */
+        put16(out, 20);                   /* version needed */
+        put16(out, 0);
+        put16(out, 0);                    /* STORE */
+        put16(out, 0);
+        put16(out, 0);
+        put32(out, e.crc);
+        put32(out, e.size);
+        put32(out, e.size);
+        put16(out, (uint16_t)e.name.size());
+        put16(out, 0);                    /* extra */
+        put16(out, 0);                    /* comment */
+        put16(out, 0);                    /* disk */
+        put16(out, 0);                    /* internal attrs */
+        put32(out, 0);                    /* external attrs */
+        put32(out, e.local_offset);
+        out.insert(out.end(), e.name.begin(), e.name.end());
+    }
+    const uint32_t cd_size = (uint32_t)out.size() - cd_offset;
+
+    put32(out, 0x06054b50u);              /* end of central directory */
+    put16(out, 0);
+    put16(out, 0);
+    put16(out, (uint16_t)entries.size());
+    put16(out, (uint16_t)entries.size());
+    put32(out, cd_size);
+    put32(out, cd_offset);
+    put16(out, 0);                        /* comment length */
+    return true;
+}
+
+std::string hex32(const uint8_t digest[32]);
+
+/* See the forward declaration above cosmetic_allowed for why this is stable
+ * across machines. Memoised because a queue gate asks once per attempt and
+ * packing a tree is real work; the cache is keyed by id@version, so an
+ * install or a version change cannot be answered from a stale entry. */
+bool package_digest(Runtime& runtime, const std::string& package_id,
+                    const std::string& version, std::string& out) {
+    const std::string key = package_id + "@" + version;
+    const auto hit = runtime.digest_cache.find(key);
+    if (hit != runtime.digest_cache.end()) {
+        out = hit->second;
+        return !out.empty();
+    }
+    /* Cache the failure too, as an empty string: a package that cannot be
+     * packed will not start packing on the next call either, and a queue gate
+     * that retries every frame should not retry the walk every frame. */
+    runtime.digest_cache[key] = std::string();
+
+    const auto by_id = runtime.packages.find(package_id);
+    if (by_id == runtime.packages.end()) return false;
+    const auto by_ver = by_id->second.find(version);
+    if (by_ver == by_id->second.end()) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!zip_store_tree(by_ver->second.root, bytes, nullptr)) return false;
+
+    uint8_t digest[32];
+    sha256_compute(bytes.data(), bytes.size(), digest);
+    out = hex32(digest);
+    runtime.digest_cache[key] = out;
+    return true;
+}
+
+std::string hex32(const uint8_t digest[32]) {
+    static const char* kHex = "0123456789abcdef";
+    std::string s;
+    s.reserve(64);
+    for (int i = 0; i < 32; ++i) {
+        s.push_back(kHex[digest[i] >> 4]);
+        s.push_back(kHex[digest[i] & 0xF]);
+    }
+    return s;
+}
+
 bool install_archive(Runtime& runtime, const fs::path& archive,
                      std::string* installed_id,
                      std::string* installed_version,
-                     std::string* error) {
+                     std::string* error,
+                     bool replace_existing = false) {
     if (archive.extension() != ".snesmod") {
         set_error(error, "SNES mod archives must use the .snesmod extension");
         return false;
@@ -1549,10 +1964,22 @@ bool install_archive(Runtime& runtime, const fs::path& archive,
     const fs::path destination =
         runtime.root / "packages" / package.id / package.version;
     if (fs::exists(destination)) {
-        cleanup();
-        set_error(error, package.id + " " + package.version +
-                         " is already installed");
-        return false;
+        if (!replace_existing) {
+            cleanup();
+            set_error(error, package.id + " " + package.version +
+                             " is already installed");
+            return false;
+        }
+        /* Replacing, not merging: the incoming copy is authoritative and a
+         * leftover file from the old one would travel with it. */
+        fs::remove_all(destination, ec);
+        if (ec) {
+            cleanup();
+            set_error(error, "cannot replace the installed package: " +
+                             ec.message());
+            return false;
+        }
+        ec.clear();
     }
     fs::create_directories(destination.parent_path(), ec);
     if (!ec) fs::rename(staging, destination, ec);
@@ -1583,6 +2010,14 @@ bool sha256_file(const fs::path& path, std::string& out,
     return true;
 }
 
+/* Selection edits, wherever they come from, re-run validation. Not launcher
+ * code: the netplay paths below (install_blob, adopt_set) edit selections in
+ * a text-mode host too, and this used to sit inside the RECOMP_LAUNCHER block
+ * -- so a host built without the launcher did not compile once mods were on. */
+void refresh_validation() {
+    state().validation = validate(state());
+}
+
 #if defined(RECOMP_LAUNCHER)
 template <size_t N>
 void copy_text(char (&out)[N], const std::string& value) {
@@ -1610,10 +2045,6 @@ std::vector<FeatureRef> selected_features(Runtime& runtime) {
         for (const Feature& feature : package->features)
             result.push_back({package, &feature});
     return result;
-}
-
-void refresh_validation() {
-    state().validation = validate(state());
 }
 
 int provider_package_count(void*) {
@@ -1876,6 +2307,11 @@ int provider_feature_choice_get(
     return 1;
 }
 
+#endif /* RECOMP_LAUNCHER */
+
+/* The two selection editors double as the netplay adopt-set path (a peer
+ * taking on the host's mod set), so they exist with or without the launcher;
+ * the provider table below merely points at them. */
 int provider_feature_enable(void*, const char* package_id,
                             const char* feature_id, int enabled) {
     if (!package_id || !feature_id) return 0;
@@ -1912,6 +2348,7 @@ int provider_feature_set_option(
     return 1;
 }
 
+#if defined(RECOMP_LAUNCHER)
 int provider_diagnostic_count(void*, const char* package_id,
                               const char* feature_id) {
     if (!package_id || !feature_id) return 0;
@@ -2126,6 +2563,17 @@ extern "C" int snes_mod_register_activation_plugin(
     if (prior != plugins.end() && prior->second.activation != callback)
         return 0;
     plugins[id].activation = callback;
+    /* Never clears an existing classification, and never sets one: a plugin
+     * is presentation-only because a build said so through the call below,
+     * and registering the ordinary way leaves it unclassified, which is the
+     * safe answer for every plugin that predates the distinction. */
+    return 1;
+}
+
+extern "C" int snes_mod_register_presentation_plugin(
+    const char* id, SNESModActivationCallback callback) {
+    if (!snes_mod_register_activation_plugin(id, callback)) return 0;
+    SNESRecomp::registered_plugins()[id].presentation = true;
     return 1;
 }
 
@@ -2242,6 +2690,776 @@ extern "C" int snes_mod_runtime_feature_option_value_c(
         SNESRecomp::option_value(runtime, *package, *feature, *option);
     std::snprintf(out, cap, "%s", value.c_str());
     return 1;
+}
+
+/*
+ * The effective mod set, as one canonical line per enabled feature.
+ *
+ * Netplay peers must agree on every mod that touches guest memory, and this is
+ * what they compare. A real match desynced because one side had localization
+ * active and the other did not -- that mod patches ROM text, RAM and VRAM in
+ * GUEST memory, so it is simulation state, not presentation.
+ *
+ * Canonical means byte-identical for equal selections on any machine:
+ *
+ *   - only ENABLED features appear; a disabled feature and an absent package
+ *     are the same thing to the simulation, and must hash alike
+ *   - only features that AFFECT THE SIMULATION appear. A feature whose
+ *     manifest declares presentation_only draws differently and simulates
+ *     identically, so including it would refuse a match over a difference
+ *     that cannot desync one -- and would make an accessibility filter
+ *     something a player has to negotiate with their opponent. See the flag's
+ *     definition for what may and may not claim it
+ *   - packages, features and options are emitted in sorted order, which
+ *     std::map gives us, so map iteration order cannot leak into the value
+ *   - the package VERSION is included: the same mod at a different version can
+ *     patch different bytes
+ *   - option values are the RESOLVED ones, not the stored ones, so a peer
+ *     relying on a manifest default and a peer that chose the same value
+ *     explicitly agree -- which is the common case and must not desync
+ *
+ * Returns the number of bytes that WOULD be written, so a caller can detect
+ * truncation rather than silently compare prefixes.
+ */
+/*
+ * The cosmetic allowlist in force for this session.
+ *
+ * WHO SETS IT. Not this machine. It comes from whoever is authoritative for
+ * the match: the automatch ruleset the SERVER published, or -- in a lobby --
+ * the host's match caps. The local build's own opinion of which of its mods
+ * are harmless is exactly the opinion that cannot be trusted, because writing
+ * `presentation_only = true` in a manifest costs a cheat author nothing.
+ *
+ * Format: ';'-separated `id@version` or `id@version#sha256`. See
+ * cosmetic_allowed for the matching rules and for the honest limits of what
+ * pinning bytes does and does not prevent.
+ *
+ * NULL or "" REVOKES EVERY EXEMPTION, and that is the correct default rather
+ * than a degenerate case. An older host, a ruleset with no such key, a server
+ * that has never heard of cosmetic mods -- each of those means "no authority
+ * has granted anything here", and the answer to that has to be no. The cost
+ * is that a player's filter counts as an ordinary mod against such a host and
+ * has to match or be switched off; the cost of the other default is that any
+ * mod on earth exempts itself by saying so.
+ *
+ * Offline, nobody calls this, nothing is exempt, and it does not matter: the
+ * exemption only ever affects what netplay compares.
+ */
+extern "C" void snes_mod_runtime_set_cosmetic_allow_c(const char* allow) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    const std::string next = allow ? allow : "";
+    if (next == runtime.cosmetic_allow) return;
+    runtime.cosmetic_allow = next;
+    /* Say it, once per change. Which mods a match treated as cosmetic is the
+     * first thing anyone will want to know after an argument about one. */
+    std::fprintf(stderr, "mods: cosmetic allowlist = %s\n",
+                 next.empty() ? "(nothing exempt)" : next.c_str());
+}
+
+extern "C" int snes_mod_runtime_get_cosmetic_allow_c(char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    const std::string& text = runtime.cosmetic_allow;
+    if (out && cap) std::snprintf(out, cap, "%s", text.c_str());
+    return (int)text.size();
+}
+
+extern "C" int snes_mod_runtime_package_digest_c(const char* package_id,
+                                                 const char* version,
+                                                 char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string digest;
+    if (out && cap) out[0] = '\0';
+    if (!package_id || !runtime.initialized) return 0;
+
+    std::string ver = version ? version : "";
+    if (ver.empty()) {
+        const SNESRecomp::Package* package =
+            SNESRecomp::selected_package(runtime, package_id);
+        if (!package) return 0;
+        ver = package->version;
+    }
+    if (!SNESRecomp::package_digest(runtime, package_id, ver, digest))
+        return 0;
+    if (out && cap) {
+        if (cap < digest.size() + 1) return 0;
+        std::memcpy(out, digest.c_str(), digest.size() + 1);
+    }
+    return 1;
+}
+
+/*
+ * The enabled features that CLAIM the cosmetic exemption and have not been
+ * granted it, one `package@version/feature` per line.
+ *
+ * This is the queue gate's evidence. An automatch ticket asserts that no
+ * simulation-affecting mod is on beyond what the ruleset imposes, and an
+ * ungranted cosmetic claim has to count as simulation-affecting -- not
+ * because it necessarily is, but because nobody in a position to know has
+ * said otherwise. Reporting them individually is what lets the refusal name
+ * the mod instead of saying "turn off your mods".
+ *
+ * Returns the number of bytes that WOULD be written, so a caller can tell
+ * truncation from emptiness.
+ */
+/*
+ * The EVIDENCE for every exemption this build is taking, one
+ * `id@version#sha256` per package, for the server to check against its own
+ * allowlist.
+ *
+ * This exists because the automatch ticket used to carry a VERDICT -- a single
+ * `mods_enabled` boolean -- and a verdict is computed by the one machine with
+ * an interest in the answer. The server could not see what had been claimed,
+ * only whether this build had decided it was acceptable, so every rule about
+ * which mods are cosmetic ran on the client and could be changed by changing
+ * the client.
+ *
+ * Reporting the packages instead moves the DECISION to the server: it holds
+ * the allowlist, it matches these digests against it, and a package it has
+ * not approved is refused however this build classified it. A stale or
+ * patched client cannot widen its own exemptions, only misreport them -- and
+ * a misreport is now a specific false factual claim about named bytes rather
+ * than an invisible flip of a boolean.
+ *
+ * Only packages with at least one ACTUALLY exempted feature appear: the list
+ * is what is being relied on, not what might have been. Sorted (std::map
+ * iteration) so two machines in the same state produce identical text.
+ */
+extern "C" int snes_mod_runtime_exempted_packages_c(char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string text;
+    if (runtime.initialized) {
+        for (const auto& sel_entry : runtime.selections) {
+            const SNESRecomp::Package* package =
+                SNESRecomp::selected_package(runtime, sel_entry.first.c_str());
+            if (!package) continue;
+            bool any = false;
+            for (const SNESRecomp::Feature& feature : package->features) {
+                if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                if (SNESRecomp::feature_exempt(runtime, *package, feature)) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) continue;
+            std::string digest;
+            /* A digest we cannot compute is reported as empty rather than
+             * omitted. Dropping the row would hide an exemption from the very
+             * check this function exists to feed; an empty digest matches no
+             * pinned allowlist entry, so it fails closed at the server. */
+            SNESRecomp::package_digest(runtime, package->id, package->version,
+                                       digest);
+            text += package->id;
+            text += '@';
+            text += package->version;
+            text += '#';
+            text += digest;
+            text += '\n';
+        }
+    }
+    if (out && cap) std::snprintf(out, cap, "%s", text.c_str());
+    return (int)text.size();
+}
+
+extern "C" int snes_mod_runtime_unapproved_cosmetics_c(char* out,
+                                                       uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string text;
+    if (runtime.initialized) {
+        for (const auto& sel_entry : runtime.selections) {
+            const SNESRecomp::Package* package =
+                SNESRecomp::selected_package(runtime, sel_entry.first.c_str());
+            if (!package) continue;
+            for (const SNESRecomp::Feature& feature : package->features) {
+                if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                /* Admissible-but-ungranted only. An INADMISSIBLE claim is
+                 * already an ordinary simulation feature everywhere that
+                 * matters -- it is in the compared set, and the set comparison
+                 * refuses it with its own message. Listing it here too would
+                 * report the same mod twice under two different reasons. */
+                if (!SNESRecomp::claim_admissible(runtime, *package, feature))
+                    continue;
+                if (SNESRecomp::cosmetic_allowed(runtime, *package)) continue;
+                text += sel_entry.first;
+                text += '@';
+                text += sel_entry.second.version;
+                text += '/';
+                text += feature.id;
+                text += '\n';
+            }
+        }
+    }
+    if (out && cap) std::snprintf(out, cap, "%s", text.c_str());
+    return (int)text.size();
+}
+
+extern "C" int snes_mod_runtime_effective_set_c(char* out, uint32_t cap) {
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::string text;
+    if (runtime.initialized) {
+        for (const auto& sel_entry : runtime.selections) {
+            const std::string& package_id = sel_entry.first;
+            const SNESRecomp::PackageSelection& selection = sel_entry.second;
+            const SNESRecomp::Package* package =
+                SNESRecomp::selected_package(runtime, package_id.c_str());
+            if (!package)
+                continue;
+            for (const SNESRecomp::Feature& feature : package->features) {
+                if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                    continue;
+                if (SNESRecomp::feature_exempt(runtime, *package, feature))
+                    continue;
+                text += package_id;
+                text += '@';
+                text += selection.version;
+                text += '/';
+                text += feature.id;
+                /* Options are listed under the package, not the feature, so
+                 * filter — emitting another feature's options here would make
+                 * the line depend on manifest ordering. */
+                std::map<std::string, std::string> opts;
+                for (const SNESRecomp::Option& option : package->options) {
+                    if (option.feature_id != feature.id)
+                        continue;
+                    opts[option.id] =
+                        SNESRecomp::option_value(runtime, *package, feature, option);
+                }
+                for (const auto& o : opts) {
+                    text += ' ';
+                    text += o.first;
+                    text += '=';
+                    text += o.second;
+                }
+                text += '\n';
+            }
+        }
+    }
+    if (text.empty())
+        text = "(none)\n";
+    if (out && cap > 0) {
+        std::snprintf(out, cap, "%s", text.c_str());
+    }
+    return (int)text.size();
+}
+
+/*
+ * Can this build honour the host's mod set?
+ *
+ * The host is authoritative and the peer answers yes or no, because mods patch
+ * guest memory: a peer running a different set is running a different game,
+ * and that is better refused at the door than discovered desyncing in the
+ * third round.
+ *
+ * The verdict is simply whether our effective set is byte-identical to theirs
+ * -- that is the same string both sides fingerprint, so agreement here and
+ * agreement at tick 0 mean the same thing. What takes the work is saying WHY
+ * when it differs, because "your mods are wrong" is not something a player can
+ * act on. Each line of the host's set is checked against what we actually have
+ * so the answer names the package, and the version or option, that we cannot
+ * meet.
+ */
+/*
+ * Do we have this package, at this version, and what is it called?
+ *
+ * The lobby shows a guest the host's required mods before anyone seats, and
+ * each row needs a local verdict: installed, wrong version, or absent. Names
+ * come from the manifest so the row reads "Gundam Wing Endless Duel
+ * Localization" rather than "gwed.localization" -- a player who has to go and
+ * install something should be told what to look for.
+ *
+ * Returns 1 installed at that version, 0 present at another, -1 absent.
+ */
+extern "C" int snes_mod_runtime_have_package_c(const char* package_id,
+                                               const char* version,
+                                               char* name_out,
+                                               uint32_t name_cap) {
+    if (name_out && name_cap) name_out[0] = '\0';
+    if (!package_id) return -1;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    auto it = runtime.packages.find(package_id);
+    if (it == runtime.packages.end() || it->second.empty()) return -1;
+    /* Any version will do for the NAME; the verdict is about the version. */
+    const SNESRecomp::Package& any = it->second.begin()->second;
+    if (name_out && name_cap)
+        std::snprintf(name_out, name_cap, "%s",
+                      any.name.empty() ? package_id : any.name.c_str());
+    if (!version || !version[0]) return 1;
+    return it->second.find(version) != it->second.end() ? 1 : 0;
+}
+
+namespace {
+
+/* Copy into a fixed row field, refusing rather than truncating. A truncated
+ * package id or version names something else, and every consumer of these
+ * rows compares them for equality. */
+bool row_field(char* dst, size_t cap, const std::string& value) {
+    if (value.size() + 1 > cap) return false;
+    std::memcpy(dst, value.c_str(), value.size() + 1);
+    return true;
+}
+
+}  // namespace
+
+extern "C" int snes_mod_runtime_package_root_c(const char* package_id,
+                                              const char* version,
+                                              char* out, uint32_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!package_id || !out || !cap) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+
+    const SNESRecomp::Package* package = nullptr;
+    if (version && version[0]) {
+        auto by_id = runtime.packages.find(package_id);
+        if (by_id == runtime.packages.end()) return 0;
+        auto by_ver = by_id->second.find(version);
+        if (by_ver == by_id->second.end()) return 0;
+        package = &by_ver->second;
+    } else {
+        package = SNESRecomp::selected_package(runtime, package_id);
+    }
+    if (!package) return 0;
+
+    const std::string root = package->root.string();
+    if (root.size() + 1 > cap) return 0;
+    std::memcpy(out, root.c_str(), root.size() + 1);
+    return 1;
+}
+
+extern "C" int snes_mod_runtime_export_package_c(const char* package_id,
+                                                const char* version,
+                                                uint8_t** out, uint32_t* out_len,
+                                                char* sha256_hex, uint32_t sha_cap,
+                                                char* err, uint32_t err_cap) {
+    auto fail = [&](const std::string& why) {
+        if (err && err_cap) std::snprintf(err, err_cap, "%s", why.c_str());
+        return 0;
+    };
+    if (out) *out = nullptr;
+    if (out_len) *out_len = 0;
+    if (sha256_hex && sha_cap) sha256_hex[0] = '\0';
+    if (err && err_cap) err[0] = '\0';
+    if (!package_id || !version || !out || !out_len)
+        return fail("bad arguments");
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return fail("mod runtime is not initialized");
+    auto by_id = runtime.packages.find(package_id);
+    if (by_id == runtime.packages.end())
+        return fail(std::string("not installed: ") + package_id);
+    auto by_ver = by_id->second.find(version);
+    if (by_ver == by_id->second.end())
+        return fail(std::string(package_id) + " is not installed at version " +
+                    version);
+
+    std::vector<uint8_t> bytes;
+    std::string error;
+    if (!SNESRecomp::zip_store_tree(by_ver->second.root, bytes, &error))
+        return fail(error.empty() ? "could not pack the package" : error);
+
+    uint8_t digest[32];
+    sha256_compute(bytes.data(), bytes.size(), digest);
+    const std::string hex = SNESRecomp::hex32(digest);
+    if (sha256_hex) {
+        if (sha_cap < hex.size() + 1) return fail("digest buffer too small");
+        std::memcpy(sha256_hex, hex.c_str(), hex.size() + 1);
+    }
+
+    uint8_t* blob = (uint8_t*)std::malloc(bytes.size() ? bytes.size() : 1);
+    if (!blob) return fail("out of memory packing the package");
+    std::memcpy(blob, bytes.data(), bytes.size());
+    *out = blob;
+    *out_len = (uint32_t)bytes.size();
+    return 1;
+}
+
+extern "C" void snes_mod_runtime_free_blob_c(uint8_t* blob) {
+    std::free(blob);
+}
+
+extern "C" int snes_mod_runtime_install_blob_c(const uint8_t* data, uint32_t len,
+                                               const char* expect_sha256,
+                                               char* installed_id, uint32_t id_cap,
+                                               char* installed_ver, uint32_t ver_cap,
+                                               char* err, uint32_t err_cap) {
+    auto fail = [&](const std::string& why) {
+        if (err && err_cap) std::snprintf(err, err_cap, "%s", why.c_str());
+        return 0;
+    };
+    if (installed_id && id_cap) installed_id[0] = '\0';
+    if (installed_ver && ver_cap) installed_ver[0] = '\0';
+    if (err && err_cap) err[0] = '\0';
+    if (!data || !len) return fail("nothing was received");
+    if (!expect_sha256 || !*expect_sha256)
+        return fail("refusing to install without a digest to check against");
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return fail("mod runtime is not initialized");
+
+    /* Checked BEFORE the archive is parsed, let alone written anywhere. This
+     * is code from another machine: everything downstream -- the zip reader,
+     * the manifest parser, the extractor -- is being handed bytes chosen by
+     * someone else, and the digest is what says they are the bytes the host
+     * meant to send. */
+    uint8_t digest[32];
+    sha256_compute(data, len, digest);
+    const std::string got = SNESRecomp::hex32(digest);
+    std::string want(expect_sha256);
+    std::transform(want.begin(), want.end(), want.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (got != want)
+        return fail("the package that arrived is not the one the host sent "
+                    "(digest mismatch); nothing was installed");
+
+    const uint64_t nonce = (uint64_t)
+        std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    std::error_code ec;
+    fs::create_directories(runtime.root, ec);
+    /* install_archive() requires the .snesmod extension, and it reads from a
+     * path -- so the verified bytes land in the mod root's own scratch file
+     * rather than a shared temp directory another process could swap. */
+    const fs::path staged =
+        runtime.root / (".incoming-" + std::to_string(nonce) + ".snesmod");
+    {
+        std::ofstream f(staged, std::ios::binary | std::ios::trunc);
+        if (!f) return fail("cannot write the incoming package");
+        f.write((const char*)data, (std::streamsize)len);
+        if (!f) {
+            std::error_code ignored;
+            fs::remove(staged, ignored);
+            return fail("cannot write the incoming package");
+        }
+    }
+
+    std::string id;
+    std::string ver;
+    std::string error;
+    /* A transfer REPLACES an existing copy of the same version.
+     *
+     * install_archive refuses when the destination exists, which is right for
+     * a file a user dropped in -- but wrong for a package the host just sent,
+     * whose bytes have already been checked against the host's digest above.
+     * Without it, a peer holding a stale or incomplete copy at that version
+     * can never repair it: the row reads "installed", so no download is
+     * offered, and the mod stays broken forever. That is precisely how a
+     * package predating its data being moved inside it survives.
+     *
+     * Only reachable after the digest check passed, so a failed or tampered
+     * transfer can never delete a working package. */
+    const bool ok = SNESRecomp::install_archive(runtime, staged, &id, &ver,
+                                                &error, /*replace=*/true);
+    std::error_code ignored;
+    fs::remove(staged, ignored);
+    if (!ok)
+        return fail(error.empty() ? "the package could not be installed" : error);
+
+    /* install_archive publishes the files; it does NOT tell the runtime they
+     * are there. Without this re-scan the package exists on disk and nowhere
+     * else: have_package_c still answers "absent", so the lobby row stays
+     * "not installed", the offer keeps omitting it, and the host's launch gate
+     * stays shut -- a mod that downloaded and installed perfectly looks like
+     * one that never arrived.
+     *
+     * provider_install (the launcher's own install path) does exactly this
+     * afterwards. Two callers of install_archive must not disagree about what
+     * finishing an install means. */
+    if (!SNESRecomp::scan(runtime, &error))
+        return fail(error.empty() ? "installed, but the mod catalog could not "
+                                    "be re-read" : error);
+    /* Selected at the version just installed, matching provider_install: a
+     * package the host requires is one this peer is expected to RUN, not
+     * merely to own. */
+    runtime.selections[id].version = ver;
+    SNESRecomp::refresh_validation();
+
+    if (installed_id && id_cap)
+        std::snprintf(installed_id, id_cap, "%s", id.c_str());
+    if (installed_ver && ver_cap)
+        std::snprintf(installed_ver, ver_cap, "%s", ver.c_str());
+    return 1;
+}
+
+extern "C" int snes_mod_runtime_plan_rows_c(SnesModPkgRow* out, int max) {
+    if (!out || max <= 0) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+    int n = 0;
+    for (const auto& sel_entry : runtime.selections) {
+        if (n >= max) break;
+        const std::string& package_id = sel_entry.first;
+        const SNESRecomp::PackageSelection& selection = sel_entry.second;
+        const SNESRecomp::Package* package =
+            SNESRecomp::selected_package(runtime, package_id.c_str());
+        if (!package) continue;
+
+        std::string feats;
+        for (const SNESRecomp::Feature& feature : package->features) {
+            if (!SNESRecomp::feature_enabled(runtime, *package, feature))
+                continue;
+            /* Presentation-only features are not part of the plan, for the
+             * same reason they are not part of the effective set: this row is
+             * what the lobby server matches a joiner's offer against, so a row
+             * here tells a joiner to go and install something. A filter that
+             * changes only what THIS machine draws is not something to send
+             * anyone shopping for -- and refusing a joiner who lacks it would
+             * reintroduce, at the package grain, exactly the barrier the flag
+             * exists to remove at the feature grain. */
+            if (SNESRecomp::feature_exempt(runtime, *package, feature))
+                continue;
+            if (!feats.empty()) feats += ',';
+            feats += feature.id;
+        }
+        if (feats.empty())
+            continue;           /* package present but contributing nothing */
+
+        SnesModPkgRow row;
+        std::memset(&row, 0, sizeof(row));
+        if (!row_field(row.id, sizeof(row.id), package_id) ||
+            !row_field(row.version, sizeof(row.version), selection.version))
+            continue;           /* see the header: drop, never truncate */
+        row_field(row.name, sizeof(row.name),
+                  package->name.empty() ? package_id : package->name);
+        /* The feature list is a human-readable extra, so a long one is trimmed
+         * rather than costing the player the whole row. */
+        std::snprintf(row.features, sizeof(row.features), "%s", feats.c_str());
+        out[n++] = row;
+    }
+    return n;
+}
+
+extern "C" int snes_mod_runtime_installed_rows_c(SnesModPkgRow* out, int max) {
+    if (!out || max <= 0) return 0;
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    if (!runtime.initialized) return 0;
+    int n = 0;
+    for (const auto& by_id : runtime.packages) {
+        for (const auto& by_version : by_id.second) {
+            if (n >= max) return n;
+            const SNESRecomp::Package& package = by_version.second;
+            SnesModPkgRow row;
+            std::memset(&row, 0, sizeof(row));
+            if (!row_field(row.id, sizeof(row.id), by_id.first) ||
+                !row_field(row.version, sizeof(row.version), by_version.first))
+                continue;
+            row_field(row.name, sizeof(row.name),
+                      package.name.empty() ? by_id.first : package.name);
+            out[n++] = row;
+        }
+    }
+    return n;
+}
+
+extern "C" int snes_mod_runtime_check_set_c(const char* want, char* reason,
+                                            uint32_t cap) {
+    auto say = [&](const std::string& text) {
+        if (reason && cap) std::snprintf(reason, cap, "%s", text.c_str());
+    };
+    if (!want) {
+        say("no set supplied");
+        return SNES_MODSET_OPTION;
+    }
+    std::string mine;
+    {
+        std::vector<char> buf(4096);
+        int need = snes_mod_runtime_effective_set_c(buf.data(),
+                                                    (uint32_t)buf.size());
+        if (need >= (int)buf.size()) {
+            say("local mod set too large to compare");
+            return SNES_MODSET_TOO_BIG;
+        }
+        mine = buf.data();
+    }
+    if (mine == want) {
+        say("");
+        return SNES_MODSET_OK;
+    }
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    std::istringstream in{std::string(want)};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line == "(none)") continue;
+        /* "<package>@<version>/<feature> <opt>=<val> ..." */
+        const std::size_t at = line.find('@');
+        const std::size_t slash = line.find('/', at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || slash == std::string::npos) continue;
+        const std::string pkg_id = line.substr(0, at);
+        const std::string version = line.substr(at + 1, slash - at - 1);
+        std::string rest = line.substr(slash + 1);
+        const std::size_t sp = rest.find(' ');
+        const std::string feature_id =
+            sp == std::string::npos ? rest : rest.substr(0, sp);
+
+        auto pkg_it = runtime.packages.find(pkg_id);
+        if (pkg_it == runtime.packages.end() || pkg_it->second.empty()) {
+            say("missing mod: " + pkg_id);
+            return SNES_MODSET_MISSING;
+        }
+        if (pkg_it->second.find(version) == pkg_it->second.end()) {
+            say(pkg_id + " needs version " + version);
+            return SNES_MODSET_VERSION;
+        }
+        const SNESRecomp::Package& package = pkg_it->second.at(version);
+        if (!SNESRecomp::find_feature(package, feature_id)) {
+            say(pkg_id + " has no feature " + feature_id);
+            return SNES_MODSET_OPTION;
+        }
+        /* Every option the host names must exist here and accept their
+         * value; a value this build rejects is as fatal as a missing package. */
+        std::istringstream toks{sp == std::string::npos ? std::string()
+                                                        : rest.substr(sp + 1)};
+        std::string tok;
+        while (toks >> tok) {
+            const std::size_t eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string opt_id = tok.substr(0, eq);
+            const std::string value = tok.substr(eq + 1);
+            const SNESRecomp::Option* option =
+                SNESRecomp::find_option(package, feature_id, opt_id);
+            if (!option) {
+                say(pkg_id + " has no option " + opt_id);
+                return SNES_MODSET_OPTION;
+            }
+            std::string err;
+            if (!SNESRecomp::validate_option_value(*option, value, &err)) {
+                say(opt_id + "=" + value + " not available here");
+                return SNES_MODSET_OPTION;
+            }
+        }
+    }
+    /* Everything the host asked for exists here and is legal -- so the
+     * difference is what we have SELECTED, which the player can fix. */
+    say("your selection differs; match the host's");
+    return SNES_MODSET_OPTION;
+}
+
+/*
+ * Adopt the host's mod set as our own selection.
+ *
+ * A peer that cannot join because its mods differ is being told to go and
+ * reproduce someone else's configuration by hand, from a log line. This writes
+ * it for them: every feature the host runs is enabled with the host's option
+ * values, and every feature they do NOT run is disabled, because a set is the
+ * whole selection and not just its positive half -- a peer with an extra mod
+ * enabled differs just as surely as one missing a mod.
+ *
+ * Persisted, and deliberately so. Mods activate before the netplay session
+ * exists -- the translation has already patched ROM by the time a handshake
+ * could run -- so this cannot take effect in the current launch, and the
+ * honest contract is "your settings now match the host, start again" rather
+ * than pretending the running match can be repaired.
+ *
+ * Refuses rather than half-applies: if any line names something this build
+ * cannot honour, nothing is written. A partially adopted set is a third
+ * configuration that matches neither side.
+ */
+extern "C" int snes_mod_runtime_adopt_set_c(const char* want, char* reason,
+                                            uint32_t cap) {
+    auto say = [&](const std::string& text) {
+        if (reason && cap) std::snprintf(reason, cap, "%s", text.c_str());
+    };
+    if (!want) {
+        say("no set supplied");
+        return SNES_MODSET_OPTION;
+    }
+    {
+        char why[96];
+        const int check = snes_mod_runtime_check_set_c(want, why, sizeof(why));
+        /* OPTION here means "we could honour it, our selection differs", which
+         * is exactly the case worth adopting. Anything else is a capability we
+         * do not have, and no amount of rewriting selections fixes it. */
+        if (check != SNES_MODSET_OK && check != SNES_MODSET_OPTION) {
+            say(why);
+            return check;
+        }
+        if (check == SNES_MODSET_OK) {
+            say("");
+            return SNES_MODSET_OK;
+        }
+    }
+
+    SNESRecomp::Runtime& runtime = SNESRecomp::state();
+    /* Disable everything first: the host's set is the whole truth.
+     *
+     * Everything the host's set can SPEAK for, that is. A presentation_only
+     * feature is deliberately absent from that set, so sweeping it off here
+     * and waiting for the set to turn it back on would switch it off for good
+     * the moment its owner joined a lobby -- and the first such feature is a
+     * photosensitivity filter, which failing silently and invisibly at the
+     * exact moment a player enters a match is the worst way it could fail.
+     * The host is authoritative over the simulation, not over what this
+     * machine's owner needs to look at. */
+    for (auto& sel : runtime.selections) {
+        const SNESRecomp::Package* package =
+            SNESRecomp::selected_package(runtime, sel.first.c_str());
+        if (!package) continue;
+        for (const SNESRecomp::Feature& feature : package->features) {
+            if (SNESRecomp::feature_exempt(runtime, *package, feature))
+                continue;
+            SNESRecomp::provider_feature_enable(nullptr, sel.first.c_str(),
+                                    feature.id.c_str(), 0);
+        }
+    }
+
+    std::istringstream in{std::string(want)};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line == "(none)") continue;
+        const std::size_t at = line.find('@');
+        const std::size_t slash = line.find('/', at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || slash == std::string::npos) continue;
+        const std::string pkg_id = line.substr(0, at);
+        const std::string version = line.substr(at + 1, slash - at - 1);
+        std::string rest = line.substr(slash + 1);
+        const std::size_t sp = rest.find(' ');
+        const std::string feature_id =
+            sp == std::string::npos ? rest : rest.substr(0, sp);
+
+        /* Pin the version the host names. selected_package() resolves
+         * through this, so an adopted set is version-exact rather than
+         * "whatever we happen to have". */
+        {
+            auto pit = runtime.packages.find(pkg_id);
+            if (pit != runtime.packages.end() &&
+                pit->second.find(version) != pit->second.end())
+                runtime.selections[pkg_id].version = version;
+        }
+        if (!SNESRecomp::provider_feature_enable(nullptr, pkg_id.c_str(),
+                                     feature_id.c_str(), 1)) {
+            say("could not enable " + pkg_id + "/" + feature_id);
+            return SNES_MODSET_OPTION;
+        }
+        std::istringstream toks{sp == std::string::npos ? std::string()
+                                                        : rest.substr(sp + 1)};
+        std::string tok;
+        while (toks >> tok) {
+            const std::size_t eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            if (!SNESRecomp::provider_feature_set_option(
+                    nullptr, pkg_id.c_str(), feature_id.c_str(),
+                    tok.substr(0, eq).c_str(), tok.substr(eq + 1).c_str())) {
+                say("could not set " + tok);
+                return SNES_MODSET_OPTION;
+            }
+        }
+    }
+    /* Persist, or the claim is a lie.
+     *
+     * Everything above mutates the in-memory runtime, and nothing writes it
+     * back on its own -- state.toml is written at commit time and not again.
+     * Without this the peer was told "your settings have been changed to match
+     * the host", restarted, and found them exactly as before. A message that
+     * tells a player the problem is fixed when it is not is worse than no
+     * message.
+     */
+    if (!SNESRecomp::save_state(runtime, &runtime.error)) {
+        say(runtime.error.empty() ? "could not save the adopted settings"
+                                  : runtime.error);
+        return SNES_MODSET_OPTION;
+    }
+    say("");
+    return SNES_MODSET_OK;
 }
 
 extern "C" const RecompLauncherCModProvider*

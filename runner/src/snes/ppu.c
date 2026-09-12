@@ -1,4 +1,6 @@
 #include "ppu.h"
+
+extern unsigned char g_snesrecomp_last_hdmaen;
 #include "ppu_legacy.h"
 
 #include <stdio.h>
@@ -117,6 +119,34 @@ void PpuResetWidescreenOamHistory(Ppu *ppu) {
   memset(ppu->wsOamMotionGrace, 0, sizeof(ppu->wsOamMotionGrace));
 }
 
+void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out) {
+  if (!ppu || !out)
+    return;
+  out->oamAdr = ppu->oamAdr;
+  out->oamInHigh = ppu->oamInHigh ? 1u : 0u;
+  out->oamSecondWrite = ppu->oamSecondWrite ? 1u : 0u;
+  out->oamBuffer = ppu->oamBuffer;
+  out->wsOamMotionLastLine = ppu->wsOamMotionLastLine;
+  memcpy(out->wsOamMotionX, ppu->wsOamMotionX, sizeof(out->wsOamMotionX));
+  memcpy(out->wsOamMotionSig, ppu->wsOamMotionSig, sizeof(out->wsOamMotionSig));
+  memcpy(out->wsOamMotionSeen, ppu->wsOamMotionSeen, sizeof(out->wsOamMotionSeen));
+  memcpy(out->wsOamMotionGrace, ppu->wsOamMotionGrace, sizeof(out->wsOamMotionGrace));
+}
+
+void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in) {
+  if (!ppu || !in)
+    return;
+  ppu->oamAdr = in->oamAdr;
+  ppu->oamInHigh = in->oamInHigh != 0u;
+  ppu->oamSecondWrite = in->oamSecondWrite != 0u;
+  ppu->oamBuffer = in->oamBuffer;
+  ppu->wsOamMotionLastLine = in->wsOamMotionLastLine;
+  memcpy(ppu->wsOamMotionX, in->wsOamMotionX, sizeof(in->wsOamMotionX));
+  memcpy(ppu->wsOamMotionSig, in->wsOamMotionSig, sizeof(in->wsOamMotionSig));
+  memcpy(ppu->wsOamMotionSeen, in->wsOamMotionSeen, sizeof(in->wsOamMotionSeen));
+  memcpy(ppu->wsOamMotionGrace, in->wsOamMotionGrace, sizeof(in->wsOamMotionGrace));
+}
+
 // Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
 // (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
 // never affects guest state. Unset/0xff = all layers (normal).
@@ -218,6 +248,14 @@ static inline void PpuResetLayerPolicies(Ppu *ppu) {
   memset(ppu->wsAnchorRightStart, 0, sizeof(ppu->wsAnchorRightStart));
   memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
   memset(ppu->wsMarginGapR, 0, sizeof(ppu->wsMarginGapR));
+  memset(ppu->wsWorldY0, 0, sizeof(ppu->wsWorldY0));
+  memset(ppu->wsWorldY1, 0, sizeof(ppu->wsWorldY1));
+  memset(ppu->wsWorldLeft, 0, sizeof(ppu->wsWorldLeft));
+  memset(ppu->wsWorldRight, 0, sizeof(ppu->wsWorldRight));
+  memset(ppu->wsElasticY0, 0, sizeof(ppu->wsElasticY0));
+  memset(ppu->wsElasticY1, 0, sizeof(ppu->wsElasticY1));
+  memset(ppu->wsElasticNSeg, 0, sizeof(ppu->wsElasticNSeg));
+  memset(ppu->wsElasticSeg, 0, sizeof(ppu->wsElasticSeg));
   memset(ppu->wsViewportInsetL, 0, sizeof(ppu->wsViewportInsetL));
   memset(ppu->wsViewportInsetR, 0, sizeof(ppu->wsViewportInsetR));
   ppu->wsWindowExpandLayers = 0;
@@ -442,6 +480,129 @@ void PpuSetWidescreenLayerViewportInset(Ppu *ppu, uint8_t layer,
   }
 }
 
+void PpuSetWidescreenLayerWorldMirrorBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                          uint8_t y1, uint16_t world_left_px,
+                                          uint16_t world_right_px) {
+  PpuSetWidescreenLayerWorldMirrorBandSlot(ppu, 0, layer, y0, y1,
+                                           world_left_px, world_right_px);
+}
+
+void PpuSetWidescreenLayerWorldMirrorBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px) {
+  // See ppu.h. An empty band or an empty/inverted world span disables the
+  // slot outright rather than leaving half-configured state behind.
+  if (slot >= kPpuWsWorldBands || layer >= 4)
+    return;
+  if (y1 <= y0 || world_right_px <= world_left_px) {
+    y0 = y1 = 0;
+    world_left_px = world_right_px = 0;
+  }
+  ppu->wsWorldY0[slot][layer] = y0;
+  ppu->wsWorldY1[slot][layer] = y1;
+  ppu->wsWorldLeft[slot][layer] = world_left_px;
+  ppu->wsWorldRight[slot][layer] = world_right_px;
+}
+
+static void PpuClearElasticBandSlot(Ppu *ppu, uint8_t slot, uint8_t layer) {
+  ppu->wsElasticY0[slot][layer] = 0;
+  ppu->wsElasticY1[slot][layer] = 0;
+  ppu->wsElasticNSeg[slot][layer] = 0;
+  memset(ppu->wsElasticSeg[slot][layer], 0,
+         sizeof(ppu->wsElasticSeg[slot][layer]));
+}
+
+void PpuSetWidescreenLayerElasticBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                      uint8_t y1,
+                                      const PpuWsElasticSeg *segs,
+                                      uint8_t nseg) {
+  PpuSetWidescreenLayerElasticBandSlot(ppu, 0, layer, y0, y1, segs, nseg);
+}
+
+void PpuSetWidescreenLayerElasticBandSlot(Ppu *ppu, uint8_t slot,
+                                          uint8_t layer, uint8_t y0,
+                                          uint8_t y1,
+                                          const PpuWsElasticSeg *segs,
+                                          uint8_t nseg) {
+  // See ppu.h. A band that fails validation is cleared outright rather than
+  // left half-applied: a partly-installed remap would tear the very glyphs
+  // this policy exists to protect.
+  if (slot >= kPpuWsElasticBands || layer >= 4)
+    return;
+  if (!segs || nseg == 0 || nseg > kPpuWsElasticSegs || y1 <= y0) {
+    PpuClearElasticBandSlot(ppu, slot, layer);
+    return;
+  }
+  int prev_dst_end = -0x8000;
+  for (uint8_t i = 0; i < nseg; i++) {
+    const PpuWsElasticSeg *s = &segs[i];
+    if (s->srcX1 <= s->srcX0 || s->dstX1 <= s->dstX0 || s->srcX0 < 0 ||
+        s->srcX1 > kPpuXPixels || s->dstX0 < prev_dst_end) {
+      PpuClearElasticBandSlot(ppu, slot, layer);
+      return;
+    }
+    prev_dst_end = s->dstX1;
+  }
+  ppu->wsElasticY0[slot][layer] = y0;
+  ppu->wsElasticY1[slot][layer] = y1;
+  ppu->wsElasticNSeg[slot][layer] = nseg;
+  memset(ppu->wsElasticSeg[slot][layer], 0,
+         sizeof(ppu->wsElasticSeg[slot][layer]));
+  memcpy(ppu->wsElasticSeg[slot][layer], segs,
+         (size_t)nseg * sizeof(PpuWsElasticSeg));
+}
+
+bool PpuSetWidescreenLayerElasticSplitBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t left_elastic_x0, uint16_t left_elastic_x1,
+    uint16_t right_elastic_x0, uint16_t right_elastic_x1) {
+  if (slot >= kPpuWsElasticBands || layer >= 4)
+    return false;
+  const int lx0 = left_elastic_x0, lx1 = left_elastic_x1;
+  const int rx0 = right_elastic_x0, rx1 = right_elastic_x1;
+  PpuWsElasticSeg segs[kPpuWsElasticSegs];
+  uint8_t n = 0;
+  if (lx1 <= lx0 && rx1 <= rx0) {
+    // No stretchable material named: the band becomes an identity remap, i.e.
+    // the layer renders its authentic 256 columns and contributes nothing to
+    // the margins. This is what a transitional scanline wants.
+    segs[n].srcX0 = 0; segs[n].srcX1 = kPpuXPixels;
+    segs[n].dstX0 = 0; segs[n].dstX1 = kPpuXPixels;
+    n++;
+  } else {
+    if (!(lx0 >= 0 && lx0 < lx1 && lx1 <= rx0 && rx0 < rx1 &&
+          rx1 <= kPpuXPixels)) {
+      PpuClearElasticBandSlot(ppu, slot, layer);
+      return false;
+    }
+    const int L = ppu->extraLeftCur, R = ppu->extraRightCur;
+    if (lx0 > 0) {
+      segs[n].srcX0 = 0;   segs[n].srcX1 = (int16_t)lx0;
+      segs[n].dstX0 = (int16_t)(-L); segs[n].dstX1 = (int16_t)(lx0 - L);
+      n++;
+    }
+    segs[n].srcX0 = (int16_t)lx0; segs[n].srcX1 = (int16_t)lx1;
+    segs[n].dstX0 = (int16_t)(lx0 - L); segs[n].dstX1 = (int16_t)lx1;
+    n++;
+    if (rx0 > lx1) {
+      segs[n].srcX0 = (int16_t)lx1; segs[n].srcX1 = (int16_t)rx0;
+      segs[n].dstX0 = (int16_t)lx1; segs[n].dstX1 = (int16_t)rx0;
+      n++;
+    }
+    segs[n].srcX0 = (int16_t)rx0; segs[n].srcX1 = (int16_t)rx1;
+    segs[n].dstX0 = (int16_t)rx0; segs[n].dstX1 = (int16_t)(rx1 + R);
+    n++;
+    if (rx1 < kPpuXPixels) {
+      segs[n].srcX0 = (int16_t)rx1; segs[n].srcX1 = kPpuXPixels;
+      segs[n].dstX0 = (int16_t)(rx1 + R);
+      segs[n].dstX1 = (int16_t)(kPpuXPixels + R);
+      n++;
+    }
+  }
+  PpuSetWidescreenLayerElasticBandSlot(ppu, slot, layer, y0, y1, segs, n);
+  return ppu->wsElasticNSeg[slot][layer] == n;
+}
+
 bool ppu_checkOverscan(Ppu* ppu) {
   // called at (0,225)
   ppu->frameOverscan = PPU_overscan(ppu); // set if we have a overscan-frame
@@ -523,6 +684,20 @@ void ppu_runLine(Ppu* ppu, int line) {
     debug_server_on_oam_render();
   }
   PpuUpdateWidescreenOamHistory(ppu, line);
+  /* Snapshot the OAM the scanline renderer is about to consume, once per
+   * frame, on whichever line the host actually starts with.
+   *
+   * This used to sit inside the line == 0 block, which silently disabled it
+   * for every frame-model host: those render the visible field as lines
+   * 1..224 and never pass line 0 at all. The ring therefore stayed empty
+   * forever and oam_render_get answered {"count":0,"snaps":[]} -- "no
+   * sprites recorded" -- for a screen full of sprites. An instrument that
+   * reports nothing is indistinguishable from a subsystem that did nothing,
+   * which is the most expensive way for a probe to fail. */
+  if (s_oam_snap_frame != snes_frame_counter) {
+    s_oam_snap_frame = snes_frame_counter;
+    debug_server_on_oam_render();
+  }
   if(line == 0) {
     if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
       int mod = PPU_mosaicSize(ppu);
@@ -708,6 +883,11 @@ static void PpuWindowsSplit(PpuWindows *win, int16 *bias, int xpos) {
 static bool PpuApplyLayerAnchorBand(Ppu *ppu, uint layer, uint y,
                                     PpuWindows *win, int16 *bias) {
   if (win->nr != 1 || win->bits != 0)
+    return false;
+  // An elastic band already carries the anchoring in its rigid segments, and
+  // it remaps the merge rather than the draw. Letting both act on one line
+  // would shift the source twice.
+  if (PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y) >= 0)
     return false;
   int left_end = 0;
   int right_start = 0;
@@ -1473,6 +1653,79 @@ static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   }
 }
 
+// Merge one isolated layer into the live priority buffer, reflecting columns
+// that fall outside the layer's AUTHORED WORLD back inside it. Unlike
+// PpuMergePaddedBackground this keeps every column the tilemap really
+// authors -- including margin columns -- and only synthesizes where the world
+// runs out. See PpuSetWidescreenLayerWorldMirrorBand.
+static void PpuMergeWorldMirroredBackground(Ppu *ppu,
+                                            PpuPixelPrioBufs *dstbuf,
+                                            const PpuPixelPrioBufs *layerbuf,
+                                            int world_left, int world_right,
+                                            int hscroll) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  const int left_extra = ppu->extraLeftCur;
+  const int right_extra = ppu->extraRightCur;
+  // Screen x of the authored world's left edge, and of the first column past
+  // its right edge, for the scroll THIS line rendered with (P1).
+  const int a = world_left - hscroll;
+  const int b = world_right - hscroll;
+  for (int x = -left_extra; x < kPpuXPixels + right_extra; x++) {
+    int sx = x;
+    if (x < a)
+      sx = 2 * a - 1 - x;
+    else if (x >= b)
+      sx = 2 * b - 1 - x;
+    if (sx < a || sx >= b)
+      continue;  // the reflection lands outside the world as well
+    if (sx < -left_extra || sx >= kPpuXPixels + right_extra)
+      continue;  // that source column was never rendered this line
+    int di = x + kPpuExtraLeftRight, si = sx + kPpuExtraLeftRight;
+    if (src[si] > dst[di])
+      dst[di] = src[si];
+  }
+}
+
+// Merge one isolated layer into the live priority buffer through an elastic
+// anchor band's piecewise horizontal map: rigid segments copy 1:1 at their
+// shifted destination, elastic segments resample nearest-neighbour so the
+// margin is absorbed by stretchable material only. Only source columns
+// [0,256) -- the picture the game authored -- are ever sampled. Destination
+// columns no segment covers are left alone, so a band can express a clamp.
+// See PpuSetWidescreenLayerElasticBand.
+static void PpuMergeElasticBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                      const PpuPixelPrioBufs *layerbuf,
+                                      const PpuWsElasticSeg *segs, int nseg) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  const int xlo = -ppu->extraLeftCur;
+  const int xhi = kPpuXPixels + ppu->extraRightCur;
+  for (int i = 0; i < nseg; i++) {
+    const int src0 = segs[i].srcX0, dst0 = segs[i].dstX0;
+    const int sw = segs[i].srcX1 - src0, dw = segs[i].dstX1 - dst0;
+    if (sw <= 0 || dw <= 0)
+      continue;
+    int d0 = dst0 < xlo ? xlo : dst0;
+    int d1 = segs[i].dstX1 > xhi ? xhi : segs[i].dstX1;
+    for (int x = d0; x < d1; x++) {
+      // Nearest neighbour about each destination pixel's CENTRE:
+      // floor(((o + 1/2) * sw) / dw) in integer arithmetic. x >= dst0, so
+      // every operand is non-negative and the division is a plain floor --
+      // deterministic, no rounding mode, identical on every host. Centre
+      // sampling (rather than the cheaper floor(o*sw/dw)) is what makes the
+      // map symmetric under reflection, so a mirror-image pair of gauges
+      // stretches to the same length; it is still exactly 1:1 when sw == dw.
+      int sx = src0 + ((2 * (x - dst0) + 1) * sw) / (2 * dw);
+      if (sx < 0 || sx >= kPpuXPixels)
+        continue;
+      int di = x + kPpuExtraLeftRight, si = sx + kPpuExtraLeftRight;
+      if (src[si] > dst[di])
+        dst[di] = src[si];
+    }
+  }
+}
+
 static void PpuMergeStretchedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                         const PpuPixelPrioBufs *layerbuf) {
   PpuZbufType *dst = dstbuf->data;
@@ -1500,7 +1753,10 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
   bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
   bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
-  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band) {
+  int world_band = PpuWidescreenLayerWorldBandAt(ppu, layer, (int)y);
+  int elastic_band = PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y);
+  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band &&
+      world_band < 0 && elastic_band < 0) {
     if (PPU_bigTiles(ppu, layer))
       PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 4, zhi, zlo, mosaic);
     else if (mosaic)
@@ -1520,7 +1776,21 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
-  if (stretch_band) {
+  if (elastic_band >= 0) {
+    // The most specific per-line statement wins: an elastic band describes
+    // this exact scanline's own horizontal layout, where a world band
+    // describes a scrolling plane whose scroll this line does not share.
+    PpuMergeElasticBackground(ppu, dstbuf, &layerbuf,
+                              ppu->wsElasticSeg[elastic_band][layer],
+                              ppu->wsElasticNSeg[elastic_band][layer]);
+  } else if (world_band >= 0) {
+    // A live world band implies the layer widens on this line, so no clamp,
+    // mirror, repeat or stretch policy can be in force at the same time.
+    PpuMergeWorldMirroredBackground(ppu, dstbuf, &layerbuf,
+                                    ppu->wsWorldLeft[world_band][layer],
+                                    ppu->wsWorldRight[world_band][layer],
+                                    ppu->hScroll[layer]);
+  } else if (stretch_band) {
     PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
   } else {
     PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
@@ -1541,7 +1811,10 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
   bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
   bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
-  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band) {
+  int world_band = PpuWidescreenLayerWorldBandAt(ppu, layer, (int)y);
+  int elastic_band = PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y);
+  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band &&
+      world_band < 0 && elastic_band < 0) {
     if (PPU_bigTiles(ppu, layer))
       PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 2, zhi, zlo, mosaic);
     else if (mosaic)
@@ -1559,7 +1832,21 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     PpuDrawBackground_2bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_2bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
-  if (stretch_band) {
+  if (elastic_band >= 0) {
+    // The most specific per-line statement wins: an elastic band describes
+    // this exact scanline's own horizontal layout, where a world band
+    // describes a scrolling plane whose scroll this line does not share.
+    PpuMergeElasticBackground(ppu, dstbuf, &layerbuf,
+                              ppu->wsElasticSeg[elastic_band][layer],
+                              ppu->wsElasticNSeg[elastic_band][layer]);
+  } else if (world_band >= 0) {
+    // A live world band implies the layer widens on this line, so no clamp,
+    // mirror, repeat or stretch policy can be in force at the same time.
+    PpuMergeWorldMirroredBackground(ppu, dstbuf, &layerbuf,
+                                    ppu->wsWorldLeft[world_band][layer],
+                                    ppu->wsWorldRight[world_band][layer],
+                                    ppu->hScroll[layer]);
+  } else if (stretch_band) {
     PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
   } else {
     PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
@@ -2471,6 +2758,8 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  * Registers journaled: the set the split handlers write. Data ports (VRAM/
  * CGRAM/OAM) are deliberately excluded — those are uploads, not per-line
  * display state, and replaying them would double-apply the data. */
+int g_ppu_scanout_latch_bypass = 0;
+
 #define PPU_RASTER_MAX 256
 typedef struct { uint8_t line; uint16_t reg; uint8_t val; } PpuRasterEntry;
 static PpuRasterEntry s_raster[PPU_RASTER_MAX];

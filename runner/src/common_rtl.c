@@ -16,7 +16,10 @@
 #include "config.h"
 #include "snes/snes.h"
 #include "snes/apu.h"
+#include "snes/joypad.h"
+#include "snes/dsp.h"
 #include "snes/cart.h"
+#include "snes/dma.h"
 #include "snes/cx4.h"
 #include "snes/sa1.h"
 #include "snes/msu1.h"
@@ -32,9 +35,14 @@
 #include "ppu_dma_trace.h"
 #include "host_report.h"
 #include "cosim.h"
+#include "snes_runahead.h"
 #if defined(SNESRECOMP_NET)
 #include "snes_netplay.h"
 #endif
+
+/* See RtlSetSpeculativeFrame in common_rtl.h. Run-ahead drives this on every
+ * build, netplay or not, so it must not sit behind the netplay guard. */
+static bool g_rtl_speculative_frame;
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -103,10 +111,32 @@ int rtl_apu_port_observers_filter(uint16 reg, uint8 value) {
   return consumed;
 }
 
+#include "snes/interp_bridge.h"
+#ifdef SNESRECOMP_NET_ROLLBACK
+#include "netplay/snes_rb_probe.h"
+#endif
+
 /* Netplay suppresses the pre-frame wall-clock fallback below. Once frames
  * begin, every runner uses the same guest-frame/APU coupling, and the audio
  * callback only consumes samples without advancing emulation. */
 static int rtl_netplay_locks_audio(void) {
+#if defined(SNESRECOMP_NET_ROLLBACK)
+  /* An armed rollback probe is held to the same rule: see snes_rb_probe.c. */
+  if (snes_rb_probe_armed())
+    return 1;
+#endif
+  /* Run-ahead is held to it too, and for the identical reason: it rewinds.
+   * The fallback below charges the SPC by WALL-CLOCK elapsed time, and
+   * run-ahead spends roughly twice the wall time per displayed frame because
+   * it simulates every frame twice. That made the SPC run at ~2x guest tempo
+   * -- measured on the attract sequence, which is music-cued and reached the
+   * title screen hundreds of frames early with run-ahead 1. Host time folded
+   * into guest state cannot survive a rewind; once the frame loop is running
+   * rtl_sync_apu_frame_boundary() is the authoritative clock and is keyed on
+   * snes_frame_counter, so suppressing this costs nothing but the no-consumer
+   * boot-window baseline. */
+  if (snes_runahead_active())
+    return 1;
 #if defined(SNESRECOMP_NET)
   return snes_netplay_active();
 #else
@@ -273,9 +303,15 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  * v6: beamMasterLast removed from the snes_saveload region (host-only
  *     timing anchor). v5 files still load via an 8-byte compat skip.
  * v7: manual joypad latch/shift state appended after the existing SNES blob.
- *     Older files initialize that transient serial state to idle. */
-#define RTL_SAV_VERSION 7u
-#define RTL_SAV_VERSION_MIN 4u
+ *     Older files initialize that transient serial state to idle.
+ * v8: multitap chunk (seats, IOBit lines, per-bank shift counters, latched
+ *     automatic-read words). Older files load with no multitap configured,
+ *     which is the pre-multitap two-pad machine exactly. */
+#define RTL_SAV_VERSION 8u
+/* 4 and 5 described a Snes tail layout this struct no longer has; see
+ * snes_saveload(). Loading one would mis-map the interrupt fields, so
+ * they are rejected by the header check instead. */
+#define RTL_SAV_VERSION_MIN 6u
 
 typedef struct FileSli {
   SaveLoadInfo base;
@@ -323,7 +359,14 @@ static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
   memory->position += n;
 }
 
-void RtlReset(int mode) {
+/* Host-side state that paces the guest but is not part of it.
+ *
+ * Shared by the two ways into a fresh machine -- RtlReset (soft reset) and
+ * SnesInit (cold boot / rematch). Kept in one place because they diverged:
+ * SnesInit reset the guest and left these alone, so a rematch started with the
+ * previous session's frame counter and APU anchors and booted to a different
+ * state than a first run. */
+void rtl_reset_host_pacing(void) {
   snes_frame_counter = 0;
   g_apu_frame_time_valid = false;
   g_apu_frame_clock = (RtlApuFrameClock){0};
@@ -336,6 +379,27 @@ void RtlReset(int mode) {
   // catch-up sees a zero delta rather than the whole run's accumulated cycles.
   g_apu_last_sync_master = g_cpu.master_cycles;
   snes_mod_audio_stop_all();
+
+  /* The DRAM refresh tax carries a SUB-SCANLINE remainder across frames, and
+   * that remainder decides where the next refresh boundary falls -- so it
+   * decides how many cycles the first block after a boot is charged.
+   *
+   * It is a static in the runtime, not part of the Snes, so it survived
+   * re-creating the machine. A rematch therefore began mid-refresh-line at
+   * whatever phase the previous session happened to stop on: the first frame
+   * was charged a different number of cycles than on a first boot, the APU
+   * catch-up residual came out different (measured: 0.804 vs 0.752), and tick
+   * 0 hashed to a different WRAM and APU state. Two peers that had stopped at
+   * different phases could not agree on a boot they had both just performed.
+   *
+   * Anchored to now and zeroed, which is the state a first boot starts from.
+   * This same carry has bitten before: it was the rollback replay divergence
+   * that had to be found by diffing .data and .bss. */
+  snes_refresh_state_set(0u, g_cpu.master_cycles);
+}
+
+void RtlReset(int mode) {
+  rtl_reset_host_pacing();
   snes_reset(g_snes, true);
   g_snes->beamMasterLast = g_cpu.master_cycles;
   SnesEnterNativeMode();
@@ -518,6 +582,69 @@ static void recomp_dspout_capture(void) {
     prev_write = w;
 }
 
+/* ── Multiplayer seats ───────────────────────────────────────────────────
+ * See common_rtl.h. The device model lives in snes/joypad.c; this is the
+ * host-facing surface plus the launch-time environment override.
+ */
+
+/* Opposing directions cannot be held on a real d-pad, and guest code is
+ * entitled to assume it. RtlRunFrame has always filtered seats 0 and 1;
+ * every other seat gets the same treatment. */
+static uint16 rtl_filter_dpad(uint16 buttons) {
+  if ((buttons & 0x30u) == 0x30u) buttons ^= 0x30u;   /* up + down */
+  if ((buttons & 0xc0u) == 0xc0u) buttons ^= 0xc0u;   /* left + right */
+  return (uint16)(buttons & 0x0fffu);
+}
+
+void RtlSetPadState(int slot, uint16 buttons) {
+  buttons = rtl_filter_dpad(buttons);
+  joypad_set_pad(slot, buttons);
+  /* Seats 0 and 1 also live in the two fields the rest of the runtime reads
+   * directly, so a game may drive them through either door. */
+  if (g_snes && slot == 0) g_snes->input1_currentState = buttons;
+  if (g_snes && slot == 1) g_snes->input2_currentState = buttons;
+}
+
+uint16 RtlGetPadState(int slot) { return joypad_get_pad(slot); }
+void RtlSetPadConnected(int slot, int connected) {
+  joypad_set_connected(slot, connected);
+}
+int RtlGetPadConnected(int slot) { return joypad_get_connected(slot); }
+void RtlSetMultitap(int port, int enabled) {
+  joypad_set_multitap(port, enabled);
+}
+int RtlGetMultitap(int port) { return joypad_get_multitap(port); }
+int RtlPlayerCount(void) { return joypad_player_count(); }
+
+/* SNES_MULTITAP=port1|port2|both|off. Applied once, before the first frame,
+ * so a launcher or a soak script can turn a tap on without a rebuild. It
+ * overrides whatever the game asked for — an explicit launch flag outranks a
+ * built-in default. */
+static void RtlApplyMultitapEnv(void) {
+  static int applied = 0;
+  const char *v;
+  if (applied) return;
+  applied = 1;
+  v = getenv("SNES_MULTITAP");
+  if (!v || !v[0]) return;
+  if (!strcmp(v, "off") || !strcmp(v, "none") || !strcmp(v, "0")) {
+    RtlSetMultitap(0, 0); RtlSetMultitap(1, 0);
+  } else if (!strcmp(v, "port1") || !strcmp(v, "1")) {
+    RtlSetMultitap(0, 1); RtlSetMultitap(1, 0);
+  } else if (!strcmp(v, "port2") || !strcmp(v, "2")) {
+    RtlSetMultitap(0, 0); RtlSetMultitap(1, 1);
+  } else if (!strcmp(v, "both") || !strcmp(v, "8")) {
+    RtlSetMultitap(0, 1); RtlSetMultitap(1, 1);
+  } else {
+    fprintf(stderr,
+            "SNES_MULTITAP=%s not understood "
+            "(expected port1, port2, both, or off) — ignoring\n", v);
+    return;
+  }
+  fprintf(stderr, "snesrecomp: multitap port1=%d port2=%d (%d seats)\n",
+          RtlGetMultitap(0), RtlGetMultitap(1), RtlPlayerCount());
+}
+
 bool RtlRunFrame(uint32 inputs) {
 #ifdef SNES_COSIM
   /* Co-sim (dev/diagnostics only): connect the coordinator once, before the
@@ -541,8 +668,14 @@ bool RtlRunFrame(uint32 inputs) {
   if ((inputs & 0x30000) == 0x30000) inputs ^= 0x30000;
   if ((inputs & 0xc0000) == 0xc0000) inputs ^= 0xc0000;
 
+  RtlApplyMultitapEnv();
+
   g_snes->input1_currentState = inputs & 0xfff;
   g_snes->input2_currentState = (inputs >> 12) & 0xfff;
+  /* Seats 0 and 1 stay owned by the packed word; seats 2..7, when a multitap
+   * is configured, keep whatever RtlSetPadState last put there. */
+  joypad_set_pad(0, (uint16)(inputs & 0xfff));
+  joypad_set_pad(1, (uint16)((inputs >> 12) & 0xfff));
 
   /* Establish the guest timestamp origin before any frame code can touch an
    * APU port. Host turbo changes how quickly frames arrive, not their guest
@@ -633,7 +766,10 @@ bool RtlRunFrame(uint32 inputs) {
   rtl_sync_apu_frame_boundary();
 
 #if SNESRECOMP_ENABLE_MODS
-  snes_mod_runtime_frame_tick_c();
+  /* Not on a speculative frame: the player never sees it, so a mod counting
+   * frames must not count it. See RtlSetSpeculativeFrame in common_rtl.h. */
+  if (!g_rtl_speculative_frame)
+    snes_mod_runtime_frame_tick_c();
 #endif
 
 #ifdef SNES_COSIM
@@ -659,6 +795,12 @@ bool RtlRunFrame(uint32 inputs) {
       s_last_sec = now;
     }
   }
+
+#ifdef SNESRECOMP_NET_ROLLBACK
+  /* Offline rollback self-check. No-op unless SNESRECOMP_RB_PROBE is set;
+   * see snes_rb_probe.c for why the runner needs one at all. */
+  snes_rb_probe_after_frame(inputs);
+#endif
 
   return false;
 }
@@ -775,6 +917,256 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
   return true;
+}
+
+/* ── Rollback snapshots ──────────────────────────────────────────────────
+ * See common_rtl.h for why the guest blob alone is not a rollback snapshot.
+ */
+
+#define RTL_RB_RESIDUE_MAGIC 0x53524252u /* 'RBRS' */
+#define RTL_RB_RESIDUE_VERSION 6u
+
+typedef struct RtlRollbackResidue {
+  uint32 magic;
+  uint32 version;
+  CpuState cpu;              /* ram pointer is preserved, not restored */
+  ApuPortSched apu_port;
+  uint64_t beam_master_last;
+  uint64_t apu_pace_cycles_estimate;
+  uint64_t apu_last_sync_cycles;
+  uint64_t apu_last_sync_master;
+  uint64_t apu_frame_start_master;
+  uint64_t main_cpu_cycles_estimate;
+  int      frame_counter;
+  uint8    apu_frame_time_valid;
+  uint8    pad[3];
+  /* v2: the interpreter bridge's cross-frame execution state. See
+   * interp_bridge.h — without it a replayed frame burns a different number of
+   * master cycles than the frame it replaces. */
+  uint8    interp[1024];   /* sized against interp_bridge_rb_state_size() */
+  /* v3: guest hardware state that lives in host globals rather than in the
+   * Snes struct, so snes_saveload never carried it.
+   *   memsel        $420D FastROM select. bridge_region_speed charges 6 vs 8
+   *                 master clocks per bus access in banks $80-FF off this one
+   *                 bit, so a rewind that left it on the discarded timeline
+   *                 re-ran the identical code for a different number of
+   *                 cycles — which is exactly the observed divergence: hPos,
+   *                 apuCatchupCycles and autoJoyTimer move while guest memory
+   *                 stays byte-identical.
+   *   last_hdmaen   $420C shadow the raster journal reads.
+   *   interp_apu_driving  suppresses the per-touch APU catch-up.
+   * cosim_state.c already hashes g_memsel as guest state; the rollback path
+   * simply never did. */
+  uint8    memsel;
+  uint8    last_hdmaen;
+  uint8    interp_apu_driving;
+  uint8    pad_v3;
+  /* v4: the DRAM refresh tax's carry. See snes_refresh_state_get. */
+  uint64_t refresh_phase;
+  uint64_t refresh_charged_upto;
+  /* v5: Dma.hdmaPendingInit -- the set of channels the CPU switched on this
+   * frame that still owe their one-slot HDMA table initialization.
+   *
+   * It sits outside dma_saveload's range on purpose (see dma.h), which is
+   * correct for a savestate and wrong for a rollback: a rollback snapshot is
+   * taken BETWEEN the CPU half of a frame (RtlRunFrame) and the render half
+   * that runs dma_doHdma (draw_ppu_frame), so the mask is live across exactly
+   * the boundary run-ahead rewinds over. Left out, run-ahead's speculative
+   * frame consumed the pending bits, the restore did not put them back, and
+   * the real frame's dma_doHdma then skipped the table init for every channel
+   * the CPU had just enabled -- wrong tableAdr/repCount/doTransfer for the
+   * rest of the frame, i.e. a corrupted raster split. Measured on Gundam
+   * Wing's pre-fight screen, the one dma_doHdma's own comment cites. */
+  uint8    hdma_pending_init;
+  uint8    pad_v5[7];
+  /* v6: the PPU's within-frame state -- the OAM write port (oamAdr,
+   * oamInHigh, oamSecondWrite, oamBuffer) and the widescreen OBJ motion
+   * classifier. Same shape of bug as hdma_pending_init above and found the
+   * same way: ppu_saveload's window stops at cgwsel, which is right for a
+   * frame-boundary savestate (ppu_handleVblank reloads the OAM port from
+   * oamaddl/oamaddh) and wrong for a mid-frame rollback. See ppu.h. */
+  PpuRollbackResidue ppu_rb;
+} RtlRollbackResidue;
+
+size_t RtlRollbackSnapshotBound(void) {
+  /* Guest blob upper bound + residue. The guest blob is WRAM (128 KiB) +
+   * APU RAM (64 KiB) + DSP (incl. the 32 KiB output ring) + PPU VRAM/CGRAM/OAM
+   * (~64 KiB) + cart SRAM and coprocessor RAM; 1 MiB clears all of it with
+   * room for a game's state_save_extra chunk. */
+  return (1u << 20) + sizeof(RtlRollbackResidue);
+}
+
+/* ── resync hooks ─────────────────────────────────────────────────────────
+ * Each group of host state that a rollback restore must put back is owned by
+ * a named pair, in the file that owns the state. psxrecomp does the same with
+ * its *_resync_after_restore() family; the point is that a subsystem author
+ * has an obvious place to look, and the roll-call below reads as a list of
+ * subsystems rather than a pile of field assignments. */
+
+/* APU pacing: how much guest time the SPC has been credited. Host accounting,
+ * so snes_saveload never carried it, but the guest polls APU ports and
+ * branches on what it reads. */
+static void rtl_apu_pace_resync_get(uint64_t *pace, uint64_t *last_sync,
+                                    uint64_t *last_master, uint64_t *frame_start,
+                                    uint64_t *main_cycles, uint8 *time_valid) {
+  *pace = g_apu_pace_cycles_estimate;
+  *last_sync = g_apu_last_sync_cycles;
+  *last_master = g_apu_last_sync_master;
+  *frame_start = g_apu_frame_start_master;
+  *main_cycles = g_main_cpu_cycles_estimate;
+  *time_valid = g_apu_frame_time_valid ? 1u : 0u;
+}
+
+static void rtl_apu_pace_resync_set(uint64_t pace, uint64_t last_sync,
+                                    uint64_t last_master, uint64_t frame_start,
+                                    uint64_t main_cycles, uint8 time_valid) {
+  g_apu_pace_cycles_estimate = pace;
+  g_apu_last_sync_cycles = last_sync;
+  g_apu_last_sync_master = last_master;
+  g_apu_frame_start_master = frame_start;
+  g_main_cpu_cycles_estimate = main_cycles;
+  g_apu_frame_time_valid = time_valid != 0;
+}
+
+/* MMIO shadows: guest hardware state that happens to live in host globals
+ * rather than in the Snes struct, which is exactly why snes_saveload missed
+ * it. g_memsel ($420D FastROM) decides 6 vs 8 master clocks per bus access in
+ * banks $80-FF, so losing it re-runs identical code for a different number of
+ * cycles. cosim_state.c already hashes it as guest state. */
+static void rtl_mmio_shadow_resync_get(uint8 *memsel, uint8 *hdmaen,
+                                       uint8 *apu_driving) {
+  *memsel = g_memsel;
+  *hdmaen = g_snesrecomp_last_hdmaen;
+  *apu_driving = (uint8)(g_interp_apu_driving ? 1 : 0);
+}
+
+static void rtl_mmio_shadow_resync_set(uint8 memsel, uint8 hdmaen,
+                                       uint8 apu_driving) {
+  g_memsel = memsel;
+  g_snesrecomp_last_hdmaen = hdmaen;
+  g_interp_apu_driving = apu_driving ? 1 : 0;
+}
+
+/*
+ * THE CONTRACT. Everything a replayed frame reads must be restored here, or
+ * the replay burns different cycles than the frame it replaces and the peers
+ * fork. Guest memory is NOT the boundary: the defect that cost the most in
+ * this port was s_refresh_phase, a sub-scanline remainder in the DRAM refresh
+ * tax, with WRAM byte-identical throughout.
+ *
+ * Adding host state to the frame path? Add it to a resync pair above (or to
+ * the owning subsystem's header, as interp_bridge and common_cpu_infra do),
+ * then to BOTH functions below, then bump RTL_RB_RESIDUE_VERSION. The
+ * _Static_assert on sizeof exists to stop that being silent.
+ *
+ * The check is mechanical, not a code review: SNESRECOMP_RB_PROBE=25:3 runs
+ * save/replay/restore/replay in one process and reports the first divergence,
+ * and SNESRECOMP_RB_PROBE_STATICS=1 names the carrier by address when it
+ * finds one. Run it after touching anything in the frame path.
+ */
+static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
+  memset(r, 0, sizeof(*r));
+  r->magic = RTL_RB_RESIDUE_MAGIC;
+  r->version = RTL_RB_RESIDUE_VERSION;
+  r->cpu = g_cpu;
+  apu_port_sched_save(g_snes->apu, &r->apu_port);
+  r->beam_master_last = g_snes->beamMasterLast;
+  r->frame_counter = snes_frame_counter;
+  rtl_apu_pace_resync_get(&r->apu_pace_cycles_estimate,
+                          &r->apu_last_sync_cycles, &r->apu_last_sync_master,
+                          &r->apu_frame_start_master,
+                          &r->main_cpu_cycles_estimate,
+                          &r->apu_frame_time_valid);
+  rtl_mmio_shadow_resync_get(&r->memsel, &r->last_hdmaen,
+                             &r->interp_apu_driving);
+  snes_refresh_state_get(&r->refresh_phase, &r->refresh_charged_upto);
+  assert(interp_bridge_rb_state_size() <= sizeof(r->interp));
+  interp_bridge_rb_state_save(r->interp);
+  r->hdma_pending_init = dma_hdma_pending_init_get(g_snes->dma);
+  ppu_rb_residue_get(g_snes->ppu, &r->ppu_rb);
+}
+
+static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
+  uint8 *ram_ptr = g_cpu.ram;
+  g_cpu = r->cpu;
+  g_cpu.ram = ram_ptr; /* host pointer, not simulation state */
+  apu_port_sched_restore(g_snes->apu, &r->apu_port);
+  g_snes->beamMasterLast = r->beam_master_last;
+  snes_frame_counter = r->frame_counter;
+  rtl_apu_pace_resync_set(r->apu_pace_cycles_estimate, r->apu_last_sync_cycles,
+                          r->apu_last_sync_master, r->apu_frame_start_master,
+                          r->main_cpu_cycles_estimate, r->apu_frame_time_valid);
+  rtl_mmio_shadow_resync_set(r->memsel, r->last_hdmaen,
+                             r->interp_apu_driving);
+  snes_refresh_state_set(r->refresh_phase, r->refresh_charged_upto);
+  interp_bridge_rb_state_load(r->interp);
+  dma_hdma_pending_init_set(g_snes->dma, r->hdma_pending_init);
+  ppu_rb_residue_set(g_snes->ppu, &r->ppu_rb);
+}
+
+size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {
+  size_t guest;
+  RtlRollbackResidue residue;
+
+  if (!data || !g_snes)
+    return 0;
+  guest = RtlSaveSnapshotToMemory(data, capacity);
+  if (guest == 0 || capacity - guest < sizeof(residue))
+    return 0;
+
+  RtlApuLock();
+  rtl_rb_residue_capture(&residue);
+  RtlApuUnlock();
+  memcpy((uint8 *)data + guest, &residue, sizeof(residue));
+  return guest + sizeof(residue);
+}
+
+bool RtlRollbackLoadFromMemory(const void *data, size_t size) {
+  RtlRollbackResidue residue;
+  DspOutputRing ring;
+  size_t guest;
+  bool ok;
+
+  if (!data || !g_snes || size <= sizeof(residue))
+    return false;
+  guest = size - sizeof(residue);
+  memcpy(&residue, (const uint8 *)data + guest, sizeof(residue));
+  if (residue.magic != RTL_RB_RESIDUE_MAGIC ||
+      residue.version != RTL_RB_RESIDUE_VERSION)
+    return false;
+
+  /* The audio output ring belongs to the live consumer, not to the tick we
+   * are rewinding to. Lift it out around the guest blob. */
+  RtlApuLock();
+  dsp_output_ring_save(g_snes->apu->dsp, &ring);
+  RtlApuUnlock();
+
+  ok = RtlLoadSnapshotFromMemory(data, guest);
+
+  RtlApuLock();
+  dsp_output_ring_restore(g_snes->apu->dsp, &ring);
+  if (ok)
+    rtl_rb_residue_apply(&residue);
+  RtlApuUnlock();
+  return ok;
+}
+
+uint32_t RtlAudioProducerCursor(void) {
+  uint32_t w;
+  if (!g_snes)
+    return 0u;
+  RtlApuLock();
+  w = dsp_output_ring_write(g_snes->apu->dsp);
+  RtlApuUnlock();
+  return w;
+}
+
+void RtlAudioRewindProducer(uint32_t cursor) {
+  if (!g_snes)
+    return;
+  RtlApuLock();
+  dsp_output_ring_set_write(g_snes->apu->dsp, cursor);
+  RtlApuUnlock();
 }
 
 void RtlSaveLoad(int cmd, int slot) {
@@ -915,6 +1307,10 @@ void WriteReg(uint16 reg, uint8 value) {
   } else if (reg >= 0x4200 && reg < 0x4220) {
     if (reg == 0x420C) {
       g_snesrecomp_last_hdmaen = value;
+      /* Per-line fact: this title switches the transition's HDMA
+       * channels on from the line-21 raster handler, and a frame-model
+       * host that samples the mask once at render time never sees them.
+       * See raster_reg_journaled() in ppu.c. */
       if (g_snes)
         ppu_rasterRecord(reg, g_snes->vPos, value);
     }
@@ -1500,6 +1896,9 @@ static void rtl_sync_apu_frame_boundary(void) {
 #endif
 }
 
+void RtlSetSpeculativeFrame(bool on) { g_rtl_speculative_frame = on; }
+bool RtlSpeculativeFrame(void) { return g_rtl_speculative_frame; }
+
 void RtlAudioSetFastForward(bool active) {
   if (!active && !g_audio_fast_forward && g_audio_recovery_frames == 0)
     return;
@@ -1726,6 +2125,8 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
 
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   assert(channels == 2);
+
+
   /* SPC state is guest-frame driven by RtlAudioSyncFrame. The host callback is
    * a consumer only: allowing it to invent SPC cycles makes its wall-clock
    * schedule a second, competing emulation clock and is what let audio drift

@@ -47,6 +47,7 @@ extern int snes_frame_counter;
 // Hardware state access (for exhaustive debug dumps)
 #include "snes/ppu.h"
 #include "snes/cpu.h"
+#include "common_cpu_infra.h"
 #include "snes/dma.h"
 #include "snes/apu.h"
 #include "snes/spc.h"
@@ -988,6 +989,41 @@ void dbg_oam_block_trace(CpuState *cpu, uint32_t pc24) {
 // it here exactly as cpu_dispatch_pc_from / _emit_return would.
 void dbg_rts_trace(CpuState *cpu, uint32_t src_pc, uint16_t entry_s,
                    uint16_t ret_s, uint32_t popped_pc, uint8_t hrv) {
+    /* DIAGNOSTIC (SNESRECOMP_TRAP_RTS=<hex pc24>): real-time stderr dump of
+     * ONE RTS/RTL site's return decision. A rare mis-return can't be caught by
+     * frame-gating a run whose frame counters have already diverged under
+     * corruption, so print on the condition instead. Shows whether the frame
+     * is balanced (ret_s==entry_s) and correctly framed (hrv), what the site
+     * popped, and — the caller-side question — what the return frame the caller
+     * left at [entry_s+1..3] actually decodes to (frame@entry). If frame@entry
+     * is not the caller's real return, the caller set the frame up wrong; if it
+     * differs from popped, the frame was disturbed mid-body. Env-gated, off by
+     * default. Placed before the rtst range check so it needs no arming. */
+    {
+        static long s_trap_rts = -2;
+        if (s_trap_rts == -2) {
+            const char *e = getenv("SNESRECOMP_TRAP_RTS");
+            s_trap_rts = (e && e[0]) ? (long)strtol(e, NULL, 16) : -1;
+        }
+        if (s_trap_rts >= 0 && (uint32_t)s_trap_rts == src_pc) {
+            extern int cpu_dispatch_has_entry(CpuState *, uint32_t);
+            uint16_t _rl = g_ram[(uint16_t)(entry_s + 1)];
+            uint16_t _rh = g_ram[(uint16_t)(entry_s + 2)];
+            uint8_t  _rb = g_ram[(uint16_t)(entry_s + 3)];
+            uint32_t _framed = ((uint32_t)_rb << 16) |
+                (uint16_t)((((_rh << 8) | _rl) + 1) & 0xFFFF);
+            const char *_caller = (g_recomp_stack_top >= 2 &&
+                                   g_recomp_stack[g_recomp_stack_top - 2])
+                ? g_recomp_stack[g_recomp_stack_top - 2] : "?";
+            fprintf(stderr,
+                "[trap-rts $%06X] f%d entry_s=$%04X ret_s=$%04X s_eq=%d hrv=%u "
+                "popped=$%06X frame@entry=$%06X pop_has_body=%d caller=%s\n",
+                src_pc, snes_frame_counter, entry_s, ret_s,
+                (int)(ret_s == entry_s), (unsigned)hrv, popped_pc, _framed,
+                cpu_dispatch_has_entry(cpu, popped_pc), _caller);
+            fflush(stderr);
+        }
+    }
     extern uint8_t g_boundary_frozen;
     if (g_boundary_frozen) return;
     if (src_pc < g_rtst_lo || src_pc > g_rtst_hi) return;
@@ -1402,12 +1438,18 @@ typedef struct {
     uint8_t e;      // emulation mode
 } FrameCpuSnap;
 
-// Per-frame PPU register snapshot (32 bytes)
+// Per-frame PPU register snapshot
 typedef struct {
     uint8_t inidisp, bgmode, mosaic, obsel, setini;
     uint8_t screenEnabled[2], cgadsub, cgwsel, pad;
     uint16_t hScroll[4], vScroll[4];
     uint16_t fixedColor, vramPointer;
+    /* Decoder inputs (asset tooling): per-BG tilemap base/size ($210[7-A])
+     * and the packed BG char bases ($210B/C). Without these a frame-keyed
+     * VRAM snapshot cannot be decoded into layers — only the LIVE registers
+     * were queryable, which is the wrong frame by the time a tool asks. */
+    uint8_t bgXsc[4];
+    uint16_t bgTileAdr;
 } FramePpuSnap;
 
 // Per-frame interrupt/timing snapshot. Added 2026-04-23 after the tooling-
@@ -1483,7 +1525,25 @@ static int s_history_count = 0;
  * the live window or the run loop. */
 static volatile int s_fdump_target = -1;
 static volatile int s_fdump_done   = -1;
+static volatile int s_fdump_errno  = 0;
 static char s_fdump_path[512];
+
+/* Burst capture of CONSECUTIVE frames (dump_frame_range).
+ *
+ * dump_frame_raw cannot do this. It returns at the moment frame N is
+ * recorded, but it polls s_fdump_done on a 10 ms tick, and a frame is
+ * 16.7 ms — so by the time the caller is woken, round-trips, and arms N+1,
+ * N+1 has usually already gone past. Every frame after the first times out.
+ * A one-frame animation glitch is exactly what needs consecutive frames, so
+ * the range is armed ONCE here and the emulation thread writes each frame as
+ * it passes. Still no pausing: same non-pausing capture path as the single
+ * shot, just left armed. */
+static volatile int s_frange_start   = -1;
+static volatile int s_frange_end     = -1;   /* exclusive */
+static volatile int s_frange_written = 0;
+static volatile int s_frange_errno   = 0;
+static volatile int s_frange_active  = 0;
+static char s_frange_dir[400];
 
 typedef struct DebugPpuHostState {
     uint8_t *render_buffer;
@@ -1519,15 +1579,41 @@ static void DebugPpuRestoreHostState(Ppu *ppu,
                                  state->enhancer_context);
 }
 
+/* Render the way the HOST does, through the game's own draw_ppu_frame.
+ *
+ * This used to paint lines 0..224 with ppu_runLine and renderFlags 0, which
+ * was wrong twice over: flags 0 selects the legacy pixel-at-a-time
+ * compositor (ppu.h documents it ignoring several features) rather than the
+ * kPpuRenderFlags_NewRenderer path the host presents with, and a bare
+ * ppu_runLine loop replays no raster journal and steps no HDMA. On a title
+ * that raster-splits and drives TM per scanline by HDMA, that is a different
+ * picture: measured ~25,800 px off the presented composite, and with INIDISP
+ * left at 0x80 at end of frame it could paint the whole frame forced-blank.
+ * dump_frame_raw is built on this, so its images were misleading.
+ *
+ * The production path mutates more than pixels — ppu_rasterRenderBegin
+ * rewrites the line-0 register baseline, ppu_rasterApplyLine walks the
+ * journal cursor, dma_initHdma/dma_doHdma step every HDMA channel — so both
+ * structs are restored wholesale afterwards. An observer must leave nothing
+ * behind. */
 static void DebugPpuRenderAuthentic(uint8_t *pixels) {
-    DebugPpuHostState state;
-    DebugPpuSaveHostState(g_ppu, &state);
-    PpuBeginDrawing(g_ppu, pixels, 256 * 4, 0);
+    static Ppu save_ppu;
+    static uint8_t save_dma[sizeof(Dma)];
+    int have_dma = (g_snes && g_snes->dma) ? 1 : 0;
+    memcpy(&save_ppu, g_ppu, sizeof(Ppu));
+    if (have_dma) memcpy(save_dma, g_snes->dma, sizeof(Dma));
+
+    PpuBeginDrawing(g_ppu, pixels, 256 * 4, save_ppu.renderFlags);
     PpuSetExtraSpace(g_ppu, 0);
     PpuSetWidescreenLineEnhancer(g_ppu, NULL, NULL);
-    for (int i = 0; i <= 224; i++)
-        ppu_runLine(g_ppu, i);
-    DebugPpuRestoreHostState(g_ppu, &state);
+    if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+        g_rtl_game_info->draw_ppu_frame();
+    else
+        for (int i = 0; i <= 224; i++)
+            ppu_runLine(g_ppu, i);
+
+    memcpy(g_ppu, &save_ppu, sizeof(Ppu));
+    if (have_dma) memcpy(g_snes->dma, save_dma, sizeof(Dma));
 }
 
 void debug_server_record_frame(int frame) {
@@ -1551,11 +1637,85 @@ void debug_server_record_frame(int frame) {
 
     if (s_fdump_target >= 0 && frame == s_fdump_target && g_ppu) {
         static uint8_t fdump_scr[256 * 4 * 240];
+        size_t want = (size_t)256 * 224 * 4;
         DebugPpuRenderAuthentic(fdump_scr);
         FILE *f = fopen(s_fdump_path, "wb");
-        if (f) { fwrite(fdump_scr, 1, 256 * 224 * 4, f); fclose(f); }
+        /* Report a failed write instead of swallowing it. This used to set
+         * s_fdump_done unconditionally, so a path the runtime could not open
+         * -- and a relative path here is relative to the RUNTIME's cwd, not
+         * the caller's, which is the usual way to get one -- answered
+         * {"ok":true} for a file that was never created. A probe that reads
+         * as a finding is worse than one that fails. */
+        s_fdump_errno = 0;
+        if (!f) {
+            s_fdump_errno = errno ? errno : EIO;
+        } else {
+            if (fwrite(fdump_scr, 1, want, f) != want)
+                s_fdump_errno = errno ? errno : EIO;
+            if (fclose(f) != 0 && !s_fdump_errno)
+                s_fdump_errno = errno ? errno : EIO;
+        }
         s_fdump_target = -1;
         s_fdump_done = frame;
+    }
+
+    if (s_frange_active && frame >= s_frange_start && frame < s_frange_end
+        && g_ppu) {
+        static uint8_t frange_scr[256 * 4 * 240];
+        size_t want = (size_t)256 * 224 * 4;
+        char path[512];
+        FILE *f;
+        /* Copy the composite the host actually presented, rather than
+         * re-rendering the PPU.
+         *
+         * Historically DebugPpuRenderAuthentic painted all 224 lines from
+         * the register state in force RIGHT NOW, with no journal replay and
+         * no HDMA. This game draws through a per-line raster journal and ends
+         * every frame with INIDISP back at 0x80, so that re-render painted
+         * the whole frame forced-blank: 120 byte-identical black frames
+         * captured off a game that was visibly rendering. That helper now
+         * replays through the game's own draw_ppu_frame, so it no longer
+         * throws the splits away -- but copying the presented composite is
+         * still the cheaper and more literal answer to "what did the player
+         * see", so this path keeps doing it.
+         *
+         * cmd_screenshot already takes this path and says why. This is the
+         * last frame the host finished compositing, so file fN.raw holds
+         * the picture presented for frame N-1; a consistent off-by-one is
+         * harmless for animation work and is stated in the reply. */
+        {
+            uint8_t *rb = g_ppu->renderBuffer;
+            uint32_t rp = g_ppu->renderPitch;
+            int rw = 256 + 2 * g_ppu->extraLeftRight;
+            int cols = rw < 256 ? rw : 256;
+            int y;
+            if (rb && rp >= (uint32_t)rw * 4) {
+                memset(frange_scr, 0, want);
+                for (y = 0; y < 224; y++)
+                    memcpy(frange_scr + (size_t)y * 256 * 4,
+                           rb + (size_t)y * rp, (size_t)cols * 4);
+            } else {
+                /* No composite to copy yet. Say so rather than writing a
+                 * black frame that reads as a rendering bug. */
+                if (!s_frange_errno) s_frange_errno = ENODATA;
+                s_frange_active = 0;
+                goto frange_done;
+            }
+        }
+        snprintf(path, sizeof(path), "%s/f%06d.raw", s_frange_dir, frame);
+        f = fopen(path, "wb");
+        if (!f) {
+            if (!s_frange_errno) s_frange_errno = errno ? errno : EIO;
+        } else {
+            if (fwrite(frange_scr, 1, want, f) != want && !s_frange_errno)
+                s_frange_errno = errno ? errno : EIO;
+            if (fclose(f) != 0 && !s_frange_errno)
+                s_frange_errno = errno ? errno : EIO;
+            s_frange_written++;
+        }
+        if (frame + 1 >= s_frange_end)
+            s_frange_active = 0;
+frange_done: ;
     }
 
     lock_mutex();
@@ -1612,6 +1772,8 @@ void debug_server_record_frame(int frame) {
         memcpy(r->ppu.vScroll, g_ppu->vScroll, sizeof(r->ppu.vScroll));
         r->ppu.fixedColor = g_ppu->fixedColor;
         r->ppu.vramPointer = g_ppu->vramPointer;
+        memcpy(r->ppu.bgXsc, g_ppu->bgXsc, sizeof(r->ppu.bgXsc));
+        r->ppu.bgTileAdr = g_ppu->bgTileAdr;
         // CGRAM + OAM snapshots
         memcpy(r->cgram, g_ppu->cgram, sizeof(r->cgram));
         memcpy(r->oam, g_ppu->oam, sizeof(r->oam));
@@ -1839,7 +2001,13 @@ static struct {
     OamWriteEntry *log; /* calloc'd at init */
 } s_oam_wr = {0};
 
-typedef struct { uint8_t y, xlow, tile, attr, xhigh; } OamSlotSnap;
+/* `big` is high-OAM bit 1: the per-sprite size select, which picks
+ * between the two sizes OBSEL names. It was omitted here, and its
+ * absence is a blind spot rather than a detail: two frames whose
+ * y/x/tile/attr are byte-identical still draw at different sizes if
+ * this bit differs, so a size-swap bug looked like "OAM did not
+ * change" while the picture plainly did. */
+typedef struct { uint8_t y, xlow, tile, attr, xhigh, big; } OamSlotSnap;
 
 typedef struct {
     uint64_t    seq;
@@ -1887,6 +2055,7 @@ void debug_server_on_oam_render(void) {
         e->slot[s].tile  = (uint8_t)(w1 & 0xff);
         e->slot[s].attr  = (uint8_t)(w1 >> 8);
         e->slot[s].xhigh = (uint8_t)((g_ppu->highOam[s >> 2] >> ((s & 3) * 2)) & 1);
+        e->slot[s].big   = (uint8_t)((g_ppu->highOam[s >> 2] >> ((s & 3) * 2 + 1)) & 1);
         if (y < 0xE0) active++;
     }
     e->active = active;
@@ -2714,19 +2883,46 @@ static void cmd_get_vram_trace(const char *args) {
     }
     int nostack = args && strstr(args, "nostack") != NULL;
     static char buf[524288];
+    /* Pagination. Without it this walked from the OLDEST entry and stopped when
+     * the buffer filled, so a long-lived ring answered with its first few
+     * thousand rows and silently dropped everything recent — a capture taken on
+     * frame 4384 came back holding nothing but frame 46. That reads as "nothing
+     * wrote here", which is a false negative, not a truncation anyone notices.
+     *
+     * So the DEFAULT is now the NEWEST window that fits, and `idx_from` /
+     * `idx_lim` (indices into the live ring, oldest = 0) select explicitly.
+     * The reply says which slice it actually returned. */
+    int budget = (int)sizeof(buf) - 4096;
+    uint64_t cap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
+    uint64_t avail = s_vram_trace.count < cap ? s_vram_trace.count : cap;
+    /* Conservative bytes-per-row so the window we promise actually fits. */
+    uint64_t rows_fit = (uint64_t)(budget / (nostack ? 180 : 260));
+    if (rows_fit < 1) rows_fit = 1;
+    uint64_t want = rows_fit;
+    uint64_t from = avail > want ? avail - want : 0;
+    if (args) {
+        const char *p2 = strstr(args, "idx_from=");
+        if (p2) { unsigned long long v = 0; sscanf(p2 + 9, "%llu", &v); from = (uint64_t)v; }
+        p2 = strstr(args, "idx_lim=");
+        if (p2) { unsigned long long v = 0; sscanf(p2 + 8, "%llu", &v);
+                  if (v && v < want) want = (uint64_t)v; }
+    }
+    if (from > avail) from = avail;
+    if (from + want > avail) want = avail - from;
+
     int pos = snprintf(buf, sizeof(buf), "{\"ranges\":[");
     for (int i = 0; i < s_vram_trace.nranges; i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s[\"0x%04x\",\"0x%04x\"]", i ? "," : "",
             s_vram_trace.ranges[i].lo, s_vram_trace.ranges[i].hi);
     pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "],\"entries\":%llu,\"log\":[",
-        (unsigned long long)s_vram_trace.count);
-    uint64_t cap = s_vram_trace.capacity ? s_vram_trace.capacity : 1;
-    uint64_t start = s_vram_trace.count < cap ?
-                     0 : s_vram_trace.write_idx - cap;
-    int budget = (int)sizeof(buf) - 4096;
-    for (uint64_t i = 0; i < s_vram_trace.count && pos < budget; i++) {
+        "],\"entries\":%llu,\"idx_from\":%llu,\"returned\":%llu,\"log\":[",
+        (unsigned long long)s_vram_trace.count,
+        (unsigned long long)from, (unsigned long long)want);
+    uint64_t base = s_vram_trace.count < cap ?
+                    0 : s_vram_trace.write_idx - cap;
+    uint64_t start = base + from;
+    for (uint64_t i = 0; i < want && pos < budget; i++) {
         uint64_t idx = (start + i) % cap;
         if (nostack) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -2790,7 +2986,11 @@ static void cmd_oam_state(const char *args) {
              (unsigned long long)s_oam_rd.count, OAM_RENDER_RING_ENTRIES);
 }
 
-/* oam_write_get [count=64] — most recent N OAM write events, oldest-first.
+/* oam_render_get [snaps=4] [slots=16] — per-frame OAM snapshots, oldest-first.
+ * Each slot row is [y, xlow, xhigh, tile, attr, big] where `big` is the
+ * high-OAM size-select bit.
+ *
+ * oam_write_get [count=64] — most recent N OAM write events, oldest-first.
  * Each: seq, frame f, h=is_high, i=index, v=value (hex), func. The seq lets
  * you interleave these against oam_render_get to see whether the DMA burst
  * for a frame landed BEFORE the render-read that consumed it, and whether the
@@ -2849,9 +3049,9 @@ static void cmd_oam_render_get(const char *args) {
             k ? "," : "", (unsigned long long)e->seq, e->frame, e->active);
         for (unsigned s = 0; s < slots && pos < budget; s++)
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s[%u,%u,%u,%u,%u]", s ? "," : "",
+                "%s[%u,%u,%u,%u,%u,%u]", s ? "," : "",
                 e->slot[s].y, e->slot[s].xlow, e->slot[s].xhigh,
-                e->slot[s].tile, e->slot[s].attr);
+                e->slot[s].tile, e->slot[s].attr, e->slot[s].big);
         pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
@@ -4695,9 +4895,203 @@ static void cmd_screenshot(const char *args) {
              path, w, h, (int)g_ppu->extraLeftRight, snes_frame_counter);
 }
 
+/* raster_journal — the per-line register waveform the renderer will replay.
+ * A frame-model host runs all of a frame's CPU work and only then draws its
+ * 224 lines, so "what the game wrote mid-frame" and "what the renderer saw"
+ * are different things. This is where the two can be compared. */
+static void cmd_raster_journal(const char *args) {
+    (void)args;
+    static char buf[65536];
+    int n = ppu_rasterDebugDump(buf, (int)sizeof(buf));
+    if (n <= 0) { send_fmt("{\"error\":\"journal unavailable\"}"); return; }
+    send_all_bounded(buf, n);
+    send_all_bounded("\n", 1);
+}
+
+/* render_inject <out_bmp> <vram_byte_lo_hex> <vram_bin> [oam_bin] [cgram_bin]
+ *
+ * Renders a frame from INJECTED PPU buffers and restores everything. Purely an
+ * observer: it never advances the guest and leaves no state behind.
+ *
+ * It exists to settle "is our renderer wrong, or is the state we render wrong?"
+ * — a question pixels alone cannot answer. Feed it an oracle capture's VRAM /
+ * OAM / CGRAM and compare the result against that oracle's own screenshot:
+ * matching means the renderer is faithful and the fault is which state we draw;
+ * differing means the fault is in the renderer's own addressing, and no amount
+ * of frame-model reordering would have fixed it.
+ *
+ * The VRAM file is a byte image of a SUB-RANGE starting at vram_byte_lo, so a
+ * bounded oracle capture can be injected without needing all 64K. Everything
+ * outside the named range keeps the live contents.
+ */
+/* render_inject <out_bmp> <vram_byte_lo_hex> <vram_bin> [oam_bin] [cgram_bin]
+ *
+ * Renders a frame from INJECTED PPU buffers and restores everything. Purely an
+ * observer: it never advances the guest and leaves no state behind.
+ *
+ * It exists to settle "is our renderer wrong, or is the state we render wrong?"
+ * — a question pixels alone cannot answer. Feed it an oracle capture's VRAM /
+ * OAM / CGRAM and compare the result against that oracle's own screenshot:
+ * matching means the renderer is faithful and the fault is which state we draw;
+ * differing means the fault is in the renderer's own addressing, and no amount
+ * of frame-model reordering would have fixed it.
+ *
+ * The VRAM file is a byte image of a SUB-RANGE starting at vram_byte_lo, so a
+ * bounded oracle capture can be injected without needing all 64K. Everything
+ * outside the named range keeps the live contents.
+ */
+static void cmd_render_inject(const char *args) {
+    if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
+    char out[256], vpath[256], opath[256], cpath[256];
+    unsigned int vlo = 0;
+    out[0] = vpath[0] = opath[0] = cpath[0] = 0;
+    int n = sscanf(args ? args : "", "%255s %x %255s %255s %255s",
+                   out, &vlo, vpath, opath, cpath);
+    if (n < 3) {
+        send_fmt("{\"error\":\"usage: render_inject <out_bmp> <vram_byte_lo_hex> "
+                 "<vram_bin> [oam_bin] [cgram_bin]\"}");
+        return;
+    }
+    if (vlo >= 0x10000) { send_fmt("{\"error\":\"vram_byte_lo out of range\"}"); return; }
+
+    /* Read the blobs BEFORE touching the PPU, so a missing file cannot leave
+     * injected state behind. */
+    static uint8_t vbuf[0x10000];
+    size_t vlen = 0;
+    { FILE *f = fopen(vpath, "rb");
+      if (!f) { send_fmt("{\"error\":\"cannot open vram_bin\",\"path\":\"%s\"}", vpath); return; }
+      vlen = fread(vbuf, 1, sizeof(vbuf), f); fclose(f); }
+    if (vlo + vlen > 0x10000) vlen = 0x10000 - vlo;
+
+    uint8_t obuf[544]; size_t olen = 0;
+    if (opath[0]) {
+        FILE *f = fopen(opath, "rb");
+        if (!f) { send_fmt("{\"error\":\"cannot open oam_bin\",\"path\":\"%s\"}", opath); return; }
+        olen = fread(obuf, 1, sizeof(obuf), f); fclose(f);
+    }
+    uint8_t cbuf[512]; size_t clen = 0;
+    if (cpath[0]) {
+        FILE *f = fopen(cpath, "rb");
+        if (!f) { send_fmt("{\"error\":\"cannot open cgram_bin\",\"path\":\"%s\"}", cpath); return; }
+        clen = fread(cbuf, 1, sizeof(cbuf), f); fclose(f);
+    }
+
+    lock_mutex();
+    /* Snapshot the WHOLE Ppu and Dma, not just the buffers we inject.
+     *
+     * The render below runs the production draw path, which mutates far more
+     * than VRAM/OAM/CGRAM: ppu_rasterRenderBegin rewrites the line-0 register
+     * baseline, ppu_rasterApplyLine walks the journal cursor, and
+     * dma_initHdma/dma_doHdma step every HDMA channel's table pointers. An
+     * observer must not leave any of that behind, so the cheap and certain
+     * thing is to restore both structs wholesale. */
+    static Ppu save_ppu;
+    static uint8_t save_dma[sizeof(Dma)];
+    int have_dma = (g_snes && g_snes->dma) ? 1 : 0;
+    memcpy(&save_ppu, g_ppu, sizeof(Ppu));
+    if (have_dma) memcpy(save_dma, g_snes->dma, sizeof(Dma));
+
+    memcpy((uint8_t *)g_ppu->vram + vlo, vbuf, vlen);
+    if (olen >= 512) memcpy((uint8_t *)g_ppu->oam, obuf, 512);
+    if (olen >= 544) memcpy(g_ppu->highOam, obuf + 512, 32);
+    if (clen >= 512) memcpy((uint8_t *)g_ppu->cgram, cbuf, 512);
+
+    static uint8_t px[256 * 4 * 240];
+    /* DebugPpuRenderAuthentic now renders through the production path and
+     * restores Ppu/Dma itself; the outer save/restore here is what undoes the
+     * INJECTION. */
+    int used_production = (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) ? 1 : 0;
+    /* render_inject's contract is "render exactly the state given". A host
+     * with a scanout latch (OAM/CGRAM snapshotted at frame start) would
+     * otherwise render its latch instead of the injected arrays — measured
+     * as injected OAM having no effect at all. */
+    g_ppu_scanout_latch_bypass = 1;
+    DebugPpuRenderAuthentic(px);
+    g_ppu_scanout_latch_bypass = 0;
+
+    memcpy(g_ppu, &save_ppu, sizeof(Ppu));
+    if (have_dma) memcpy(g_snes->dma, save_dma, sizeof(Dma));
+    unlock_mutex();
+
+    FILE *f = fopen(out, "wb");
+    if (!f) { send_fmt("{\"error\":\"cannot open out_bmp\",\"path\":\"%s\"}", out); return; }
+    const int w = 256, h = 224;
+    int row_bytes = w * 3;
+    int pad = (4 - (row_bytes % 4)) % 4;
+    int stride = row_bytes + pad;
+    int img_size = stride * h;
+    int file_size = 54 + img_size;
+    uint8_t hdr[54] = {0};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = file_size; hdr[3] = file_size >> 8; hdr[4] = file_size >> 16; hdr[5] = file_size >> 24;
+    hdr[10] = 54; hdr[14] = 40;
+    hdr[18] = (uint8_t)(w & 0xFF); hdr[19] = (uint8_t)((w >> 8) & 0xFF);
+    { int neg_h = -h; memcpy(&hdr[22], &neg_h, 4); }
+    hdr[26] = 1; hdr[28] = 24;
+    hdr[34] = img_size; hdr[35] = img_size >> 8; hdr[36] = img_size >> 16; hdr[37] = img_size >> 24;
+    fwrite(hdr, 1, 54, f);
+    uint8_t row_buf[256 * 3 + 4];
+    memset(row_buf, 0, sizeof(row_buf));
+    for (int y = 0; y < h; y++) {
+        const uint8_t *src = px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) {
+            row_buf[x * 3 + 0] = src[x * 4 + 0];
+            row_buf[x * 3 + 1] = src[x * 4 + 1];
+            row_buf[x * 3 + 2] = src[x * 4 + 2];
+        }
+        fwrite(row_buf, 1, stride, f);
+    }
+    fclose(f);
+    send_fmt("{\"ok\":true,\"path\":\"%s\",\"vram_lo\":\"0x%04x\",\"vram_bytes\":%u,"
+             "\"oam_bytes\":%u,\"cgram_bytes\":%u,\"width\":%d,\"height\":%d,"
+             "\"path_used\":\"%s\"}",
+             out, vlo, (unsigned)vlen, (unsigned)olen, (unsigned)clen, w, h,
+             used_production ? "production-draw_ppu_frame" : "fallback-ppu_runLine");
+}
+
 static void cmd_get_ppu_state(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
     Ppu *p = g_ppu;
+    /* elasticBands: only the configured (layer, slot) pairs, since the full
+     * kPpuWsElasticBands x 4 x kPpuWsElasticSegs table would dwarf the rest
+     * of the reply. Each entry carries the band's scanline range and its
+     * piecewise map as [srcX0, srcX1, dstX0, dstX1] quads, which is exactly
+     * what a widescreen verdict needs to reproduce the mapping. */
+    char eb[3072];
+    size_t ebn = 0;
+    eb[ebn++] = '[';
+    for (unsigned slot = 0; slot < kPpuWsElasticBands; slot++) {
+        for (unsigned layer = 0; layer < 4; layer++) {
+            unsigned nseg = p->wsElasticNSeg[slot][layer];
+            if (!nseg || p->wsElasticY1[slot][layer] <= p->wsElasticY0[slot][layer])
+                continue;
+            int n = snprintf(eb + ebn, sizeof(eb) - ebn,
+                             "%s{\"slot\":%u,\"layer\":%u,\"y0\":%u,\"y1\":%u,\"segs\":[",
+                             ebn > 1 ? "," : "", slot, layer,
+                             p->wsElasticY0[slot][layer],
+                             p->wsElasticY1[slot][layer]);
+            if (n < 0 || (size_t)n >= sizeof(eb) - ebn) { ebn = sizeof(eb); break; }
+            ebn += (size_t)n;
+            for (unsigned i = 0; i < nseg; i++) {
+                const PpuWsElasticSeg *s = &p->wsElasticSeg[slot][layer][i];
+                n = snprintf(eb + ebn, sizeof(eb) - ebn, "%s[%d,%d,%d,%d]",
+                             i ? "," : "", s->srcX0, s->srcX1, s->dstX0, s->dstX1);
+                if (n < 0 || (size_t)n >= sizeof(eb) - ebn) { ebn = sizeof(eb); break; }
+                ebn += (size_t)n;
+            }
+            if (ebn >= sizeof(eb) - 4) break;
+            eb[ebn++] = ']';
+            eb[ebn++] = '}';
+        }
+        if (ebn >= sizeof(eb) - 4) break;
+    }
+    if (ebn >= sizeof(eb) - 4) {
+        /* Truncation would emit invalid JSON; report the overflow instead. */
+        snprintf(eb, sizeof(eb), "\"overflow\"");
+    } else {
+        eb[ebn++] = ']';
+        eb[ebn] = '\0';
+    }
     send_fmt("{\"inidisp\":\"0x%02x\",\"bgmode\":%d,\"mosaic\":\"0x%02x\",\"obsel\":\"0x%02x\","
              "\"setini\":\"0x%02x\","
              "\"bgXsc\":[\"0x%02x\",\"0x%02x\",\"0x%02x\",\"0x%02x\"],"
@@ -4713,7 +5107,13 @@ static void cmd_get_ppu_state(const char *args) {
              "\"widescreen\":{\"budget\":%u,\"left\":%u,\"right\":%u,\"bottom\":%u,"
              "\"layerWiden\":\"0x%02x\",\"layerClamp\":\"0x%02x\","
              "\"layerMirror\":\"0x%02x\",\"layerRepeat\":\"0x%02x\","
-             "\"windowExpandLayers\":\"0x%02x\",\"windowExpandWindows\":\"0x%02x\"},"
+             "\"windowExpandLayers\":\"0x%02x\",\"windowExpandWindows\":\"0x%02x\","
+             "\"worldBands\":["
+               "{\"slot\":0,\"y0\":[%u,%u,%u,%u],\"y1\":[%u,%u,%u,%u],"
+                 "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]},"
+               "{\"slot\":1,\"y0\":[%u,%u,%u,%u],\"y1\":[%u,%u,%u,%u],"
+                 "\"left\":[%u,%u,%u,%u],\"right\":[%u,%u,%u,%u]}],"
+             "\"elasticBands\":%s},"
              "\"evenFrame\":%s}",
              p->inidisp, p->bgmode & 7, p->mosaic, p->obsel,
              p->setini,
@@ -4732,6 +5132,26 @@ static void cmd_get_ppu_state(const char *args) {
              p->extraBottomCur, p->wsLayerWidenMask, p->wsLayerClamp,
              p->wsLayerMirror, p->wsLayerRepeat,
              p->wsWindowExpandLayers, p->wsWindowExpandWindows,
+             /* worldBands: per-layer authored-world spans for the
+              * world-mirror policy (PpuSetWidescreenLayerWorldMirrorBand).
+              * y1<=y0 or right<=left on a layer means that slot is off. */
+             p->wsWorldY0[0][0], p->wsWorldY0[0][1], p->wsWorldY0[0][2],
+             p->wsWorldY0[0][3],
+             p->wsWorldY1[0][0], p->wsWorldY1[0][1], p->wsWorldY1[0][2],
+             p->wsWorldY1[0][3],
+             p->wsWorldLeft[0][0], p->wsWorldLeft[0][1],
+             p->wsWorldLeft[0][2], p->wsWorldLeft[0][3],
+             p->wsWorldRight[0][0], p->wsWorldRight[0][1],
+             p->wsWorldRight[0][2], p->wsWorldRight[0][3],
+             p->wsWorldY0[1][0], p->wsWorldY0[1][1], p->wsWorldY0[1][2],
+             p->wsWorldY0[1][3],
+             p->wsWorldY1[1][0], p->wsWorldY1[1][1], p->wsWorldY1[1][2],
+             p->wsWorldY1[1][3],
+             p->wsWorldLeft[1][0], p->wsWorldLeft[1][1],
+             p->wsWorldLeft[1][2], p->wsWorldLeft[1][3],
+             p->wsWorldRight[1][0], p->wsWorldRight[1][1],
+             p->wsWorldRight[1][2], p->wsWorldRight[1][3],
+             eb,
              p->evenFrame ? "true" : "false");
 }
 
@@ -4746,7 +5166,11 @@ static void cmd_get_interrupt_state(const char *args) {
     send_fmt("{\"inNmi\":%s,\"inIrq\":%s,\"inVblank\":%s,"
              "\"nmiEnabled\":%s,\"hIrqEnabled\":%s,\"vIrqEnabled\":%s,"
              "\"autoJoyRead\":%s,\"hPos\":%u,\"vPos\":%u,"
-             "\"hTimer\":%u,\"vTimer\":%u,\"autoJoyTimer\":%u}",
+             "\"hTimer\":%u,\"vTimer\":%u,\"autoJoyTimer\":%u,"
+             "\"irqLatches\":%u,\"irqMissedFields\":%u,\"lastMissedLine\":%u,"
+             "\"irqOvershot\":%u,\"lastOvershotLine\":%u,\"lastOvershotBy\":%u,"
+             "\"targetInPast\":%u,\"lastPastTarget\":%u,\"lastPastBeam\":%u,"
+             "\"nmiBeamLine\":%u,\"nmiLateCount\":%u,\"beamLagAtNmi\":%llu}",
              s->inNmi       ? "true" : "false",
              s->inIrq       ? "true" : "false",
              s->inVblank    ? "true" : "false",
@@ -4754,7 +5178,12 @@ static void cmd_get_interrupt_state(const char *args) {
              s->hIrqEnabled ? "true" : "false",
              s->vIrqEnabled ? "true" : "false",
              s->autoJoyRead ? "true" : "false",
-             s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer);
+             s->hPos, s->vPos, s->hTimer, s->vTimer, s->autoJoyTimer,
+             s->dbgIrqLatches, s->dbgIrqMissed, s->dbgLastMissedLine,
+             s->dbgIrqOvershot, s->dbgLastOvershotLine, s->dbgLastOvershotBy,
+             s->dbgTargetInPast, s->dbgLastPastTarget, s->dbgLastPastBeam,
+             s->dbgNmiBeamLine, s->dbgNmiLateCount,
+             (unsigned long long)s->dbgBeamLagAtNmi);
 }
 
 /* cx4_state [n] — instruction-level Cx4 (HG51B S169) status plus the always-on
@@ -5036,7 +5465,9 @@ static void cmd_get_frame_extended(const char *args) {
         "\"screenEnabled\":[\"0x%02x\",\"0x%02x\"],"
         "\"cgadsub\":\"0x%02x\",\"cgwsel\":\"0x%02x\","
         "\"hScroll\":[%d,%d,%d,%d],\"vScroll\":[%d,%d,%d,%d],"
-        "\"fixedColor\":\"0x%04x\",\"vramPointer\":\"0x%04x\"},",
+        "\"fixedColor\":\"0x%04x\",\"vramPointer\":\"0x%04x\","
+        "\"bgXsc\":[\"0x%02x\",\"0x%02x\",\"0x%02x\",\"0x%02x\"],"
+        "\"bgTileAdr\":\"0x%04x\"},",
         r->frame_number,
         r->cpu.a, r->cpu.x, r->cpu.y, r->cpu.sp, r->cpu.pc, r->cpu.dp,
         r->cpu.k, r->cpu.db, r->cpu.flags, r->cpu.e,
@@ -5046,7 +5477,9 @@ static void cmd_get_frame_extended(const char *args) {
         r->ppu.cgadsub, r->ppu.cgwsel,
         r->ppu.hScroll[0], r->ppu.hScroll[1], r->ppu.hScroll[2], r->ppu.hScroll[3],
         r->ppu.vScroll[0], r->ppu.vScroll[1], r->ppu.vScroll[2], r->ppu.vScroll[3],
-        r->ppu.fixedColor, r->ppu.vramPointer);
+        r->ppu.fixedColor, r->ppu.vramPointer,
+        r->ppu.bgXsc[0], r->ppu.bgXsc[1], r->ppu.bgXsc[2], r->ppu.bgXsc[3],
+        r->ppu.bgTileAdr);
     send(s_client_sock, buf, pos, 0);
 
     // DMA channels (incl. HDMA state fields captured per-frame)
@@ -5502,9 +5935,18 @@ static void cmd_dispatch_log_get(const char *args) {
  *     dispatch_total : all runtime indirect dispatches
  *     found1/found0  : hit an exact AOT body / fell to the interp tier
  *     found0_pct     : found0 as % of dispatch_total (interp-fallback rate)
- *     tier_hits      : total interp tier-down invocations
+ *     tier_hits      : tier-downs entered from a GENERATED dispatch default,
+ *                      i.e. the five interp_tier_* entry points. NOT a total:
+ *                      the interpreter's own in-loop gap discovery
+ *                      (TIER2_KIND_GOTO_GAP, TIER2_KIND_CALL_GAP) records
+ *                      into the tier-2 manifest without passing through them,
+ *                      so a config whose gaps are all found that way reads
+ *                      tier_hits:0 next to a large tier2_clean. That is not a
+ *                      contradiction -- they count different things, and the
+ *                      manifest, not this counter, is the complete record.
  *     tier2_sites    : distinct (site,target,m/x) interp gaps
- *     tier2_clean/bail : summed clean vs bail (bail = interp step-cap = risk)
+ *     tier2_clean/bail : summed clean vs bail (bail = interp step-cap = risk).
+ *                      Recorded from every gap path, so this IS the total.
  */
 extern unsigned cpu_dispatch_log_count(void);
 extern void cpu_dispatch_found_totals(uint64_t *found1, uint64_t *found0);
@@ -7336,7 +7778,80 @@ static void cmd_audio_shadow_div(const char *args) {
              (unsigned long long)st.echo_div_count, erms_db, emax_db);
 }
 
-/* dump_frame_raw <frame> <path> — arm a non-pausing capture of frame N's pixels
+/* dump_frame_range <start> <count> <dir> — arm a non-pausing capture of
+ * `count` CONSECUTIVE frames beginning at `start`, one raw BGRX 256x224x4
+ * file per frame at <dir>/fNNNNNN.raw, and block until the range has passed.
+ * <dir> must already exist and is resolved against the RUNTIME's working
+ * directory, so pass it absolute. See the note beside s_frange_start for why
+ * repeated dump_frame_raw calls cannot do this. */
+static void cmd_dump_frame_range(const char *args) {
+    char dir[400] = {0};
+    int start = -1, count = 0, i;
+    int budget_ticks;
+
+    if (sscanf(args, "%d %d %399s", &start, &count, dir) < 3
+        || start < 0 || count < 1) {
+        send_fmt("{\"error\":\"usage: dump_frame_range <start> <count> <dir>\"}");
+        return;
+    }
+    if (count > 4096) count = 4096;
+    if (s_frange_active) {
+        send_fmt("{\"error\":\"a range capture is already armed\"}");
+        return;
+    }
+    strncpy(s_frange_dir, dir, sizeof(s_frange_dir) - 1);
+    s_frange_dir[sizeof(s_frange_dir) - 1] = 0;
+    s_frange_written = 0;
+    s_frange_errno = 0;
+    s_frange_start = start;
+    s_frange_end = start + count;
+    s_frange_active = 1;
+
+    /* Wait for the range to pass, with headroom: the frames themselves plus
+     * the wait for `start` to arrive. Ticks are 10 ms. */
+    budget_ticks = 1500 + count * 4;
+    for (i = 0; i < budget_ticks && s_frange_active; i++) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+    if (s_frange_active) {
+        s_frange_active = 0;
+        send_fmt("{\"error\":\"timeout waiting for frames %d..%d "
+                 "(already passed?)\",\"written\":%d}",
+                 start, start + count - 1, s_frange_written);
+        return;
+    }
+    if (s_frange_errno == ENODATA) {
+        send_fmt("{\"error\":\"the host has not composited a frame yet "
+                 "(renderBuffer unset) -- nothing to capture\",\"written\":%d}",
+                 s_frange_written);
+        return;
+    }
+    if (s_frange_errno) {
+        send_fmt("{\"error\":\"writing into %s failed: %s\",\"written\":%d,"
+                 "\"hint\":\"the directory must exist and is relative to the "
+                 "runtime's working directory\"}",
+                 dir, strerror(s_frange_errno), s_frange_written);
+        return;
+    }
+    send_fmt("{\"ok\":true,\"start\":%d,\"count\":%d,\"written\":%d,"
+             "\"dir\":\"%s\",\"width\":256,\"height\":224,"
+             "\"source\":\"presented-composite\",\"lag\":1}",
+             start, count, s_frange_written, dir);
+}
+
+/* dump_frame_raw <frame> <path> — RE-RENDERS the PPU rather than copying the
+ * presented composite, so it drops every mid-frame effect: raster splits,
+ * per-line HDMA, anything the host's per-line loop applied. On a game that
+ * ends its frame in forced blank the result is an all-black image of a
+ * perfectly good picture. Kept as-is for the bsnes framebuffer diff, which
+ * wants the register-authentic render; use dump_frame_range for what the
+ * player actually sees.
+ *
+ * dump_frame_raw <frame> <path> — arm a non-pausing capture of frame N's pixels
  * (debug_server_record_frame writes raw BGRX 256x224x4 when the frame passes) and
  * block until done. For the PPU framebuffer diff vs the bsnes oracle. */
 static void cmd_dump_frame_raw(const char *args) {
@@ -7357,9 +7872,14 @@ static void cmd_dump_frame_raw(const char *args) {
         usleep(10000);
 #endif
     }
-    if (s_fdump_done == n)
+    if (s_fdump_done == n && s_fdump_errno == 0)
         send_fmt("{\"ok\":true,\"frame\":%d,\"path\":\"%s\",\"width\":256,\"height\":224}",
                  n, path);
+    else if (s_fdump_done == n)
+        send_fmt("{\"error\":\"frame %d reached but writing %s failed: %s\","
+                 "\"hint\":\"a relative path resolves against the runtime's "
+                 "working directory, not yours\"}",
+                 n, path, strerror(s_fdump_errno));
     else {
         s_fdump_target = -1;
         send_fmt("{\"error\":\"timeout; frame %d not reached (already passed?)\"}", n);
@@ -7715,6 +8235,7 @@ static const CmdEntry s_commands[] = {
     {"get_spc_pc_hist", cmd_get_spc_pc_hist},
     {"get_apu_misc",   cmd_get_apu_misc},
     {"frame",         cmd_frame},
+    {"dump_frame_range", cmd_dump_frame_range},
     {"read_ram",      cmd_read_ram},
     {"dump_ram",      cmd_dump_ram},
     {"dump_cart",     cmd_dump_cart},
@@ -7812,6 +8333,7 @@ static const CmdEntry s_commands[] = {
     {"dump_cgram",    cmd_dump_cgram},
     {"dump_oam",      cmd_dump_oam},
     {"get_ppu_state", cmd_get_ppu_state},
+    {"raster_journal", cmd_raster_journal},
     {"ppu_lines",     cmd_ppu_lines},
     {"ppu_window",    cmd_ppu_window},
     {"get_cpu_state", cmd_get_cpu_state},
@@ -7820,6 +8342,7 @@ static const CmdEntry s_commands[] = {
     {"get_apu_state", cmd_get_apu_state},
     {"dump_apu_ram",  cmd_dump_apu_ram},
     {"screenshot",     cmd_screenshot},
+    {"render_inject",  cmd_render_inject},
     {"dump_frame_raw", cmd_dump_frame_raw},
     {"stackbal",       cmd_stackbal},
     {"fingerprint",    cmd_fingerprint},

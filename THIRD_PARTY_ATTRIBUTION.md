@@ -404,6 +404,30 @@ the paragraph above, and it came back clean.
 - Added DMA-register spying and per-channel decompressed byte feeding so S-DD1
   transfers can populate PPU destinations through the existing DMA engine.
 
+## S-DD1 decompression implementation
+
+`runner/src/snes/sdd1.{c,h}` was extracted from the StarOceanSNESRecomp vendored
+runner copy and adapted into the shared runner cartridge/DMA layer.
+
+- Immediate source: https://github.com/SupraBT/StarOceanSNESRecomp
+- Declared source lineage in that file: bsnes-plus / Andreas Naive S-DD1
+  decompression research
+- Additional public lineage: Snes9x S-DD1 decompressor by Brad Jorsch, with
+  research by Andreas Naive and John Weidman
+- License status: review required before treating this as generally
+  redistributable framework code. The known public lineage includes
+  non-commercial and GPL-family emulator code, so downstream distribution must
+  satisfy the applicable original license terms.
+
+### Derivation / modifications
+
+- Wired the chip through `Cart` as `CART_SDD1`, including reset, saveload, and
+  cart read/write dispatch.
+- Added S-DD1 MMC resolution for `$C0-$FF` ROM windows and the `$4800-$4807`
+  CPU-visible register window.
+- Added DMA-register spying and per-channel decompressed byte feeding so S-DD1
+  transfers can populate PPU destinations through the existing DMA engine.
+
 ## LakeSnes — 65816 CPU core
 
 `runner/src/snes/interp816.{c,h}`, the 65816 interpreter backing the
@@ -458,3 +482,16 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## third_party/gl_core — OpenGL 3.1 core loader
+
+`third_party/gl_core/gl_core_3_1.{c,h}` is generated output from
+[glLoadGen](https://github.com/Alfonse/glLoadGen) (Jason McKesson, "Alfonse"),
+an OpenGL loader generator. glLoadGen is distributed under the MIT licence and
+its generated loaders are explicitly unencumbered — the generator's own
+documentation places no restriction on the output.
+
+It arrived here from the desktop hosts of the SNES ports, seven of which
+carried byte-identical copies of these two files alongside byte-identical
+copies of the GL presenter that uses them. It is vendored once, here, so that
+`runner/src/desktop/opengl.c` has a loader to call and a port does not.

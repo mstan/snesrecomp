@@ -38,6 +38,18 @@ static const uint16 kDefaultKbdControls[kKeys_Total] = {
   A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), N, N, _(SDLK_f), _(SDLK_r), A(SDLK_w),
   // VolumeUp VolumeDown
   0, 0,
+  /* SaveStateMenu — deliberately UNBOUND by default.
+   *
+   * recomp-ui offers F7 for it, but on SNES F1..F10 are already the ten
+   * LoadState slots above, so a built-in F7 default would collide and
+   * KeyMapHash_Add would drop one of them with a "Duplicate key" line. A port
+   * that wants the menu on F7 says so in its own config.ini [KeyMap]
+   * (SaveStateMenu = F7), which is an explicit trade its player can see,
+   * rather than one silently made for every port in the scaffold. */
+  0,
+  /* Rewind — unbound for exactly the same reason. recomp-ui offers F8, which
+   * is LoadState slot 8 in the table above. */
+  0,
 };
 #undef _
 #undef A
@@ -58,6 +70,7 @@ static const KeyNameId kKeyNameId[] = {
   M(Load), M(Save),
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
+  S(SaveStateMenu), S(Rewind),
 };
 #undef S
 #undef M
@@ -289,6 +302,23 @@ static int GetIniSection(const char *s) {
     return 4;
   if (StringEqualsNoCase(s, "[GamepadMap]"))
     return 5;
+  if (StringEqualsNoCase(s, "[Netplay]"))
+    return 6;
+  if (StringEqualsNoCase(s, "[Controller]"))
+    return 7;
+  /* [Controller.<guid>] -- a saved per-device profile. The launcher owns
+   * these; the runner only needs to not treat them as a malformed file. Each
+   * one would otherwise print "Invalid .ini section" on every start. */
+  if (StringStartsWithNoCase(s, "[Controller."))
+    return 8;
+  /* HOST-owned sections, for the same reason as [Controller.<guid>] above:
+   * the runner does not read them, but a per-game host does (its own
+   * config reader opens the same file), and every one of them printed
+   * "Invalid .ini section" on every start. A section this core has no
+   * business parsing is not a malformed file. */
+  if (StringEqualsNoCase(s, "[Video]") ||
+      StringEqualsNoCase(s, "[Emulation]"))
+    return 9;
   return -1;
 }
 
@@ -319,6 +349,21 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
         }
       }
     }
+  } else if (section == 7) {
+    if (StringEqualsNoCase(key, "SourceP1")) {
+      g_config.player_src[0] = (int)strtol(value, (char**)NULL, 10);
+      return true;
+    } else if (StringEqualsNoCase(key, "SourceP2")) {
+      g_config.player_src[1] = (int)strtol(value, (char**)NULL, 10);
+      return true;
+    }
+    /* GuidPn / DeadzonePn are the launcher's business; accepted silently so
+     * the runner does not report the launcher's own keys as unknown. */
+    return true;
+  } else if (section == 8) {
+    return true;                 /* saved profile; launcher-owned */
+  } else if (section == 9) {
+    return true;                 /* host-owned; this core does not read it */
   } else if (section == 1) {
     if (StringEqualsNoCase(key, "WindowSize")) {
       char *s;
@@ -401,6 +446,12 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
     } else if (StringEqualsNoCase(key, "SkipLauncher")) {
       return ParseBool(value, &g_config.skip_launcher);
     }
+  } else if (section == 6) {
+    if (StringEqualsNoCase(key, "PlayerName")) {
+      snprintf(g_config.netplay_player_name,
+               sizeof(g_config.netplay_player_name), "%s", value);
+      return true;
+    }
   } else if (section == 4) {
   }
   return false;
@@ -461,6 +512,13 @@ void ParseConfigFile(const char *filename) {
    * = false` in config.ini overrides this. */
   g_config.enable_gamepad[0] = true;
   g_config.enable_gamepad[1] = true;
+  /* Seeded BEFORE the file is read, so a config.ini with no [Controller]
+   * section behaves exactly as it did before the section existed: player 1 on
+   * the keyboard, player 2 silent until someone assigns it a device. Leaving
+   * these zero would have read as "no slot uses the keyboard" and taken the
+   * keyboard away from every existing install. */
+  g_config.player_src[0] = 1;   /* keyboard */
+  g_config.player_src[1] = 0;   /* none */
   g_config.gamepad_deadzone = 10000;
   g_config.display_aspect = kSnesDisplayAspect_Crt4x3;
   g_config.skip_launcher = false;
@@ -600,6 +658,7 @@ void WriteConfigFile(const char *filename) {
     { "GamepadMap", "EnableGamepad2" },
     { "General",    "SkipLauncher" },
     { "GamepadMap", "GamepadDeadzone" },
+    { "Netplay",    "PlayerName" },
   };
   const int N = (int)countof(kvs);
   static const char *const kDisplayAspectNames[kSnesDisplayAspect_Count] = {
@@ -621,6 +680,7 @@ void WriteConfigFile(const char *filename) {
   snprintf(kvs[9].val, sizeof(kvs[9].val), "%s", g_config.enable_gamepad[1] ? "true" : "false");
   snprintf(kvs[10].val, sizeof(kvs[10].val), "%d", g_config.skip_launcher ? 1 : 0);
   snprintf(kvs[11].val, sizeof(kvs[11].val), "%d", g_config.gamepad_deadzone);
+  snprintf(kvs[12].val, sizeof(kvs[12].val), "%s", g_config.netplay_player_name);
 
   char *data = NULL;
   long sz = 0;

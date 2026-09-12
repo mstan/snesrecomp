@@ -1,5 +1,7 @@
 /*
- * S-DD1 chip emulation — faithful port of bsnes-plus (Andreas Naive algorithm).
+ * S-DD1 chip emulation, extracted from the StarOceanSNESRecomp vendored runner.
+ * The file's declared lineage is bsnes-plus / Andreas Naive S-DD1 research;
+ * see THIRD_PARTY_ATTRIBUTION.md before distributing this as framework code.
  *
  * Two entry points:
  *   sdd1_decompress()        — whole-block decompression (CPU reads via $C0-$FF)

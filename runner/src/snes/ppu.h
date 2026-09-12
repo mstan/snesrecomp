@@ -41,7 +41,28 @@ enum {
   // Number of stopped frames tolerated after a moving unhinted OBJ reaches the
   // left widened margin.
   kPpuWsOamMovingGraceFrames = 4,
+  // A layer may need more than one authored-world span per frame (e.g. an
+  // arena strip above a status bar and a second one below it).
+  kPpuWsWorldBands = 2,
+  // Elastic anchor bands (see PpuSetWidescreenLayerElasticBand). A raster
+  // status bar needs one band per tile row whose horizontal layout differs,
+  // plus one identity band per transitional line: GWED's fight HUD uses five.
+  kPpuWsElasticBands = 6,
+  // Piecewise segments per elastic band. Five is what a symmetric
+  // rigid/elastic/centre/elastic/rigid split costs; the spare room is for
+  // layouts that need more than one stretchable run per side.
+  kPpuWsElasticSegs = 8,
 };
+
+// One piece of an elastic anchor band's horizontal mapping: destination
+// columns [dstX0,dstX1) of the widened line are produced from source columns
+// [srcX0,srcX1) of the native 256-px rendered line. Equal widths copy 1:1 --
+// a RIGID segment, shifted if dstX0 != srcX0. A wider destination resamples
+// (nearest neighbour, integer math) -- an ELASTIC segment.
+typedef struct PpuWsElasticSeg {
+  int16_t srcX0, srcX1;   // source columns, within [0,256]
+  int16_t dstX0, dstX1;   // destination columns, within [-extraLeft,256+extraRight]
+} PpuWsElasticSeg;
 
 typedef uint16_t PpuZbufType;
 
@@ -235,6 +256,17 @@ struct Ppu {
   uint8_t wsAnchorRightStart[kPpuWsAnchorBands][4];
   // Skip offscreen staging columns before sampling a layer's side margins.
   uint8_t wsMarginGapL[4], wsMarginGapR[4];
+  // Authored-world spans, in tilemap pixels, for the world-mirror bands (see
+  // PpuSetWidescreenLayerWorldMirrorBand). y1<=y0 or right<=left = off.
+  uint8_t wsWorldY0[kPpuWsWorldBands][4], wsWorldY1[kPpuWsWorldBands][4];
+  uint16_t wsWorldLeft[kPpuWsWorldBands][4];
+  uint16_t wsWorldRight[kPpuWsWorldBands][4];
+  // Piecewise horizontal remaps for the elastic anchor bands (see
+  // PpuSetWidescreenLayerElasticBand). nseg == 0 or y1 <= y0 = slot off.
+  uint8_t wsElasticY0[kPpuWsElasticBands][4];
+  uint8_t wsElasticY1[kPpuWsElasticBands][4];
+  uint8_t wsElasticNSeg[kPpuWsElasticBands][4];
+  PpuWsElasticSeg wsElasticSeg[kPpuWsElasticBands][4][kPpuWsElasticSegs];
   // Treat [left_px, 256-right_px) as a layer's authentic visible viewport
   // when a host line enhancer supplies the expanded scene. This lets the
   // layer's normally hidden/blank native edge columns reveal lower layers.
@@ -405,6 +437,58 @@ static inline int PpuWidescreenLayerExtra(
   return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
 }
 
+// Which world-mirror band, if any, governs BG(layer+1) on scanline y.
+// Returns the band slot, or -1 for natural (unreflected) tilemap rendering.
+// Deliberately inert unless a side margin is actually live, and every other
+// per-line policy wins over this one: on a line the layer does not widen
+// (layer mask, clamp, mirror, repeat, stretch, BG3-widen) there is no margin
+// to reflect into, and the line's hScroll may not even be the world camera --
+// a raster-split status bar pinned to hScroll 0 is the usual case.
+static inline int PpuWidescreenLayerWorldBandAt(
+    const Ppu *ppu, unsigned int layer, int y) {
+  if (layer >= 4 || !(ppu->extraLeftCur | ppu->extraRightCur))
+    return -1;
+  int widest = ppu->extraLeftCur > ppu->extraRightCur ? ppu->extraLeftCur
+                                                      : ppu->extraRightCur;
+  if (!PpuWidescreenLayerExtra(ppu, layer, y, widest))
+    return -1;
+  for (unsigned int slot = 0; slot < kPpuWsWorldBands; slot++) {
+    if (ppu->wsWorldY1[slot][layer] > ppu->wsWorldY0[slot][layer] &&
+        y >= ppu->wsWorldY0[slot][layer] &&
+        y < ppu->wsWorldY1[slot][layer] &&
+        ppu->wsWorldRight[slot][layer] > ppu->wsWorldLeft[slot][layer])
+      return (int)slot;
+  }
+  return -1;
+}
+
+// Which elastic anchor band, if any, governs BG(layer+1) on scanline y.
+// Returns the band slot, or -1 for the ordinary (unremapped) merge.
+// Inert unless a side margin is live. Deliberately shares the world band's
+// precedence rule -- clamp band, layer mask, mirror/repeat/stretch and the
+// BG3-widen gate all win over this one -- so a game excludes a line from the
+// remap exactly the way it excludes one from a world band. Where the two do
+// overlap the elastic band wins, because it is the more specific statement
+// about the same scanline: the world band describes a scrolling plane and the
+// elastic band a raster-split status bar pinned to its own scroll.
+static inline int PpuWidescreenLayerElasticBandAt(
+    const Ppu *ppu, unsigned int layer, int y) {
+  if (layer >= 4 || !(ppu->extraLeftCur | ppu->extraRightCur))
+    return -1;
+  int widest = ppu->extraLeftCur > ppu->extraRightCur ? ppu->extraLeftCur
+                                                      : ppu->extraRightCur;
+  if (!PpuWidescreenLayerExtra(ppu, layer, y, widest))
+    return -1;
+  for (unsigned int slot = 0; slot < kPpuWsElasticBands; slot++) {
+    if (ppu->wsElasticNSeg[slot][layer] &&
+        ppu->wsElasticY1[slot][layer] > ppu->wsElasticY0[slot][layer] &&
+        y >= ppu->wsElasticY0[slot][layer] &&
+        y < ppu->wsElasticY1[slot][layer])
+      return (int)slot;
+  }
+  return -1;
+}
+
 
 enum {
   kWindow1Inversed = 1,
@@ -435,10 +519,61 @@ void ppu_rasterRenderBegin(Ppu *ppu);
 int  ppu_rasterTakeHdmaen(uint8_t *out);
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
 void ppu_rasterApplyLine(Ppu *ppu, int line);
+
+/* Scanout latch bypass — set by the debug server around render_inject so an
+ * injected OAM/CGRAM state is rendered as given. A frame-model host that
+ * latches OAM/CGRAM at the frame's start (hardware scans out the state as of
+ * line 0; a mid-frame DMA below the sprites belongs to the NEXT scanout)
+ * must honor this flag in its draw_ppu_frame and render the LIVE state when
+ * it is set. Default 0. */
+extern int g_ppu_scanout_latch_bypass;
+int  ppu_rasterDebugDump(char *out, int cap);
+
+/* Raster journal — per-line replay of mid-frame INIDISP writes for frame-model
+ * hosts. See the block comment in ppu.c. Host calls Begin after its
+ * vblank-edge work and ApplyLine in its render loop; the register write path
+ * calls Record with the beam line. */
+void ppu_rasterBegin(Ppu *ppu);
+void ppu_rasterRenderBegin(Ppu *ppu);
+int  ppu_rasterTakeHdmaen(uint8_t *out);
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
+void ppu_rasterApplyLine(Ppu *ppu, int line);
 int  ppu_rasterDebugDump(char *out, int cap);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 void PpuResetWidescreenOamHistory(Ppu *ppu);
+
+/* Rollback seam for PPU state that lives WITHIN a frame.
+ *
+ * ppu_saveload serializes the register window inidisp..cgwsel and the
+ * cgram/oam/vram memories. Everything below sits outside it, correctly so for
+ * a SAVESTATE: it is taken at a frame boundary, where ppu_handleVblank has
+ * just reloaded the OAM write port from oamaddl/oamaddh and the widescreen
+ * classifier can re-seed from the next frame.
+ *
+ * A ROLLBACK snapshot is taken MID-frame -- run-ahead and netplay resim both
+ * snapshot after the CPU half of the frame and before the render half that
+ * calls ppu_handleVblank -- so this state is live across exactly the boundary
+ * being rewound. Leaving it out let a speculative frame's $2104 writes walk
+ * oamAdr forward and kept that walk after the restore, so the real frame then
+ * wrote sprite attributes to the wrong OAM slots. */
+typedef struct PpuRollbackResidue {
+  uint8_t  oamAdr;
+  uint8_t  oamInHigh;
+  uint8_t  oamSecondWrite;
+  uint8_t  oamBuffer;
+  /* Presentation-only, and deliberately NOT digested (a digest carries the
+   * simulation; peers may render differently). Restored anyway so a rewind
+   * reproduces the same picture, which is the whole point of run-ahead. */
+  int16_t  wsOamMotionLastLine;
+  int16_t  wsOamMotionX[128];
+  uint32_t wsOamMotionSig[128];
+  uint8_t  wsOamMotionSeen[16];
+  uint8_t  wsOamMotionGrace[128];
+} PpuRollbackResidue;
+
+void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out);
+void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in);
 
 // Replace stale BG1 tilemap pixels in widened side margins before final
 // composition. The callback is host-only and runs independently for main and
@@ -628,5 +763,121 @@ void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
 // framebuffer padding that was hidden on the original display.
 void PpuSetWidescreenLayerViewportInset(Ppu *ppu, uint8_t layer,
                                         uint8_t left_px, uint8_t right_px);
+
+// Reflect BG(layer+1) about the edges of its AUTHORED WORLD rather than about
+// the viewport edge, on scanlines [y0,y1).
+//
+// PpuSetWidescreenLayerMirror/RepeatBand fold the rendered native scanline
+// back at screen x=0/255. That is right for a layer whose content ends where
+// the original screen ends, and wrong for a bounded arena: mid-scroll the
+// margins of such a layer hold genuine authored tilemap art, and folding at
+// the viewport edge throws it away.
+//
+// This policy leaves those columns alone and only intervenes where the
+// tilemap runs out of authored content. Per pixel, with `x` the tilemap X
+// this line renders at (the line's own hScroll + screen x, in map pixels and
+// before the map's own wrap):
+//   x <  world_left_px   ->  sample 2*world_left_px  - 1 - x
+//   x >= world_right_px  ->  sample 2*world_right_px - 1 - x
+//   otherwise            ->  render naturally
+// A pixel whose reflection also lands outside [left,right) is left
+// transparent, so lower layers and the backdrop still fill it.
+//
+// The rule is applied uniformly to margin and authentic columns; in practice a
+// game clamps the camera so only margins can leave the world. Phase comes from
+// the scroll the PPU rendered the line with, never from a WRAM camera mirror
+// (WIDESCREEN_PATTERNS P1). Presentation-only: no emulated register is
+// touched, the fields live outside every savestate span, and the policy is
+// inert while the widescreen margin is 0.
+//
+// Applies to the Mode-1 policy-dispatched 4bpp/2bpp paths, including their
+// big-tile and mosaic variants. Requires kPpuRenderFlags_NewRenderer.
+// Re-apply per frame like the other widescreen setters; slot 0 is the band set
+// by the convenience function.
+void PpuSetWidescreenLayerWorldMirrorBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                          uint8_t y1, uint16_t world_left_px,
+                                          uint16_t world_right_px);
+void PpuSetWidescreenLayerWorldMirrorBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px);
+
+// ELASTIC ANCHOR BANDS -- anchor a raster status bar's chrome to the widened
+// viewport edges and bridge the gap that opens by stretching only the
+// material that can survive being stretched.
+//
+// PpuSetWidescreenLayerAnchorBand already moves a status bar's left and right
+// chunks out to the expanded edges. That is only half an answer whenever the
+// bar is ONE continuous graphic with no transparent column to hide the seam:
+// anchoring then opens an `extra`-px hole on each side of the centre group,
+// through which lower layers and the backdrop show. PpuSetWidescreenLayer-
+// StretchBand closes such a hole, but it scales the WHOLE line, which
+// distorts every glyph on it.
+//
+// An elastic band splits the difference per column. On scanlines [y0,y1) of
+// BG(layer+1), destination column x in [-extraLeft, 256+extraRight) is
+// produced from the native 256-px rendered line by an explicit piecewise map:
+//   for the segment whose [dstX0,dstX1) contains x, with o = x - dstX0,
+//   sw = srcX1 - srcX0 and dw = dstX1 - dstX0:
+//       sx = srcX0 + ((2*o + 1) * sw) / (2 * dw)
+// i.e. nearest neighbour about each destination pixel's centre, in integer
+// arithmetic (no rounding mode, no float, identical on every host). Equal
+// source and destination widths make that an exact 1:1 copy, so a RIGID
+// segment is byte-exact wherever it is placed -- that is what keeps names,
+// digits, labels and markers pixel-perfect while they move outward. A wider
+// destination resamples, which is exactly invisible when the source run's
+// columns are identical to each other, and which preserves a gauge's fill
+// FRACTION when the run is a bar: k filled of n source columns become
+// round(k*dw/n) of dw destination columns within a pixel, so full stays full,
+// empty stays empty and 37% stays 37%. Centre sampling rather than
+// floor(o*sw/dw) is what makes the map symmetric under reflection, so a
+// mirror-image pair of gauges stretches to the same length.
+//
+// Segments must be ascending and non-overlapping in destination space; a band
+// that is not is rejected outright rather than half-applied. Destination
+// columns no segment covers stay transparent, so a band can also express a
+// pure clamp (one segment {0,256,0,256}) for a transitional line.
+//
+// Implemented at the merge step of the Mode-1 policy dispatchers, so it covers
+// the 4bpp, 2bpp, big-tile and mosaic draw paths in one place. Only source
+// columns [0,256) are sampled -- the native picture the game authored, never
+// the margin columns the widened render happens to reach. Presentation-only:
+// no emulated register is touched, the fields live outside every savestate
+// span, and the whole policy is inert while the margin is 0. Requires
+// kPpuRenderFlags_NewRenderer. Re-apply per frame like the other widescreen
+// setters (PpuSetExtraSpace* clears them); slot 0 is the band set by the
+// convenience form.
+//
+// A layer must not carry an elastic band and an anchor band on the same line:
+// the anchor band stands down where an elastic band is live, since the
+// elastic band's rigid segments already express the anchoring.
+void PpuSetWidescreenLayerElasticBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                      uint8_t y1,
+                                      const PpuWsElasticSeg *segs,
+                                      uint8_t nseg);
+void PpuSetWidescreenLayerElasticBandSlot(Ppu *ppu, uint8_t slot,
+                                          uint8_t layer, uint8_t y0,
+                                          uint8_t y1,
+                                          const PpuWsElasticSeg *segs,
+                                          uint8_t nseg);
+
+// Build and install the symmetric five-segment layout a centred status bar
+// wants, from the two stretchable source runs alone:
+//
+//   [0, left_elastic_x0)             rigid, shifted out to the left edge
+//   [left_elastic_x0, ..._x1)        elastic, absorbs the left margin
+//   [left_elastic_x1, right_..._x0)  rigid, unshifted (holds the centre group)
+//   [right_elastic_x0, ..._x1)       elastic, absorbs the right margin
+//   [right_elastic_x1, 256)          rigid, shifted out to the right edge
+//
+// The elastic runs are what a game measures: pick spans whose columns are
+// identical to one another (plain chrome) or which are a gauge's interior.
+// Empty runs (x1 <= x0 for both sides) install the identity/clamp band.
+// Returns false and leaves the slot cleared if the spans are not ordered
+// 0 <= lx0 < lx1 <= rx0 < rx1 <= 256. Reads the CURRENT margin
+// (extraLeftCur/extraRightCur), so it must be called after PpuSetExtraSpace*.
+bool PpuSetWidescreenLayerElasticSplitBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t left_elastic_x0, uint16_t left_elastic_x1,
+    uint16_t right_elastic_x0, uint16_t right_elastic_x1);
 
 #endif

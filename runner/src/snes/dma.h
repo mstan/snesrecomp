@@ -43,6 +43,13 @@ struct Dma {
   /* Transient state for channels enabled between frame initializations. Keep
    * this before channel so dma_saveload's serialized channel region remains
    * byte-for-byte compatible with existing saves. */
+  /* Bitmask of channels whose HDMA was switched on part-way through a frame
+   * and still owe their one-slot table initialization. See dma_doHdma().
+   *
+   * Declared BEFORE `channel` on purpose: dma_saveload() serializes from
+   * `channel` to the end of the struct, so putting it here leaves the
+   * savestate layout byte-identical. That is also the honest place for it --
+   * it is transient within-frame sequencing, not guest-visible state. */
   uint8_t hdmaPendingInit;
   DmaChannel channel[8];
   uint32_t dmaTimer;
@@ -52,6 +59,18 @@ struct Dma {
 Dma* dma_init(Snes* snes);
 void dma_free(Dma* dma);
 void dma_reset(Dma* dma);
+/* Rollback seam for `hdmaPendingInit`.
+ *
+ * It is deliberately outside dma_saveload's range (see the field), which is
+ * right for a SAVESTATE -- that is taken at a frame boundary, where no
+ * within-frame sequencing is outstanding. A ROLLBACK snapshot is not:
+ * run-ahead and netplay resim both snapshot between the CPU half of a frame
+ * and the render half that runs dma_doHdma(), so a channel switched on by the
+ * CPU half still owes its table init when the snapshot is taken. Restoring
+ * without it makes the replayed frame initialise a different set of channels
+ * than the frame it replaces. */
+uint8_t dma_hdma_pending_init_get(const Dma* dma);
+void dma_hdma_pending_init_set(Dma* dma, uint8_t mask);
 uint8_t dma_read(Dma* dma, uint16_t adr); // 43x0-43xf
 void dma_write(Dma* dma, uint16_t adr, uint8_t val); // 43x0-43xf
 void dma_doDma(Dma* dma);
@@ -59,6 +78,20 @@ void dma_initHdma(Dma* dma);
 void dma_doHdma(Dma* dma);
 void dma_primeHdmaFirstLine(Dma* dma);
 uint64_t dma_hdmaMasterEstimate(Dma* dma);
+/* Per-scanline HDMA. A frame-model host owns these edges: call dma_initHdma()
+ * once at the top of the visible field and dma_doHdma() before rendering each
+ * scanline (FRAME_MODEL_HOSTS.md). */
+void dma_initHdma(Dma* dma);
+void dma_doHdma(Dma* dma);
+/* Perform the first HDMA transfer's REGISTER WRITES only, leaving all channel
+ * state (table cursor, repCount, doTransfer) untouched. Hardware's vblank
+ * init transfers each channel's first value before any visible pixel; a
+ * frame-model render loop that steps dma_doHdma after each line otherwise
+ * leaves its first rendered row with the pre-HDMA register state — measured
+ * as a one-line bright strip above Gundam Wing's intro letterbox. Call
+ * between dma_initHdma and the first rendered line. */
+void dma_primeHdmaFirstLine(Dma* dma);
+uint64_t dma_hdmaMasterEstimate(Dma* dma); /* per-frame CPU-stall estimate */
 bool dma_cycle(Dma* dma);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
 void dma_saveload(Dma *dma, SaveLoadInfo *sli);

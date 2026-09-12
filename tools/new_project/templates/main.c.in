@@ -1,0 +1,666 @@
+/*
+ * @DISPLAY_NAME@ — desktop host.
+ *
+ * Deliberately small: ROM resolution, a window, a texture, a keyboard map,
+ * and the frame loop the framework expects (capture input -> RtlRunFrame ->
+ * present). snesrecomp/runner/src/desktop/mmx23_host_main.inc is the
+ * fully-featured reference host — netplay barrier, shaders, save states,
+ * gamepad config — and is worth reading before growing this one.
+ *
+ * Nothing here ever ships a ROM. The player supplies one, and the host's job
+ * is to make that easy rather than to exit with a usage line:
+ *
+ *   1. The recomp-ui GUI launcher (built when the project has the recomp-ui
+ *      submodule) picks and verifies one, alongside display/audio/input. It
+ *      opens by default; a ROM on the command line preloads it rather than
+ *      skipping it. `--no-launcher` (or SDL_VIDEODRIVER=dummy) suppresses it
+ *      for scripted runs, `--launcher` forces it.
+ *   2. Otherwise snesrecomp_launcher_resolve_rom_sha256() takes the
+ *      positional argument, then a copy beside the executable, then the
+ *      <exe_dir>/rom.cfg cache, then a native file picker.
+ *
+ * Both check what they are handed against the digests in rom_identity.txt —
+ * the same ones tools/regen.sh generated this C from — so a ROM that cannot
+ * have produced this executable is caught at the door rather than as
+ * mis-execution ten frames in.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common_rtl.h"
+#include "common_cpu_infra.h"
+#include "widescreen.h"
+#include "game_rtl.h"
+#include "snes/ppu.h"
+#include "desktop/sdl_compat.h"
+#include "host_paths.h"      /* snesrecomp_exe_dir_path */
+#include "launcher.h"        /* snesrecomp_launcher_resolve_rom_sha256 */
+#include "launcher_cache.h"  /* snesrecomp_rom_cache_read */
+#include "snesrecomp_rom_identity.h" /* generated from rom_identity.txt */
+
+#if SNESRECOMP_ENABLE_MODS
+/* Mod packages -- always built (CMakeLists.txt sets SNESRECOMP_ENABLE_MODS).
+ * The catalog is mods/preloaded beside the executable, staged by the build;
+ * an empty one is valid. The runtime owns installs, selection and the plan;
+ * this host only initializes it, hands its provider to the launcher, commits
+ * the plan against the ROM, and activates plugins once the guest exists. */
+#include "mod_runtime.h"
+static int g_mods_ready;
+#endif
+
+#if defined(RECOMP_LAUNCHER)
+/* Defined by recomp_target_launcher_ui() in CMakeLists.txt. Absent when the
+ * project was scaffolded with --no-recomp-ui, and every launcher block in
+ * this file compiles out with it. */
+#include "recomp_launcher.h"
+#include "launcher_profile.h"
+/* Generate & rebuild, framework-owned. Speaks RecompLauncherCGameInfo, so it
+ * only exists where the launcher does. */
+#include "snesrecomp_codegen_host.h"
+#endif
+
+#if defined(SNES_HAS_LOBBY_CLIENT)
+/* Delay-sync netplay + MotK lobby. Defined by snesrecomp_enable_recomp_net()
+ * in CMakeLists.txt (scaffolded with --netplay); without it every netplay
+ * block compiles out and the launcher's netplay button stays hidden. The
+ * fully-featured reference (rematch, soft-return, dual viewport) is
+ * MetalWarriorsSNESRecomp's src/main.c. */
+#include "snes_netplay.h"
+#include "snes_host_lobby.h"
+#include "snes_host_app.h"
+#if defined(SNESRECOMP_NET_ROLLBACK)
+#include "netplay/snes_netplay_rb.h"
+#endif
+
+static SnesNetplayConfig g_netplay_cfg;
+static int g_netplay_pending;    /* launcher armed a session; start after SnesInit */
+static int g_netplay_from_lobby; /* admit pump waits for the lobby peer */
+
+static void host_lobby_ensure_init(void)
+{
+    static int once;
+    SnesHostLobbyIdentity id;
+    SnesHostLobbyOpts opts;
+    if (once)
+        return;
+    once = 1;
+    memset(&id, 0, sizeof(id));
+    id.game_name = "@DISPLAY_NAME@";
+    id.game_version = SNES_GAME_VERSION;
+    id.lan_registry_path = "netplay_lan_lobby.txt";
+    id.default_lobby_name = "Netplay Lobby";
+    memset(&opts, 0, sizeof(opts));
+    opts.rematch_set_ready = 1;
+    if (snes_host_lobby_init(&id, &opts) != 0)
+        fprintf(stderr, "netplay: snes_host_lobby_init failed\n");
+}
+
+static uint16_t read_keyboard(void);
+
+static uint16_t netplay_capture_pad(void *ctx)
+{
+    (void)ctx;
+    return (uint16_t)(read_keyboard() & 0x0fffu);
+}
+
+static void netplay_poll_events(void *ctx, int *want_soft_exit)
+{
+    SDL_Event event;
+    (void)ctx;
+    while (SDL_PollEvent(&event)) {
+        if (event.type == SDL_QUIT)
+            *want_soft_exit = 2;
+        if (event.type == SDL_KEYDOWN &&
+            SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
+            *want_soft_exit = 1;
+    }
+}
+#endif /* SNES_HAS_LOBBY_CLIENT */
+
+#define GAME_WIDTH  256
+#define GAME_HEIGHT 224
+
+extern Ppu *g_ppu;
+
+/* The PPU rasterizes into this, not straight into the host texture: the
+ * texture is only mapped for the instant of the present, while the line
+ * renderer needs a stable target for the whole field (and the raster IRQ
+ * runs guest code in the middle of it). Sized for the runner's maximum
+ * side-space budget so a widescreen build needs no second buffer. */
+static uint8_t g_my_pixels[kPpuBufWidth * 4 * 240];
+
+/* The framework calls this to hand the host a frame.
+ *
+ * Three steps, and leaving out any one of them produces a black window:
+ *
+ *   1. PpuBeginDrawing points the PPU at a render target. Without it
+ *      ppu->renderBuffer is NULL and the first ppu_runLine segfaults.
+ *   2. The game's own draw_ppu_frame() rasterizes the field — ppu_runLine
+ *      per line, HDMA, the raster IRQ. Nothing else in a production build
+ *      calls it: common_rtl.c's call site is inside #ifdef SNES_COSIM, so
+ *      the host is the only caller there is.
+ *   3. RtlWidescreenPresent copies the result into the mapped texture.
+ *
+ * Steps 1 and 2 were both missing here until 2026-09, so every project this
+ * template produced presented an untouched texture forever, and read as
+ * "the recompiler does not boot my game". */
+void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags)
+{
+    if (!g_ppu)
+        return;
+    PpuBeginDrawing(g_ppu, g_my_pixels, GAME_WIDTH * 4, render_flags);
+    if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+        g_rtl_game_info->draw_ppu_frame();
+    if (!g_ppu->renderBuffer)
+        return;
+    RtlWidescreenPresent(pixel_buffer, pitch, g_ppu->renderBuffer,
+                         GAME_WIDTH, GAME_HEIGHT);
+}
+
+/* Runner input word: 12 button bits per seat.
+ * B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R. */
+static uint16_t read_keyboard(void)
+{
+    const uint8_t *keys = snesrecomp_sdl_get_keyboard_state();
+    uint16_t pad = 0;
+    if (!keys)
+        return 0;
+    if (keys[SDL_SCANCODE_Z])      pad |= 1u << 0;   /* B */
+    if (keys[SDL_SCANCODE_A])      pad |= 1u << 1;   /* Y */
+    if (keys[SDL_SCANCODE_RSHIFT]) pad |= 1u << 2;   /* Select */
+    if (keys[SDL_SCANCODE_RETURN]) pad |= 1u << 3;   /* Start */
+    if (keys[SDL_SCANCODE_UP])     pad |= 1u << 4;
+    if (keys[SDL_SCANCODE_DOWN])   pad |= 1u << 5;
+    if (keys[SDL_SCANCODE_LEFT])   pad |= 1u << 6;
+    if (keys[SDL_SCANCODE_RIGHT])  pad |= 1u << 7;
+    if (keys[SDL_SCANCODE_X])      pad |= 1u << 8;   /* A */
+    if (keys[SDL_SCANCODE_S])      pad |= 1u << 9;   /* X */
+    if (keys[SDL_SCANCODE_C])      pad |= 1u << 10;  /* L */
+    if (keys[SDL_SCANCODE_V])      pad |= 1u << 11;  /* R */
+    return pad;
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static uint8 *read_rom(const char *path, int *size_out)
+{
+    FILE *file = fopen(path, "rb");
+    long size;
+    uint8 *data;
+
+    if (!file) {
+        fprintf(stderr, "@PROJECT_NAME@: cannot open ROM: %s\n", path);
+        return NULL;
+    }
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0) {
+        fclose(file);
+        return NULL;
+    }
+    data = (uint8 *)malloc((size_t)size);
+    if (!data || fread(data, 1, (size_t)size, file) != (size_t)size) {
+        free(data);
+        fclose(file);
+        fprintf(stderr, "@PROJECT_NAME@: short read: %s\n", path);
+        return NULL;
+    }
+    fclose(file);
+    *size_out = (int)size;
+    return data;
+}
+
+/* The identity carries the digests as text, because tools/regen.sh and the
+ * CI workflow read the same rom_identity.txt. The ROM checks want bytes.
+ * Returns NULL when the identity is unset or malformed, which the callers
+ * read as "cannot verify" rather than "verified". */
+static const uint8_t *expected_rom_sha256(uint8_t out[32])
+{
+    const char *hex = SNESRECOMP_ROM_EXPECTED_SHA256;
+    int i;
+
+    if (!hex || strlen(hex) != 64)
+        return NULL;
+    for (i = 0; i < 32; ++i) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return NULL;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return out;
+}
+
+static int expected_rom_crc32(uint32_t *out)
+{
+    const char *hex = SNESRECOMP_ROM_EXPECTED_CRC32;
+    uint32_t v = 0;
+    int i;
+
+    if (!hex || strlen(hex) != 8)
+        return 0;
+    for (i = 0; i < 8; ++i) {
+        int n = hex_nibble(hex[i]);
+        if (n < 0)
+            return 0;
+        v = (v << 4) | (uint32_t)n;
+    }
+    *out = v;
+    return 1;
+}
+
+/* The dump this project was generated from, if the player parked a copy next
+ * to the executable or in the working directory. Not a requirement — it is
+ * the habit `tools/regen.sh` documents, and skipping the prompt for someone
+ * who already followed it is the whole point. */
+static int find_rom_beside_exe(char *out, size_t cap)
+{
+    const char *name = SNESRECOMP_ROM_FILE;
+    FILE *f;
+
+    if (!name || !name[0])
+        return 0;
+    if (snesrecomp_exe_dir_path(name, out, cap)) {
+        f = fopen(out, "rb");
+        if (f) {
+            fclose(f);
+            return 1;
+        }
+    }
+    f = fopen(name, "rb");
+    if (f) {
+        fclose(f);
+        snprintf(out, cap, "%s", name);
+        return 1;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+#if defined(RECOMP_LAUNCHER)
+/* Pre-boot GUI: ROM picker, display/audio/input settings, verification status.
+ * Returns 1 when `out` holds a ROM to boot, 0 to fall through to the
+ * text-mode resolve below, and -1 when the player chose to quit. */
+static int run_gui_launcher(const char *initial_rom, char *out, size_t cap)
+{
+    RecompLauncherCSettings ls;
+    RecompLauncherCGameInfo gi;
+    uint8_t sha[32];
+    uint32_t crc;
+    char assets_dir[1024];
+    int lr;
+
+    /* recomp-ui resolves its staged assets (assets/fonts, assets/img) relative
+     * to the executable; the argument exists for hosts with other layouts. */
+    if (!snesrecomp_exe_dir_path(".", assets_dir, sizeof(assets_dir)))
+        snprintf(assets_dir, sizeof(assets_dir), ".");
+
+    memset(&ls, 0, sizeof(ls));
+    ls.output_method = 2;      /* OpenGL */
+    ls.window_scale  = 3;      /* matches the game window opened below */
+    ls.enable_audio  = 1;
+    ls.audio_freq    = 32000;
+    ls.volume        = 100;
+    ls.player_src[0] = 1;      /* keyboard */
+
+    memset(&gi, 0, sizeof(gi));
+    /* One profile call sets the whole SNES identity — theme, pad art, platform
+     * label, ROM noun, capability set — so those can never drift apart. */
+    launcher_profile_apply("snes", &gi);
+    gi.name        = "@DISPLAY_NAME@";
+    gi.region      = "(@REGION@)";
+    gi.num_players = @PLAYERS@;
+    /* `sha` outlives the run_window call below, which is the only consumer. */
+    if (expected_rom_sha256(sha)) {
+        gi.known_sha256     = (const uint8_t (*)[32])&sha;
+        gi.num_known_sha256 = 1;
+    }
+    if (expected_rom_crc32(&crc)) {
+        gi.expected_crc     = crc;
+        gi.has_expected_crc = 1;
+    }
+#if SNESRECOMP_ENABLE_MODS
+    /* The Mods page appears only when the game supplies a provider; recomp-ui
+     * keeps its half hidden otherwise. */
+    gi.mods = g_mods_ready ? snes_mod_runtime_launcher_provider_c() : NULL;
+#endif
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    /* The netplay button is capability-gated: these two fields are what make
+     * the launcher show it. */
+    gi.netplay_supported = 1;
+    host_lobby_ensure_init();
+    gi.netplay = snes_host_lobby_callbacks();
+#endif
+
+    /* Wire "Generate & rebuild…". Zero configuration by design: generate and
+     * build are framework behavior, so a fix there reaches every port on a pin
+     * bump instead of needing one edit per port. No-ops when the SDK, CMake or
+     * the build tree is absent, which is the normal state of a shipped build. */
+    snesrecomp_codegen_host_autowire(&gi, gi.name);
+
+    out[0] = '\0';
+    lr = recomp_launcher_run_window("@WINDOW_TITLE@", &ls, &gi, assets_dir,
+                                    (initial_rom && initial_rom[0]) ? initial_rom
+                                                                    : NULL,
+                                    out, cap);
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    /* A lobby launch arms the session; snes_netplay_start() runs after
+     * SnesInit, once the guest exists. */
+    if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && ls.netplay_launch.enabled) {
+        SnesHostLaunchResult res;
+        snes_host_app_apply_launch(&ls.netplay_launch, &res);
+        g_netplay_cfg = res.net_cfg;
+        g_netplay_pending = 1;
+        g_netplay_from_lobby = 1;
+    }
+#endif
+    if (lr == RECOMP_LAUNCHER_RESULT_QUIT)
+        return -1;
+    if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && out[0])
+        return 1;
+    if (lr == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
+        /* The player generated sources and rebuilt: this binary is stale.
+         * Does not return on success — it execs the new build (or, on
+         * Windows, schedules a helper and exits so the .exe is unlocked). */
+        snesrecomp_codegen_host_relaunch_or_exit(out);
+        return -1;   /* only reached if the relaunch could not be performed */
+    }
+    /* UNAVAILABLE (assets or GL missing) means "the GUI produced no ROM" —
+     * resolve one the text-mode way. */
+    out[0] = '\0';
+    return 0;
+}
+#endif /* RECOMP_LAUNCHER */
+
+int main(int argc, char **argv)
+{
+    char rom_path[1024] = "";
+    char beside_exe[1024] = "";
+    uint8_t sha[32];
+    const uint8_t *want_sha = expected_rom_sha256(sha);
+    /* First non-flag argument, not argv[1]: the hosts in this ecosystem take
+     * their flags BEFORE the ROM (`<exe> --launcher <rom>`), so reading
+     * argv[1] here would see "--launcher" and conclude there is no ROM. */
+    int pos_arg = 0;
+    {
+        int ai;
+        for (ai = 1; ai < argc; ++ai) {
+            if (!argv[ai] || !argv[ai][0] || argv[ai][0] == '-') continue;
+            pos_arg = ai;
+            break;
+        }
+    }
+    int has_positional = (pos_arg != 0);
+    /* --launcher / --no-launcher, spelled as the reference host spells them
+     * (snesrecomp/runner/src/desktop/mmx23_host_main.inc).
+     *
+     * A positional ROM used to suppress the launcher outright, which was
+     * wrong in the one case that matters most: Studio ALWAYS knows the ROM
+     * and always passes it, so the launcher never appeared from the Build or
+     * Diagnostics tabs. A ROM on the command line says which ROM to use, not
+     * whether a human is present -- so it now preloads the launcher instead.
+     *
+     * Suppression stays explicit, because scripted harnesses launch as
+     * `<exe> <rom>` and expect to boot straight into the game; making the GUI
+     * unconditional would hang every one of them on a window nobody is
+     * watching. */
+    int force_launcher = 0, no_launcher = 0;
+    {
+        int i;
+        for (i = 1; i < argc; ++i) {
+            if (argv[i] && strcmp(argv[i], "--launcher") == 0) force_launcher = 1;
+            else if (argv[i] && strcmp(argv[i], "--no-launcher") == 0) no_launcher = 1;
+        }
+    }
+    int rom_size = 0;
+    uint8 *rom;
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+    int running = 1;
+
+    if (!has_positional)
+        find_rom_beside_exe(beside_exe, sizeof(beside_exe));
+
+#if SNESRECOMP_ENABLE_MODS
+    /* Before the launcher, which needs the provider to show the Mods page. */
+    {
+        char mods_dir[1024];
+        if (snesrecomp_exe_dir_path("mods/preloaded", mods_dir, sizeof(mods_dir))) {
+            g_mods_ready = snes_mod_runtime_initialize_c(
+                mods_dir, SNESRECOMP_ROM_GAME_ID, SNESRECOMP_ROM_EXPECTED_SHA256);
+            if (!g_mods_ready)
+                fprintf(stderr, "mods: unavailable: %s\n",
+                        snes_mod_runtime_last_error_c());
+        }
+    }
+#endif
+
+#if defined(RECOMP_LAUNCHER)
+    /* A dummy video driver means CI or a screenshot harness: there is no one
+     * to answer a GUI, and blocking on one would hang the job. */
+    {
+        const char *vd = getenv("SDL_VIDEODRIVER");
+        int headless = (vd && strcmp(vd, "dummy") == 0);
+
+        if (!headless && !no_launcher && (force_launcher || !has_positional)) {
+            /* Open on the ROM the player already has, so a second launch is
+             * PLAY rather than Change-ROM: the copy beside the executable
+             * first, else whatever the last run cached in rom.cfg. */
+            char hint[1024];
+
+            /* An explicit ROM outranks a copy beside the exe and the cache:
+             * --launcher with a ROM means "show me the launcher, loaded with
+             * THIS one". */
+            if (has_positional)
+                snprintf(hint, sizeof(hint), "%s", argv[pos_arg]);
+            else
+                snprintf(hint, sizeof(hint), "%s", beside_exe);
+            if (!hint[0] && !snesrecomp_rom_cache_read(hint, sizeof(hint)))
+                hint[0] = '\0';
+            {
+                int lr = run_gui_launcher(hint, rom_path, sizeof(rom_path));
+                if (lr < 0)
+                    return 0;          /* player quit from the launcher */
+            }
+        }
+    }
+#endif
+
+    /* Players supply their own ROM; none is shipped with this build. Without
+     * one from the GUI, resolve it the text-mode way: the positional argument,
+     * then the copy beside the executable, then <exe_dir>/rom.cfg, then a
+     * native file picker — each checked against the digests above. */
+    if (!rom_path[0]) {
+        char *resolve_argv[2];
+        int resolve_argc = 1;
+
+        resolve_argv[0] = argv[0];
+        if (has_positional) {
+            resolve_argv[1] = argv[pos_arg];
+            resolve_argc = 2;
+        } else if (beside_exe[0]) {
+            resolve_argv[1] = beside_exe;
+            resolve_argc = 2;
+        }
+        if (!snesrecomp_launcher_resolve_rom_sha256(resolve_argc, resolve_argv,
+                                                    rom_path, sizeof(rom_path),
+                                                    want_sha)) {
+            fprintf(stderr,
+                    "usage: %s [path-to-rom.sfc] [--launcher|--no-launcher]\n"
+                    "  --launcher     show the pre-boot launcher even with a ROM\n"
+                    "  --no-launcher  never show it (scripted runs)\n"
+                    "You must legally own a copy of @DISPLAY_NAME@.\n", argv[0]);
+            return 1;
+        }
+    }
+
+#if SNESRECOMP_ENABLE_MODS
+    /* Resolve the enabled features against THIS ROM and persist the plan. The
+     * launcher's Play does the same through the provider; this is the
+     * text-mode path, and a second commit is a no-op. A rejected plan (wrong
+     * ROM for a package, a plugin nothing registered) is a refusal, not a
+     * silent fallback. */
+    if (g_mods_ready && !snes_mod_runtime_commit_c(rom_path)) {
+        fprintf(stderr, "mods: plan rejected: %s\n",
+                snes_mod_runtime_last_error_c());
+        return 1;
+    }
+#endif
+
+    rom = read_rom(rom_path, &rom_size);
+    if (!rom)
+        return 1;
+
+    RtlRegisterGame(&kGameInfo);
+    if (!SnesInit(rom, rom_size)) {
+        fprintf(stderr, "@PROJECT_NAME@: SnesInit failed\n");
+        return 1;
+    }
+#if SNESRECOMP_ENABLE_MODS
+    /* Plugins act on a machine that exists: after SnesInit, before frame 1. */
+    if (g_mods_ready)
+        snes_mod_runtime_activate_plugins_c();
+#endif
+#if defined(SNES_HAS_LOBBY_CLIENT)
+    if (g_netplay_pending) {
+#if SNESRECOMP_ENABLE_MODS && defined(SNESRECOMP_NET_ROLLBACK)
+        /* A mod that patches guest memory is simulation state. The host
+         * publishes its effective set and every peer must confirm it before
+         * the match may start (snes_netplay_rb.h); two peers on different
+         * sets cannot stay in sync, so the netcode refuses with a reason
+         * instead of desyncing minutes in. */
+        if (g_mods_ready) {
+            static char s_modset[2048];
+            int need = snes_mod_runtime_effective_set_c(s_modset,
+                                                        sizeof(s_modset));
+            if (need >= 0 && need < (int)sizeof(s_modset))
+                snes_netplay_rb_set_modset(s_modset,
+                                           &snes_mod_runtime_check_set_c,
+                                           &snes_mod_runtime_adopt_set_c);
+            else
+                fprintf(stderr, "mods: effective set is %d bytes, too large "
+                        "to publish -- netplay cannot gate on it\n", need);
+        }
+#endif
+        int nrc = snes_netplay_start(&g_netplay_cfg);
+        if (nrc != 0)
+            fprintf(stderr,
+                    "netplay: snes_netplay_start failed (%d) — continuing "
+                    "offline\n", nrc);
+        g_netplay_pending = 0;
+    }
+#endif
+
+    /* snesrecomp_sdl_* wrap the SDL2/SDL3 API differences, so this host
+     * builds against either backend (-DSNESRECOMP_SDL_BACKEND=SDL2|SDL3). */
+    if (!snesrecomp_sdl_init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    window = snesrecomp_sdl_create_window("@WINDOW_TITLE@", GAME_WIDTH * 3,
+                                          GAME_HEIGHT * 3, 0);
+    renderer = window ? snesrecomp_sdl_create_renderer(window, false, true)
+                      : NULL;
+    texture = renderer
+        ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING,
+                            GAME_WIDTH, GAME_HEIGHT)
+        : NULL;
+    if (!window || !renderer || !texture) {
+        fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    while (running) {
+        SDL_Event event;
+        void *pixels = NULL;
+        int pitch = 0;
+        uint32 inputs;
+
+        while (SDL_PollEvent(&event)) {
+            /* SDL2 spellings: sdl_compat.h defines SDL_ENABLE_OLD_NAMES for
+             * SDL3, so these compile against either backend. The SDL3-only
+             * names (SDL_EVENT_QUIT, ...) do not. */
+            if (event.type == SDL_QUIT)
+                running = 0;
+            if (event.type == SDL_KEYDOWN &&
+                SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
+                running = 0;
+        }
+
+#if defined(SNES_HAS_LOBBY_CLIENT)
+        /* Netplay session: the delay-sync admit pump owns the frame cadence.
+         * Both seats' inputs come back merged from the netcode; on a stall
+         * the held framebuffer is re-presented so the window stays live. */
+        if (snes_netplay_active()) {
+            SnesHostBarrierHooks hooks;
+            int run = running;
+            int admitted;
+            memset(&hooks, 0, sizeof(hooks));
+            hooks.capture_local_pad = &netplay_capture_pad;
+            hooks.poll_events = &netplay_poll_events;
+            admitted = snes_host_barrier_admit(g_netplay_from_lobby, &run,
+                                               &hooks);
+            running = run;
+            if (!running)
+                break;
+            if (admitted) {
+                int burst = 0;
+                for (;;) {
+                    inputs = snes_netplay_published_inputs() |
+                             snes_netplay_active_mask();
+                    RtlRunFrame(inputs);
+                    snes_netplay_finish_frame();
+                    if (burst >= snes_host_catchup_budget())
+                        break;
+                    snes_netplay_stage_local(netplay_capture_pad(NULL));
+                    if (!snes_netplay_poll_admit())
+                        break;
+                    burst++;
+                }
+                if (snesrecomp_sdl_lock_texture(texture, NULL, &pixels,
+                                                &pitch)) {
+                    RtlDrawPpuFrame((uint8 *)pixels, (size_t)pitch, 0);
+                    SDL_UnlockTexture(texture);
+                }
+            }
+            /* Stalled: present the texture as-is — the held frame. */
+            SDL_RenderClear(renderer);
+            snesrecomp_sdl_render_texture(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
+            continue;
+        }
+#endif /* SNES_HAS_LOBBY_CLIENT */
+
+        /* Seat 0 in the low 12 bits, seat 1 in the next 12. Seats 2..7 (with
+         * a multitap) go through RtlSetPadState — see
+         * snesrecomp/docs/MULTITAP.md. */
+        inputs = read_keyboard();
+        RtlRunFrame(inputs);
+
+        if (snesrecomp_sdl_lock_texture(texture, NULL, &pixels, &pitch)) {
+            RtlDrawPpuFrame((uint8 *)pixels, (size_t)pitch, 0);
+            SDL_UnlockTexture(texture);
+        }
+        SDL_RenderClear(renderer);
+        snesrecomp_sdl_render_texture(renderer, texture, NULL, NULL);
+        SDL_RenderPresent(renderer);
+    }
+
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    free(rom);
+    return 0;
+}

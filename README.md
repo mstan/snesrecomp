@@ -194,6 +194,34 @@ game-integration details.
 
 ## How to use SNESRecomp
 
+### Scaffold a full project (source checkout)
+
+From a snesrecomp checkout, one command takes a ROM to a repository that
+builds, regenerates, packages, and publishes itself:
+
+```sh
+# macOS / Linux / WSL / Git Bash
+sh tools/new_project/setup_project.sh ~/roms/game.sfc --dir ~/src
+```
+
+```powershell
+# Windows (needs Git for Windows, Python 3 and CMake on PATH)
+powershell -File tools\new_project\setup_project.ps1 -Rom C:\roms\game.sfc -Dir C:\src
+```
+
+Pass the ROM and answer the questions: title, players and multitap, netplay
+and rollback, launcher, boxart, CI, generate and build, GitHub. Every answer
+has a default probed from the cartridge, and every question has a flag for
+scripting (`--players 1-8`, `--rollback`, `--yes`, ...). It probes the
+cartridge header, lays out the repo, wires the framework submodules, seeds
+the analysis config, writes CI and packaging, and can generate, build, and
+`gh repo create` in the same run. See
+[docs/GAME_PROJECT_SETUP.md](docs/GAME_PROJECT_SETUP.md) and
+[tools/new_project/README.md](tools/new_project/README.md).
+
+The result builds a real executable, but it is not a working port: the frame
+driver in `src/game_rtl.c` is where the game-specific work starts.
+
 ### Generate a project with the released CLI
 
 1. Download `snesrecomp-cli-windows-x86_64.zip` from
@@ -244,6 +272,30 @@ python tools/build_cli.py release
 ```
 
 The ready-to-use ZIP is written to `dist/`.
+
+### Regenerate an existing game project (headless SDK)
+
+Game repositories that already ship `bank*.cfg` seeds should use the
+`generate` command instead of scaffolding a new tree. This is the stable
+contract for local UIs and launcher automation:
+
+```sh
+python snesrecomp_cli.py generate \
+  --rom "Metal Warriors (USA).sfc" \
+  --project-root /path/to/MetalWarriorsSNESRecomp \
+  --cfg-dir recomp \
+  --out-dir src/gen \
+  --funcs-h recomp/funcs.h \
+  --cfg-roots \
+  --expected-crc32 f2ab92d4 \
+  --json-progress
+```
+
+See [`docs/LOCAL_CODEGEN_SDK.md`](docs/LOCAL_CODEGEN_SDK.md) for exit codes,
+the JSONL progress event schema, and the portable **recomp-ui host** under
+`host/` (`snesrecomp_codegen_host`) that other game repos can compile in for
+Generate → rebuild → relaunch (including the Windows deferred `.cmd` helper).
+`verify-rom` checks digests alone.
 
 ## Choosing SDL3 or SDL2 for a desktop game
 

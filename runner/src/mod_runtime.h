@@ -58,6 +58,165 @@ snes_mod_runtime_launcher_provider_c(void);
 const char* snes_mod_runtime_last_error_c(void);
 int snes_mod_runtime_feature_enabled_c(const char* package_id,
                                        const char* feature_id);
+/* Verdicts for snes_mod_runtime_check_set_c. Values match the wire codes in
+ * the netplay protocol, but are declared here so the mod runtime does not have
+ * to know what a packet is -- the netplay layer owns that mapping. */
+#define SNES_MODSET_OK      0
+#define SNES_MODSET_MISSING 1  /* package absent entirely */
+#define SNES_MODSET_VERSION 2  /* present at a different version */
+#define SNES_MODSET_OPTION  3  /* option, value, or selection we cannot meet */
+#define SNES_MODSET_TOO_BIG 4  /* set too large to compare honestly */
+
+/* Write the host's set into this build's own selection, so a player whose
+ * mods differ can join by starting again rather than by reproducing someone
+ * else's configuration by hand. Disables everything the host does not run: a
+ * set is the whole selection, and an extra mod differs as surely as a missing
+ * one. All-or-nothing -- a partially adopted set matches neither side.
+ *
+ * Cannot take effect in the current launch: mods activate before the netplay
+ * session exists, so the contract is "your settings now match, start again". */
+int snes_mod_runtime_adopt_set_c(const char* want, char* reason, uint32_t cap);
+
+/* Is `package_id` installed at `version`? 1 yes, 0 present at another version,
+ * -1 absent. Writes the package's display name (falling back to its id) so a
+ * lobby row can name what a player needs to install. */
+int snes_mod_runtime_have_package_c(const char* package_id, const char* version,
+                                    char* name_out, uint32_t name_cap);
+
+/* One package row on the lobby wire.
+ *
+ * The effective-set text below is keyed by FEATURE, which is the right grain
+ * for "are we simulating the same thing". The lobby server asks a coarser
+ * question -- does this peer have this package at this version, at all -- so
+ * these rows are per PACKAGE, and carry the enabled feature ids alongside for
+ * the player to read. Both grains describe the same selection; neither
+ * replaces the other. */
+#define SNES_MOD_ROW_ID_LEN    96
+#define SNES_MOD_ROW_VER_LEN   32
+#define SNES_MOD_ROW_NAME_LEN  64
+#define SNES_MOD_ROW_FEATS_LEN 192
+
+typedef struct SnesModPkgRow {
+    char id[SNES_MOD_ROW_ID_LEN];
+    char version[SNES_MOD_ROW_VER_LEN];
+    char name[SNES_MOD_ROW_NAME_LEN];
+    /* Plan rows only: comma-separated ids of the features the host turned on.
+     * Empty on an offer row, which says only "I have this package". */
+    char features[SNES_MOD_ROW_FEATS_LEN];
+} SnesModPkgRow;
+
+/* The host's required plan: one row per package with at least one ENABLED
+ * feature, at the version actually selected. Returns the number of rows
+ * written (capped at `max`), or 0 when nothing is enabled.
+ *
+ * A row whose id or version does not fit is DROPPED rather than truncated: a
+ * truncated id names a different package, and the server would compare it to
+ * a peer's offer and reach a confident wrong answer. */
+int snes_mod_runtime_plan_rows_c(SnesModPkgRow* out, int max);
+
+/* Every (package, version) installed on this machine -- what a peer offers so
+ * the server can tell what it is missing. Enabled or not: the question is
+ * possession, and the host's plan decides what runs. Same drop-don't-truncate
+ * rule as above. */
+int snes_mod_runtime_installed_rows_c(SnesModPkgRow* out, int max);
+
+/* Where `package_id`@`version` lives on disk (its version directory).
+ *
+ * A mod's data belongs INSIDE its package, because that is the unit that gets
+ * transferred: a package whose files sit elsewhere in the install arrives at a
+ * peer as a manifest describing a mod it does not have. Plugins resolve their
+ * assets from here rather than from the executable's directory.
+ *
+ * Pass NULL for `version` to get the selected one. Returns 1 on success. */
+int snes_mod_runtime_package_root_c(const char* package_id, const char* version,
+                                    char* out, uint32_t cap);
+
+/* ---- peer-to-peer package transfer -------------------------------------
+ *
+ * The host packs a package it has; the guest verifies and installs it. The
+ * bytes travel over a direct ICE connection between the two players, never
+ * through the lobby server -- see runner/src/lobby.
+ */
+
+/* Pack `package_id`@`version` into a .snesmod archive in memory.
+ *
+ * Writes the archive's SHA-256 as lowercase hex into `sha256_hex` (needs 65
+ * bytes). The digest is computed here, at the source, so the receiver checks
+ * the bytes it actually got against a value that never shared a path with
+ * them. Returns 1 on success; *out must then be released with
+ * snes_mod_runtime_free_blob_c. */
+int snes_mod_runtime_export_package_c(const char* package_id,
+                                      const char* version,
+                                      uint8_t** out, uint32_t* out_len,
+                                      char* sha256_hex, uint32_t sha_cap,
+                                      char* err, uint32_t err_cap);
+void snes_mod_runtime_free_blob_c(uint8_t* blob);
+
+/* Install a received archive.
+ *
+ * `expect_sha256` is REQUIRED and checked before a single byte is unpacked:
+ * this is code from another machine, and the digest is the only thing tying
+ * what arrived to what the host said it was sending. A mismatch is refused
+ * without touching the mod directory. Returns 1 on success. */
+int snes_mod_runtime_install_blob_c(const uint8_t* data, uint32_t len,
+                                    const char* expect_sha256,
+                                    char* installed_id, uint32_t id_cap,
+                                    char* installed_ver, uint32_t ver_cap,
+                                    char* err, uint32_t err_cap);
+
+/* Can this build honour the host's mod set? Returns one of the above and
+ * writes a player-actionable reason ("missing mod: x", "y needs version z").
+ * Empty reason on OK. */
+int snes_mod_runtime_check_set_c(const char* want, char* reason, uint32_t cap);
+
+/* The effective mod set as canonical text, one line per ENABLED feature:
+ *   "<package>@<version>/<feature> <option>=<value> ...\n"
+ * Sorted and using resolved option values, so equal selections produce
+ * byte-identical output on any machine. "(none)\n" when nothing is enabled.
+ * Returns the length that WOULD be written, so truncation is detectable.
+ *
+ * This is what netplay peers must agree on: a mod that patches guest memory is
+ * simulation state, and two peers running different sets cannot stay in sync. */
+/*
+ * The cosmetic allowlist in force for this session: which packages the
+ * AUTHORITY for this match (the automatch ruleset the server published, or
+ * the lobby host's caps) has granted the presentation-only exemption to.
+ *
+ * ';'-separated, each entry `id@version` or `id@version#sha256`, the digest
+ * being of the package packed by the runtime's own deterministic zip.
+ *
+ * NULL or "" revokes every exemption -- the safe default, and the one an
+ * older host or a ruleset without the key must produce. A manifest's
+ * `presentation_only = true` is only the mod asking; this is the grant.
+ */
+void snes_mod_runtime_set_cosmetic_allow_c(const char* allow);
+int snes_mod_runtime_get_cosmetic_allow_c(char* out, uint32_t cap);
+
+/* Deterministic content digest of an installed package, as 64 lowercase hex
+ * characters. Pass NULL/"" for `version` to use the selected one. 1 on
+ * success. Use it to WRITE an allowlist entry; matching one is the runtime's
+ * job. */
+int snes_mod_runtime_package_digest_c(const char* package_id,
+                                      const char* version,
+                                      char* out, uint32_t cap);
+
+/* The evidence for every exemption this build is actually taking, one
+ * `id@version#sha256` per package. Send it with an automatch ticket so the
+ * SERVER checks the exemptions against its own allowlist, instead of being
+ * handed this client's verdict and having to take it on faith. A package whose
+ * digest cannot be computed reports an empty one, which matches no pinned
+ * entry and so fails closed. Returns the bytes that WOULD be written. */
+int snes_mod_runtime_exempted_packages_c(char* out, uint32_t cap);
+
+/* Enabled features claiming the cosmetic exemption without a grant, one
+ * `package@version/feature` per line; empty when there are none. A queue gate
+ * must treat these as simulation-affecting -- not because they necessarily
+ * are, but because no authority has said they are not. Returns the bytes that
+ * WOULD be written, so truncation is distinguishable from emptiness. */
+int snes_mod_runtime_unapproved_cosmetics_c(char* out, uint32_t cap);
+
+int snes_mod_runtime_effective_set_c(char* out, uint32_t cap);
+
 int snes_mod_runtime_feature_option_value_c(const char* package_id,
                                             const char* feature_id,
                                             const char* option_id,
@@ -68,6 +227,26 @@ int snes_mod_runtime_feature_option_value_c(const char* package_id,
  * Register a trusted implementation. A .snesmod archive may select only this
  * stable id; archives never provide native code, symbols, or library paths.
  */
+/*
+ * Register a plugin AND classify it as presentation-only: this callback
+ * changes what the machine draws and touches no CPU, WRAM, VRAM, OAM, CGRAM,
+ * APU or save state.
+ *
+ * This is the EXECUTABLE vouching for a function it contains, and it is the
+ * only way that classification can be made. A manifest's
+ * `presentation_only = true` is the mod vouching for itself, which is worth
+ * nothing on its own -- a feature whose plugins were registered the ordinary
+ * way is refused the exemption however its manifest is written. So a package
+ * can only ever claim the exemption for behaviour this build already ships and
+ * has already classified; it cannot describe new cosmetic behaviour into
+ * existence, because it cannot introduce code at all.
+ *
+ * Use it only where that is demonstrably true. It is a security boundary, not
+ * a label.
+ */
+int snes_mod_register_presentation_plugin(const char* id,
+                                          SNESModActivationCallback callback);
+
 int snes_mod_register_activation_plugin(const char* id,
                                         SNESModActivationCallback callback);
 

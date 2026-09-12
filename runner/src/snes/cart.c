@@ -13,6 +13,7 @@
 #include "sdd1.h"
 
 extern uint32_t g_interp816_cur_pc;
+#include "sdd1.h"
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr);
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
@@ -183,6 +184,11 @@ case CART_CX4: {
       break;
     }
     case CART_SDD1: {
+      /* The $4800-$4807 chip window is never ROM. main reached this via the
+       * generic LoROM rule below; this branch checked it outright, and the
+       * explicit check is kept because sdd1_lorom_window_offset() runs first. */
+      if (cart_is_sdd1_window(cart, bank, adr))
+        return NULL;
       /* S-DD1 carts are LoROM. The $4800-$4807 window in banks $00-$3F/$80-$BF
        * belongs to the decompression chip, not the ROM — return NULL so callers
        * route it through cart_read/cart_write. */

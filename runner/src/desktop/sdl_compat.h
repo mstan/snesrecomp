@@ -115,6 +115,23 @@ static inline SDL_Renderer *snesrecomp_sdl_create_renderer(
 #endif
 }
 
+/* Render drivers this SDL build actually has, so a host can offer the ones
+ * that exist rather than a hardcoded platform matrix that goes stale. SDL2
+ * reports through a struct, SDL3 returns the name directly. */
+static inline int snesrecomp_sdl_num_render_drivers(void) {
+  return SDL_GetNumRenderDrivers();
+}
+
+static inline const char *snesrecomp_sdl_render_driver_name(int index) {
+#if SNESRECOMP_SDL3
+  return SDL_GetRenderDriver(index);
+#else
+  static SDL_RendererInfo info;
+  if (SDL_GetRenderDriverInfo(index, &info) != 0) return NULL;
+  return info.name;
+#endif
+}
+
 static inline const char *snesrecomp_sdl_renderer_name(
     SDL_Renderer *renderer) {
 #if SNESRECOMP_SDL3
@@ -186,6 +203,16 @@ static inline bool snesrecomp_sdl_get_texture_size(
 #else
   return SDL_QueryTexture(
              texture, NULL, NULL, width, height) == 0;
+#endif
+}
+
+/* SDL3 grew a modifier-state out-parameter on this; SDL2 takes the keycode
+ * alone. Callers that only want "which physical key is this" pass neither. */
+static inline SDL_Scancode snesrecomp_sdl_scancode_from_key(SDL_Keycode key) {
+#if SNESRECOMP_SDL3
+  return SDL_GetScancodeFromKey(key, NULL);
+#else
+  return SDL_GetScancodeFromKey(key);
 #endif
 }
 

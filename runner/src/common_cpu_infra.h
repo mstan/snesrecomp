@@ -47,9 +47,20 @@ typedef RtlEnhancedRenderResult RtlEnhancedRenderFrameFunc(
     RtlEnhancedRendererFrame *frame);
 
 void WatchdogCheck(void);
+void snes_refresh_charge(void);   /* DRAM refresh tax; see common_cpu_infra.c */
+void snes_refresh_exempt(void);   /* mark a master-clock teleport (park, load) */
+/* Rollback: the refresh tax carries a sub-scanline remainder and a high-water
+ * mark across frames, and both decide how many cycles the NEXT block is
+ * charged. A rewind that leaves them on the discarded timeline replays the
+ * same code for a different number of master cycles. See common_cpu_infra.c. */
+void snes_refresh_state_get(uint64_t *phase, uint64_t *charged_upto);
+void snes_refresh_state_set(uint64_t phase, uint64_t charged_upto);
 void WatchdogFrameStart(void);
 void RecompStackPush(const char *name);
 void RecompStackPop(void);
+/* Pop for an LLE yield unwind: the frame is unfinished, so no balance figure
+ * is recorded. See common_cpu_infra.c. */
+void RecompStackPopYield(void);
 /* Optional stack-balance auditor (see common_cpu_infra.c): reports stack
  * movement beyond consumption of the caller's materialized JSR/JSL frame when
  * SNESRECOMP_STACK_BALANCE_DIAGNOSTICS is enabled. */
@@ -71,6 +82,9 @@ void CpuDispatchLogDumpJson(FILE *f);
 extern int g_recomp_stack_top;
 extern uint16_t g_cpu_entry_s[];
 int cpu_resolve_ancestor_skip(uint16_t ret_s);
+/* DIAGNOSTIC: dump the live recomp frame array (name, entry S, hrv per slot)
+ * to `out`, highlighting any slot whose entry S equals `mark` (0 = none). */
+void recomp_dump_frame_array(FILE *out, uint16_t mark);
 int cpu_resolve_post_return_skip(uint16_t post_s);
 typedef struct CpuTailcallContextSave {
   uint8_t valid;

@@ -37,9 +37,22 @@ echo "=== PPU sprite limits ==="
     -o "$OUT/ppu_sprite_limit_test"
 "$OUT/ppu_sprite_limit_test"
 
+echo "=== PPU widescreen world-mirror band ==="
+"$CC" -std=c11 -Wall -Wextra -O1     -DSNESRECOMP_REVERSE_DEBUG=0     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes"     "$ROOT/tests/ppu/ppu_world_mirror_test.c"     "$ROOT/runner/src/snes/ppu.c"     "$ROOT/runner/src/snes/ppu_legacy.c"     -o "$OUT/ppu_world_mirror_test"
+"$OUT/ppu_world_mirror_test"
+
+echo "=== PPU widescreen elastic anchor band ==="
+"$CC" -std=c11 -Wall -Wextra -O1     -DSNESRECOMP_REVERSE_DEBUG=0     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes"     "$ROOT/tests/ppu/ppu_elastic_band_test.c"     "$ROOT/runner/src/snes/ppu.c"     "$ROOT/runner/src/snes/ppu_legacy.c"     -o "$OUT/ppu_elastic_band_test"
+"$OUT/ppu_elastic_band_test"
+
 echo "=== DMA / HDMA ==="
-# sdd1.c is intentionally linked with dma.c; its disabled-path condition is
-# not type-limits clean under the harness's stricter -Werror policy.
+# sdd1.c is upstream's vendored S-DD1 decoder and is not -Werror clean here:
+# sdd1.c:773 reads `(a16 >= 0x00 && 0)`, an always-true comparison on a
+# uint16_t ANDed with 0, so the clause is dead. The product build does not
+# use -Werror, so this only bites the harness. Exempted rather than edited:
+# the file belongs to work still moving upstream, and quietly rewriting
+# somebody else's condition is how a real intent ("disabled for now") gets
+# lost. Worth reporting there.
 "$CC" -std=c11 -Wall -Wextra -Werror -Wno-error=type-limits -O1 \
     -DSNESRECOMP_REVERSE_DEBUG=0 \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
@@ -163,6 +176,14 @@ echo "=== automatic joypad register byte order ==="
     -o "$OUT/auto_joypad_test"
 "$OUT/auto_joypad_test"
 
+echo "=== Super Multitap protocol ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/joypad/multitap_test.c" \
+    "$ROOT/runner/src/snes/joypad.c" \
+    -o "$OUT/multitap_test"
+"$OUT/multitap_test"
+
 echo "=== runtime dispatch ==="
 "$CC" -std=c11 -Wall -Wextra -ffunction-sections -fdata-sections \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
@@ -186,6 +207,19 @@ echo "=== production diagnostic gates ==="
     "$ROOT/runner/src/common_cpu_infra.c" \
     -Wl,--gc-sections -o "$OUT/diagnostic_gates_test"
 "$OUT/diagnostic_gates_test"
+
+echo "=== rollback state digest ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/netplay/rb_state_digest_test.c" \
+    "$ROOT/runner/src/netplay/snes_state_digest.c" \
+    "$ROOT/runner/src/snes/joypad.c" \
+    "$ROOT/runner/src/snes/apu.c" \
+    "$ROOT/runner/src/snes/spc.c" \
+    "$ROOT/runner/src/snes/dsp.c" \
+    "$ROOT/runner/src/crc32.c" \
+    -o "$OUT/rb_state_digest_test"
+"$OUT/rb_state_digest_test"
 
 echo "=== APU guest-time pacing ==="
 "$CC" -std=c11 -Wall -Wextra -Werror \
@@ -259,3 +293,103 @@ for mode in 0 1 2 3; do
         SNESRECOMP_AUDIO_TRACE_TEST_FOPEN_FAIL=1 \
         "./audio_trace_clock_gate_test_$mode" open-fail)
 done
+
+echo "=== lobby mod plan (match_caps.mods wire shape) ==="
+# Includes snes_lobby_client.c directly to exercise the real codec, so it needs
+# the same guard define and include roots the runner build uses.
+"$CC" -std=c11 -Wall -Wextra -O1 \
+    -D_POSIX_C_SOURCE=200809L -DSNES_HAS_LOBBY_CLIENT=1 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/lobby" \
+    -I "$ROOT/runner/src/lobby/ws" -I "$ROOT/lib/recomp-net/include" \
+    "$ROOT/tests/netplay/lobby_mod_plan_test.c" \
+    "$ROOT"/runner/src/lobby/ws/*.c \
+    -o "$OUT/lobby_mod_plan_test"
+"$OUT/lobby_mod_plan_test"
+
+echo "=== keybinds: the runner-layout keyboard word ==="
+# Needs SDL headers for the scancode enum only (no window, no device). Skipped
+# rather than failed where they are absent, like the OSD test below.
+KB_SDL_CFLAGS=""; KB_SDL_LIBS=""; KB_SDL_DEF=""
+if pkg-config --exists sdl3 2>/dev/null; then
+    KB_SDL_CFLAGS="$(pkg-config --cflags sdl3)"
+    KB_SDL_LIBS="$(pkg-config --libs sdl3)"
+    KB_SDL_DEF="-DSNESRECOMP_SDL3=1"
+elif pkg-config --exists sdl2 2>/dev/null; then
+    KB_SDL_CFLAGS="$(pkg-config --cflags sdl2)"
+    KB_SDL_LIBS="$(pkg-config --libs sdl2)"
+fi
+if [ -n "$KB_SDL_LIBS" ]; then
+    "$CC" -std=c11 -Wall -Wextra -O1 $KB_SDL_DEF $KB_SDL_CFLAGS \
+        -I "$ROOT/runner/src" \
+        "$ROOT/tests/joypad/keybinds_runner_layout_test.c" \
+        "$ROOT/runner/src/keybinds.c" \
+        $KB_SDL_LIBS -o "$OUT/keybinds_runner_layout_test"
+    ( cd "$OUT" && ./keybinds_runner_layout_test )
+else
+    echo "  (skipped: no SDL headers)"
+fi
+
+echo "=== mod runtime: presentation_only is not compared by netplay ==="
+# C++ because mod_runtime is C++, and it is compiled here rather than mocked so
+# the real manifest parser, the real effective-set text and the real adopt
+# sweep are what the cases run against. The fixture catalog is written into
+# $OUT by the test itself, so this stays ROM-free and leaves nothing in the
+# source tree.
+"${CXX:-g++}" -std=c++17 -Wall -Wextra -O1 \
+    -I "$ROOT/runner/src" \
+    -x c++ "$ROOT/tests/netplay/mod_presentation_only_test.c" \
+    "$ROOT/runner/src/mod_runtime.cpp" \
+    "$ROOT/runner/src/crc32.c" \
+    "$ROOT/runner/src/sha256.c" \
+    -o "$OUT/mod_presentation_only_test"
+rm -rf "$OUT/mod_presentation_only_fixture"
+"$OUT/mod_presentation_only_test" "$OUT/mod_presentation_only_fixture"
+
+echo "=== host OSD (FPS readout / turbo / toasts) ==="
+# Needs SDL for its clock only (no window; SDL_INIT_TIMER). Skipped rather than
+# failed where SDL headers are absent, so this stays a ROM-free harness that
+# also runs on a machine without the game's build deps.
+OSD_SDL_CFLAGS=""
+OSD_SDL_LIBS=""
+OSD_SDL_BACKEND=""
+if pkg-config --exists sdl3 2>/dev/null; then
+    OSD_SDL_CFLAGS="$(pkg-config --cflags sdl3)"
+    OSD_SDL_LIBS="$(pkg-config --libs sdl3)"
+    OSD_SDL_BACKEND="-DSNESRECOMP_SDL_BACKEND=3"
+elif pkg-config --exists sdl2 2>/dev/null; then
+    OSD_SDL_CFLAGS="$(pkg-config --cflags sdl2)"
+    OSD_SDL_LIBS="$(pkg-config --libs sdl2)"
+    OSD_SDL_BACKEND="-DSNESRECOMP_SDL_BACKEND=2"
+fi
+if [ -n "$OSD_SDL_LIBS" ]; then
+    # shellcheck disable=SC2086
+    "$CC" -std=c11 -Wall -Wextra -O1 \
+        -I "$ROOT/runner/src" -I "$ROOT/runner/src/desktop" \
+        $OSD_SDL_CFLAGS $OSD_SDL_BACKEND \
+        "$ROOT/tests/osd/osd_test.c" \
+        "$ROOT/runner/src/snes_osd.c" \
+        $OSD_SDL_LIBS -o "$OUT/osd_test"
+    "$OUT/osd_test"
+else
+    echo "  (skipped: no SDL2/SDL3 pkg-config)"
+fi
+
+echo "=== account secret path (rebuild must not sign you out) ==="
+# _GNU_SOURCE: rnet_auth.c uses getaddrinfo, and the test uses mkdtemp.
+"$CC" -std=gnu11 -Wall -Wextra -O1 -D_GNU_SOURCE \
+    -I "$ROOT/lib/recomp-net/include" -I "$ROOT/lib/recomp-net/src" \
+    "$ROOT/tests/auth/secret_path_test.c" \
+    "$ROOT/lib/recomp-net/src/auth/rnet_auth.c" \
+    "$ROOT/lib/recomp-net/src/auth/rnet_sha256.c" \
+    -lpthread -o "$OUT/secret_path_test"
+"$OUT/secret_path_test"
+
+echo "=== rewind ring (ordering, clamping, what commit discards) ==="
+# The snapshot API is stubbed, so this tests the ring rather than re-testing
+# the save format the save-state menu already exercises.
+"$CC" -std=gnu11 -Wall -Wextra -O1 -D_GNU_SOURCE \
+    -I "$ROOT/runner/src" \
+    "$ROOT/tests/rewind/rewind_test.c" \
+    "$ROOT/runner/src/snes_rewind.c" \
+    -o "$OUT/rewind_test"
+"$OUT/rewind_test"

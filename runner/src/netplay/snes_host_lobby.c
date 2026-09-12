@@ -1,7 +1,14 @@
 #include "snes_host_lobby.h"
+#include "recomp_net/auth.h"
+#include "snes_netplay_identity.h"
+/* Fork detection lives in the rollback engine; this file only reports what it
+ * already found. Included unconditionally: the accessors compile to a "no
+ * fork" answer in a build without rollback. */
+#include "snes_netplay_rb.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv: SNESRECOMP_LOBBY_LIST_DEBUG */
 #include <stdint.h>
 #include <time.h>
 
@@ -12,7 +19,10 @@
 #endif
 
 #include "recomp_net/lan_lobby.h"
+#include "host_paths.h"
 #include "recomp_net/lan_direct.h"
+#include "recomp_net/lan_beacon.h"
+#include "recomp_net/chat_filter.h"
 #include "recomp_net/address.h"
 
 #if !defined(RECOMP_LAUNCHER) && !defined(SNES_HOST_HAS_RECOMP_UI)
@@ -49,6 +59,17 @@ static RecompLauncherCNetplayLaunch g_lan_launch;
 static RNetLanLobby g_lan_room; /* host + direct-guest in-memory seat state */
 static RNetLanDirectHost *g_direct_host;
 static RNetLanDirectGuest *g_direct_guest;
+/* LAN discovery across machines. The registry file below is visible to one
+ * machine only, and a remote peer used to reach a LAN room solely by typing
+ * its IP into Join Direct -- discovery "worked on the same machine, not on
+ * the other PC". While hosting, the room is also announced by UDP broadcast
+ * on RNET_LAN_BEACON_DEFAULT_PORT (one datagram a second); every launcher
+ * listens and lists what it hears beside the file row. The row's lobby_id is
+ * the same "lan:<ip:port>" Join Direct builds, so joining it takes the
+ * JOIN_REQ path that already exists -- the beacon only replaces the typing. */
+static RNetLanBeacon *g_beacon_pub;    /* host: announces g_lan_room */
+static RNetLanBeacon *g_beacon_listen; /* browser: what other hosts announce */
+static RNetLanBeaconRoom g_beacon_last; /* what the publisher was last told */
 static char g_direct_peer_endpoint[64]; /* guest launch peer = typed IP:port */
 static char g_lobby_url[256];
 static char g_resume_endpoint[64];
@@ -56,7 +77,7 @@ static char g_runtime_error[64];
 static RNetIpv4Address g_local_addresses[kMaxLocalAddresses];
 static int g_local_address_count;
 static char g_external_ip[RNET_IPV4_ADDRESS_TEXT_MAX];
-static int g_lobby_input_delay = 2; /* waiting-room setting; clamped 2..20 */
+static int g_lobby_input_delay = 6; /* waiting-room setting; clamped 2..20 */
 static int g_lobby_force_turn = 0;  /* host: ICE relay-only for server lobbies */
 static int g_lobby_force_input_relay = 0; /* host: server UDP input relay */
 static int g_lobby_max_slots = 2;   /* seat ceiling for current/created room */
@@ -80,22 +101,213 @@ static int clamp_input_delay(int delay)
   return delay;
 }
 
+/* The LAN room is a file. Two instances of one build only see the same room
+ * if they read the same file, and the working directory is whatever each
+ * was launched from -- a terminal in the repo root, a file manager in the
+ * build dir -- so a relative registry path is anchored to the executable's
+ * directory, not to the cwd. An absolute path from the game is kept as is. */
 static const char *lan_path(void)
 {
-  return g_id.lan_registry_path && g_id.lan_registry_path[0]
-             ? g_id.lan_registry_path
-             : "netplay_lan_lobby.txt";
+  static char resolved[1024];
+  const char *p = g_id.lan_registry_path && g_id.lan_registry_path[0]
+                      ? g_id.lan_registry_path
+                      : "netplay_lan_lobby.txt";
+  const int absolute = p[0] == '/' || p[0] == '\\' ||
+                       (p[0] && p[1] == ':'); /* C:\... */
+  if (absolute)
+    return p;
+  if (!resolved[0] && !snesrecomp_exe_dir_path(p, resolved, sizeof(resolved)))
+    return p; /* no exe dir known: the old cwd-relative behaviour */
+  return resolved;
 }
+
+/* Defined with the rest of the chat plumbing further down; needed up here by
+ * the pump and by the one place every LAN room teardown passes through. */
+static void lan_chat_clear(void);
+static void lan_chat_drain(void);
+/* Defined below; the beacon filter needs the identity before then. */
+static const char *game_name(void);
+static const char *game_version(void);
+
+/* LAN seat swap: the two-seat room has one trade. incoming = the guest asked
+ * the host (host side); outgoing = 0 idle, 1 waiting, 2 accepted, -1 declined
+ * (guest side, and the host's own instant result). */
+static int g_lan_swap_incoming;
+static int g_lan_swap_outgoing;
 
 static void close_direct_sockets(void)
 {
   rnet_lan_direct_host_close(&g_direct_host);
   rnet_lan_direct_guest_close(&g_direct_guest);
+  /* The announce follows the waiting-room socket: a room nobody can JOIN_REQ
+   * (match running, host gone) must not keep appearing in browsers. */
+  rnet_lan_beacon_close(&g_beacon_pub);
+  memset(&g_beacon_last, 0, sizeof(g_beacon_last));
+  g_lan_swap_incoming = 0;
+  g_lan_swap_outgoing = 0;
+  /* The room is over, so its log is too. Every LAN teardown -- leave, kick,
+   * host close -- passes through here, which is why the clear lives here
+   * rather than at each of those call sites. */
+  lan_chat_clear();
 }
 
 static int publish_lan_room(void)
 {
+  /* The seated guest hears every room change over its socket; the file is
+   * for browsers on this machine; the beacon (beacon_publish_step, from the
+   * pump) is for browsers on the other machines. */
+  if (g_direct_host)
+    (void)rnet_lan_direct_host_notify_room(g_direct_host, &g_lan_room);
   return rnet_lan_lobby_publish(lan_path(), &g_lan_room) == RNET_LAN_LOBBY_OK;
+}
+
+/* The beacon's view of g_lan_room. lobby_id is exactly the Join Direct id so
+ * cb_join needs no new case. */
+static void beacon_room_from_lan(RNetLanBeaconRoom *out)
+{
+  memset(out, 0, sizeof(*out));
+  snprintf(out->lobby_id, sizeof(out->lobby_id), "lan:%s", g_lan_room.endpoint);
+  snprintf(out->endpoint, sizeof(out->endpoint), "%s", g_lan_room.endpoint);
+  snprintf(out->game_name, sizeof(out->game_name), "%s", g_lan_room.game);
+  snprintf(out->game_version, sizeof(out->game_version), "%s",
+           g_lan_room.game_version);
+  snprintf(out->room_name, sizeof(out->room_name), "%s", g_lan_room.name);
+  out->has_password = g_lan_room.password[0] != '\0';
+  out->player_count = g_lan_room.joiner_name[0] ? 2 : 1;
+  out->max_slots = 2;
+  out->started = g_lan_room.started;
+}
+
+/* Host, once per pump: announce the room while its waiting-room socket is
+ * open. Opening is lazy and retried, so a transient socket failure costs one
+ * second, not the session. The publisher refuses a non-private endpoint
+ * (127.0.0.1 from a LAN-only room, a WAN address): that is the beacon's
+ * RFC1918 rule, and such a room is not reachable by broadcast anyway. */
+static void beacon_publish_step(void)
+{
+  RNetLanBeaconRoom room;
+  if (!g_hosting_lan || !g_direct_host || !g_lan_room.endpoint[0])
+    return;
+  if (!g_beacon_pub) {
+    if (rnet_lan_beacon_publish_open(&g_beacon_pub, 0) != 0) {
+      static int s_said;
+      if (!s_said++)
+        fprintf(stderr, "snes_host_lobby: LAN discovery beacon could not "
+                        "open a UDP socket; other machines will not list "
+                        "this room (Join Direct still works)\n");
+      return;
+    }
+  }
+  beacon_room_from_lan(&room);
+  if (memcmp(&room, &g_beacon_last, sizeof(room)) != 0) {
+    g_beacon_last = room;
+    if (rnet_lan_beacon_publish_set_room(g_beacon_pub, &room) != 0) {
+      static int s_said;
+      if (!s_said++)
+        fprintf(stderr, "snes_host_lobby: LAN room endpoint %s is not a "
+                        "private IPv4 address; not announcing it to the LAN\n",
+                room.endpoint);
+      return;
+    }
+    fprintf(stderr, "snes_host_lobby: announcing LAN room %s on UDP %d\n",
+            room.endpoint, RNET_LAN_BEACON_DEFAULT_PORT);
+  }
+  (void)rnet_lan_beacon_publish_tick(g_beacon_pub);
+}
+
+/* Browser, once per pump: hear other hosts. Opened lazily on the first pump
+ * (the netplay page), kept for the launcher's life; the cache forgets a room
+ * five seconds after its last announce, so a closed room disappears on its
+ * own. Two launchers on one machine share the port (reuseaddr). */
+static void beacon_listen_step(void)
+{
+  if (!g_beacon_listen) {
+    static int s_tried;
+    if (s_tried)
+      return;  /* one failure is a firewall / port conflict, not a retry case */
+    s_tried = 1;
+    if (rnet_lan_beacon_listen_open(&g_beacon_listen, 0) != 0) {
+      fprintf(stderr, "snes_host_lobby: LAN discovery listener could not bind "
+                      "UDP %d; rooms hosted on other machines will not be "
+                      "listed (Join Direct still works)\n",
+              RNET_LAN_BEACON_DEFAULT_PORT);
+      return;
+    }
+  }
+  (void)rnet_lan_beacon_listen_pump(g_beacon_listen);
+}
+
+/* A heard room is listed when it is this game at this version (the same
+ * filter the registry read applies, and what JOIN_REQ will insist on), is
+ * not started, and is not the room this launcher already shows another way:
+ * its own hosted room, or the same-machine registry row. `skip_endpoint` is
+ * that registry row's endpoint (or empty). */
+static int beacon_row_listed(const RNetLanBeaconRoom *room,
+                             const char *skip_endpoint)
+{
+  if (strcmp(room->game_name, game_name()) != 0)
+    return 0;
+  /* Same rule the lobby-server browser applies, and for the same reason.
+   * This used to be an unconditional exact match, which is right for two
+   * shipped releases and wrong for everything else: every development build
+   * carries a dirty-diff hash of its own working tree, so two developers on
+   * one LAN could never see each other's rooms -- the beacon arrived, the
+   * row was dropped, and nothing said why. The join still refuses a real
+   * mismatch; it just gets to explain itself. */
+  if (snes_lobby_version_filter_strict() && room->game_version[0] &&
+      strcmp(room->game_version, game_version()) != 0)
+    return 0;
+  if (room->started)
+    return 0;
+  if (g_hosting_lan && strcmp(room->endpoint, g_lan_room.endpoint) == 0)
+    return 0;
+  if (skip_endpoint && skip_endpoint[0] &&
+      strcmp(room->endpoint, skip_endpoint) == 0)
+    return 0;
+  return 1;
+}
+
+/* index-th listed beacon row (see beacon_row_listed). 1 = filled. */
+static int fill_beacon_row(int index, const char *skip_endpoint,
+                           RecompLauncherCNetplayLobby *out)
+{
+  RNetLanBeaconRoom room;
+  int i;
+  int n;
+  if (!g_beacon_listen || index < 0)
+    return 0;
+  n = rnet_lan_beacon_count(g_beacon_listen);
+  for (i = 0; i < n; ++i) {
+    if (!rnet_lan_beacon_get(g_beacon_listen, i, &room))
+      break;
+    if (!beacon_row_listed(&room, skip_endpoint))
+      continue;
+    if (index-- > 0)
+      continue;
+    if (!out)
+      return 1;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->lobby_id, sizeof(out->lobby_id), "%s", room.lobby_id);
+    snprintf(out->name, sizeof(out->name), "LAN - %s",
+             room.room_name[0] ? room.room_name : room.endpoint);
+    snprintf(out->game_name, sizeof(out->game_name), "%s", room.game_name);
+    snprintf(out->game_version, sizeof(out->game_version), "%s",
+             room.game_version[0] ? room.game_version : game_version());
+    out->player_count = room.player_count > 0 ? room.player_count : 1;
+    out->max_slots = room.max_slots >= 2 ? room.max_slots : 2;
+    out->has_password = room.has_password;
+    out->latency_ms = -1;
+    return 1;
+  }
+  return 0;
+}
+
+static int beacon_row_count(const char *skip_endpoint)
+{
+  int n = 0;
+  while (fill_beacon_row(n, skip_endpoint, NULL))
+    ++n;
+  return n;
 }
 
 static const char *game_name(void)
@@ -109,11 +321,189 @@ static const char *game_version(void)
                                                     : "0.0.0";
 }
 
+#if SNESRECOMP_ENABLE_MODS
+#include "mod_runtime.h"
+#endif
+
+static void dl_queue_step(void);
+static void mod_set_sync_step(void);
+static void desync_report_step(void);
+static void cb_push_match_caps(void *ctx);
+static void host_caps_watch_step(void);
+
+/*
+ * The host's required mod plan, carried in match caps.
+ *
+ * Filled here rather than only in push_match_caps so EVERY caps push carries
+ * it: a plan that only rides along when someone happens to toggle a mod is a
+ * plan that goes stale the first time anything else changes.
+ *
+ * One row per PACKAGE, which is both what the lobby server matches a joiner's
+ * offer against and what a player actually installs. The runtime's own
+ * effective-set text is per FEATURE and stays the basis of the simulation
+ * equality check -- a package can be present and still be configured
+ * differently. Two grains, two questions.
+ */
+static void fill_caps_mods(SnesLobbyMatchCaps *caps)
+{
+#if SNESRECOMP_ENABLE_MODS
+  SnesModPkgRow rows[SNES_LOBBY_MAX_MODS];
+  int n;
+  int i;
+
+  if (!caps)
+    return;
+  /* Apply our own grant FIRST, because both the plan rows and the effective
+   * set below are computed through it: a host that publishes an allowlist and
+   * then reports a set built without it would advertise its own cosmetic mods
+   * as requirements, and guests would be told to install them. */
+  snprintf(caps->mod_cosmetic_allow, sizeof(caps->mod_cosmetic_allow), "%s",
+           g_opts.cosmetic_allow ? g_opts.cosmetic_allow : "");
+  snes_mod_runtime_set_cosmetic_allow_c(caps->mod_cosmetic_allow);
+  caps->mod_count = 0;
+  n = snes_mod_runtime_plan_rows_c(rows, SNES_LOBBY_MAX_MODS);
+  for (i = 0; i < n && i < SNES_LOBBY_MAX_MODS; ++i) {
+    SnesLobbyModPkg *dst = &caps->mods[caps->mod_count];
+    /* The runtime already refuses to emit a row whose id or version had to be
+     * cut, so anything arriving here is whole. The lobby's fields are at least
+     * as wide; snprintf is belt-and-braces, not the policy. */
+    snprintf(dst->id, sizeof(dst->id), "%s", rows[i].id);
+    snprintf(dst->ver, sizeof(dst->ver), "%s", rows[i].version);
+    snprintf(dst->name, sizeof(dst->name), "%s", rows[i].name);
+    snprintf(dst->feats, sizeof(dst->feats), "%s", rows[i].features);
+    caps->mod_count++;
+  }
+  /* The exact configuration, not just the package list. */
+  {
+    char text[1024];
+    const int need = snes_mod_runtime_effective_set_c(text, (uint32_t)sizeof(text));
+    caps->mod_set[0] = '\0';
+    if (need > 0 && need < (int)sizeof(text) && strcmp(text, "(none)\n") != 0) {
+      size_t o = 0;
+      size_t k;
+      for (k = 0; text[k] && o + 1 < sizeof(caps->mod_set); ++k) {
+        char c = text[k];
+        if (c == '\n') {
+          if (o == 0 || caps->mod_set[o - 1] == ';') continue;
+          c = ';';
+        }
+        caps->mod_set[o++] = c;
+      }
+      caps->mod_set[o] = '\0';
+      if (o && caps->mod_set[o - 1] == ';') caps->mod_set[o - 1] = '\0';
+      if (text[k] != '\0') {
+        /* Publishing a PREFIX would be worse than publishing nothing: a guest
+         * would adopt a partial configuration and believe it matched. */
+        caps->mod_set[0] = '\0';
+        fprintf(stderr, "netplay: mod set too long to publish; guests will be "
+                        "asked to match it at launch instead\n");
+      }
+    }
+  }
+
+  /* Say what went on the wire. The caps line next to this one reported
+   * widescreen/hud/aspect and said nothing about mods, so a host with a plan
+   * and a guest without the packages produced two clean-looking logs and a
+   * join that failed for reasons neither of them recorded. */
+  if (caps->mod_count > 0) {
+    int k;
+    fprintf(stderr, "netplay: publishing mod plan (%d package(s)) - peers "
+                    "may join without these, but the match will not start "
+                    "until they have them\n", caps->mod_count);
+    for (k = 0; k < caps->mod_count; ++k)
+      fprintf(stderr, "netplay:   requires %s@%s [%s]\n", caps->mods[k].id,
+              caps->mods[k].ver, caps->mods[k].feats);
+  } else {
+    fprintf(stderr, "netplay: publishing mod plan (none) - vanilla match\n");
+  }
+#else
+  if (caps)
+    caps->mod_count = 0;
+#endif
+}
+
+/* What this peer already has, for the join's mod_offer. The lobby server
+ * subtracts this from the host's plan and refuses to seat on any remainder, so
+ * this is the half of the seat decision that speaks for US.
+ *
+ * Every installed (package, version) pair, enabled or not: the question the
+ * server asks is possession. Which of them actually RUN is the host's plan to
+ * decide, and a peer that owns a mod it has switched off can still play in a
+ * lobby that requires it. */
+static int mod_offer_rows(SnesLobbyModPkg *out, int max, void *ctx)
+{
+  (void)ctx;
+#if SNESRECOMP_ENABLE_MODS
+  {
+    SnesModPkgRow rows[SNES_LOBBY_MAX_MODS];
+    int n;
+    int i;
+    int o = 0;
+    if (!out || max <= 0)
+      return 0;
+    n = snes_mod_runtime_installed_rows_c(rows, SNES_LOBBY_MAX_MODS);
+    for (i = 0; i < n && o < max; ++i) {
+      int dup = 0;
+      int k;
+      /* One row per package id. The runtime lists every (id, version) it
+       * holds, but peers match on id, so a second version of the same package
+       * says nothing new and would spend one of the few rows the offer has
+       * room for. The first version stays as the one we report, so the row
+       * can still say WHICH version we hold. */
+      for (k = 0; k < o; ++k)
+        if (!strcmp(out[k].id, rows[i].id)) { dup = 1; break; }
+      if (dup)
+        continue;
+      memset(&out[o], 0, sizeof(out[o]));
+      snprintf(out[o].id, sizeof(out[o].id), "%s", rows[i].id);
+      snprintf(out[o].ver, sizeof(out[o].ver), "%s", rows[i].version);
+      /* Name and features are the host plan's business; an offer claims
+       * possession and nothing else. */
+      o++;
+    }
+    return o;
+  }
+#else
+  (void)out;
+  (void)max;
+  return 0;
+#endif
+}
+
+/* The mod runtime, handed to the lobby as three plain functions. The lobby
+ * moves bytes; only these know what a package is. */
+#if SNESRECOMP_ENABLE_MODS
+static int xfer_export(const char *id, const char *ver, uint8_t **out,
+                       uint32_t *out_len, char *sha, uint32_t sha_cap,
+                       char *err, uint32_t err_cap, void *ctx)
+{
+  (void)ctx;
+  return snes_mod_runtime_export_package_c(id, ver, out, out_len, sha, sha_cap,
+                                           err, err_cap);
+}
+
+static void xfer_free(uint8_t *blob)
+{
+  snes_mod_runtime_free_blob_c(blob);
+}
+
+static int xfer_install(const uint8_t *data, uint32_t len,
+                        const char *expect_sha256, char *id, uint32_t id_cap,
+                        char *ver, uint32_t ver_cap, char *err,
+                        uint32_t err_cap, void *ctx)
+{
+  (void)ctx;
+  return snes_mod_runtime_install_blob_c(data, len, expect_sha256, id, id_cap,
+                                         ver, ver_cap, err, err_cap);
+}
+#endif
+
 static SnesLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
 {
   SnesLobbyMatchCaps caps;
   memset(&caps, 0, sizeof(caps));
   caps.valid = 1;
+  caps.rollback = 1;   /* framework default; fill_match_caps may override */
   caps.input_delay = clamp_input_delay(g_lobby_input_delay);
   if (settings) {
     caps.widescreen = settings->widescreen != 0;
@@ -125,6 +515,7 @@ static SnesLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
   caps.input_delay = clamp_input_delay(caps.input_delay);
   caps.force_turn = g_lobby_force_turn ? 1 : 0;
   caps.force_input_relay = g_lobby_force_input_relay ? 1 : 0;
+  fill_caps_mods(&caps);
   return caps;
 }
 
@@ -332,6 +723,18 @@ int snes_host_lobby_init(const SnesHostLobbyIdentity *id,
   g_runtime_error[0] = '\0';
   g_external_ip[0] = '\0';
   g_local_address_count = 0;
+  /* Installed before any join can be issued: a join that goes out without the
+   * offer tells the server this peer owns no mods at all, and the server turns
+   * it away from every lobby whose host enabled one. */
+  snes_lobby_set_mod_offer_supplier(mod_offer_rows, NULL);
+#if SNESRECOMP_ENABLE_MODS
+  snes_lobby_set_mod_transfer_hooks(xfer_export, xfer_free, xfer_install, NULL);
+  fprintf(stderr, "netplay: mod transfer hooks installed (this build can send "
+                  "and receive mods)\n");
+#else
+  fprintf(stderr, "netplay: built without mod support; this build cannot send "
+                  "or receive mods\n");
+#endif
   g_inited = 1;
   return 0;
 }
@@ -339,6 +742,7 @@ int snes_host_lobby_init(const SnesHostLobbyIdentity *id,
 void snes_host_lobby_shutdown(void)
 {
   snes_host_lobby_disconnect();
+  rnet_lan_beacon_close(&g_beacon_listen);
   g_inited = 0;
 }
 
@@ -429,9 +833,15 @@ static void cb_set_url(void *ctx, const char *url)
 
 static int cb_connect(void *ctx)
 {
+  int rc;
   (void)ctx;
   snes_lobby_set_game_identity(game_name(), game_version());
-  return snes_lobby_connect(cb_default_url(NULL));
+  rc = snes_lobby_connect(cb_default_url(NULL));
+  /* connect() resets the client; the reset keeps the identity, and this
+   * re-apply is the second lock on the same door -- a lobby created or a
+   * chat sent with an empty title is invisible to everyone else. */
+  snes_lobby_set_game_identity(game_name(), game_version());
+  return rc;
 }
 
 static int cb_connected(void *ctx)
@@ -443,7 +853,70 @@ static int cb_connected(void *ctx)
 static void cb_pump(void *ctx)
 {
   (void)ctx;
+  /* Point the account client at the lobby host, and pump it.
+   *
+   * rnet_auth.c derives its HTTP host from the ws:// URL handed to
+   * rnet_account_init, and its own comment says "Init runs from the netplay
+   * pump" -- but nothing called it. The linker then dead-stripped
+   * rnet_account_init out of the binary entirely, so g.host stayed the
+   * zero-initialised empty string and every "/auth" POST died in
+   * getaddrinfo("", "0"). That surfaces as "couldn't reach the lobby server
+   * to sign in" no matter which host is configured, which is exactly the
+   * wrong place to go looking.
+   *
+   * Re-init only when the URL actually changes rather than every pump: the
+   * worker thread reads g.host while a login is in flight, and memset-ing it
+   * under that read 60 times a second would be a data race for no gain. */
+  {
+    static char auth_url[256];
+    const char *url = cb_default_url(NULL);
+    if (url && url[0] && strcmp(url, auth_url) != 0) {
+      /* Anchor the secret to the EXECUTABLE directory before the first init.
+       * Its default is the bare relative name "netplay_secret", resolved
+       * against the working directory -- so the same install signed itself
+       * out depending on where it was launched from, and a rebuild run from a
+       * different directory read as a lost login. rnet_auth.c migrates an old
+       * CWD-relative file into this path on first load, so nobody is signed
+       * out by the move. */
+      char secret_path[512];
+      if (snesrecomp_exe_dir_path("netplay_secret", secret_path,
+                                  sizeof(secret_path)))
+        rnet_account_set_secret_path(secret_path);
+      snprintf(auth_url, sizeof(auth_url), "%s", url);
+      rnet_account_init(url);
+    }
+  }
+  rnet_account_pump();
+
+  /* Publish the account name to the lobby.
+   *
+   * The lobby's display name is what seats and the players-online list show,
+   * and it defaults to the literal "Host" when empty (snes_lobby_client.c
+   * create path). Nothing pushed the account handle into it: signing in --
+   * including the automatic sign-in from a stored secret -- only updated the
+   * ACCOUNT, so a signed-in player created a lobby and appeared as "Host".
+   * Only an explicit rename through the name modal ever set it.
+   *
+   * Done here rather than at a sign-in edge because there is no single such
+   * edge: interactive login, stored-secret redemption and a server-side
+   * handle change all land asynchronously in the pump. Comparing against the
+   * live name makes this idempotent -- set_display_name only re-sends hello
+   * when the value actually changed. */
+  if (rnet_account_state() == RNET_ACCOUNT_SIGNED_IN) {
+    const char *handle = rnet_account_handle();
+    const char *shown = snes_lobby_display_name();
+    if (handle && handle[0] && (!shown || strcmp(shown, handle) != 0))
+      snes_lobby_set_display_name(handle);
+  }
+
   snes_lobby_pump();
+  dl_queue_step();
+  host_caps_watch_step();
+  mod_set_sync_step();
+  desync_report_step();
+  lan_chat_drain();
+  beacon_listen_step();
+  beacon_publish_step();
   if (g_hosting_lan && g_direct_host) {
     int rtt = -1;
     if (rnet_lan_direct_host_pump(g_direct_host, &g_lan_room, &rtt))
@@ -475,11 +948,26 @@ static void cb_set_player_name(void *ctx, const char *name)
 {
   (void)ctx;
   snes_lobby_set_display_name(name && name[0] ? name : "Player");
+  /* Persist immediately: the launcher may never reach PLAY (the player can
+   * set a name, browse the lobby and quit), and a name that only survives a
+   * successful launch still prompts on the next run. */
+  if (name && name[0])
+    (void)snes_netplay_identity_store(name);
 }
 
 static const char *cb_player_name(void *ctx)
 {
+  static char persisted[64];
   (void)ctx;
+  {
+    const char *live = snes_lobby_display_name();
+    if (live && live[0])
+      return live;
+  }
+  /* Nothing set this session: hand back what the last run stored, so the
+   * launcher opens with the name already filled in. */
+  if (snes_netplay_identity_load(persisted, sizeof(persisted)))
+    return persisted;
   return snes_lobby_display_name();
 }
 
@@ -489,11 +977,92 @@ static void cb_request_list(void *ctx)
   snes_lobby_request_list();
 }
 
+/* The list is: hub rows, then the same-machine registry row (if any), then
+ * the rooms heard on the LAN beacon. The registry row's endpoint is passed to
+ * the beacon filter so a host on THIS machine is listed once, not twice. */
+/* Which sources the browser is currently asking for. The UI sets it from the
+ * fork the player took; 0 keeps the old merge-everything behaviour for a
+ * launcher that never calls the setter. */
+static int g_list_scope;
+
+#if defined(RECOMP_LAUNCHER_HAS_SET_BLOCKS)
+static int cb_set_blocks(void *ctx, const char *accounts)
+{
+  (void)ctx;
+  return snes_lobby_set_blocks(accounts);
+}
+#endif
+
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+static int cb_chat_report(void *ctx, const char *const *mids, int mid_count,
+                          const char *reason, const char *note)
+{
+  (void)ctx;
+  /* Thin on purpose: the frame is built once in recomp-net so the rule about
+   * what may be reported does not end up written five times, and this layer's
+   * whole job is to pass it on. */
+  return snes_lobby_report_chat(mids, mid_count, reason, note);
+}
+#endif
+
+#if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
+static int cb_list_scope_set(void *ctx, int scope)
+{
+  (void)ctx;
+  g_list_scope = scope;
+  return 0;
+}
+#endif
+
+static int list_want_online(void)
+{
+  return g_list_scope != RECOMP_LAUNCHER_LIST_SCOPE_LAN;
+}
+
+static int list_want_lan(void)
+{
+  return g_list_scope != RECOMP_LAUNCHER_LIST_SCOPE_ONLINE;
+}
+
 static int cb_list_count(void *ctx)
 {
   RecompLauncherCNetplayLobby lan;
+  int have_lan;
   (void)ctx;
-  return snes_lobby_list_count() + (fill_lan_row(&lan) ? 1 : 0);
+  have_lan = list_want_lan() && fill_lan_row(&lan);
+  /* SNESRECOMP_LOBBY_LIST_DEBUG=1: say where the browser's rows come from,
+   * once per change. "The list is empty" has four possible causes -- wrong
+   * scope, nothing on the server, no registry row, no beacons heard -- and
+   * they are indistinguishable from the screen. Off by default; this is a
+   * line to ask a player for, not one to print at everybody. */
+  {
+    static int enabled = -1;
+    if (enabled < 0) {
+      const char *e = getenv("SNESRECOMP_LOBBY_LIST_DEBUG");
+      enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (enabled) {
+      static int last_scope = -1, last_remote = -1, last_lan = -1, last_beacon = -1;
+      int remote = snes_lobby_list_count();
+      int beacons = beacon_row_count(have_lan ? lan.lobby_id + 4 : "");
+      if (last_scope != g_list_scope || last_remote != remote ||
+          last_lan != have_lan || last_beacon != beacons) {
+        last_scope = g_list_scope; last_remote = remote;
+        last_lan = have_lan; last_beacon = beacons;
+        fprintf(stderr,
+                "[lobby-list] scope=%s server_rows=%d local_registry=%d "
+                "lan_beacons=%d version=\"%s\" strict=%d\n",
+                g_list_scope == 1 ? "LAN" : g_list_scope == 2 ? "ONLINE" : "ANY",
+                remote, have_lan, beacons, game_version(),
+                snes_lobby_version_filter_strict());
+      }
+    }
+  }
+  return (list_want_online() ? snes_lobby_list_count() : 0) +
+         (have_lan ? 1 : 0) +
+         (list_want_lan()
+              ? beacon_row_count(have_lan ? lan.lobby_id + 4 : "")
+              : 0);
 }
 
 static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
@@ -503,9 +1072,22 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   (void)ctx;
   if (!out || index < 0)
     return 0;
-  remote_count = snes_lobby_list_count();
-  if (index >= remote_count)
-    return index == remote_count ? fill_lan_row(out) : 0;
+  remote_count = list_want_online() ? snes_lobby_list_count() : 0;
+  if (index >= remote_count) {
+    RecompLauncherCNetplayLobby lan;
+    int have_lan = list_want_lan() && fill_lan_row(&lan);
+    if (!list_want_lan())
+      return 0;
+    index -= remote_count;
+    if (have_lan) {
+      if (index == 0) {
+        *out = lan;
+        return 1;
+      }
+      --index;
+    }
+    return fill_beacon_row(index, have_lan ? lan.lobby_id + 4 : "", out);
+  }
   if (!snes_lobby_list_get(index, &row))
     return 0;
   memset(out, 0, sizeof(*out));
@@ -517,6 +1099,41 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   out->player_count = row.player_count;
   out->max_slots = row.max_slots;
   out->has_password = row.has_password;
+  snprintf(out->host_country, sizeof(out->host_country), "%s", row.host_country);
+  out->allow_spectators = row.allow_spectators;
+  out->max_spectators = row.max_spectators;
+  out->spectator_count = row.spectator_count;
+  return 1;
+}
+
+/* Players online: the hub's `players` list. The LAN room has no hub. */
+static int cb_online_count(void *ctx)
+{
+  (void)ctx;
+  return snes_lobby_connected() ? snes_lobby_online_count() : 0;
+}
+
+static int cb_online_get(void *ctx, int index, RecompLauncherCNetplayOnlinePlayer *out)
+{
+  SnesLobbyOnlinePlayer p;
+  const char *me;
+  (void)ctx;
+  if (!out || !snes_lobby_online_get(index, &p))
+    return 0;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->display_name, sizeof(out->display_name), "%s", p.display_name);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
+  /* The key a local ignore/block list uses. Empty for a guest. */
+  snprintf(out->account, sizeof(out->account), "%s", p.account);
+#endif
+  snprintf(out->country, sizeof(out->country), "%s", p.country);
+  snprintf(out->lobby_name, sizeof(out->lobby_name), "%s", p.lobby_name);
+  out->in_lobby = p.lobby_id[0] != '\0';
+  out->hosting = p.hosting;
+  /* Which row is us: the hub tags each row with the first characters of
+   * its connection id. A name match would mark every namesake. */
+  me = snes_lobby_player_id();
+  out->is_local = me && me[0] && p.tag[0] && strncmp(me, p.tag, strlen(p.tag)) == 0;
   return 1;
 }
 
@@ -641,7 +1258,30 @@ static int cb_join(void *ctx, const char *lobby_id, const char *password,
     g_joined_direct = 0;
     g_direct_peer_endpoint[0] = '\0';
 
-    /* Same-machine fast path: shared file registry. */
+    /* UDP JOIN_REQ to the host's socket first -- on the same machine too.
+     * The host's seat table, chat and seat swaps all live on that socket;
+     * a joiner that only wrote itself into the registry file is invisible
+     * to the host and can neither talk nor trade seats. The endpoint comes
+     * from the lobby id (the registry's advertised address, or what the
+     * player typed for Join Direct). */
+    rc = rnet_lan_direct_guest_join(
+        endpoint, game_name(), game_version(), password ? password : "",
+        name && name[0] ? name : "Player", guest_bind, 2500, &state,
+        &g_direct_guest);
+    if (rc == RNET_LAN_DIRECT_OK) {
+      g_lan_room = state;
+      g_joined_lan = 1;
+      g_joined_direct = 1;
+      snprintf(g_direct_peer_endpoint, sizeof(g_direct_peer_endpoint), "%s",
+               endpoint);
+      snprintf(g_resume_endpoint, sizeof(g_resume_endpoint), "%s", endpoint);
+      return 0;
+    }
+    if (rc == RNET_LAN_DIRECT_ERR_PASSWORD)
+      return -2;
+
+    /* Registry-file fallback: a host without a direct socket (older build).
+     * Seated, but with no channel to the host beyond the file. */
     rc = rnet_lan_lobby_join(lan_path(), game_name(), game_version(),
                              password ? password : "",
                              name && name[0] ? name : "Player", &state);
@@ -654,21 +1294,11 @@ static int cb_join(void *ctx, const char *lobby_id, const char *password,
                endpoint[0] ? endpoint : state.endpoint);
       return 0;
     }
-
-    /* Remote / cross-subnet: UDP JOIN_REQ to the typed IP:port. */
-    rc = rnet_lan_direct_guest_join(
-        endpoint, game_name(), game_version(), password ? password : "",
-        name && name[0] ? name : "Player", guest_bind, 2500, &state,
-        &g_direct_guest);
-    if (rc != RNET_LAN_DIRECT_OK)
-      return map_direct_join_rc(rc);
-    g_lan_room = state;
-    g_joined_lan = 1;
-    g_joined_direct = 1;
-    snprintf(g_direct_peer_endpoint, sizeof(g_direct_peer_endpoint), "%s",
-             endpoint);
-    snprintf(g_resume_endpoint, sizeof(g_resume_endpoint), "%s", endpoint);
-    return 0;
+    if (rc == RNET_LAN_LOBBY_ERR_PASSWORD)
+      return -2;
+    if (rc == RNET_LAN_LOBBY_ERR_IO)
+      return -3;
+    return -1;
   }
   g_hosting_lan = 0;
   g_joined_lan = 0;
@@ -720,6 +1350,8 @@ static int cb_member_get(void *ctx, int index,
     out->slot = index == 0 ? state.host_slot : 1 - state.host_slot;
     out->ready = index == 0 || state.joiner_name[0] != '\0';
     out->is_host = index == 0;
+    /* The launcher's self-service (drag your own row) keys on this. */
+    out->is_local = index == 0 ? (g_hosting_lan ? 1 : 0) : (g_joined_lan ? 1 : 0);
     snprintf(out->display_name, sizeof(out->display_name), "%s",
              index == 0 ? state.host_name : state.joiner_name);
     /* Host row: N/A. Guest row: Direct-IP / LAN UDP RTT when known. */
@@ -731,11 +1363,500 @@ static int cb_member_get(void *ctx, int index,
     return 0;
   out->slot = member.slot;
   out->ready = member.ready;
+  out->is_spectator = member.is_spectator;
   out->is_host = snes_lobby_member_is_host(&member);
+  snprintf(out->country, sizeof(out->country), "%s", member.country);
+  {
+    const char *me = snes_lobby_player_id();
+    out->is_local = (me && me[0] && member.player_id[0] &&
+                     strcmp(me, member.player_id) == 0) ? 1 : 0;
+  }
   snprintf(out->display_name, sizeof(out->display_name), "%s",
            member.display_name);
   out->latency_ms = snes_lobby_member_latency_ms(member.slot);
   return 1;
+}
+
+/* ---- lobby chat ---------------------------------------------------------
+ *
+ * Two transports, one discipline. Online the lobby server echoes every line
+ * back and that echo is the copy we keep. On LAN the HOST plays the server's
+ * part: a guest sends its line to the host, keeps nothing locally, and the
+ * host stamps the seat name on it and echoes it back. Either way the UI never
+ * appends its own send, so both peers hold the same lines in the same order.
+ *
+ * Direct-IP only on the LAN side. The same-machine file registry has no
+ * channel between the two instances to carry a line over, so a room seated
+ * through it reports no chat rather than a box that swallows what you type. */
+#define SNES_LAN_CHAT_RING 64
+static SnesLobbyChatMsg g_lan_chat[SNES_LAN_CHAT_RING];
+static int g_lan_chat_head;
+static int g_lan_chat_count;
+static uint32_t g_lan_chat_seq;
+
+static void lan_chat_clear(void)
+{
+  g_lan_chat_head = 0;
+  g_lan_chat_count = 0;
+  /* seq keeps counting across rooms -- see snes_lobby_chat_clear. */
+}
+
+static void lan_chat_push(const char *player_id, const char *from,
+                          const char *text)
+{
+  SnesLobbyChatMsg *m;
+  int idx;
+  if (!text || !text[0])
+    return;
+  if (g_lan_chat_count < SNES_LAN_CHAT_RING) {
+    idx = (g_lan_chat_head + g_lan_chat_count) % SNES_LAN_CHAT_RING;
+    g_lan_chat_count++;
+  } else {
+    idx = g_lan_chat_head;
+    g_lan_chat_head = (g_lan_chat_head + 1) % SNES_LAN_CHAT_RING;
+  }
+  m = &g_lan_chat[idx];
+  memset(m, 0, sizeof(*m));
+  snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+  snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+  snprintf(m->text, sizeof(m->text), "%s", text);
+  /* A LAN room has no server to mask for it: every peer masks the line as
+   * it lands in the ring, the host included. */
+  (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
+  /* On LAN a player id is whatever each side calls itself, so "mine" is
+   * decided by the display name the host stamped -- the only identity both
+   * sides agree on here. */
+  {
+    const char *me = snes_lobby_display_name();
+    m->is_local = (me && me[0] && m->from[0] && strcmp(m->from, me) == 0) ? 1 : 0;
+  }
+  m->seq = ++g_lan_chat_seq;
+}
+
+/* Drain whatever the direct-IP link delivered since the last pump. */
+static void lan_chat_drain(void)
+{
+  RNetLanChatLine line;
+  if (g_hosting_lan && g_direct_host) {
+    while (rnet_lan_direct_host_take_chat(g_direct_host, &line))
+      lan_chat_push(line.player_id, line.from, line.text);
+    if (rnet_lan_direct_host_take_swap_request(g_direct_host))
+      g_lan_swap_incoming = 1;
+  } else if (g_joined_lan && g_joined_direct && g_direct_guest) {
+    int accept = 0;
+    while (rnet_lan_direct_guest_take_chat(g_direct_guest, &line))
+      lan_chat_push(line.player_id, line.from, line.text);
+    if (rnet_lan_direct_guest_take_swap_result(g_direct_guest, &accept))
+      g_lan_swap_outgoing = accept ? 2 : -1;
+  }
+}
+
+/* Host: trade the two seats and tell the room. */
+static int lan_swap_seats(const char *why)
+{
+  if (!g_hosting_lan) return -1;
+  fprintf(stderr, "netplay: LAN seat swap (%s): host_slot %d -> %d\n", why,
+          g_lan_room.host_slot, 1 - g_lan_room.host_slot);
+  g_lan_room.host_slot = 1 - g_lan_room.host_slot;
+  g_lan_room.started = 0;
+  return publish_lan_room() ? 0 : -1;
+}
+
+/* 1 when this LAN room can actually carry a line between the two peers. */
+static int lan_chat_available(void)
+{
+  if (g_hosting_lan)
+    return g_direct_host != NULL;
+  if (g_joined_lan)
+    return g_joined_direct && g_direct_guest != NULL;
+  return 0;
+}
+
+static int cb_chat_send(void *ctx, const char *text)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) {
+    if (!lan_chat_available())
+      return -1;
+    if (g_hosting_lan) {
+      /* The host keeps its own line and sends it on -- it is the authority
+       * here, exactly as the lobby server is online. */
+      const char *me = snes_lobby_display_name();
+      return rnet_lan_direct_host_send_chat(g_direct_host, me ? me : "",
+                                            me ? me : "Host",
+                                            text) == RNET_LAN_DIRECT_OK
+                 ? 0
+                 : -1;
+    }
+    /* Guest: send and keep nothing. The host's echo is the copy we keep, so
+     * the two logs cannot disagree about order. */
+    {
+      const char *me = snes_lobby_display_name();
+      return rnet_lan_direct_guest_send_chat(g_direct_guest, me ? me : "",
+                                             text) == RNET_LAN_DIRECT_OK
+                 ? 0
+                 : -1;
+    }
+  }
+  return snes_lobby_send_chat(text);
+}
+
+static int cb_chat_count(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return lan_chat_available() ? g_lan_chat_count : 0;
+  return snes_lobby_chat_count();
+}
+
+static int cb_chat_get(void *ctx, int index,
+                       RecompLauncherCNetplayChatMessage *out)
+{
+  SnesLobbyChatMsg msg;
+  (void)ctx;
+  if (!out)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  if (g_hosting_lan || g_joined_lan) {
+    if (!lan_chat_available() || index < 0 || index >= g_lan_chat_count)
+      return 0;
+    msg = g_lan_chat[(g_lan_chat_head + index) % SNES_LAN_CHAT_RING];
+  } else if (!snes_lobby_chat_get(index, &msg)) {
+    return 0;
+  }
+  snprintf(out->from, sizeof(out->from), "%s", msg.from);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
+  snprintf(out->account, sizeof(out->account), "%s", msg.account);
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+  /* Empty against a server that predates message ids, which the UI reads as
+   * "this line cannot be reported" rather than offering an action that would
+   * be refused. */
+  snprintf(out->mid, sizeof(out->mid), "%s", msg.mid);
+#endif
+  snprintf(out->text, sizeof(out->text), "%s", msg.text);
+  out->is_local = msg.is_local;
+  out->is_system = msg.is_system;
+  out->seq = msg.seq;
+  return 1;
+}
+
+/* Server chat: per-game, online only. A LAN room has no server and no wider
+ * audience, so the panel is hidden there (send refuses, count 0). */
+/* ---- optional Discord sign-in ------------------------------------------
+ * Thin adapters over snes_netplay_auth, which owns the HTTP, the worker
+ * thread and the device key. */
+static int cb_account_available(void *ctx) { (void)ctx; return rnet_account_available(); }
+static int cb_account_login_begin(void *ctx) { (void)ctx; return rnet_account_login_begin(); }
+static int cb_account_state(void *ctx) { (void)ctx; return rnet_account_state(); }
+static const char *cb_account_handle(void *ctx) { (void)ctx; return rnet_account_handle(); }
+static const char *cb_account_username(void *ctx) { (void)ctx; return rnet_account_username(); }
+static const char *cb_account_error(void *ctx) { (void)ctx; return rnet_account_error(); }
+static int cb_account_sign_out(void *ctx) { (void)ctx; return rnet_account_sign_out(); }
+/* ── automatch ──────────────────────────────────────────────────────────────
+ *
+ * Thin: the lobby client owns the protocol and the state machine, and this
+ * layer only translates its vocabulary into the launcher's. The one piece of
+ * POLICY here is mods_enabled -- see cb_automatch_queue.
+ */
+#if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
+static int cb_automatch_available(void *ctx)
+{
+    (void)ctx;
+    /* Ask once the answer could exist. The launcher polls this every frame
+     * while the netplay page is up, which is exactly when a reply is useful,
+     * and the client refuses to re-send while one is outstanding. */
+    if (snes_lobby_connected() && !snes_lobby_automatch_available())
+        snes_lobby_automatch_request_rulesets();
+    return snes_lobby_automatch_available();
+}
+
+static int cb_automatch_ruleset_count(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_ruleset_count();
+}
+
+static int cb_automatch_ruleset_get(void *ctx, int index,
+                                    RecompLauncherCNetplayRuleset *out)
+{
+    SnesLobbyRuleset r;
+    (void)ctx;
+    if (!out || !snes_lobby_automatch_ruleset_get(index, &r)) return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->id, sizeof(out->id), "%s", r.id);
+    snprintf(out->label, sizeof(out->label), "%s", r.label);
+    snprintf(out->caps_summary, sizeof(out->caps_summary), "%s", r.caps_summary);
+    snprintf(out->game_version, sizeof(out->game_version), "%s", r.game_version);
+    out->max_slots = 2;
+    return 1;
+}
+
+static int cb_automatch_queue(void *ctx, const char *ruleset_id)
+{
+    (void)ctx;
+    /*
+     * mods_enabled asserts that a SIM-AFFECTING mod feature is on locally
+     * BEYOND whatever the chosen ruleset itself imposes.
+     *
+     * The distinction matters and is not pedantry. A ruleset that pins the
+     * widescreen margin has both peers running the same patched sim by the
+     * server's own instruction -- that is the ruleset, not a divergence. A
+     * feature the ruleset says nothing about is a divergence, and it is the
+     * desync §5 is about.
+     *
+     * The server cannot check either one. It takes this client's word, and
+     * the assertion exists so that a modified client is making a deliberate
+     * false statement rather than exploiting an omission. Which is why the
+     * answer is computed by the GAME (SnesHostLobbyOpts.mods_enabled) rather
+     * than assumed here: only the game knows what its own features do.
+     */
+    char why[160];
+    int mods;
+    why[0] = '\0';
+
+    /*
+     * The SERVER's grant, not ours, and applied before the game is asked
+     * anything -- the whole assertion below is computed through it.
+     *
+     * An automatch room is the server's room. Whatever this build would allow
+     * as a host is irrelevant here: a player queueing for a public pool does
+     * not get to decide which of their own mods are harmless, because that is
+     * precisely the decision a cheat would make in its own favour. A ruleset
+     * with no list grants nothing, so an unapproved cosmetic claim counts as
+     * simulation-affecting and the queue is refused.
+     */
+    {
+        SnesLobbyRuleset r;
+        char allow[512];
+        int i, n = snes_lobby_automatch_ruleset_count();
+        allow[0] = '\0';
+        for (i = 0; i < n; ++i) {
+            if (!snes_lobby_automatch_ruleset_get(i, &r)) continue;
+            /* NULL/"" selects the first, matching the client's own rule. */
+            if (ruleset_id && ruleset_id[0] && strcmp(r.id, ruleset_id) != 0)
+                continue;
+            snprintf(allow, sizeof(allow), "%s", r.caps.mod_cosmetic_allow);
+            break;
+        }
+        snes_mod_runtime_set_cosmetic_allow_c(allow);
+    }
+
+    /*
+     * Refuse an ungranted cosmetic claim here, by name, before the game's own
+     * assertion runs.
+     *
+     * The game's answer is derived from the effective set, which now excludes
+     * anything the server DID grant -- so without this check a mod the server
+     * never approved would simply be absent from the game's view and pass
+     * unnoticed. It is checked here rather than in the game because it is the
+     * framework's rule, not a per-title one, and a title that forgot to
+     * implement it would be the hole.
+     */
+#if SNESRECOMP_ENABLE_MODS
+    {
+        char bad[512];
+        if (snes_mod_runtime_unapproved_cosmetics_c(bad, sizeof(bad)) > 0 &&
+            bad[0]) {
+            char *nl = strchr(bad, '\n');
+            if (nl) *nl = '\0';
+            snprintf(why, sizeof(why),
+                     "%s is not on this queue's approved list", bad);
+            snes_lobby_automatch_refuse_local(why);
+            return -1;
+        }
+    }
+#endif
+
+    mods = g_opts.mods_enabled
+               ? g_opts.mods_enabled(g_opts.mods_ctx, ruleset_id, why, sizeof(why))
+               : 0;
+    if (mods) {
+        /* Refuse here rather than sending a ticket the server will certainly
+         * bounce: mods_not_pooled comes back as one generic line, and this
+         * side knows exactly which feature caused it. */
+        snes_lobby_automatch_refuse_local(
+            why[0] ? why : "Turn off sim-affecting mods to queue");
+        return -1;
+    }
+    /* Declare the exemptions we are relying on, so the SERVER checks them
+     * against its own allowlist rather than taking the verdict above on
+     * trust. The two gates are layers: an old server ignores this field and
+     * the assertion still holds, a new one stops needing to believe us. */
+    {
+        char exempt[768];
+        exempt[0] = '\0';
+#if SNESRECOMP_ENABLE_MODS
+        if (snes_mod_runtime_exempted_packages_c(exempt, sizeof(exempt)) >=
+            (int)sizeof(exempt)) {
+            /* Never queue having declared less than we rely on. */
+            snes_lobby_automatch_refuse_local(
+                "too many mod exemptions to declare to the server");
+            return -1;
+        }
+#endif
+        return snes_lobby_automatch_queue(ruleset_id, 0, exempt) == 0 ? 0 : -1;
+    }
+}
+
+static int cb_automatch_cancel(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_cancel();
+}
+
+static int cb_automatch_state(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_state();
+}
+
+static int cb_automatch_queued_secs(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_queued_secs();
+}
+
+static int cb_automatch_pool(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_pool();
+}
+
+static int cb_automatch_found_get(void *ctx, RecompLauncherCNetplayFound *out)
+{
+    SnesLobbyAutomatchFound f;
+    (void)ctx;
+    if (!out || !snes_lobby_automatch_found_get(&f)) return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->handle, sizeof(out->handle), "%s", f.opponent);
+    snprintf(out->country, sizeof(out->country), "%s", f.opponent_country);
+    snprintf(out->ruleset_label, sizeof(out->ruleset_label), "%s",
+             f.ruleset_label);
+    /* <0 rather than 0 when the server offered none: zero is a legitimate
+     * estimate on a LAN and must not read as "unknown". */
+    out->est_rtt_ms = f.est_rtt_ms > 0 ? f.est_rtt_ms : -1;
+    out->accept_secs_left = f.accept_secs;
+    return 1;
+}
+
+static int cb_automatch_accept(void *ctx, int accept)
+{
+    (void)ctx;
+    return snes_lobby_automatch_accept(accept);
+}
+
+static const char *cb_automatch_error(void *ctx)
+{
+    (void)ctx;
+    return snes_lobby_automatch_error();
+}
+#endif /* RECOMP_LAUNCHER_HAS_AUTOMATCH */
+
+static int cb_account_set_handle(void *ctx, const char *h) {
+    (void)ctx;
+    return rnet_account_set_handle(h);
+}
+
+static int cb_server_chat_send(void *ctx, const char *text)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan || !snes_lobby_connected())
+    return -1;
+  return snes_lobby_send_server_chat(text);
+}
+
+static int cb_server_chat_count(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_server_chat_count();
+}
+
+static int cb_server_chat_get(void *ctx, int index,
+                              RecompLauncherCNetplayChatMessage *out)
+{
+  SnesLobbyChatMsg msg;
+  (void)ctx;
+  if (!out || !snes_lobby_server_chat_get(index, &msg))
+    return 0;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->from, sizeof(out->from), "%s", msg.from);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_ACCOUNT)
+  snprintf(out->account, sizeof(out->account), "%s", msg.account);
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+  /* Empty against a server that predates message ids, which the UI reads as
+   * "this line cannot be reported" rather than offering an action that would
+   * be refused. */
+  snprintf(out->mid, sizeof(out->mid), "%s", msg.mid);
+#endif
+  snprintf(out->text, sizeof(out->text), "%s", msg.text);
+  out->is_local = msg.is_local;
+  out->is_system = msg.is_system;
+  out->seq = msg.seq;
+  return 1;
+}
+
+/* ---- spectators ---------------------------------------------------------
+ * The gallery exists only on the lobby server. A LAN / direct-IP room has no
+ * server to enforce "cannot affect the game" at, so it reports no gallery and
+ * the UI's spectator section stays hidden there. */
+
+static int cb_allow_spectators_get(void *ctx)
+{
+  (void)ctx;
+  return snes_lobby_allow_spectators_pref();
+}
+
+static int cb_allow_spectators_set(void *ctx, int allow)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return -1;
+  snes_lobby_set_allow_spectators(allow);
+  return 0;
+}
+
+static int cb_lobby_allow_spectators(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_allow_spectators();
+}
+
+static int cb_lobby_max_spectators(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_max_spectators();
+}
+
+static int cb_lobby_spectator_count(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_spectator_count();
+}
+
+static int cb_local_is_spectator(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return 0;
+  return snes_lobby_local_is_spectator();
+}
+
+static int cb_spectator_slot(void *ctx, int index)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan)
+    return -1;
+  return snes_lobby_spectator_slot(index);
 }
 
 static int cb_move_member(void *ctx, int from_slot, int to_slot)
@@ -743,10 +1864,7 @@ static int cb_move_member(void *ctx, int from_slot, int to_slot)
   (void)ctx;
   if (g_hosting_lan && from_slot >= 0 && from_slot <= 1 && to_slot >= 0 &&
       to_slot <= 1 && from_slot != to_slot) {
-    g_lan_room.host_slot = 1 - g_lan_room.host_slot;
-    g_lan_room.started = 0;
-    (void)publish_lan_room();
-    return 0;
+    return lan_swap_seats("host move_member");
   }
   if (g_joined_lan)
     return -1;
@@ -885,8 +2003,12 @@ static int cb_input_delay_set(void *ctx, int delay_frames)
     g_lan_room.input_delay = g_lobby_input_delay;
     (void)publish_lan_room();
     if (g_direct_host && g_lan_room.joiner_name[0])
-      (void)rnet_lan_direct_host_notify_caps(g_direct_host,
-                                             g_lobby_input_delay);
+      /* notify_caps takes the room, not the delay. The delay it should carry
+       * was already written into g_lan_room two lines up, and passing the int
+       * here made the guest read an integer as a room pointer. Only a build
+       * with recomp-ui compiles this branch, which is why it survived: GCC 14
+       * turned int-conversion into an error and surfaced it. */
+      (void)rnet_lan_direct_host_notify_caps(g_direct_host, &g_lan_room);
     return 0;
   }
   if (g_joined_lan)
@@ -991,15 +2113,582 @@ static int cb_fill_launch(void *ctx, RecompLauncherCNetplayLaunch *out)
   out->input_player = 0;
   out->session_id = join.session_id;
   out->input_delay = clamp_input_delay(caps->input_delay);
-  out->force_input_relay = caps->force_input_relay ? 1 : 0;
+  /* The launch's own statement, not the caps copy: the caps field is shared
+   * with the host's UI toggle and is overwritten by any lobby_update that
+   * arrives before we get here. See SnesLobbyJoinInfo::force_input_relay. */
+  out->force_input_relay = join.force_input_relay ? 1 : 0;
   out->max_slots = join.max_slots >= 2 ? clamp_lobby_max_slots(join.max_slots)
                                        : clamp_lobby_max_slots(g_lobby_max_slots);
   out->player_count = join.player_count > 0 ? join.player_count : out->max_slots;
+  /* player_count above is the PLAYER count the server sent, and it stays
+   * that: it is what sizes every peer's rollback slot_count, and a spectator
+   * counted in it is a seat the whole match waits on and nobody fills.
+   *
+   * The role rides separately, and the engine reads it to decide whether this
+   * build contributes a row at all. */
+  out->is_spectator = join.local_is_spectator ? 1 : 0;
+  out->spectator_wire_slot = 0;
+  if (out->is_spectator) {
+    const int wire = snes_lobby_local_wire_slot();
+    if (wire <= 0) {
+      /* No relay base published, so there is no slot we could send from that
+       * the relay would recognise as a spectator. Falling back to a player
+       * slot is the one thing a spectator must never do -- the relay would
+       * forward it and the peers would take it as that seat's input. Refuse
+       * instead: a lobby with a message beats a desynced match. */
+      fprintf(stderr,
+              "netplay: refusing to launch as a spectator - the host "
+              "published no spectator relay slot (lobby seat %d)\n",
+              join.local_slot);
+      return 0;
+    }
+    out->spectator_wire_slot = wire;
+  }
   snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s",
            join.bind_hostport);
   snprintf(out->peer_hostport, sizeof(out->peer_hostport), "%s",
            join.peer_hostport);
   return 1;
+}
+
+/* ---- lobby mod plan -------------------------------------------------------
+ *
+ * recomp-ui already renders all of this -- a row per required mod, an
+ * installed/missing mark, a missing count and a download button. This game
+ * left the callbacks NULL, so the panel was simply dark and a guest learned
+ * about a mod mismatch only when the match refused to start. Nothing new is
+ * drawn here; the data is just supplied.
+ */
+
+/* Row `index` of the plan the HOST published. */
+static const SnesLobbyModPkg *plan_row(int index)
+{
+  const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
+  if (!caps || !caps->valid || index < 0 || index >= caps->mod_count)
+    return NULL;
+  return &caps->mods[index];
+}
+
+static int cb_lobby_mods_count(void *ctx)
+{
+  const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
+  (void)ctx;
+  if (!caps || !caps->valid)
+    return 0;
+  return caps->mod_count;
+}
+
+static int cb_lobby_mods_get(void *ctx, int index,
+                             RecompLauncherCNetplayLobbyMod *out)
+{
+  const SnesLobbyModPkg *row = plan_row(index);
+  const char *id;
+  const char *version;
+  (void)ctx;
+  if (!out)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  if (!row)
+    return 0;
+  id = row->id;
+  version = row->ver;
+  snprintf(out->id, sizeof(out->id), "%s", id);
+  snprintf(out->version, sizeof(out->version), "%s", version);
+  /* The host published a display name; prefer it, and fall back to the id.
+   * The local lookup below overrides it when this peer has the package, so a
+   * player sees the same name the host sees either way. */
+  snprintf(out->name, sizeof(out->name), "%s",
+           row->name[0] ? row->name : id);
+  out->installed = 0;
+
+  /* Pull this package's lines out of the host's published set.
+   *
+   * caps.mod_set is the canonical text with ';' where newlines were, one entry
+   * per enabled feature:  "<pkg>@<ver>/<feature> <opt>=<val> ..."
+   * The row shows the part after the package prefix, so a guest reads the
+   * host's actual choices -- "localization language=en" -- rather than its own
+   * local settings, which are not what the match will run. */
+  {
+    const SnesLobbyMatchCaps *caps = snes_lobby_match_caps();
+    size_t o = 0;
+    if (caps && caps->valid && caps->mod_set[0]) {
+      const char *p = caps->mod_set;
+      const size_t id_len = strlen(id);
+      while (*p) {
+        const char *end = strchr(p, ';');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        /* "<id>@" anchors the match, so a package whose id is a prefix of
+         * another's cannot claim its line. */
+        if (len > id_len + 1 && !strncmp(p, id, id_len) && p[id_len] == '@') {
+          const char *slash = (const char *)memchr(p, '/', len);
+          if (slash) {
+            const size_t tail = len - (size_t)(slash + 1 - p);
+            /* One entry per line. A package with several features, or one
+             * feature with several options, is a list -- run together on one
+             * line it wraps into a paragraph the player has to parse. */
+            if (o && o + 1 < sizeof(out->options))
+              out->options[o++] = '\n';
+            if (o + tail < sizeof(out->options)) {
+              memcpy(out->options + o, slash + 1, tail);
+              o += tail;
+            }
+          }
+        }
+        if (!end) break;
+        p = end + 1;
+      }
+    }
+    out->options[o] = '\0';
+  }
+
+#if SNESRECOMP_ENABLE_MODS
+  {
+    char name[64];
+    /* NULL version: "do I have this package at all". A different version is
+     * still HAVING it, so the lobby says installed and offers no download --
+     * there is nothing to fetch. If the two versions genuinely simulate
+     * differently, the mod-set exchange at session start says so precisely,
+     * naming the versions and offering to adopt the host's selection. */
+    const int have =
+        snes_mod_runtime_have_package_c(id, NULL, name, (uint32_t)sizeof(name));
+    if (name[0])
+      snprintf(out->name, sizeof(out->name), "%s", name);
+    if (have > 0) {
+      out->installed = 1;
+      /* Say so when the versions differ. Not a blocker here, but it is the
+       * first thing worth knowing if the match later refuses to start. */
+      if (version[0] &&
+          snes_mod_runtime_have_package_c(id, version, NULL, 0) == 0)
+        snprintf(out->reason, sizeof(out->reason),
+                 "host runs %s; you have another version", version);
+    } else {
+      snprintf(out->reason, sizeof(out->reason), "not installed");
+    }
+  }
+#else
+  snprintf(out->reason, sizeof(out->reason), "this build has no mod support");
+#endif
+  return 1;
+}
+
+static int cb_lobby_mods_missing(void *ctx)
+{
+  const int n = cb_lobby_mods_count(ctx);
+  int missing = 0;
+  int i;
+  for (i = 0; i < n; ++i) {
+    RecompLauncherCNetplayLobbyMod lm;
+    if (cb_lobby_mods_get(ctx, i, &lm) && !lm.installed)
+      missing++;
+  }
+  return missing;
+}
+
+/* Can this peer pull the plan's mods from the host RIGHT NOW?
+ *
+ * Not yet: this build has no mod transfer. Answered as a capability question
+ * rather than left for the download call to fail, because the UI asks this
+ * BEFORE drawing the button -- a button that cannot work is worse than no
+ * button, and the message it used to print blamed the host for it.
+ *
+ * When the transfer lands this becomes "are we seated, is there a host, and is
+ * the plan unmet". Note that it must NOT be answered from the lobby server's
+ * `can_transfer` flag: the server hardcodes that true and is describing
+ * itself, not this build's ability to drive a transfer.
+ */
+/* "Download All": the missing rows, fetched one after another.
+ *
+ * The queue lives here rather than in the lobby client because this is the
+ * layer that knows which rows are missing -- the client moves one package at
+ * a time and has no opinion about which. Advanced from the pump, since a
+ * transfer finishing is not an event anything reports. */
+static char g_dl_id[SNES_LOBBY_MAX_MODS][SNES_LOBBY_MOD_ID_LEN];
+static char g_dl_ver[SNES_LOBBY_MAX_MODS][SNES_LOBBY_MOD_VER_LEN];
+static int  g_dl_n;
+static int  g_dl_next;
+
+static void dl_queue_clear(void)
+{
+  g_dl_n = 0;
+  g_dl_next = 0;
+}
+
+/* Start the next queued package once the previous one has left. Called every
+ * pump; a no-op unless a queue is running and the link is idle. */
+static void dl_queue_step(void)
+{
+  if (g_dl_next >= g_dl_n) {
+    if (g_dl_n) dl_queue_clear();
+    return;
+  }
+  if (snes_lobby_mod_in_flight()[0])
+    return;                        /* one at a time */
+  {
+    const int i = g_dl_next++;
+    const int rc = snes_lobby_mod_request(g_dl_id[i], g_dl_ver[i]);
+    if (rc == 0) {
+      fprintf(stderr, "netplay: download-all %d/%d: %s\n", i + 1, g_dl_n,
+              g_dl_id[i]);
+    } else if (rc == -2) {
+      g_dl_next--;                 /* still busy; try again next pump */
+    } else {
+      fprintf(stderr, "netplay: download-all stopped at %s\n", g_dl_id[i]);
+      dl_queue_clear();
+    }
+  }
+}
+
+/* Republish whenever the HOST's own configuration changes.
+ *
+ * push_match_caps was called from exactly one place in the launcher: the
+ * feature enable checkbox. Changing an option -- picking a language from a
+ * dropdown -- changed what the host would run and told nobody, so guests kept
+ * showing and ADOPTING the previous value, and only found out at launch when
+ * the mod-set check refused them.
+ *
+ * Watched here rather than wired into each control because publication is this
+ * layer's job: any path that changes the effective set, present or future, is
+ * covered by comparing the set itself. The comparison is against the canonical
+ * text, so it fires on a real change and not on a redraw. */
+#if SNESRECOMP_ENABLE_MODS
+static char g_published_set[1024];
+
+static void host_caps_watch_step(void)
+{
+  char text[1024];
+  int need;
+
+  if (!snes_lobby_in_lobby() || !snes_lobby_is_host()) {
+    g_published_set[0] = '\0';
+    return;
+  }
+  need = snes_mod_runtime_effective_set_c(text, (uint32_t)sizeof(text));
+  if (need <= 0 || need >= (int)sizeof(text))
+    return;
+  if (!strcmp(text, g_published_set))
+    return;
+  snprintf(g_published_set, sizeof(g_published_set), "%s", text);
+  fprintf(stderr, "netplay: mod configuration changed - republishing to the "
+                  "lobby\n");
+  cb_push_match_caps(NULL);
+}
+#else
+static void host_caps_watch_step(void) {}
+#endif
+
+/* Bring this peer's mod configuration into line with the host's, in the
+ * LOBBY, where it still costs nothing.
+ *
+ * Owning a package and running it are different things. The lobby gate asks
+ * only whether a peer HAS each mod, so a guest that downloaded both and
+ * enabled neither sails through it -- and is then refused by the session's
+ * mod-set check, which compares enabled features and resolved options. That
+ * refusal is correct; the problem is that it arrives after Play, having told
+ * the player everything was ready.
+ *
+ * Adoption is the same policy the netplay layer already applies on that
+ * refusal, moved earlier. It works here because mods commit and activate
+ * after the launcher exits (src/main.c), so a selection changed in the lobby
+ * is the selection the match runs -- no "start the game again".
+ *
+ * Only ever toward the host's set, only for a guest, and only when it
+ * actually differs. */
+#if SNESRECOMP_ENABLE_MODS
+static char g_adopted_set[512];
+
+static void mod_set_sync_step(void)
+{
+  const SnesLobbyMatchCaps *caps;
+  char want[1024];
+  char reason[160];
+  size_t i;
+  size_t o = 0;
+
+  if (!snes_lobby_in_lobby() || snes_lobby_is_host()) {
+    g_adopted_set[0] = '\0';
+    /* Out of a lobby, no authority is granting anything, so the exemption
+     * lapses rather than lingering from the last host we spoke to. A host
+     * sets its own grant in fill_caps_mods and must not be cleared here. */
+    if (!snes_lobby_in_lobby())
+      snes_mod_runtime_set_cosmetic_allow_c(NULL);
+    return;
+  }
+  caps = snes_lobby_match_caps();
+  if (!caps || !caps->valid)
+    return;
+  /* The host is the authority here, so its grant governs before anything is
+   * compared or adopted. Applied even when the host's own mod set is empty --
+   * a vanilla host that permits an accessibility filter is the ordinary case,
+   * and returning early on an empty set would leave a stale allowlist from a
+   * previous lobby in force. */
+  snes_mod_runtime_set_cosmetic_allow_c(caps->mod_cosmetic_allow);
+  if (!caps->mod_set[0])
+    return;
+  if (!strcmp(g_adopted_set, caps->mod_set))
+    return;                      /* already tried this exact set */
+
+  /* Back to the canonical newline form the runtime speaks. */
+  for (i = 0; caps->mod_set[i] && o + 2 < sizeof(want); ++i)
+    want[o++] = caps->mod_set[i] == ';' ? '\n' : caps->mod_set[i];
+  want[o++] = '\n';
+  want[o] = '\0';
+
+  if (snes_mod_runtime_check_set_c(want, reason, sizeof(reason)) == SNES_MODSET_OK)
+    return;                      /* already matches */
+
+  snprintf(g_adopted_set, sizeof(g_adopted_set), "%s", caps->mod_set);
+  if (snes_mod_runtime_adopt_set_c(want, reason, sizeof(reason)) == 0) {
+    fprintf(stderr, "netplay: matched the host's mod configuration:\n%s", want);
+    /* The set changed, so what we announce has changed with it. */
+    (void)snes_lobby_set_ready(1);
+  } else {
+    fprintf(stderr, "netplay: cannot match the host's mod set: %s\n",
+            reason[0] ? reason : "(no reason given)");
+  }
+}
+#else
+static void mod_set_sync_step(void) {}
+#endif
+
+/*
+ * Report a simulation fork once per session, promptly.
+ *
+ * Promptly, not at teardown: a desync usually ENDS the match, and often takes
+ * the connection with it, so a report deferred to a clean shutdown is a report
+ * that mostly never gets sent. Once per session because the interesting fact
+ * is that the peers diverged and where -- a hundred rows from one broken match
+ * would drown the signal the rows exist to carry.
+ *
+ * Best-effort throughout. Nothing here may hold up a teardown or change what
+ * the player sees; it is a diagnostic, and a diagnostic that costs a match is
+ * not worth having.
+ */
+static void desync_report_step(void)
+{
+#if SNES_HAS_LOBBY_CLIENT
+  static int reported;
+  SnesLobbyDesyncReport r;
+  uint32_t tick = 0;
+  uint32_t mine = 0, theirs = 0;
+  const char *partition = "?";
+  char exempt[512];
+
+  if (!snes_lobby_connected()) {
+    /* A fresh connection is a fresh session: arm again so the next match can
+     * report its own fork. */
+    reported = 0;
+    return;
+  }
+  if (reported)
+    return;
+  if (!snes_netplay_rb_last_fork(&tick, &partition))
+    return;
+  snes_netplay_rb_fork_digests(&mine, &theirs);
+
+  exempt[0] = '\0';
+#if SNESRECOMP_ENABLE_MODS
+  /* What this peer was running, so the row can be read beside what the match
+   * approved. A fork under an unapproved exemption and a fork under none are
+   * different facts, and the row is worth little without which it was. */
+  (void)snes_mod_runtime_exempted_packages_c(exempt, sizeof(exempt));
+  {
+    /* Newlines to ';' -- the wire carries one line. */
+    char *p;
+    for (p = exempt; *p; ++p)
+      if (*p == '\n') *p = ';';
+    if (p > exempt && p[-1] == ';') p[-1] = '\0';
+  }
+#endif
+
+  memset(&r, 0, sizeof(r));
+  r.tick = tick;
+  r.partition = partition;
+  r.mine = mine;
+  r.theirs = theirs;
+  r.is_host = snes_lobby_is_host() ? 1 : 0;
+  r.mod_exempt = exempt;
+
+  reported = 1;    /* set before the send: a failed send must not retry */
+  if (snes_lobby_report_desync(&r) == 0)
+    fprintf(stderr,
+            "netplay: reported a state fork at tick %u (%s), local %08x vs "
+            "peer %08x -- this records that the two peers DIFFERED, not who "
+            "was wrong\n",
+            (unsigned)tick, partition, (unsigned)mine, (unsigned)theirs);
+#endif
+}
+
+static int cb_lobby_mods_can_download(void *ctx)
+{
+  (void)ctx;
+#if SNESRECOMP_ENABLE_MODS
+  /* A guest seated in a server lobby, with a host to ask. Not derived from
+   * the server's `can_transfer` flag: that is hardcoded true and describes
+   * the server, not this build's ability to drive a transfer.
+   *
+   * LAN and direct-IP sessions have no signalling relay to carry the SDP, so
+   * they answer no and say so in the panel rather than offering a button that
+   * would sit at "connecting" forever. */
+  if (g_hosting_lan || g_joined_lan || g_joined_direct)
+    return 0;
+  if (!snes_lobby_in_lobby() || snes_lobby_is_host())
+    return 0;
+  return snes_lobby_host_player_id()[0] != '\0';
+#else
+  return 0;
+#endif
+}
+
+static int cb_lobby_mods_download_one(void *ctx, int index)
+{
+  const SnesLobbyModPkg *row = plan_row(index);
+  (void)ctx;
+  if (!row || !cb_lobby_mods_can_download(NULL))
+    return -1;
+  /* Passes -2 (busy) through untouched: the UI tells those two apart, and
+   * flattening them here would report a working transfer as a broken one. */
+  return snes_lobby_mod_request(row->id, row->ver);
+}
+
+static int cb_lobby_mods_progress_one(void *ctx, int index)
+{
+  const SnesLobbyModPkg *row = plan_row(index);
+  const char *moving = snes_lobby_mod_in_flight();
+  (void)ctx;
+  /* Progress belongs to the row being transferred, not to every row: without
+   * this every unmet row would show the same bar and the player could not
+   * tell which one was actually moving. */
+  if (!row || !moving[0] || strcmp(moving, row->id) != 0)
+    return -1;
+  return snes_lobby_mod_progress();
+}
+
+static int cb_mod_xfer_failed(void *ctx, char *err, size_t err_cap)
+{
+  (void)ctx;
+  return snes_lobby_mod_failed(err, err_cap);
+}
+
+static void cb_mod_xfer_cancel(void *ctx)
+{
+  (void)ctx;
+  snes_lobby_mod_cancel();
+}
+
+static int cb_lobby_mods_download(void *ctx)
+{
+  int n;
+  int i;
+  (void)ctx;
+  if (!cb_lobby_mods_can_download(NULL))
+    return -1;
+  dl_queue_clear();
+  n = cb_lobby_mods_count(NULL);
+  for (i = 0; i < n && g_dl_n < SNES_LOBBY_MAX_MODS; ++i) {
+    RecompLauncherCNetplayLobbyMod lm;
+    if (!cb_lobby_mods_get(NULL, i, &lm) || lm.installed)
+      continue;
+    snprintf(g_dl_id[g_dl_n], SNES_LOBBY_MOD_ID_LEN, "%s", lm.id);
+    snprintf(g_dl_ver[g_dl_n], SNES_LOBBY_MOD_VER_LEN, "%s", lm.version);
+    g_dl_n++;
+  }
+  if (g_dl_n == 0)
+    return -1;                     /* nothing missing; nothing to start */
+  fprintf(stderr, "netplay: downloading all %d missing mod(s) from the host\n",
+          g_dl_n);
+  dl_queue_step();
+  return 0;
+}
+
+static void cb_push_match_caps(void *ctx)
+{
+  SnesLobbyMatchCaps caps;
+  (void)ctx;
+  if (!snes_lobby_is_host())
+    return;                    /* guests do not publish a plan */
+  caps = default_caps(NULL);   /* already carries the current mod plan */
+  (void)snes_lobby_set_match_caps(&caps);
+}
+
+/* Seat self-service: online rooms only. The LAN room is two seats with
+ * the host as the only authority; there a swap is the host's move_member. */
+static int cb_seat_move_self(void *ctx, int to_slot)
+{
+  (void)ctx;
+  if (g_hosting_lan) {
+    /* Two seats: the other one is free only while nobody has joined. */
+    if (to_slot != 1 - g_lan_room.host_slot) return -1;
+    if (g_lan_room.joiner_name[0]) return -1; /* occupied: ask instead */
+    return lan_swap_seats("host move_self");
+  }
+  if (g_joined_lan) return -1; /* the only other seat is the host's: ask */
+  return snes_lobby_seat_move_self(to_slot);
+}
+static int cb_seat_swap_request(void *ctx, int target_slot)
+{
+  (void)ctx;
+  if (g_hosting_lan) {
+    /* The host is the authority of a LAN room: its own trade is immediate. */
+    if (target_slot != 1 - g_lan_room.host_slot || !g_lan_room.joiner_name[0])
+      return -1;
+    if (lan_swap_seats("host swap_request") != 0) return -1;
+    g_lan_swap_outgoing = 2;
+    return 0;
+  }
+  if (g_joined_lan) {
+    if (!g_joined_direct || !g_direct_guest) return -1;
+    if (target_slot != g_lan_room.host_slot) return -1;
+    if (g_lan_swap_outgoing == 1) return -1;
+    if (rnet_lan_direct_guest_send_swap_request(g_direct_guest) != RNET_LAN_DIRECT_OK)
+      return -1;
+    g_lan_swap_outgoing = 1;
+    return 0;
+  }
+  return snes_lobby_seat_swap_request(target_slot);
+}
+static int cb_seat_swap_incoming(void *ctx, char *who, size_t who_cap, int *from_slot)
+{
+  (void)ctx;
+  if (g_hosting_lan) {
+    if (!g_lan_swap_incoming) return 0;
+    if (who && who_cap)
+      snprintf(who, who_cap, "%s",
+               g_lan_room.joiner_name[0] ? g_lan_room.joiner_name : "Player");
+    if (from_slot) *from_slot = 1 - g_lan_room.host_slot;
+    return 1;
+  }
+  if (g_joined_lan) return 0;
+  return snes_lobby_seat_swap_incoming(who, who_cap, from_slot);
+}
+static int cb_seat_swap_respond(void *ctx, int accept)
+{
+  (void)ctx;
+  if (g_hosting_lan) {
+    int swapped = 0;
+    if (!g_lan_swap_incoming) return -1;
+    g_lan_swap_incoming = 0;
+    if (accept && g_lan_room.joiner_name[0] && lan_swap_seats("host accepted") == 0) swapped = 1;
+    if (g_direct_host)
+      (void)rnet_lan_direct_host_send_swap_result(g_direct_host, swapped);
+    return 0;
+  }
+  if (g_joined_lan) return -1;
+  return snes_lobby_seat_swap_respond(accept);
+}
+static int cb_seat_swap_outgoing(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) return g_lan_swap_outgoing;
+  return snes_lobby_seat_swap_outgoing();
+}
+static void cb_seat_swap_clear(void *ctx)
+{
+  (void)ctx;
+  if (g_hosting_lan || g_joined_lan) {
+    if (g_lan_swap_outgoing != 1) g_lan_swap_outgoing = 0;
+    return;
+  }
+  snes_lobby_seat_swap_clear();
 }
 
 static RecompLauncherCNetplayCallbacks g_callbacks = {
@@ -1042,6 +2731,76 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
     cb_lobby_max_slots,
     cb_force_turn_get,
     cb_force_turn_set,
+    /* Designated from here: the struct is append-only, and positional entries
+     * past this point would silently shift if a field were ever inserted. */
+    .push_match_caps = cb_push_match_caps,
+    .lobby_mods_count = cb_lobby_mods_count,
+    .lobby_mods_get = cb_lobby_mods_get,
+    .lobby_mods_missing = cb_lobby_mods_missing,
+    .lobby_mods_download = cb_lobby_mods_download,
+    .lobby_mods_can_download = cb_lobby_mods_can_download,
+    .lobby_mods_download_one = cb_lobby_mods_download_one,
+    .lobby_mods_progress_one = cb_lobby_mods_progress_one,
+    .mod_xfer_failed = cb_mod_xfer_failed,
+    .mod_xfer_cancel = cb_mod_xfer_cancel,
+    .allow_spectators_get = cb_allow_spectators_get,
+    .allow_spectators_set = cb_allow_spectators_set,
+    .lobby_allow_spectators = cb_lobby_allow_spectators,
+    .lobby_max_spectators = cb_lobby_max_spectators,
+    .lobby_spectator_count = cb_lobby_spectator_count,
+    .local_is_spectator = cb_local_is_spectator,
+    .spectator_slot = cb_spectator_slot,
+    .chat_send = cb_chat_send,
+    .chat_count = cb_chat_count,
+    .chat_get = cb_chat_get,
+    .seat_move_self = cb_seat_move_self,
+    .seat_swap_request = cb_seat_swap_request,
+    .seat_swap_incoming = cb_seat_swap_incoming,
+    .seat_swap_respond = cb_seat_swap_respond,
+    .seat_swap_outgoing = cb_seat_swap_outgoing,
+    .seat_swap_clear = cb_seat_swap_clear,
+    .online_count = cb_online_count,
+    .online_get = cb_online_get,
+    .server_chat_send = cb_server_chat_send,
+    .server_chat_count = cb_server_chat_count,
+    .server_chat_get = cb_server_chat_get,
+#if defined(RECOMP_LAUNCHER_HAS_ACCOUNT)
+    /* Optional Discord sign-in. Guarded on the launcher ABI macro so this
+     * runner still builds against a recomp-ui that predates the callbacks --
+     * the UI and the runners can land in any order. */
+    .account_available = cb_account_available,
+    .account_login_begin = cb_account_login_begin,
+    .account_state = cb_account_state,
+    .account_handle = cb_account_handle,
+    .account_username = cb_account_username,
+    .account_error = cb_account_error,
+    .account_sign_out = cb_account_sign_out,
+    .account_set_handle = cb_account_set_handle,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_SET_BLOCKS)
+    .set_blocks = cb_set_blocks,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+    .chat_report = cb_chat_report,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
+    .list_scope_set = cb_list_scope_set,
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
+    /* Guarded like the account block above, and for the same reason: this
+     * runner still builds against a recomp-ui that predates the callbacks. */
+    .automatch_available = cb_automatch_available,
+    .automatch_ruleset_count = cb_automatch_ruleset_count,
+    .automatch_ruleset_get = cb_automatch_ruleset_get,
+    .automatch_queue = cb_automatch_queue,
+    .automatch_cancel = cb_automatch_cancel,
+    .automatch_state = cb_automatch_state,
+    .automatch_queued_secs = cb_automatch_queued_secs,
+    .automatch_pool = cb_automatch_pool,
+    .automatch_found_get = cb_automatch_found_get,
+    .automatch_accept = cb_automatch_accept,
+    .automatch_error = cb_automatch_error,
+#endif
 };
 
 const RecompLauncherCNetplayCallbacks *snes_host_lobby_callbacks(void)

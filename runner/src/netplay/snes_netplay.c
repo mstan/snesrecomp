@@ -11,6 +11,28 @@
 
 #if defined(SNESRECOMP_NET)
 #include "recomp_net/recomp_net.h"
+/*
+ * Rollback is an optional build (snesrecomp_enable_rollback). A game that
+ * links netplay without it must still compile, so everything the rollback
+ * host provides is reached through the shims below rather than by including
+ * its header unconditionally — that header pulls in retcomm-rbengine, which
+ * is not on the include path unless rollback was enabled.
+ */
+#if defined(SNESRECOMP_NET_ROLLBACK)
+#include "snes_netplay_rb.h"
+#else
+#include <stdint.h>
+struct SnesNetplayRbBindings;
+static inline int  snes_netplay_rb_enabled(void) { return 0; }
+static inline void snes_netplay_rb_set_default(int on) { (void)on; }
+static inline void snes_netplay_rb_bind(const struct SnesNetplayRbBindings *b) { (void)b; }
+static inline int  snes_netplay_rb_start(void) { return 0; }
+static inline void snes_netplay_rb_shutdown(void) {}
+static inline int  snes_netplay_rb_poll_admit(void) { return 0; }
+static inline void snes_netplay_rb_finish_frame(void) {}
+static inline void snes_netplay_rb_stage_local(uint16_t buttons) { (void)buttons; }
+static inline uint32_t snes_netplay_rb_sim_tick(void) { return 0; }
+#endif
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #if defined(SNES_HAS_LOBBY_CLIENT)
@@ -24,8 +46,14 @@ void snes_netplay_config_defaults(SnesNetplayConfig *cfg)
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
     cfg->local_slot = 0;
+    cfg->slot_count = 2;
     cfg->input_player = -1; /* auto → resolve at start */
     cfg->input_delay = 2;
+    /* Framework default: ROLLBACK. recomp-ui's lobby settles the mode
+     * room-wide and also defaults it on; builds without the rollback host
+     * ignore the field. Rolled out at scale 2026-08-29 (Alex) after LAN
+     * delay-7 sessions validated the transport. */
+    cfg->rollback = 1;
     cfg->session_id = 1;
     cfg->transport = 0;
     strncpy(cfg->bind_hostport, "0.0.0.0:7777", sizeof(cfg->bind_hostport) - 1);
@@ -47,6 +75,8 @@ void snes_netplay_apply_env(SnesNetplayConfig *cfg)
     if (v && v[0] && v[0] != '0') cfg->enabled = 1;
     v = getenv("SNES_NET_SLOT");
     if (v && v[0]) cfg->local_slot = (int)strtol(v, NULL, 10);
+    v = getenv("SNES_NET_SLOTS");
+    if (v && v[0]) cfg->slot_count = (int)strtol(v, NULL, 10);
     v = getenv("SNES_NET_INPUT_PLAYER");
     if (v && v[0]) cfg->input_player = (int)strtol(v, NULL, 10);
     v = getenv("SNES_NET_DELAY");
@@ -61,6 +91,15 @@ void snes_netplay_apply_env(SnesNetplayConfig *cfg)
     if (v && v[0]) {
         strncpy(cfg->peer_hostport, v, sizeof(cfg->peer_hostport) - 1);
         cfg->peer_hostport[sizeof(cfg->peer_hostport) - 1] = '\0';
+    }
+    v = getenv("SNES_RB_PREDICTION");
+    if (v && v[0]) cfg->input_prediction = (int)strtol(v, NULL, 10);
+    v = getenv("SNES_NET_MODE");
+    if (v && v[0]) {
+        /* Operator override, both directions: "rollback"/"rb" force
+         * rollback, anything else ("delay", ...) forces delay-sync. */
+        cfg->rollback =
+            (strcmp(v, "rollback") == 0 || strcmp(v, "rb") == 0) ? 1 : 0;
     }
     v = getenv("SNES_NET_TRANSPORT");
     if (v && v[0]) {
@@ -83,11 +122,15 @@ void snes_netplay_set_sync_byte_hooks(SnesNetplayCaptureSyncBytes capture,
 
 #if !defined(SNESRECOMP_NET)
 
+int  snes_netplay_rollback_active(void) { return 0; }
+
 int  snes_netplay_active(void) { return 0; }
 int  snes_netplay_is_running(void) { return 0; }
 const char *snes_netplay_transport_name(void) { return "none"; }
 int  snes_netplay_ice_failed(void) { return 0; }
 int  snes_netplay_local_slot(void) { return -1; }
+int  snes_netplay_is_spectator(void) { return 0; }
+int  snes_netplay_slot_count(void) { return 2; }
 int  snes_netplay_input_player(void) { return 0; }
 uint32_t snes_netplay_sim_tick(void) { return 0; }
 uint32_t snes_netplay_frames_finished(void) { return 0; }
@@ -142,9 +185,22 @@ int  snes_netplay_request_load(int slot)
     (void)slot;
     return 0;
 }
+int  snes_netplay_state_barrier(void) { return 0; }
 void snes_netplay_diag_tick(void) {}
 
 #else /* SNESRECOMP_NET */
+
+/* App-layer LOAD phases. Library busy covers probe/xfer; xfer!=NONE also
+ * covers the post-apply ready rendezvous (size==0 probe does not stall
+ * try_admit by itself). */
+enum {
+    NP_XFER_NONE = 0,
+    NP_XFER_LOAD_PROBE,
+    NP_XFER_LOAD_SEND,
+    NP_XFER_LOAD_READY
+};
+#define NP_LOAD_READY_CRC 0x4C4F4144u /* 'LOAD' */
+#define NP_LOAD_COOLDOWN_MS 1500u
 
 typedef struct {
     RNetSession *session;
@@ -153,19 +209,24 @@ typedef struct {
     int          active;
     int          slot_count;
     int          local_slot;
+    int          spectator;
     int          input_player; /* resolved 0/1 */
     int          needs_advance;
     int          latched_for_tick;
     uint32_t     latched_sim_tick;
-    uint16_t     published[2];
+    uint16_t     published[SNES_NETPLAY_MAX_SLOTS];
     uint8_t      host_sync[2];       /* game-defined slot-0 sync bytes */
     int          host_sync_valid;
     int          use_ice;
     int          guest_sandbox;      /* save root redirected to saves/netplay */
     int          sram_sync_sent;     /* host: SRAM blob transfer started */
     int          sram_sync_done;     /* both: initial SRAM sync finished */
-    int          host_load_applied;  /* host already applied LOAD locally */
     int          host_sram_applied;  /* host already has live SRAM */
+    /* LOAD sync FSM (MotK-style probe → optional xfer → ready → hard_resync). */
+    int          xfer;               /* NP_XFER_* */
+    int          xfer_slot;
+    int          load_applied_local; /* snapshot applied; waiting ready/resync */
+    uint32_t     load_cooldown_until_ms; /* debounce after completed load */
     /* Owned buffers for RNetIceConfig pointers (juice may retain them). */
     char         ice_stun_host[128];
     char         ice_turn_host[128];
@@ -180,6 +241,7 @@ typedef struct {
     char         bind_hostport[64];
     char         peer_hostport[64];
     int          input_delay;
+    int          input_prediction;   /* P; 0 = engine default */
     int          force_input_relay;
     uint32_t     session_id;
     int          is_host;
@@ -190,6 +252,82 @@ typedef struct {
 } NetplayState;
 
 static NetplayState g_np;
+
+/*
+ * Apply one published row set to the runtime seats.
+ *
+ * Seats 0 and 1 stay in g_np.published for snes_netplay_published_inputs(),
+ * which every existing game reads and packs into RtlRunFrame. Seats 2..7
+ * cannot fit that word, so they go straight in through RtlSetPadState — the
+ * same entry point a local multitap game uses. A game therefore needs no
+ * netplay-specific code to gain seats beyond the second.
+ */
+static void np_apply_published(const uint16_t *buttons, int slots)
+{
+    int i;
+    for (i = 0; i < SNES_NETPLAY_MAX_SLOTS; ++i)
+        g_np.published[i] = 0;
+    if (!buttons || slots <= 0)
+        return;
+    if (slots > SNES_NETPLAY_MAX_SLOTS)
+        slots = SNES_NETPLAY_MAX_SLOTS;
+    for (i = 0; i < slots; ++i) {
+        g_np.published[i] = buttons[i] & 0x0FFFu;
+        if (i >= 2)
+            RtlSetPadState(i, g_np.published[i]);
+    }
+}
+/* 1 once snes_netplay_rb has taken over admit for this session. Set only
+ * after the rollback host starts cleanly, so a failed start falls back to
+ * delay-sync rather than leaving the session with no admit path at all. */
+static int g_np_rollback;
+
+/* Rollback resolves each seat's row itself (wire row or hold-last invent) and
+ * hands the result back here, so snes_netplay_published_inputs() reads the
+ * same way in both modes and games need no change. */
+static void np_rb_publish(uint32_t tick, const uint16_t *buttons, int slots)
+{
+    (void)tick;
+    np_apply_published(buttons, slots);
+}
+
+static void np_rb_apply_sync(const uint8_t in[2])
+{
+    if (g_apply_sync_bytes)
+        g_apply_sync_bytes(in);
+}
+
+static void np_rollback_try_start(void)
+{
+#if defined(SNESRECOMP_NET_ROLLBACK)
+    SnesNetplayRbBindings b;
+
+    g_np_rollback = 0;
+    if (!snes_netplay_rb_enabled())
+        return;
+    memset(&b, 0, sizeof(b));
+    b.session = &g_np.session;
+    b.local_slot = &g_np.local_slot;
+    b.slot_count = &g_np.slot_count;
+    b.input_delay = &g_np.input_delay;
+    b.input_prediction = &g_np.input_prediction;
+    b.force_turn = 0;
+    b.publish = &np_rb_publish;
+    b.apply_sync_bytes = &np_rb_apply_sync;
+    snes_netplay_rb_bind(&b);
+    if (snes_netplay_rb_start()) {
+        g_np_rollback = 1;
+    } else {
+        fprintf(stderr,
+                "snes_netplay: rollback host failed to start — "
+                "falling back to delay-sync for this session\n");
+        snes_netplay_rb_bind(NULL);
+    }
+#else
+    /* Not built with rollback: delay-sync is the only admit path. */
+    g_np_rollback = 0;
+#endif
+}
 static int g_return_to_lobby;
 static uint32_t g_connect_wait_started_ms;
 static FILE *g_diag_file;
@@ -258,14 +396,20 @@ static void host_sample_local(rnet_u32 tick, RNetInputSample *out, void *ctx)
 static void host_publish(rnet_u32 tick, const RNetInputSample *by_slot, int slots, void *ctx)
 {
     NetplayState *st = (NetplayState *)ctx;
+    uint16_t buttons[SNES_NETPLAY_MAX_SLOTS];
     int i;
+    int n = slots;
     (void)tick;
-    st->published[0] = 0;
-    st->published[1] = 0;
+    (void)st;
     st->host_sync_valid = 0;
-    if (!by_slot || slots <= 0) return;
-    for (i = 0; i < slots && i < 2; ++i)
-        st->published[i] = decode_pad(&by_slot[i]) & 0x0FFFu;
+    if (!by_slot || slots <= 0) {
+        np_apply_published(NULL, 0);
+        return;
+    }
+    if (n > SNES_NETPLAY_MAX_SLOTS) n = SNES_NETPLAY_MAX_SLOTS;
+    for (i = 0; i < n; ++i)
+        buttons[i] = decode_pad(&by_slot[i]) & 0x0FFFu;
+    np_apply_published(buttons, n);
     /* Slot 0 carries the authoritative game-defined sync bytes. */
     if (by_slot[0].valid && by_slot[0].size >= 4) {
         st->host_sync[0] = by_slot[0].bytes[2];
@@ -317,6 +461,21 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
     int in_motk_room = 0;
 
     if (cfg->transport == 2) return 0; /* force LAN */
+
+    /* The lobby server owns the transport, and when it allocates a UDP input
+     * relay it says so: op:"launch" carries relay_endpoint, both endpoints are
+     * rewritten to it, and match caps set force_input_relay (see
+     * using_server_input_relay / fill_peer_bind_from_join in the lobby client).
+     * Honour that assignment.
+     *
+     * Choosing p2p ICE anyway is not a harmless preference. The relay is the
+     * only transport that carries more than two participants -- the session
+     * holds exactly one ICE agent -- and the only place "the gallery is
+     * read-only" can be enforced against a patched client, because the relay
+     * drops a spectator's packets itself. Taking ICE instead put three agents
+     * on one broadcast signalling channel, where the spectator's offer read as
+     * a peer ICE restart and destroyed the two players' established link. */
+    if (cfg->force_input_relay) return 0;
 #if defined(SNES_HAS_LOBBY_CLIENT)
     in_motk_room = snes_lobby_connected() && snes_lobby_in_lobby();
 #endif
@@ -330,7 +489,8 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
         }
         return 1;
     }
-    /* Auto: hosted MotK room always uses ICE. Do not demote to LAN when the
+    /* Auto: a hosted MotK room the server did NOT put on the relay uses ICE
+     * (the relay assignment is honoured above). Do not demote to LAN when the
      * lobby rewrites 0.0.0.0 binds to a private TCP peer IP (often wrong —
      * e.g. router .1). LAN file-registry (no MotK seat) stays on LAN UDP. */
     if (in_motk_room)
@@ -352,6 +512,11 @@ static int resolve_use_ice(const SnesNetplayConfig *cfg)
 #endif
 }
 
+int snes_netplay_rollback_active(void)
+{
+    return g_np_rollback && g_np.active;
+}
+
 int snes_netplay_active(void)
 {
     return g_np.active && g_np.session != NULL;
@@ -365,7 +530,10 @@ int snes_netplay_is_running(void)
 const char *snes_netplay_transport_name(void)
 {
     if (!snes_netplay_active()) return "none";
-    return g_np.use_ice ? "ice" : "lan";
+    if (g_np.use_ice) return "ice";
+    /* "lan" and "relay" are the same UDP transport; they are not the same
+     * thing to read in a log when a match misbehaves. */
+    return g_np.force_input_relay ? "relay" : "lan";
 }
 
 int snes_netplay_ice_failed(void)
@@ -384,6 +552,11 @@ int snes_netplay_local_slot(void)
     return snes_netplay_active() ? g_np.local_slot : -1;
 }
 
+int snes_netplay_is_spectator(void)
+{
+    return (snes_netplay_active() && g_np.spectator) ? 1 : 0;
+}
+
 int snes_netplay_input_player(void)
 {
     return snes_netplay_active() ? g_np.input_player : 0;
@@ -392,6 +565,7 @@ int snes_netplay_input_player(void)
 uint32_t snes_netplay_sim_tick(void)
 {
     if (!snes_netplay_active()) return 0;
+    if (g_np_rollback) return snes_netplay_rb_sim_tick();
     return rnet_session_sim_tick(g_np.session);
 }
 
@@ -403,6 +577,12 @@ uint32_t snes_netplay_frames_finished(void)
 void snes_netplay_stage_local(uint16_t buttons)
 {
     buttons &= 0x0FFFu;
+    if (g_np_rollback) {
+        snes_netplay_rb_stage_local(buttons);
+        g_np.staged_buttons = buttons;
+        g_np.staged_valid = 1;
+        return;
+    }
     if (snes_netplay_active() && rnet_session_is_running(g_np.session)) {
         uint32_t t = rnet_session_sim_tick(g_np.session);
         if (g_np.latched_for_tick && g_np.latched_sim_tick == t)
@@ -420,6 +600,10 @@ void snes_netplay_stage_local(uint16_t buttons)
 int snes_netplay_needs_local_sample(void)
 {
     if (!snes_netplay_active()) return 0;
+    /* Rollback re-reads the live pad on every admit attempt: a stalled tick
+     * that later admits must carry the player's current input, not the pad
+     * they were holding when the stall began. */
+    if (g_np_rollback) return 1;
     if (!rnet_session_is_running(g_np.session)) return 1;
     {
         uint32_t t = rnet_session_sim_tick(g_np.session);
@@ -445,6 +629,11 @@ uint32_t snes_netplay_published_inputs(void)
     return (uint32_t)g_np.published[0] | ((uint32_t)g_np.published[1] << 12);
 }
 
+int snes_netplay_slot_count(void)
+{
+    return snes_netplay_active() && g_np.slot_count > 0 ? g_np.slot_count : 2;
+}
+
 uint32_t snes_netplay_active_mask(void)
 {
     return 3u << 30;
@@ -460,10 +649,58 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     if (!cfg || !cfg->enabled) return -1;
     if (g_np.session) snes_netplay_shutdown();
     snes_netplay_connect_wait_reset();
+    /* Settled session mode (config default rollback; lobby launch and
+     * SNES_NET_MODE already folded in by the callers/apply_env). */
+    snes_netplay_rb_set_default(cfg->rollback);
 
     rnet_config_init_defaults(&rcfg);
-    rcfg.slot_count = 2;
-    rcfg.local_slot = (rnet_u8)(cfg->local_slot < 0 ? 0 : (cfg->local_slot > 1 ? 1 : cfg->local_slot));
+    {
+        int seats = cfg->slot_count > 0 ? cfg->slot_count : 2;
+        int slot;
+        if (seats < 2) seats = 2;
+        if (seats > SNES_NETPLAY_MAX_SLOTS) seats = SNES_NETPLAY_MAX_SLOTS;
+        /* Seats past the second only exist behind a multitap. Refusing to
+         * open a wider session than the machine can route is the "abort
+         * rather than silently degrade" rule: a peer that quietly ran two
+         * seats while the other ran five would desync on input, not on
+         * anything that names itself. */
+        if (seats > 2 && RtlPlayerCount() < seats) {
+            fprintf(stderr,
+                    "snes_netplay: %d seats requested but the port "
+                    "configuration reaches only %d — enable a multitap "
+                    "(SNES_MULTITAP / RtlSetMultitap) on every peer\n",
+                    seats, RtlPlayerCount());
+            return -1;
+        }
+        rcfg.slot_count = (rnet_u8)seats;
+        if (cfg->spectator) {
+            /* No seat. local_slot == slot_count is the observer sentinel:
+             * every "is this my seat?" test in the session and the rollback
+             * answers no, so this build resolves every slot from the wire and
+             * contributes to none.
+             *
+             * The wire id is a DIFFERENT number -- a slot in the relay's
+             * namespace, above its player count, which is what makes the relay
+             * refuse to forward anything sent from here. Clamping it into a
+             * player slot would be the one failure that desyncs a live match,
+             * so a spectator without one refuses to start. */
+            if (cfg->spectator_wire_slot <= 0 ||
+                cfg->spectator_wire_slot < seats ||
+                cfg->spectator_wire_slot > 0xff) {
+                fprintf(stderr,
+                        "snes_netplay: spectator without a usable relay slot "
+                        "(%d, seats=%d) — refusing to start\n",
+                        cfg->spectator_wire_slot, seats);
+                return -1;
+            }
+            rcfg.local_slot = (rnet_u8)seats;
+            rcfg.wire_slot = (rnet_u8)cfg->spectator_wire_slot;
+        } else {
+            slot = cfg->local_slot < 0 ? 0 : cfg->local_slot;
+            if (slot >= seats) slot = seats - 1;
+            rcfg.local_slot = (rnet_u8)slot;
+        }
+    }
     rcfg.input_delay = (rnet_u8)(cfg->input_delay < 0 ? 0
                                 : (cfg->input_delay > 20 ? 20 : cfg->input_delay));
     rcfg.session_id = cfg->session_id ? cfg->session_id : 1u;
@@ -474,6 +711,27 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     use_ice = resolve_use_ice(cfg);
     if (use_ice < 0)
         return -4;
+
+    /* A spectator has no route over ICE, and must say so rather than show it.
+     *
+     * The session owns exactly one ICE agent, and in a p2p match both players
+     * spend theirs on each other. A third participant therefore negotiates
+     * with nobody: it stalls the full 5s host/STUN timeout, tries a TURN
+     * fallback against no peer, and renders a black window the whole time --
+     * a failure that looks, to the person watching it, like the game is
+     * broken. Only the lobby server's UDP input relay carries a third
+     * participant, so without one there is nothing to spectate over.
+     *
+     * Refusing here is the same rule as the missing-relay-slot check above:
+     * abort rather than silently degrade. The players are unaffected. */
+    if (cfg->spectator && use_ice) {
+        fprintf(stderr,
+                "snes_netplay: spectating needs the lobby server's UDP input "
+                "relay, but this match was launched peer-to-peer (no "
+                "relay_endpoint) — refusing to start rather than showing a "
+                "black screen\n");
+        return -5;
+    }
 
     memset(&host, 0, sizeof(host));
     host.sample_local = host_sample_local;
@@ -505,7 +763,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
         g_np.ice_bind_addr[0] = '\0';
 
         rnet_ice_config_init_defaults(&ice);
-        ice.controlling = (rcfg.local_slot == 0) ? 1u : 0u;
+        /* A spectator is never the offerer: its sentinel slot is not 0, so
+         * this already answers no. Stated rather than left to arithmetic. */
+        ice.controlling = (!cfg->spectator && rcfg.local_slot == 0) ? 1u : 0u;
 
         /* Prefer a concrete LAN IPv4 for host candidates (not 0.0.0.0). */
         naddr = rnet_ipv4_enumerate(addrs, sizeof(addrs) / sizeof(addrs[0]));
@@ -654,6 +914,7 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.active = 1;
     g_np.slot_count = (int)rcfg.slot_count;
     g_np.local_slot = (int)rcfg.local_slot;
+    g_np.spectator = cfg->spectator ? 1 : 0;
     g_np.input_player = in_player;
     g_np.staged_valid = 0;
     g_np.needs_advance = 0;
@@ -661,13 +922,23 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.latched_sim_tick = 0;
     g_np.host_sync_valid = 0;
     g_np.host_sync[0] = g_np.host_sync[1] = 0;
-    g_np.published[0] = g_np.published[1] = 0;
+    memset(g_np.published, 0, sizeof(g_np.published));
     g_np.use_ice = use_ice;
     g_np.sram_sync_sent = 0;
     g_np.sram_sync_done = 0;
-    g_np.host_load_applied = 0;
     g_np.host_sram_applied = 0;
+    g_np.xfer = NP_XFER_NONE;
+    g_np.xfer_slot = 0;
+    g_np.load_applied_local = 0;
+    g_np.load_cooldown_until_ms = 0;
     g_np.input_delay = (int)rcfg.input_delay;
+    /* Session-settled invent runway. Clamp to the engine's accepted band so
+     * a malformed lobby value cannot disable prediction outright. */
+    g_np.input_prediction = cfg->input_prediction;
+    if (g_np.input_prediction && g_np.input_prediction < 2)
+        g_np.input_prediction = 2;
+    if (g_np.input_prediction > 32)
+        g_np.input_prediction = 32;
     g_np.force_input_relay = cfg->force_input_relay ? 1 : 0;
     g_np.session_id = rcfg.session_id;
     g_np.is_host = (g_np.local_slot == 0) ? 1 : 0;
@@ -702,6 +973,12 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_diag_file_session = 0;
     g_diag_last_write_ms = 0;
 
+    if (g_np.spectator)
+        fprintf(stderr,
+                "snes_netplay: SPECTATING - simulating %d seat(s) from the "
+                "wire, relay slot %u, contributing no input\n",
+                g_np.slot_count, (unsigned)rcfg.wire_slot);
+
     /* Guest: sandbox SRAM/savestate paths so host sync never touches personal saves. */
     if (g_np.local_slot != 0) {
         RtlSetSaveRoot("saves/netplay");
@@ -716,10 +993,12 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     /* Frame-locked SPC drain starts from a clean accumulator on both peers. */
     RtlNetplayAudioReset();
 
+    np_rollback_try_start();
+
     fprintf(stderr,
             "snes_netplay: started transport=%s slot=%d input_player=%d session=%u "
             "delay=%u force_input_relay=%d bind=%s peer=%s\n",
-            use_ice ? "ice" : "lan", g_np.local_slot, g_np.input_player,
+            snes_netplay_transport_name(), g_np.local_slot, g_np.input_player,
             (unsigned)rcfg.session_id, (unsigned)rcfg.input_delay,
             g_np.force_input_relay, cfg->bind_hostport,
             /* Lobby peer rewrite is unused for ICE (candidates via WS). */
@@ -729,6 +1008,11 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
 void snes_netplay_shutdown(void)
 {
+    snes_netplay_rb_shutdown();
+#if defined(SNESRECOMP_NET_ROLLBACK)
+    snes_netplay_rb_bind(NULL);
+#endif
+    g_np_rollback = 0;
     if (g_diag_file) {
         fclose(g_diag_file);
         g_diag_file = NULL;
@@ -759,10 +1043,90 @@ void snes_netplay_shutdown(void)
     snes_netplay_connect_wait_reset();
 }
 
+static int np_read_slot_file(int slot, uint8_t **out, size_t *out_size);
+
 static int np_xfer_busy(void)
 {
+    if (g_np.xfer != NP_XFER_NONE)
+        return 1;
     return rnet_session_state_busy(g_np.session) ||
            rnet_session_state_take_ready(g_np.session, NULL, NULL, NULL, NULL);
+}
+
+static int np_load_cooldown_active(void)
+{
+    uint32_t now;
+    if (!g_np.load_cooldown_until_ms)
+        return 0;
+    now = SDL_GetTicks();
+    if ((int32_t)(now - g_np.load_cooldown_until_ms) >= 0) {
+        g_np.load_cooldown_until_ms = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static int np_slot_crc(int slot, rnet_u32 *size_out, rnet_u32 *crc_out)
+{
+    uint8_t *buf = NULL;
+    size_t n = 0;
+    if (np_read_slot_file(slot, &buf, &n) != 0 || !buf || n == 0)
+        return 0;
+    if (size_out)
+        *size_out = (rnet_u32)n;
+    if (crc_out)
+        *crc_out = rnet_checksum(buf, n);
+    free(buf);
+    return 1;
+}
+
+static int np_apply_slot_file(int slot)
+{
+    uint8_t *buf = NULL;
+    size_t n = 0;
+    int ok;
+    if (np_read_slot_file(slot, &buf, &n) != 0 || !buf) {
+        fprintf(stderr, "snes_netplay: load slot=%d — local file missing\n", slot);
+        return 0;
+    }
+    ok = RtlLoadSnapshotFromMemory(buf, n) ? 1 : 0;
+    if (!ok)
+        fprintf(stderr, "snes_netplay: load slot=%d — apply failed (%zu bytes)\n",
+                slot, n);
+    free(buf);
+    return ok;
+}
+
+static void np_commit_load_sync(void)
+{
+    rnet_session_hard_resync(g_np.session);
+    np_prime_after_hard_resync();
+    RtlNetplayAudioReset();
+    g_np.needs_advance = 0;
+    g_np.latched_for_tick = 0;
+    g_np.staged_valid = 0;
+    g_np.load_applied_local = 0;
+    g_np.xfer = NP_XFER_NONE;
+    g_np.load_cooldown_until_ms = SDL_GetTicks() + NP_LOAD_COOLDOWN_MS;
+    if (!g_np.load_cooldown_until_ms)
+        g_np.load_cooldown_until_ms = 1;
+    fprintf(stderr, "snes_netplay: load sync committed (hard_resync)\n");
+}
+
+static void np_enter_load_ready(int slot)
+{
+    g_np.xfer = NP_XFER_LOAD_READY;
+    g_np.xfer_slot = slot;
+    g_np.load_applied_local = 1;
+    if (g_np.local_slot != 0)
+        return;
+    if (rnet_session_state_probe(g_np.session, RNET_STATE_OP_LOAD, (rnet_u8)slot, 0,
+                                 NP_LOAD_READY_CRC) != 0) {
+        fprintf(stderr, "snes_netplay: load ready probe failed — forcing resync\n");
+        np_commit_load_sync();
+        return;
+    }
+    fprintf(stderr, "snes_netplay: load slot=%d — waiting mutual ready\n", slot);
 }
 
 static int np_write_slot_file(int slot, const void *data, size_t size)
@@ -868,26 +1232,157 @@ static void np_apply_ready_state(void)
         return;
     }
 
-    /* LOAD: guest applies; host already applied immediately at request time. */
-    if (g_np.local_slot != 0 || !g_np.host_load_applied) {
+    /* LOAD: both peers apply from the transferred blob, then ready-rendezvous
+     * before hard_resync (keeps input epochs aligned). */
+    if (!g_np.load_applied_local) {
         if (!RtlLoadSnapshotFromMemory(data, size)) {
             fprintf(stderr, "snes_netplay: load snapshot failed (%zu bytes)\n", size);
-        } else {
-            fprintf(stderr, "snes_netplay: applied synced load slot=%u (%zu bytes)\n",
-                    (unsigned)slot, size);
-            if (g_np.local_slot != 0)
-                np_write_slot_file((int)slot, data, size);
+            rnet_session_state_finish(g_np.session, 0);
+            g_np.xfer = NP_XFER_NONE;
+            return;
         }
+        fprintf(stderr, "snes_netplay: applied synced load slot=%u (%zu bytes)\n",
+                (unsigned)slot, size);
+        if (g_np.local_slot != 0)
+            np_write_slot_file((int)slot, data, size);
     } else {
-        fprintf(stderr, "snes_netplay: guest caught up; host load already applied\n");
-        g_np.host_load_applied = 0;
+        fprintf(stderr, "snes_netplay: load slot=%u transfer done (already applied)\n",
+                (unsigned)slot);
     }
-    rnet_session_state_finish(g_np.session, 1);
-    np_prime_after_hard_resync();
-    RtlNetplayAudioReset();
-    g_np.needs_advance = 0;
-    g_np.latched_for_tick = 0;
-    g_np.staged_valid = 0;
+    rnet_session_state_finish(g_np.session, 0);
+    np_enter_load_ready((int)slot);
+}
+
+static void np_guest_handle_probe(void)
+{
+    rnet_u8 op = 0, slot = 0;
+    rnet_u32 size = 0, crc = 0;
+    int match = 0;
+
+    if (g_np.local_slot == 0)
+        return;
+    if (!rnet_session_state_probe_pending(g_np.session, &op, &slot, &size, &crc))
+        return;
+
+    /* Post-load ready rendezvous. */
+    if (op == RNET_STATE_OP_LOAD && size == 0 && crc == NP_LOAD_READY_CRC) {
+        if (!g_np.load_applied_local)
+            return;
+        if (rnet_session_state_probe_reply(g_np.session, 1) != 0)
+            return;
+        np_commit_load_sync();
+        return;
+    }
+
+    if (size == 0) {
+        /* SAVE size==0 coord unused on SNES — ACK so host is not stuck. */
+        (void)rnet_session_state_probe_reply(g_np.session, 1);
+        return;
+    }
+
+    if (op == RNET_STATE_OP_SRAM) {
+        /* Host drives SRAM via state_begin today; answer hash if probed. */
+        match = 0;
+        if (g_sram && g_sram_size > 0) {
+            rnet_u32 local_crc = rnet_checksum(g_sram, (size_t)g_sram_size);
+            match = ((rnet_u32)g_sram_size == size && local_crc == crc);
+        }
+        (void)rnet_session_state_probe_reply(g_np.session, match);
+        if (match)
+            g_np.sram_sync_done = 1;
+        return;
+    }
+
+    {
+        rnet_u32 local_sz = 0, local_crc = 0;
+        match = np_slot_crc((int)slot, &local_sz, &local_crc) && local_sz == size &&
+                local_crc == crc;
+        if (op == RNET_STATE_OP_LOAD && match && !g_np.load_applied_local) {
+            if (!np_apply_slot_file((int)slot)) {
+                fprintf(stderr,
+                        "snes_netplay: guest load slot=%u — hash matched but "
+                        "apply failed; requesting transfer\n",
+                        (unsigned)slot);
+                match = 0;
+            }
+        }
+        (void)rnet_session_state_probe_reply(g_np.session, match);
+        if (op == RNET_STATE_OP_LOAD) {
+            g_np.xfer_slot = (int)slot;
+            if (match) {
+                g_np.xfer = NP_XFER_LOAD_READY;
+                g_np.load_applied_local = 1;
+                fprintf(stderr,
+                        "snes_netplay: guest load slot=%u — hashes match, applied "
+                        "(skip transfer)\n",
+                        (unsigned)slot);
+            } else {
+                g_np.xfer = NP_XFER_LOAD_SEND;
+                fprintf(stderr,
+                        "snes_netplay: guest load slot=%u — hash miss, waiting "
+                        "transfer\n",
+                        (unsigned)slot);
+            }
+        }
+    }
+}
+
+static void np_host_drive_load_xfer(void)
+{
+    int match = 0;
+    uint8_t *buf = NULL;
+    size_t n = 0;
+
+    if (g_np.local_slot != 0 || !g_np.session)
+        return;
+
+    switch (g_np.xfer) {
+    case NP_XFER_LOAD_PROBE:
+        if (!rnet_session_state_probe_take_reply(g_np.session, &match))
+            return;
+        rnet_session_state_probe_finish(g_np.session);
+        if (match) {
+            if (!np_apply_slot_file(g_np.xfer_slot)) {
+                g_np.xfer = NP_XFER_NONE;
+                return;
+            }
+            fprintf(stderr,
+                    "snes_netplay: host load slot=%d — hashes match, skip transfer\n",
+                    g_np.xfer_slot);
+            np_enter_load_ready(g_np.xfer_slot);
+            return;
+        }
+        if (np_read_slot_file(g_np.xfer_slot, &buf, &n) != 0 || !buf) {
+            g_np.xfer = NP_XFER_NONE;
+            return;
+        }
+        if (rnet_session_state_begin(g_np.session, RNET_STATE_OP_LOAD,
+                                     (rnet_u8)g_np.xfer_slot, buf, n) != 0) {
+            free(buf);
+            fprintf(stderr, "snes_netplay: state_begin(load) failed\n");
+            g_np.xfer = NP_XFER_NONE;
+            return;
+        }
+        free(buf);
+        g_np.xfer = NP_XFER_LOAD_SEND;
+        fprintf(stderr, "snes_netplay: host load slot=%d — transferring %zu bytes\n",
+                g_np.xfer_slot, n);
+        return;
+
+    case NP_XFER_LOAD_READY:
+        if (!rnet_session_state_probe_take_reply(g_np.session, &match))
+            return;
+        rnet_session_state_probe_finish(g_np.session);
+        np_commit_load_sync();
+        return;
+
+    case NP_XFER_LOAD_SEND:
+        /* Completion handled in np_apply_ready_state → np_enter_load_ready. */
+        return;
+
+    default:
+        return;
+    }
 }
 
 static void np_maybe_start_sram_sync(void)
@@ -960,8 +1455,7 @@ int snes_netplay_request_save(int slot)
 
 int snes_netplay_request_load(int slot)
 {
-    uint8_t *buf = NULL;
-    size_t n = 0;
+    rnet_u32 size = 0, crc = 0;
     if (!snes_netplay_active() || !rnet_session_is_running(g_np.session))
         return 0;
     if (g_np.local_slot != 0) {
@@ -972,34 +1466,47 @@ int snes_netplay_request_load(int slot)
         fprintf(stderr, "snes_netplay: load busy\n");
         return 1;
     }
+    if (np_load_cooldown_active()) {
+        fprintf(stderr, "snes_netplay: load cooldown\n");
+        return 1;
+    }
     if (slot < 0) slot = 0;
     if (slot > 19) slot = 19;
 
-    if (np_read_slot_file(slot, &buf, &n) != 0) {
+    if (!np_slot_crc(slot, &size, &crc)) {
         fprintf(stderr, "snes_netplay: no save in slot %d\n", slot);
         return 1;
     }
 
-    /* Host-immediate apply from local file; stall admit until guest catches up. */
-    if (!RtlLoadSnapshotFromMemory(buf, n)) {
-        fprintf(stderr, "snes_netplay: host local load failed\n");
-        free(buf);
+    /* Hash probe first — skip the ~300KB ICE transfer when guest already has
+     * the blob. Apply + hard_resync happen only after probe/xfer + ready. */
+    if (rnet_session_state_probe(g_np.session, RNET_STATE_OP_LOAD, (rnet_u8)slot, size,
+                                 crc) != 0) {
+        fprintf(stderr, "snes_netplay: load probe failed\n");
         return 1;
     }
-    g_np.host_load_applied = 1;
-    RtlNetplayAudioReset();
-    g_np.needs_advance = 0;
-    g_np.latched_for_tick = 0;
-    g_np.staged_valid = 0;
-    fprintf(stderr, "snes_netplay: host applied load slot=%d; syncing guest (%zu bytes)\n",
-            slot, n);
-
-    if (rnet_session_state_begin(g_np.session, RNET_STATE_OP_LOAD, (rnet_u8)slot, buf, n) != 0) {
-        fprintf(stderr, "snes_netplay: state_begin(load) failed\n");
-        g_np.host_load_applied = 0;
-    }
-    free(buf);
+    g_np.xfer = NP_XFER_LOAD_PROBE;
+    g_np.xfer_slot = slot;
+    g_np.load_applied_local = 0;
+    fprintf(stderr, "snes_netplay: host load slot=%d — hash probe (%u bytes)\n", slot,
+            (unsigned)size);
     return 1;
+}
+
+int snes_netplay_state_barrier(void)
+{
+    RNetSessionStats st;
+    if (!snes_netplay_active() || !g_np.session)
+        return 0;
+    if (g_np.xfer != NP_XFER_NONE)
+        return 1;
+    if (rnet_session_state_busy(g_np.session))
+        return 1;
+    memset(&st, 0, sizeof(st));
+    rnet_session_get_stats(g_np.session, &st);
+    if (st.state_busy || st.last_stall == RNET_ADMIT_STATE_XFER)
+        return 1;
+    return 0;
 }
 
 static int np_diag_enabled(void)
@@ -1254,7 +1761,9 @@ static void np_pump_session(void)
 #endif
     drain_lobby_signals();
     rnet_session_pump(g_np.session);
+    np_guest_handle_probe();
     np_apply_ready_state();
+    np_host_drive_load_xfer();
     if (rnet_session_is_running(g_np.session))
         np_maybe_start_sram_sync();
 }
@@ -1287,6 +1796,17 @@ int snes_netplay_poll_admit(void)
         snes_netplay_diag_tick();
         return 0;
     }
+    /* App-layer load barrier (probe / xfer / ready rendezvous). */
+    if (g_np.xfer != NP_XFER_NONE) {
+        snes_netplay_diag_tick();
+        return 0;
+    }
+
+    if (g_np_rollback) {
+        int ok = snes_netplay_rb_poll_admit();
+        snes_netplay_diag_tick();
+        return ok;
+    }
 
     if (g_np.needs_advance) return 1;
 
@@ -1303,6 +1823,11 @@ int snes_netplay_poll_admit(void)
 void snes_netplay_finish_frame(void)
 {
     if (!snes_netplay_active()) return;
+    if (g_np_rollback) {
+        snes_netplay_rb_finish_frame();
+        g_np.frames_finished++;
+        return;
+    }
     if (!g_np.needs_advance) return;
     rnet_session_advance(g_np.session);
     g_np.needs_advance = 0;
