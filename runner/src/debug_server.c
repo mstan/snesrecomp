@@ -4924,6 +4924,22 @@ static void cmd_raster_journal(const char *args) {
  * bounded oracle capture can be injected without needing all 64K. Everything
  * outside the named range keeps the live contents.
  */
+/* render_inject <out_bmp> <vram_byte_lo_hex> <vram_bin> [oam_bin] [cgram_bin]
+ *
+ * Renders a frame from INJECTED PPU buffers and restores everything. Purely an
+ * observer: it never advances the guest and leaves no state behind.
+ *
+ * It exists to settle "is our renderer wrong, or is the state we render wrong?"
+ * — a question pixels alone cannot answer. Feed it an oracle capture's VRAM /
+ * OAM / CGRAM and compare the result against that oracle's own screenshot:
+ * matching means the renderer is faithful and the fault is which state we draw;
+ * differing means the fault is in the renderer's own addressing, and no amount
+ * of frame-model reordering would have fixed it.
+ *
+ * The VRAM file is a byte image of a SUB-RANGE starting at vram_byte_lo, so a
+ * bounded oracle capture can be injected without needing all 64K. Everything
+ * outside the named range keeps the live contents.
+ */
 static void cmd_render_inject(const char *args) {
     if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
     char out[256], vpath[256], opath[256], cpath[256];
@@ -5031,117 +5047,6 @@ static void cmd_render_inject(const char *args) {
              "\"path_used\":\"%s\"}",
              out, vlo, (unsigned)vlen, (unsigned)olen, (unsigned)clen, w, h,
              used_production ? "production-draw_ppu_frame" : "fallback-ppu_runLine");
-}
-
-/* render_inject <out_bmp> <vram_byte_lo_hex> <vram_bin> [oam_bin] [cgram_bin]
- *
- * Renders a frame from INJECTED PPU buffers and restores everything. Purely an
- * observer: it never advances the guest and leaves no state behind.
- *
- * It exists to settle "is our renderer wrong, or is the state we render wrong?"
- * — a question pixels alone cannot answer. Feed it an oracle capture's VRAM /
- * OAM / CGRAM and compare the result against that oracle's own screenshot:
- * matching means the renderer is faithful and the fault is which state we draw;
- * differing means the fault is in the renderer's own addressing, and no amount
- * of frame-model reordering would have fixed it.
- *
- * The VRAM file is a byte image of a SUB-RANGE starting at vram_byte_lo, so a
- * bounded oracle capture can be injected without needing all 64K. Everything
- * outside the named range keeps the live contents.
- */
-static void cmd_render_inject(const char *args) {
-    if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
-    char out[256], vpath[256], opath[256], cpath[256];
-    unsigned int vlo = 0;
-    out[0] = vpath[0] = opath[0] = cpath[0] = 0;
-    int n = sscanf(args ? args : "", "%255s %x %255s %255s %255s",
-                   out, &vlo, vpath, opath, cpath);
-    if (n < 3) {
-        send_fmt("{\"error\":\"usage: render_inject <out_bmp> <vram_byte_lo_hex> "
-                 "<vram_bin> [oam_bin] [cgram_bin]\"}");
-        return;
-    }
-    if (vlo >= 0x10000) { send_fmt("{\"error\":\"vram_byte_lo out of range\"}"); return; }
-
-    /* Read the blobs BEFORE touching the PPU, so a missing file cannot leave
-     * injected state behind. */
-    static uint8_t vbuf[0x10000];
-    size_t vlen = 0;
-    { FILE *f = fopen(vpath, "rb");
-      if (!f) { send_fmt("{\"error\":\"cannot open vram_bin\",\"path\":\"%s\"}", vpath); return; }
-      vlen = fread(vbuf, 1, sizeof(vbuf), f); fclose(f); }
-    if (vlo + vlen > 0x10000) vlen = 0x10000 - vlo;
-
-    uint8_t obuf[544]; size_t olen = 0;
-    if (opath[0]) {
-        FILE *f = fopen(opath, "rb");
-        if (!f) { send_fmt("{\"error\":\"cannot open oam_bin\",\"path\":\"%s\"}", opath); return; }
-        olen = fread(obuf, 1, sizeof(obuf), f); fclose(f);
-    }
-    uint8_t cbuf[512]; size_t clen = 0;
-    if (cpath[0]) {
-        FILE *f = fopen(cpath, "rb");
-        if (!f) { send_fmt("{\"error\":\"cannot open cgram_bin\",\"path\":\"%s\"}", cpath); return; }
-        clen = fread(cbuf, 1, sizeof(cbuf), f); fclose(f);
-    }
-
-    lock_mutex();
-    /* Save every buffer we are about to overwrite. */
-    static uint16_t save_vram[0x8000];
-    static uint16_t save_oam[0x100];
-    static uint8_t  save_high[0x20];
-    static uint16_t save_cgram[0x100];
-    memcpy(save_vram,  g_ppu->vram,    sizeof(save_vram));
-    memcpy(save_oam,   g_ppu->oam,     sizeof(save_oam));
-    memcpy(save_high,  g_ppu->highOam, sizeof(save_high));
-    memcpy(save_cgram, g_ppu->cgram,   sizeof(save_cgram));
-
-    memcpy((uint8_t *)g_ppu->vram + vlo, vbuf, vlen);
-    if (olen >= 512) memcpy((uint8_t *)g_ppu->oam, obuf, 512);
-    if (olen >= 544) memcpy(g_ppu->highOam, obuf + 512, 32);
-    if (clen >= 512) memcpy((uint8_t *)g_ppu->cgram, cbuf, 512);
-
-    static uint8_t px[256 * 4 * 240];
-    DebugPpuRenderAuthentic(px);
-
-    memcpy(g_ppu->vram,    save_vram,  sizeof(save_vram));
-    memcpy(g_ppu->oam,     save_oam,   sizeof(save_oam));
-    memcpy(g_ppu->highOam, save_high,  sizeof(save_high));
-    memcpy(g_ppu->cgram,   save_cgram, sizeof(save_cgram));
-    unlock_mutex();
-
-    FILE *f = fopen(out, "wb");
-    if (!f) { send_fmt("{\"error\":\"cannot open out_bmp\",\"path\":\"%s\"}", out); return; }
-    const int w = 256, h = 224;
-    int row_bytes = w * 3;
-    int pad = (4 - (row_bytes % 4)) % 4;
-    int stride = row_bytes + pad;
-    int img_size = stride * h;
-    int file_size = 54 + img_size;
-    uint8_t hdr[54] = {0};
-    hdr[0] = 'B'; hdr[1] = 'M';
-    hdr[2] = file_size; hdr[3] = file_size >> 8; hdr[4] = file_size >> 16; hdr[5] = file_size >> 24;
-    hdr[10] = 54; hdr[14] = 40;
-    hdr[18] = w; hdr[19] = w >> 8;
-    { int neg_h = -h; memcpy(&hdr[22], &neg_h, 4); }
-    hdr[26] = 1; hdr[28] = 24;
-    hdr[34] = img_size; hdr[35] = img_size >> 8; hdr[36] = img_size >> 16; hdr[37] = img_size >> 24;
-    fwrite(hdr, 1, 54, f);
-    uint8_t row_buf[256 * 3 + 4];
-    memset(row_buf, 0, sizeof(row_buf));
-    for (int y = 0; y < h; y++) {
-        const uint8_t *src = px + (size_t)y * w * 4;
-        for (int x = 0; x < w; x++) {
-            row_buf[x * 3 + 0] = src[x * 4 + 0];
-            row_buf[x * 3 + 1] = src[x * 4 + 1];
-            row_buf[x * 3 + 2] = src[x * 4 + 2];
-        }
-        fwrite(row_buf, 1, stride, f);
-    }
-    fclose(f);
-    send_fmt("{\"ok\":true,\"path\":\"%s\",\"vram_lo\":\"0x%04x\",\"vram_bytes\":%u,"
-             "\"oam_bytes\":%u,\"cgram_bytes\":%u,\"width\":%d,\"height\":%d}",
-             out, vlo, (unsigned)vlen, (unsigned)olen, (unsigned)clen, w, h);
 }
 
 static void cmd_get_ppu_state(const char *args) {

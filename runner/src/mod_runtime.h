@@ -208,7 +208,7 @@ int snes_mod_runtime_package_digest_c(const char* package_id,
  * entry and so fails closed. Returns the bytes that WOULD be written. */
 int snes_mod_runtime_exempted_packages_c(char* out, uint32_t cap);
 
-/* Enabled features claiming the cosmetic exemption without a grant, one/* Enabled features claiming the cosmetic exemption without a grant, one
+/* Enabled features claiming the cosmetic exemption without a grant, one
  * `package@version/feature` per line; empty when there are none. A queue gate
  * must treat these as simulation-affecting -- not because they necessarily
  * are, but because no authority has said they are not. Returns the bytes that

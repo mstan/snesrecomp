@@ -3242,13 +3242,6 @@ int snes_lobby_join(const char *lobby_id, const char *password, const char *gues
     char dn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
     char gn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
     char gv_esc[JSON_ESC_CAP(SNES_LOBBY_VERSION_LEN)];
-    int n;
-    char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
-    char pw_esc[JSON_ESC_CAP(128)];
-    char bind_esc[JSON_ESC_CAP(SNES_LOBBY_ENDPOINT_LEN)];
-    char dn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
-    char gn_esc[JSON_ESC_CAP(SNES_LOBBY_NAME_LEN)];
-    char gv_esc[JSON_ESC_CAP(SNES_LOBBY_VERSION_LEN)];
     const char *gn;
     const char *gv;
     int n;
@@ -4579,7 +4572,6 @@ int snes_lobby_send_signal_to(const char *to_player_id, int type, int flag,
 {
     char esc[4096];
     char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
-    char lid_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
     char to_esc[JSON_ESC_CAP(SNES_LOBBY_ID_LEN)];
     char msg[4608];
     const char *lid;
@@ -4593,7 +4585,6 @@ int snes_lobby_send_signal_to(const char *to_player_id, int type, int flag,
      * right for the game's own ICE but wrong for a transfer: a third player
      * would push a stranger's SDP into their agent and corrupt a negotiation
      * they are not part of. */
-    json_escape(lid, lid_esc, sizeof(lid_esc));
     json_escape(to_player_id ? to_player_id : "", to_esc, sizeof(to_esc));
     snprintf(msg, sizeof(msg),
              "{\"op\":\"signal\",\"lobby_id\":\"%s\",\"to_player_id\":\"%s\","
