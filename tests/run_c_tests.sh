@@ -306,6 +306,29 @@ echo "=== lobby mod plan (match_caps.mods wire shape) ==="
     -o "$OUT/lobby_mod_plan_test"
 "$OUT/lobby_mod_plan_test"
 
+echo "=== keybinds: the runner-layout keyboard word ==="
+# Needs SDL headers for the scancode enum only (no window, no device). Skipped
+# rather than failed where they are absent, like the OSD test below.
+KB_SDL_CFLAGS=""; KB_SDL_LIBS=""; KB_SDL_DEF=""
+if pkg-config --exists sdl3 2>/dev/null; then
+    KB_SDL_CFLAGS="$(pkg-config --cflags sdl3)"
+    KB_SDL_LIBS="$(pkg-config --libs sdl3)"
+    KB_SDL_DEF="-DSNESRECOMP_SDL3=1"
+elif pkg-config --exists sdl2 2>/dev/null; then
+    KB_SDL_CFLAGS="$(pkg-config --cflags sdl2)"
+    KB_SDL_LIBS="$(pkg-config --libs sdl2)"
+fi
+if [ -n "$KB_SDL_LIBS" ]; then
+    "$CC" -std=c11 -Wall -Wextra -O1 $KB_SDL_DEF $KB_SDL_CFLAGS \
+        -I "$ROOT/runner/src" \
+        "$ROOT/tests/joypad/keybinds_runner_layout_test.c" \
+        "$ROOT/runner/src/keybinds.c" \
+        $KB_SDL_LIBS -o "$OUT/keybinds_runner_layout_test"
+    ( cd "$OUT" && ./keybinds_runner_layout_test )
+else
+    echo "  (skipped: no SDL headers)"
+fi
+
 echo "=== mod runtime: presentation_only is not compared by netplay ==="
 # C++ because mod_runtime is C++, and it is compiled here rather than mocked so
 # the real manifest parser, the real effective-set text and the real adopt

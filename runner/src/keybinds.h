@@ -58,6 +58,21 @@ const KeyBinds *keybinds_get(void);
  * from the SDL keyboard state. See header docstring for bit layout. */
 uint16_t keybinds_read_player(const uint8_t *keys, int player);
 
+/* The same read in the RUNNER's seat layout -- the 12-bit word a per-game
+ * host ORs into `inputs` and hands to RtlRunFrame, and the order
+ * debug_server's k_controller_names uses:
+ *
+ *   bit 0 B, 1 Y, 2 Select, 3 Start, 4 Up, 5 Down, 6 Left, 7 Right,
+ *   bit 8 A, 9 X, 10 L, 11 R
+ *
+ * Use THIS from a runner. The keyboard-local word above is the exact mirror
+ * of this one -- its bit 4 is Right where this one's is Up -- so passing it
+ * to a runner compiles, runs, and silently swaps every direction while
+ * scrambling the face buttons. That is not hypothetical: it shipped in a
+ * per-game host and reached a player as "the arrow keys all go the wrong
+ * way". Having both here means no runner has to know the mirror exists. */
+uint16_t keybinds_read_player_runner(const uint8_t *keys, int player);
+
 /* ── Rebind API (used by the launcher's Configure view) ──────────────────
  * Buttons are indexed 0..keybinds_button_count()-1 in the fixed order
  * a, b, x, y, l, r, start, select, up, down, left, right — the same order

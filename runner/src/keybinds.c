@@ -279,6 +279,25 @@ void keybinds_save(void) {
 /* Keyboard-local joypad bitmask layout; converted to the runner's serial
  * controller mask by the desktop host before RtlRunFrame().
  * Returns 0 if either `keys` is NULL or player is out of range. */
+uint16_t keybinds_read_player_runner(const uint8_t *keys, int player) {
+    if (!keys) return 0;
+    const PlayerBinds *pb = (player == 2) ? &s_binds.p2 : &s_binds.p1;
+    uint16_t b = 0;
+    if (pb->b      != SDL_SCANCODE_UNKNOWN && keys[pb->b])      b |= 1u << 0;
+    if (pb->y      != SDL_SCANCODE_UNKNOWN && keys[pb->y])      b |= 1u << 1;
+    if (pb->select != SDL_SCANCODE_UNKNOWN && keys[pb->select]) b |= 1u << 2;
+    if (pb->start  != SDL_SCANCODE_UNKNOWN && keys[pb->start])  b |= 1u << 3;
+    if (pb->up     != SDL_SCANCODE_UNKNOWN && keys[pb->up])     b |= 1u << 4;
+    if (pb->down   != SDL_SCANCODE_UNKNOWN && keys[pb->down])   b |= 1u << 5;
+    if (pb->left   != SDL_SCANCODE_UNKNOWN && keys[pb->left])   b |= 1u << 6;
+    if (pb->right  != SDL_SCANCODE_UNKNOWN && keys[pb->right])  b |= 1u << 7;
+    if (pb->a      != SDL_SCANCODE_UNKNOWN && keys[pb->a])      b |= 1u << 8;
+    if (pb->x      != SDL_SCANCODE_UNKNOWN && keys[pb->x])      b |= 1u << 9;
+    if (pb->l      != SDL_SCANCODE_UNKNOWN && keys[pb->l])      b |= 1u << 10;
+    if (pb->r      != SDL_SCANCODE_UNKNOWN && keys[pb->r])      b |= 1u << 11;
+    return b;
+}
+
 uint16_t keybinds_read_player(const uint8_t *keys, int player) {
     if (!keys) return 0;
     const PlayerBinds *pb = (player == 2) ? &s_binds.p2 : &s_binds.p1;
