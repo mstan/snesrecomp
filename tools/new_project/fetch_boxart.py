@@ -267,7 +267,11 @@ def fetch_to_paths(
     system: str = DEFAULT_SYSTEM,
 ) -> tuple[Path, Path, str]:
     """Fetch libretro Named_Boxarts PNG, write PNG + TGA + BOXART_SOURCE.txt."""
-    names = candidate_names(cue_stem, display_name, *(extra_names or []))
+    # The exact names (the No-Intro name resolved from the ROM's CRC32) go
+    # FIRST: libretro's thumbnails are filed under exactly that name, so it
+    # lands on the first request; the filename and display-name guesses are
+    # the fallback for a dump that is not in No-Intro.
+    names = candidate_names(*(extra_names or []), cue_stem, display_name)
     if not names:
         raise ValueError("pass cue_stem and/or display_name")
     png, url, matched = try_fetch(names, system)
@@ -292,6 +296,31 @@ def fetch_to_paths(
     return tga_path, png_path, url
 
 
+def install_from_file(src: Path, tga_path: Path, png_path: Path | None = None) -> tuple[Path, Path]:
+    """Use the author's own image: a PNG is decoded and written as the
+    launcher's TGA (plus kept as the README's PNG); a TGA is copied as is."""
+    src = Path(src).expanduser().resolve()
+    data = src.read_bytes()
+    tga_path = Path(tga_path)
+    png_path = Path(png_path) if png_path else tga_path.with_suffix(".png")
+    tga_path.parent.mkdir(parents=True, exist_ok=True)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h, rgba = png_to_rgba(data)
+        write_tga_bgra(tga_path, w, h, rgba)
+        png_path.write_bytes(data)
+    elif src.suffix.lower() == ".tga":
+        tga_path.write_bytes(data)
+    else:
+        raise ValueError(f"{src}: not a PNG or TGA")
+    (tga_path.parent / "BOXART_SOURCE.txt").write_text(
+        "Box art supplied by the project author.\n"
+        f"From: {src}\n"
+        "PNG is for README; TGA is for recomp-ui LAUNCHER_BOXART.\n",
+        encoding="utf-8",
+    )
+    return tga_path, png_path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -301,7 +330,10 @@ def main() -> int:
     )
     ap.add_argument("--cue-stem", default="", help="cue filename or stem hint")
     ap.add_argument("--display-name", default="", help="game display name hint")
-    ap.add_argument("--name", action="append", default=[], help="extra libretro name candidate")
+    ap.add_argument("--name", action="append", default=[],
+                    help="exact libretro name to try FIRST (e.g. the No-Intro name resolved from the ROM's CRC32)")
+    ap.add_argument("--from-file", default="",
+                    help="use this local PNG or TGA instead of fetching (the author's own art)")
     ap.add_argument(
         "--source-out",
         default="",
@@ -322,8 +354,18 @@ def main() -> int:
 
     names = candidate_names(args.cue_stem, args.display_name, *args.name)
     if not names:
-        print("error: pass --cue-stem and/or --display-name", file=sys.stderr)
-        return 2
+        if not args.from_file:
+            print("error: pass --cue-stem and/or --display-name", file=sys.stderr)
+            return 2
+    if args.from_file:
+        try:
+            tga_path, png_path = install_from_file(Path(args.from_file), Path(args.out), Path(args.png_out) if args.png_out else None)
+        except (OSError, ValueError, SystemExit) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"  wrote {png_path}")
+        print(f"  wrote {tga_path}")
+        return 0
 
     print(f"  searching libretro boxart ({len(names)} candidates)…", file=sys.stderr)
     out = Path(args.out)

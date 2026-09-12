@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Fetch a cartridge's publisher, developer and release year from libretro-database.
+"""Fetch a cartridge's name, publisher, developer, year and description by its CRC32.
 
-libretro-database keeps per-system metadata DATs keyed by the ROM's CRC32:
+Everything starts from the ROM's digest, never from a guessed title:
 
+  metadat/no-intro/<System>.dat      game ( name "<No-Intro name>" rom ( crc ... ) )
   metadat/publisher/<System>.dat     game ( comment "<name>" publisher "X" rom ( crc ... ) )
   metadat/developer/<System>.dat     ... developer "X" ...
   metadat/releaseyear/<System>.dat   ... releaseyear "1994" ...
 
-There is no marketing description there (a DAT "description" is the name
-again), so the wizard asks for one afterwards if nothing else supplies it.
+The No-Intro name is what libretro's thumbnails are filed under, so a boxart
+fetch by that exact name lands first time. libretro carries no marketing
+description; that comes from Wikipedia's REST summary for the title (the
+No-Intro name with its region tags removed), accepted only when the page is
+a plain article about a game. The extract is CC BY-SA; the source URL is
+returned with it so the project can attribute it.
 
 Companion to fetch_boxart.py: same "Fetch boxart and metadata" step, same
 system names. Network required; the DATs are cached for a week under
@@ -31,6 +36,7 @@ from pathlib import Path
 LIBRETRO_RAW = "https://raw.githubusercontent.com/libretro/libretro-database/master/"
 DEFAULT_SYSTEM = "Nintendo - Super Nintendo Entertainment System"
 FIELDS = ("publisher", "developer", "releaseyear")
+WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 CACHE_MAX_AGE_SEC = 7 * 24 * 3600
 USER_AGENT = "snesrecomp-new-project/1.0"
 
@@ -59,7 +65,10 @@ def dat_text(field: str, system: str, *, force: bool = False) -> str:
 
 _GAME_RE = re.compile(r"game \(\s*(.*?)\n\)", re.S)
 _KV_RE = re.compile(r'^\s*(\w+)\s+"((?:[^"\\]|\\.)*)"', re.M)
-_CRC_RE = re.compile(r"rom \([^)]*\bcrc\s+([0-9A-Fa-f]{8})", re.S)
+# A No-Intro rom line quotes a name that itself contains parentheses --
+# rom ( name "Super Metroid (Japan, USA) (En,Ja).sfc" size ... crc ... ) --
+# so the scan must step over quoted strings rather than stop at the first ')'.
+_CRC_RE = re.compile(r'rom \((?:[^()"]|"[^"]*")*?\bcrc\s+([0-9A-Fa-f]{8})', re.S)
 
 
 def find_by_crc(text: str, crc32: str) -> dict[str, str] | None:
@@ -73,8 +82,60 @@ def find_by_crc(text: str, crc32: str) -> dict[str, str] | None:
     return None
 
 
-def lookup(crc32: str, system: str = DEFAULT_SYSTEM, *, force: bool = False) -> dict[str, str]:
+def nointro_name(crc32: str, system: str, *, force: bool = False) -> str:
+    """The No-Intro name for this dump, or ""."""
+    try:
+        text = dat_text("no-intro", system, force=force)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+        print(f"warning: no-intro DAT unavailable: {exc}", file=sys.stderr)
+        return ""
+    hit = find_by_crc(text, crc32)
+    return (hit or {}).get("name", "")
+
+
+def title_from_name(name: str) -> str:
+    """'Super Metroid (Japan, USA) (En,Ja)' -> 'Super Metroid'."""
+    return re.sub(r"\s*\([^)]*\)", "", name).strip()
+
+
+def wikipedia_description(title: str) -> tuple[str, str]:
+    """(short description, source URL) from Wikipedia's page summary, or ("", "").
+
+    Tries '<title> (video game)' before '<title>', and takes a page only when
+    it is a plain article whose summary is about a game -- a title that is
+    also a film or a band must not come back with the wrong page's text.
+    """
+    if not title:
+        return "", ""
+    for cand in (f"{title} (video game)", f"{title} (SNES video game)", title):
+        url = WIKIPEDIA_SUMMARY + urllib.parse.quote(cand.replace(" ", "_"))
+        try:
+            data = json.loads(http_get(url, timeout=30).decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+            continue
+        if data.get("type") != "standard":
+            continue
+        short = (data.get("description") or "").lower()
+        extract = (data.get("extract") or "").strip()
+        if "game" not in short and "game" not in extract[:200].lower():
+            continue
+        # The first two sentences make a README-sized blurb.
+        sentences = re.split(r"(?<=[.!?])\s+", extract)
+        blurb = " ".join(sentences[:2]).strip()
+        if len(blurb) > 400:
+            blurb = sentences[0].strip()
+        page = (data.get("content_urls") or {}).get("desktop", {}).get("page") or url
+        return blurb, page
+    return "", ""
+
+
+def lookup(crc32: str, system: str = DEFAULT_SYSTEM, *, force: bool = False,
+           description: bool = True) -> dict[str, str]:
     out: dict[str, str] = {}
+    ni = nointro_name(crc32, system, force=force)
+    if ni:
+        out["nointro_name"] = ni
+        out["name"] = ni
     for field in FIELDS:
         try:
             text = dat_text(field, system, force=force)
@@ -88,6 +149,11 @@ def lookup(crc32: str, system: str = DEFAULT_SYSTEM, *, force: bool = False) -> 
             out["name"] = hit["comment"]
         if hit.get(field):
             out["year" if field == "releaseyear" else field] = hit[field]
+    if description and out.get("name"):
+        blurb, source = wikipedia_description(title_from_name(out["name"]))
+        if blurb:
+            out["description"] = blurb
+            out["description_source"] = source
     return out
 
 
@@ -98,17 +164,20 @@ def main() -> int:
                     help="libretro-database system name")
     ap.add_argument("--json-out", default="", help="write the result here too")
     ap.add_argument("--refresh", action="store_true", help="ignore the cache")
+    ap.add_argument("--no-description", action="store_true",
+                    help="skip the Wikipedia summary (publisher/developer/year only)")
     args = ap.parse_args()
     if not re.fullmatch(r"[0-9A-Fa-f]{8}", args.crc32.strip()):
         print(f"error: --crc32 must be 8 hex digits, got {args.crc32!r}", file=sys.stderr)
         return 2
-    hit = lookup(args.crc32, args.system, force=args.refresh)
-    hit["source"] = LIBRETRO_RAW + "metadat/ (publisher, developer, releaseyear DATs, by CRC32)"
+    hit = lookup(args.crc32, args.system, force=args.refresh,
+                 description=not args.no_description)
+    hit["source"] = LIBRETRO_RAW + "metadat/ (no-intro, publisher, developer, releaseyear DATs, by CRC32)"
     text = json.dumps(hit, indent=2)
     if args.json_out:
         Path(args.json_out).write_text(text + "\n", encoding="utf-8")
     print(text)
-    return 0 if any(k in hit for k in ("publisher", "developer", "year")) else 1
+    return 0 if any(k in hit for k in ("name", "publisher", "developer", "year")) else 1
 
 
 if __name__ == "__main__":

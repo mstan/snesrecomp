@@ -109,16 +109,28 @@ wrong.
 
 The title is not asked: the probe names the project from the cartridge
 header, then the filename (`Super Metroid`), and the folder and CMake name
-follow (`SuperMetroidSNESRecomp`); `--name` overrides it. One question,
-"Fetch boxart and metadata", covers the launcher's boxart (libretro
-Named_Boxarts, `fetch_boxart.py`) and the README's publisher, developer and
-year (libretro-database's per-system DATs keyed by the ROM's CRC32,
-`fetch_metadata.py`). What the fetch cannot supply -- libretro carries no
-marketing descriptions -- is asked afterwards, and only that. Scripted runs
-stay offline unless `--fetch-boxart` says otherwise. When no boxart was
-fetched, the wizard says where to put your own:
-`launcher_assets/img/boxart.tga` (32-bit TGA, staged beside the executable on
-the next build) and an optional `boxart.png` for the README.
+follow (`SuperMetroidSNESRecomp`); `--name` overrides it.
+
+Everything else keys off the ROM's digest, which the probe computes first,
+never off a guessed title. One question, "Fetch boxart and metadata by the
+ROM's hash", covers:
+
+- the No-Intro name for the dump, publisher, developer and year, from
+  libretro-database's per-system DATs keyed by CRC32 (`fetch_metadata.py`);
+- a short description: Wikipedia's page summary for that title, taken only
+  when the page is a plain article about a game. It is CC BY-SA, and the
+  README attributes it with the page URL;
+- the launcher's boxart from libretro Named_Boxarts under that exact
+  No-Intro name, falling back to filename and title guesses
+  (`fetch_boxart.py`).
+
+Whatever the hash cannot be matched to is asked for instead, and only that:
+a missing description, publisher or year becomes a prompt, and on a
+terminal an unmatched boxart becomes a prompt for the path to your own
+`.png` or `.tga`, which is converted and installed. Scripted runs stay
+offline unless `--fetch-boxart` says otherwise, and print where custom art
+goes: `launcher_assets/img/boxart.tga` (32-bit TGA, staged beside the
+executable on the next build) plus an optional `boxart.png` for the README.
 
 ## Pieces
 

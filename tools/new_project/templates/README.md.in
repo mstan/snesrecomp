@@ -5,6 +5,8 @@ A native recompilation of **@DISPLAY_NAME@** (@REGION@), built on
 
 @DESCRIPTION@
 
+@DESCRIPTION_SOURCE@
+
 > **You must legally own a copy of the game.** No ROM data is distributed with
 > this project, in the repository or in any release. The recompiled C is
 > generated locally from your own copy and is never committed.

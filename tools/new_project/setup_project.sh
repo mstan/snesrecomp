@@ -375,29 +375,43 @@ if [ -z "$ZIP_PREFIX" ]; then
     fi
 fi
 
-# "Fetch boxart and metadata": one question covers the launcher's boxart
-# (libretro Named_Boxarts, fetched into the project below) and the README's
-# publisher / developer / year (libretro-database, keyed by the ROM's CRC32,
-# fetched now so the rendered files carry them). Both need the network, so a
-# non-interactive run stays offline unless --fetch-boxart says otherwise.
-# What the fetch does not supply -- libretro has no marketing descriptions --
-# is asked afterwards, and only then.
+# "Fetch boxart and metadata": everything keys off the ROM's digest, which
+# the probe computed above, never off a guessed title. One question covers
+# the launcher's boxart (libretro Named_Boxarts, under the No-Intro name the
+# CRC32 resolves to, fetched into the project below) and the README's
+# publisher / developer / year (libretro-database, by CRC32) and description
+# (Wikipedia's summary for that title, CC BY-SA, attributed in the README).
+# Both need the network, so a non-interactive run stays offline unless
+# --fetch-boxart says otherwise. Whatever the hash cannot be matched to is
+# asked for afterwards, and only that.
 if [ "$SET_BOXART" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-    prompt_yn "Fetch boxart and metadata from libretro? (needs the network)" FETCH_BOXART 1
+    prompt_yn "Fetch boxart and metadata by the ROM's hash? (needs the network)" FETCH_BOXART 1
 fi
-DEVELOPER=""
+DEVELOPER=""; NOINTRO_NAME=""; DESCRIPTION_SOURCE=""
 if [ "$FETCH_BOXART" -eq 1 ]; then
-    echo "== Fetching metadata (libretro-database, crc32 $ROM_CRC32) =="
+    echo "== Fetching metadata (crc32 $ROM_CRC32: libretro-database, then Wikipedia) =="
     META_JSON=$(mktemp)
     if "$PYTHON" "$SCRIPT_DIR/fetch_metadata.py" --crc32 "$ROM_CRC32" \
             --json-out "$META_JSON" >/dev/null 2>&1; then
         meta_get() { "$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$META_JSON" "$1"; }
+        NOINTRO_NAME=$(meta_get nointro_name)
         [ -n "$PUBLISHER" ] || PUBLISHER=$(meta_get publisher)
         [ -n "$YEAR" ] || YEAR=$(meta_get year)
         DEVELOPER=$(meta_get developer)
+        if [ -z "$DESCRIPTION" ]; then
+            DESCRIPTION=$(meta_get description)
+            [ -z "$DESCRIPTION" ] || DESCRIPTION_SOURCE=$(meta_get description_source)
+        fi
+        echo "  matched:   ${NOINTRO_NAME:-(no No-Intro entry for this dump)}"
         echo "  publisher: ${PUBLISHER:--}  developer: ${DEVELOPER:--}  year: ${YEAR:--}"
+        if [ -n "$DESCRIPTION_SOURCE" ]; then
+            echo "  description: $(printf '%s' "$DESCRIPTION" | cut -c1-96)..."
+            echo "               ($DESCRIPTION_SOURCE)"
+        else
+            echo "  description: none found -- asked below"
+        fi
     else
-        echo "  no libretro-database entry for this ROM (crc32 $ROM_CRC32)"
+        echo "  no libretro-database entry for crc32 $ROM_CRC32 -- metadata is asked below"
     fi
     rm -f "$META_JSON"
 fi
@@ -545,6 +559,9 @@ DEVELOPER_DISP=${DEVELOPER:-—}
 YEAR_DISP=${YEAR:-—}
 DESCRIPTION_MD="$DESCRIPTION"
 [ -n "$DESCRIPTION_MD" ] || DESCRIPTION_MD="_Add a short description here._"
+# A fetched description is Wikipedia's text (CC BY-SA); the README says so.
+DESCRIPTION_SOURCE_MD=""
+[ -z "$DESCRIPTION_SOURCE" ] || DESCRIPTION_SOURCE_MD="_Description from [Wikipedia]($DESCRIPTION_SOURCE), CC BY-SA 4.0._"
 
 echo "== New SNES project =="
 echo "  repo:       $ROOT"
@@ -674,6 +691,7 @@ fill() {
         --set "MULTITAP_BLOCK=$MULTITAP_BLOCK" \
         --set "SETUP_DATE=$SETUP_DATE" \
         --set "DESCRIPTION=$DESCRIPTION_MD" \
+        --set "DESCRIPTION_SOURCE=$DESCRIPTION_SOURCE_MD" \
         --set "PUBLISHER=$PUBLISHER_DISP" \
         --set "DEVELOPER=$DEVELOPER_DISP" \
         --set "YEAR=$YEAR_DISP" \
@@ -753,13 +771,27 @@ if [ "$FETCH_BOXART" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     # — CMake already carries the BOXART argument and stages the file the
     # moment it exists.
     ROM_STEM=${ROM_FILE%.*}
-    if "$PYTHON" "$SCRIPT_DIR/fetch_boxart.py" \
-        --out "$ROOT/launcher_assets/img/boxart.tga" \
-        --cue-stem "$ROM_STEM" \
-        --display-name "$NAME"; then
+    # The No-Intro name the CRC32 resolved to goes first: thumbnails are
+    # filed under exactly that. The filename and title are the fallback.
+    set -- --out "$ROOT/launcher_assets/img/boxart.tga" \
+           --cue-stem "$ROM_STEM" --display-name "$NAME"
+    [ -z "$NOINTRO_NAME" ] || set -- "$@" --name "$NOINTRO_NAME"
+    if "$PYTHON" "$SCRIPT_DIR/fetch_boxart.py" "$@"; then
         :
+    elif [ "$INTERACTIVE" -eq 1 ]; then
+        # Not matched by the hash: ask for the author's own art instead.
+        echo "  No libretro boxart matched this dump (crc32 $ROM_CRC32)."
+        BOXART_FILE=""
+        prompt_line "Path to your own boxart (.png or .tga; empty = none for now)" BOXART_FILE ""
+        if [ -n "$BOXART_FILE" ]; then
+            "$PYTHON" "$SCRIPT_DIR/fetch_boxart.py" \
+                --out "$ROOT/launcher_assets/img/boxart.tga" \
+                --from-file "$BOXART_FILE" || boxart_advice
+        else
+            boxart_advice
+        fi
     else
-        echo "warning: boxart fetch failed." >&2
+        echo "warning: no libretro boxart matched this dump." >&2
         boxart_advice
     fi
 elif [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
