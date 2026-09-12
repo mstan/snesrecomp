@@ -86,9 +86,16 @@ static void bridge_apu_flush(CpuState *cpu) {
      * sync already advance the SPC to the exact absolute timestamp. */
     if (interp_bridge_use_absolute_apu_timeline(
             rtl_apu_frame_timeline_active(),
-            g_snes && cart_has_sa1(g_snes->cart))) {
+            g_snes && cart_has_sa1(g_snes->cart),
+            rtl_apu_extended_frame_timing() &&
+            g_snes && g_snes->apu && g_snes->apu->portTimeValid)) {
         s_apu_pending_master = 0;
         g_apu_last_sync_master = cpu->master_cycles;
+        if (rtl_apu_extended_frame_timing()) {
+            RtlApuLock();
+            rtl_sync_apu_to_cpu_locked();
+            RtlApuUnlock();
+        }
         return;
     }
     RtlApuLock();
@@ -385,6 +392,25 @@ static int      s_interp_bounce_owner_depth = 0;
  * to a compiled ancestor, not to this interpreter's guest call chain. */
 static uint16_t s_interp_owner_exit_s = 0;
 static int      s_interp_owner_exit_valid = 0;
+/* A scheduler / whole-program frame (yield_pc != 0) has no exit boundary:
+ * it entered at whatever S the previous frame yielded from — typically deep
+ * inside a wait-for-vblank routine — and its guest program legitimately
+ * returns above that S on every frame.  Its s_exit is a resume point, not a
+ * compiled-ancestor boundary, so "S crossed above the watermark" proves
+ * nothing there.  (SM: LoadInitialMenuTiles JSR WaitForNMI at the same depth
+ * it later JSLs SetupDmaTransfer; the inline-argument rewritten return sat
+ * 4 bytes above the frame's entry S and was mis-classified as a compiled
+ * ancestor's, producing a SKIP_1 that abandoned the live frame.) */
+static int      s_interp_owner_is_scheduler = 0;
+
+/* Has a post-return S crossed above the owning interpreter frame's exit
+ * watermark into a compiled ancestor?  Never for a scheduler-owned frame. */
+static int interp_owner_crossed(uint16_t post_s) {
+    if (!s_interp_owner_exit_valid || s_interp_owner_is_scheduler)
+        return 0;
+    const uint16_t d = (uint16_t)(post_s - s_interp_owner_exit_s);
+    return d != 0 && d < 0x8000u;
+}
 /* Recomp-stack depth immediately before any interpreter frame bounces into a
  * paired AOT root. A rewritten return in that root belongs directly to the
  * interpreter; one reached below that root belongs to a compiled ancestor
@@ -639,8 +665,7 @@ int interp_bridge_return_targets_owner(uint16 ret_s, uint16 post_s) {
     if (root_delta == 0 || root_delta >= 0x8000u)
         return 0;
 
-    const uint16 owner_delta = (uint16)(post_s - s_interp_owner_exit_s);
-    return owner_delta == 0 || owner_delta >= 0x8000u;
+    return !interp_owner_crossed(post_s);
 }
 
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
@@ -1027,6 +1052,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                 (unsigned)_le->pc, _le->op);
                     }
                     fputc('\n', stderr);
+                    /* The 64-entry local window above is often all padding
+                     * bytes ($FF) by the time the tripwire fires; the always-on
+                     * global ring still holds the frames that led here. */
+                    if (s_low_exec_reports == 1)
+                        interp_bridge_dump_recent_steps(8192, stderr);
                 }
             }
         }
@@ -1358,9 +1388,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             {
                 /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
                  * convert on APU-port access / ~4096 master / exits. */
-                if (!interp_bridge_use_absolute_apu_timeline(
+                if (rtl_apu_extended_frame_timing() ||
+                    !interp_bridge_use_absolute_apu_timeline(
                         rtl_apu_frame_timeline_active(),
-                        g_snes && cart_has_sa1(g_snes->cart))) {
+                        g_snes && cart_has_sa1(g_snes->cart), false)) {
                     s_apu_pending_master += _master;
                     if (s_apu_pending_master >= 4096) bridge_apu_flush(cpu);
                 }
@@ -1563,20 +1594,32 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                      * interpreter's watermark, belongs to an ancestor outside
                      * this interpreter frame. Preserve that non-local return
                      * instead of resuming at ret. */
-                    const uint16_t _owner_delta =
-                        (uint16_t)(in.sp - s_enter);
                     const int _skip_crossed_owner =
-                        _owner_delta != 0 && _owner_delta < 0x8000u;
+                        interp_owner_crossed(in.sp);
                     if (_air != RECOMP_RETURN_SKIP_1 ||
                         _skip_crossed_owner) {
                         if (yield_pc) {
+                            /* No ancestor outside a scheduler frame can
+                             * consume a multi-level skip.  Reporting the
+                             * frame as complete would resume the next frame
+                             * at a stale PC over a half-unwound stack (the
+                             * $5C0080 / InvalidInterrupt_Crash signature);
+                             * bail contained instead. */
                             static int s_ynlr_logged = 0;
                             if (s_ynlr_logged < 8) {
                                 s_ynlr_logged++;
                                 fprintf(stderr, "[interp_bridge] yield-mode NLR "
-                                        "exit (non-unwind) _air=%d target=$%06X\n",
-                                        (int)_air, (unsigned)target);
+                                        "exit (non-unwind) _air=%d target=$%06X "
+                                        "frame=%d site=$%06X sp_pre=$%04X "
+                                        "sp=$%04X s_enter=$%04X — contained bail\n",
+                                        (int)_air, (unsigned)target,
+                                        snes_frame_counter, (unsigned)pc_before,
+                                        (unsigned)_sp_pre, (unsigned)in.sp,
+                                        (unsigned)s_enter);
                             }
+                            sync_interp_to_cpu(&in, cpu);
+                            bridge_apu_flush(cpu);
+                            return 0;
                         }
                         sync_interp_to_cpu(&in, cpu);
                         /* A nested non-scheduler tier run belongs to a compiled
@@ -1729,8 +1772,10 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     if (yield_pc) s_lle_sched_depth++;
     const uint16_t _saved_owner_exit_s = s_interp_owner_exit_s;
     const int _saved_owner_exit_valid = s_interp_owner_exit_valid;
+    const int _saved_owner_is_scheduler = s_interp_owner_is_scheduler;
     s_interp_owner_exit_s = s_exit;
     s_interp_owner_exit_valid = 1;
+    s_interp_owner_is_scheduler = yield_pc != 0;
     s_interp_bridge_depth++;
     /* Attribution scope (see interp_scope_name above). Saved/restored rather
      * than assumed clean: a bounce chain re-enters this wrapper with an AOT
@@ -1749,6 +1794,7 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     s_interp_bridge_depth--;
     s_interp_owner_exit_s = _saved_owner_exit_s;
     s_interp_owner_exit_valid = _saved_owner_exit_valid;
+    s_interp_owner_is_scheduler = _saved_owner_is_scheduler;
     if (yield_pc) {
         s_lle_sched_depth--;
         /* A pending yield unwind must have been consumed by this frame's
@@ -2265,12 +2311,9 @@ RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
         /* If S crossed above this interpreter's entry watermark, the rewrite
          * landed in a compiled ancestor. Let the nested tier below consume
          * that ancestor continuation and return the matching SKIP_N. */
-        const uint16_t owner_delta =
-            (uint16_t)(cpu->S - s_interp_owner_exit_s);
         const int crossed_into_compiled_ancestor =
             s_interp_bounce_recomp_base > 0 &&
-            s_interp_owner_exit_valid &&
-            owner_delta != 0 && owner_delta < 0x8000u;
+            interp_owner_crossed(cpu->S);
         if (!crossed_into_compiled_ancestor)
             return interp_bridge_lle_yield_unwind(cpu, target_pc24);
     }

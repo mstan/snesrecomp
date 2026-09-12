@@ -1,4 +1,5 @@
 #include "common_rtl.h"
+#include "apu_frame_clock.h"
 #include "common_cpu_infra.h"
 #include <setjmp.h>
 #include <time.h>
@@ -142,13 +143,32 @@ uint64_t g_apu_last_sync_master = 0;
  * 357368 SNES master cycles and 17088 SPC cycles in this runtime's 60 Hz
  * model. g_cpu.master_cycles supplies only the within-frame position because
  * its total per frame varies with recompilation coverage. */
-#define RTL_MASTER_CYCLES_PER_FRAME 357368ull
-#define RTL_APU_CYCLES_PER_FRAME     17088ull
 static uint64_t g_apu_frame_start_master;
+/* A host iteration may span many hardware frames (an NMI-disabled loader).
+ * This carries the guest timestamp across them so the SPC is paced by guest
+ * time actually executed rather than by host frame count; the cycle constants
+ * live with it in apu_frame_clock.h. */
+static RtlApuFrameClock g_apu_frame_clock;
+/* Host opt-in, set once before the first frame. Not rollback state: it is a
+ * property of the host, not of the timeline being rewound. */
+static bool g_extended_frame_timing;
 static bool g_apu_frame_time_valid;
 
 bool rtl_apu_frame_timeline_active(void) {
   return g_apu_frame_time_valid;
+}
+
+double RtlLastFramePeriods(void) {
+  return g_extended_frame_timing && g_apu_frame_clock.last_duration
+      ? (double)g_apu_frame_clock.last_duration / RTL_APU_CYCLES_PER_FRAME : 1.0;
+}
+
+void RtlEnableExtendedFrameTiming(void) {
+  g_extended_frame_timing = true;
+}
+
+bool rtl_apu_extended_frame_timing(void) {
+  return g_extended_frame_timing;
 }
 
 /* Fast-forward advances the real SPC/DSP state faster than the host device can
@@ -166,6 +186,8 @@ static int16 g_audio_last_output_r;
 static void rtl_sync_apu_frame_boundary(void);
 
 static uint64_t rtl_apu_guest_cycle(void) {
+  if (g_extended_frame_timing)
+    return rtl_apu_clock_now(&g_apu_frame_clock, g_cpu.master_cycles);
   uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
   /* `within` is deliberately NOT clamped to one frame.
    *
@@ -304,6 +326,7 @@ static void memory_sli_func(SaveLoadInfo *sli, void *data, size_t n) {
 void rtl_reset_host_pacing(void) {
   snes_frame_counter = 0;
   g_apu_frame_time_valid = false;
+  g_apu_frame_clock = (RtlApuFrameClock){0};
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_main_cpu_cycles_estimate = 0;
   g_apu_pace_cycles_estimate = 0;
@@ -607,6 +630,7 @@ bool RtlRunFrame(uint32 inputs) {
    * duration. */
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_apu_frame_time_valid = true;
+  rtl_apu_clock_begin(&g_apu_frame_clock, g_cpu.master_cycles);
   WatchdogFrameStart();
   // Watchdog guard: WatchdogCheck() (called per-block in v2 gen) longjmps
   // here when a frame exceeds 5s, so an infinite loop in recompiled code
@@ -845,7 +869,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
  */
 
 #define RTL_RB_RESIDUE_MAGIC 0x53524252u /* 'RBRS' */
-#define RTL_RB_RESIDUE_VERSION 6u
+#define RTL_RB_RESIDUE_VERSION 7u
 
 typedef struct RtlRollbackResidue {
   uint32 magic;
@@ -885,6 +909,11 @@ typedef struct RtlRollbackResidue {
   /* v4: the DRAM refresh tax's carry. See snes_refresh_state_get. */
   uint64_t refresh_phase;
   uint64_t refresh_charged_upto;
+  /* v7: the carried APU frame clock (apu_frame_clock.h). Only live when the
+   * host opted into extended frame timing, but captured unconditionally —
+   * a residue whose contents depend on a host mode is a residue nobody can
+   * reason about. */
+  RtlApuFrameClock apu_frame_clock;
   /* v5: Dma.hdmaPendingInit -- the set of channels the CPU switched on this
    * frame that still owe their one-slot HDMA table initialization.
    *
@@ -929,24 +958,33 @@ size_t RtlRollbackSnapshotBound(void) {
  * branches on what it reads. */
 static void rtl_apu_pace_resync_get(uint64_t *pace, uint64_t *last_sync,
                                     uint64_t *last_master, uint64_t *frame_start,
-                                    uint64_t *main_cycles, uint8 *time_valid) {
+                                    uint64_t *main_cycles, uint8 *time_valid,
+                                    RtlApuFrameClock *frame_clock) {
   *pace = g_apu_pace_cycles_estimate;
   *last_sync = g_apu_last_sync_cycles;
   *last_master = g_apu_last_sync_master;
   *frame_start = g_apu_frame_start_master;
   *main_cycles = g_main_cpu_cycles_estimate;
   *time_valid = g_apu_frame_time_valid ? 1u : 0u;
+  /* The carried guest clock is frame-path state, so a rollback that left it
+   * on the discarded timeline would pace the SPC from a start_guest that
+   * never happened — the same class of divergence g_memsel caused (v3).
+   * g_extended_frame_timing is deliberately NOT here: it is the host's
+   * standing opt-in, identical on both timelines. */
+  *frame_clock = g_apu_frame_clock;
 }
 
 static void rtl_apu_pace_resync_set(uint64_t pace, uint64_t last_sync,
                                     uint64_t last_master, uint64_t frame_start,
-                                    uint64_t main_cycles, uint8 time_valid) {
+                                    uint64_t main_cycles, uint8 time_valid,
+                                    const RtlApuFrameClock *frame_clock) {
   g_apu_pace_cycles_estimate = pace;
   g_apu_last_sync_cycles = last_sync;
   g_apu_last_sync_master = last_master;
   g_apu_frame_start_master = frame_start;
   g_main_cpu_cycles_estimate = main_cycles;
   g_apu_frame_time_valid = time_valid != 0;
+  g_apu_frame_clock = *frame_clock;
 }
 
 /* MMIO shadows: guest hardware state that happens to live in host globals
@@ -997,7 +1035,8 @@ static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
                           &r->apu_last_sync_cycles, &r->apu_last_sync_master,
                           &r->apu_frame_start_master,
                           &r->main_cpu_cycles_estimate,
-                          &r->apu_frame_time_valid);
+                          &r->apu_frame_time_valid,
+                          &r->apu_frame_clock);
   rtl_mmio_shadow_resync_get(&r->memsel, &r->last_hdmaen,
                              &r->interp_apu_driving);
   snes_refresh_state_get(&r->refresh_phase, &r->refresh_charged_upto);
@@ -1016,7 +1055,8 @@ static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
   snes_frame_counter = r->frame_counter;
   rtl_apu_pace_resync_set(r->apu_pace_cycles_estimate, r->apu_last_sync_cycles,
                           r->apu_last_sync_master, r->apu_frame_start_master,
-                          r->main_cpu_cycles_estimate, r->apu_frame_time_valid);
+                          r->main_cpu_cycles_estimate, r->apu_frame_time_valid,
+                          &r->apu_frame_clock);
   rtl_mmio_shadow_resync_set(r->memsel, r->last_hdmaen,
                              r->interp_apu_driving);
   snes_refresh_state_set(r->refresh_phase, r->refresh_charged_upto);
@@ -1689,8 +1729,9 @@ static void rtl_sync_apu_frame_boundary(void) {
   /* RtlRunFrame has already incremented snes_frame_counter. This is the exact
    * boundary after the completed frame; adding its stale within-frame master
    * offset here would count the frame body twice. */
-  uint64_t boundary = (uint64_t)snes_frame_counter *
-                      RTL_APU_CYCLES_PER_FRAME;
+  uint64_t boundary = g_extended_frame_timing
+      ? rtl_apu_clock_finish(&g_apu_frame_clock, g_cpu.master_cycles)
+      : (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME;
   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
                                     1u << 20);
   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);

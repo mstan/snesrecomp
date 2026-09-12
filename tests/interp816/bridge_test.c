@@ -55,7 +55,11 @@ static Snes g_test_snes;
 Snes *g_snes = &g_test_snes;
 uint64_t g_apu_last_sync_master;
 int g_interp_apu_driving;
-bool rtl_apu_frame_timeline_active(void) { return false; }
+static bool g_frame_timeline, g_extended_frames;
+static unsigned g_absolute_syncs, g_relative_syncs;
+bool rtl_apu_frame_timeline_active(void) { return g_frame_timeline; }
+bool rtl_apu_extended_frame_timing(void) { return g_extended_frames; }
+void rtl_sync_apu_to_cpu_locked(void) { ++g_absolute_syncs; }
 bool sa1_cpu_irq_pending(const Sa1 *sa1) { (void)sa1; return false; }
 int g_recomp_stack_top;
 uint16_t g_cpu_entry_s[64];
@@ -77,16 +81,27 @@ static const char *g_push_log[16];
 static int g_push_count = 0;
 static int g_push_depth = 0;
 static int g_pop_underflow = 0;
+/* Model the real push/pop on g_recomp_stack_top too (common_cpu_infra.c
+ * seeds g_cpu_entry_s[slot] = S at push).  The bridge keys its
+ * "did this rewritten return cross into a compiled ancestor" decision on
+ * s_interp_bounce_recomp_base = g_recomp_stack_top at bounce time; with a
+ * stub that never advanced the top, that whole branch was untestable. */
+static CpuState g_c;
 void RecompStackPush(const char *name) {
     if (g_push_count < 16) g_push_log[g_push_count] = name;
     g_push_count++;
     g_push_depth++;
+    if (g_recomp_stack_top < 64) {
+        g_cpu_entry_s[g_recomp_stack_top] = g_c.S;
+        g_recomp_stack_top++;
+    }
 }
 void RecompStackPop(void) {
     if (g_push_depth <= 0) g_pop_underflow = 1;
     g_push_depth--;
+    if (g_recomp_stack_top > 0) g_recomp_stack_top--;
 }
-void snes_catchupApu(Snes *snes) { (void)snes; }
+void snes_catchupApu(Snes *snes) { (void)snes; ++g_relative_syncs; }
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
     (void)snes; (void)master_clock;
 }
@@ -327,14 +342,43 @@ int main(void) {
     RAM = malloc(MEMSZ);
 
     printf("S0 APU timeline policy remains cartridge-scoped\n");
-    CHECK(!interp_bridge_use_absolute_apu_timeline(false, false),
+    CHECK(!interp_bridge_use_absolute_apu_timeline(false, false, false),
           "inactive non-SA1 timeline must use legacy catch-up");
-    CHECK(!interp_bridge_use_absolute_apu_timeline(true, false),
+    CHECK(!interp_bridge_use_absolute_apu_timeline(true, false, false),
           "active non-SA1 timeline must use legacy catch-up");
-    CHECK(!interp_bridge_use_absolute_apu_timeline(false, true),
+    CHECK(!interp_bridge_use_absolute_apu_timeline(false, true, false),
           "inactive SA1 timeline must use legacy catch-up");
-    CHECK(interp_bridge_use_absolute_apu_timeline(true, true),
+    CHECK(interp_bridge_use_absolute_apu_timeline(true, true, false),
           "active SA1 timeline must suppress duplicate catch-up");
+    CHECK(interp_bridge_use_absolute_apu_timeline(true, false, true),
+          "mapped extended frames must suppress duplicate catch-up");
+    CHECK(!interp_bridge_use_absolute_apu_timeline(false, false, true),
+          "mapped time before the frame loop must retain bootstrap catch-up");
+
+    /* No APU port touches: long interpreted work must periodically sync the
+     * absolute clock, while unmapped boot still uses relative catch-up. */
+    { Apu apu = {0};
+      g_test_snes.apu = &apu;
+      g_frame_timeline = true;
+      for (unsigned mode = 0; mode < 3; ++mode) {
+        memset(RAM, 0, MEMSZ); init_cpu();
+        uint8_t c[] = {0xA2,0xFF,0xCA,0xD0,0xFD,0x60};
+        load(0x8000, c, sizeof c);
+        cpu_push_jsr_return_frame(&g_c);
+        g_extended_frames = mode != 0;
+        apu.portTimeValid = mode == 2;
+        g_absolute_syncs = g_relative_syncs = 0;
+        CHECK(interp_bridge_run(&g_c, 0x008000) == 1, "timed loop returns");
+        if (mode == 2)
+          CHECK(g_absolute_syncs > 1 && g_relative_syncs == 0,
+                "mapped work syncs repeatedly without double-driving SPC");
+        else
+          CHECK(g_relative_syncs > 1 && g_absolute_syncs == 0,
+                "legacy and unmapped boot retain relative progress");
+      }
+      g_test_snes.apu = NULL;
+      g_frame_timeline = g_extended_frames = false;
+    }
 
     /* S1: LDA #$01 ; JSR $8100 (compiled) ; RTS */
     { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
@@ -584,6 +628,47 @@ int main(void) {
       CHECK((g_c.A & 0xFF) == 0x5A,
             "A.lo=%02X exp 5A (rewritten continuation executed)", g_c.A & 0xFF);
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (bounce frame consumed once)", g_c.S);
+      g_aot_rewrites_return = 0; }
+
+    /* S8d: the scheduler frame resumes DEEP — inside a wait routine's
+     * epilogue (WaitForNMI shape), i.e. below the S its caller runs at.  The
+     * caller returns to, then JSLs an AOT callee that rewrites its return
+     * (inline arguments) from a shallower S than the frame's entry S.  That
+     * entry S is a resume point, not a compiled-ancestor boundary, so the
+     * rewritten continuation must still come back to this interpreter.  It
+     * was mis-classified as "crossed into a compiled ancestor", run nested,
+     * and surfaced as SKIP_1 that abandoned the live frame.  Super Metroid
+     * file select: FileSelectMenu_0_FadeOutConfigGfx -> (JSR) WaitForNMI
+     * -> LoadInitialMenuTiles -> JSL SetupDmaTransfer(+8 inline bytes). */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_rewrites_return = 1;
+      uint8_t wait_epilogue[] = {0x60};          /* $8300: RTS (frame entry) */
+      uint8_t caller[] = {
+          0x20,0x00,0x83,                        /* $8000: JSR $8300 (already in progress) */
+          0x22,0x00,0x81,0x00,                   /* $8003: JSL fake AOT (rewrites return) */
+          0xA9,0xEE                              /* $8007: must NOT execute */
+      };
+      uint8_t continuation[] = {
+          0xA9,0x5A,                             /* $8200: rewritten landing */
+          0xAD,0x20,0x00, 0xD0,0xFB             /* $8202: scheduler yield loop */
+      };
+      load(0x8000, caller, sizeof caller);
+      load(0x8200, continuation, sizeof continuation);
+      load(0x8300, wait_epilogue, sizeof wait_epilogue);
+      RAM[0x20] = 0;
+      /* The previous frame yielded inside $8300's callee frame: JSR $8300's
+       * return address ($8002) sits on the stack and S is below the caller. */
+      RAM[0x1FF] = 0x80; RAM[0x1FE] = 0x02; g_c.S = 0x01FD;
+      int rc = interp_bridge_run_loop(&g_c, 0x008300, 0x008202, 0x0020, 0);
+      printf("S8d scheduler frame resumed below its caller keeps a rewritten return\n");
+      CHECK(rc == 1, "rc=%d exp 1 (frame yields, not bail)", rc);
+      CHECK(g_aot_called == 1, "aot_called=%d exp 1", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x5A,
+            "A.lo=%02X exp 5A (rewritten continuation executed in owner)", g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (JSL frame consumed once)", g_c.S);
+      CHECK(interp_bridge_lle_resume_pc() == 0x008202,
+            "resume=$%06X exp $008202 (yield loop)",
+            (unsigned)interp_bridge_lle_resume_pc());
       g_aot_rewrites_return = 0; }
 
     /* S8b: an AOT root reached from the LLE scheduler can non-locally return
