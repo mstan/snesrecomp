@@ -54,6 +54,8 @@ void cart_reset(Cart* cart) {
 
 void cart_saveload(Cart *cart, SaveLoadInfo *sli) {
   sli->func(sli, cart->ram, cart->ramSize);
+  if (cart->superfx && snes_saveload_get_version() >= 9)
+    superfx_saveload(cart->superfx, sli);
   /* Cx4 games have no battery RAM, so the block above streams nothing; the
    * coprocessor's own 8 KB of working RAM is the guest-visible state that a
    * mid-game state must carry. */

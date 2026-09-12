@@ -8,6 +8,8 @@
  * not include ares framework code.
  */
 #include "superfx.h"
+#include "saveload.h"
+#include <stddef.h>
 
 #include <limits.h>
 #include <stdio.h>
@@ -15,6 +17,14 @@
 #include <string.h>
 
 enum { kSuperFxWsMaxExtra = 288, kSuperFxWsMaxWidth = 800 };
+
+void superfx_saveload(SuperFx *fx, SaveLoadInfo *sli) {
+  /* ROM/RAM pointers precede r; diagnostics and private presentation replay
+   * follow irq_pending. Neither belongs to the emulated GSU state. */
+  _Static_assert(offsetof(SuperFx, instruction_count) - offsetof(SuperFx, r) == 696,
+                 "Super FX state layout changed: bump RTL_SAV_VERSION");
+  sli->func(sli, &fx->r, 696);
+}
 
 typedef struct SuperFxPresentationReplay {
   SuperFx clone;

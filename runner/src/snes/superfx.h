@@ -113,6 +113,9 @@ SuperFx *superfx_create(uint8_t *rom, uint32_t rom_size,
                         uint8_t *ram, uint32_t ram_size);
 void superfx_destroy(SuperFx *fx);
 void superfx_reset(SuperFx *fx);
+struct SaveLoadInfo;
+/* RTLS v9+: architectural state only. Cartridge RAM is streamed by cart. */
+void superfx_saveload(SuperFx *fx, struct SaveLoadInfo *sli);
 
 /* Synchronize to the S-CPU's monotonically increasing SNES master clock. */
 void superfx_sync(SuperFx *fx, uint64_t master_clock);

@@ -138,6 +138,9 @@ typedef struct RtlGameInfo {
    * release runs do not create tier2_*.json/jsonl artifacts. Developers can
    * still opt in at launch with SNESRECOMP_TIER2_CAPTURE=1. */
   int tier2_capture;
+  /* Zero uses the framework minimum. A title can reject formats which
+   * predate required coprocessor or execution-state data before loading. */
+  uint32_t minimum_state_version;
 } RtlGameInfo;
 
 extern const RtlGameInfo *g_rtl_game_info;

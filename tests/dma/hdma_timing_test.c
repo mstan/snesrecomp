@@ -174,6 +174,30 @@ int main(void) {
     failures += check(dma->channel[0].tableAdr == 0x0203, "external beam owner consumed terminator");
     failures += check(dma->channel[0].hdmaActive, "external beam owner preserves HDMAEN state");
 
+    /* A masked, pending IRQ must not freeze beam polling (Star Fox boot
+     * waits for a later raster position before unmasking interrupts). */
+    dma_reset(dma);
+    snes.hPos = 100;
+    snes.vPos = 10;
+    snes.inIrq = true;
+    snes.hIrqEnabled = snes.vIrqEnabled = false;
+    snes_advance_master_cycles(&snes, 200);
+    failures += check(snes.hPos == 300 && snes.vPos == 10,
+                      "pending IRQ still allows beam progress");
+    failures += check(snes.inIrq, "beam advance does not acknowledge pending IRQ");
+
+    /* A NEW IRQ still yields at the comparator edge so hosts can service
+     * it promptly, before clocks after that edge have been consumed. */
+    snes.inIrq = false;
+    snes.hIrqEnabled = true;
+    snes.hTimer = 100;
+    snes_advance_master_cycles(&snes, 200);
+    failures += check(snes.inIrq && snes.hPos == 401,
+                      "new IRQ stops at its comparator edge");
+    snes_advance_master_cycles(&snes, 50);
+    failures += check(snes.hPos == 451,
+                      "subsequent clocks advance while IRQ remains pending");
+
     dma_free(dma);
     if (failures) return 1;
     puts("hdma_timing_test: ok");

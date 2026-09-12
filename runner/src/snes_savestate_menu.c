@@ -366,8 +366,14 @@ static void menu_move(int delta)
 
 static void menu_submit(int save)
 {
+    char path[256];
+    RtlEnsureSaveDir();
+    slot_path(s_selected, path, sizeof(path));
     if (save) {
-        RtlSaveLoad(kSaveLoad_Save, s_selected);
+        if (!RtlSaveSnapshot(path)) {
+            set_status("SAVE FAILED: SLOT %02d", s_selected);
+            return;
+        }
         if (s_have_live_thumb)
             write_thumb(s_selected, s_live_thumb);
         refresh_thumbs();
@@ -387,7 +393,10 @@ static void menu_submit(int save)
         snes_osd_push_slot_empty(s_selected);
         return;
     }
-    RtlSaveLoad(kSaveLoad_Load, s_selected);
+    if (!RtlLoadSnapshot(path)) {
+        set_status("LOAD FAILED: SLOT %02d", s_selected);
+        return;
+    }
     /* A load CLOSES the menu, so set_status() here would draw one frame of a
      * panel that is already gone. The toast outlives the menu, which is why
      * the load path needs it more than the save path does. */

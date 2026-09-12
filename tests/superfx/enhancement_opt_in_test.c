@@ -7,6 +7,22 @@
 #include <string.h>
 
 #include "snes/superfx.h"
+#include "snes/saveload.h"
+
+typedef struct StateSink {
+  SaveLoadInfo base;
+  uint8_t bytes[1024];
+  size_t size;
+  int load;
+} StateSink;
+
+static void transfer_state(SaveLoadInfo *sli, void *data, size_t size) {
+  StateSink *sink = (StateSink *)sli;
+  if (size > sizeof(sink->bytes)) abort();
+  if (sink->load) memcpy(data, sink->bytes, size);
+  else memcpy(sink->bytes, data, size);
+  sink->size = size;
+}
 
 enum { kRomSize = 65536, kRamSize = 65536 };
 
@@ -170,6 +186,21 @@ int main(void) {
         "returning to faithful mode discards all enhanced presentation state");
   check(!superfx_get_widescreen_frame(optin, NULL, NULL, NULL, NULL),
         "faithful mode never exposes an enhanced frame");
+
+  StateSink state = {{transfer_state}, {0}, 0, 0};
+  native->master_clock = 123456;
+  native->clock_credit = -7;
+  native->irq_pending = true;
+  native->cache_valid[3] = true;
+  native->cache[48] = 0xa5;
+  superfx_saveload(native, &state.base);
+  check(state.size == 696, "versioned GSU state has the expected size");
+  state.load = 1;
+  superfx_saveload(optin, &state.base);
+  check(memcmp(&native->r, &optin->r, state.size) == 0,
+        "registers, pipeline, pixel/cache state, IRQ and clocks restore");
+  check(optin->rom == optin_rom && optin->ram == optin_ram,
+        "restore preserves the destination machine's memory pointers");
 
   destroy_fixture(native, native_rom, native_ram);
   destroy_fixture(optin, optin_rom, optin_ram);

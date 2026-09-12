@@ -124,6 +124,7 @@ uint16_t SwapInputBits(uint16_t x);
 bool snes_loadRom(Snes* snes, const uint8_t* data, int length);
 /* Savestate format version for snes_saveload layout (RTLS header). */
 void snes_saveload_set_version(uint32_t version);
+uint32_t snes_saveload_get_version(void);
 void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
 void snes_advance_master_cycles(Snes *snes, uint32_t clocks);
