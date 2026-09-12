@@ -159,7 +159,7 @@ def test_wai_bounce_unwind_pops_generated_diagnostic_frame():
     needle = "return interp_bridge_lle_yield_unwind(cpu, 0x008001u);"
     assert needle in src, src
     before = src[:src.index(needle)]
-    assert before.rstrip().endswith("RecompStackPop();"), src
+    assert before.rstrip().endswith("RecompStackPopYield();"), src
 
 
 def test_function_entry_yields_when_lle_frame_deadline_is_reached():
@@ -172,7 +172,7 @@ def test_function_entry_yields_when_lle_frame_deadline_is_reached():
     assert check in src, src
     assert unwind in src, src
     before = src[:src.index(unwind)]
-    assert before.rstrip().endswith("RecompStackPop();"), src
+    assert before.rstrip().endswith("RecompStackPopYield();"), src
 
 
 def test_cfg_block_yields_at_an_architectural_resume_pc():
@@ -191,7 +191,7 @@ def test_cfg_block_yields_at_an_architectural_resume_pc():
     unwind = "return interp_bridge_lle_yield_unwind(cpu, 0x008004u);"
     assert unwind in src, src
     before = src[:src.index(unwind)]
-    assert before.rstrip().endswith("RecompStackPop();"), src
+    assert before.rstrip().endswith("RecompStackPopYield();"), src
 
 
 if __name__ == '__main__':
