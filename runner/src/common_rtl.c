@@ -2348,6 +2348,18 @@ static bool SimpleHdma_PtrRangeValid(const uint8 *p, size_t length) {
 }
 
 void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc) {
+  /* Calling this IS the declaration that the host walks the HDMA tables in
+   * its own raster loop, so the framework's beam must not walk them too:
+   * every table would be consumed twice per line, once here and once from
+   * snes_advance_beam inside any guest register write that syncs the master
+   * clock. Measured in Super Metroid, that second pass re-ran the Ceres
+   * shaft's BG-mode split from the wrong table entry and drew one frame in
+   * eighty as full-screen garbage. Eight ports drive HDMA this way and none
+   * of them had said so; inferring it here is the fix that reaches all of
+   * them. A host that wants the beam to own HDMA simply does not call this.
+   * Re-asserted per frame, which also survives a save-state load restoring
+   * the Snes struct the flag lives in. */
+  if (g_snes) snes_set_hdma_beam_enabled(g_snes, false);
   if (!dc->hdmaActive) {
     c->table = 0;
     return;
