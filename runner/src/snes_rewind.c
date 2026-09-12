@@ -108,6 +108,10 @@ void snes_rewind_shutdown(void) {
         s_ring = NULL;
     }
     s_count = s_head = s_sel = 0;
+    s_frame_tick = 0;
+    s_blob_size = 0;
+    s_have_live_thumb = 0;
+    s_enabled = 1;
     s_open = 0;
     s_configured = 0;
 }

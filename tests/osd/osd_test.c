@@ -10,7 +10,7 @@
 
 #include "snes_osd.h"
 
-#include <SDL.h>
+#include "desktop/sdl_compat.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -22,14 +22,10 @@ static void check(int ok, const char *what) {
 }
 
 int main(void) {
-    /* SDL_GetTicks / SDL_GetPerformanceCounter need the timer subsystem; no
-     * video, so this runs headless in CI. */
-    if (!SDL_Init(SDL_INIT_TIMER)) {
-        /* SDL2 returns 0 on success, SDL3 returns true — accept either. */
-        if (SDL_Init(SDL_INIT_TIMER) != 0 && SDL_WasInit(SDL_INIT_TIMER) == 0) {
-            printf("SDL_Init failed: %s\n", SDL_GetError());
-            return 1;
-        }
+    /* The clocks work without a video device on both SDL backends. */
+    if (!snesrecomp_sdl_init(0)) {
+        printf("SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
     }
 
     const uint32_t *px = NULL;

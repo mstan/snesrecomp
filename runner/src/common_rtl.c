@@ -307,7 +307,7 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  * v8: multitap chunk (seats, IOBit lines, per-bank shift counters, latched
  *     automatic-read words). Older files load with no multitap configured,
  *     which is the pre-multitap two-pad machine exactly. */
-#define RTL_SAV_VERSION 8u
+#define RTL_SAV_VERSION 9u /* Super FX architectural state in cart_saveload. */
 /* 4 and 5 described a Snes tail layout this struct no longer has; see
  * snes_saveload(). Loading one would mis-map the interrupt fields, so
  * they are rejected by the header check instead. */
@@ -836,7 +836,8 @@ bool RtlLoadSnapshot(const char *filename) {
   uint32 hdr[2];
   if (fread(hdr, sizeof(hdr), 1, f) != 1
       || hdr[0] != RTL_SAV_MAGIC
-      || hdr[1] < RTL_SAV_VERSION_MIN || hdr[1] > RTL_SAV_VERSION) {
+      || hdr[1] < RTL_SAV_VERSION_MIN || hdr[1] > RTL_SAV_VERSION
+      || (g_rtl_game_info && hdr[1] < g_rtl_game_info->minimum_state_version)) {
     printf("Save file %s: bad magic/version (legacy StateRecorder format no longer supported)\n", filename);
     fclose(f);
     return false;
@@ -893,7 +894,8 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   uint32 hdr[2];
   memcpy(hdr, data, sizeof hdr);
   if (hdr[0] != RTL_SAV_MAGIC || hdr[1] < RTL_SAV_VERSION_MIN ||
-      hdr[1] > RTL_SAV_VERSION)
+      hdr[1] > RTL_SAV_VERSION ||
+      (g_rtl_game_info && hdr[1] < g_rtl_game_info->minimum_state_version))
     return false;
 
   MemorySli memory = {

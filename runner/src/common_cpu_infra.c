@@ -761,6 +761,7 @@ void RecompStackBalDumpJson(FILE *f) {
  * complete and (exit_s - entry_s) is a meaningful balance figure.
  * audit == 0: this exit is an LLE yield unwind — see RecompStackPopYield. */
 static void recomp_stack_pop_common(int audit) {
+  (void)audit; /* Only used when stack-balance diagnostics are compiled in. */
 #ifdef SNESRECOMP_INTERP_PROFILE
   if (g_aotprof_on < 0) aotprof_latch_env();
   if (g_aotprof_on == 1) {
@@ -1103,4 +1104,3 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   return g_snes;
 #endif /* SNESRECOMP_SETUP_HOST */
 }
-

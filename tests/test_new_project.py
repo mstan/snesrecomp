@@ -533,8 +533,8 @@ def test_mods_are_built_into_every_project():
         assert "set(SNESRECOMP_ENABLE_MODS ON" in cmake, "loader not enabled"
         assert cmake.index("SNESRECOMP_ENABLE_MODS ON") < cmake.index(
             "runner/runner.cmake)"), "must be set before runner.cmake reads it"
-        assert "snesrecomp_target_stage_dir(FixtureQuestSNESRecomp " \
-               "${CMAKE_SOURCE_DIR}/mods mods)" in cmake, "catalog not staged"
+        assert "snesrecomp_target_mod_catalog(FixtureQuestSNESRecomp " \
+               "${CMAKE_SOURCE_DIR}/mods/preloaded)" in cmake, "catalog not staged"
         assert cmake.count("snesrecomp_codegen_host.c") == 1, \
             "codegen host wired more than once"
 
