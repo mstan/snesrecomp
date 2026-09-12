@@ -576,6 +576,14 @@ void dma_doHdma(Dma* dma) {
   }
 }
 
+uint8_t dma_hdma_pending_init_get(const Dma* dma) {
+  return dma ? dma->hdmaPendingInit : 0u;
+}
+
+void dma_hdma_pending_init_set(Dma* dma, uint8_t mask) {
+  if(dma) dma->hdmaPendingInit = mask;
+}
+
 bool dma_cycle(Dma* dma) {
   if(dma->dmaBusy) {
     dma_doDma(dma);

@@ -119,6 +119,34 @@ void PpuResetWidescreenOamHistory(Ppu *ppu) {
   memset(ppu->wsOamMotionGrace, 0, sizeof(ppu->wsOamMotionGrace));
 }
 
+void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out) {
+  if (!ppu || !out)
+    return;
+  out->oamAdr = ppu->oamAdr;
+  out->oamInHigh = ppu->oamInHigh ? 1u : 0u;
+  out->oamSecondWrite = ppu->oamSecondWrite ? 1u : 0u;
+  out->oamBuffer = ppu->oamBuffer;
+  out->wsOamMotionLastLine = ppu->wsOamMotionLastLine;
+  memcpy(out->wsOamMotionX, ppu->wsOamMotionX, sizeof(out->wsOamMotionX));
+  memcpy(out->wsOamMotionSig, ppu->wsOamMotionSig, sizeof(out->wsOamMotionSig));
+  memcpy(out->wsOamMotionSeen, ppu->wsOamMotionSeen, sizeof(out->wsOamMotionSeen));
+  memcpy(out->wsOamMotionGrace, ppu->wsOamMotionGrace, sizeof(out->wsOamMotionGrace));
+}
+
+void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in) {
+  if (!ppu || !in)
+    return;
+  ppu->oamAdr = in->oamAdr;
+  ppu->oamInHigh = in->oamInHigh != 0u;
+  ppu->oamSecondWrite = in->oamSecondWrite != 0u;
+  ppu->oamBuffer = in->oamBuffer;
+  ppu->wsOamMotionLastLine = in->wsOamMotionLastLine;
+  memcpy(ppu->wsOamMotionX, in->wsOamMotionX, sizeof(in->wsOamMotionX));
+  memcpy(ppu->wsOamMotionSig, in->wsOamMotionSig, sizeof(in->wsOamMotionSig));
+  memcpy(ppu->wsOamMotionSeen, in->wsOamMotionSeen, sizeof(in->wsOamMotionSeen));
+  memcpy(ppu->wsOamMotionGrace, in->wsOamMotionGrace, sizeof(in->wsOamMotionGrace));
+}
+
 // Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
 // (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
 // never affects guest state. Unset/0xff = all layers (normal).

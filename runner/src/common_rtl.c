@@ -19,6 +19,7 @@
 #include "snes/joypad.h"
 #include "snes/dsp.h"
 #include "snes/cart.h"
+#include "snes/dma.h"
 #include "snes/cx4.h"
 #include "snes/sa1.h"
 #include "snes/msu1.h"
@@ -34,6 +35,7 @@
 #include "ppu_dma_trace.h"
 #include "host_report.h"
 #include "cosim.h"
+#include "snes_runahead.h"
 #if defined(SNESRECOMP_NET)
 #include "snes_netplay.h"
 #endif
@@ -123,6 +125,18 @@ static int rtl_netplay_locks_audio(void) {
   if (snes_rb_probe_armed())
     return 1;
 #endif
+  /* Run-ahead is held to it too, and for the identical reason: it rewinds.
+   * The fallback below charges the SPC by WALL-CLOCK elapsed time, and
+   * run-ahead spends roughly twice the wall time per displayed frame because
+   * it simulates every frame twice. That made the SPC run at ~2x guest tempo
+   * -- measured on the attract sequence, which is music-cued and reached the
+   * title screen hundreds of frames early with run-ahead 1. Host time folded
+   * into guest state cannot survive a rewind; once the frame loop is running
+   * rtl_sync_apu_frame_boundary() is the authoritative clock and is keyed on
+   * snes_frame_counter, so suppressing this costs nothing but the no-consumer
+   * boot-window baseline. */
+  if (snes_runahead_active())
+    return 1;
 #if defined(SNESRECOMP_NET)
   return snes_netplay_active();
 #else
@@ -910,7 +924,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
  */
 
 #define RTL_RB_RESIDUE_MAGIC 0x53524252u /* 'RBRS' */
-#define RTL_RB_RESIDUE_VERSION 4u
+#define RTL_RB_RESIDUE_VERSION 6u
 
 typedef struct RtlRollbackResidue {
   uint32 magic;
@@ -950,6 +964,28 @@ typedef struct RtlRollbackResidue {
   /* v4: the DRAM refresh tax's carry. See snes_refresh_state_get. */
   uint64_t refresh_phase;
   uint64_t refresh_charged_upto;
+  /* v5: Dma.hdmaPendingInit -- the set of channels the CPU switched on this
+   * frame that still owe their one-slot HDMA table initialization.
+   *
+   * It sits outside dma_saveload's range on purpose (see dma.h), which is
+   * correct for a savestate and wrong for a rollback: a rollback snapshot is
+   * taken BETWEEN the CPU half of a frame (RtlRunFrame) and the render half
+   * that runs dma_doHdma (draw_ppu_frame), so the mask is live across exactly
+   * the boundary run-ahead rewinds over. Left out, run-ahead's speculative
+   * frame consumed the pending bits, the restore did not put them back, and
+   * the real frame's dma_doHdma then skipped the table init for every channel
+   * the CPU had just enabled -- wrong tableAdr/repCount/doTransfer for the
+   * rest of the frame, i.e. a corrupted raster split. Measured on Gundam
+   * Wing's pre-fight screen, the one dma_doHdma's own comment cites. */
+  uint8    hdma_pending_init;
+  uint8    pad_v5[7];
+  /* v6: the PPU's within-frame state -- the OAM write port (oamAdr,
+   * oamInHigh, oamSecondWrite, oamBuffer) and the widescreen OBJ motion
+   * classifier. Same shape of bug as hdma_pending_init above and found the
+   * same way: ppu_saveload's window stops at cgwsel, which is right for a
+   * frame-boundary savestate (ppu_handleVblank reloads the OAM port from
+   * oamaddl/oamaddh) and wrong for a mid-frame rollback. See ppu.h. */
+  PpuRollbackResidue ppu_rb;
 } RtlRollbackResidue;
 
 size_t RtlRollbackSnapshotBound(void) {
@@ -1046,6 +1082,8 @@ static void rtl_rb_residue_capture(RtlRollbackResidue *r) {
   snes_refresh_state_get(&r->refresh_phase, &r->refresh_charged_upto);
   assert(interp_bridge_rb_state_size() <= sizeof(r->interp));
   interp_bridge_rb_state_save(r->interp);
+  r->hdma_pending_init = dma_hdma_pending_init_get(g_snes->dma);
+  ppu_rb_residue_get(g_snes->ppu, &r->ppu_rb);
 }
 
 static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
@@ -1062,6 +1100,8 @@ static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
                              r->interp_apu_driving);
   snes_refresh_state_set(r->refresh_phase, r->refresh_charged_upto);
   interp_bridge_rb_state_load(r->interp);
+  dma_hdma_pending_init_set(g_snes->dma, r->hdma_pending_init);
+  ppu_rb_residue_set(g_snes->ppu, &r->ppu_rb);
 }
 
 size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {
