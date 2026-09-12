@@ -253,5 +253,4 @@ mod tests {
         assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0xFF, 0xFFFF), 0x3FFFFF);
         assert_eq!(rom_offset(RomMapping::Sdd1ExLoRom, 0x80, 0x8000), 0);
     }
-
 }
