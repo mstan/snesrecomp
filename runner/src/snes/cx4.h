@@ -129,4 +129,8 @@ void cx4_rdrom_index_range(const Cx4 *cx4, uint32_t *lo, uint32_t *hi);
  * which on hardware requires a reset to clear. A loud stuck-state indicator. */
 int cx4_locked(const Cx4 *cx4);
 
+/* Clock extension for execution snapshots. The original RTLS Cx4 payload
+ * predates this anchor; stream it from the versioned title extension. */
+void cx4_saveload_clock(Cx4 *cx4, struct SaveLoadInfo *sli);
+
 #endif /* SNES_CX4_H */

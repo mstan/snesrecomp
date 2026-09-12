@@ -327,6 +327,7 @@ static struct RendererFuncs g_renderer_funcs;
 /* Set by the hotkeys; consumed once in the frame loop. */
 static int g_savestate_menu_hotkey;
 static int g_rewind_hotkey;
+static uint64_t g_state_generation;
 
 /* The last field actually presented, kept so an overlay can freeze the guest
  * and still have something to draw behind itself. Sized like g_my_pixels. */
@@ -338,6 +339,11 @@ static unsigned g_screenshot_frame;
 static GamepadInfo g_gamepad[2];
 
 extern Snes *g_snes;
+
+void snesrecomp_desktop_set_widescreen(int enabled) {
+  g_config.widescreen = enabled != 0;
+  WriteConfigFile(g_active_config_file);
+}
 
 static void GameReset(void) {
   if (g_game->on_reset) g_game->on_reset();
@@ -366,15 +372,19 @@ static void PreparePpuFrame(void) {
   if (fh <= 0 || fh > 240) fh = 224;
   g_snes_width = fw;
   g_snes_height = fh;
-  /* The PPU's own widescreen never activates here. */
-  g_ws_extra = 0;
-  g_ws_active = false;
+  /* Native widescreen ports rasterize directly into the widened field. */
+  g_ws_extra = g_game->native_widescreen ? (fw - 256) / 2 : 0;
+  g_ws_active = g_ws_extra != 0;
   g_new_ppu = (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
   if (g_config.no_sprite_limits)
     g_ppu_render_flags |= kPpuRenderFlags_NoSpriteLimits;
   else
     g_ppu_render_flags &= ~kPpuRenderFlags_NoSpriteLimits;
-  PpuBeginDrawing(g_ppu, g_my_pixels, 256 * 4, 0);
+  uint32 flags = g_game->native_widescreen ? g_ppu_render_flags : 0;
+  if (g_ws_active) flags |= kPpuRenderFlags_NewRenderer;
+  PpuBeginDrawing(g_ppu, g_my_pixels,
+                  (g_game->native_widescreen ? fw : 256) * 4, flags);
+  PpuSetExtraSpace(g_ppu, (uint8)g_ws_extra);
 }
 
 // --- Scripted input ---
@@ -740,6 +750,16 @@ static void CaptureSimulationFrame(unsigned number) {
   if (g_game->end_sim_frame) g_game->end_sim_frame(g_my_pixels, number);
 }
 
+/* Snapshots and their thumbnails share the same completed raster boundary. */
+static void NoteStateFrame(void) {
+  if (g_ppu && g_ppu->renderBuffer) {
+    int width = g_game->native_widescreen ? g_snes_width : 256;
+    snes_savestate_menu_note_frame((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
+    snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
+  }
+  snes_rewind_note_frame();
+}
+
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
   (void)render_flags;
   if (!pixel_buffer) return;
@@ -967,6 +987,8 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
  * bug as F1 through HandleInput. Controller bits still flow, so the panel
  * can be navigated. */
 static bool g_overlay_modal;
+static void SetAudioPaused(bool paused);
+static void ResetAudioTimeline(void);
 
 /* Buttons still held when a panel closed, masked from the guest until each
  * is released. The button that closed the panel must not also act in the
@@ -998,6 +1020,14 @@ static void PumpOverlayEvents(bool *running, void (*key_down)(int key, int repea
       *running = false;
       break;
     case SDL_KEYDOWN:
+      /* The browser consumes SNES control bits too. Dispatch only controls;
+       * slot/reset hotkeys must not change the guest behind a modal panel. */
+      if (key_down == snes_savestate_menu_handle_key) {
+        int cmd = FindCmdForSdlKey(SNESRECOMP_SDL_EVENT_KEY(event),
+                                  SNESRECOMP_SDL_EVENT_MOD(event));
+        if (cmd >= kKeys_Controls && cmd <= kKeys_Controls_Last)
+          HandleCommand(cmd, true);
+      }
       key_down(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_REPEAT(event));
       break;
     case SDL_KEYUP:
@@ -1285,6 +1315,7 @@ static void RunSavestateMenuLoop(bool *running) {
   host_report_breadcrumb("save-state browser OPEN - guest frozen until it "
                          "closes (pad B, or Escape/Backspace on the keyboard)");
   g_overlay_modal = true;
+  SetAudioPaused(true);
   while (snes_savestate_menu_is_open() && *running) {
     /* Key presses go straight to the overlay, NOT through HandleInput: the
      * game's own hotkeys must not fire while a panel owns the screen (F1
@@ -1300,6 +1331,8 @@ static void RunSavestateMenuLoop(bool *running) {
     frames++;
   }
   g_overlay_modal = false;
+  ResetAudioTimeline();
+  SetAudioPaused(g_paused);
   OverlayNoteClosed();
   host_report_breadcrumb("save-state browser CLOSED after %u pumps - guest resuming",
                          frames);
@@ -1329,6 +1362,7 @@ static void RunRewindLoop(bool *running) {
   host_report_breadcrumb("rewind filmstrip OPEN - guest frozen until it closes "
                          "(pad B, or Escape; Left/Right scrub, A or Enter commits)");
   g_overlay_modal = true;
+  SetAudioPaused(true);
   while (snes_rewind_is_open() && *running) {
     PumpOverlayEvents(running, &RewindKeyDown);
     if (!*running)
@@ -1365,6 +1399,9 @@ static void RunRewindLoop(bool *running) {
     frames++;
   }
   g_overlay_modal = false;
+  ResetAudioTimeline();
+  SetAudioPaused(g_paused);
+  g_state_generation = RtlStateGeneration(); /* keep the trimmed rewind history */
   OverlayNoteClosed();
   host_report_breadcrumb("rewind filmstrip CLOSED after %u pumps - guest resuming",
                          frames);
@@ -1394,6 +1431,16 @@ static SDL_AudioStream *g_audio_stream;
 static uint8 *g_audio_stream_buffer;
 static size_t g_audio_stream_buffer_size;
 #endif
+
+static void ResetAudioTimeline(void) {
+  RtlApuLock();
+  g_audiobuffer_end = g_audiobuffer_cur;
+  g_audio_primed = false;
+#if SNESRECOMP_SDL3
+  if (g_audio_stream) SDL_ClearAudioStream(g_audio_stream);
+#endif
+  RtlApuUnlock();
+}
 
 void RtlApuLock(void) {
   SDL_LockMutex(g_audio_mutex);
@@ -1872,6 +1919,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     framedump_dir = argv[1];
     argc -= 2, argv += 2;
   }
+  if (game->state_menu_hotkeys) ConfigUseStateMenuDefaults();
   ParseConfigFile(config_file);
   g_active_config_file = config_file;
   /* Local overrides (gitignored). Last parser to set a key wins. */
@@ -2150,8 +2198,8 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   }
 
   g_gamepad[0].joystick_id = g_gamepad[1].joystick_id = -1;
-  g_ws_extra = 0;
-  g_ws_active = false;
+  g_ws_extra = g_game->native_widescreen ? (g_snes_width - 256) / 2 : 0;
+  g_ws_active = g_ws_extra != 0;
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
     g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits;
 
@@ -2459,10 +2507,17 @@ error_reading:;
   /* Rewind ring: reads the env overrides and reserves slot headers; the
    * buffer itself is allocated lazily on the first capture. */
   snes_rewind_configure();
+  g_state_generation = RtlStateGeneration();
 
   host_report_breadcrumb("entering main loop");
 
   while (running) {
+    if (g_state_generation != RtlStateGeneration()) {
+      ResetAudioTimeline();
+      snes_rewind_shutdown();
+      snes_rewind_configure();
+      g_state_generation = RtlStateGeneration();
+    }
     SDL_Event event;
 
     /* Inert unless SNESRECOMP_CRASH_TEST is set — support drill for the
@@ -2510,7 +2565,7 @@ error_reading:;
       SetAudioPaused(audiopaused);
     }
 
-    if (g_paused) {
+    if (g_paused && !g_savestate_menu_hotkey && !g_rewind_hotkey) {
       snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
       SDL_Delay(16);
       continue;
@@ -2562,8 +2617,8 @@ error_reading:;
           frameCtr++;
           g_screenshot_frame = frameCtr;
           snes_osd_note_frame();
-          snes_rewind_note_frame();
           CaptureSimulationFrame(frameCtr);
+          NoteStateFrame();
           snes_netplay_finish_frame();
           if (burst >= snes_host_catchup_budget())
             break;
@@ -2744,6 +2799,7 @@ error_reading:;
       GameReset();
       continue;   /* guest was frozen: no frame to run or present */
     }
+    if (g_paused) continue;
     /* The script ticks HERE, after every path that can leave this iteration
      * without running a frame. Ticked above the overlay checks, an
      * iteration that opened a panel consumed a script frame the guest never
@@ -2762,16 +2818,6 @@ error_reading:;
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
     ApplyScriptForcePokes();
     snes_osd_note_frame();
-    /* One guest frame happened: offer it to the rewind ring, and offer the
-     * field as the next save's thumbnail. Both are no-ops while a panel is
-     * open, so a thumbnail is of the game and not of the overlay. */
-    snes_rewind_note_frame();
-    if (g_ppu && g_ppu->renderBuffer) {
-      snes_savestate_menu_note_frame((const uint32_t *)g_ppu->renderBuffer,
-                                     256, g_snes_height);
-      snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer,
-                                   256, g_snes_height);
-    }
     ProfileEnd(kProfileGuest, profile_start);
     frameCtr++;
     g_screenshot_frame = frameCtr;
@@ -2805,6 +2851,7 @@ error_reading:;
 
     profile_start = ProfileStart();
     CaptureSimulationFrame(frameCtr);
+    NoteStateFrame();
     g_audio_producer_active = false;
     ProfileEnd(kProfileRaster, profile_start);
     profile_start = ProfileStart();
@@ -2860,6 +2907,7 @@ error_reading:;
     HandleCommand(kKeys_Save + 0, true);
 
   RtlWriteSram();
+  snes_rewind_shutdown();
 
   // clean sdl
   SetAudioPaused(true);
@@ -3297,7 +3345,18 @@ static const char kDefaultConfigIniContent[] =
   "ControlsP2 = DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n";
 
 static const char *DefaultConfigIni(void) {
-  return g_game->default_config_ini ? g_game->default_config_ini : kDefaultConfigIniContent;
+  if (g_game->default_config_ini) return g_game->default_config_ini;
+  if (g_game->state_menu_hotkeys) {
+    static char menu_config[sizeof(kDefaultConfigIniContent) + 128];
+    const char *keys = strstr(kDefaultConfigIniContent, "SaveStateMenu = F11\n");
+    const char *after_load = strchr(strstr(keys, "Load ="), '\n') + 1;
+    snprintf(menu_config, sizeof(menu_config), "%.*s%s%s",
+        (int)(keys - kDefaultConfigIniContent), kDefaultConfigIniContent,
+        "SaveStateMenu = F7\nRewind = F8\n"
+        "Load = F1,F2,F3,F4,F5,F6,F11,F12,F9,F10\n", after_load);
+    return menu_config;
+  }
+  return kDefaultConfigIniContent;
 }
 
 /* Write the default config.ini next to the executable and chdir there. Silent

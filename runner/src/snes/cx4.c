@@ -1199,6 +1199,10 @@ int cx4_load_firmware(Cx4 *c, const char *rom_path) {
   return 1;
 }
 
+void cx4_saveload_clock(Cx4 *c, struct SaveLoadInfo *sli) {
+  if (c && sli) sli->func(sli, &c->last_master, sizeof(c->last_master));
+}
+
 void cx4_saveload(Cx4 *c, struct SaveLoadInfo *sli) {
   if (!c || !sli) return;
   /* Guest-visible device state only. The data ROM is static; the rings are host

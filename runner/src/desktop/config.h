@@ -139,6 +139,7 @@ enum {
 
 extern Config g_config;
 
+void ConfigUseStateMenuDefaults(void);
 void ParseConfigFile(const char *filename);
 // Re-apply only the [KeyMap] section (launcher hotkey editor wrote it after
 // the initial parse). Keyboard command map is rebuilt; gamepad map and all
