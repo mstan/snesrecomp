@@ -83,6 +83,10 @@ typedef struct SnesDesktopHostGame {
   /* Guest-side polling that decides the default frame width. Left at 0 the
    * host presents 256x224. */
   int frame_width, frame_height;
+  /* Use the runner's widened PPU field instead of a game-owned compositor. */
+  int native_widescreen;
+  /* F7/F8 menus, with legacy slot 7/8 loads moved to F11/F12. */
+  int state_menu_hotkeys;
 
   /* ── Hooks. Every one is optional. ────────────────────────────────────── */
 
@@ -144,6 +148,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
  * default). For per-title code that composes against the current frame. */
 int snesrecomp_desktop_frame_width(void);
 int snesrecomp_desktop_frame_height(void);
+void snesrecomp_desktop_set_widescreen(int enabled);
 
 /* Ask the host to reset its pacing clock at the next opportunity (a title
  * that just changed its presentation settings). */

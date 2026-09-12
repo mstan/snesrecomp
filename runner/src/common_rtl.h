@@ -323,6 +323,15 @@ void RtlSramFilePath(char *buf, size_t buflen);
 void RtlMigrateLegacySram(const char *legacy_title);
 bool RtlSaveSnapshot(const char *filename);
 bool RtlLoadSnapshot(const char *filename);
+/* Opt-in native execution extension for title state callbacks. Save/load in
+ * state_*_extra; apply in on_state_loaded, after generic post-load cleanup.
+ * Version/size checked, pointer-free; intended for matching runtime builds. */
+struct SaveLoadInfo;
+void RtlSaveExecutionState(struct SaveLoadInfo *sli);
+bool RtlLoadExecutionState(struct SaveLoadInfo *sli);
+void RtlApplyExecutionState(void);
+/* Host timeline invalidation after a successful load or reset. */
+uint64_t RtlStateGeneration(void);
 size_t RtlSaveSnapshotToMemory(void *data, size_t capacity);
 bool RtlLoadSnapshotFromMemory(const void *data, size_t size);
 

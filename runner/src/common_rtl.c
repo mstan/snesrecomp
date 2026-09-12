@@ -398,7 +398,11 @@ void rtl_reset_host_pacing(void) {
   snes_refresh_state_set(0u, g_cpu.master_cycles);
 }
 
+static uint64_t s_state_generation;
+uint64_t RtlStateGeneration(void) { return s_state_generation; }
+
 void RtlReset(int mode) {
+  ++s_state_generation;
   rtl_reset_host_pacing();
   snes_reset(g_snes, true);
   g_snes->beamMasterLast = g_cpu.master_cycles;
@@ -871,6 +875,7 @@ bool RtlLoadSnapshot(const char *filename) {
    * game one hook to rebuild it against the freshly restored WRAM. */
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
+  ++s_state_generation;
   return true;
 }
 
@@ -918,6 +923,7 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   PpuResetWidescreenOamHistory(g_snes->ppu);
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
+  ++s_state_generation;
   return true;
 }
 
@@ -1104,6 +1110,37 @@ static void rtl_rb_residue_apply(const RtlRollbackResidue *r) {
   interp_bridge_rb_state_load(r->interp);
   dma_hdma_pending_init_set(g_snes->dma, r->hdma_pending_init);
   ppu_rb_residue_set(g_snes->ppu, &r->ppu_rb);
+}
+
+static RtlRollbackResidue s_loaded_execution;
+static bool s_loaded_execution_valid;
+
+void RtlSaveExecutionState(SaveLoadInfo *sli) {
+  RtlRollbackResidue r;
+  rtl_rb_residue_capture(&r);
+  r.cpu.ram = NULL; /* Never persist a process address. */
+  uint32 size = sizeof(r);
+  sli->func(sli, &size, sizeof(size));
+  sli->func(sli, &r, sizeof(r));
+  cx4_saveload_clock(g_snes->cart->cx4, sli);
+}
+
+bool RtlLoadExecutionState(SaveLoadInfo *sli) {
+  uint32 size = 0;
+  s_loaded_execution_valid = false;
+  sli->func(sli, &size, sizeof(size));
+  if (size != sizeof(s_loaded_execution)) return false;
+  memset(&s_loaded_execution, 0, sizeof(s_loaded_execution));
+  sli->func(sli, &s_loaded_execution, sizeof(s_loaded_execution));
+  cx4_saveload_clock(g_snes->cart->cx4, sli);
+  return s_loaded_execution_valid =
+      s_loaded_execution.magic == RTL_RB_RESIDUE_MAGIC &&
+      s_loaded_execution.version == RTL_RB_RESIDUE_VERSION;
+}
+
+void RtlApplyExecutionState(void) {
+  if (s_loaded_execution_valid) rtl_rb_residue_apply(&s_loaded_execution);
+  s_loaded_execution_valid = false;
 }
 
 size_t RtlRollbackSaveToMemory(void *data, size_t capacity) {
