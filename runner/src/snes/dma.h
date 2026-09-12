@@ -43,7 +43,6 @@ struct Dma {
   /* Transient state for channels enabled between frame initializations. Keep
    * this before channel so dma_saveload's serialized channel region remains
    * byte-for-byte compatible with existing saves. */
-  uint8_t hdmaPendingInit;
   /* Bitmask of channels whose HDMA was switched on part-way through a frame
    * and still owe their one-slot table initialization. See dma_doHdma().
    *

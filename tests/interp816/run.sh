@@ -5,7 +5,10 @@ set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 mkdir -p build
-CFLAGS="-std=c11 -Wall -Wextra -Wno-unused-parameter -O1"
+# _POSIX_C_SOURCE because -std=c11 is strict ISO: it hides setenv() (phase 1's
+# bridge_test) and gmtime_r() (tier2_capture.c), so phase 1 has never compiled
+# on Linux. Pre-existing on both main and this branch.
+CFLAGS="-std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wno-unused-parameter -O1"
 
 echo "=== Phase 0: interp816 core ==="
 gcc $CFLAGS -I runner/src/snes \

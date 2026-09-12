@@ -1791,7 +1791,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         "op=$%02X frame=%d sp=$%04X — corrupted control transfer\n",
                         _pbnk, (unsigned)pc_before, op, snes_frame_counter,
                         (unsigned)in.sp);
-                    interp_bridge_dump_recent_steps(64, stderr);
+                    /* Step history at the trap. This branch had an
+                     * always-on file-static ring (g_itrace_recent); main
+                     * replaced it with the function-local one above, so use
+                     * that instead of reviving a duplicate. `head` (first 8
+                     * steps) is always recorded; the 256-entry `ring` only
+                     * fills under SNESRECOMP_ITRACE, so pass total=0 when
+                     * untraced -- printing the entry path and claiming NO
+                     * spin history beats dumping an unfilled ring. */
+                    itrace_dump(entry_pc24, head, (int)(itn < 8 ? itn : 8),
+                                ring, trace ? itn : 0);
                     fflush(stderr);
                     exit(43);
                 }
@@ -2242,31 +2251,6 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     return 0;
 }
 
-/* Each bridge run installs a stable interpreted-function name so debug write
- * attribution does not leak an enclosing AOT frame. */
-extern const char *g_last_recomp_func;
-#define INTERP_SCOPE_NAMES 4096u
-static char s_interp_scope_names[INTERP_SCOPE_NAMES][20];
-static uint32_t s_interp_scope_pc[INTERP_SCOPE_NAMES];
-static uint8_t s_interp_scope_used[INTERP_SCOPE_NAMES];
-
-static const char *interp_scope_name(uint32_t pc24) {
-    pc24 &= 0xFFFFFFu;
-    uint32_t slot = (pc24 * 2654435761u) & (INTERP_SCOPE_NAMES - 1u);
-    for (uint32_t probe = 0; probe < INTERP_SCOPE_NAMES; probe++) {
-        uint32_t i = (slot + probe) & (INTERP_SCOPE_NAMES - 1u);
-        if (!s_interp_scope_used[i]) {
-            s_interp_scope_used[i] = 1;
-            s_interp_scope_pc[i] = pc24;
-            snprintf(s_interp_scope_names[i], sizeof(s_interp_scope_names[i]),
-                     "interp@$%06X", (unsigned)pc24);
-            return s_interp_scope_names[i];
-        }
-        if (s_interp_scope_pc[i] == pc24)
-            return s_interp_scope_names[i];
-    }
-    return "interp@(table full)";
-}
 
 /* ── interpreter attribution scope ────────────────────────────────────────
  *
@@ -2336,10 +2320,6 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     s_interp_owner_exit_s = s_exit;
     s_interp_owner_exit_valid = 1;
     s_interp_bridge_depth++;
-    const char *_saved_func = g_last_recomp_func;
-    const char *_scope_name = interp_scope_name(entry_pc24);
-    g_last_recomp_func = _scope_name;
-    RecompStackPush(_scope_name);
     /* Attribution scope (see interp_scope_name above). Saved/restored rather
      * than assumed clean: a bounce chain re-enters this wrapper with an AOT
      * name installed, and that name must come back on our exit. */

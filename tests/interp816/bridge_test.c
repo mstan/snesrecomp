@@ -72,25 +72,6 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 
-/* Attribution-scope stubs (common_cpu_infra.c in the real runner). The test
- * doubles record what the bridge pushed so the interp scope is testable: the
- * write rings copy g_last_recomp_func / the stack at write time, and if the
- * bridge stops installing its interp@$ name, interpreted writes silently
- * re-attribute to the stale enclosing AOT frame. */
-const char *g_last_recomp_func = "(none)";
-static const char *g_push_log[16];
-static int g_push_count = 0;
-static int g_push_depth = 0;
-static int g_pop_underflow = 0;
-void RecompStackPush(const char *name) {
-    if (g_push_count < 16) g_push_log[g_push_count] = name;
-    g_push_count++;
-    g_push_depth++;
-}
-void RecompStackPop(void) {
-    if (g_push_depth <= 0) g_pop_underflow = 1;
-    g_push_depth--;
-}
 void snes_refresh_charge(void) {}
 uint32_t cpu_region_speed(uint32_t addr24) {
     return (uint32_t)snes_region_speed(addr24, g_memsel);
