@@ -156,6 +156,11 @@ def test_scaffold_carries_rom_identity_into_the_pipeline():
         identity = (project / "rom_identity.txt").read_text(encoding="utf-8")
         assert crc in identity, "rom_identity.txt is missing the ROM CRC32"
         assert sha in identity, "rom_identity.txt is missing the ROM SHA-256"
+        # The catalog matches on every digest; a submission takes them from
+        # here instead of hashing the ROM again, so all of them are recorded.
+        assert hashlib.md5(raw).hexdigest() in identity, "rom_identity.txt is missing the MD5"
+        assert hashlib.sha1(raw).hexdigest() in identity, "rom_identity.txt is missing the SHA-1"
+        assert f"rom_size        = {len(raw)}" in identity, "rom_identity.txt is missing rom_size"
 
         # The README is documentation and still states them for a reader.
         readme = (project / "README.md").read_text(encoding="utf-8")

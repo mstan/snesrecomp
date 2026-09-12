@@ -22,8 +22,9 @@ import pathlib
 import re
 import sys
 
-FIELDS = ("display_name", "rom_file", "expected_crc32",
-          "expected_sha256", "mapping", "region", "game_id")
+FIELDS = ("display_name", "rom_file", "expected_crc32", "expected_md5",
+          "expected_sha1", "expected_sha256", "rom_size", "mapping", "region",
+          "game_id")
 
 LINE = re.compile(r"^([A-Za-z0-9_]+)[ \t]*=[ \t]*(.*)$")
 

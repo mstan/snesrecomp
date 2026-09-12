@@ -177,8 +177,17 @@ def probe(path: pathlib.Path) -> dict:
         "file_size": len(raw_file),
         "normalized_size": len(normalized),
         "had_copier_header": len(raw_file) != len(normalized),
-        "crc32": "%08x" % (zlib.crc32(raw_file) & 0xFFFFFFFF),
-        "sha256": hashlib.sha256(raw_file).hexdigest(),
+        # Every digest the catalog matches on, of the NORMALIZED image (a
+        # 512-byte copier header stripped): that is what verify-rom, the
+        # launcher and the catalog's own hashing compute, and No-Intro's
+        # digests are of the bare image too. Recorded in rom_identity.txt so
+        # a catalog submission can take them from the repository instead of
+        # asking the submitter to hash the ROM again.
+        "crc32": "%08x" % (zlib.crc32(normalized) & 0xFFFFFFFF),
+        "md5": hashlib.md5(normalized).hexdigest(),
+        "sha1": hashlib.sha1(normalized).hexdigest(),
+        "sha256": hashlib.sha256(normalized).hexdigest(),
+        "rom_size": len(normalized),
         "mapping": mapping,
         "header_title": title,
         "file_title": clean_filename_title(path.stem),

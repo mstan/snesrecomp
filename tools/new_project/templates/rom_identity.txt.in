@@ -11,8 +11,14 @@
 
 display_name    = @DISPLAY_NAME@
 rom_file        = @ROM_FILE@
+# Every digest of the bare image (copier header stripped), so the Retro
+# catalog can take a submission's identity from this file rather than ask
+# the submitter to hash the ROM again. The build verifies on crc32/sha256.
 expected_crc32  = @ROM_CRC32@
+expected_md5    = @ROM_MD5@
+expected_sha1   = @ROM_SHA1@
 expected_sha256 = @ROM_SHA256@
+rom_size        = @ROM_SIZE@
 mapping         = @ROM_MAPPING@
 region          = @REGION@
 # What a mod package's [[target]] game_id must name to apply to this title
