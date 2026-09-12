@@ -87,6 +87,8 @@ typedef struct SnesDesktopHostGame {
   int native_widescreen;
   /* F7/F8 menus, with legacy slot 7/8 loads moved to F11/F12. */
   int state_menu_hotkeys;
+  int display_aspect_supported; /* expose the three SNES pixel-aspect choices */
+  int shader_supported;        /* expose GLSL presets (OpenGL presenter) */
 
   /* ── Hooks. Every one is optional. ────────────────────────────────────── */
 

@@ -41,6 +41,7 @@
 #include "host_clock.h"
 
 #include "snes/ppu.h"
+#include "snes/msu1.h"
 #include "snes/apu.h"
 #include "snes/dsp.h"
 #include "snes/snes.h"
@@ -2178,6 +2179,9 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         ls.fullscreen    = g_config.fullscreen;
         ls.ignore_aspect = g_config.ignore_aspect_ratio;
         ls.linear_filter = g_config.linear_filtering;
+        ls.aspect_index = SnesDisplayAspect_Clamp(g_config.display_aspect);
+        if (g_config.shader)
+          snprintf(ls.shader_path, sizeof(ls.shader_path), "%s", g_config.shader);
         ls.enable_audio  = g_config.enable_audio;
         ls.audio_freq    = g_config.audio_freq;
         ls.volume        = g_config.volume;
@@ -2232,6 +2236,18 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
 #if defined(SNESRECOMP_HOST_HAS_BLEND)
         gi.has_frame_blend  = 1;
 #endif
+        if (game->display_aspect_supported) {
+          static const char *const labels[] = {
+            "4:3 (CRT)", "8:7 (Square pixels)", "1:1 (Square frame)"
+          };
+          gi.aspect_labels = labels;
+          gi.num_aspect_labels = kSnesDisplayAspect_Count;
+          gi.aspect_setting_label = "Display aspect";
+          gi.aspect_setting_help =
+              "4:3 recreates a traditional TV. 8:7 uses square pixels. "
+              "1:1 presents the native picture in a square.";
+        }
+        gi.has_shader = game->shader_supported;
         gi.has_run_ahead    = 1;   /* the runtime snapshots a machine in a frame */
         gi.has_vsync        = 1;
         gi.has_renderer     = 1;
@@ -2284,6 +2300,13 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
           g_config.fullscreen          = (uint8)ls.fullscreen;
           g_config.ignore_aspect_ratio = ls.ignore_aspect != 0;
           g_config.linear_filtering    = ls.linear_filter != 0;
+          if (game->display_aspect_supported)
+            g_config.display_aspect = (uint8)SnesDisplayAspect_Clamp(ls.aspect_index);
+          if (game->shader_supported) {
+            static char shader_path[sizeof(ls.shader_path)];
+            snprintf(shader_path, sizeof(shader_path), "%s", ls.shader_path);
+            g_config.shader = shader_path[0] ? shader_path : NULL;
+          }
           g_config.enable_audio        = true;   /* always on */
           g_config.audio_freq          = (uint16)ls.audio_freq;
           g_config.volume              = ls.volume;
@@ -2471,6 +2494,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   if (game->on_rom_loaded) game->on_rom_loaded(kRom, kRom_SIZE);
 
   RtlRegisterGame(game->game_info);
+  msu1_set_rom_path(rom_path_buf);
   Snes *snes = SnesInit(kRom, kRom_SIZE);
   host_report_breadcrumb("SnesInit: %s", snes ? "ok" : "FAILED");
   if (snes == NULL) {

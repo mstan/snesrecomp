@@ -1,4 +1,4 @@
-/* ROM-backed checks for the X2/X3 adapter and the real shared desktop host.
+/* ROM-backed checks for the MMX adapters and the real shared desktop host.
  * The caller supplies an empty working directory; only slot 12 is used. */
 #define MMX_DESKTOP_ENTRY MmxDesktopMain
 #include "../src/desktop/host_main.c"
@@ -62,6 +62,10 @@ int main(int argc, char **argv) {
   fseek(f, 0, SEEK_END); long rom_size = ftell(f); rewind(f);
   uint8 *rom = malloc(rom_size);
   check(fread(rom, 1, rom_size, f) == (size_t)rom_size, "ROM reads"); fclose(f);
+  if ((rom_size & 0x7fff) == 512) {
+    rom_size -= 512;
+    memmove(rom, rom + 512, rom_size);
+  }
   g_config.new_renderer = true; g_config.widescreen = true;
   g_last_drawable_width = 1280; g_last_drawable_height = 720;
   g_ppu_render_flags = kPpuRenderFlags_NewRenderer;
