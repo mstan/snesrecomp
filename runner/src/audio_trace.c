@@ -429,10 +429,16 @@ void audio_trace_sample_clocks(uint64_t *produced, uint64_t *consumed) {
 void audio_trace_get_stats(AudioTraceStats *out) {
   RtlApuLock();
 #if AUDIO_TRACE_HAS_STORAGE && !AUDIO_TRACE_WRITES_HISTORY
+  /* Keep the storage arrays referenced in builds that never write history,
+   * so the linker cannot drop them. Read the anchor back as well as writing
+   * it: a write-only variable is -Wunused-but-set-variable on GCC 15, which
+   * is -Werror in tests/run_c_tests.sh. */
   static volatile uintptr_t s_storage_anchor;
-  s_storage_anchor ^= (uintptr_t)&s_pcm[0];
-  s_storage_anchor ^= (uintptr_t)&s_events[0];
-  s_storage_anchor ^= (uintptr_t)&s_snaps[0];
+  uintptr_t anchor = s_storage_anchor;
+  anchor ^= (uintptr_t)&s_pcm[0];
+  anchor ^= (uintptr_t)&s_events[0];
+  anchor ^= (uintptr_t)&s_snaps[0];
+  s_storage_anchor = anchor;
 #endif
   *out = s_stats;
   RtlApuUnlock();
