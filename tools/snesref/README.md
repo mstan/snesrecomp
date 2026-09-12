@@ -48,6 +48,8 @@ for any libretro SNES core.
 
 ## Build
 
+Windows:
+
 ```bat
 :: 1. extract the SDL2 VC dev package here as SDL2-2.30.9\   (libsdl.org)
 :: 2. build
@@ -55,6 +57,15 @@ build.bat
 ```
 
 Produces `snesref.exe`.
+
+Linux / macOS (SDL2 development headers from the system package manager):
+
+```sh
+./build.sh
+```
+
+Produces `snesref`. The core is loaded with `dlopen` there and
+`LoadLibrary` on Windows, so the same source builds on both.
 
 ## Run
 
@@ -64,6 +75,18 @@ snesref.exe <core.dll> <rom.sfc>
 ```
 
 Place the libretro core DLL (and its `SDL2.dll`) next to the exe, or pass a path.
+
+```sh
+./snesref <core.so> <rom.sfc>
+# e.g. ./snesref ~/.config/retroarch/cores/snes9x_libretro.so mmx.sfc
+```
+
+Headless capture wants the dummy SDL drivers:
+
+```sh
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy SNESREF_FAST=1 SNESREF_FRAMES=2000 \
+  SNESREF_FRAME_DUMP_DIR=frames ./snesref core.so game.sfc
+```
 
 ### Deterministic capture
 

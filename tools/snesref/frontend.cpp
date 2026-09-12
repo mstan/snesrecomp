@@ -11,8 +11,27 @@
  *   Shift+F1-F9 = save state slot       F1-F9 = load state slot
  *   Backspace = clear the WRAM trace    Esc = quit
  */
+/* The core is a shared library on every platform: LoadLibrary on Windows,
+ * dlopen elsewhere. The tool was Windows-only until 2026-09, when a flicker
+ * report on Linux needed the oracle's frame dumps beside the recomp's. */
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+typedef HMODULE CoreHandle;
+static CoreHandle core_open(const char* path) { return LoadLibraryA(path); }
+static void* core_sym(CoreHandle h, const char* name) { return (void*)GetProcAddress(h, name); }
+static void core_close(CoreHandle h) { FreeLibrary(h); }
+static const char* core_error(void) {
+    static char buf[64]; snprintf(buf, sizeof buf, "err %lu", GetLastError()); return buf;
+}
+#else
+#include <dlfcn.h>
+typedef void* CoreHandle;
+static CoreHandle core_open(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static void* core_sym(CoreHandle h, const char* name) { return dlsym(h, name); }
+static void core_close(CoreHandle h) { dlclose(h); }
+static const char* core_error(void) { const char* e = dlerror(); return e ? e : "?"; }
+#endif
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <cstdio>
@@ -22,7 +41,7 @@
 #include "libretro.h"
 
 // ---- core function pointers ----
-static HMODULE g_core;
+static CoreHandle g_core;
 #define LR(sym) static decltype(&sym) p_##sym;
 LR(retro_init) LR(retro_deinit) LR(retro_api_version)
 LR(retro_get_system_info) LR(retro_get_system_av_info)
@@ -36,7 +55,7 @@ LR(retro_get_memory_data) LR(retro_get_memory_size)
 #undef LR
 
 template<class T> static void bind(T& fn, const char* name) {
-    fn = (T)GetProcAddress(g_core, name);
+    fn = (T)core_sym(g_core, name);
     if (!fn) { fprintf(stderr, "missing core symbol: %s\n", name); exit(2); }
 }
 
@@ -497,8 +516,8 @@ int main(int argc, char** argv) {
     { const char* input = getenv("SNESREF_INPUT_FILE");
       if (input && input[0] && !load_input_file(input)) return 6; }
 
-    g_core = LoadLibraryA(corePath);
-    if (!g_core) { fprintf(stderr,"LoadLibrary failed: %s (err %lu)\n", corePath, GetLastError()); return 2; }
+    g_core = core_open(corePath);
+    if (!g_core) { fprintf(stderr,"core load failed: %s (%s)\n", corePath, core_error()); return 2; }
     bind(p_retro_init,"retro_init"); bind(p_retro_deinit,"retro_deinit");
     bind(p_retro_api_version,"retro_api_version");
     bind(p_retro_get_system_info,"retro_get_system_info");
@@ -631,6 +650,6 @@ int main(int argc, char** argv) {
     }
     wav_close();
     p_retro_unload_game(); p_retro_deinit();
-    SDL_Quit(); FreeLibrary(g_core);
+    SDL_Quit(); core_close(g_core);
     return 0;
 }
